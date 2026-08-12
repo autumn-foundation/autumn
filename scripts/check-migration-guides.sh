@@ -591,6 +591,9 @@ function links_to(text, path,   at, i, ch, start, slashes, depth, open_at, dest)
     } else {
       dest = reference_target(text, at)
     }
+    # A fragment selects a place *within* the destination, so a deep link into
+    # the relevant section still points at the guide.
+    sub(/#.*$/, "", dest)
     if (dest == path) return 1
   }
   return 0
@@ -674,6 +677,10 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
     md_fence_hit = 0
   }
   if (md_fence_hit) {
+    # The delimiters themselves end the paragraph they interrupt. An empty
+    # block reaches neither the body below nor any content line, so without
+    # this a `<x-widget>` after one stayed inline instead of opening a block.
+    md_paragraph_open = 0
     if (!md_in_fence) {
       md_in_fence = 1
       md_fence_len = run
@@ -706,7 +713,10 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
       if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
     } else if (md_html_end != "") {
       if (index(line, md_html_end) > 0) md_in_html_block = 0
-    } else if (line ~ /^[[:space:]]*$/) {
+    } else if (body ~ /^[[:space:]]*$/) {
+      # Measured on the container-normalised body: inside a block quote the
+      # blank line that ends the block is written `>`, and testing the raw
+      # line kept the block open and swallowed the link after it.
       md_in_html_block = 0
     }
     return ""
@@ -1059,8 +1069,12 @@ findings="$(
       # paragraph open, and the next unindented line was then absorbed as a
       # lazy continuation — including a guide link that renders outside the
       # entry entirely.
+      # Measured on the raw line, not on `visible`: a fence delimiter renders
+      # as nothing, so its visible indentation is always zero and every fence
+      # looked outdented — flushing entries whose fence sat correctly at the
+      # item content column, and losing the link that followed it.
       if (md_fence_hit && entry != "" && !md_in_fence &&
-          leading_spaces(visible) < entry_content_indent) {
+          leading_spaces($0) < entry_content_indent) {
         flush_entry()
         entry_paragraph_open = 0
       }
@@ -1462,9 +1476,16 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
         {
           # A link reference definition, and a title continuing one onto the
           # next line, render nothing — they populate a section on paper only.
-          if (is_link_definition(visible)) {
+          # A definition opener whose destination sits on the next line is
+          # still a definition, and the whole of it renders nothing. Tracking
+          # only the single-line shape let the destination line populate the
+          # section on its own.
+          if (is_link_definition(visible) || is_definition_opener(visible)) {
             pending_title = 1
           } else if (pending_title && is_orphan_title(visible)) {
+            pending_title = 0
+          } else if (pending_title && strip_inline_tags(visible) ~ /^[[:space:]]*[^[:space:]]+[[:space:]]*$/) {
+            # The destination, alone on the line below its opener.
             pending_title = 0
           } else if (strip_inline_tags(visible) ~ /[^[:space:]]/) {
             pending_title = 0

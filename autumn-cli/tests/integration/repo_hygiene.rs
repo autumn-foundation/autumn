@@ -5826,3 +5826,154 @@ fn shell_scripts_keep_slashes_out_of_awk_bracket_expressions() {
         offenders.join("\n"),
     );
 }
+
+// --- Review rounds 44-45: container blanks, fence state, fragments --------
+
+#[test]
+fn migration_guide_gate_ends_a_quoted_html_block_at_a_quoted_blank_line() {
+    // Inside a block quote a blank line is written `>`, not whitespace, so
+    // testing the raw line for blankness never ends the block and the link
+    // after it was discarded — the reference implementation renders it as a
+    // real anchor inside the quote.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed.\n  \
+         > <div>\n  > x\n  >\n  \
+         > See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a quoted blank line ends the quoted block\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_closes_a_paragraph_at_an_empty_fence() {
+    // An empty fenced block still ends the paragraph before it. Neither
+    // delimiter reached the branch that clears the flag, so a standalone tag
+    // afterwards stayed inline and the headings inside the raw block it should
+    // have opened were read as the guide's own structure.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = "# Migrating from Autumn `0.x` to `0.7.0`\n\n\
+         Intro prose.\n\n\
+         ```\n```\n\
+         <x-widget>\n\
+         ## At a glance\n\n\
+         - **New version:** `autumn-web 0.7.0`\n\n\
+         ## Summary\n\n\
+         Why.\n\n\
+         ## Before you start\n\n\
+         Pin.\n\n\
+         ## Breaking changes\n\n\
+         Before / after.\n\n\
+         ## How to verify\n\n\
+         Run `cargo check`.\n\n\
+         ### Guide-only upgrade walkthrough\n\n\
+         - **Status:** performed 2026-01-01\n";
+    write_fixture_guide(&tmp, "0.7.0", guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "headings inside a raw block are not the guide's structure\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_keeps_an_entry_open_across_an_indented_fence() {
+    // A fence indented to the item content column belongs to the item, so the
+    // link after it is still the entry's link. Fence delimiters render as
+    // nothing, so measuring their indentation from the *visible* text always
+    // read zero and flushed the entry early.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed.\n  \
+         ```\n  sample\n  ```\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "an indented fence stays inside its list item\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_a_fragment_link_to_the_guide() {
+    // A deep link into the relevant section is a better link, not a worse one:
+    // the destination still resolves to the required guide.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md#api-changes).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a fragment still points at the guide\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_count_a_multiline_definition_as_content() {
+    // A definition whose destination sits on the next line renders nothing at
+    // all, so a section holding only one is empty. The opener alone is not a
+    // definition, which is exactly why the emptiness check missed it.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace(
+        "Why this release breaks.",
+        "[only]:\n    https://example.invalid",
+    );
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a definition split across lines still renders nothing\n{}",
+        gate_report(&output),
+    );
+}
