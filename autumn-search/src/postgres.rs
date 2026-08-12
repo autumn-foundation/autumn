@@ -345,7 +345,7 @@ impl PostgresSearchStore {
             }
 
             let mut vector_sql = String::new();
-            let mut param = binds.len() + 1;
+            let mut param = binds.len().saturating_add(1);
             for field in &document.document.fields {
                 let Some(weight) = definition.weight_of(field.name) else {
                     continue;
@@ -363,7 +363,7 @@ impl PostgresSearchStore {
                     "setweight(to_tsvector($5::text::regconfig, ${param}), '{weight}')"
                 );
                 binds.push(Bound::Text(field.value.clone()));
-                param += 1;
+                param = param.saturating_add(1);
             }
             if vector_sql.is_empty() {
                 "to_tsvector($5::text::regconfig, '')".clone_into(&mut vector_sql);
@@ -452,7 +452,7 @@ fn checked(definition: &IndexDefinition) -> SearchResult<()> {
 /// string. Non-finite values are clamped to `0`, which keeps a malformed
 /// embedding from producing invalid SQL.
 fn array_literal(vector: &[f32]) -> String {
-    let mut out = String::with_capacity(vector.len() * 8 + 2);
+    let mut out = String::with_capacity(vector.len().saturating_mul(8).saturating_add(2));
     out.push('{');
     for (index, value) in vector.iter().enumerate() {
         if index > 0 {
@@ -467,7 +467,7 @@ fn array_literal(vector: &[f32]) -> String {
 
 /// Render an embedding as a `pgvector` literal (`[1,2,3]`).
 fn vector_literal(vector: &[f32]) -> String {
-    let mut out = String::with_capacity(vector.len() * 8 + 2);
+    let mut out = String::with_capacity(vector.len().saturating_mul(8).saturating_add(2));
     out.push('[');
     for (index, value) in vector.iter().enumerate() {
         if index > 0 {
@@ -515,7 +515,7 @@ fn filter_sql(
     if let Some(tenant) = &filter.tenant_id {
         let _ = write!(sql, " AND tenant_id = ${next_param}");
         binds.push(Bound::Text(tenant.clone()));
-        *next_param += 1;
+        *next_param = next_param.saturating_add(1);
     }
     if let Some(allowed) = &filter.allowed_ids {
         if allowed.is_empty() {
@@ -528,13 +528,13 @@ fn filter_sql(
             // for every distinct id set.
             let _ = write!(sql, " AND record_id = ANY(${next_param})");
             binds.push(Bound::Ids(allowed.clone()));
-            *next_param += 1;
+            *next_param = next_param.saturating_add(1);
         }
     }
     if !filter.excluded_ids.is_empty() {
         let _ = write!(sql, " AND NOT (record_id = ANY(${next_param}))");
         binds.push(Bound::Ids(filter.excluded_ids.clone()));
-        *next_param += 1;
+        *next_param = next_param.saturating_add(1);
     }
     for (field, value) in &filter.equals {
         if field == crate::backend::TENANT_FILTER_KEY {
@@ -551,7 +551,7 @@ fn filter_sql(
             continue;
         }
         binds.push(Bound::Text(value.clone()));
-        *next_param += 1;
+        *next_param = next_param.saturating_add(1);
     }
     sql
 }
@@ -576,7 +576,7 @@ fn score_threshold_sql(score_expr: &str, min_score: Option<f32>, next_param: &mu
         return String::new();
     }
     let sql = format!(" AND {score_expr} >= ${next_param}::double precision");
-    *next_param += 1;
+    *next_param = next_param.saturating_add(1);
     sql
 }
 
@@ -968,9 +968,9 @@ impl SearchBackend for PostgresSearchStore {
             // prepared statement per page, which the unbounded statement cache
             // never evicts.
             let limit_param = param;
-            let offset_param = param + 1;
+            let offset_param = param.saturating_add(1);
             let size = i64::from(query.page.size());
-            let offset = i64::from(query.page.page().saturating_sub(1)) * size;
+            let offset = i64::from(query.page.page().saturating_sub(1)).saturating_mul(size);
             let rows = bind_all(
                 diesel::sql_query(format!(
                     "SELECT record_id, \
@@ -1082,7 +1082,7 @@ impl SearchBackend for PostgresSearchStore {
                     // avoid. `array_length` returns `integer`, hence the cast.
                     {
                         let slot = param;
-                        param += 1;
+                        param = param.saturating_add(1);
                         binds.push(Bound::BigInt(
                             i64::try_from(query.vector.len()).unwrap_or(i64::MAX),
                         ));
@@ -1448,7 +1448,7 @@ impl PostgresSearchStore {
                 if let Some(after) = after {
                     predicates.push(format!("{key} > ${param}"));
                     binds.push(Bound::BigInt(after));
-                    param += 1;
+                    param = param.saturating_add(1);
                 }
                 limit_clause = format!(" LIMIT ${param}");
                 binds.push(Bound::BigInt(i64::try_from(limit).unwrap_or(i64::MAX)));

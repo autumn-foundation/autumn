@@ -11,6 +11,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -65,7 +67,7 @@ fn compute_body_hash(bytes: &[u8], content_type: Option<&[u8]>) -> Vec<u8> {
 
 fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
+        String::with_capacity(bytes.as_ref().len().saturating_mul(2)),
         |mut out, byte| {
             use std::fmt::Write as _;
             let _ = write!(out, "{byte:02x}");
@@ -460,11 +462,6 @@ struct MemoryInFlightLock {
     expires_at: Instant,
 }
 
-/// Clamp horizon (~10 years) used when a caller-supplied TTL would overflow
-/// `Instant + Duration`. This constant is itself always representable when
-/// added to a fresh `Instant`, so it can never re-trigger the overflow.
-const SATURATING_DEADLINE_HORIZON_SECS: u64 = 10 * 365 * 24 * 3600;
-
 /// Compute an expiry `Instant` for `ttl`, saturating instead of panicking on
 /// overflow.
 ///
@@ -473,14 +470,10 @@ const SATURATING_DEADLINE_HORIZON_SECS: u64 = 10 * 365 * 24 * 3600;
 /// `Duration::from_secs(u64::MAX)` (which is entirely attacker-influenceable
 /// via configured TTLs) triggers this. Instead of panicking we clamp the
 /// deadline to ~10 years out (far enough that the entry is effectively
-/// non-expiring), falling back to `now` only in the astronomically unlikely
-/// event that even the clamped horizon is not representable.
+/// non-expiring). See [`crate::time_math::saturating_deadline`], which the
+/// job and job-tracking modules share.
 fn saturating_deadline(ttl: Duration) -> Instant {
-    let now = Instant::now();
-    now.checked_add(ttl).unwrap_or_else(|| {
-        now.checked_add(Duration::from_secs(SATURATING_DEADLINE_HORIZON_SECS))
-            .unwrap_or(now)
-    })
+    crate::time_math::saturating_deadline(Instant::now(), ttl)
 }
 
 impl MemoryIdempotencyStore {

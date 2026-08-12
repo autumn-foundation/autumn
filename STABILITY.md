@@ -275,8 +275,15 @@ UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p autumn-web schema_keys_snapshot_guard
 
 ## Migration guides
 
-Every major release ships with a migration guide under
-[`docs/migrations/`](docs/migrations/). The guide is written against the
+**Every release with a breaking change ships a migration guide** under
+[`docs/migrations/`](docs/migrations/) — pre-`1.0` that means most `0.x`
+releases, not just majors. This is enforced, not merely promised:
+`scripts/check-migration-guides.sh` fails CI when a `CHANGELOG.md` section
+declares a breaking change without a matching `docs/migrations/<version>.md`,
+or when a breaking entry does not link its guide (issue #1588). A release
+without an upgrade path is treated as a broken build.
+
+The guide is written against the
 [migration guide template](docs/migrations/TEMPLATE.md) and covers:
 
 1. The summary and scope of the breaking changes.
@@ -285,10 +292,15 @@ Every major release ships with a migration guide under
 4. Compiler-error cheat sheet — "if you see this error, do that".
 5. Dependency major bumps carried with the release.
 6. Link to the CHANGELOG section for the release.
+7. How to verify the upgrade landed, and the recorded guide-only upgrade
+   walk-through of an app scaffolded on the previous release.
 
-Draft migration guides are opened alongside the first breaking change that
-targets the next major; they are merged and polished across the prerelease
-cycle so that the `x.0.0` release ships with a complete guide on day one.
+Draft guides are opened alongside the *first* breaking change of a cycle, as
+[`docs/migrations/next.md`](docs/migrations/next.md), and grow with each
+subsequent breaking-change PR; the draft is renamed to `<version>.md` at
+release time, so the release ships with a complete guide on day one. See
+[`docs/migrations/README.md`](docs/migrations/README.md) for the process and
+the `**Breaking:**` changelog convention.
 
 ## CSV import/export (issue #808)
 

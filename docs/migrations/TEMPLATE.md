@@ -1,15 +1,23 @@
-# Migrating from Autumn `X.Y` to `(X+1).0`
+# Migrating from Autumn `X.Y` to `X.Z`
 
-> **Template.** Copy this file to `docs/migrations/<X.Y>-to-<X+1.0>.md`
-> when drafting the guide for the next major release. Replace every
-> `{placeholder}` with concrete content and delete sections that do not
-> apply. Link the new file from
-> [`docs/migrations/README.md`](README.md).
+> **Template.** Copy this file to `docs/migrations/next.md` with the first
+> breaking change that lands after a release; it is renamed to
+> `docs/migrations/<version>.md` when that release ships.
+>
+> **Delete this banner block in the copy** — and replace every `{placeholder}`
+> with concrete content. `scripts/check-migration-guides.sh` fails on both.
+>
+> Delete sections that do not apply, **except** these six, which the gate
+> requires and which must each have content under them:
+> *At a glance*, *Summary*, *Before you start*, *Breaking changes*,
+> *How to verify*, *Guide-only upgrade walkthrough*.
+>
+> Link the new file from [`docs/migrations/README.md`](README.md).
 
 ## At a glance
 
 - **Old version:** `autumn-web {X.Y.Z}`
-- **New version:** `autumn-web {(X+1).0.0}`
+- **New version:** `autumn-web {X.Z.0}`
 - **Expected upgrade effort:** {S / M / L — one paragraph of context}
 - **MSRV delta:** `{old MSRV}` → `{new MSRV}` ({reason, or "unchanged"})
 - **Carried dependency majors:** {e.g. `axum 0.8 → 0.9`, `diesel 2 → 3`,
@@ -138,6 +146,34 @@ For each major dependency bump carried with this release:
 - Call out any of their changes that leak through Autumn's public API.
 
 If no majors were carried, delete this section.
+
+## How to verify
+
+The reader's proof the upgrade landed. Keep it to concrete, checkable steps —
+commands with expected output, not "make sure everything works". Required by
+`scripts/check-migration-guides.sh`.
+
+1. `cargo check` — clean, with none of the errors in the cheat sheet above.
+2. `cargo test` — the suite is green on the new version.
+3. `autumn doctor --strict` — no findings.
+4. {one step per breaking change: the observable behaviour that proves the fix
+   was applied, e.g. "hit `/x` and confirm the response carries `Y`"}
+
+### Guide-only upgrade walkthrough
+
+Upgrade an app scaffolded with `autumn new` on the **previous** release using
+only this guide — no changelog, no source reading — and record the result here
+before publishing to crates.io. See
+[`docs/release-checklist.md`](../release-checklist.md), *Migration Guide Gate*.
+
+- **Status:** pending
+  {the value must *begin* with `performed YYYY-MM-DD` once the walk-through is
+  done, or `backfilled` for a guide written after its release shipped;
+  `pending` is accepted only while this file is still `next.md`}
+- **From → to:** `autumn-cli {X.Y.Z}` app upgraded to `autumn-web {X.Z.0}`
+- **Elapsed:** {minutes — the success metric is under 30}
+- **Gaps found and fixed in this guide:** {none, or what the walk-through
+  exposed}
 
 ## Troubleshooting
 

@@ -17,6 +17,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -329,7 +331,9 @@ pub fn coordinator_from_config(
 #[must_use]
 pub fn fixed_delay_tick_key(task_name: &str, delay: Duration, unix_elapsed: Duration) -> String {
     let interval = delay.as_nanos().max(1);
-    let bucket = unix_elapsed.as_nanos() / interval;
+    // `interval` is `.max(1)`, so the division is always defined; going through
+    // `checked_div` states that rather than relying on the reader to spot it.
+    let bucket = unix_elapsed.as_nanos().checked_div(interval).unwrap_or(0);
     format!("{task_name}:{bucket}")
 }
 

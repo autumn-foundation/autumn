@@ -139,7 +139,7 @@ impl MemorySearchBackend {
             let sequences = store.sequences.entry(index.clone()).or_default();
             let mut next = store.next_sequence;
             for id in ids {
-                next += 1;
+                next = next.saturating_add(1);
                 sequences.insert(*id, next);
             }
             store.next_sequence = next;
@@ -188,7 +188,7 @@ impl MemorySearchBackend {
                     {
                         continue;
                     }
-                    next += 1;
+                    next = next.saturating_add(1);
                     applied.push((document.id(), next));
                 }
                 for (id, sequence) in &applied {

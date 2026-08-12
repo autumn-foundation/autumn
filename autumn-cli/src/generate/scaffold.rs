@@ -817,6 +817,19 @@ fn plan_scaffold_with_options_impl(
         name: snake_name.clone(),
     });
 
+    // Parents this resource is currently nested under, discovered from the
+    // `// autumn:nested:<plural>` markers already on disk (issue #1323). On the
+    // GENERATE path this is always empty — the marker is written by the `Modify`
+    // this same run is about to plan — so it costs one directory scan and
+    // changes nothing. On the DESTROY path it is the ONLY evidence available
+    // when `--belongs-to` was not repeated on the command line, and it drives
+    // both the parent-side cleanup and the `main.rs` unmounting below.
+    let nested_parents = if options_with_key.api {
+        Vec::new()
+    } else {
+        super::nested::parents_carrying_child(project_root, &plural)
+    };
+
     // Route file under `src/routes/<plural>.rs`
     if !options_with_key.api {
         // The shared-layout preflight applies only to standard scaffolds, which
@@ -922,12 +935,10 @@ fn plan_scaffold_with_options_impl(
         // the flag is something the author typed once, days ago, and forgetting
         // it must not leave a `crate::routes::{plural}::children_section(…)`
         // call dangling in a parent whose child module this destroy just
-        // deleted — an uncompilable project. On the GENERATE path this finds
-        // nothing (the marker is written by the `Modify` above, which has not
-        // run yet), so it costs one directory scan and changes no output.
-        for parent_routes in super::nested::parents_carrying_child(project_root, &plural) {
+        // deleted — an uncompilable project.
+        for parent_routes in &nested_parents {
             plan.push_revert(Revert::NestedChildSection {
-                path: parent_routes,
+                path: parent_routes.clone(),
                 child_plural: plural.clone(),
             });
         }
@@ -1099,7 +1110,15 @@ fn plan_scaffold_with_options_impl(
         &validated_field_names,
         &sm_field_names,
         &rich_text_field_names,
-        nesting.is_some(),
+        // On the DESTROY path `--belongs-to` may not have been repeated on the
+        // command line, so `nesting` is `None` — but `main.rs` still mounts the
+        // two nested handlers this resource emitted, and a revert that removed
+        // the child's routes module while leaving those entries behind would
+        // leave the project uncompilable. The markers on disk are the same
+        // evidence the parent-side cleanup already keys off, so ask them too.
+        // On the generate path the marker is only written by the `Modify` above,
+        // which has not run yet, so this is exactly `nesting.is_some()` there.
+        nesting.is_some() || !nested_parents.is_empty(),
     );
     let mut mods = vec!["models", "schema", "repositories"];
     if !options_with_key.api {
@@ -6166,6 +6185,24 @@ async fn children_section_with(
     }})
 }}
 
+/// Confirm the parent {parent_snake} exists, so a request naming one that does
+/// not answers **404** rather than a plausible-looking empty list — and so a
+/// nested create fails as a not-found instead of surfacing the foreign-key
+/// constraint violation as a 500.
+///
+/// Only the routes that take the id from an untrusted URL call this; the
+/// parent's own `show` view already loaded the row before it renders the
+/// section, so it pays nothing.
+async fn require_{parent_snake}(db: &mut Db, {fk}: i64) -> AutumnResult<()> {{
+    {parent_plural}::table
+        .find({fk})
+        .select({parent_plural}::id)
+        .first::<i64>(&mut **db)
+        .await
+        .map_err(AutumnError::not_found)?;
+    Ok(())
+}}
+
 /// The standalone page wrapper around [`children_section_with`] — shared by
 /// `nested_index` and `nested_create`'s 422 re-render so both render the same
 /// document.
@@ -6183,6 +6220,7 @@ async fn nested_view(
     submit_token: Option<&SubmitToken>,
     submit_field: Option<&SubmitFormField>,
 ) -> AutumnResult<Markup> {{
+    require_{parent_snake}(db, {fk}).await?;
     let section = children_section_with(db, {fk}, page_req, changeset, state, session, csrf, csrf_field, submit_token, submit_field).await?;
     Ok({layout_fn}(&format!("{pascal_name}s for {parent_pascal} #{{}}", {fk}), {cp_nested}flash, html! {{
         h1 {{ "{pascal_name}s for {parent_pascal} #" ({fk}) }}
@@ -6240,6 +6278,7 @@ pub async fn nested_create(
         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, view).into_response());
     }}
     let new = into_new(changeset.data())?;
+    require_{parent_snake}(&mut db, *{fk}).await?;
 {insert_block}    flash.success("{pascal_name} created").await;
     Ok(autumn_web::Redirect::to(&crate::routes::{parent_plural}::paths::show(*{fk})).into_response())
 }}
@@ -19063,6 +19102,93 @@ exempt_paths = [
         );
         // The flat index still sorts.
         assert!(routes.contains(".sortable(\"body\")"), "{routes}");
+    }
+
+    #[test]
+    fn belongs_to_nested_routes_404_on_a_parent_that_does_not_exist() {
+        // A path id is untrusted. Without a probe, `GET /posts/999/comments`
+        // renders a plausible-looking empty list + form, and submitting that
+        // form surfaces the foreign-key violation as a 500 instead of a 404.
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains("async fn require_post(db: &mut Db, post_id: i64)"),
+            "missing the parent-existence probe:\n{routes}"
+        );
+        assert!(
+            routes.contains(".map_err(AutumnError::not_found)?"),
+            "the probe must 404, not 500:\n{routes}"
+        );
+        // Both untrusted-path entry points run it: the page wrapper (which
+        // backs `nested_index` AND the 422 re-render) and the create's insert.
+        let view = routes
+            .split("async fn nested_view(")
+            .nth(1)
+            .expect("nested_view helper");
+        assert!(view.contains("require_post(db, post_id).await?;"), "{view}");
+        let create = routes
+            .split("pub async fn nested_create(")
+            .nth(1)
+            .expect("nested_create handler");
+        let probe = create
+            .find("require_post(&mut db, *post_id).await?;")
+            .expect("nested_create must probe the parent");
+        let insert = create
+            .find("diesel::insert_into(comments::table)")
+            .expect("nested_create must insert");
+        assert!(
+            probe < insert,
+            "the probe must run BEFORE the insert:\n{create}"
+        );
+    }
+
+    #[test]
+    fn destroy_unmounts_nested_routes_even_without_the_belongs_to_flag() {
+        // `--belongs-to` is something the author typed once, days ago. Omitting
+        // it on `destroy` must not leave `main.rs` mounting handlers whose
+        // module this destroy just deleted — an uncompilable project.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project_with_scaffolded_parent();
+                nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+                let main_path = tmp.path().join("src/main.rs");
+                assert!(
+                    fs::read_to_string(&main_path)
+                        .unwrap()
+                        .contains("routes::comments::nested_index")
+                );
+
+                // Recompute the plan WITHOUT `--belongs-to`, exactly as a
+                // forgetful `autumn destroy scaffold Comment …` would.
+                let revert = plan_scaffold_with_options_for_revert(
+                    tmp.path(),
+                    "Comment",
+                    &["body:Text".into(), "post:references".into()],
+                    "20260428000000",
+                    &ScaffoldOptions::default(),
+                )
+                .unwrap();
+                revert
+                    .revert(Flags {
+                        force: true,
+                        ..Flags::default()
+                    })
+                    .unwrap();
+
+                let main = fs::read_to_string(&main_path).unwrap();
+                assert!(!main.contains("nested_index"), "{main}");
+                assert!(!main.contains("nested_create"), "{main}");
+                let parent = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+                assert!(!parent.contains("children_section"), "{parent}");
+                assert!(!parent.contains("autumn:nested"), "{parent}");
+            },
+        );
     }
 
     #[test]

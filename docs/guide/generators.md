@@ -230,7 +230,7 @@ On top of the usual flat CRUD you get:
 
 | Generated | What it does |
 | --- | --- |
-| `GET /posts/{post_id}/comments` | The child list for one parent, paginated by the same `PageRequest` extractor the flat index uses (`?page=N&size=M`). |
+| `GET /posts/{post_id}/comments` | The child list for one parent, paginated by the same `PageRequest` extractor the flat index uses (`?page=N&size=M`). A `post_id` that doesn't exist answers **404**, not an empty list. |
 | `POST /posts/{post_id}/comments` | A `#[secured]` create whose foreign key comes from the **path**. Invalid input re-renders at 422 with inline errors and preserved values; success redirects (PRG) to the parent's show page. |
 | `pub async fn children_section(…)` in `src/routes/comments.rs` | The child list (a `data_table`, each row linking to the child's own show view) plus the inline create form. Public on purpose — call it from any hand-written page too. |
 | An edit to `src/routes/posts.rs` | The parent's generated `show` view now renders that section. |
