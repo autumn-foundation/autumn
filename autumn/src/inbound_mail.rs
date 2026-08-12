@@ -870,8 +870,11 @@ fn subtle_eq(a: &[u8], b: &[u8]) -> bool {
 /// `"<support@company.com>"` → `"support@company.com"`
 /// `"support@company.com"` → `"support@company.com"` (unchanged)
 fn extract_addr_spec(addr: &str) -> String {
-    // The `>` is searched for *after* the first `<`, so `>bogus< <a@b.com>`
-    // still yields `a@b.com`.
+    // The `>` is searched for *after* the first `<`, so
+    // `"Support <support@company.com>"` yields `support@company.com`. A stray
+    // `>` *before* the first `<` is not stripped: `>bogus< <a@b.com>` anchors
+    // on the first `<` (after `bogus`) and yields `<a@b.com` — matching the
+    // pre-#1611 `find('<')`/relative-`find('>')` behavior exactly.
     if let Some((_, after_angle)) = addr.split_once('<')
         && let Some((inner, _)) = after_angle.split_once('>')
     {
@@ -1503,13 +1506,16 @@ fn mime_param(header_val: &str, name: &str) -> Option<String> {
 /// The longest MIME boundary RFC 2046 §5.1.1 permits.
 const MAX_BOUNDARY_LEN: usize = 70;
 
-/// Maximum `multipart/*` nesting depth accepted by [`extract_multipart_bodies`].
+/// Maximum `multipart/*` nesting depth recursed into by
+/// [`extract_multipart_bodies`]. The guard is `depth < MAX_MIME_DEPTH` with the
+/// top-level body at `depth == 0`, so containers at depths `0..=16` are parsed
+/// (17 `multipart/*` levels in total) and anything nested deeper is kept
+/// verbatim as an opaque attachment rather than being parsed — or dropped.
 ///
 /// Each level of nesting costs one stack frame but only ~55 bytes of request
 /// body, so without a cap an unauthenticated POST under the route's 50 MB
 /// `DefaultBodyLimit` could recurse deep enough to overflow the stack and abort
-/// the process (issue #1611). Beyond the cap a nested part is kept verbatim as
-/// an opaque attachment rather than being parsed — or dropped.
+/// the process (issue #1611).
 const MAX_MIME_DEPTH: usize = 16;
 
 /// Extract the MIME boundary parameter from a `Content-Type` header value.
@@ -1872,6 +1878,15 @@ fn parse_mailgun_form_data(
     content_type: &str,
 ) -> (HashMap<String, String>, Vec<Attachment>) {
     let Some(boundary) = extract_boundary(content_type) else {
+        // Without a usable boundary the form cannot be parsed at all; the
+        // caller then fails signature verification on the empty field map and
+        // answers 401. Name the real cause here so that outcome is diagnosable
+        // as a boundary problem, not a signing-key problem.
+        tracing::warn!(
+            %content_type,
+            "inbound_mail.mailgun: multipart/form-data boundary is missing, empty, or over 70 \
+             chars (RFC 2046 §5.1.1); body not parsed"
+        );
         return (HashMap::new(), Vec::new());
     };
     let delim_bytes = format!("--{boundary}").into_bytes();
