@@ -1774,6 +1774,15 @@ impl TestApp {
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
         #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
+        // Resolve the injected clock BEFORE the state literal so `started_at`
+        // is stamped on the same timeline the app will read time from. A sim
+        // installs a virtual clock here, and uptime has to start at that
+        // clock's origin rather than at real process time.
+        let clock: std::sync::Arc<dyn crate::time::ClockSource> = self
+            .clock
+            .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock));
+        let started_at = clock.monotonic();
+
         let mut state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
@@ -1810,7 +1819,7 @@ impl TestApp {
                 .expect("test shard pools should build from config"),
             profile: self.config.profile.clone(),
             role: self.config.role,
-            started_at: std::time::Instant::now(),
+            started_at,
             health_detailed: self.config.health.detailed,
             probes: probes.clone(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -1833,9 +1842,7 @@ impl TestApp {
                 .unwrap_or(self.config.security.forbidden_response),
             auth_session_key: self.config.auth.session_key.clone(),
             shared_cache: None,
-            clock: self
-                .clock
-                .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock)),
+            clock,
             entropy: self
                 .entropy
                 .unwrap_or_else(|| std::sync::Arc::new(crate::entropy::OsEntropy)),

@@ -2292,7 +2292,41 @@ pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
     client.enqueue(name, payload).await
 }
 
-/// Convert a relative delay into an absolute due instant.
+/// The instant "now" resolves to for enqueue-side due-time math, read through
+/// the **injected** clock of the running job runtime.
+///
+/// The free `enqueue_*` functions take no state, so they reach the clock the
+/// same way they reach the backend: through the process-global [`JobClient`]
+/// installed at runtime start. That client carries the app's
+/// [`crate::time::ClockSource`], so under a `#[sim_test]` this is the virtual
+/// instant — which is what makes a delayed enqueue actually come due when
+/// `Sim::advance` crosses its delay.
+///
+/// Reading `Utc::now()` here instead would be a silent determinism hole rather
+/// than a cosmetic one: the runtime filters due-at against its *injected* clock
+/// (`due_at.filter(|due| *due > self.clock.now())`), so a real-time due instant
+/// sits years beyond the sim epoch and the job never becomes due at all.
+///
+/// Falls back to real time only when no runtime is installed, where there is no
+/// injected clock to read and no job to schedule.
+fn job_now() -> chrono::DateTime<chrono::Utc> {
+    global_job_client().map_or_else(
+        || {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "no job runtime is installed, so there is no injected clock to read; \
+                          this is the documented real-time fallback"
+            )]
+            {
+                chrono::Utc::now()
+            }
+        },
+        |client| client.clock.now(),
+    )
+}
+
+/// Convert a relative delay into an absolute due instant, measured from the
+/// injected clock (see [`job_now`]).
 ///
 /// Saturates to `DateTime::MAX` on overflow (practically impossible).
 fn delay_to_when(delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
@@ -2301,7 +2335,7 @@ fn delay_to_when(delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
     let Ok(delta) = chrono::TimeDelta::from_std(delay) else {
         return chrono::DateTime::<chrono::Utc>::MAX_UTC;
     };
-    chrono::Utc::now()
+    job_now()
         .checked_add_signed(delta)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
 }

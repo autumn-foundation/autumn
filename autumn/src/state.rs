@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::Cache;
-use crate::time::{ClockSource, SystemClock};
+use crate::time::{ClockSource, MonotonicInstant, SystemClock};
 
 /// Newtype wrapper used to store the global cache in the extension map so that
 /// `set_cache` (called from startup hooks) is visible to all `AppState` clones.
@@ -88,8 +88,15 @@ pub struct AppState {
     /// without re-reading `AUTUMN_ROLE` by hand.
     pub(crate) role: crate::config::ProcessRole,
 
-    /// When the application started. Used for uptime calculation.
-    pub(crate) started_at: std::time::Instant,
+    /// When the application started, on the injected clock's monotonic
+    /// timeline. Used for uptime calculation.
+    ///
+    /// Read through [`crate::time::ClockSource::monotonic`] rather than a raw
+    /// [`std::time::Instant`] so uptime is virtual (and reproducible) under a
+    /// [`#[sim_test]`](crate::sim_test). Re-stamped by
+    /// [`with_clock`](Self::with_clock) so a clock installed after construction
+    /// owns the origin uptime is measured from.
+    pub(crate) started_at: MonotonicInstant,
 
     /// Whether the health endpoint should include detailed info.
     pub(crate) health_detailed: bool,
@@ -501,10 +508,31 @@ impl AppState {
     }
 
     /// Replace the clock (builder / test helper).
+    ///
+    /// Also re-stamps [`started_at`](Self::started_at) from the new clock, so
+    /// [`uptime`](Self::uptime) is measured on the timeline that is actually
+    /// installed. Without this, a state built with the default [`SystemClock`]
+    /// and then handed a virtual clock would compare a *virtual* `now` against a
+    /// *real* origin and report a nonsense uptime.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
+        self.started_at = clock.monotonic();
         self.clock = clock;
         self
+    }
+
+    /// Returns the current instant on the injected clock's monotonic timeline —
+    /// the deterministic replacement for [`std::time::Instant::now`] when
+    /// measuring how long something took.
+    ///
+    /// Framework internals and app code alike should bracket work with two of
+    /// these and take the difference via
+    /// [`MonotonicInstant::saturating_duration_since`]. Handlers can reach the
+    /// same value through the [`crate::time::Clock`] extractor's
+    /// [`monotonic`](crate::time::Clock::monotonic).
+    #[must_use]
+    pub fn monotonic(&self) -> MonotonicInstant {
+        self.clock.monotonic()
     }
 
     /// Clone the shared clock handle, e.g. to thread into a subsystem that needs
@@ -658,15 +686,20 @@ impl AppState {
     }
 
     /// Returns how long the application has been running.
+    ///
+    /// Measured on the injected clock's monotonic timeline, so it is immune to
+    /// wall-clock jumps in production and moves with
+    /// [`Sim::advance`](crate::sim::Sim::advance) under a
+    /// [`#[sim_test]`](crate::sim_test).
     #[must_use]
     pub fn uptime(&self) -> std::time::Duration {
-        self.started_at.elapsed()
+        self.monotonic().saturating_duration_since(self.started_at)
     }
 
     /// Format uptime as a human-readable string (e.g., "2h 15m").
     #[must_use]
     pub fn uptime_display(&self) -> String {
-        let secs = self.started_at.elapsed().as_secs();
+        let secs = self.uptime().as_secs();
         if secs < 60 {
             format!("{secs}s")
         } else if secs < 3600 {
@@ -756,7 +789,7 @@ impl AppState {
             shards: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: probe::ProbeState::ready_for_test(),
             metrics: middleware::MetricsCollector::new(),
