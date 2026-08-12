@@ -7715,3 +7715,53 @@ fn migration_guide_gate_treats_a_comment_containing_dashes_as_a_comment() {
         );
     }
 }
+
+// --- Review round 65: links do not span a paragraph boundary --------------
+
+#[test]
+fn migration_guide_gate_rejects_a_link_split_across_a_blank_line() {
+    // An inline link cannot span a paragraph break: the reference
+    // implementation renders two paragraphs and no anchor. Joining the item's
+    // lines with a space erased the boundary and made the halves look like one
+    // working link.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. [guide](docs/migrations/0.7.0.md\n\n  )\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a link cannot be assembled across a paragraph break",
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_a_link_wrapped_within_a_paragraph() {
+    // The counterpart, and the reason the fix is scoped to blank lines: a
+    // label wrapped onto the next line of the *same* paragraph is one link,
+    // and changelogs wrap like this constantly.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration\n  \
+         guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a wrapped label is still one link\n{}",
+        gate_report(&output),
+    );
+}

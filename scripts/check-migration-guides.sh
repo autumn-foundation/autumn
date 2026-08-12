@@ -750,7 +750,7 @@ function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
         p += 2
         continue
       }
-      if (ch == " " || ch == "\t") break
+      if (ch == " " || ch == "\t" || ch == "\n") break
       if (ch == ")") {
         if (depth == 0) break
         depth--
@@ -872,6 +872,8 @@ function links_to(text, path,   at, i, ch, start, slashes, depth, open_at, dest)
     open_at = 0
     for (i = at - 1; i >= 1; i--) {
       ch = substr(text, i, 1)
+      # A label does not reach back past a paragraph boundary either.
+      if (ch == "\n") break
       if (ch != "[" && ch != "]") continue
       slashes = 0
       while (i - slashes - 1 >= 1 && substr(text, i - slashes - 1, 1) == "\\") slashes++
@@ -1630,7 +1632,10 @@ findings="$(
         # It still *defines* — the collection pass is separate — so a reference
         # the entry actually uses continues to resolve.
         if (is_link_definition(visible) || is_definition_opener(visible)) next
-        entry_visible = entry_visible " " visible
+        # A blank line ends the paragraph. Joining across it with a space
+        # erased the boundary, so a `[label](dest` and a `)` in two different
+        # paragraphs assembled into one link that renders as neither.
+        entry_visible = entry_visible ((visible ~ /[^[:space:]]/) ? " " : "\n") visible
       }
     }
     # CommonMark lazy continuation: while the item paragraph is still open, an
