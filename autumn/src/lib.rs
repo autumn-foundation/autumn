@@ -1631,6 +1631,8 @@ pub mod test;
 /// Dependency-free HTML parser + CSS-selector matcher backing the structural
 /// HTML assertions on [`test::TestResponse`].
 mod test_html;
+/// Saturating time/duration arithmetic shared by the request-path modules.
+pub(crate) mod time_math;
 pub use config::ProcessRole;
 pub use state::AppState;
 

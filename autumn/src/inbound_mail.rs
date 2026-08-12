@@ -48,6 +48,24 @@
 //!     .await;
 //! ```
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -115,24 +133,27 @@ mod sns_verify {
 
     fn read_der_length(data: &[u8], pos: &mut usize) -> Option<usize> {
         let first = *data.get(*pos)?;
-        *pos += 1;
+        *pos = pos.checked_add(1)?;
         if first & 0x80 == 0 {
-            return Some(first as usize);
+            return Some(usize::from(first));
         }
-        let n = (first & 0x7f) as usize;
+        let n = usize::from(first & 0x7f);
         if n == 0 || n > 4 {
             return None;
         }
         let mut len = 0usize;
         for _ in 0..n {
-            len = (len << 8) | (*data.get(*pos)? as usize);
-            *pos += 1;
+            // `n <= 4`, so the accumulated length never exceeds 32 bits.
+            len = len
+                .checked_shl(8)?
+                .checked_add(usize::from(*data.get(*pos)?))?;
+            *pos = pos.checked_add(1)?;
         }
         Some(len)
     }
 
     fn skip_tlv(data: &[u8], pos: &mut usize) -> Option<()> {
-        *pos += 1; // tag
+        *pos = pos.checked_add(1)?; // tag
         let len = read_der_length(data, pos)?;
         *pos = pos.checked_add(len).filter(|&e| e <= data.len())?;
         Some(())
@@ -142,7 +163,7 @@ mod sns_verify {
         if *data.get(*pos)? != 0x30 {
             return None;
         }
-        *pos += 1;
+        *pos = pos.checked_add(1)?;
         let len = read_der_length(data, pos)?;
         let content_start = *pos;
         *pos = content_start
@@ -151,22 +172,16 @@ mod sns_verify {
         Some((content_start, len))
     }
 
-    /// Extract the DER-encoded SubjectPublicKeyInfo from a DER X.509 certificate.
+    /// Extract the DER-encoded `SubjectPublicKeyInfo` from a DER X.509 certificate.
     pub(super) fn extract_spki_from_der(cert_der: &[u8]) -> Option<Vec<u8>> {
-        let mut pos = 0;
-        // Certificate SEQUENCE
-        let (_, _) = enter_sequence(cert_der, &mut pos)?;
-        // Restart pos at TBSCertificate
-        let mut pos = 0;
-        skip_tlv(cert_der, &mut pos)?; // skip outer tag+len, get to TBS content
-        // Re-enter properly: outer Certificate SEQUENCE → TBSCertificate SEQUENCE
+        // Outer Certificate SEQUENCE → TBSCertificate SEQUENCE.
         let mut outer = 0usize;
         let (cert_start, cert_len) = enter_sequence(cert_der, &mut outer)?;
-        let tbs_data = &cert_der[cert_start..cert_start + cert_len];
+        let tbs_data = cert_der.get(cert_start..cert_start.checked_add(cert_len)?)?;
 
         let mut tbs = 0usize;
         let (tbs_start, tbs_len) = enter_sequence(tbs_data, &mut tbs)?;
-        let tbs_content = &tbs_data[tbs_start..tbs_start + tbs_len];
+        let tbs_content = tbs_data.get(tbs_start..tbs_start.checked_add(tbs_len)?)?;
 
         let mut p = 0usize;
         // Skip version [0] EXPLICIT (tag 0xa0) if present.
@@ -182,18 +197,17 @@ mod sns_verify {
         // subjectPublicKeyInfo starts here; capture the full TLV.
         let spki_start = p;
         skip_tlv(tbs_content, &mut p)?;
-        Some(tbs_content[spki_start..p].to_vec())
+        Some(tbs_content.get(spki_start..p)?.to_vec())
     }
 
     /// Decode a PEM certificate (first CERTIFICATE block) to DER bytes.
     pub(super) fn pem_to_der(pem: &str) -> Option<Vec<u8>> {
-        let start = pem.find("-----BEGIN CERTIFICATE-----")?;
-        let after = &pem[start + "-----BEGIN CERTIFICATE-----".len()..];
-        let end = after.find("-----END CERTIFICATE-----")?;
-        let b64: String = after[..end]
-            .chars()
-            .filter(|c| !c.is_ascii_whitespace())
-            .collect();
+        const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+        const END: &str = "-----END CERTIFICATE-----";
+
+        let (_, after_begin) = pem.split_once(BEGIN)?;
+        let (body, _) = after_begin.split_once(END)?;
+        let b64: String = body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
         base64::engine::general_purpose::STANDARD.decode(b64).ok()
     }
 
@@ -208,37 +222,35 @@ mod sns_verify {
         use rsa::pkcs8::DecodePublicKey as _;
         use sha2::Digest as _;
 
+        // SHA-1 DigestInfo prefix: SEQUENCE { SEQUENCE { OID sha1, NULL }, OCTET STRING }
+        const SHA1_DI_PREFIX: &[u8] = &[
+            0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04,
+            0x14,
+        ];
+
         let public_key = rsa::RsaPublicKey::from_public_key_der(spki_der).map_err(|_| ())?;
-        match sig_version {
-            "2" => {
-                let hash = sha2::Sha256::digest(message);
-                public_key
-                    .verify(Pkcs1v15Sign::new::<sha2::Sha256>(), &hash, sig)
-                    .map_err(|_| ())
-            }
-            _ => {
-                // SignatureVersion 1 uses SHA-1.
-                // sha1 0.10 uses const-oid 0.10.x while rsa 0.9 uses const-oid 0.9.x,
-                // so Pkcs1v15Sign::new::<sha1::Sha1>() fails to compile.  Work around
-                // the version split by using new_unprefixed() and prepending the
-                // DigestInfo DER structure (RFC 3447 §9.2) manually.
-                use sha1::Digest as _;
-                let hash = sha1::Sha1::digest(message);
-                // SHA-1 DigestInfo prefix: SEQUENCE { SEQUENCE { OID sha1, NULL }, OCTET STRING }
-                const SHA1_DI_PREFIX: &[u8] = &[
-                    0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00,
-                    0x04, 0x14,
-                ];
-                let mut digest_info = SHA1_DI_PREFIX.to_vec();
-                digest_info.extend_from_slice(&hash);
-                public_key
-                    .verify(Pkcs1v15Sign::new_unprefixed(), &digest_info, sig)
-                    .map_err(|_| ())
-            }
+        if sig_version == "2" {
+            let hash = sha2::Sha256::digest(message);
+            public_key
+                .verify(Pkcs1v15Sign::new::<sha2::Sha256>(), &hash, sig)
+                .map_err(|_| ())
+        } else {
+            // SignatureVersion 1 uses SHA-1.
+            // sha1 0.10 uses const-oid 0.10.x while rsa 0.9 uses const-oid 0.9.x,
+            // so Pkcs1v15Sign::new::<sha1::Sha1>() fails to compile.  Work around
+            // the version split by using new_unprefixed() and prepending the
+            // DigestInfo DER structure (RFC 3447 §9.2) manually.
+            use sha1::Digest as _;
+            let hash = sha1::Sha1::digest(message);
+            let mut digest_info = SHA1_DI_PREFIX.to_vec();
+            digest_info.extend_from_slice(&hash);
+            public_key
+                .verify(Pkcs1v15Sign::new_unprefixed(), &digest_info, sig)
+                .map_err(|_| ())
         }
     }
 
-    /// Verify the SNS notification signature and optional TopicArn binding.
+    /// Verify the SNS notification signature and optional `TopicArn` binding.
     ///
     /// `expected_topic_arn` — when `Some`, the notification's `TopicArn` must
     /// match exactly; this prevents any other AWS account's SNS topic from
@@ -308,7 +320,7 @@ mod sns_verify {
             StatusCode::UNAUTHORIZED
         })?;
         verify_rsa_signature(&spki, canonical.as_bytes(), &sig_bytes, sig_version).map_err(
-            |_| {
+            |()| {
                 tracing::warn!("inbound_mail.ses: SNS signature verification failed");
                 StatusCode::UNAUTHORIZED
             },
@@ -348,22 +360,12 @@ pub static SKIP_SNS_VERIFICATION: std::sync::atomic::AtomicBool =
 ///
 /// Mailgun signs webhooks as `HMAC-SHA256(timestamp || token, signing_key)`.
 /// Returns a lowercase hex string (64 characters).
-///
-/// # Panics
-///
-/// Panics if `signing_key` cannot be used to initialize the HMAC (which the
-/// underlying library guarantees never happens for any key size).
 #[must_use]
 pub fn compute_mailgun_signature(timestamp: &str, token: &str, signing_key: &str) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac =
-        HmacSha256::new_from_slice(signing_key.as_bytes()).expect("HMAC can accept any key size");
-    mac.update(timestamp.as_bytes());
-    mac.update(token.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
+    let mut message = Vec::with_capacity(timestamp.len().saturating_add(token.len()));
+    message.extend_from_slice(timestamp.as_bytes());
+    message.extend_from_slice(token.as_bytes());
+    crate::security::config::hmac_sha256_hex(signing_key.as_bytes(), &message)
 }
 
 // ── Core email type ───────────────────────────────────────────────────────────
@@ -683,13 +685,18 @@ impl RecipientPattern {
     }
 }
 
+/// Split an address into `(local-part, domain)` at the **last** `@`.
+///
+/// The last `@` — not the first — is load bearing: a quoted local part may
+/// legally contain one (`"x@y"@example.com`).
 fn split_address(addr: &str) -> Option<(&str, &str)> {
-    let at = addr.rfind('@')?;
-    Some((&addr[..at], &addr[at + 1..]))
+    addr.rsplit_once('@')
 }
 
+/// The local part of an address (everything before the **last** `@`), or the
+/// whole string when there is no `@`.
 fn local_part(addr: &str) -> &str {
-    addr.rfind('@').map_or(addr, |at| &addr[..at])
+    addr.rsplit_once('@').map_or(addr, |(local, _)| local)
 }
 
 // ── Handler types ─────────────────────────────────────────────────────────────
@@ -804,7 +811,7 @@ impl InboundMailRouter {
             .spam_report
             .as_ref()
             .and_then(|r| r.verdict.as_deref())
-            .map_or(false, |v| v.eq_ignore_ascii_case("yes"))
+            .is_some_and(|v| v.eq_ignore_ascii_case("yes"))
             && let Some(handler) = self.spam_handler
         {
             return handler(email).await;
@@ -863,10 +870,12 @@ fn subtle_eq(a: &[u8], b: &[u8]) -> bool {
 /// `"<support@company.com>"` → `"support@company.com"`
 /// `"support@company.com"` → `"support@company.com"` (unchanged)
 fn extract_addr_spec(addr: &str) -> String {
-    if let Some(start) = addr.find('<')
-        && let Some(rel_end) = addr[start + 1..].find('>')
+    // The `>` is searched for *after* the first `<`, so `>bogus< <a@b.com>`
+    // still yields `a@b.com`.
+    if let Some((_, after_angle)) = addr.split_once('<')
+        && let Some((inner, _)) = after_angle.split_once('>')
     {
-        return addr[start + 1..start + 1 + rel_end].trim().to_string();
+        return inner.trim().to_string();
     }
     addr.trim().to_string()
 }
@@ -949,47 +958,14 @@ pub(crate) fn parse_mailgun(
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty());
     let is_bounce = bounced_address.is_some();
-    let final_headers = headers;
-
-    let spam_score = form
-        .get("X-Mailgun-Spam-Score")
-        .or_else(|| form.get("x-mailgun-spam-score"))
-        .and_then(|s| s.parse::<f64>().ok());
-    let spam_verdict = form
-        .get("X-Mailgun-Sflag")
-        .or_else(|| form.get("x-mailgun-sflag"))
-        .cloned();
-    let spam_report = if spam_score.is_some() || spam_verdict.is_some() {
-        Some(SpamReport {
-            score: spam_score,
-            verdict: spam_verdict,
-        })
-    } else {
-        None
-    };
 
     // Use actual file parts when available (multipart/form-data delivery); fall back
     // to metadata-only attachment stubs for URL-encoded deliveries where Mailgun
     // includes only attachment-count / attachment-{n} fields.
-    let attachments = if !file_parts.is_empty() {
-        file_parts
+    let attachments = if file_parts.is_empty() {
+        mailgun_attachment_stubs(form)
     } else {
-        let attachment_count: usize = form
-            .get("attachment-count")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-            .min(100);
-        let mut metadata = Vec::new();
-        for i in 1..=attachment_count {
-            if let Some(name) = form.get(&format!("attachment-{i}")) {
-                metadata.push(Attachment {
-                    filename: Some(name.clone()),
-                    content_type: "application/octet-stream".to_string(),
-                    data: Bytes::new(),
-                });
-            }
-        }
-        metadata
+        file_parts
     };
 
     Ok(InboundEmail {
@@ -999,9 +975,9 @@ pub(crate) fn parse_mailgun(
         subject,
         text_body,
         html_body,
-        headers: final_headers,
+        headers,
         attachments,
-        spam_report,
+        spam_report: mailgun_spam_report(form),
         raw: form
             .get("body-mime")
             .map(|s| Bytes::from(s.as_bytes().to_vec()))
@@ -1017,6 +993,37 @@ pub(crate) fn parse_mailgun(
     })
 }
 
+/// Build the [`SpamReport`] from Mailgun's spam form fields, if any are present.
+fn mailgun_spam_report(form: &HashMap<String, String>) -> Option<SpamReport> {
+    let score = form
+        .get("X-Mailgun-Spam-Score")
+        .or_else(|| form.get("x-mailgun-spam-score"))
+        .and_then(|s| s.parse::<f64>().ok());
+    let verdict = form
+        .get("X-Mailgun-Sflag")
+        .or_else(|| form.get("x-mailgun-sflag"))
+        .cloned();
+    (score.is_some() || verdict.is_some()).then(|| SpamReport { score, verdict })
+}
+
+/// Metadata-only attachment stubs for URL-encoded Mailgun deliveries, which
+/// carry only `attachment-count` / `attachment-{n}` fields (no bytes).
+fn mailgun_attachment_stubs(form: &HashMap<String, String>) -> Vec<Attachment> {
+    let attachment_count: usize = form
+        .get("attachment-count")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+        .min(100);
+    (1..=attachment_count)
+        .filter_map(|i| form.get(&format!("attachment-{i}")))
+        .map(|name| Attachment {
+            filename: Some(name.clone()),
+            content_type: "application/octet-stream".to_string(),
+            data: Bytes::new(),
+        })
+        .collect()
+}
+
 fn parse_mailgun_headers(json: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if json.is_empty() {
@@ -1026,7 +1033,10 @@ fn parse_mailgun_headers(json: &str) -> HashMap<String, String> {
         for item in arr {
             if let serde_json::Value::Array(pair) = item
                 && pair.len() == 2
-                && let (Some(name), Some(value)) = (pair[0].as_str(), pair[1].as_str())
+                && let (Some(name), Some(value)) = (
+                    pair.first().and_then(serde_json::Value::as_str),
+                    pair.get(1).and_then(serde_json::Value::as_str),
+                )
             {
                 map.insert(name.to_ascii_lowercase(), value.to_string());
             }
@@ -1175,58 +1185,30 @@ pub fn __fuzz_parse_address_list(value: &str) {
     let _ = parse_address_list(value);
 }
 
+/// Fuzzing seam: parse a Mailgun `multipart/form-data` webhook body, exercising
+/// the boundary splitter and the quote-aware `Content-Disposition` parser.
+#[cfg(fuzzing)]
+pub fn __fuzz_parse_mailgun_form_data(body: &[u8], content_type: &str) {
+    let _ = parse_mailgun_form_data(body, content_type);
+}
+
 /// Minimal RFC 5322 parser.
 ///
 /// Handles folded headers, plain-text and HTML bodies (single-part only).
 /// Multi-part MIME bodies are accepted but only the first part is extracted.
 fn parse_rfc5322(raw: Bytes) -> InboundEmail {
     // Split at the byte level so body bytes are preserved exactly for binary attachments.
-    let (header_bytes, body_bytes): (&[u8], &[u8]) = find_subslice(&raw, b"\r\n\r\n")
-        .map(|p| (&raw[..p], &raw[p + 4..]))
-        .or_else(|| find_subslice(&raw, b"\n\n").map(|p| (&raw[..p], &raw[p + 2..])))
-        .unwrap_or((raw.as_ref(), &[]));
+    let (header_bytes, body_bytes): (&[u8], &[u8]) =
+        split_mime_headers(raw.as_ref()).unwrap_or_else(|| (raw.as_ref(), &[]));
     let header_block = String::from_utf8_lossy(header_bytes);
 
-    let mut from = String::new();
-    let mut to = Vec::new();
-    let mut cc = Vec::new();
-    let mut subject = String::new();
-    let mut parsed_headers: HashMap<String, String> = HashMap::new();
-
-    let mut cur_name = String::new();
-    let mut cur_value = String::new();
-
-    for line in header_block.lines() {
-        if line.starts_with(' ') || line.starts_with('\t') {
-            cur_value.push(' ');
-            cur_value.push_str(line.trim());
-        } else if let Some(colon) = line.find(':') {
-            if !cur_name.is_empty() {
-                apply_header(
-                    &mut parsed_headers,
-                    &mut from,
-                    &mut to,
-                    &mut cc,
-                    &mut subject,
-                    &cur_name,
-                    &cur_value,
-                );
-            }
-            cur_name = line[..colon].trim().to_ascii_lowercase();
-            cur_value = line[colon + 1..].trim().to_string();
-        }
-    }
-    if !cur_name.is_empty() {
-        apply_header(
-            &mut parsed_headers,
-            &mut from,
-            &mut to,
-            &mut cc,
-            &mut subject,
-            &cur_name,
-            &cur_value,
-        );
-    }
+    let ParsedHeaders {
+        from,
+        to,
+        cc,
+        subject,
+        headers: parsed_headers,
+    } = parse_header_block(&header_block);
 
     let content_type = parsed_headers
         .get("content-type")
@@ -1240,68 +1222,20 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
     // but pass the original `content_type` value to boundary extraction so that
     // case-sensitive boundary parameter values are preserved.
     let ct_lower = content_type.to_ascii_lowercase();
-    let (text_body, html_body, attachments) = if body_bytes.iter().all(|b| b.is_ascii_whitespace())
-    {
+    let (text_body, html_body, attachments) = if body_bytes.iter().all(u8::is_ascii_whitespace) {
         (None, None, Vec::new())
     } else if ct_lower.starts_with("multipart/") {
         // Pass raw bytes so binary attachment parts are not corrupted.
         extract_multipart_bodies(body_bytes, &content_type)
     } else {
-        let disposition = parsed_headers
-            .get("content-disposition")
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        let is_attachment = disposition.starts_with("attachment")
-            || (!ct_lower.is_empty()
-                && !ct_lower.starts_with("text/")
-                && !ct_lower.starts_with("message/"));
-        if is_attachment {
-            let filename = parsed_headers
+        extract_single_part_body(
+            body_bytes,
+            &ct_lower,
+            &cte,
+            parsed_headers
                 .get("content-disposition")
-                .and_then(|d| mime_param(d, "filename"));
-            let ct_only = ct_lower
-                .split(';')
-                .next()
-                .map_or("application/octet-stream", str::trim)
-                .to_string();
-            let data = if cte == "base64" {
-                let stripped: String = String::from_utf8_lossy(body_bytes)
-                    .chars()
-                    .filter(|c| !c.is_ascii_whitespace())
-                    .collect();
-                base64::engine::general_purpose::STANDARD
-                    .decode(stripped.as_bytes())
-                    .map_or_else(|_| Bytes::copy_from_slice(body_bytes), Bytes::from)
-            } else if cte == "quoted-printable" {
-                Bytes::from(decode_quoted_printable_bytes(body_bytes))
-            } else {
-                Bytes::copy_from_slice(body_bytes)
-            };
-            (
-                None,
-                None,
-                vec![Attachment {
-                    filename,
-                    content_type: ct_only,
-                    data,
-                }],
-            )
-        } else {
-            let body_str = String::from_utf8_lossy(body_bytes).into_owned();
-            if ct_lower.contains("text/html") {
-                (
-                    None,
-                    Some(decode_transfer_encoding(&body_str, &cte)),
-                    Vec::new(),
-                )
-            } else {
-                (
-                    Some(decode_transfer_encoding(&body_str, &cte)),
-                    None,
-                    Vec::new(),
-                )
-            }
-        }
+                .map(String::as_str),
+        )
     };
 
     InboundEmail {
@@ -1319,6 +1253,111 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
         is_bounce: false,
         bounced_address: None,
         complained_address: None,
+    }
+}
+
+/// The distinguished RFC 5322 headers plus the full header map.
+struct ParsedHeaders {
+    from: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    subject: String,
+    headers: HashMap<String, String>,
+}
+
+/// Parse an RFC 5322 header block, joining folded continuation lines.
+fn parse_header_block(header_block: &str) -> ParsedHeaders {
+    let mut parsed = ParsedHeaders {
+        from: String::new(),
+        to: Vec::new(),
+        cc: Vec::new(),
+        subject: String::new(),
+        headers: HashMap::new(),
+    };
+    let mut cur_name = String::new();
+    let mut cur_value = String::new();
+
+    for line in header_block.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            cur_value.push(' ');
+            cur_value.push_str(line.trim());
+        } else if let Some((name, value)) = line.split_once(':') {
+            if !cur_name.is_empty() {
+                apply_header(&mut parsed, &cur_name, &cur_value);
+            }
+            cur_name = name.trim().to_ascii_lowercase();
+            cur_value = value.trim().to_string();
+        }
+    }
+    if !cur_name.is_empty() {
+        apply_header(&mut parsed, &cur_name, &cur_value);
+    }
+    parsed
+}
+
+/// Classify a non-`multipart` body as an attachment, an HTML body, or text.
+fn extract_single_part_body(
+    body_bytes: &[u8],
+    ct_lower: &str,
+    cte: &str,
+    disposition: Option<&str>,
+) -> (Option<String>, Option<String>, Vec<Attachment>) {
+    let disposition_lower = disposition.unwrap_or_default().to_ascii_lowercase();
+    let is_attachment = disposition_lower.starts_with("attachment")
+        || (!ct_lower.is_empty()
+            && !ct_lower.starts_with("text/")
+            && !ct_lower.starts_with("message/"));
+
+    if is_attachment {
+        let filename = disposition.and_then(|d| mime_param(d, "filename"));
+        let content_type = mime_type_only(ct_lower, "application/octet-stream");
+        return (
+            None,
+            None,
+            vec![Attachment {
+                filename,
+                content_type,
+                data: decode_part_bytes(body_bytes, cte),
+            }],
+        );
+    }
+
+    let body_str = String::from_utf8_lossy(body_bytes).into_owned();
+    let decoded = decode_transfer_encoding(&body_str, cte);
+    if ct_lower.contains("text/html") {
+        (None, Some(decoded), Vec::new())
+    } else {
+        (Some(decoded), None, Vec::new())
+    }
+}
+
+/// The bare `type/subtype` of a `Content-Type` value, without its parameters.
+fn mime_type_only(content_type: &str, fallback: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .map_or(fallback, str::trim)
+        .to_string()
+}
+
+/// Decode a MIME part body to raw bytes per its `Content-Transfer-Encoding`.
+///
+/// Unlike [`decode_transfer_encoding`] this never round-trips through `String`,
+/// so binary attachments survive byte-exactly.
+fn decode_part_bytes(body: &[u8], cte: &str) -> Bytes {
+    match cte {
+        "base64" => {
+            // base64 is ASCII, so the lossy string round-trip cannot corrupt it.
+            let stripped: String = String::from_utf8_lossy(body)
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(stripped.as_bytes())
+                .map_or_else(|_| Bytes::copy_from_slice(body), Bytes::from)
+        }
+        "quoted-printable" => Bytes::from(decode_quoted_printable_bytes(body)),
+        _ => Bytes::copy_from_slice(body),
     }
 }
 
@@ -1347,35 +1386,40 @@ fn decode_transfer_encoding(body: &str, cte: &str) -> String {
 /// bodies the `Vec<u8>` is used directly so no UTF-8 lossy replacement occurs.
 fn decode_quoted_printable_bytes(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        if input[i] == b'=' {
-            if i + 1 < input.len() && (input[i + 1] == b'\n' || input[i + 1] == b'\r') {
-                // Soft line break: `=\n` or `=\r\n`
-                i += 1;
-                if i + 1 < input.len() && input[i] == b'\r' && input[i + 1] == b'\n' {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            } else if i + 2 < input.len()
-                && input[i + 1].is_ascii_hexdigit()
-                && input[i + 2].is_ascii_hexdigit()
-            {
-                let hi = (input[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
-                let lo = (input[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
-                out.push((hi << 4) | lo);
-                i += 3;
-            } else {
-                out.push(b'=');
-                i += 1;
-            }
+    let mut rest = input;
+    while let Some((&first, tail)) = rest.split_first() {
+        if first != b'=' {
+            out.push(first);
+            rest = tail;
+        } else if let [b'\r', b'\n', more @ ..] = tail {
+            rest = more; // soft line break `=\r\n`
+        } else if let [b'\r' | b'\n', more @ ..] = tail {
+            rest = more; // soft line break `=\n`, or a lone `=\r`
+        } else if let [hi, lo, more @ ..] = tail
+            && let Some(byte) = hex_pair_to_byte(*hi, *lo)
+        {
+            out.push(byte);
+            rest = more;
         } else {
-            out.push(input[i]);
-            i += 1;
+            // Literal `=`: at end of input, or not followed by two hex digits.
+            out.push(b'=');
+            rest = tail;
         }
     }
     out
+}
+
+/// Value of one ASCII hex digit (`0..=15`), or `None` if `b` is not hex.
+fn hex_nibble(b: u8) -> Option<u8> {
+    u8::try_from(char::from(b).to_digit(16)?).ok()
+}
+
+/// Combine two ASCII hex digits into the byte they encode.
+fn hex_pair_to_byte(hi: u8, lo: u8) -> Option<u8> {
+    // `hi` is at most 15, so the multiply and add can never overflow.
+    hex_nibble(hi)?
+        .checked_mul(16)?
+        .checked_add(hex_nibble(lo)?)
 }
 
 /// Decode a quoted-printable encoded string per RFC 2045.
@@ -1392,73 +1436,95 @@ fn decode_quoted_printable(input: &str) -> String {
 /// correctly handling quoted strings so that a semicolon inside a quoted
 /// filename (e.g. `filename="Q1;final.pdf"`) is not treated as a separator.
 fn mime_param(header_val: &str, name: &str) -> Option<String> {
-    let bytes = header_val.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    while i < len {
-        // Skip whitespace / leading semicolon between parameters.
-        while i < len && (bytes[i] == b';' || bytes[i] == b' ' || bytes[i] == b'\t') {
-            i += 1;
-        }
-        if i >= len {
-            break;
-        }
-        // Read the key up to '=' or ';'.
-        let key_start = i;
-        while i < len && bytes[i] != b'=' && bytes[i] != b';' {
-            i += 1;
-        }
-        let key = header_val[key_start..i].trim();
-        if i >= len || bytes[i] == b';' {
-            continue;
-        }
-        i += 1; // skip '='
-        // Skip whitespace before the value.
-        while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
-            i += 1;
-        }
-        if i >= len {
-            break;
-        }
-        // Read the value, respecting double-quoted strings.
-        let val = if bytes[i] == b'"' {
-            i += 1; // skip opening '"'
-            let mut val = String::new();
-            while i < len && bytes[i] != b'"' {
-                if bytes[i] == b'\\' && i + 1 < len {
-                    i += 1; // skip backslash escape
+    // Scan `char`s rather than bytes: a byte-wise `b as char` cast Latin-1-decodes
+    // UTF-8 input, so `filename="café.pdf"` came back as `cafÃ©.pdf` (issue #1611).
+    let mut chars = header_val.chars().peekable();
+    loop {
+        // Skip the separator and any whitespace between parameters.
+        while chars.next_if(|&c| matches!(c, ';' | ' ' | '\t')).is_some() {}
+        chars.peek()?; // end of input — no such parameter
+
+        // Read the key, stopping at `=` (value follows) or `;` (valueless).
+        let mut key = String::new();
+        let mut has_value = false;
+        for c in chars.by_ref() {
+            match c {
+                '=' => {
+                    has_value = true;
+                    break;
                 }
-                val.push(bytes[i] as char);
-                i += 1;
+                ';' => break,
+                _ => key.push(c),
             }
-            if i < len {
-                i += 1;
-            } // skip closing '"'
+        }
+        if !has_value {
+            continue; // valueless parameter, or end of input
+        }
+
+        // Skip whitespace between `=` and the value.
+        while chars.next_if(|&c| matches!(c, ' ' | '\t')).is_some() {}
+        let &lead = chars.peek()?; // a trailing `=` at end of input yields nothing
+
+        let val = if lead == '"' {
+            chars.next(); // opening quote
+            let mut val = String::new();
+            // A `;` inside the quotes is part of the value, not a separator.
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    // A trailing backslash with nothing after it is literal.
+                    '\\' => val.push(chars.next().unwrap_or('\\')),
+                    _ => val.push(c),
+                }
+            }
             val
         } else {
-            let val_start = i;
-            while i < len && bytes[i] != b';' {
-                i += 1;
+            let mut val = String::new();
+            // Leave the `;` in place; the next iteration skips it.
+            while let Some(&c) = chars.peek() {
+                if c == ';' {
+                    break;
+                }
+                val.push(c);
+                chars.next();
             }
-            header_val[val_start..i].trim().to_string()
+            val.trim().to_string()
         };
-        if key.eq_ignore_ascii_case(name) {
+
+        if key.trim().eq_ignore_ascii_case(name) {
             return Some(val);
         }
     }
-    None
 }
 
+/// The longest MIME boundary RFC 2046 §5.1.1 permits.
+const MAX_BOUNDARY_LEN: usize = 70;
+
+/// Maximum `multipart/*` nesting depth accepted by [`extract_multipart_bodies`].
+///
+/// Each level of nesting costs one stack frame but only ~55 bytes of request
+/// body, so without a cap an unauthenticated POST under the route's 50 MB
+/// `DefaultBodyLimit` could recurse deep enough to overflow the stack and abort
+/// the process (issue #1611). Beyond the cap a nested part is kept verbatim as
+/// an opaque attachment rather than being parsed — or dropped.
+const MAX_MIME_DEPTH: usize = 16;
+
 /// Extract the MIME boundary parameter from a `Content-Type` header value.
+///
+/// Returns `None` for a boundary that RFC 2046 §5.1.1 does not permit — empty,
+/// or longer than 70 characters — so the caller falls back to its single-part
+/// path instead of scanning the body for a delimiter that cannot be legitimate.
 fn extract_boundary(content_type: &str) -> Option<String> {
     content_type.split(';').skip(1).find_map(|part| {
-        let part = part.trim();
-        let (key, val) = part.split_once('=')?;
-        if key.trim().eq_ignore_ascii_case("boundary") {
-            Some(val.trim().trim_matches('"').to_string())
-        } else {
-            None
+        let (key, val) = part.trim().split_once('=')?;
+        if !key.trim().eq_ignore_ascii_case("boundary") {
+            return None;
         }
+        let val = val.trim().trim_matches('"');
+        if val.is_empty() || val.len() > MAX_BOUNDARY_LEN {
+            return None;
+        }
+        Some(val.to_string())
     })
 }
 
@@ -1470,6 +1536,15 @@ fn extract_multipart_bodies(
     body: &[u8],
     content_type: &str,
 ) -> (Option<String>, Option<String>, Vec<Attachment>) {
+    extract_multipart_bodies_at(body, content_type, 0)
+}
+
+/// [`extract_multipart_bodies`] at nesting `depth`; see [`MAX_MIME_DEPTH`].
+fn extract_multipart_bodies_at(
+    body: &[u8],
+    content_type: &str,
+    depth: usize,
+) -> (Option<String>, Option<String>, Vec<Attachment>) {
     let Some(boundary) = extract_boundary(content_type) else {
         return (
             Some(String::from_utf8_lossy(body).into_owned()),
@@ -1478,50 +1553,15 @@ fn extract_multipart_bodies(
         );
     };
     let delimiter = format!("--{boundary}");
-    let delim = delimiter.as_bytes();
     let mut text_body: Option<String> = None;
     let mut html_body: Option<String> = None;
     let mut attachments: Vec<Attachment> = Vec::new();
 
-    // Split body into parts by finding each boundary delimiter.
-    // RFC 2046 §5.1.1: boundaries must appear at the start of a line and be followed by a
-    // valid terminator (CRLF, `-`, SP, HT, or EOF) — not an arbitrary character like a digit.
-    //
-    // `seg_start` tracks the beginning of the current segment independently of `pos` (the
-    // search cursor), so that advancing past a false-positive match does not discard content.
-    let mut raw_parts: Vec<&[u8]> = Vec::new();
-    let mut pos = 0;
-    let mut seg_start = 0;
-    loop {
-        match find_subslice(&body[pos..], delim) {
-            None => {
-                raw_parts.push(&body[seg_start..]);
-                break;
-            }
-            Some(rel) => {
-                let abs = pos + rel;
-                if abs > 0 && body.get(abs - 1) != Some(&b'\n') {
-                    // Not at a line start — skip this false match.
-                    pos += rel + 1;
-                    continue;
-                }
-                // Boundary must be followed by a valid MIME terminator.
-                let after = abs + delim.len();
-                if !matches!(
-                    body.get(after),
-                    None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
-                ) {
-                    pos += rel + 1;
-                    continue;
-                }
-                raw_parts.push(&body[seg_start..abs]);
-                seg_start = abs + delim.len();
-                pos = seg_start;
-            }
-        }
-    }
-
-    for part in raw_parts.into_iter().skip(1) {
+    // The first segment is the preamble (everything before the opening boundary).
+    for part in split_mime_parts(body, delimiter.as_bytes())
+        .into_iter()
+        .skip(1)
+    {
         // End-boundary remainder starts with `--`; blank/whitespace-only parts are noise.
         if part.starts_with(b"--") || part.iter().all(|b| b.is_ascii_whitespace() || *b == b'-') {
             continue;
@@ -1537,49 +1577,30 @@ fn extract_multipart_bodies(
             .or_else(|| part.strip_suffix(b"\n"))
             .unwrap_or(part);
 
-        // Split part into headers and body at the blank-line separator.
         // If no blank-line separator exists, the part has no headers — treat the
         // entire content as the body with empty headers (RFC 2045 §5.2 defaults apply).
-        let (part_header_bytes, part_body_bytes) = find_subslice(part, b"\r\n\r\n")
-            .map(|p| (&part[..p], &part[p + 4..]))
-            .or_else(|| find_subslice(part, b"\n\n").map(|p| (&part[..p], &part[p + 2..])))
-            .unwrap_or((&part[..0], part));
-
+        let (part_header_bytes, part_body_bytes) =
+            split_mime_headers(part).unwrap_or((&[], part));
         let part_headers = unfold_mime_headers(&String::from_utf8_lossy(part_header_bytes));
-        // Per RFC 2045 §5.2, a missing Content-Type defaults to text/plain.
-        let part_ct_lower = part_headers
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-            .map_or_else(
-                || "text/plain".to_string(),
-                |l| l[13..].trim().to_ascii_lowercase(),
-            );
-        let part_ct_orig = part_headers
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-            .map_or_else(|| "text/plain".to_string(), |l| l[13..].trim().to_string());
-        let part_cte = part_headers
-            .lines()
-            .find(|l| {
-                l.to_ascii_lowercase()
-                    .starts_with("content-transfer-encoding:")
-            })
-            .map(|l| l[26..].trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        // Keep original case for value extraction; only compare names case-insensitively.
-        let disposition = part_headers
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
-            .map(|l| l[l.find(':').map_or(0, |p| p + 1)..].trim().to_string())
-            .unwrap_or_default();
-        let disposition_lower = disposition.to_ascii_lowercase();
-        let is_attachment = disposition_lower.starts_with("attachment")
-            || mime_param(&disposition, "filename").is_some();
 
-        if part_ct_lower.starts_with("multipart/") {
+        // Per RFC 2045 §5.2, a missing Content-Type defaults to text/plain.
+        let part_ct_orig = header_line_value(&part_headers, "content-type").unwrap_or("text/plain");
+        let part_ct_lower = part_ct_orig.to_ascii_lowercase();
+        let part_cte = header_line_value(&part_headers, "content-transfer-encoding")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        // Keep original case for value extraction; only compare names case-insensitively.
+        let disposition = header_line_value(&part_headers, "content-disposition").unwrap_or("");
+        let is_attachment = disposition.to_ascii_lowercase().starts_with("attachment")
+            || mime_param(disposition, "filename").is_some();
+
+        // A nested `multipart/*` past the depth cap is *not* parsed further and
+        // *not* dropped: it falls through to the attachment arm below and is kept
+        // verbatim as an opaque part.
+        if part_ct_lower.starts_with("multipart/") && depth < MAX_MIME_DEPTH {
             // Recurse into nested multipart parts (e.g. multipart/alternative).
             let (nested_text, nested_html, nested_atts) =
-                extract_multipart_bodies(part_body_bytes, &part_ct_orig);
+                extract_multipart_bodies_at(part_body_bytes, part_ct_orig, depth.saturating_add(1));
             if text_body.is_none() {
                 text_body = nested_text;
             }
@@ -1594,32 +1615,18 @@ fn extract_multipart_bodies(
             let s = String::from_utf8_lossy(part_body_bytes).into_owned();
             html_body = Some(decode_transfer_encoding(&s, &part_cte));
         } else if is_attachment || !part_ct_lower.starts_with("text/") {
+            if part_ct_lower.starts_with("multipart/") {
+                tracing::warn!(
+                    max_depth = MAX_MIME_DEPTH,
+                    "inbound_mail: MIME nesting depth cap reached; \
+                     keeping the remaining subtree as an opaque attachment"
+                );
+            }
             // Collect attachment parts; use raw bytes to avoid UTF-8 corruption.
-            let filename = mime_param(&disposition, "filename");
-            let ct_only = part_ct_lower
-                .split(';')
-                .next()
-                .map_or("application/octet-stream", str::trim)
-                .to_string();
-            let data = if part_cte == "base64" {
-                let stripped: String = String::from_utf8_lossy(part_body_bytes)
-                    .chars()
-                    .filter(|c| !c.is_ascii_whitespace())
-                    .collect();
-                base64::engine::general_purpose::STANDARD
-                    .decode(stripped.as_bytes())
-                    .map_or_else(|_| Bytes::copy_from_slice(part_body_bytes), Bytes::from)
-            } else if part_cte == "quoted-printable" {
-                // Use the byte-returning decoder to avoid UTF-8 replacement for
-                // non-text attachments whose decoded bytes may not be valid UTF-8.
-                Bytes::from(decode_quoted_printable_bytes(part_body_bytes))
-            } else {
-                Bytes::copy_from_slice(part_body_bytes)
-            };
             attachments.push(Attachment {
-                filename,
-                content_type: ct_only,
-                data,
+                filename: mime_param(disposition, "filename"),
+                content_type: mime_type_only(&part_ct_lower, "application/octet-stream"),
+                data: decode_part_bytes(part_body_bytes, &part_cte),
             });
         }
     }
@@ -1637,85 +1644,83 @@ fn decode_rfc2047(value: &str) -> String {
     let mut result = String::with_capacity(value.len());
     let mut rest = value;
     let mut last_was_encoded = false;
-    while let Some(start) = rest.find("=?") {
-        let before = &rest[..start];
-        // If the gap between encoded words is only whitespace, skip it.
-        if last_was_encoded && before.chars().all(|c| c == ' ' || c == '\t') {
-            // swallow inter-word whitespace
-        } else {
+    // Each iteration consumes one `=?charset?encoding?text?=` word. A word that
+    // is truncated at any of its three `?` separators is emitted verbatim and
+    // ends the scan — exactly as the original cursor-based parser did.
+    while let Some((before, after_intro)) = rest.split_once("=?") {
+        // If the gap between encoded words is only whitespace, swallow it.
+        if !(last_was_encoded && before.chars().all(|c| c == ' ' || c == '\t')) {
             result.push_str(before);
         }
-        rest = &rest[start + 2..];
-        let Some(charset_end) = rest.find('?') else {
+        let Some((charset, after_charset)) = after_intro.split_once('?') else {
             result.push_str("=?");
-            result.push_str(rest);
+            result.push_str(after_intro);
             return result;
         };
-        let charset = &rest[..charset_end];
-        rest = &rest[charset_end + 1..];
-        let Some(enc_end) = rest.find('?') else {
+        let Some((encoding, after_encoding)) = after_charset.split_once('?') else {
             result.push_str("=?");
             result.push_str(charset);
             result.push('?');
-            result.push_str(rest);
+            result.push_str(after_charset);
             return result;
         };
-        let encoding = &rest[..enc_end];
-        rest = &rest[enc_end + 1..];
-        let Some(text_end) = rest.find("?=") else {
+        let Some((encoded_text, after_word)) = after_encoding.split_once("?=") else {
             result.push_str("=?");
             result.push_str(charset);
             result.push('?');
             result.push_str(encoding);
             result.push('?');
-            result.push_str(rest);
+            result.push_str(after_encoding);
             return result;
         };
-        let encoded_text = &rest[..text_end];
-        rest = &rest[text_end + 2..];
-        let decoded_bytes: Option<Vec<u8>> = match encoding.to_ascii_uppercase().as_str() {
-            "B" => {
-                let stripped: String = encoded_text
-                    .chars()
-                    .filter(|c| !c.is_ascii_whitespace())
-                    .collect();
-                base64::engine::general_purpose::STANDARD
-                    .decode(stripped.as_bytes())
-                    .ok()
-            }
-            "Q" => Some(decode_rfc2047_q(encoded_text.as_bytes())),
-            _ => None,
-        };
-        let decoded = decoded_bytes
-            .and_then(|b| rfc2047_bytes_to_string(b, charset))
-            .unwrap_or_else(|| encoded_text.to_string());
-        result.push_str(&decoded);
+        rest = after_word;
+        result.push_str(&decode_encoded_word(charset, encoding, encoded_text));
         last_was_encoded = true;
     }
     result.push_str(rest);
     result
 }
 
+/// Decode the payload of one RFC 2047 encoded word.
+///
+/// Falls back to the undecoded text for an unknown encoding, undecodable
+/// base64, or bytes that do not map to a `String` under `charset`.
+fn decode_encoded_word(charset: &str, encoding: &str, encoded_text: &str) -> String {
+    let decoded_bytes: Option<Vec<u8>> = match encoding.to_ascii_uppercase().as_str() {
+        "B" => {
+            let stripped: String = encoded_text
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(stripped.as_bytes())
+                .ok()
+        }
+        "Q" => Some(decode_rfc2047_q(encoded_text.as_bytes())),
+        _ => None,
+    };
+    decoded_bytes
+        .and_then(|b| rfc2047_bytes_to_string(b, charset))
+        .unwrap_or_else(|| encoded_text.to_string())
+}
+
 /// Decode RFC 2047 Q-encoding (header variant): `_` → space, `=XX` → byte.
 fn decode_rfc2047_q(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        if input[i] == b'_' {
+    let mut rest = input;
+    while let Some((&first, tail)) = rest.split_first() {
+        if first == b'_' {
             out.push(b' ');
-            i += 1;
-        } else if input[i] == b'='
-            && i + 2 < input.len()
-            && input[i + 1].is_ascii_hexdigit()
-            && input[i + 2].is_ascii_hexdigit()
+            rest = tail;
+        } else if first == b'='
+            && let [hi, lo, more @ ..] = tail
+            && let Some(byte) = hex_pair_to_byte(*hi, *lo)
         {
-            let hi = (input[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
-            let lo = (input[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
-            out.push((hi << 4) | lo);
-            i += 3;
+            out.push(byte);
+            rest = more;
         } else {
-            out.push(input[i]);
-            i += 1;
+            out.push(first);
+            rest = tail;
         }
     }
     out
@@ -1724,27 +1729,19 @@ fn decode_rfc2047_q(input: &[u8]) -> Vec<u8> {
 /// Convert a decoded byte sequence to a String given its RFC 2047 charset label.
 fn rfc2047_bytes_to_string(bytes: Vec<u8>, charset: &str) -> Option<String> {
     match charset.to_ascii_lowercase().as_str() {
-        "utf-8" | "utf8" | "us-ascii" | "ascii" => String::from_utf8(bytes).ok(),
-        "iso-8859-1" | "latin-1" | "iso8859-1" => Some(bytes.iter().map(|&b| b as char).collect()),
+        "iso-8859-1" | "latin-1" | "iso8859-1" => Some(bytes.iter().copied().map(char::from).collect()),
+        // utf-8 / us-ascii / ascii — and anything unrecognised, which is assumed UTF-8.
         _ => String::from_utf8(bytes).ok(),
     }
 }
 
-fn apply_header(
-    headers: &mut HashMap<String, String>,
-    from: &mut String,
-    to: &mut Vec<String>,
-    cc: &mut Vec<String>,
-    subject: &mut String,
-    name: &str,
-    value: &str,
-) {
-    headers.insert(name.to_string(), value.to_string());
+fn apply_header(parsed: &mut ParsedHeaders, name: &str, value: &str) {
+    parsed.headers.insert(name.to_string(), value.to_string());
     match name {
-        "from" => *from = value.to_string(),
-        "to" => *to = parse_address_list(value),
-        "cc" => *cc = parse_address_list(value),
-        "subject" => *subject = decode_rfc2047(value),
+        "from" => parsed.from = value.to_string(),
+        "to" => parsed.to = parse_address_list(value),
+        "cc" => parsed.cc = parse_address_list(value),
+        "subject" => parsed.subject = decode_rfc2047(value),
         _ => {}
     }
 }
@@ -1765,6 +1762,87 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Split `hay` at the first occurrence of `needle`, dropping the needle itself.
+fn split_at_needle<'a>(hay: &'a [u8], needle: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
+    let p = find_subslice(hay, needle)?;
+    Some((hay.get(..p)?, hay.get(p.checked_add(needle.len())?..)?))
+}
+
+/// Split a MIME entity into `(header block, body)` at the first blank line,
+/// accepting both CRLF and bare-LF line endings. `None` when there is no
+/// blank-line separator at all.
+fn split_mime_headers(entity: &[u8]) -> Option<(&[u8], &[u8])> {
+    split_at_needle(entity, b"\r\n\r\n").or_else(|| split_at_needle(entity, b"\n\n"))
+}
+
+/// Look up a header value by name in an unfolded header block.
+///
+/// Names are compared case-insensitively (RFC 5322 §2.2); the value keeps its
+/// original casing because MIME parameter values are case-sensitive.
+fn header_line_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+/// RFC 2046 §5.1.1: the byte right after a boundary delimiter must be CRLF, LF,
+/// `-` (closing delimiter), SP, HT, or end-of-input — never an arbitrary
+/// character such as a digit. Rejecting anything else stops a boundary-prefix
+/// false match (`--abc` inside `--abc123`) from splitting a part.
+fn is_boundary_terminator(b: Option<&u8>) -> bool {
+    matches!(b, None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t'))
+}
+
+/// Split `body` on every RFC 2046-valid occurrence of `delim`.
+///
+/// A delimiter counts only when it starts a line *and* is followed by a valid
+/// terminator. The segment start is tracked independently of the search cursor,
+/// so skipping past a false match never discards content. The first segment is
+/// the preamble that precedes the opening delimiter.
+fn split_mime_parts<'a>(body: &'a [u8], delim: &[u8]) -> Vec<&'a [u8]> {
+    if delim.is_empty() {
+        return vec![body];
+    }
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let mut seg_start = 0usize;
+    let mut pos = 0usize;
+    loop {
+        let Some(rel) = find_subslice(body.get(pos..).unwrap_or_default(), delim) else {
+            parts.extend(body.get(seg_start..));
+            break;
+        };
+        let abs = pos.saturating_add(rel);
+        let at_line_start = abs
+            .checked_sub(1)
+            .is_none_or(|prev| body.get(prev) == Some(&b'\n'));
+        let after = abs.saturating_add(delim.len());
+        if !at_line_start || !is_boundary_terminator(body.get(after)) {
+            // False match — advance the cursor only, keeping `seg_start` put.
+            pos = abs.saturating_add(1);
+            continue;
+        }
+        parts.extend(body.get(seg_start..abs));
+        seg_start = after;
+        pos = after;
+    }
+    parts
+}
+
+/// Offset of the first occurrence of `delim` in `body` that is followed by a
+/// valid MIME terminator (see [`is_boundary_terminator`]).
+fn find_valid_delim(body: &[u8], delim: &[u8]) -> Option<usize> {
+    let mut pos = 0usize;
+    loop {
+        let rel = find_subslice(body.get(pos..).unwrap_or_default(), delim)?;
+        let abs = pos.saturating_add(rel);
+        if is_boundary_terminator(body.get(abs.saturating_add(delim.len()))) {
+            return Some(abs);
+        }
+        pos = abs.saturating_add(1);
+    }
+}
+
 /// Unfold RFC 2822 §2.2.3 header folding.
 ///
 /// A CRLF (or bare LF) immediately before a whitespace character is a fold
@@ -1778,37 +1856,8 @@ fn unfold_mime_headers(s: &str) -> String {
 
 /// Find the first part-end delimiter (`crlf_delim` preferred over `lf_delim`)
 /// whose immediately following byte is a valid MIME terminator.
-///
-/// Per RFC 2046 §5.1.1, a boundary delimiter must be followed by `\r\n`, `\n`,
-/// `--`, SP, HT, or end-of-input — never by an arbitrary character such as a
-/// digit. This prevents a boundary-prefix false match (e.g. `\r\n--abc` inside
-/// `\r\n--abc123`) from prematurely ending a MIME part.
 fn find_part_end(body: &[u8], crlf_delim: &[u8], lf_delim: &[u8]) -> Option<usize> {
-    let mut pos = 0;
-    while let Some(rel) = find_subslice(&body[pos..], crlf_delim) {
-        let abs = pos + rel;
-        let after = abs + crlf_delim.len();
-        if matches!(
-            body.get(after),
-            None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
-        ) {
-            return Some(abs);
-        }
-        pos = abs + 1;
-    }
-    pos = 0;
-    while let Some(rel) = find_subslice(&body[pos..], lf_delim) {
-        let abs = pos + rel;
-        let after = abs + lf_delim.len();
-        if matches!(
-            body.get(after),
-            None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
-        ) {
-            return Some(abs);
-        }
-        pos = abs + 1;
-    }
-    None
+    find_valid_delim(body, crlf_delim).or_else(|| find_valid_delim(body, lf_delim))
 }
 
 /// Parse a `multipart/form-data` Mailgun webhook body into a field map and attachment list.
@@ -1821,12 +1870,9 @@ fn parse_mailgun_form_data(
     let Some(boundary) = extract_boundary(content_type) else {
         return (HashMap::new(), Vec::new());
     };
-    let delim = format!("--{boundary}");
-    let delim_bytes = delim.as_bytes();
-    let crlf_delim = format!("\r\n--{boundary}");
-    let lf_delim = format!("\n--{boundary}");
-    let crlf_delim_bytes = crlf_delim.as_bytes();
-    let lf_delim_bytes = lf_delim.as_bytes();
+    let delim_bytes = format!("--{boundary}").into_bytes();
+    let crlf_delim_bytes = format!("\r\n--{boundary}").into_bytes();
+    let lf_delim_bytes = format!("\n--{boundary}").into_bytes();
 
     let mut map = HashMap::new();
     let mut file_parts: Vec<Attachment> = Vec::new();
@@ -1834,37 +1880,34 @@ fn parse_mailgun_form_data(
 
     loop {
         // Locate the next "--{boundary}" in the raw byte buffer.
-        let Some(rel) = find_subslice(&body[search_from..], delim_bytes) else {
+        let Some(rel) = find_subslice(body.get(search_from..).unwrap_or_default(), &delim_bytes)
+        else {
             break;
         };
-        let abs = search_from + rel;
-        let after_delim = abs + delim_bytes.len();
+        let abs = search_from.saturating_add(rel);
+        let after_delim = abs.saturating_add(delim_bytes.len());
 
-        // RFC 2046 §5.1.1: boundary must start at the beginning of a line.
-        if abs > 0 && body.get(abs - 1) != Some(&b'\n') {
-            search_from = abs + 1;
+        // RFC 2046 §5.1.1: a boundary must start a line and be followed by a
+        // valid terminator byte. Anything else is a false match — skip it.
+        let at_line_start = abs
+            .checked_sub(1)
+            .is_none_or(|prev| body.get(prev) == Some(&b'\n'));
+        if !at_line_start || !is_boundary_terminator(body.get(after_delim)) {
+            search_from = abs.saturating_add(1);
             continue;
         }
 
-        // RFC 2046: boundary must be followed by a valid terminator byte.
-        if !matches!(
-            body.get(after_delim),
-            None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
-        ) {
-            search_from = abs + 1;
-            continue;
-        }
-
+        let after = body.get(after_delim..).unwrap_or_default();
         // "--{boundary}--" is the final delimiter — stop.
-        if body[after_delim..].starts_with(b"--") {
+        if after.starts_with(b"--") {
             break;
         }
 
         // Skip the CRLF/LF that follows the opening boundary line.
-        let part_start = if body[after_delim..].starts_with(b"\r\n") {
-            after_delim + 2
-        } else if body[after_delim..].starts_with(b"\n") {
-            after_delim + 1
+        let part_start = if after.starts_with(b"\r\n") {
+            after_delim.saturating_add(2)
+        } else if after.starts_with(b"\n") {
+            after_delim.saturating_add(1)
         } else {
             after_delim
         };
@@ -1872,91 +1915,81 @@ fn parse_mailgun_form_data(
         // The part body ends just before the next "\r\n--{boundary}" or "\n--{boundary}".
         // `find_part_end` validates the terminator byte to avoid false matches on
         // boundary-prefix strings (e.g. "\r\n--abc" inside "\r\n--abc123").
-        let part_end = find_part_end(&body[part_start..], crlf_delim_bytes, lf_delim_bytes)
-            .map_or(body.len(), |p| part_start + p);
+        let part_end = find_part_end(
+            body.get(part_start..).unwrap_or_default(),
+            &crlf_delim_bytes,
+            &lf_delim_bytes,
+        )
+        .map_or(body.len(), |p| part_start.saturating_add(p));
 
         search_from = part_end;
-        let part = &body[part_start..part_end];
+        let part = body.get(part_start..part_end).unwrap_or_default();
 
-        // Split part headers from body on the blank line.
-        let (headers_bytes, body_bytes) = if let Some(sep) = find_subslice(part, b"\r\n\r\n") {
-            (&part[..sep], &part[sep + 4..])
-        } else if let Some(sep) = find_subslice(part, b"\n\n") {
-            (&part[..sep], &part[sep + 2..])
-        } else {
+        // A part with no blank-line separator has no body; skip it entirely.
+        let Some((headers_bytes, body_bytes)) = split_mime_headers(part) else {
             continue;
         };
-
-        // Headers are ASCII; lossy conversion is safe here.  Unfold before
-        // parsing so a folded Content-Disposition reads as one logical line.
-        let headers_str = unfold_mime_headers(&String::from_utf8_lossy(headers_bytes));
-
-        // Preserve the original disposition value so that filename casing is not
-        // corrupted — parameter values are case-sensitive (RFC 2183 §2).
-        // Key matching (name=, filename=) is done case-insensitively.
-        let disposition = headers_str
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
-            .map(|l| l[l.find(':').map_or(0, |p| p + 1)..].trim().to_string())
-            .unwrap_or_default();
-
-        // Use the quote-aware parser so that filenames containing semicolons,
-        // e.g. filename="Q1;final.pdf", are not truncated at the semicolon.
-        let name = mime_param(&disposition, "name");
-        let Some(name) = name else { continue };
-
-        let filename = mime_param(&disposition, "filename");
-
-        if let Some(filename) = filename {
-            // File part: use raw bytes from the original buffer to avoid lossy UTF-8 corruption.
-            let part_ct = headers_str
-                .lines()
-                .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-                .map_or_else(
-                    || "application/octet-stream".to_string(),
-                    |l| {
-                        l[13..]
-                            .trim()
-                            .split(';')
-                            .next()
-                            .map_or("application/octet-stream", str::trim)
-                            .to_ascii_lowercase()
-                    },
-                );
-            let part_cte = headers_str
-                .lines()
-                .find(|l| {
-                    l.to_ascii_lowercase()
-                        .starts_with("content-transfer-encoding:")
-                })
-                .map(|l| l[26..].trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            let data: Bytes = if part_cte == "base64" {
-                // base64 is ASCII; string round-trip is safe.
-                let stripped: String = String::from_utf8_lossy(body_bytes)
-                    .chars()
-                    .filter(|c| !c.is_ascii_whitespace())
-                    .collect();
-                base64::engine::general_purpose::STANDARD
-                    .decode(stripped.as_bytes())
-                    .map_or_else(|_| Bytes::copy_from_slice(body_bytes), Bytes::from)
-            } else {
-                // Binary (8-bit): copy raw bytes without any string conversion.
-                Bytes::copy_from_slice(body_bytes)
-            };
-            file_parts.push(Attachment {
-                filename: Some(filename),
-                content_type: part_ct,
-                data,
-            });
-        } else {
-            // Text field: lossy conversion is acceptable.
-            // Do not trim trailing newlines — the boundary separator is already excluded
-            // by the line-anchored boundary split, so trailing content is intentional.
-            map.insert(name, String::from_utf8_lossy(body_bytes).into_owned());
+        match mailgun_form_part(headers_bytes, body_bytes) {
+            Some(MailgunFormPart::File(attachment)) => file_parts.push(attachment),
+            Some(MailgunFormPart::Field { name, value }) => {
+                map.insert(name, value);
+            }
+            None => continue,
         }
     }
     (map, file_parts)
+}
+
+/// One decoded `multipart/form-data` part: either a text field or a file.
+enum MailgunFormPart {
+    Field { name: String, value: String },
+    File(Attachment),
+}
+
+/// Decode one `multipart/form-data` part. `None` when the part carries no
+/// `name` parameter, which every Mailgun form field and file part has.
+fn mailgun_form_part(headers_bytes: &[u8], body_bytes: &[u8]) -> Option<MailgunFormPart> {
+    // Headers are ASCII; lossy conversion is safe here.  Unfold before parsing
+    // so a folded Content-Disposition reads as one logical line.
+    let headers_str = unfold_mime_headers(&String::from_utf8_lossy(headers_bytes));
+
+    // Preserve the original disposition value so that filename casing is not
+    // corrupted — parameter values are case-sensitive (RFC 2183 §2).
+    // Key matching (name=, filename=) is done case-insensitively, and the
+    // quote-aware parser keeps `filename="Q1;final.pdf"` intact.
+    let disposition = header_line_value(&headers_str, "content-disposition").unwrap_or("");
+    let name = mime_param(disposition, "name")?;
+
+    let Some(filename) = mime_param(disposition, "filename") else {
+        // Text field: lossy conversion is acceptable.
+        // Do not trim trailing newlines — the boundary separator is already excluded
+        // by the line-anchored boundary split, so trailing content is intentional.
+        return Some(MailgunFormPart::Field {
+            name,
+            value: String::from_utf8_lossy(body_bytes).into_owned(),
+        });
+    };
+
+    // File part: use raw bytes from the original buffer to avoid lossy UTF-8 corruption.
+    let content_type = header_line_value(&headers_str, "content-type").map_or_else(
+        || "application/octet-stream".to_string(),
+        |v| mime_type_only(v, "application/octet-stream").to_ascii_lowercase(),
+    );
+    let cte = header_line_value(&headers_str, "content-transfer-encoding")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    // Only base64 is decoded here; anything else (including 8-bit binary) is
+    // copied through byte-for-byte, unchanged from the original parser.
+    let data = if cte == "base64" {
+        decode_part_bytes(body_bytes, "base64")
+    } else {
+        Bytes::copy_from_slice(body_bytes)
+    };
+    Some(MailgunFormPart::File(Attachment {
+        filename: Some(filename),
+        content_type,
+        data,
+    }))
 }
 
 /// Decode a Mailgun webhook body, supporting both `application/x-www-form-urlencoded`
@@ -2093,12 +2126,11 @@ fn build_ses_route(
 
             // Verify SNS signature (and optional TopicArn binding) before parsing.
             #[cfg(feature = "inbound-ses")]
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-                if let Err(status) =
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body)
+                && let Err(status) =
                     sns_verify::verify(&json, &http_client, topic_arn.as_deref()).await
-                {
-                    return status;
-                }
+            {
+                return status;
             }
 
             match parse_ses(&body) {
@@ -2108,7 +2140,7 @@ fn build_ses_route(
                         .get(&url)
                         .send()
                         .await
-                        .and_then(|r| r.error_for_status())
+                        .and_then(reqwest::Response::error_for_status)
                     {
                         Ok(_) => StatusCode::OK,
                         Err(e) => {
@@ -3294,6 +3326,119 @@ mod tests {
             email.to.iter().any(|a| a == "Replies+ABC@app.example"),
             "original casing must be preserved; got: {:?}",
             email.to
+        );
+    }
+
+    // ── Hostile-MIME hardening (issue #1611) ─────────────────────────────────
+
+    /// Build a `multipart/*` bomb nested `depth` levels deep.
+    ///
+    /// Each level costs ~55 bytes, so a 50 MB request body (the route's
+    /// `DefaultBodyLimit`) buys roughly a million levels of recursion.
+    fn nested_multipart_bomb(depth: usize) -> Vec<u8> {
+        let mut raw = String::new();
+        raw.push_str("From: a@b.example\r\nSubject: nest\r\n");
+        raw.push_str("Content-Type: multipart/mixed; boundary=\"b0\"\r\n\r\n");
+        for i in 0..depth {
+            let next = i + 1;
+            raw.push_str(&format!(
+                "--b{i}\r\nContent-Type: multipart/mixed; boundary=\"b{next}\"\r\n\r\n"
+            ));
+        }
+        raw.push_str(&format!(
+            "--b{depth}\r\nContent-Type: text/plain\r\n\r\ninnermost\r\n"
+        ));
+        raw.into_bytes()
+    }
+
+    #[test]
+    fn deeply_nested_multipart_does_not_overflow_the_stack() {
+        // D1: unbounded MIME recursion is an unauthenticated process-abort.
+        // 256 KiB is a deliberately small stack; the parser must be depth-capped
+        // rather than recursing once per nesting level.
+        let raw = nested_multipart_bomb(5_000);
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let email = parse_rfc5322(Bytes::from(raw));
+                // Never silently drop the message: the capped subtree survives
+                // as an opaque attachment (or as a body).
+                email.attachments.len() + usize::from(email.text_body.is_some())
+            })
+            .expect("spawn parser thread");
+        let kept = handle
+            .join()
+            .expect("deeply nested multipart must not overflow the stack");
+        assert!(kept > 0, "capped MIME subtree must not be dropped silently");
+    }
+
+    #[test]
+    fn extract_boundary_rejects_over_length_boundary() {
+        // D2: RFC 2046 §5.1.1 caps a boundary at 70 characters. A longer value
+        // is not a boundary — fall back to the single-part path.
+        let long = "a".repeat(71);
+        let ct = format!("multipart/mixed; boundary=\"{long}\"");
+        assert_eq!(extract_boundary(&ct), None);
+
+        let body = format!("--{long}\r\nContent-Type: text/plain\r\n\r\nhi\r\n--{long}--\r\n");
+        let (text, html, atts) = extract_multipart_bodies(body.as_bytes(), &ct);
+        assert_eq!(
+            text.as_deref(),
+            Some(body.as_str()),
+            "over-length boundary must take the no-boundary fallback"
+        );
+        assert!(html.is_none());
+        assert!(atts.is_empty());
+    }
+
+    #[test]
+    fn extract_boundary_accepts_exactly_seventy_chars() {
+        let max = "b".repeat(70);
+        let ct = format!("multipart/mixed; boundary=\"{max}\"");
+        assert_eq!(extract_boundary(&ct).as_deref(), Some(max.as_str()));
+    }
+
+    #[test]
+    fn extract_boundary_rejects_empty_boundary() {
+        // D2: an empty boundary makes every position a match.
+        assert_eq!(extract_boundary("multipart/mixed; boundary=\"\""), None);
+        assert_eq!(extract_boundary("multipart/mixed; boundary="), None);
+        assert_eq!(extract_boundary("multipart/mixed; boundary=  "), None);
+
+        let (text, _, atts) =
+            extract_multipart_bodies(b"whatever", "multipart/mixed; boundary=\"\"");
+        assert_eq!(text.as_deref(), Some("whatever"));
+        assert!(atts.is_empty());
+    }
+
+    #[test]
+    fn mime_param_preserves_utf8_in_quoted_value() {
+        // D3: the byte→char cast Latin-1-decoded UTF-8 input, so `café.pdf`
+        // came back as `cafÃ©.pdf`.
+        assert_eq!(
+            mime_param("attachment; filename=\"café.pdf\"", "filename").as_deref(),
+            Some("café.pdf")
+        );
+        assert_eq!(
+            mime_param("attachment; filename=\"🚀 launch.png\"", "filename").as_deref(),
+            Some("🚀 launch.png")
+        );
+        // Unquoted values were already sliced from the &str and stayed correct.
+        assert_eq!(
+            mime_param("attachment; filename=café.pdf", "filename").as_deref(),
+            Some("café.pdf")
+        );
+    }
+
+    #[test]
+    fn mime_param_keeps_quoted_semicolon_and_backslash_escapes() {
+        assert_eq!(
+            mime_param("attachment; filename=\"Q1;final.pdf\"", "filename").as_deref(),
+            Some("Q1;final.pdf")
+        );
+        assert_eq!(
+            mime_param("attachment; filename=\"a\\\"b.pdf\"", "filename").as_deref(),
+            Some("a\"b.pdf")
         );
     }
 }

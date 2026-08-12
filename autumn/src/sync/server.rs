@@ -808,7 +808,15 @@ impl SyncBackend for MemorySyncBackend {
         state
             .applied
             .retain(|_, record| record.applied_at >= older_than);
-        let removed = before - state.applied.len();
+        // `retain` only ever removes, so `before >= len()` holds by
+        // construction — but a `usize` underflow here would be a silent
+        // ~1.8e19 "removed" count in release, so saturate and assert the
+        // invariant in debug rather than trusting it silently.
+        debug_assert!(
+            before >= state.applied.len(),
+            "retain must not grow the applied set"
+        );
+        let removed = before.saturating_sub(state.applied.len());
         drop(state);
         Ok(removed as u64)
     }

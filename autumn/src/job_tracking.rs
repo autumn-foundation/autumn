@@ -972,7 +972,10 @@ impl InMemoryJobTrackingStore {
     pub fn new(ttl_secs: u64) -> Self {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
-            ttl: chrono::TimeDelta::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX)),
+            // `TimeDelta::seconds` PANICS above `i64::MAX / 1_000`, so the
+            // obvious `try_from(..).unwrap_or(i64::MAX)` saturation crashed on
+            // exactly the pathological `ttl_secs` it was meant to absorb.
+            ttl: crate::time_math::saturating_time_delta_secs(ttl_secs),
             clock: Arc::new(SystemClock),
             creates_since_sweep: Arc::new(AtomicU64::new(0)),
         }
@@ -1011,7 +1014,7 @@ impl InMemoryJobTrackingStore {
             key.to_owned(),
             MemoryEntry {
                 record,
-                expires_at: now + self.ttl,
+                expires_at: crate::time_math::saturating_dt_add(now, self.ttl),
             },
         );
         if self
@@ -1038,7 +1041,7 @@ impl InMemoryJobTrackingStore {
         {
             f(&mut entry.record);
             entry.record.updated_at = now;
-            entry.expires_at = now + self.ttl;
+            entry.expires_at = crate::time_math::saturating_dt_add(now, self.ttl);
         }
     }
 
@@ -1070,7 +1073,7 @@ impl InMemoryJobTrackingStore {
                         owner,
                         updated_at: now,
                     },
-                    expires_at: now + self.ttl,
+                    expires_at: crate::time_math::saturating_dt_add(now, self.ttl),
                 },
             );
         }
@@ -1447,7 +1450,10 @@ impl PgJobTrackingStore {
     }
 
     fn expires_at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
-        now + chrono::TimeDelta::seconds(i64::try_from(self.ttl_secs).unwrap_or(i64::MAX))
+        crate::time_math::saturating_dt_add(
+            now,
+            crate::time_math::saturating_time_delta_secs(self.ttl_secs),
+        )
     }
 
     async fn conn(
@@ -1731,6 +1737,63 @@ mod tests {
         let owner = TrackedJobOwner::from_session(&session, &state).await;
 
         assert_eq!(owner, TrackedJobOwner::User("user-42".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_with_extreme_ttl_does_not_panic() {
+        // Regression (issue #1611): `jobs.tracking.ttl_secs` is plain config,
+        // so a pathological value reached two panicking chrono APIs —
+        // `TimeDelta::seconds` panics above `i64::MAX / 1_000`, and
+        // `DateTime<Utc> + TimeDelta` panics when the sum leaves the
+        // representable range. Both must clamp to a far-future (effectively
+        // non-expiring) deadline rather than crash the process.
+        for ttl_secs in [
+            u64::MAX,
+            u64::try_from(i64::MAX).unwrap_or(u64::MAX),
+            // Just past `TimeDelta`'s `i64::MAX / 1_000` second ceiling.
+            9_223_372_036_854_776_u64,
+        ] {
+            let store = InMemoryJobTrackingStore::new(ttl_secs);
+
+            // Every write path stamps `expires_at = now + ttl`.
+            store
+                .create("k1", TrackedJobOwner::Anonymous)
+                .await
+                .unwrap();
+            store.mark_running("k1").await.unwrap();
+            store
+                .set_progress("k1", 50, Some("half".to_owned()))
+                .await
+                .unwrap();
+            let record = store.get("k1").await.unwrap().expect("record");
+            store
+                .reset_for_retry("k1", TrackedJobOwner::Anonymous, record.updated_at)
+                .await
+                .unwrap();
+            store
+                .complete("k1", serde_json::json!({"ok": true}))
+                .await
+                .unwrap();
+
+            assert!(
+                store.get("k1").await.unwrap().is_some(),
+                "a record written with an extreme TTL must be present and unexpired"
+            );
+        }
+    }
+
+    #[test]
+    fn extreme_ttl_secs_clamps_to_a_representable_time_delta() {
+        // The shared helper is what keeps `TimeDelta::seconds`' panic out of
+        // the tracking store's constructors.
+        assert_eq!(
+            crate::time_math::saturating_time_delta_secs(86_400),
+            chrono::TimeDelta::seconds(86_400)
+        );
+        assert_eq!(
+            crate::time_math::saturating_time_delta_secs(u64::MAX),
+            chrono::TimeDelta::MAX
+        );
     }
 
     #[tokio::test]

@@ -460,11 +460,6 @@ struct MemoryInFlightLock {
     expires_at: Instant,
 }
 
-/// Clamp horizon (~10 years) used when a caller-supplied TTL would overflow
-/// `Instant + Duration`. This constant is itself always representable when
-/// added to a fresh `Instant`, so it can never re-trigger the overflow.
-const SATURATING_DEADLINE_HORIZON_SECS: u64 = 10 * 365 * 24 * 3600;
-
 /// Compute an expiry `Instant` for `ttl`, saturating instead of panicking on
 /// overflow.
 ///
@@ -473,14 +468,10 @@ const SATURATING_DEADLINE_HORIZON_SECS: u64 = 10 * 365 * 24 * 3600;
 /// `Duration::from_secs(u64::MAX)` (which is entirely attacker-influenceable
 /// via configured TTLs) triggers this. Instead of panicking we clamp the
 /// deadline to ~10 years out (far enough that the entry is effectively
-/// non-expiring), falling back to `now` only in the astronomically unlikely
-/// event that even the clamped horizon is not representable.
+/// non-expiring). See [`crate::time_math::saturating_deadline`], which the
+/// job and job-tracking modules share.
 fn saturating_deadline(ttl: Duration) -> Instant {
-    let now = Instant::now();
-    now.checked_add(ttl).unwrap_or_else(|| {
-        now.checked_add(Duration::from_secs(SATURATING_DEADLINE_HORIZON_SECS))
-            .unwrap_or(now)
-    })
+    crate::time_math::saturating_deadline(Instant::now(), ttl)
 }
 
 impl MemoryIdempotencyStore {

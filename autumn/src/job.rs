@@ -1822,7 +1822,9 @@ impl RedisMaintenanceThrottle {
         if now < self.next_run_at {
             return false;
         }
-        self.next_run_at = now + self.interval;
+        // The interval is config-derived (`retry_promotion_interval`), and
+        // `Instant + Duration` panics when the sum is not representable.
+        self.next_run_at = crate::time_math::saturating_deadline(now, self.interval);
         true
     }
 }
@@ -3472,7 +3474,13 @@ impl LocalJobCoordination {
             }
         }
         let expires_at = match window {
-            JobUniquenessWindow::TtlMs(ms) => Some(now + std::time::Duration::from_millis(ms)),
+            // `unique_for` is app-supplied, and `Instant + Duration` panics
+            // when the sum is not representable on the platform clock; clamp
+            // so an absurd window means "holds effectively forever".
+            JobUniquenessWindow::TtlMs(ms) => Some(crate::time_math::saturating_deadline(
+                now,
+                std::time::Duration::from_millis(ms),
+            )),
             JobUniquenessWindow::Pending | JobUniquenessWindow::Running => None,
         };
         inner.unique_holds.insert(
@@ -4004,6 +4012,16 @@ fn jittered_retry_delay_ms(entropy: &dyn crate::entropy::Entropy, base_delay_ms:
     half + entropy.next_u64() % spread
 }
 
+/// Exponential backoff delay in ms for `attempt` (1-indexed) on the local
+/// in-process backend — the counterpart of `redis_retry_delay_ms` /
+/// `pg_retry_delay_ms`.
+/// `attempt` is 1-indexed, so the exponent is `attempt - 1`; a `0` attempt
+/// saturates to the first-attempt delay rather than underflowing (matching
+/// the Redis and Postgres backends).
+const fn local_retry_delay_ms(initial_backoff_ms: u64, attempt: u32) -> u64 {
+    initial_backoff_ms.saturating_mul(2_u64.saturating_pow(attempt.saturating_sub(1)))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn execute_local_job(
     job: QueuedJob,
@@ -4207,7 +4225,7 @@ async fn execute_local_job(
                 let traceparent = job.traceparent;
                 #[cfg(feature = "telemetry-otlp")]
                 let tracestate = job.tracestate;
-                let base_delay = backoff_ms.saturating_mul(2_u64.saturating_pow(job.attempt - 1));
+                let base_delay = local_retry_delay_ms(backoff_ms, job.attempt);
                 let delay = jittered_retry_delay_ms(state.entropy(), base_delay);
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -9042,6 +9060,25 @@ mod tests {
     }
 
     #[test]
+    fn local_retry_delay_doubles_per_attempt_and_survives_a_zero_attempt() {
+        // The 1-indexed series must be preserved exactly.
+        assert_eq!(local_retry_delay_ms(100, 1), 100);
+        assert_eq!(local_retry_delay_ms(100, 2), 200);
+        assert_eq!(local_retry_delay_ms(100, 3), 400);
+        assert_eq!(local_retry_delay_ms(100, 4), 800);
+        assert_eq!(local_retry_delay_ms(100, 5), 1_600);
+
+        // Regression (issue #1611): `attempt - 1` underflows for `attempt ==
+        // 0` (a debug-build panic; a wildly wrong exponent in release). A
+        // zero attempt must degrade to the first-attempt delay, matching the
+        // Redis and Postgres backends' `saturating_sub(1)`.
+        assert_eq!(local_retry_delay_ms(100, 0), 100);
+
+        // A huge attempt must saturate, not overflow.
+        assert_eq!(local_retry_delay_ms(100, u32::MAX), u64::MAX);
+    }
+
+    #[test]
     fn jittered_retry_delay_stays_within_the_equal_jitter_bounds() {
         let entropy = crate::entropy::SeededEntropy::new(0);
         for _ in 0..1_000 {
@@ -10624,6 +10661,25 @@ mod tests {
         assert!(throttle.take_due(start));
         assert!(!throttle.take_due(start + Duration::from_millis(999)));
         assert!(throttle.take_due(start + Duration::from_secs(1)));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_maintenance_throttle_with_extreme_interval_does_not_panic() {
+        // Regression (issue #1611): the throttle interval is derived from the
+        // configured retry backoff, and `Instant + Duration` panics when the
+        // sum is not representable. A pathological interval must clamp the
+        // next-run deadline (making the maintenance pass effectively one-shot)
+        // rather than crash the Redis worker task.
+        let start = std::time::Instant::now();
+        for interval in [Duration::MAX, Duration::from_secs(u64::MAX)] {
+            let mut throttle = RedisMaintenanceThrottle::new(start, interval);
+            assert!(throttle.take_due(start), "the first pass always runs");
+            assert!(
+                !throttle.take_due(start + Duration::from_secs(3_600)),
+                "a clamped deadline must still be far in the future"
+            );
+        }
     }
 
     #[cfg(feature = "redis")]
@@ -17330,6 +17386,39 @@ mod uniqueness_concurrency_tests {
     }
 
     // ── unique key derivation ────────────────────────────────────────────────
+
+    #[test]
+    fn extreme_ttl_uniqueness_window_does_not_panic() {
+        // Regression (issue #1611): `#[job(unique_for = ...)]` compiles to a
+        // `JobUniquenessWindow::TtlMs(u64)` the app author controls, and
+        // `Instant + Duration::from_millis(ms)` panics when the sum is not
+        // representable. A pathological window must clamp to a far-future
+        // expiry (i.e. "holds effectively forever") rather than panic inside
+        // the enqueue path.
+        let coordination = LocalJobCoordination::default();
+
+        for ms in [u64::MAX, u64::MAX / 2] {
+            let key = format!("k-{ms}");
+            assert!(
+                coordination.try_acquire_unique(
+                    "job",
+                    &key,
+                    "job-1",
+                    JobUniquenessWindow::TtlMs(ms)
+                ),
+                "the first holder always acquires the key"
+            );
+            assert!(
+                !coordination.try_acquire_unique(
+                    "job",
+                    &key,
+                    "job-2",
+                    JobUniquenessWindow::TtlMs(ms)
+                ),
+                "a clamped TTL hold must still be unexpired, so duplicates coalesce"
+            );
+        }
+    }
 
     #[test]
     fn default_unique_key_is_stable_for_equal_args_regardless_of_field_order() {
