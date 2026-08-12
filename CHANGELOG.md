@@ -1729,6 +1729,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/pre-push-check.sh` now runs the gate and the gated-features clippy
   lane. CI lints the `inbound-mail`/`inbound-mailgun`/`inbound-ses`/`storage`
   features and runs the inbound-mail test suites. [no-plugin]
+- **panic gate:** hardened `scripts/check-panic-gate.sh` against a set of
+  reviewer-confirmed bypasses that had passed both the script and `cargo clippy
+  -- -D warnings` while shipping a production panic (#1611). Header validation is
+  now structural (the block must open *exactly* `#![cfg_attr(not(test), deny(`
+  after comment/whitespace stripping), so a widened `all(not(test), any())`
+  predicate or a `not(test)` living only in a comment no longer passes. A new
+  tree-wide inner-suppression scan rejects any `#![allow(…)]`/`#![expect(…)]`
+  (including the `cfg_attr(…, allow(…))` form) that re-permits a gated lint or a
+  blanket group (`restriction`/`all`/`pedantic`/`nursery`) across **every** `*.rs`
+  under the scan roots — closing the unmarked-submodule hole — while exempting
+  `#[cfg(test)]` scopes; the scan roots now include the sibling framework crates
+  (`autumn-admin-plugin`, `autumn-media-plugin`, `autumn-storage-s3`,
+  `autumn-cache-redis`). Per-site allows must now carry a **non-empty** reason,
+  and the feature-reachability check only counts an *enforcing* CI clippy lane
+  (`-p autumn-web` + `-D warnings`, not commented out), so a stubbed lane can no
+  longer fake coverage. The `--self-test` suite grows to 34 cases, one per bypass.
+  CONTRIBUTING.md documents the enforced-subset scoping (the manifest is an
+  incremental subset of the request path, not the whole of it) and the
+  `macro_rules!` expansion blind spot the gate cannot see. [no-plugin]
 - **inbound_mail:** `compute_mailgun_signature` delegates to
   `security::config::hmac_sha256_hex` (output byte-identical); removed a dead
   re-parse in the SNS certificate DER reader (#1611). [no-plugin]

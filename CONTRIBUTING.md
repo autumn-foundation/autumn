@@ -11,7 +11,7 @@ cross-package break is caught locally instead of on the PR:
 
 It mirrors CI's always-on `lint` + `test` jobs (`.github/workflows/ci.yml`) —
 `./scripts/check-panic-gate.sh` (the [#1611][issue-1611] request-path panic
-gate; first because it needs no toolchain and finishes in about a second),
+gate; first because it needs no toolchain and finishes in a couple of seconds),
 `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
 warnings`, a `--lib` clippy run over the gated request-path features, a
 **compile-only** `cargo test --workspace --no-run`, and a
@@ -135,6 +135,23 @@ the 30 files listed in the `REQUEST_PATH_MODULES` array in
 `scripts/check-panic-gate.sh`, each entry carrying the Cargo feature that gates
 its `mod` declaration.
 
+**Honest scoping — the manifest is the *enforced* subset, not the whole request
+path.** The 30 modules are the files the gate enforces today, not a claim that
+they are the *only* per-request code. Other unambiguously per-request or
+framework-owned modules are **not yet gated** and still contain production-path
+panics — known examples include `router.rs`, `etag.rs`, `security/rate_limit.rs`,
+`security/headers.rs`, `sse.rs`, and the `csrf` / `negotiate` / `range` /
+`validation` / `auth` seams, plus the sibling plugin crates
+(`autumn-media-plugin`, `autumn-storage-s3`, `autumn-cache-redis`,
+`autumn-admin-plugin`). The manifest is deliberately **incremental**: it grows
+monotonically and never shrinks (enforced by `MODULE_COUNT_FLOOR`), and the
+invariant is being burned down toward full request-path coverage one audited
+batch at a time. This staged rollout is the scoping [#1611][issue-1611] accepted
+(its own "one-time audit / Tier-M" framing calls for an incremental manifest
+rather than a big-bang flip); do not read a module's absence from the list as a
+promise that it is panic-free. Adding one of the ungated modules above — after
+auditing and fixing its panics — is exactly the expected follow-up.
+
 Explicitly **exempt** surfaces (a panic there cannot take down a live request):
 
 - `#[cfg(test)]` code, benches, and examples;
@@ -148,13 +165,27 @@ Explicitly **exempt** surfaces (a panic there cannot take down a live request):
   request-path logic must stay a thin shim that **delegates to a gated runtime
   function** in `autumn-web`; do not inline fallible parsing or arithmetic into
   the tokens a macro emits, where nothing will ever lint it.
+- **`macro_rules!` expansions** are a blind spot the gate *cannot* close:
+  clippy suppresses lints inside a macro expansion, so a `panic!`/`.unwrap()`
+  written in a `macro_rules!` body — even one defined in an ungated module and
+  *invoked from* a gated one — produces no diagnostic on the gated module. A
+  request-path module therefore **must not invoke a local panic-expanding macro**
+  on its production path; a macro that can expand to a panic must itself expand
+  to a call into a gated runtime function that carries the invariant. There is no
+  script check for this (the expansion is invisible at the source level), so it
+  is a review responsibility — treat a `macro_rules!` that hides an `unwrap`,
+  `expect`, `panic!`, or `unreachable!` used on the request path as a gate escape.
 
 ### What the gate checks
 
 Each gated module carries a header that opts its **production** target into the
-panic-class clippy denials. Copy it verbatim — this is the rustfmt-normalized
-form, and `scripts/check-panic-gate.sh` requires the **complete** set of nine
-lints, not a subset:
+panic-class clippy denials. Copy the `#![cfg_attr(…)]` block verbatim — this is
+the rustfmt-normalized form, and `scripts/check-panic-gate.sh` requires the
+**complete** set of nine lints, not a subset. (The `// autumn-panic-gate:` marker
+line's prose may read "request-path **crate**" for a crate-level header — e.g.
+`autumn-search/src/lib.rs` — versus "request-path **module**" for a module-level
+one; the script only keys on the `autumn-panic-gate:` token, so either wording is
+fine.)
 
 ```rust
 // autumn-panic-gate: request-path module — production code path must be panic-free.
@@ -188,26 +219,44 @@ in the CI `lint` job (same workflow as `fmt`/`clippy`, no new services):
   default-feature run never even compiles; and
 - `scripts/check-panic-gate.sh` verifies the manifest itself.
 
-That last script is the gate on the gate, and it checks more than "the file still
-exists":
+That last script is the gate on the gate. Because the header is only worth as
+much as clippy's ability to *see* it, the script is built to close the ways a
+production panic could ship while both it and `cargo clippy -- -D warnings` stay
+green:
 
 - every manifest module exists, carries the `autumn-panic-gate:` marker, and the
   marker is **immediately followed** by its `#![cfg_attr(…)]` header — a marker
   floating free in a doc comment or in test code proves nothing, and an unrelated
   `cfg_attr` earlier in the file cannot stand in for the gate;
-- the header is terminated and lists all nine lints;
-- **anti-spoof**: no inner attribute (`#![…]`) anywhere in the module may combine
-  `allow(` with a gated lint — a module-wide inner allow would silently defeat the
-  deny while leaving it in place to read;
-- every per-site `#[allow(<gated lint>…)]` carries a `reason = "…"`;
-- **reverse manifest**: every `*.rs` file under `autumn/src` and `autumn-search/src`
-  that carries the marker is listed in `REQUEST_PATH_MODULES` (a module gated
-  in-file but missing from the manifest is unchecked — this is how `nested_form.rs`
-  drifted out);
+- **structural header shape**: after stripping `//` comments and whitespace, the
+  header must open *exactly* `#![cfg_attr(not(test), deny(` and list all nine
+  lints. A widened predicate like `all(not(test), any())` (whose deny never
+  compiles), a `not(test)` that lives only in a comment, or a lint named only in
+  a comment are all rejected — a plain substring check would wave them through;
+- **anti-spoof, tree-wide**: no inner attribute — `#![allow(…)]`, `#![expect(…)]`,
+  or the `#![cfg_attr(…, allow(…))]` form — may re-permit a gated lint *or* a
+  blanket lint group (`clippy::restriction`/`all`/`pedantic`/`nursery`) that
+  contains one. This scan runs over **every** `*.rs` under the scan roots, not
+  just manifest entries, so an unmarked submodule of a gated module (e.g. a
+  `helpers.rs` with a module-level `#![allow(clippy::unwrap_used)]`) cannot slip a
+  suppression past both the manifest and the reverse-manifest check. Inner allows
+  inside a `#[cfg(test)]` scope are exempt (that is where a module's own tests
+  legitimately allow them);
+- every per-site **outer** `#[allow(<gated lint>…)]` carries a **non-empty**
+  `reason = "…"` (`reason = ""` does not count);
+- **reverse manifest**: every marker-carrying `*.rs` under the scan roots is listed
+  in `REQUEST_PATH_MODULES` (a module gated in-file but missing from the manifest
+  is unchecked — this is how `nested_form.rs` drifted out). The scan roots are
+  `autumn/src`, `autumn-search/src`, and the four sibling framework crates
+  (`autumn-admin-plugin`, `autumn-media-plugin`, `autumn-storage-s3`,
+  `autumn-cache-redis`); `autumn-cli` and `autumn-macros` are exempt and not
+  scanned;
 - the manifest never shrinks below `MODULE_COUNT_FLOOR`;
 - **feature reachability**: a module gated behind a non-default Cargo feature must
-  have that feature enabled by one of `ci.yml`'s `cargo clippy` invocations,
-  otherwise its deny block is never compiled and the gate is decorative there.
+  have that feature enabled by an **enforcing** `ci.yml` clippy lane — one that is
+  not commented out and carries both `-p autumn-web` and `-D warnings` — otherwise
+  its deny block is never compiled and the gate is decorative there. A
+  commented-out or non-deny lane does not count, so it cannot fake reachability.
 
 The last one has exactly one exemption today, spelled out in the script's
 `FEATURE_LINT_EXEMPT` array: `middleware/trace_context.rs` is
@@ -224,9 +273,10 @@ the same scrutiny as deleting a lint.
 
 Run it locally with `./scripts/check-panic-gate.sh` — the default invocation runs
 its own `--self-test` (synthetic fixtures in a temp dir, asserting the checker
-still *fails* on each spoof it claims to catch) before checking the real tree, and
-both legs together take about a second. `./scripts/pre-push-check.sh` runs it as
-its first step, alongside the gated-features clippy run.
+still *fails* on each spoof it claims to catch, including the widened-predicate,
+inner-`expect`, group-allow, and unmarked-submodule bypasses) before checking the
+real tree, and both legs together take a couple of seconds. `./scripts/pre-push-check.sh`
+runs it as its first step, alongside the gated-features clippy run.
 
 ### Falsifying the gate (AC1)
 

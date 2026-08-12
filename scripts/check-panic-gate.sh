@@ -5,34 +5,46 @@
 # indexing_slicing/string_slice/arithmetic_side_effects) on the production code
 # path via `cfg_attr(not(test), …)`.
 #
-# This script guards the *manifest and the header shape*: it fails if a gated
-# module is missing, has lost or weakened its gate header, spoofs it with a
-# module-wide `allow`, drifted out of the manifest, or is gated behind a Cargo
-# feature CI's clippy never enables (so the deny block would never compile).
-# The actual panic detection is performed by `cargo clippy` in the same `lint`
-# job — this script makes sure that clippy run can still see the denials.
+# This script guards the *manifest and the header shape*, and — crucially — the
+# absence of any module-wide escape hatch that would let a production panic ship
+# while `cargo clippy -- -D warnings` stays green. The actual panic detection is
+# performed by clippy in the same `lint` job; this script keeps that clippy run
+# able to see the denials in the first place.
 #
 # WHAT IT CHECKS
 #   1. Every manifest module exists and carries the `autumn-panic-gate:` marker.
 #   2. The marker is IMMEDIATELY followed (blank/comment lines aside) by the
-#      `#![cfg_attr(` gate header, and THAT block is the one validated — a
-#      marker floating free of a header, or an unrelated `cfg_attr` earlier in
-#      the file, cannot stand in for the gate.
-#   3. The header block is terminated, says `not(test)` + `deny(`, and lists
-#      every lint in REQUIRED_PANIC_LINTS (the COMPLETE set, not a subset).
-#   4. Anti-spoof: no INNER attribute (`#![…]`) anywhere in a gated module may
-#      combine `allow(` with a required lint — a module-wide inner allow would
-#      silently defeat the deny. Per-site OUTER `#[allow(…)]` stays legal.
-#   5. Per-site allow hygiene: an outer `#[allow(<required lint>…)]` must carry
-#      a `reason = "…"` in the same attribute.
-#   6. Reverse manifest: every `*.rs` file under the scanned source roots that
-#      carries the marker must be listed in the manifest (closes the drift hole
-#      where a module was gated in-file but never added to this list).
+#      `#![cfg_attr(` gate header, and THAT block is the one validated.
+#   3. STRUCTURAL header shape: after stripping `//` comments and all whitespace,
+#      the header must open EXACTLY `#![cfg_attr(not(test),deny(` — a widened
+#      predicate like `all(not(test), any())` (whose deny never compiles) or a
+#      `not(test)` that lives only in a comment therefore fail. The block must
+#      carry no `allow(`/`expect(`/`warn(` of its own, and must list every lint
+#      in REQUIRED_PANIC_LINTS (the COMPLETE set, not a subset).
+#   4. Tree-wide inner-suppression scan: NO inner attribute (`#![allow(…)]` or
+#      `#![expect(…)]`, including the `cfg_attr(…, allow(…))` form) anywhere under
+#      the scan roots may re-permit a required lint OR a blanket lint group
+#      (`clippy::restriction|all|pedantic|nursery`). This runs over EVERY `*.rs`
+#      under the roots — not just manifest entries — so an unmarked submodule of a
+#      gated module cannot slip a module-wide allow past both the manifest and the
+#      reverse-manifest check. Attributes inside a `#[cfg(test)]` scope are
+#      exempt (that is where a gated module's own tests legitimately allow them).
+#   5. Per-site allow hygiene: an OUTER `#[allow(<required lint>…)]` in a gated
+#      module must carry a NON-EMPTY `reason = "…"`.
+#   6. Reverse manifest: every marker-carrying `*.rs` under the scan roots must be
+#      listed in the manifest (closes the in-file-gated-but-unlisted drift hole).
 #   7. Module-count floor: the manifest may not shrink below MODULE_COUNT_FLOOR.
-#   8. Feature reachability: a module gated behind a non-default Cargo feature
-#      must have that feature enabled by one of ci.yml's `cargo clippy`
-#      invocations, otherwise its deny block is never compiled and the gate is
-#      decorative.
+#   8. Feature reachability: a module gated behind a non-default Cargo feature must
+#      have that feature enabled by an ENFORCING ci.yml clippy lane (one that is
+#      not commented out and carries both `-p autumn-web` and `-D warnings`),
+#      otherwise its deny block is never compiled. The single knowing exception
+#      (telemetry-otlp) is declared in FEATURE_LINT_EXEMPT and announced on every
+#      run; that list is itself validated so it cannot rot into a silent hole.
+#
+# NOT covered (documented in CONTRIBUTING.md "Request-path panic gate"): panics
+# that reach a gated module only through a `macro_rules!` expansion, because
+# clippy suppresses lints inside macro expansions and no source-level gate can
+# see them. Request-path modules must not invoke panic-expanding local macros.
 #
 # Called from the `lint` job in ci.yml. Run locally with:
 #
@@ -42,7 +54,8 @@
 #
 # The default invocation runs the self-test FIRST so a refactor that silently
 # defangs this script fails here rather than years later on a real regression.
-# Both legs together stay well under a second — no toolchain, no network.
+# Both legs together run in a couple of seconds — no toolchain, no network
+# (the `--check-only` real pass alone is about a second and a half).
 
 set -euo pipefail
 
@@ -110,9 +123,9 @@ REQUEST_PATH_MODULES=(
 # cannot quietly shrink the gate's surface.
 MODULE_COUNT_FLOOR=30
 
-# Gated modules whose feature is KNOWINGLY not enabled by any CI clippy lane,
-# as `<path>:<feature>`. Their headers are real but unenforced: the deny block
-# is never compiled, so clippy cannot fail on a panic-class site there.
+# Gated modules whose feature is KNOWINGLY not enabled by any enforcing CI clippy
+# lane, as `<path>:<feature>`. Their headers are real but unenforced: the deny
+# block is never compiled, so clippy cannot fail on a panic-class site there.
 #
 # This list exists so that hole is *visible and reviewed* rather than hidden by
 # mislabelling the module as `default`. The check prints a NOTE for every entry
@@ -135,10 +148,16 @@ FEATURE_LINT_EXEMPT=(
 )
 
 # What the checks below actually read; the self-test points it at its own list.
-GATE_FEATURE_EXEMPT=("${FEATURE_LINT_EXEMPT[@]}")
+# Guarded expansion so an emptied list is safe under `set -u` on bash < 4.4.
+GATE_FEATURE_EXEMPT=(${FEATURE_LINT_EXEMPT[@]+"${FEATURE_LINT_EXEMPT[@]}"})
 
-# Source roots swept by the reverse-manifest check.
-SCAN_DIRS="autumn/src,autumn-search/src"
+# Source roots swept by the reverse-manifest and inner-suppression scans. The
+# request-path modules live in autumn/src + autumn-search/src, but a module-wide
+# panic-lint allow anywhere in a library crate that ships on/near the request
+# path is a hole, so the sibling framework crates are swept too. `autumn-cli`
+# (an operator tool) and `autumn-macros` (compile-time proc-macro internals) are
+# deliberately EXEMPT and absent here.
+SCAN_DIRS="autumn/src,autumn-search/src,autumn-admin-plugin/src,autumn-media-plugin/src,autumn-storage-s3/src,autumn-cache-redis/src"
 
 # Read-only inputs for the feature-reachability check.
 CI_WORKFLOW=".github/workflows/ci.yml"
@@ -162,6 +181,11 @@ REQUIRED_PANIC_LINTS=(
   clippy::arithmetic_side_effects
 )
 
+# Blanket clippy lint-group tokens. Our nine lints all live in the `restriction`
+# group; allowing any of these groups module-wide re-permits them wholesale, so
+# an inner allow/expect of a group is as much a spoof as naming the lint.
+LINT_GROUPS=(restriction all pedantic nursery)
+
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
@@ -169,9 +193,9 @@ REQUIRED_PANIC_LINTS=(
 # Lint tokens are matched with a trailing non-identifier guard so `clippy::panic`
 # is not satisfied by `clippy::panic_in_result_fn`, nor `clippy::todo` by
 # `clippy::todos`. Matching happens with bash's own `=~` rather than a grep
-# subprocess: the per-site allow scan walks every attribute of every gated
-# module (inbound_mail.rs alone has hundreds), and a subshell per lint per
-# attribute is the difference between a snappy gate and a sluggish one.
+# subprocess: the hot paths walk every attribute of every gated module, and a
+# subshell per lint per attribute is the difference between a snappy gate and a
+# sluggish one.
 LINT_BOUNDARY='([^A-Za-z0-9_]|$)'
 
 # One alternation over the whole required set, used as a cheap pre-filter
@@ -185,12 +209,33 @@ build_any_lint_regex() {
 }
 ANY_REQUIRED_LINT_RE="$(build_any_lint_regex)"
 
-# Print the gate header block of $1: the `#![cfg_attr(…)]` attribute that
-# IMMEDIATELY follows the `autumn-panic-gate:` marker (only blank lines and the
-# marker's own `//` comment block may sit between them). Anchoring to the marker
-# — rather than grabbing the file's first `cfg_attr` — is what stops a
-# `#![cfg_attr(docsrs, …)]` above the header, or a marker buried in a doc
-# comment or in test code, from passing for the gate.
+# The token set the tree-wide inner-suppression scan rejects: every required
+# lint PLUS the blanket groups. Emitted as an awk-ready ERE.
+build_suppression_token_regex() {
+  local joined="" lint grp
+  for lint in "${REQUIRED_PANIC_LINTS[@]}"; do
+    joined+="${joined:+|}${lint#clippy::}"
+  done
+  for grp in "${LINT_GROUPS[@]}"; do
+    joined+="|$grp"
+  done
+  printf 'clippy::(%s)([^A-Za-z0-9_]|$)' "$joined"
+}
+SUPPRESSION_TOKEN_RE="$(build_suppression_token_regex)"
+
+# A non-empty reason string on a per-site allow: `reason = "…"` with at least one
+# character inside the quotes. `reason = ""` does not satisfy it.
+NONEMPTY_REASON_RE='reason[[:space:]]*=[[:space:]]*"[^"]+"'
+
+# Print the STRUCTURALLY NORMALIZED gate header of $1: the `#![cfg_attr(…)]`
+# attribute that IMMEDIATELY follows the `autumn-panic-gate:` marker (only blank
+# lines and the marker's own `//` comment block may sit between them), with its
+# `//` comments stripped and ALL whitespace removed. Anchoring to the marker —
+# rather than grabbing the file's first `cfg_attr` — is what stops a
+# `#![cfg_attr(docsrs, …)]` above the header, or a marker buried in a doc comment
+# or in test code, from passing for the gate. Normalizing in the same pass (so a
+# lint or a `not(test)` that appears only in a `//` comment does not count) keeps
+# check_module to a single subprocess per module.
 #
 # Exit codes: 0 ok, 3 no marker, 4 marker not adjacent to a header,
 # 5 header opener never terminated, 6 marker but no header before EOF.
@@ -207,12 +252,15 @@ gate_header_block() {
       started = 1
     }
     started {
-      buf = buf $0 ORS
-      t = $0
+      line = $0
+      sub(/\/\/.*/, "", line)        # strip // comment before anything else
+      t = line
       gsub(/"[^"]*"/, "", t)         # brackets inside string literals do not count
       depth += gsub(/\[/, "[", t)
       depth -= gsub(/\]/, "]", t)
-      if (depth <= 0) { printf "%s", buf; rc = 0; exit }
+      gsub(/[[:space:]]/, "", line)  # remove all whitespace
+      norm = norm line
+      if (depth <= 0) { printf "%s", norm; rc = 0; exit }
     }
     END {
       if (!seen)          { rc = 3 }
@@ -262,18 +310,29 @@ attr_blocks() {
   ' "$1"
 }
 
-# Print (one per line) every Cargo feature named by a `cargo clippy … --features
-# "…"` invocation in the workflow file $1. Any clippy lane counts: what matters
-# for the gate is that SOME `-D warnings` clippy run compiles the module with
-# its feature on.
+# Print (one per line) every Cargo feature named by an ENFORCING `cargo clippy`
+# lane in the workflow file $1. A lane counts only if it is not a YAML comment
+# and carries BOTH `-p autumn-web` and `-D warnings` — otherwise a commented-out,
+# wrong-package, or non-deny lane could make a feature look linted when no error
+# would ever fire, hiding a real hole (and, worse, force deletion of an honest
+# FEATURE_LINT_EXEMPT entry). One awk pass (this runs on every gate_check).
 ci_clippy_features() {
-  grep -oE 'cargo clippy .*--features "[^"]+"' "$1" \
-    | grep -oE -- '--features "[^"]+"' \
-    | sed -E 's/--features "//; s/"$//' \
-    | tr ',' '\n' \
-    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
-    | sed '/^$/d' \
-    | sort -u || true
+  awk '
+    /^[[:space:]]*#/ { next }                               # skip YAML comment lines
+    /cargo clippy/ && /-p autumn-web/ && /-D warnings/ {
+      s = $0
+      while (match(s, /--features "[^"]+"/)) {
+        f = substr(s, RSTART + 12, RLENGTH - 13)            # inside the quotes
+        n = split(f, arr, ",")
+        for (i = 1; i <= n; i++) {
+          g = arr[i]
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", g)
+          if (g != "") print g
+        }
+        s = substr(s, RSTART + RLENGTH)
+      }
+    }
+  ' "$1" | sort -u || true
 }
 
 # Print (one per line) the crate's default feature set from the Cargo manifest $1.
@@ -292,11 +351,16 @@ cargo_default_features() {
 # ---------------------------------------------------------------------------
 
 # check_module <file> <path-for-messages>
+#
+# Validates the gate header shape and the per-site OUTER allow hygiene of one
+# manifest module. Module-wide INNER suppressions are NOT judged here — they are
+# caught tree-wide by check_inner_suppressions so an unmarked submodule cannot
+# escape — so this loop simply skips inner attributes.
 check_module() {
   local file="$1" label="$2"
-  local block rc=0
+  local norm rc=0
 
-  block="$(gate_header_block "$file")" || rc=$?
+  norm="$(gate_header_block "$file")" || rc=$?
   case "$rc" in
     0) ;;
     3) die "missing gate marker 'autumn-panic-gate:' in $label" ;;
@@ -310,28 +374,39 @@ check_module() {
     *) die "internal: could not read the gate header of $label (awk exit $rc)" ;;
   esac
 
-  if ! grep -q 'not(test)' <<<"$block" || ! grep -q 'deny(' <<<"$block"; then
-    die "missing gate deny header opener '#![cfg_attr(not(test), deny(' in $label"
+  # Structural shape: gate_header_block already stripped comments + whitespace,
+  # so the normalized header must OPEN exactly `#![cfg_attr(not(test),deny(`. A
+  # substring test for 'not(test)' and 'deny(' is not enough —
+  # `#![cfg_attr(all(not(test), any()), deny(…))]` would pass it while `any()`
+  # keeps the deny from ever compiling, and a `not(test)` sitting only in a `//`
+  # comment would pass it too.
+  local want='#![cfg_attr(not(test),deny('
+  [[ "${norm:0:${#want}}" == "$want" ]] \
+    || die "the gate header in $label does not open exactly '#![cfg_attr(not(test), deny(…'.
+  After stripping comments and whitespace it began: '${norm:0:48}…'. A widened cfg
+  predicate (e.g. all(not(test), any())) makes the deny block never compile, and a
+  'not(test)' that appears only in a comment does not gate anything. Use the header
+  verbatim from CONTRIBUTING.md."
+  # The block must deny only — no allow/expect/warn smuggled beside the deny.
+  if [[ "$norm" == *"allow("* || "$norm" == *"expect("* || "$norm" == *"warn("* ]]; then
+    die "the gate header in $label contains an allow(/expect(/warn( — the deny block must
+  deny only. Justify a site with a narrowly-scoped outer #[allow(…, reason = \"…\")] instead."
   fi
-  # An `allow(` sharing the gate's own cfg_attr would re-permit what the block
-  # next to it denies.
-  if grep -q 'allow(' <<<"$block"; then
-    die "the gate header in $label contains an 'allow(' — the deny block must deny only.
-  Justify a site with a narrowly-scoped outer #[allow(…, reason = \"…\")] instead."
-  fi
-  # Require every canonical panic lint by its fully-qualified token, matched
-  # WITHIN the extracted deny block so no gated module can quietly drop one from
-  # the header while a per-site `#[allow(...)]` keeps the token alive elsewhere.
+  # Require every canonical panic lint by its fully-qualified token, matched in
+  # the comment-stripped normalized header so a lint that appears only in a `//`
+  # comment cannot stand in for a lint dropped from the real deny list.
   local lint re
   for lint in "${REQUIRED_PANIC_LINTS[@]}"; do
     re="${lint}${LINT_BOUNDARY}"
-    [[ "$block" =~ $re ]] \
+    [[ "$norm" =~ $re ]] \
       || die "gate header in $label is missing required panic lint '$lint'"
   done
 
-  # Attribute-level checks over the whole file.
+  # Per-site OUTER allow hygiene: every #[allow(<required lint>…)] needs a
+  # non-empty reason. INNER attributes are handled tree-wide, so skip them here.
   local kind lineno text has_lint
   while IFS=$'\t' read -r kind lineno text; do
+    [[ "$kind" == OUTER ]] || continue
     [[ "$text" == *"allow("* ]] || continue
     [[ "$text" =~ $ANY_REQUIRED_LINT_RE ]] || continue
     has_lint=""
@@ -343,18 +418,92 @@ check_module() {
       fi
     done
     [[ -n "$has_lint" ]] || continue
-    if [[ "$kind" == INNER ]]; then
-      die "module-wide inner attribute at $label:$lineno allows '$has_lint':
-      $text
-  An inner #![…allow(…)] re-permits the lint for the WHOLE module and silently
-  defeats the gate header. Move it to the narrowest outer #[allow(…, reason = \"…\")]."
-    fi
-    if [[ "$text" != *"reason ="* ]]; then
-      die "the #[allow(…)] of '$has_lint' at $label:$lineno carries no 'reason = \"…\"':
+    [[ "$text" =~ $NONEMPTY_REASON_RE ]] \
+      || die "the #[allow(…)] of '$has_lint' at $label:$lineno carries no non-empty 'reason = \"…\"':
       $text
   Every panic-gate exception must state the invariant that makes it safe."
-    fi
   done < <(attr_blocks "$file")
+}
+
+# check_inner_suppressions <dir> <scan-dirs csv>
+#
+# Tree-wide: reject any module-wide inner suppression of a panic-gate lint. An
+# inner `#![allow(…)]` / `#![expect(…)]` (or the `#![cfg_attr(…, allow(…))]`
+# form) that names a required lint OR a blanket group re-permits it for the whole
+# module and beats the parent module's deny — and because it needs no marker and
+# no manifest entry, neither check_module nor the reverse-manifest scan would see
+# it in an unmarked submodule. Attributes inside a `#[cfg(test)]` scope are
+# exempt: that is where a gated module's own tests legitimately allow them.
+check_inner_suppressions() {
+  local dir="$1" scan_csv="$2"
+  local -a scan
+  IFS=',' read -r -a scan <<<"$scan_csv"
+
+  local -a files=()
+  mapfile -t files < <(find "${scan[@]/#/$dir/}" -name '*.rs' 2>/dev/null | sort)
+  [[ ${#files[@]} -gt 0 ]] || return 0
+
+  local hit
+  # awk emits `file<TAB>line<TAB>attr` for each offending inner suppression.
+  hit="$(awk -v BAD="$SUPPRESSION_TOKEN_RE" '
+    FNR == 1 { depth = 0; ntest = 0; pending = 0; inattr = 0; abuf = ""; adepth = 0; delete tat }
+    {
+      code = $0
+      sub(/\/\/.*/, "", code)   # strip line comment
+
+      # A #[cfg(test)] / #[cfg(all(test, …))] on this line arms the next brace as
+      # a test scope. (Wrapped cfg attrs are rare; rustfmt keeps them one-line.)
+      if (code ~ /#\[[[:space:]]*cfg\([[:space:]]*(all\([[:space:]]*)?test[[:space:],)]/) pending = 1
+
+      # Accumulate a (possibly multi-line) INNER attribute.
+      if (!inattr) {
+        a = code
+        sub(/^[[:space:]]+/, "", a)
+        if (a ~ /^#!\[/) { inattr = 1; astart = FNR; abuf = ""; adepth = 0 }
+      }
+      if (inattr) {
+        abuf = abuf " " code
+        t = code
+        gsub(/"[^"]*"/, "", t)
+        adepth += gsub(/\[/, "[", t)
+        adepth -= gsub(/\]/, "]", t)
+        if (adepth <= 0) {
+          flat = abuf
+          gsub(/[[:space:]]+/, " ", flat)
+          sub(/^ /, "", flat)
+          if (ntest == 0 && (flat ~ /allow\(/ || flat ~ /expect\(/) && flat ~ BAD)
+            printf "%s\t%d\t%s\n", FILENAME, astart, flat
+          inattr = 0
+        }
+      }
+
+      # Brace + test-scope tracking (attributes carry no { }, so counting their
+      # lines is a no-op).
+      n = length(code)
+      for (i = 1; i <= n; i++) {
+        c = substr(code, i, 1)
+        if (c == "{") {
+          depth++
+          if (pending) { tat[depth] = 1; ntest++; pending = 0 } else { tat[depth] = 0 }
+        } else if (c == "}") {
+          if (depth > 0) { if (tat[depth]) { ntest--; tat[depth] = 0 } depth-- }
+        }
+      }
+    }
+  ' "${files[@]}")"
+
+  if [[ -n "$hit" ]]; then
+    local f l a
+    IFS=$'\t' read -r f l a <<<"${hit%%$'\n'*}"
+    f="${f#"$dir"/}"
+    die "module-wide inner suppression at $f:$l re-permits a panic-gate lint:
+      $a
+  An inner #![allow(…)] / #![expect(…)] (or a cfg_attr wrapping one) applies to the
+  WHOLE module and beats the request-path deny — even in an unmarked submodule of a
+  gated module. Move it to the narrowest OUTER #[allow(…, reason = \"…\")] on the one
+  site that needs it, or fix the underlying panic. (Inner allows inside a
+  #[cfg(test)] scope are fine and are exempt.)"
+  fi
 }
 
 # check_reverse_manifest <dir> <scan-dirs csv> <module…>
@@ -391,10 +540,10 @@ check_reverse_manifest() {
 
 # check_feature_reachability <dir> <ci workflow> <cargo manifest> <module…>
 #
-# A module gated behind a feature no CI clippy run enables is never compiled
-# with its deny block, so the gate is decorative there. Hard failure by default,
-# because the failure mode is invisible: CI stays green while the module is
-# unguarded. The only way past it is an explicit entry in FEATURE_LINT_EXEMPT
+# A module gated behind a feature no enforcing CI clippy run enables is never
+# compiled with its deny block, so the gate is decorative there. Hard failure by
+# default, because the failure mode is invisible: CI stays green while the module
+# is unguarded. The only way past it is an explicit entry in FEATURE_LINT_EXEMPT
 # (see the comment on that array), which is announced on every run.
 #
 # Reads the GATE_FEATURE_EXEMPT array so the self-test can supply its own.
@@ -410,13 +559,13 @@ check_feature_reachability() {
   local ci_feats default_feats
   ci_feats="$(ci_clippy_features "$dir/$ci_file")"
   [[ -n "$ci_feats" ]] \
-    || die "found no 'cargo clippy … --features \"…\"' invocation in $ci_file — the
-  feature-reachability check cannot verify that feature-gated request-path modules
-  are linted at all."
+    || die "found no enforcing 'cargo clippy … -p autumn-web … --features \"…\" … -D warnings'
+  invocation in $ci_file — the feature-reachability check cannot verify that
+  feature-gated request-path modules are linted at all."
   default_feats="$(cargo_default_features "$dir/$cargo_toml")"
 
   # A feature is "linted" if it is on in a default-feature build or named by
-  # some CI clippy lane.
+  # some enforcing CI clippy lane.
   linted() {
     [[ "$1" == "default" ]] && return 0
     grep -qxF "$1" <<<"$default_feats" && return 0
@@ -437,9 +586,10 @@ check_feature_reachability() {
   An exemption for a module (or a feature) the manifest no longer has is dead weight —
   delete it."
     if linted "$ex_feat"; then
-      die "FEATURE_LINT_EXEMPT still exempts $ex_path, but '$ex_feat' IS now enabled by a
-  CI clippy lane (or is a default feature), so the module is enforced again. Delete the
-  FEATURE_LINT_EXEMPT entry — a stale exemption is how a temporary hole becomes permanent."
+      die "FEATURE_LINT_EXEMPT still exempts $ex_path, but '$ex_feat' IS now enabled by an
+  enforcing CI clippy lane (or is a default feature), so the module is enforced again.
+  Delete the FEATURE_LINT_EXEMPT entry — a stale exemption is how a temporary hole
+  becomes permanent."
     fi
   done
 
@@ -452,12 +602,12 @@ check_feature_reachability() {
   for a module built by a plain \`cargo clippy --workspace\`)"
     linted "$feat" && continue
     if grep -qxF "$entry" <<<"$(printf '%s\n' ${exempt[@]+"${exempt[@]}"})"; then
-      echo "panic-gate: NOTE — $path is gated behind '$feat', which no CI clippy lane" \
-        "enables, so its deny block is NOT enforced (documented in FEATURE_LINT_EXEMPT)."
+      echo "panic-gate: NOTE — $path is gated behind '$feat', which no enforcing CI clippy" \
+        "lane enables, so its deny block is NOT enforced (documented in FEATURE_LINT_EXEMPT)."
       continue
     fi
-    die "$path is gated behind the '$feat' cargo feature, but no 'cargo clippy … --features'
-  invocation in $ci_file enables it and it is not a default feature. Its
+    die "$path is gated behind the '$feat' cargo feature, but no enforcing 'cargo clippy …
+  --features' invocation in $ci_file enables it and it is not a default feature. Its
   #![cfg_attr(not(test), deny(…))] block is therefore NEVER compiled and the panic gate
   does not apply to it. Fix by adding '$feat' to the gated-features clippy step in
   $ci_file (installing any system deps that feature needs); if that is genuinely not
@@ -488,6 +638,7 @@ gate_check() {
   done
 
   check_reverse_manifest "$dir" "$scan_csv" "${modules[@]}"
+  check_inner_suppressions "$dir" "$scan_csv"
   check_feature_reachability "$dir" "$ci_file" "$cargo_toml" "${modules[@]}"
 
   echo "panic-gate: ${#modules[@]} request-path modules gated"
@@ -507,7 +658,7 @@ run_real_check() {
 self_test() {
   local tmp
   tmp="$(mktemp -d)"
-  # shellcheck disable=SC2064 -- expand now: $tmp is function-local.
+  # shellcheck disable=SC2064 # expand now: $tmp is function-local.
   trap "rm -rf '$tmp'" EXIT
   local pass=0 total=0
   # Shadow the real exemption list for the whole self-test (bash's dynamic
@@ -539,6 +690,11 @@ self_test() {
 EOF
   }
 
+  # A default enforcing ci.yml clippy lane (has -p autumn-web AND -D warnings).
+  default_ci() {
+    printf '        run: cargo clippy -p autumn-web --features "cifeat,other" --all-targets -- -D warnings\n'
+  }
+
   # A fixture root holds ONLY the module(s) a scenario is about: every negative
   # case must have exactly one marker-carrying file, so it cannot pass on some
   # other check's error (an early version seeded every root with a spare valid
@@ -548,8 +704,7 @@ EOF
     local dir="$1"
     mkdir -p "$dir/src" "$dir/.github/workflows"
     printf 'default = ["deffeat"]\n' >"$dir/Cargo.toml"
-    printf '        run: cargo clippy -p autumn-web --features "cifeat,other" --all-targets -- -D warnings\n' \
-      >"$dir/.github/workflows/ci.yml"
+    default_ci >"$dir/.github/workflows/ci.yml"
   }
 
   # Write a valid gated module at $1, optionally followed by extra body lines
@@ -632,7 +787,7 @@ EOF
   check_fail "unterminated header fails" "unterminated" \
     gate_check "$d4" "$wf" Cargo.toml 1 src src/unterminated.rs:default
 
-  # 5. Module-wide inner allow after the header (spoof).
+  # 5. Module-wide inner allow after the header (spoof) — caught tree-wide.
   local d5="$tmp/d5"; make_fixture "$d5"
   write_module "$d5/src/spoof.rs" <<'EOF'
 
@@ -640,7 +795,7 @@ EOF
 
 pub fn x() {}
 EOF
-  check_fail "inner #![allow] spoof after the header fails" "module-wide inner attribute" \
+  check_fail "inner #![allow] spoof after the header fails" "module-wide inner suppression" \
     gate_check "$d5" "$wf" Cargo.toml 1 src src/spoof.rs:default
 
   # 6. allow() smuggled into the gate's own cfg_attr block.
@@ -648,7 +803,7 @@ EOF
   write_module "$d6/src/inblock.rs" </dev/null
   sed -i 's/^        clippy::string_slice,$/        clippy::string_slice,\n    ),\n    allow(clippy::indexing_slicing/' \
     "$d6/src/inblock.rs"
-  check_fail "allow() inside the cfg_attr block fails" "contains an 'allow('" \
+  check_fail "allow() inside the cfg_attr block fails" "deny block must" \
     gate_check "$d6" "$wf" Cargo.toml 1 src src/inblock.rs:default
 
   # 7. Marker separated from the header by real code.
@@ -677,7 +832,7 @@ EOF
 #[allow(clippy::indexing_slicing)]
 pub fn x() {}
 EOF
-  check_fail "per-site #[allow] without a reason fails" "carries no 'reason" \
+  check_fail "per-site #[allow] without a reason fails" "non-empty 'reason" \
     gate_check "$d9" "$wf" Cargo.toml 1 src src/noreason.rs:default
 
   # 10. …and the same allow WITH a reason passes, even rustfmt-wrapped across
@@ -746,7 +901,7 @@ EOF
   with_exempt() {
     local list="$1"
     shift
-    # shellcheck disable=SC2206 -- deliberate word splitting of a space-separated list.
+    # shellcheck disable=SC2206 # deliberate word splitting of a space-separated list.
     GATE_FEATURE_EXEMPT=($list)
     gate_check "$@"
   }
@@ -782,6 +937,147 @@ EOF
   check_fail "exemption for an unlisted module fails" "not a REQUEST_PATH_MODULES entry" \
     with_exempt "src/gone.rs:unlinted-feat" \
     "$d21" "$wf" Cargo.toml 1 src src/good.rs:default
+
+  # ----- hardening bypasses (gate-integrity review) -----
+
+  # 22. Widened cfg predicate: all(not(test), any()) — deny never compiles.
+  local d22="$tmp/d22"; make_fixture "$d22"
+  {
+    valid_header | sed 's/^    not(test),$/    all(not(test), any()),/'
+    printf '\npub fn x() {}\n'
+  } >"$d22/src/widened.rs"
+  check_fail "widened cfg predicate (all(not(test), any())) fails" "does not open exactly" \
+    gate_check "$d22" "$wf" Cargo.toml 1 src src/widened.rs:default
+
+  # 23. not(test) only in a comment; the real predicate is `test`.
+  local d23="$tmp/d23"; make_fixture "$d23"
+  {
+    printf '// autumn-panic-gate: request-path module — production code path must be panic-free.\n'
+    printf '#![cfg_attr(\n    test, // really not(test) — honest, guv\n    deny(\n'
+    printf '        clippy::unwrap_used,\n        clippy::expect_used,\n        clippy::panic,\n'
+    printf '        clippy::unreachable,\n        clippy::todo,\n        clippy::unimplemented,\n'
+    printf '        clippy::indexing_slicing,\n        clippy::string_slice,\n'
+    printf '        clippy::arithmetic_side_effects,\n    )\n)]\n\npub fn x() {}\n'
+  } >"$d23/src/commented.rs"
+  check_fail "not(test) only in a comment fails" "does not open exactly" \
+    gate_check "$d23" "$wf" Cargo.toml 1 src src/commented.rs:default
+
+  # 24. Inner #![expect(…)] of required lints (expect, not allow) — tree-wide.
+  local d24="$tmp/d24"; make_fixture "$d24"
+  write_module "$d24/src/exp.rs" <<'EOF'
+
+#![expect(clippy::unwrap_used, clippy::indexing_slicing)]
+
+pub fn x() {}
+EOF
+  check_fail "inner #![expect] of required lints fails" "module-wide inner suppression" \
+    gate_check "$d24" "$wf" Cargo.toml 1 src src/exp.rs:default
+
+  # 25. Inner #![allow(clippy::restriction)] blanket group — tree-wide.
+  local d25="$tmp/d25"; make_fixture "$d25"
+  write_module "$d25/src/grp.rs" <<'EOF'
+
+#![allow(clippy::restriction)]
+
+pub fn x() {}
+EOF
+  check_fail "inner #![allow(clippy::restriction)] group fails" "module-wide inner suppression" \
+    gate_check "$d25" "$wf" Cargo.toml 1 src src/grp.rs:default
+
+  # 26. Unmarked submodule of a gated module carrying an inner allow: invisible
+  #     to both the manifest and the reverse-manifest scan (no marker), caught
+  #     tree-wide. The manifest module itself is clean.
+  local d26="$tmp/d26"; make_fixture "$d26"
+  write_module "$d26/src/good.rs" </dev/null
+  printf '#![allow(clippy::unwrap_used)]\n\npub fn helper() -> u8 { "1".parse().unwrap() }\n' \
+    >"$d26/src/helpers.rs"
+  check_fail "unmarked submodule inner allow fails" "module-wide inner suppression" \
+    gate_check "$d26" "$wf" Cargo.toml 1 src src/good.rs:default
+
+  # 27. Inner allow inside a #[cfg(test)] mod tests { … } is exempt (PASS).
+  local d27="$tmp/d27"; make_fixture "$d27"
+  write_module "$d27/src/good.rs" <<'EOF'
+
+pub fn x() {}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    #[test]
+    fn t() { let _: u8 = "1".parse().unwrap(); }
+}
+EOF
+  check_pass "inner allow inside #[cfg(test)] mod is exempt" \
+    gate_check "$d27" "$wf" Cargo.toml 1 src src/good.rs:default
+
+  # 28. A cfg_attr(feature = …, allow(dead_code)) inner attr (a real pattern in
+  #     job.rs) must NOT trip the tree-wide scan — dead_code is not a panic lint.
+  local d28="$tmp/d28"; make_fixture "$d28"
+  write_module "$d28/src/good.rs" <<'EOF'
+#![cfg_attr(feature = "sqlite", allow(dead_code))]
+
+pub fn x() {}
+EOF
+  check_pass "cfg_attr allow(dead_code) does not trip the scan" \
+    gate_check "$d28" "$wf" Cargo.toml 1 src src/good.rs:default
+
+  # 29. Empty reason string on a per-site allow is rejected.
+  local d29="$tmp/d29"; make_fixture "$d29"
+  write_module "$d29/src/empty.rs" <<'EOF'
+
+#[allow(clippy::indexing_slicing, reason = "")]
+pub fn x() {}
+EOF
+  check_fail "empty reason string fails" "non-empty 'reason" \
+    gate_check "$d29" "$wf" Cargo.toml 1 src src/empty.rs:default
+
+  # 30. A COMMENTED-OUT ci lane mentioning the exempt feature must not count as
+  #     linting it — the exemption stays valid and the NOTE still prints (PASS).
+  local d30="$tmp/d30"; make_fixture "$d30"
+  {
+    default_ci
+    printf '        # run: cargo clippy -p autumn-web --features "otlp" --all-targets -- -D warnings\n'
+  } >"$d30/.github/workflows/ci.yml"
+  write_module "$d30/src/good.rs" </dev/null
+  if [[ "$(with_exempt "src/good.rs:otlp" \
+      "$d30" "$wf" Cargo.toml 1 src src/good.rs:otlp 2>&1)" == *"NOTE"* ]]; then
+    record ok "commented-out ci lane does not count as linting the feature"
+  else
+    record no "commented-out ci lane does not count as linting the feature" "expected a PASS with NOTE"
+  fi
+
+  # 31. A clippy lane WITHOUT -D warnings does not count as enforcing.
+  local d31="$tmp/d31"; make_fixture "$d31"
+  printf '        run: cargo clippy -p autumn-web --features "softfeat" --all-targets\n' \
+    >"$d31/.github/workflows/ci.yml"
+  write_module "$d31/src/good.rs" </dev/null
+  check_fail "non-deny clippy lane does not count" "no enforcing" \
+    gate_check "$d31" "$wf" Cargo.toml 1 src src/good.rs:softfeat
+
+  # 32. A clippy lane WITHOUT -p autumn-web does not count either.
+  local d32="$tmp/d32"; make_fixture "$d32"
+  printf '        run: cargo clippy --workspace --features "wsfeat" --all-targets -- -D warnings\n' \
+    >"$d32/.github/workflows/ci.yml"
+  write_module "$d32/src/good.rs" </dev/null
+  check_fail "workspace-scoped clippy lane does not count" "no enforcing" \
+    gate_check "$d32" "$wf" Cargo.toml 1 src src/good.rs:wsfeat
+
+  # 33. The inner-suppression scan really is tree-wide: a suppression in a
+  #     SECOND scan root (not the manifest module's root) is still caught.
+  local d33="$tmp/d33"; make_fixture "$d33"
+  mkdir -p "$d33/other"
+  write_module "$d33/src/good.rs" </dev/null
+  printf '#![allow(clippy::panic)]\n\npub fn y() {}\n' >"$d33/other/sneaky.rs"
+  check_fail "suppression in a second scan root is caught" "module-wide inner suppression" \
+    gate_check "$d33" "$wf" Cargo.toml 1 src,other src/good.rs:default
+
+  # 34. A non-required inner allow (circuit_breaker.rs pattern) is fine (PASS).
+  local d34="$tmp/d34"; make_fixture "$d34"
+  write_module "$d34/src/good.rs" </dev/null
+  printf '#![allow(clippy::missing_panics_doc, clippy::items_after_statements)]\n\npub fn z() {}\n' \
+    >"$d34/src/adjacent.rs"
+  check_pass "non-required inner allow is fine" \
+    gate_check "$d34" "$wf" Cargo.toml 1 src src/good.rs:default
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]] || die "panic-gate self-test failed — the checker is not

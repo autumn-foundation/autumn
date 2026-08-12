@@ -59,9 +59,9 @@ step() {
 
 # --- 1. Request-path panic gate (#1611) --------------------------------------
 # Mirrors ci.yml `lint` job: `./scripts/check-panic-gate.sh`. Deliberately
-# FIRST: it needs no toolchain and finishes in well under a second, so a
-# dropped gate header, a manifest drift or a module-wide `allow` spoof is
-# reported before the multi-minute compile legs below start. The script runs
+# FIRST: it needs no toolchain and finishes in a couple of seconds, so a
+# dropped gate header, a manifest drift, or a module-wide `allow`/`expect` spoof
+# is reported before the multi-minute compile legs below start. The script runs
 # its own `--self-test` first, so a checker that has stopped catching things
 # fails here too.
 step "./scripts/check-panic-gate.sh   (self-test + manifest gate; no toolchain)"
@@ -122,7 +122,8 @@ cargo test --workspace --doc
 
 echo
 echo "pre-push-check: OK — workspace test targets compile clean, doctests pass."
-echo "note: steps 1-5 are COMPILE-ONLY; step 6 RUNS doctests (cheap: mostly"
+echo "note: step 1 (panic gate) needs no toolchain; steps 2-5 are COMPILE-ONLY;"
+echo "      step 6 RUNS doctests (cheap: mostly"
 echo "      no_run/ignore, no DB, and --doc never triggers the ~17GB trybuild run)."
 echo "      A bare \`cargo test --workspace\` (without --no-run / --doc) additionally"
 echo "      RUNS trybuild, expanding scratch by ~17GB — avoid it on a small disk."
