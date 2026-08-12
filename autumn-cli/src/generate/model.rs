@@ -247,7 +247,7 @@ fn plan_model_with_options_impl(
     // `generate scaffold Post` from a compile error to a planning error that an
     // existing test pins.
     if !for_revert {
-        validate_lock_version_field(&fields)?;
+        validate_lock_version_field(&fields, &options.defaults)?;
     }
     if !for_revert
         && lock_version_field(&fields).is_some()
@@ -1878,7 +1878,10 @@ pub fn is_lock_version_column(field: &Field) -> bool {
 /// # Errors
 /// Returns [`GenerateError::InvalidField`] when a field named `lock_version`
 /// is not a non-nullable `i32`/`i64`.
-pub fn validate_lock_version_field(fields: &[Field]) -> Result<(), GenerateError> {
+pub fn validate_lock_version_field(
+    fields: &[Field],
+    defaults: &[String],
+) -> Result<(), GenerateError> {
     let Some(field) = lock_version_field(fields) else {
         return Ok(());
     };
@@ -1909,6 +1912,38 @@ pub fn validate_lock_version_field(fields: &[Field]) -> Result<(), GenerateError
                  second row ever created. Drop the `unique` marker."
             ),
         });
+    }
+    // A seed the counter cannot be incremented from. The generated `UPDATE`
+    // evaluates `lock_version + 1` in SQL, and Postgres raises `integer out of
+    // range` rather than wrapping — so seeding at the column's maximum makes the
+    // FIRST update on every row a 500. Rejecting the seed is the only fix that
+    // keeps the emitted statement simple; see the note on `lock_bump` about why
+    // the generated SQL deliberately does not emulate the repository's
+    // `wrapping_add`.
+    let ceiling = if field.kind == FieldKind::I64 {
+        i64::MAX
+    } else {
+        i64::from(i32::MAX)
+    };
+    for default in defaults {
+        let Some((name, value)) = default.split_once('=') else {
+            continue;
+        };
+        if name.trim() != LOCK_VERSION_COLUMN {
+            continue;
+        }
+        if value.trim().parse::<i64>() == Ok(ceiling) {
+            return Err(GenerateError::InvalidField {
+                token: default.clone(),
+                reason: format!(
+                    "`{LOCK_VERSION_COLUMN}` cannot be seeded at {ceiling}, the largest value \
+                     `{ty}` can hold: the generated UPDATE increments the column in SQL, so the \
+                     first save on every row would fail with `integer out of range`. Seed a \
+                     lower value, or declare `{LOCK_VERSION_COLUMN}:i64` for more headroom.",
+                    ty = field.rust_type(),
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -5679,6 +5714,70 @@ autumn-web = \"0.3\"\n";
             .is_err(),
             "a malformed field list must still fail on the revert path"
         );
+    }
+
+    #[test]
+    fn a_lock_version_seeded_at_its_ceiling_is_rejected() {
+        // The generated UPDATE increments the column in SQL, and Postgres raises
+        // `integer out of range` rather than wrapping — verified against
+        // Postgres 16 — so seeding at the maximum makes the FIRST save on every
+        // row a 500, not a distant theoretical overflow.
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+            &ModelOptions {
+                defaults: vec!["lock_version=2147483647".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("2147483647") && msg.contains("i64"),
+            "the refusal must name the ceiling and the way out: {msg}"
+        );
+
+        // `i64` has its own, much higher ceiling.
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i64".into()],
+            "20260427000000",
+            &ModelOptions {
+                defaults: vec!["lock_version=9223372036854775807".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("9223372036854775807"),
+            "got: {err}"
+        );
+
+        // An i32 ceiling is fine on an i64 column, and any seed below the
+        // ceiling is fine on either — the counter can still be incremented.
+        for (ty, seed) in [
+            ("lock_version:i64", "lock_version=2147483647"),
+            ("lock_version:i32", "lock_version=2147483646"),
+            ("lock_version:i32", "lock_version=5"),
+        ] {
+            let tmp = project();
+            plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), ty.into()],
+                "20260427000000",
+                &ModelOptions {
+                    defaults: vec![seed.into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{ty} seeded {seed} must be accepted: {e}"));
+        }
     }
 
     #[test]

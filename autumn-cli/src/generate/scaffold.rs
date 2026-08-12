@@ -2549,6 +2549,19 @@ fn render_routes_file(
         // A scaffold whose every other column is transition-only (issue #1326)
         // has an empty `update_columns`, so the separator is conditional or the
         // emitted tuple would start with a stray comma.
+        //
+        // The bump is a plain SQL `+ 1`, which DIVERGES from the repository
+        // path's `wrapping_add(1)` at the column's ceiling: Postgres raises
+        // `integer out of range` where the Rust path would wrap to the minimum.
+        // That is deliberate. Wrapping a lock version is not obviously the safer
+        // behaviour — a wrapped counter can collide with a stale client holding
+        // the same value from a previous cycle, which is the exact failure this
+        // guard exists to prevent — and emulating it would put a `CASE WHEN` in
+        // every scaffolded update forever. Reaching the ceiling organically
+        // takes 2^31 saves of one row; `lock_version:i64` is the answer for a
+        // row that churns that hard. The one *reachable* way to hit it, seeding
+        // a `--default` at the maximum, is refused by
+        // `validate_lock_version_field`.
         let lock_bump = lock_version.map_or_else(String::new, |_| {
             let sep = if update_columns.is_empty() { "" } else { ", " };
             format!("{sep}{plural}::lock_version.eq({plural}::lock_version + 1)")

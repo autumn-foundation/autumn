@@ -108,7 +108,7 @@ pub fn plan_migration_with_options(
             // supplied, so rejecting `RemoveLockVersionFromPosts
             // lock_version:String` would block the very escape hatch the other
             // error messages point at.
-            super::model::validate_lock_version_field(&fields)?;
+            super::model::validate_lock_version_field(&fields, &[])?;
             // A field kind with no working diesel SQLite conversion (Uuid,
             // Attachment, Decimal) would leak an uncompilable column into the
             // generated SQLite app, so reject it here too — same guard as

@@ -811,7 +811,12 @@ autumn generate scaffold Post title:String body:Text lock_version:i32
   the JSON API path conflict-check too).
 - The **migration** declares it `NOT NULL DEFAULT 0` (`INTEGER` for
   `i32`, `BIGINT` for `i64`), since the INSERT never names it. Pass
-  `--default lock_version=<n>` to seed from a different base.
+  `--default lock_version=<n>` to seed from a different base (a seed at the
+  column's maximum is refused — the generated `UPDATE` increments in SQL, and
+  Postgres raises `integer out of range` rather than wrapping, so the first
+  save on every row would fail). A counter that reaches its ceiling
+  organically needs 2³¹ saves of one row; use `lock_version:i64` for anything
+  that churns that hard.
   `autumn generate migration AddLockVersionToPosts lock_version:i32`
   gets the same `DEFAULT 0`, so retrofitting an existing table also
   backfills its rows in one statement.
