@@ -324,6 +324,17 @@ function strip_inline_tags(text,   out) {
   return out
 }
 
+function is_definition_opener(text,   body, close_at) {
+  # `[label]:` with the destination possibly still to come on the next line.
+  # is_link_definition is the stricter question — does this line, on its own,
+  # render nothing — which is not the same as whether a definition starts here.
+  body = block_body(text)
+  if (substr(body, 1, 1) != "[") return 0
+  close_at = unescaped_index(body, "]", 2)
+  if (close_at < 3) return 0
+  return substr(body, close_at + 1, 1) == ":"
+}
+
 function is_link_definition(text,   body, close_at) {
   # `[label]: destination "title"` renders nothing at all, so a required
   # section holding only these is empty to a reader — which is the whole thing
@@ -782,25 +793,65 @@ collect_link_defs() {
   : >"$out"
   [[ -f "$src" ]] || return 0
   awk "$AWK_MARKDOWN_LIB"'
+    # A definition is `[label]: destination "optional title"`, and CommonMark
+    # lets it span up to three lines: the destination may sit below the label
+    # and the title below that. It is also all-or-nothing — a title that never
+    # closes means there is no definition, and the whole run renders as a
+    # paragraph. Collecting a truncated destination from such a line reported a
+    # link that does not exist.
+    #
+    # Lines are buffered until the definition either completes or is ruled out,
+    # which is what makes both of those cases decidable at all.
+    function flush_def(   dest, rest, ch, closer, sq, gap) {
+      if (pending == "") return
+      sq = sprintf("%c", 39)
+      rest = pending_rest
+      sub(/^[[:space:]]+/, "", rest)
+      if (rest == "") return                       # still waiting for a destination
+      if (substr(rest, 1, 1) == "<") {
+        if (index(rest, ">") == 0) { pending = ""; return }
+        dest = substr(rest, 2, index(rest, ">") - 2)
+        rest = substr(rest, index(rest, ">") + 1)
+      } else {
+        dest = rest
+        sub(/[[:space:]].*$/, "", dest)
+        rest = substr(rest, length(dest) + 1)
+      }
+      gap = (rest ~ /^[[:space:]]/)
+      sub(/^[[:space:]]+/, "", rest)
+      if (rest != "") {
+        # Whatever follows the destination can only be a title, and only with
+        # whitespace before it.
+        ch = substr(rest, 1, 1)
+        if (!gap || (ch != "\"" && ch != sq && ch != "(")) { pending = ""; return }
+        closer = ch == "(" ? ")" : ch
+        if (index(substr(rest, 2), closer) == 0) return   # title may continue below
+        rest = substr(rest, index(substr(rest, 2), closer) + 2)
+        if (rest ~ /[^[:space:]]/) { pending = ""; return }
+      }
+      if (dest != "") printf "%s\t%s\n", pending, dest
+      pending = ""
+    }
     {
       if (!md_in_fence) track_block_indent($0)
-      # Whether a paragraph was open *before* this line: a definition-shaped
-      # line continuing one is literal text and defines nothing.
       was_paragraph = md_paragraph_open
       visible = visible_text($0)
-      if (md_fence_hit || md_in_fence) next
-      if (was_paragraph) next
-      if (!is_link_definition(visible)) next
+      if (md_fence_hit || md_in_fence) { pending = ""; next }
       body = block_body(visible)
+      if (pending != "" && body ~ /[^[:space:]]/) {
+        pending_rest = pending_rest " " body
+        flush_def()
+        next
+      }
+      pending = ""
+      if (was_paragraph) next
+      if (!is_definition_opener(visible)) next
       close_at = unescaped_index(body, "]", 2)
-      label = substr(body, 2, close_at - 2)
-      dest = substr(body, close_at + 2)
-      sub(/^[[:space:]]+/, "", dest)
-      # Only the destination: a trailing title is metadata, not the target.
-      sub(/[[:space:]].*$/, "", dest)
-      if (dest ~ /^<.*>$/) dest = substr(dest, 2, length(dest) - 2)
-      if (label != "" && dest != "") printf "%s\t%s\n", label, dest
+      pending = substr(body, 2, close_at - 2)
+      pending_rest = substr(body, close_at + 2)
+      flush_def()
     }
+    END { flush_def() }
   ' "$src" >>"$out"
 }
 
@@ -991,10 +1042,15 @@ findings="$(
   # rule and still demand no guide, because nothing was ever counted as an
   # entry. Scoped to the explicit inline marker: a bare paragraph under a
   # `### Breaking Changes` heading is usually the intro to the list below it.
-  entry == "" &&
-  (tolower(strip_code_spans(visible)) ~ /\*\*breaking(:\*\*|\*\*:)/ ||
-   (breaking_heading && block_body(visible) ~ /[^[:space:]]/ &&
-    block_body(visible) !~ /^>/)) {
+  # Any ordinary paragraph is a candidate. flush_entry decides what it is: the
+  # marker makes it a declaration, the word "breaking" without one makes it an
+  # unmarked break, and prose with neither produces nothing at all. Restricting
+  # this to marked prose meant the lint never saw a paragraph, so a break
+  # described in prose was invisible to every check.
+  #
+  # Block quotes stay out: they carry this changelog\047s section notes, which
+  # are asides rather than entries.
+  entry == "" && block_body(visible) ~ /[^[:space:]]/ && block_body(visible) !~ /^>/ {
     entry_line = FNR
     entry_breaking_heading = breaking_heading
     entry = $0

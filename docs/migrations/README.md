@@ -96,7 +96,8 @@ reviewable act rather than a silent one.
 It fails when:
 
 - a changelog entry describes breaking something without the marker (so an
-  unmarked break cannot hide from the coverage check);
+  unmarked break cannot hide from the coverage check). Bullets and ordinary
+  paragraphs are both read — prose is not a way around the convention;
 - a section with a breaking entry has no guide at `docs/migrations/<version>.md`
   (or `next.md` for `## [Unreleased]`). A release candidate section
   (`## [0.7.0-rc.1]`) is gated against its release's guide, `0.7.0.md`;

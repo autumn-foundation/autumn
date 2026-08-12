@@ -5205,3 +5205,106 @@ fn migration_guide_gate_collects_consecutive_link_definitions() {
         gate_report(&output),
     );
 }
+
+// --- Review round 36: definition parsing, unmarked prose ------------------
+
+#[test]
+fn migration_guide_gate_rejects_a_definition_with_an_unterminated_title() {
+    // CommonMark creates no definition when the title never closes — the whole
+    // line renders as a paragraph. Truncating at the first whitespace recorded
+    // a destination that does not exist, so the reference above resolved to a
+    // link the reader never gets.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration guide][upgrade].\n\n\
+         [upgrade]: docs/migrations/0.7.0.md \"unterminated\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a malformed title means there is no definition at all",
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_a_definition_split_across_lines() {
+    // The destination may sit on the line below the label, and the title on
+    // the line below that. Both render as real links, so rejecting either
+    // blocks CI on valid markdown.
+    for tail in [
+        "[upgrade]:\n    docs/migrations/0.7.0.md\n",
+        "[upgrade]: docs/migrations/0.7.0.md\n\"why it broke\"\n",
+    ] {
+        let tmp = migration_gate_fixture("0.7.0");
+        write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            format!(
+                "# Changelog\n\n\
+                 ## [0.7.0] - 2026-09-01\n\n\
+                 ### Changed\n\n\
+                 - **db:** **Breaking:** renamed. See the [migration guide][upgrade].\n\n{tail}"
+            ),
+        )
+        .expect("changelog");
+
+        let output = run_migration_gate(tmp.path());
+        assert!(
+            output.status.success(),
+            "a definition may span lines\n{}",
+            gate_report(&output),
+        );
+    }
+}
+
+#[test]
+fn migration_guide_gate_lints_an_unmarked_break_in_a_plain_paragraph() {
+    // The unmarked-break lint only ever saw list items, so prose describing a
+    // break without the marker was never examined — the same shape of hole as
+    // marked paragraphs never becoming entries.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         This is a breaking API rename.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "prose describing a break without the marker must be caught\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_leaves_ordinary_prose_paragraphs_alone() {
+    // The counterpart: admitting paragraphs to the lint must not turn every
+    // sentence in the changelog into an entry demanding a guide.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         This release focuses on observability and developer experience.\n\n\
+         ### Changed\n\n\
+         - **api:** an addition.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "prose that describes no break declares nothing\n{}",
+        gate_report(&output),
+    );
+}
