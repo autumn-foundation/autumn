@@ -213,6 +213,23 @@ function expand_tabs(text,   out, i, n, ch, col) {
   return out
 }
 
+function is_thematic_break(text,   body, ch, n, i, c) {
+  # Three or more `-`, `*` or `_`, spaces permitted between them and nothing
+  # else on the line. It ends the block before it, list item included.
+  body = block_body(text)
+  sub(/[[:space:]]+$/, "", body)
+  ch = substr(body, 1, 1)
+  if (ch != "-" && ch != "*" && ch != "_") return 0
+  n = 0
+  for (i = 1; i <= length(body); i++) {
+    c = substr(body, i, 1)
+    if (c == ch) { n++; continue }
+    if (c == " " || c == "\t") continue
+    return 0
+  }
+  return n >= 3
+}
+
 function marker_interrupts(body,   n, ch) {
   # A bullet may interrupt a paragraph; an ordered marker may only when its
   # number is 1. So after a marked paragraph `2.` is a lazy continuation and
@@ -419,33 +436,63 @@ function is_orphan_title(text,   body, first, last, sq) {
   return (first == "\"" || first == sq) && last == first
 }
 
-function is_standalone_tag(text,   n, i, ch, quote, sq) {
-  # A complete tag alone on its line. Attributes are optional and so are their
-  # values: `<x-widget>`, `<x-widget disabled>` and `<x-widget title=">">` are
-  # all complete tags and all open a raw block.
+function is_standalone_tag(text,   n, i, ch, sq, closing) {
+  # A *well-formed* complete tag alone on its line, which is what CommonMark
+  # requires of a type-7 opener. Accepting anything tag-shaped let `<x =>`
+  # open a raw block and swallow the entry beneath it, though it renders as
+  # literal text.
   #
-  # Scanned rather than pattern-matched, because a quoted attribute value may
-  # contain `>` without ending the tag, and because a valueless attribute is
-  # neither an attribute-free tag nor a `name=value` one — the two shapes the
-  # earlier patterns between them recognised.
+  #   open:     < name attribute* space* /? >
+  #   closing:  </ name space* >
+  #   name:     letter, then letters, digits or `-`
+  #   attribute: space+ name (space* = space* value)?
+  #   value:    unquoted, or single- or double-quoted
   sq = sprintf("%c", 39)
-  if (text !~ /^<\/?[a-zA-Z]/) return 0
   n = length(text)
-  quote = ""
-  for (i = 2; i <= n; i++) {
+  if (substr(text, 1, 1) != "<") return 0
+  i = 2
+  closing = 0
+  if (substr(text, i, 1) == "/") { closing = 1; i++ }
+  if (substr(text, i, 1) !~ /^[a-zA-Z]$/) return 0
+  while (i <= n && substr(text, i, 1) ~ /^[a-zA-Z0-9-]$/) i++
+  if (closing) {
+    while (i <= n && substr(text, i, 1) ~ /^[[:space:]]$/) i++
+    if (substr(text, i, 1) != ">") return 0
+    return substr(text, i + 1) ~ /^[[:space:]]*$/
+  }
+  while (i <= n) {
     ch = substr(text, i, 1)
-    if (quote != "") {
-      if (ch == quote) quote = ""
+    if (ch == ">") return substr(text, i + 1) ~ /^[[:space:]]*$/
+    if (ch == "/") {
+      i++
+      if (substr(text, i, 1) != ">") return 0
+      return substr(text, i + 1) ~ /^[[:space:]]*$/
+    }
+    # Anything else has to be an attribute, and attributes are introduced by
+    # whitespace — `<x =>` has none before its `=`, which is what makes it
+    # text rather than a tag.
+    if (ch !~ /^[[:space:]]$/) return 0
+    while (i <= n && substr(text, i, 1) ~ /^[[:space:]]$/) i++
+    ch = substr(text, i, 1)
+    if (ch == ">" || ch == "/") continue
+    if (ch !~ /^[a-zA-Z_:]$/) return 0
+    while (i <= n && substr(text, i, 1) ~ /^[a-zA-Z0-9_.:-]$/) i++
+    while (i <= n && substr(text, i, 1) ~ /^[[:space:]]$/) i++
+    if (substr(text, i, 1) != "=") continue
+    i++
+    while (i <= n && substr(text, i, 1) ~ /^[[:space:]]$/) i++
+    ch = substr(text, i, 1)
+    if (ch == "\"" || ch == sq) {
+      i++
+      while (i <= n && substr(text, i, 1) != ch) i++
+      if (i > n) return 0
+      i++
       continue
     }
-    if (ch == "\"" || ch == sq) { quote = ch; continue }
-    # A second `<` means this was never a tag: `Vec<Route>` alone on a line is
-    # prose, and swallowing it would hide entries the lint has to read.
-    if (ch == "<") return 0
-    if (ch == ">") break
+    if (ch == "" || ch ~ /^[[:space:]]$/ || ch == ">" || ch == "<" || ch == "`") return 0
+    while (i <= n && substr(text, i, 1) !~ /^[[:space:]">`<]$/ && substr(text, i, 1) != sq) i++
   }
-  if (i > n) return 0
-  return substr(text, i + 1) ~ /^[[:space:]]*$/
+  return 0
 }
 
 function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
@@ -1220,7 +1267,9 @@ findings="$(
     # Ordinary prose: not blank, not a quoted aside, not indented code. Under a
     # breaking heading the heading declares for it; otherwise it needs the
     # inline marker, and either way flush_entry still runs the unmarked lint.
-    return (block_body(vis) ~ /[^[:space:]]/ && block_body(vis) !~ /^[> ]/)
+    return (block_body(vis) ~ /[^[:space:]]/ && block_body(vis) !~ /^[> ]/ &&
+            !is_link_definition(vis) && !is_definition_opener(vis) &&
+            !is_thematic_break(vis))
   }
 
   function start_paragraph_entry() {
@@ -1256,7 +1305,7 @@ findings="$(
       # outside the list item — markdown renders it as a sibling block, so it
       # is not part of this entry and must not supply its guide link.
       if (visible ~ /[^[:space:]]/ && leading_spaces(visible) < entry_content_indent &&
-          entry_paragraph_open == 0) {
+          (entry_paragraph_open == 0 || is_thematic_break(visible))) {
         flush_entry()
         # This line ended the item, so it is a block of its own — and the
         # paragraph rule above already ran, while the item was still open. A

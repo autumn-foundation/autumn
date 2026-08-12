@@ -6185,3 +6185,105 @@ fn migration_guide_gate_lets_a_one_marker_interrupt_a_paragraph() {
         "`1.` interrupts the paragraph and takes its link with it",
     );
 }
+
+// --- Review round 48: definitions, thematic breaks, tag validity ----------
+
+#[test]
+fn migration_guide_gate_does_not_lint_a_reference_definition_as_prose() {
+    // A definition renders nothing, so it declares nothing — but it was
+    // becoming a paragraph entry, and a label containing the word "breaking"
+    // was then reported as an unmarked break, blocking a valid changelog.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [Unreleased]\n\n\
+         [breaking-reference]: https://example.invalid/note\n\n\
+         - **api:** an addition.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a link definition is not prose describing a break\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_ends_an_entry_at_a_thematic_break() {
+    // `---` ends the list item, so the link after it renders in its own
+    // paragraph outside the list and cannot be that entry's guide link.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\
+         ---\n\
+         [migration guide](docs/migrations/0.7.0.md)\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a link past a thematic break is outside the entry",
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_open_a_block_on_a_malformed_tag() {
+    // `<x =>` is not a well-formed tag, so CommonMark renders it as literal
+    // text and the bullet below stays a real list item. Accepting anything
+    // tag-shaped swallowed that entry and reported the section as empty.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         <x =>\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a malformed tag must not hide the entry beneath it",
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_opens_a_block_on_a_well_formed_tag() {
+    // The counterpart: tightening tag validation must not stop recognising
+    // the real thing, in any of its shapes.
+    for tag in [
+        "<x-widget>",
+        "<x-widget disabled>",
+        "<x-widget a=\"1\" b>",
+        "</x-widget>",
+    ] {
+        let tmp = migration_gate_fixture("0.7.0");
+        write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            format!(
+                "# Changelog\n\n\
+                 ## [0.7.0] - 2026-09-01\n\n\
+                 ### Changed\n\n\
+                 - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+                 {tag}\n  \
+                 See the [migration guide](docs/migrations/0.7.0.md).\n"
+            ),
+        )
+        .expect("changelog");
+
+        assert!(
+            !run_migration_gate(tmp.path()).status.success(),
+            "`{tag}` is a complete tag and opens a raw block",
+        );
+    }
+}
