@@ -246,6 +246,7 @@ struct Widget {
 
 const WIDGETS_SQL: &str = "SELECT id, name FROM widgets";
 const WIDGET_BY_ID_SQL: &str = "SELECT id, name FROM widgets WHERE id = $1";
+const GADGETS_SQL: &str = "SELECT id, name FROM gadgets";
 
 #[get("/widgets")]
 async fn widgets(mut db: Db) -> Result<String, AutumnError> {
@@ -277,6 +278,39 @@ async fn widget(mut db: Db) -> Result<String, AutumnError> {
         .map(|row| format!("{}:{}", row.id, row.name))
         .collect::<Vec<_>>()
         .join(","))
+}
+
+/// Uses two pooled connections in a fixed order, one query each. The replay
+/// pool hands tape *i* to the *i*-th connection it opens, so this is the shape
+/// that catches tapes listed in the wrong order.
+#[get("/two-connections")]
+async fn two_connections(State(state): State<AppState>) -> Result<String, AutumnError> {
+    let pool = state
+        .pool()
+        .ok_or_else(|| AutumnError::internal_server_error_msg("no pool"))?
+        .clone();
+    let mut first = pool
+        .get()
+        .await
+        .map_err(|error| AutumnError::internal_server_error_msg(format!("first: {error}")))?;
+    let mut second = pool
+        .get()
+        .await
+        .map_err(|error| AutumnError::internal_server_error_msg(format!("second: {error}")))?;
+
+    let widgets: Vec<Widget> = diesel::sql_query(WIDGETS_SQL)
+        .load(&mut first)
+        .await
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!("widgets query failed: {error}"))
+        })?;
+    let gadgets: Vec<Widget> = diesel::sql_query(GADGETS_SQL)
+        .load(&mut second)
+        .await
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!("gadgets query failed: {error}"))
+        })?;
+    Ok(format!("{}/{}", widgets.len(), gadgets.len()))
 }
 
 /// Asks the database something the tape never recorded.
@@ -619,6 +653,58 @@ async fn replay_reports_divergence_when_a_whole_tape_is_never_claimed() {
         }),
         "an unclaimed tape must be accounted for like a partly-consumed one, got {:?}",
         outcome.divergences
+    );
+}
+
+#[tokio::test]
+async fn tapes_are_claimed_in_the_order_the_recorded_request_used_its_connections() {
+    // Connection ids are process-wide birth order, so the request's *first*
+    // connection can carry the higher id — exactly the ordering that goes wrong
+    // if tapes are sorted by id anywhere between the recorder and the replay
+    // pool. The capsule lists them in first-use order, and the replay pool must
+    // hand them out in that order: connection 20's tape to the first connection
+    // opened, connection 3's to the second.
+    let mut widgets = widgets_tape(WIDGETS_SQL, &[], Vec::new());
+    widgets.id = 20;
+    let mut gadgets = widgets_tape(GADGETS_SQL, &[], Vec::new());
+    gadgets.id = 3;
+
+    let recorded = with_connections(
+        capsule(
+            request("GET", "/two-connections"),
+            CapsuleOutcome::Status {
+                code: 200,
+                message: String::new(),
+                problem_type: None,
+            },
+        ),
+        vec![widgets, gadgets],
+    );
+
+    let divergences = Arc::new(DivergenceLog::new());
+    let pool = pool_from_capsule(&recorded, Arc::clone(&divergences)).expect("replay pool builds");
+    let client = TestApp::new()
+        .config(test_config())
+        .routes(routes![two_connections])
+        .with_db(pool)
+        .build();
+
+    let response = client.get("/two-connections").send().await;
+    response.assert_ok();
+    assert_eq!(
+        response.text(),
+        "2/2",
+        "each connection must be answered from the tape the request used it for"
+    );
+    assert!(
+        divergences.entries().is_empty(),
+        "tapes handed out in first-use order must replay clean, got {:?}",
+        divergences.entries()
+    );
+    assert!(
+        divergences.unconsumed().is_empty(),
+        "and both tapes must be fully consumed, got {:?}",
+        divergences.unconsumed()
     );
 }
 

@@ -387,7 +387,10 @@ This is the first slice. What it does not do, stated plainly:
   code will usually diverge, which is the honest outcome rather than a bug.
 - **Concurrent connections inside one request** (a `join!` over two checkouts)
   are recorded per connection, but their ordering is not guaranteed to repeat,
-  and a different interleaving shows up as a divergence.
+  and a different interleaving shows up as a divergence. Connections a request
+  uses one after another are fine: tapes are recorded — and handed back on
+  replay — in the order the request *first used* each connection, not by
+  connection id.
 - **`PostgreSQL` only, over plaintext TCP.** A `sslmode` URL, a Unix-socket URL,
   or a `sqlite` build disables database capture: the capsule still records the
   request, clock and outcome, and says in `notes` why it has no tape. A

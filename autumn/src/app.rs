@@ -5649,7 +5649,11 @@ impl AppBuilder {
     ///   points the checkout marker at the stub pool nor writes a capsule of
     ///   itself.
     /// * The session store is forced to memory and the process cache is
-    ///   cleared, so no Redis or external cache is dialled.
+    ///   cleared, so no Redis or external cache is dialled. A store installed
+    ///   with [`with_session_store`](Self::with_session_store) is **dropped**
+    ///   rather than forwarded: it outranks the config in `apply_session_layer`,
+    ///   so passing it through would let a replay reach — and write to — the
+    ///   application's real session backend.
     /// * No job runtime, no scheduler, no startup/shutdown hooks, and only
     ///   *sync* event listeners (a durable listener needs the job runtime).
     /// * No storage preflight, no mailer, no fail-fast configuration gates: a
@@ -5673,7 +5677,14 @@ impl AppBuilder {
             state_initializers,
             config_loader_factory,
             telemetry_provider,
-            session_store,
+            // F15: deliberately *not* destructured. A store installed with
+            // `with_session_store(...)` outranks `config.session.backend` in
+            // `apply_session_layer`, so forwarding it would let a replay dial —
+            // and mutate — the application's live Redis or database session
+            // backend, or fail 503 when that backend is unreachable. Replay
+            // builds its router with no custom store, so the memory backend
+            // `force_offline_replay_config` sets is what actually applies.
+            session_store: _replay_ignores_custom_session_store,
             policy_registrations,
             #[cfg(feature = "db")]
             db_interceptor,
@@ -5798,7 +5809,7 @@ impl AppBuilder {
                 static_gate_layers: Vec::new(),
                 #[cfg(feature = "maud")]
                 error_page_renderer,
-                session_store,
+                session_store: None,
                 #[cfg(feature = "openapi")]
                 openapi: None,
                 #[cfg(feature = "mcp")]
@@ -10896,6 +10907,29 @@ mod tests {
         assert!(
             forcer.contains("failure_capture.enabled = false"),
             "replay must not capture a capsule of the replay itself"
+        );
+    }
+
+    /// Forcing `session.backend = memory` is not enough on its own: a store
+    /// installed with `with_session_store(...)` *outranks* the config in
+    /// `apply_session_layer`, so passing it through would let a replay dial —
+    /// and mutate — the application's live Redis or database session backend,
+    /// or 503 when that backend is unreachable. The replay router must be built
+    /// with no custom store so the forced memory backend is what applies.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_never_uses_the_applications_custom_session_store() {
+        let source = include_str!("app.rs");
+        let handler = replay_mode_source(source);
+
+        assert!(
+            handler.contains("session_store: None,"),
+            "the replay router context must be built with no custom session store"
+        );
+        assert!(
+            !handler.contains("            session_store,"),
+            "the replay handler must not forward the builder's session store; \
+             a custom store outranks the forced memory backend"
         );
     }
 

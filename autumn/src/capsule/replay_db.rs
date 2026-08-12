@@ -631,9 +631,14 @@ fn hex_preview(bytes: &[u8]) -> String {
 ///
 /// The pool is sized to the number of connections the capsule recorded (at
 /// least one), and each connection the pool establishes claims the next
-/// unclaimed tape. A request that opens *more* connections than the recording
-/// did gets an empty tape, on which every statement is a divergence — the
-/// honest answer, since nothing was recorded for it (F12).
+/// unclaimed tape. This is why
+/// [`DbBuffer`](crate::capsule::DbBuffer) records tapes in the order the
+/// request *first used* each connection rather than by connection id: the
+/// *i*-th tape answers the *i*-th connection the replayed run opens, so any
+/// other ordering swaps the tapes and diverges on traffic that was recorded
+/// perfectly. A request that opens *more* connections than the recording did
+/// gets an empty tape, on which every statement is a divergence — the honest
+/// answer, since nothing was recorded for it (F12).
 ///
 /// Recycling is set to [`RecyclingMethod::Fast`] so returning a connection to
 /// the pool does not issue a `SELECT 1` ping the tape never recorded.

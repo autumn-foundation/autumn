@@ -117,21 +117,38 @@ impl Default for CaptureSettings {
 /// The connection recorder owns the contents; this type only provides the
 /// per-request accumulation and the byte budget that stops an unbounded query
 /// result from filling memory.
+///
+/// Tapes are kept in the order the request **first used** each connection, not
+/// by connection id. Ids are process-wide birth order and say nothing about
+/// this request: a long-lived pooled connection can carry a much lower id than
+/// one minted moments ago, so a request that used the fresh connection first
+/// would have its tapes listed backwards. Replay hands tape *i* to the *i*-th
+/// connection its pool opens (F12), so a reordering there swaps the tapes and
+/// makes both connections diverge against traffic that was recorded perfectly.
 #[derive(Debug, Default)]
 pub struct DbBuffer {
     tapes: BTreeMap<u64, ConnectionTape>,
+    /// Connection ids in first-use order — the order [`snapshot`](Self::snapshot)
+    /// writes them, and therefore the order replay claims them in.
+    order: Vec<u64>,
     bytes: usize,
 }
 
 impl DbBuffer {
-    /// The tape for a connection, created on first use.
+    /// The tape for a connection, created on first use — and remembered in
+    /// `order` at that moment, which is what makes the snapshot first-use
+    /// ordered.
     pub fn tape_mut(&mut self, connection_id: u64) -> &mut ConnectionTape {
-        self.tapes
-            .entry(connection_id)
-            .or_insert_with(|| ConnectionTape {
-                id: connection_id,
-                ..ConnectionTape::default()
-            })
+        match self.tapes.entry(connection_id) {
+            std::collections::btree_map::Entry::Occupied(tape) => tape.into_mut(),
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                self.order.push(connection_id);
+                slot.insert(ConnectionTape {
+                    id: connection_id,
+                    ..ConnectionTape::default()
+                })
+            }
+        }
     }
 
     /// Charge `bytes` against the capsule budget.
@@ -155,14 +172,19 @@ impl DbBuffer {
         self.tapes.is_empty()
     }
 
-    /// Snapshot the tapes for serialization, in connection order.
+    /// Snapshot the tapes for serialization, in first-use order.
     #[must_use]
     pub fn snapshot(&self) -> Option<CapsuleDb> {
         if self.tapes.is_empty() {
             return None;
         }
         Some(CapsuleDb {
-            connections: self.tapes.values().cloned().collect(),
+            connections: self
+                .order
+                .iter()
+                .filter_map(|id| self.tapes.get(id))
+                .cloned()
+                .collect(),
         })
     }
 }
@@ -633,7 +655,7 @@ fn arm_body_capture(req: Request<Body>, scope: &Arc<CaptureScope>) -> Request<Bo
             scope.arm_body(BodyTap::Absent);
             req
         }
-        None if !has_streamed_body(&req) => {
+        None if !has_undeclared_body(&req) => {
             scope.arm_body(BodyTap::Absent);
             req
         }
@@ -712,10 +734,22 @@ fn body_length(req: &Request<Body>) -> Option<usize> {
         .or_else(|| usize::try_from(http_body::Body::size_hint(req.body()).exact()?).ok())
 }
 
-/// Whether the request declares a body whose length is not known up front.
-fn has_streamed_body(req: &Request<Body>) -> bool {
-    req.headers()
-        .contains_key(axum::http::header::TRANSFER_ENCODING)
+/// Whether a request whose length [`body_length`] could not determine still has
+/// a body worth teeing.
+///
+/// Asked of the **body**, not the headers. `Transfer-Encoding: chunked` is the
+/// HTTP/1.1 way of announcing a body of unknown length, but HTTP/2 and HTTP/3
+/// have no such header: a streamed h2 request arrives with no `Content-Length`,
+/// no exact size hint and nothing in the headers to go on. Requiring the header
+/// would classify every one of those as having no body at all, and the capsule
+/// would replay the request empty — a silent falsification, not a limitation.
+///
+/// Only a body already at end-of-stream is treated as absent. Anything else is
+/// teed: `max_body_bytes` still bounds what is kept, and a body that turns out
+/// to be empty snapshots as [`CapturedBody::Absent`] anyway, so guessing "yes"
+/// costs a wrapper and never a wrong capsule.
+fn has_undeclared_body(req: &Request<Body>) -> bool {
+    !http_body::Body::is_end_stream(req.body())
 }
 
 #[cfg(test)]
@@ -896,6 +930,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_body_with_no_length_and_no_transfer_encoding_is_still_teed() {
+        // HTTP/2 (and /3) have no `Transfer-Encoding`: a streamed h2 request
+        // arrives with no `Content-Length`, no exact size hint and no header to
+        // hint at one. Deciding "does this request have a body" from the
+        // HTTP/1.1 header alone classifies it as having none, and the capsule
+        // then replays a request whose body has silently vanished.
+        let trace = Trace::default();
+        let request = Request::post("/x")
+            .version(axum::http::Version::HTTP_2)
+            .body(Body::new(WatchedBody {
+                trace: trace.clone(),
+                chunks: vec![b"h2-", b"payload"],
+            }))
+            .expect("request builds");
+
+        let scope = run_capture(CaptureSettings::default(), request, trace, true).await;
+
+        match scope.captured_body() {
+            CapturedBody::Buffered(bytes) => assert_eq!(&bytes[..], b"h2-payload"),
+            other => panic!(
+                "a body with no declared length must be teed, not assumed absent, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_body_at_all_is_recorded_as_absent() {
+        // The other side of the same predicate: an empty body is at
+        // end-of-stream from the start, so nothing is wrapped and the capsule
+        // records a request that genuinely had no body.
+        let request = Request::get("/x")
+            .body(Body::empty())
+            .expect("request builds");
+        let scope = run_capture(CaptureSettings::default(), request, Trace::default(), true).await;
+
+        assert!(matches!(scope.captured_body(), CapturedBody::Absent));
+        assert_eq!(
+            scope.body_note(),
+            None,
+            "a request with no body needs no caveat"
+        );
+    }
+
+    #[tokio::test]
     async fn streamed_body_over_the_cap_is_dropped_mid_stream() {
         // No declared length, so the layer cannot skip up front: the cap has to
         // hold while the frames arrive.
@@ -1000,12 +1078,23 @@ mod tests {
     }
 
     #[test]
-    fn db_buffer_snapshots_tapes_in_connection_order() {
+    fn db_buffer_snapshots_tapes_in_first_use_order() {
+        // Connection ids are process-wide birth order, which says nothing about
+        // the order *this* request reached for them: a long-lived pooled
+        // connection 2 can easily be checked out after a freshly minted 7.
+        // Replay hands tape *i* to the *i*-th connection its pool opens, so the
+        // capsule must list them in the order the request first used them or
+        // the tapes get swapped and both connections diverge.
         let mut buffer = DbBuffer::default();
         buffer.tape_mut(7);
         buffer.tape_mut(2);
+        buffer.tape_mut(7);
         let snapshot = buffer.snapshot().expect("tapes were created");
         let ids: Vec<u64> = snapshot.connections.iter().map(|tape| tape.id).collect();
-        assert_eq!(ids, vec![2, 7]);
+        assert_eq!(
+            ids,
+            vec![7, 2],
+            "tapes must be listed in the order the request first used each connection"
+        );
     }
 }
