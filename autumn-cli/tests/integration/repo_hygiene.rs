@@ -6287,3 +6287,53 @@ fn migration_guide_gate_still_opens_a_block_on_a_well_formed_tag() {
         );
     }
 }
+
+// --- Review round 49: only punctuation is backslash-escapable -------------
+
+#[test]
+fn migration_guide_gate_keeps_a_backslash_before_a_letter_in_a_destination() {
+    // Only ASCII punctuation can be backslash-escaped, so a backslash before a
+    // letter stays in the destination — the reference implementation renders
+    // `href="docs/migrations/0.7.0.m%5Cd"`. Dropping every backslash made a
+    // link to a nonexistent path satisfy the guide requirement.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.m\\d).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a preserved backslash means this points somewhere else",
+    );
+}
+
+#[test]
+fn migration_guide_gate_resolves_an_escaped_punctuation_destination() {
+    // The counterpart: punctuation *is* escapable, so `0.7.0\.md` renders as
+    // `0.7.0.md` and does point at the guide.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0\\.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "an escaped dot still resolves to the guide\n{}",
+        gate_report(&output),
+    );
+}

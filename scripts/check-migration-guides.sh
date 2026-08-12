@@ -495,6 +495,13 @@ function is_standalone_tag(text,   n, i, ch, sq, closing) {
   return 0
 }
 
+function escapable(ch) {
+  # CommonMark escapes only ASCII punctuation. A backslash before anything
+  # else — a letter, say — stays in the text, so dropping every backslash
+  # turned a link to a nonexistent path into one that matched the guide.
+  return index("!\"#$%&" sprintf("%c", 39) "()*+,-./:;<=>?@[\\]^_`{|}~", ch) > 0
+}
+
 function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
   # Parse an inline link destination starting just inside the `(`, and return
   # it only if the construct closes as a link. The destination is parsed rather
@@ -512,7 +519,11 @@ function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
     p++
     while (p <= n) {
       ch = substr(text, p, 1)
-      if (ch == "\\" && p < n) { dest = dest substr(text, p + 1, 1); p += 2; continue }
+      if (ch == "\\" && p < n && escapable(substr(text, p + 1, 1))) {
+        dest = dest substr(text, p + 1, 1)
+        p += 2
+        continue
+      }
       if (ch == ">") break
       if (ch == "<") return ""
       dest = dest ch
@@ -526,7 +537,11 @@ function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
     depth = 0
     while (p <= n) {
       ch = substr(text, p, 1)
-      if (ch == "\\" && p < n) { dest = dest substr(text, p + 1, 1); p += 2; continue }
+      if (ch == "\\" && p < n && escapable(substr(text, p + 1, 1))) {
+        dest = dest substr(text, p + 1, 1)
+        p += 2
+        continue
+      }
       if (ch == " " || ch == "\t") break
       if (ch == ")") {
         if (depth == 0) break
