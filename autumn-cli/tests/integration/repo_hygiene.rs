@@ -7847,3 +7847,54 @@ fn migration_guide_gate_still_ignores_links_inside_a_raw_html_container() {
         "markdown inside a container is still literal",
     );
 }
+
+// --- Review round 67: escapes in reference labels are literal -------------
+
+#[test]
+fn migration_guide_gate_matches_reference_labels_without_unescaping() {
+    // Declared behaviour, not a fix. Label matching folds case and collapses
+    // whitespace; it does not unescape punctuation. The reference
+    // implementation links `[up\!]` to `[up\!]:` and does *not* link `[up!]`
+    // to it, so the two labels are distinct. A review round asked for
+    // unescaping, which would make an unrelated label resolve to the guide.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration guide][up\\!].\n\n\
+         [up\\!]: docs/migrations/0.7.0.md\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "an escaped label matches its own escaped definition\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_match_an_unescaped_label_to_an_escaped_one() {
+    // The other half: `[up!]` is a different label from `[up\!]`, so it
+    // resolves to nothing and the entry has no clickable guide.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration guide][up!].\n\n\
+         [up\\!]: docs/migrations/0.7.0.md\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an unescaped label does not resolve to an escaped definition",
+    );
+}
