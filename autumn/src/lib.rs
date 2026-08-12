@@ -339,7 +339,7 @@ pub mod __fuzz {
     #[cfg(feature = "inbound-mail")]
     pub use crate::inbound_mail::{
         __fuzz_parse_address_list as parse_address_list, __fuzz_parse_generic as parse_generic,
-        __fuzz_parse_ses as parse_ses,
+        __fuzz_parse_mailgun_form_data as parse_mailgun_form_data, __fuzz_parse_ses as parse_ses,
     };
 }
 
@@ -1631,6 +1631,8 @@ pub mod test;
 /// Dependency-free HTML parser + CSS-selector matcher backing the structural
 /// HTML assertions on [`test::TestResponse`].
 mod test_html;
+/// Saturating time/duration arithmetic shared by the request-path modules.
+pub(crate) mod time_math;
 pub use config::ProcessRole;
 pub use state::AppState;
 

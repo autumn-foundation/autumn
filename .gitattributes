@@ -20,3 +20,7 @@ examples/saas/** text eol=lf
 # (which always emits LF); force LF so Windows autocrlf does not fail the
 # comparison on checkout (same rationale as the saas rules above).
 autumn-cli/tests/golden/** text eol=lf
+
+# Fuzz corpus seeds are byte-exact regression inputs (MIME bodies where CRLF is
+# semantically meaningful); never normalize or diff them as text.
+fuzz/corpus/** binary

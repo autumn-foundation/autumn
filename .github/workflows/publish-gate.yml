@@ -230,6 +230,11 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: ./scripts/check-release-notes.sh
+      - name: Migration guide coverage gate
+        # Belt and braces with the same gate in ci.yml's lint job: a tag can be
+        # pushed from a commit that never went through a PR, and a release
+        # without an upgrade path is treated as a broken build (issue #1588).
+        run: ./scripts/check-migration-guides.sh
 
   # ---------------------------------------------------------------------------
   # 6. Downstream smoke test
