@@ -157,10 +157,32 @@ function unescaped_index(text, needle, start,   pos, at, slashes) {
   return 0
 }
 
+function mask_link_metadata(text,   out, at, start, dest, gap) {
+  # Blank out the `(...)` of every inline link: a destination and title are
+  # link metadata, not prose. The suppression token written inside a title is
+  # a tooltip, and reading it there silenced the lint on a real break.
+  out = text
+  start = 1
+  while ((at = index(substr(out, start), "](")) > 0) {
+    at = start + at - 1
+    dest = link_destination(out, at + 2)
+    if (md_link_end > 0) {
+      gap = ""
+      while (length(gap) < md_link_end - at) gap = gap " "
+      out = substr(out, 1, at) gap substr(out, md_link_end + 1)
+      start = md_link_end + 1
+    } else {
+      start = at + 1
+    }
+  }
+  return out
+}
+
 function suppressed_by_comment(text,   t, at) {
   # The suppression must be a real HTML comment: not inside a code span (that
-  # is a demonstration) and not escaped (that is a rendered example).
-  t = strip_code_spans(text)
+  # is a demonstration), not inside a link title (that is a tooltip) and not
+  # escaped (that is a rendered example).
+  t = mask_link_metadata(strip_code_spans(text))
   at = 1
   while ((at = unescaped_index(t, "<!--", at)) > 0) {
     if (substr(t, at) ~ /^<!--[[:space:]]*migration-guide-gate:/) return 1
@@ -191,7 +213,7 @@ function expand_tabs(text,   out, i, n, ch, col) {
   return out
 }
 
-function list_marker_width(text,   body, n, ch) {
+function list_marker_width(text,   body, n, ch, pad) {
   # Width of a list marker at the start of `text` (already dedented), counting
   # the marker and the whitespace after it; 0 when this is not a list item.
   # Markdown allows `-`, `*`, `+` and ordered markers such as `1.` or `1)`.
@@ -209,7 +231,13 @@ function list_marker_width(text,   body, n, ch) {
   }
   ch = substr(body, n + 1, 1)
   if (ch != " " && ch != "\t") return 0
-  while (substr(body, n + 1, 1) == " " || substr(body, n + 1, 1) == "\t") n++
+  # CommonMark takes one to four spaces as marker padding. Once five or more
+  # follow, only the first is padding and the rest make the content an indented
+  # code block — so consuming them all turned a rendered code sample into an
+  # entry, marker, link and all.
+  pad = 0
+  while (substr(body, n + pad + 1, 1) == " " || substr(body, n + pad + 1, 1) == "\t") pad++
+  n += (pad > 4) ? 1 : pad
   return n
 }
 
@@ -1153,6 +1181,13 @@ findings="$(
     # Where this item content starts: past the marker and the space after it.
     entry_content_indent = entry_indent + list_marker_width(dedent3(visible))
     item_content_indent = entry_content_indent
+    # Four or more columns past the content boundary makes the content of this
+    # item an indented code block, which renders as a sample and declares
+    # nothing. The item still opens — later lines may be real prose — but this
+    # line contributes no visible text to it.
+    if (leading_spaces(substr(expand_tabs(visible), entry_content_indent + 1)) >= 4) {
+      entry_visible = ""
+    }
     entry_paragraph_open = 1
     entry_is_paragraph = 0
     next

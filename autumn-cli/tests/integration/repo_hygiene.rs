@@ -5977,3 +5977,114 @@ fn migration_guide_gate_does_not_count_a_multiline_definition_as_content() {
         gate_report(&output),
     );
 }
+
+// --- Review round 46: marker padding, suppression in link metadata --------
+
+#[test]
+fn migration_guide_gate_caps_list_marker_padding_at_four_spaces() {
+    // CommonMark takes only one space as marker padding once five or more
+    // follow, leaving four to make the content an indented code block. The
+    // reference implementation renders the whole entry inside `<pre><code>`,
+    // so neither the marker nor the link is real — consuming every space made
+    // a code sample satisfy coverage.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         -     **Breaking:** example [guide](docs/migrations/0.7.0.md)\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    let listed = bash_command()
+        .args(["scripts/check-migration-guides.sh", "--list"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run --list");
+    let inventory = String::from_utf8_lossy(&listed.stdout).to_string();
+    assert!(
+        output.status.success(),
+        "a code sample declares nothing, so nothing is required\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        inventory
+            .lines()
+            .any(|line| line.starts_with("0.7.0") && line.ends_with('0')),
+        "the section must report zero breaking entries:\n{inventory}",
+    );
+}
+
+#[test]
+fn migration_guide_gate_keeps_four_space_padding_a_real_entry() {
+    // The boundary on the other side: four spaces is still marker padding, so
+    // this is an ordinary entry and its missing guide link must be caught.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         -    **Breaking:** renamed, with no link of its own.\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "four spaces is padding, so this is a real breaking entry",
+    );
+}
+
+#[test]
+fn migration_guide_gate_ignores_a_suppression_inside_a_link_title() {
+    // The suppression has to be a real HTML comment. Inside a link title it is
+    // tooltip metadata — the reference implementation renders it as a `title`
+    // attribute — so it must not silence the unmarked-break lint.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - This is a breaking API rename \
+           [details](https://example.invalid \
+           \"<!-- migration-guide-gate: tooltip -->\")\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a tooltip is not a suppression comment",
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_honours_a_real_suppression_beside_a_link() {
+    // The counterpart: masking link metadata must not blind the gate to a
+    // genuine suppression written next to a link, which is how the entry
+    // describing this gate is written in the real changelog.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **release:** the gate fails when a section declares a breaking \
+           change with no guide, see [the docs](https://example.invalid). \
+           <!-- migration-guide-gate: describes the gate itself -->\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a real suppression beside a link still applies\n{}",
+        gate_report(&output),
+    );
+}
