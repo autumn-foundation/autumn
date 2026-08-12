@@ -339,7 +339,7 @@ pub mod __fuzz {
     #[cfg(feature = "inbound-mail")]
     pub use crate::inbound_mail::{
         __fuzz_parse_address_list as parse_address_list, __fuzz_parse_generic as parse_generic,
-        __fuzz_parse_ses as parse_ses,
+        __fuzz_parse_mailgun_form_data as parse_mailgun_form_data, __fuzz_parse_ses as parse_ses,
     };
 }
 

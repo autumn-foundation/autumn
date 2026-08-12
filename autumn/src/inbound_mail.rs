@@ -1003,7 +1003,10 @@ fn mailgun_spam_report(form: &HashMap<String, String>) -> Option<SpamReport> {
         .get("X-Mailgun-Sflag")
         .or_else(|| form.get("x-mailgun-sflag"))
         .cloned();
-    (score.is_some() || verdict.is_some()).then(|| SpamReport { score, verdict })
+    if score.is_none() && verdict.is_none() {
+        return None;
+    }
+    Some(SpamReport { score, verdict })
 }
 
 /// Metadata-only attachment stubs for URL-encoded Mailgun deliveries, which
@@ -1579,8 +1582,7 @@ fn extract_multipart_bodies_at(
 
         // If no blank-line separator exists, the part has no headers — treat the
         // entire content as the body with empty headers (RFC 2045 §5.2 defaults apply).
-        let (part_header_bytes, part_body_bytes) =
-            split_mime_headers(part).unwrap_or((&[], part));
+        let (part_header_bytes, part_body_bytes) = split_mime_headers(part).unwrap_or((&[], part));
         let part_headers = unfold_mime_headers(&String::from_utf8_lossy(part_header_bytes));
 
         // Per RFC 2045 §5.2, a missing Content-Type defaults to text/plain.
@@ -1729,7 +1731,9 @@ fn decode_rfc2047_q(input: &[u8]) -> Vec<u8> {
 /// Convert a decoded byte sequence to a String given its RFC 2047 charset label.
 fn rfc2047_bytes_to_string(bytes: Vec<u8>, charset: &str) -> Option<String> {
     match charset.to_ascii_lowercase().as_str() {
-        "iso-8859-1" | "latin-1" | "iso8859-1" => Some(bytes.iter().copied().map(char::from).collect()),
+        "iso-8859-1" | "latin-1" | "iso8859-1" => {
+            Some(bytes.iter().copied().map(char::from).collect())
+        }
         // utf-8 / us-ascii / ascii — and anything unrecognised, which is assumed UTF-8.
         _ => String::from_utf8(bytes).ok(),
     }
@@ -1790,7 +1794,7 @@ fn header_line_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
 /// `-` (closing delimiter), SP, HT, or end-of-input — never an arbitrary
 /// character such as a digit. Rejecting anything else stops a boundary-prefix
 /// false match (`--abc` inside `--abc123`) from splitting a part.
-fn is_boundary_terminator(b: Option<&u8>) -> bool {
+const fn is_boundary_terminator(b: Option<&u8>) -> bool {
     matches!(b, None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t'))
 }
 
@@ -1934,7 +1938,7 @@ fn parse_mailgun_form_data(
             Some(MailgunFormPart::Field { name, value }) => {
                 map.insert(name, value);
             }
-            None => continue,
+            None => {}
         }
     }
     (map, file_parts)
@@ -3440,5 +3444,250 @@ mod tests {
             mime_param("attachment; filename=\"a\\\"b.pdf\"", "filename").as_deref(),
             Some("a\"b.pdf")
         );
+    }
+
+    // ── Characterization: byte-cursor decoders ───────────────────────────────
+
+    #[test]
+    fn decode_quoted_printable_bytes_edge_cases() {
+        // Pins the exact semantics the index-free rewrite must preserve.
+        let cases: &[(&str, &[u8], &[u8])] = &[
+            ("lone `=` at EOF", b"=", b"="),
+            ("`=` + one hex digit at EOF", b"=4", b"=4"),
+            ("complete hex escape", b"=41", b"A"),
+            ("lowercase hex escape", b"=6a", b"j"),
+            ("soft break LF", b"a=\nb", b"ab"),
+            ("soft break CRLF", b"a=\r\nb", b"ab"),
+            ("soft break lone CR", b"a=\rb", b"ab"),
+            ("soft break CR at EOF", b"a=\r", b"a"),
+            ("non-hex after `=`", b"=ZZ", b"=ZZ"),
+            ("half-hex after `=`", b"=4Z", b"=4Z"),
+            ("trailing `=` after text", b"abc=", b"abc="),
+            ("no escapes at all", b"plain text", b"plain text"),
+            ("empty input", b"", b""),
+            (
+                "binary bytes round-trip",
+                b"=00=FF=80=7F",
+                b"\x00\xff\x80\x7f",
+            ),
+            ("escape then literal", b"=41=", b"A="),
+        ];
+        for (name, input, expected) in cases {
+            assert_eq!(
+                decode_quoted_printable_bytes(input).as_slice(),
+                *expected,
+                "quoted-printable case: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rfc2047_q_edge_cases() {
+        let cases: &[(&str, &[u8], &[u8])] = &[
+            ("underscore is space", b"a_b", b"a b"),
+            ("hex escape", b"=41", b"A"),
+            ("`=` + one hex digit at EOF", b"=4", b"=4"),
+            ("lone `=` at EOF", b"=", b"="),
+            ("non-hex after `=`", b"=ZZ", b"=ZZ"),
+            // Unlike the body decoder, Q-encoding has no soft line breaks.
+            ("no soft line break", b"=\n", b"=\n"),
+            ("empty input", b"", b""),
+        ];
+        for (name, input, expected) in cases {
+            assert_eq!(
+                decode_rfc2047_q(input).as_slice(),
+                *expected,
+                "rfc2047-Q case: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rfc2047_truncated_words_pass_through_verbatim() {
+        // Every truncation point emits the partial word unchanged and stops.
+        for input in ["=?", "=?utf-8?", "=?utf-8?B?", "=?utf-8?B?QQ"] {
+            assert_eq!(decode_rfc2047(input), input, "truncated word: {input}");
+        }
+        assert_eq!(decode_rfc2047("=?utf-8?B?QQ==?="), "A");
+        assert_eq!(decode_rfc2047("Re: =?utf-8?Q?caf=C3=A9?="), "Re: café");
+    }
+
+    // ── Characterization: address helpers ────────────────────────────────────
+
+    #[test]
+    fn split_address_uses_the_last_at_sign() {
+        assert_eq!(split_address("a@b@c"), Some(("a@b", "c")));
+        assert_eq!(split_address("\"x@y\"@z"), Some(("\"x@y\"", "z")));
+        assert_eq!(split_address("@"), Some(("", "")));
+        assert_eq!(split_address("nodomain"), None);
+        assert_eq!(split_address(""), None);
+    }
+
+    #[test]
+    fn local_part_is_everything_before_the_last_at_sign() {
+        assert_eq!(local_part("a@b@c"), "a@b");
+        assert_eq!(local_part("user@example.com"), "user");
+        assert_eq!(local_part("nodomain"), "nodomain");
+        assert_eq!(local_part(""), "");
+    }
+
+    #[test]
+    fn extract_addr_spec_searches_for_the_angle_close_after_the_open() {
+        assert_eq!(extract_addr_spec("Support <s@c.com>"), "s@c.com");
+        assert_eq!(extract_addr_spec("<s@c.com>"), "s@c.com");
+        assert_eq!(extract_addr_spec("s@c.com"), "s@c.com");
+        assert_eq!(extract_addr_spec("<>"), "");
+        // No closing `>` at all — the whole (trimmed) input is the addr-spec.
+        assert_eq!(extract_addr_spec("<a@b"), "<a@b");
+        // The `>` is only searched for *after* the first `<`.
+        assert_eq!(extract_addr_spec(">bogus< <real@d.com>"), "<real@d.com");
+    }
+
+    // ── Robustness: hostile MIME must never panic ────────────────────────────
+
+    #[test]
+    fn malformed_mime_inputs_never_panic() {
+        let cases: &[(&str, &[u8])] = &[
+            ("empty body", b""),
+            ("bare CRLFCRLF", b"\r\n\r\n"),
+            ("bare LFLF", b"\n\n"),
+            ("header block with no colon", b"not-a-header\r\n\r\nbody"),
+            ("line that is only a colon", b":\r\n\r\nbody"),
+            (
+                "continuation line first",
+                b" folded first\r\nTo: a@b.c\r\n\r\nbody",
+            ),
+            ("fold as last thing in block", b"To: a@b.c\r\n \r\n\r\nbody"),
+            ("non-UTF8 bytes in headers", b"Subject: \xff\xfe\r\n\r\nbody"),
+            (
+                "boundary with nothing after it",
+                b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b",
+            ),
+            (
+                "truncated mid-boundary",
+                b"Content-Type: multipart/mixed; boundary=abcdef\r\n\r\n--abc",
+            ),
+            (
+                "empty boundary",
+                b"Content-Type: multipart/mixed; boundary=\"\"\r\n\r\n--\r\nx",
+            ),
+            (
+                "zero-length part body",
+                b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\n\r\n--b--\r\n",
+            ),
+            (
+                "part with no blank-line terminator",
+                b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n--b--\r\n",
+            ),
+            (
+                "inner part declares the outer boundary",
+                b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nx\r\n--b--\r\n",
+            ),
+            (
+                "base64 truncations",
+                b"Content-Transfer-Encoding: base64\r\nContent-Type: text/plain\r\n\r\n==\nA\nA===\nAB=C",
+            ),
+            (
+                "quoted-printable truncations",
+                b"Content-Transfer-Encoding: quoted-printable\r\nContent-Type: text/plain\r\n\r\n=\n=4\n=ZZ\n=",
+            ),
+            (
+                "rfc2047 truncations in subject",
+                b"Subject: =? =?utf-8? =?utf-8?B? =?utf-8?B?QQ\r\n\r\nbody",
+            ),
+            (
+                "unterminated quote in filename",
+                b"Content-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"oops\r\n\r\n%PDF",
+            ),
+            (
+                "trailing backslash at EOF in filename",
+                b"Content-Disposition: attachment; filename=\"a\\",
+            ),
+            ("non-UTF8 body bytes", b"Content-Type: text/plain\r\n\r\n\xff\xfe\x00\x80"),
+        ];
+
+        for (name, raw) in cases {
+            let email = parse_rfc5322(Bytes::from_static(raw));
+            // Touch every field so nothing is lazily skipped.
+            let _ = (
+                email.from.len(),
+                email.to.len(),
+                email.subject.len(),
+                email.text_body.is_some(),
+                email.html_body.is_some(),
+                email.attachments.len(),
+                email.headers.len(),
+            );
+            assert!(!name.is_empty());
+        }
+
+        // 500 `;` separators in a Content-Disposition header.
+        let many = format!("attachment{}; filename=\"x.bin\"", ";".repeat(500));
+        assert_eq!(mime_param(&many, "filename").as_deref(), Some("x.bin"));
+    }
+
+    // ── Property-based invariants ────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// `parse_rfc5322` is reachable unauthenticated on the generic route,
+        /// so arbitrary bytes must never panic it.
+        #[test]
+        fn parse_rfc5322_never_panics(raw in prop::collection::vec(any::<u8>(), 0..8192)) {
+            let _email = parse_rfc5322(Bytes::from(raw));
+        }
+
+        /// Arbitrary header values and parameter names must never panic
+        /// `mime_param`, including at multi-byte character boundaries.
+        #[test]
+        fn mime_param_never_panics(header in ".*", name in "[a-z]{1,12}") {
+            let _ = mime_param(&header, &name);
+        }
+
+        /// Arbitrary bodies and `Content-Type` values must never panic the
+        /// multipart splitter (and must always terminate).
+        #[test]
+        fn extract_multipart_bodies_never_panics(
+            body in prop::collection::vec(any::<u8>(), 0..2048),
+            content_type in ".*",
+        ) {
+            let _ = extract_multipart_bodies(&body, &content_type);
+        }
+
+        /// The quoted-printable decoder must never panic on arbitrary bytes.
+        #[test]
+        fn decode_quoted_printable_bytes_never_panics(
+            input in prop::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let _ = decode_quoted_printable_bytes(&input);
+            let _ = decode_rfc2047_q(&input);
+        }
+
+        /// A `find_subslice` hit is always a complete in-bounds match, which is
+        /// what every caller relies on when slicing at `p + needle.len()`.
+        #[test]
+        fn find_subslice_result_is_in_bounds(
+            hay in prop::collection::vec(any::<u8>(), 0..512),
+            needle in prop::collection::vec(any::<u8>(), 0..16),
+        ) {
+            if let Some(p) = find_subslice(&hay, &needle) {
+                prop_assert!(p + needle.len() <= hay.len());
+                prop_assert_eq!(&hay[p..p + needle.len()], needle.as_slice());
+            }
+        }
+
+        /// Nesting depth is capped, so no input can recurse the parser to death.
+        #[test]
+        fn nested_multipart_depth_is_capped(depth in 0usize..64) {
+            let raw = nested_multipart_bomb(depth);
+            let email = parse_rfc5322(Bytes::from(raw));
+            prop_assert!(
+                email.text_body.is_some() || !email.attachments.is_empty(),
+                "the innermost part must survive as a body or an attachment"
+            );
+        }
     }
 }
