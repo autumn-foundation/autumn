@@ -3478,6 +3478,15 @@ mod attachment_read_back_tests {
     // A missing or unparsable value is a 400, not a silent `0`: `0` would be a
     // *plausible* version that could match a freshly created row and wave a
     // hand-crafted submit straight past the guard.
+    //
+    // It scans EVERY `lock_version` pair for the first that parses as an
+    // integer, rather than taking the first pair and parsing that. The CSRF and
+    // submit-token field names are app-configurable (`[security.csrf]` /
+    // `[security.submit_token] field_name`), so an app may legitimately name one
+    // of them `lock_version` — and those hidden inputs are prepended, so they
+    // land in the body FIRST. Stopping at the first pair would read a UUID,
+    // fail to parse it, and 400 every single update even though the real
+    // version was right there a few bytes later.
     let lock_version_parser = lock_version.map_or_else(String::new, |_| {
         format!(
             "\n/// Read the hidden `lock_version` the edit form was rendered with\n\
@@ -3489,8 +3498,8 @@ mod attachment_read_back_tests {
              /// rows and the handler re-renders at 409.\n\
              fn parse_lock_version(body: &Bytes) -> AutumnResult<{lock_version_ty}> {{\n    \
              url::form_urlencoded::parse(body.as_ref())\n        \
-             .find(|(key, _)| key == \"lock_version\")\n        \
-             .and_then(|(_, value)| value.parse::<{lock_version_ty}>().ok())\n        \
+             .filter(|(key, _)| key == \"lock_version\")\n        \
+             .find_map(|(_, value)| value.parse::<{lock_version_ty}>().ok())\n        \
              .ok_or_else(|| AutumnError::bad_request_msg(\n            \
              \"missing or invalid lock_version: re-open the edit form and try again\",\n        \
              ))\n\
@@ -17207,6 +17216,26 @@ exempt_paths = [
         assert!(
             routes.contains("fn parse_lock_version("),
             "the routes file must parse the submitted version out of the body: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_parser_survives_a_colliding_security_field_name() {
+        // The CSRF and submit-token field names are app-configurable, so an app
+        // may legitimately name one of them `lock_version` — and those hidden
+        // inputs are prepended, landing in the body BEFORE the real version.
+        // Taking the first `lock_version` pair would read a UUID, fail to parse
+        // it, and 400 every update. The parser scans for the first pair that
+        // parses instead.
+        let routes = lock_routes();
+        assert!(
+            routes.contains(".filter(|(key, _)| key == \"lock_version\")")
+                && routes.contains(".find_map(|(_, value)| value.parse::<i32>().ok())"),
+            "the parser must scan every lock_version pair, not stop at the first: {routes}"
+        );
+        assert!(
+            !routes.contains(".find(|(key, _)| key == \"lock_version\")"),
+            "a first-match-wins parse is the collision bug: {routes}"
         );
     }
 
