@@ -213,7 +213,8 @@ owner-scopes the index; pass `--no-policy` to opt out (issue #1125).
 
 **Scaffold typed path module (trunk-dev)**: scaffolds reference a generated
 `autumn_web::paths![index, show, new, create, edit, update, delete]` module
-(`+events` under `--live`, `+validate_{field}` under `--live-validation`) for
+(`+events` under `--live`, `+validate_{field}` under `--live-validation`,
+`+nested_index, nested_create` under `--belongs-to`) for
 every href/action/redirect/SSE endpoint/`hx-post` target instead of literal URL
 strings (issue #1133).
 
@@ -517,6 +518,7 @@ Next steps:
 - `--live-validation` **(trunk-dev)**: For `scaffold` — per-field inline validation endpoints with `hx-post` inputs (implies `--live`)
 - `--unique FIELD` / `--index FIELD` / `--default field=variant` **(trunk-dev)**: Constraint/index/default markers (see field table)
 - `--no-policy` **(trunk-dev)**: For `scaffold` — skip the default-generated record-level `Policy`/`Scope`. Ignored under `--api` (issue #1125)
+- `--belongs-to <Parent>` **(trunk-dev)**: For `scaffold` — bind this resource to a parent as its child (issue #1323). Needs a matching `references` column (`--belongs-to Post` + `post:references`) and a parent that is **already scaffolded**. Emits `GET`/`POST /<parents>/{<fk>}/<children>` (the create takes the FK from the path, never the body), a `pub children_section(…)` helper, an injected children list + inline "add" form on the **parent's** generated `show` view, a back-link on the child's show view, and a cross-parent-isolation test. Marker-delimited, so re-runs are idempotent and `autumn destroy` reverses it. If the child has an owner column, the nested list inherits the flat index's `#[secured]` + owner scoping. Refused with `--api`/`--live`/`--live-validation`/`--sharded`, an `Attachment` column, a nullable or self-referential parent reference, or a parent that isn't scaffolded / is `slug`-keyed / carries a `:states(…)` column / has a hand-rewritten `show`. Single-level only
 - `--searchable <field,field>` **(trunk-dev)**: For `scaffold` — make the named text fields Postgres full-text searchable. Emits `#[searchable]` attrs, a `search_vector` generated column + GIN index migration, and a search box wired to `GET /<plural>/search`. Rejected for non-text/unknown fields, uuid-PK models, and owner-scoped models; gated off under `--live`/`--live-validation` (issue #1319)
 
 ## Wizard name constraints

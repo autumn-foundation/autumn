@@ -1669,6 +1669,88 @@ fn generated_scaffold_cargo_checks() {
     );
 }
 
+/// Issue #1323: a `--belongs-to` scaffold compiles against the real framework
+/// AND its generated nested write-path test passes.
+///
+/// This is the only machine proof that the nested surface type-checks: the
+/// nested handlers, the shared `children_section` helper, the `exclude_parent_fk`
+/// form flag, the `paths::nested_index`/`nested_create` helpers, AND — critically
+/// — the *injected* edit to the parent's already-generated `show` handler, which
+/// is a textual patch to a file this invocation does not own. A `cargo check`
+/// here is what catches that patch going stale if the flat `show` template ever
+/// changes shape.
+///
+/// The generated nested test needs no database (its rows are in-process), so it
+/// is run for real rather than just compiled.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_nested_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("nested-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Comment",
+            "body:Text",
+            "post:references",
+            "--belongs-to",
+            "Post",
+        ],
+    );
+
+    let child = fs::read_to_string(project.join("src/routes/comments.rs")).unwrap();
+    assert!(
+        child.contains("#[get(\"/posts/{post_id}/comments\", name = \"nested_index\")]"),
+        "missing the nested read route:\n{child}"
+    );
+    assert!(
+        child.contains("#[post(\"/posts/{post_id}/comments\", name = \"nested_create\")]"),
+        "missing the nested create route:\n{child}"
+    );
+    let parent = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        parent.contains("crate::routes::comments::children_section("),
+        "the parent show must render its children:\n{parent}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on the nested scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+
+    // AC7: create child under parent -> appears in that parent's list -> does
+    // NOT appear under a different parent. DB-free, so run it here.
+    let output = Command::new("cargo")
+        .args(["test", "--test", "comment", "comments_nested_under_parent"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the generated nested write-path test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("test result: ok"),
+        "expected the generated nested test to pass:\n{stdout}"
+    );
+}
+
 /// Issue #1125: a scaffold WITH an owner column generates a record-level
 /// `Policy`/`Scope`, authorizes the mutating HTML handlers, scopes the index,
 /// and emits a cross-user 403 smoke test. `cargo check --tests` proves the

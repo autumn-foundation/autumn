@@ -214,6 +214,73 @@ Composite foreign keys, cascade policy (`ON DELETE`/`ON UPDATE`), and runtime
 association traversal (`belongs_to`/`has_many`) are not in scope for this
 token — see issue #835 for the latter.
 
+#### Nested resources with `--belongs-to`
+
+`references` gives the child a foreign key and a parent dropdown on its *own*
+form. `--belongs-to` adds the half a flat scaffold has always left to you: the
+**parent's** show page listing its children with an inline "add" form, and the
+nested routes behind it.
+
+```bash
+autumn generate scaffold Post title:String
+autumn generate scaffold Comment body:Text post:references --belongs-to Post
+```
+
+On top of the usual flat CRUD you get:
+
+| Generated | What it does |
+| --- | --- |
+| `GET /posts/{post_id}/comments` | The child list for one parent, paginated by the same `PageRequest` extractor the flat index uses (`?page=N&size=M`). |
+| `POST /posts/{post_id}/comments` | A `#[secured]` create whose foreign key comes from the **path**. Invalid input re-renders at 422 with inline errors and preserved values; success redirects (PRG) to the parent's show page. |
+| `pub async fn children_section(…)` in `src/routes/comments.rs` | The child list (a `data_table`, each row linking to the child's own show view) plus the inline create form. Public on purpose — call it from any hand-written page too. |
+| An edit to `src/routes/posts.rs` | The parent's generated `show` view now renders that section. |
+| A back-link on the child's show view | `Back to Post`, closing the loop. |
+| A test in `tests/comment.rs` | Create a child under a parent → it appears in *that* parent's list → it does **not** appear under a different parent. |
+
+If the child carries an owner column (`user_id`/`author_id`/`owner_id`), the
+nested list inherits the flat index's owner scoping: it is `#[secured]` and
+filtered to the signed-in user's own rows, so nesting can never open a second,
+wider door onto the same table. Widen it deliberately (drop the filter in
+`children_section_with`) if the children really are public.
+
+The nested create runs the same context-only `authorize_create::<Child>` the
+flat create runs — it does **not** authorize the *parent*. If attaching a child
+should depend on who owns the post, add that check to the generated handler; the
+policy has no parent-aware hook.
+
+The parent foreign key is deliberately **not** an editable control on the nested
+form: the parent is the URL. The handler overwrites the column from the path
+before it validates, so a hand-crafted body carrying its own `post_id` cannot
+re-parent a comment. (The child's own `/comments/new` form still shows the
+belongs_to dropdown — that is where choosing a parent belongs.)
+
+The child list is deliberately **not** sortable: unlike the flat index it runs a
+fixed `ORDER BY id DESC` and extracts no `ListQuery`, so advertising sortable
+headers would render links that reload the identical list. It is also a
+hand-written parent-scoped query rather than a repository call — the repository
+has no "children of X" method — so anything the repository layer applies for
+free on the flat index has to be spelled out in `children_section_with`
+(soft-delete and owner scoping already are).
+
+The edits to the parent's routes file are marker-delimited
+(`// autumn:nested:comments`), so re-running the generator never double-injects
+and `autumn destroy scaffold Comment body:Text post:references --belongs-to Post`
+takes exactly those lines back out — including when one parent has several
+nested children, and including after `cargo fmt` has reflowed them. Destroy also
+finds the parent from the markers alone, so forgetting to repeat `--belongs-to`
+still leaves a compiling project.
+
+Refused at generation time, with an actionable message, when combined with
+`--api`, `--live`, `--live-validation`, `--sharded`, an `Attachment` column, a
+nullable parent reference (`post:references?`), or a self-referential parent —
+and when the **parent** isn't a shape the injection can patch: not scaffolded
+yet, `slug`-keyed (`slug:slug{from:title}`), carrying a `:states(…)` column, or
+with a hand-rewritten `show` view. In those cases scaffold the child without
+`--belongs-to` — the `references` column and its dropdown still work — and write
+the parent-scoped list by hand. Nesting is single-level: `/a/{id}/b` but
+never `/a/{id}/b/{id}/c`. Many-to-many joins, polymorphic associations, and
+counter-cache columns stay hand-written.
+
 ### Human-readable URLs with `slug:slug{from:...}`
 
 `slug:slug{from:title}` gives a model a clean, shareable URL
