@@ -817,6 +817,34 @@ fn plan_scaffold_with_options_impl(
         name: snake_name.clone(),
     });
 
+    // …and the mirror: children nested INTO this resource. Destroying a parent
+    // out from under them deletes the module they still import
+    // (`crate::routes::<parent>::paths`, `schema::<parents>`) and leaves their
+    // nested routes mounted — an uncompilable project. The default destroy
+    // already stops, but only by accident: the injected section reads as
+    // "diverged from generated content", whose message says nothing about
+    // children and which `--force` waves straight through. Refuse explicitly
+    // instead, naming them, so `--force` cannot turn a deliberate override of
+    // one check into silent breakage of another.
+    if for_revert && !options_with_key.api {
+        let dependents = super::nested::children_nested_under(project_root, &plural);
+        if !dependents.is_empty() {
+            return Err(GenerateError::Config(format!(
+                "{} nested under {plural}, and src/routes/{plural}.rs renders their children \
+                 section. Destroying {plural} now would delete the module they import \
+                 (`crate::routes::{plural}::paths`, `schema::{plural}`) and leave their \
+                 nested routes mounted. Destroy {} first — that also removes the section from \
+                 src/routes/{plural}.rs — then destroy {plural}.",
+                if dependents.len() == 1 {
+                    format!("{} is", dependents[0])
+                } else {
+                    format!("{} are", dependents.join(", "))
+                },
+                dependents.join(", "),
+            )));
+        }
+    }
+
     // Parents this resource is currently nested under, discovered from the
     // `// autumn:nested:<plural>` markers already on disk (issue #1323). On the
     // GENERATE path this is always empty — the marker is written by the `Modify`
@@ -897,26 +925,43 @@ fn plan_scaffold_with_options_impl(
             }
         }
         let routes_dir = project_root.join("src").join("routes");
+        let own_routes_path = routes_dir.join(format!("{plural}.rs"));
+        // This resource may itself be a PARENT: its `show` can carry sections
+        // injected for children nested under it (issue #1323). The flat template
+        // below knows nothing about those, so a `--force` regeneration would
+        // overwrite them away — silently dropping the children list AND the only
+        // durable record of the relationship, after which a child regeneration
+        // would emit no nested handlers while `main.rs` still mounted them.
+        // Re-apply them onto the fresh render instead. Empty for the common
+        // case, and skipped on the revert path (where this Create is a Delete).
+        let previous_own_routes = if for_revert {
+            String::new()
+        } else {
+            read_or_empty(&own_routes_path)
+        };
         plan.create(
-            routes_dir.join(format!("{plural}.rs")),
-            render_routes_file(
-                project_root,
-                &pascal_name,
-                &snake_name,
-                &plural,
-                &form_fields,
-                &fields,
-                options_with_key.model.sharded,
-                options_with_key.model.soft_delete,
-                options_with_key.model.id_type,
-                options_with_key.live,
-                options_with_key.live_validation,
-                metadata.validations(),
-                &missing_reference_targets,
-                authorize_routes,
-                owner_column.as_ref().map(|o| o.name.as_str()),
-                &options_with_key.model.searchable,
-                nesting.as_ref(),
+            own_routes_path,
+            super::nested::reapply_children(
+                &previous_own_routes,
+                &render_routes_file(
+                    project_root,
+                    &pascal_name,
+                    &snake_name,
+                    &plural,
+                    &form_fields,
+                    &fields,
+                    options_with_key.model.sharded,
+                    options_with_key.model.soft_delete,
+                    options_with_key.model.id_type,
+                    options_with_key.live,
+                    options_with_key.live_validation,
+                    metadata.validations(),
+                    &missing_reference_targets,
+                    authorize_routes,
+                    owner_column.as_ref().map(|o| o.name.as_str()),
+                    &options_with_key.model.searchable,
+                    nesting.as_ref(),
+                ),
             ),
         );
         let route_mod_path = routes_dir.join("mod.rs");
@@ -19335,6 +19380,71 @@ exempt_paths = [
             msg.contains("quietly serves the wrong rows"),
             "the message must name the failure mode — this shape COMPILES:\n{msg}"
         );
+    }
+
+    #[test]
+    fn regenerating_the_parent_keeps_the_children_section_it_carries() {
+        // `Post` is not a child, so its plan has no `Nesting` and the flat
+        // template it re-renders knows nothing about comments. Without the
+        // re-apply, a `--force` on the parent would silently drop the children
+        // list and the markers — after which a later child regeneration, having
+        // no markers to read, would emit no nested handlers while `main.rs`
+        // still mounted them.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+
+        let regen = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let parent = action_contents(&regen, "src/routes/posts.rs");
+        assert!(
+            parent.contains("// autumn:nested:comments"),
+            "the markers are the only durable record of the relationship:\n{parent}"
+        );
+        assert!(
+            parent.contains("crate::routes::comments::children_section("),
+            "{parent}"
+        );
+        assert!(parent.contains("(__autumn_children_comments)"), "{parent}");
+    }
+
+    #[test]
+    fn destroying_a_parent_that_still_has_nested_children_is_refused() {
+        // Deleting posts.rs and schema::posts out from under comments.rs — which
+        // imports both — leaves the project uncompilable with the nested routes
+        // still mounted. The plain divergence check stops the default destroy by
+        // accident, but says nothing about children and `--force` waves it
+        // through, so refuse explicitly.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+
+        let err = plan_scaffold_with_options_for_revert(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("comments is nested under posts"), "got: {msg}");
+        assert!(msg.contains("Destroy comments first"), "got: {msg}");
+        assert!(msg.contains("crate::routes::posts::paths"), "got: {msg}");
+
+        // …and the child's own destroy is unaffected: it is the operation the
+        // refusal points at, so it must not refuse itself.
+        plan_scaffold_with_options_for_revert(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &ScaffoldOptions::default(),
+        )
+        .expect("destroying the CHILD must still be allowed");
     }
 
     #[test]

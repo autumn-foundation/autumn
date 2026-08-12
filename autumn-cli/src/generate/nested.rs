@@ -388,6 +388,59 @@ pub(super) fn resolve(
     Ok(Some(nesting))
 }
 
+/// The child plurals currently nested INTO `parent_plural`'s routes file — the
+/// mirror of [`parents_carrying_child`], read from the same markers.
+///
+/// `parents_carrying_child` answers "who nests ME?"; this answers "who do I
+/// nest?". A resource that is a parent has no `--belongs-to` of its own and no
+/// `Nesting`, so without this its own regeneration would overwrite the injected
+/// section away (silently losing the children list AND the only durable record
+/// of the relationship), and its own destroy would delete the module its
+/// children still import.
+pub(super) fn children_nested_under(project_root: &Path, parent_plural: &str) -> Vec<String> {
+    let path = project_root
+        .join("src")
+        .join("routes")
+        .join(format!("{parent_plural}.rs"));
+    std::fs::read_to_string(&path)
+        .map_or_else(|_| Vec::new(), |src| children_nested_under_src(&src))
+}
+
+/// Re-apply every child section that `previous` carried onto a freshly rendered
+/// parent routes file.
+///
+/// A parent's own `generate … --force` re-renders `src/routes/<parents>.rs` from
+/// the flat template, which knows nothing about children. Without this the
+/// regeneration would quietly drop the children list and the markers with it —
+/// and a later child regeneration, having no markers left to read, would emit no
+/// nested handlers while `main.rs` still mounted them.
+pub(super) fn reapply_children(previous: &str, fresh: &str) -> String {
+    children_nested_under_src(previous)
+        .iter()
+        .fold(fresh.to_owned(), |acc, child| {
+            inject_into_parent_show(&acc, child)
+        })
+}
+
+/// [`children_nested_under`] against source text already in hand.
+fn children_nested_under_src(src: &str) -> Vec<String> {
+    let mut children: Vec<String> = src
+        .lines()
+        .filter_map(|line| {
+            // `rfind` because the marker is a line TRAILER; the code ahead of it
+            // may legitimately mention the same text. The prefix carries its
+            // colon, so `// autumn:nested-extractors` cannot match.
+            let trimmed = line.trim_end();
+            let at = trimmed.rfind(CHILD_MARKER_PREFIX)?;
+            let child = &trimmed[at + CHILD_MARKER_PREFIX.len()..];
+            (!child.is_empty()).then(|| child.to_owned())
+        })
+        .collect();
+    children.sort();
+    children.dedup();
+    children
+}
+
 /// Recover the parent this resource is already nested under from the markers in
 /// `src/routes/*.rs`, as the `snake_case` base name `--belongs-to` would have
 /// been given (`posts.rs` -> `post`).

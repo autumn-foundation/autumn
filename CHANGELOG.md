@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its foreign key, is refused before anything is written — the parent's section
   passes its own `row.id`, so the change would leave that call compiling while
   reading another table's ids. Un-nest with `destroy` first.
+  Regenerating the PARENT re-applies the child sections it carried, and
+  destroying a parent that still has nested children is refused with the order
+  to follow.
   When the child carries an owner column, the nested list inherits the flat
   index's `#[secured]` + owner scoping, so nesting never opens a second, wider
   door onto the same rows.

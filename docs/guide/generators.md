@@ -267,6 +267,12 @@ Because the markers record the relationship durably, `--belongs-to` is a
 (and says so in a warning) rather than half-dismantling it, and `autumn destroy`
 finds the parent without it.
 
+Regenerating the **parent** is safe: `autumn generate scaffold Post … --force`
+re-applies every child section it was carrying onto the fresh render, so the
+children list and the markers survive. Destroying a parent that still has nested
+children is refused (destroy the children first — that removes the section from
+the parent as it goes).
+
 Changing or dropping the parent is refused, before anything is written. The
 parent's section hands `children_section` its own `row.id`, so re-pointing the
 child at a different parent would leave that call compiling but reading the
