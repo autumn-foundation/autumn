@@ -1882,12 +1882,8 @@ fn parse_mailgun_form_data(
     let mut file_parts: Vec<Attachment> = Vec::new();
     let mut search_from = 0_usize;
 
-    loop {
-        // Locate the next "--{boundary}" in the raw byte buffer.
-        let Some(rel) = find_subslice(body.get(search_from..).unwrap_or_default(), &delim_bytes)
-        else {
-            break;
-        };
+    // Locate each "--{boundary}" in the raw byte buffer.
+    while let Some(rel) = find_subslice(body.get(search_from..).unwrap_or_default(), &delim_bytes) {
         let abs = search_from.saturating_add(rel);
         let after_delim = abs.saturating_add(delim_bytes.len());
 
