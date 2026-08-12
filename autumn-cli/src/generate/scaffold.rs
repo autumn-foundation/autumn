@@ -5396,17 +5396,26 @@ pub async fn show(
             } else {
                 String::new()
             };
-            // Issue #1318: a state transition mutates the row, so it must move
-            // the optimistic-locking counter too — otherwise an author holding
-            // an edit form opened before the transition saves successfully and
-            // is never told the record moved on, which is exactly the "changed
-            // by someone else" case the 409 banner promises to catch. The bump
-            // also makes the transition's own write a compare-and-swap-adjacent
-            // observation point for anyone else guarding on the version.
+            // Issue #1318: a state transition is a read-modify-write — it loads
+            // the row, asks `transition_{field}_to` whether the edge is legal
+            // from the state it just read, then writes. With a lock column in
+            // play that whole sequence becomes a compare-and-swap against the
+            // version it read, for two reasons:
             //
-            // The tuple parentheses are conditional: without a lock column the
-            // emitted `.set(...)` must stay the single-expression pre-#1318 form
-            // byte for byte.
+            //   * the GUARD stops two concurrent transitions out of the same
+            //     source state from both committing. Both would pass the
+            //     legality check against the stale row they each loaded, and an
+            //     `id`-only `WHERE` would let the second silently overwrite the
+            //     first's transition;
+            //   * the BUMP makes the transition visible to everyone else
+            //     guarding on the version — without it, an author holding an
+            //     edit form opened before the transition saves successfully and
+            //     is never told the record moved on, which is exactly the
+            //     "changed by someone else" case the 409 banner promises.
+            //
+            // Every fragment is empty without a lock column, including the tuple
+            // parentheses: the emitted `.set(...)` must stay the
+            // single-expression pre-#1318 form byte for byte.
             let (transition_set_open, transition_lock_bump, transition_set_close) =
                 if lock_version.is_some() {
                     (
@@ -5417,6 +5426,35 @@ pub async fn show(
                 } else {
                     ("", String::new(), "")
                 };
+            let transition_update_bind = if lock_version.is_some() {
+                "let updated = "
+            } else {
+                ""
+            };
+            let transition_lock_filter = lock_version.map_or_else(String::new, |_| {
+                format!(".filter({plural}::lock_version.eq(row.lock_version))")
+            });
+            // Zero rows means the version moved between the load and the write.
+            // Re-render the detail page at 409 rather than redirecting with a
+            // success flash for a transition that never happened. `row` is the
+            // pre-transition snapshot, which is the honest thing to show: the
+            // reader reloads and decides again.
+            let transition_conflict_block = lock_version.map_or_else(String::new, |_| {
+                format!(
+                    "            if updated == 0 {{\n                \
+                     flash.error(\"This {snake_name} was changed by someone else since this page was loaded. Reload and try again.\").await;\n                \
+                     let view = show_view(\n                    \
+                     db,\n                    \
+                     &row,\n                    \
+                     flash_messages(&flash.consume().await),\n                    \
+                     csrf.as_ref(),\n                    \
+                     csrf_field.as_ref(){show_view_state_arg_call},\n                \
+                     )\n                \
+                     .await?;\n                \
+                     return Ok((autumn_web::reexports::http::StatusCode::CONFLICT, view).into_response());\n            \
+                     }}\n"
+                )
+            });
             let mut transition_handlers = String::new();
             for f in &sm_fields {
                 let field = &f.name;
@@ -5447,11 +5485,11 @@ pub async fn transition_{field}(
     let target = submitted.get("{field}").cloned().unwrap_or_default();
     match row.transition_{field}_to(&target) {{
         Ok(new_state) => {{
-            diesel::update({plural}::table.find(*id))
+            {transition_update_bind}diesel::update({plural}::table.find(*id){transition_lock_filter})
                 .set({transition_set_open}{plural}::{field}.eq(new_state){transition_lock_bump}{transition_set_close})
                 .execute(&mut *db)
                 .await?;
-            flash.success("{pascal_name} {field} updated").await;
+{transition_conflict_block}            flash.success("{pascal_name} {field} updated").await;
             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())
         }}
         Err(err) => {{
@@ -17439,11 +17477,45 @@ exempt_paths = [
     }
 
     #[test]
+    fn state_transition_is_a_compare_and_swap_on_the_version() {
+        // A transition is a read-modify-write: it loads the row, checks the edge
+        // is legal from the state it read, then writes. Without a guard, two
+        // concurrent transitions out of the same source state both pass the
+        // check and both commit — the second silently overwriting the first.
+        // The bump alone does not prevent that; the WHERE does.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:String:states(draft->published)".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let transition = handler_slice(&routes, "transition_status");
+        assert!(
+            transition.contains(".filter(posts::lock_version.eq(row.lock_version))"),
+            "the transition write must be guarded by the version it read: {transition}"
+        );
+        assert!(
+            transition.contains("if updated == 0") && transition.contains("StatusCode::CONFLICT"),
+            "a lost transition race must 409, not report success: {transition}"
+        );
+        assert!(
+            transition.contains("changed by someone else"),
+            "the 409 must explain itself: {transition}"
+        );
+    }
+
+    #[test]
     fn state_transition_bumps_the_lock_version() {
-        // A transition mutates the row, so it must move the counter — otherwise
-        // an author whose edit form predates the transition saves successfully
-        // and is never told the record moved on, which is exactly the case the
-        // 409 banner promises to catch.
+        // The bump is the other half: it makes the transition visible to anyone
+        // else guarding on the version, so an author whose edit form predates
+        // the transition is told the record moved on instead of saving over it.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),

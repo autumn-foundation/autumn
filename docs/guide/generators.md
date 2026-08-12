@@ -847,9 +847,13 @@ autumn generate scaffold Post title:String body:Text lock_version:i32
   sequence: first write wins and bumps, stale write 409s and changes
   nothing, retry against the returned version succeeds.
 
-- A `:states(...)` **transition** bumps the version too, so an author
-  holding an edit form opened before someone else advanced the state is
-  told about it on save rather than saving over a record that moved on.
+- A `:states(...)` **transition** is guarded the same way. It is itself a
+  read-modify-write — load the row, check the edge is legal from the state
+  just read, write — so its `UPDATE` carries `WHERE lock_version =
+  <the version it read>` and 409s (re-rendering the detail page) when it
+  loses the race, instead of letting two concurrent transitions out of the
+  same state both commit. It bumps the version too, so an author holding an
+  edit form opened before the transition is told the record moved on.
 - `autumn db pull` reproduces the attribute when it finds a
   `lock_version` column, so a pulled table round-trips to the same model.
 

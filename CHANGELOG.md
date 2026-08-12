@@ -33,8 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `role="alert"` banner, and the row's **current** version in the hidden field —
   so a second Save applies their edit on top of the newer row. Handing the stale
   version back would leave the form permanently unsavable. A `:states(...)`
-  transition bumps the version too, so an author holding an older edit form
-  learns the record moved on instead of saving over it.
+  transition gets the same compare-and-swap: it is itself a read-modify-write
+  (load, check the edge is legal from the state just read, write), so two
+  concurrent transitions out of the same state would otherwise both commit. It
+  guards on the version it read, 409s on a lost race, and bumps — so an author
+  holding an older edit form also learns the record moved on.
 
   Coverage: the generated `tests/<snake>.rs` gains a
   `<plural>_optimistic_lock_conflict` test pinning the contract;
