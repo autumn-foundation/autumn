@@ -5384,3 +5384,79 @@ fn migration_guide_gate_does_not_read_a_deep_heading_as_an_entry() {
         gate_report(&output),
     );
 }
+
+// --- Review round 38: escaped bangs, block-quoted fences ------------------
+
+#[test]
+fn migration_guide_gate_accepts_a_link_after_an_escaped_bang() {
+    // `\!` renders as a literal `!` and leaves the link clickable — the
+    // reference implementation emits `!<a href=…>`. Treating any preceding
+    // `!` as an image rejected a link that works.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. \\![migration guide](docs/migrations/0.7.0.md)\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "an escaped bang is a literal `!`, not an image\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_opens_a_fence_inside_a_block_quote() {
+    // A block-quote marker sits in front of the fence, so fence detection has
+    // to look past it. It did not, and the link displayed inside the quoted
+    // sample counted although CommonMark renders it as code.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n  \
+         > ~~~\n  > [migration guide](docs/migrations/0.7.0.md)\n  > ~~~\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a link inside a quoted fence renders as code",
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_treats_a_block_quote_note_as_an_aside() {
+    // The counterpart, and the reason quote markers are stripped only for
+    // block detection: an aside under `### Breaking Changes` must stay an
+    // aside. Stripping the marker everywhere would make it an entry and fail
+    // this repository's own changelog.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Breaking Changes\n\n\
+         > Backfilled from the guide, which shipped with the release.\n\n\
+         - **db:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a quoted note is not a breaking entry\n{}",
+        gate_report(&output),
+    );
+}

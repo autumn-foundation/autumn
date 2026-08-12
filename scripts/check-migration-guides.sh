@@ -304,6 +304,24 @@ function track_block_indent(text,   width) {
   }
 }
 
+function strip_quote_markers(text,   out, guard) {
+  # Block detection has to see past an enclosing block quote: `> ~~~` opens a
+  # fence, and a link displayed inside it renders as code.
+  #
+  # Deliberately NOT folded into block_body. The entry rules use the unstripped
+  # body to tell a quoted section note from a declaration, and this changelog
+  # writes its backfill notes exactly that way — stripping the marker there
+  # would turn every one of them into an entry demanding a guide link.
+  out = text
+  for (guard = 0; guard < 8; guard++) {
+    if (substr(out, 1, 1) != ">") break
+    out = substr(out, 2)
+    if (substr(out, 1, 1) == " ") out = substr(out, 2)
+    out = dedent3(out)
+  }
+  return out
+}
+
 function block_body(text,   strip) {
   # The line as a block parser sees it: the enclosing list item indentation
   # removed first, then the up-to-three spaces markdown allows on a block
@@ -498,7 +516,11 @@ function inside_image_label(text, at,   i, ch, depth, slashes) {
     if (ch == "]") { depth++; continue }
     if (depth > 0) { depth--; continue }
     # An unmatched `[`, so it encloses `at`. Keep walking outward past it.
-    if (i > 1 && substr(text, i - 1, 1) == "!") return 1
+    if (i > 1 && substr(text, i - 1, 1) == "!") {
+      slashes = 0
+      while (i - slashes - 2 >= 1 && substr(text, i - slashes - 2, 1) == "\\") slashes++
+      if (slashes % 2 == 0) return 1
+    }
   }
   return 0
 }
@@ -530,7 +552,13 @@ function links_to(text, path,   at, i, ch, start, slashes, depth, open_at, dest)
     if (open_at == 0) continue
     # An unescaped `!` before the bracket makes this an image, which renders a
     # picture rather than a path the reader can follow.
-    if (open_at > 1 && substr(text, open_at - 1, 1) == "!") continue
+    # `\!` renders as a literal `!` and leaves the link clickable, so only an
+    # unescaped bang makes this an image.
+    if (open_at > 1 && substr(text, open_at - 1, 1) == "!") {
+      slashes = 0
+      while (open_at - slashes - 2 >= 1 && substr(text, open_at - slashes - 2, 1) == "\\") slashes++
+      if (slashes % 2 == 0) continue
+    }
     if (inside_image_label(text, open_at)) continue
     md_link_label = substr(text, open_at + 1, at - open_at - 1)
     if (substr(text, at + 1, 1) == "(") {
@@ -607,7 +635,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # Sliced from the *expanded* line: leading_spaces counts visual columns, so
   # feeding that count to substr on a tab-indented line started the slice
   # mid-marker and the fence went unseen.
-  body = block_body(line)
+  body = strip_quote_markers(block_body(line))
   ch = substr(body, 1, 1)
   if (ch == "`" || ch == "~") {
     run = 0
