@@ -9,6 +9,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **failure capsules:** a failing request can now be recorded and replayed
+  offline (#1598). With `[failure_capture] enabled = true`, every caught panic
+  and every 5xx writes a **capsule** — one JSON file holding the redacted
+  request, the database traffic the handler produced, the clock readings it
+  took and the outcome the client received — and `autumn replay <capsule>`
+  rebuilds the application around it and re-runs it. The gap this closes is the
+  one between "I have a stack trace" and "I can reproduce it": a production
+  500 that depends on the row a query returned is not reproducible from a log
+  line, however structured, and the usual answer — copy the request into a
+  test, guess at the data — is exactly the guess that makes a bug take a week.
+
+  Database effects are captured at the **wire**, not at the query API. A pooled
+  connection is established through a tee that frames PostgreSQL protocol
+  messages in both directions and groups them into exchanges: the SQL, the bind
+  parameters, and the raw backend frames — `RowDescription`, every `DataRow`,
+  `CommandComplete`, `ReadyForQuery` — byte for byte. Replay serves those bytes
+  back to a real `tokio-postgres` client through an in-process stub server over
+  an in-memory duplex pipe, so no socket is opened and no live database is
+  contacted. The wire is the only honest seam available: diesel's `PgRow` wraps
+  a `tokio_postgres::Row` that has no public constructor, so rows cannot be
+  fabricated at the API level by anything — including Autumn. Attribution costs
+  no extra latency: `Db::checkout` merges `SET autumn.capsule_request` into the
+  same round trip as `SET statement_timeout`, and a checkout with no capture
+  scope sends the clearing form so background work can never land in whoever
+  held that connection last. Each capsule also carries the connection's memo —
+  its session prologue, its already-prepared statement metadata, its catalog
+  lookups — because a capsule recorded on a warm pooled connection must replay
+  against a cold stub.
+
+  **A capsule contains real request data and real database rows**, and the
+  documentation leads with that rather than burying it. Headers, query
+  parameters and structured bodies are masked through the same
+  `[log] filter_parameters` list the access log uses (plus every `#[encrypted]`
+  column name); any SQL bind whose bytes echo a masked value is blanked, and so
+  is any masked value quoted back inside an outcome message, panic payload or
+  backtrace. What is *not* masked is stated just as plainly: database result
+  rows, URL path segments, unstructured bodies. A body that declares structure
+  but does not parse as it is dropped entirely rather than recorded unmasked.
+  Capsules are written owner-only (0600 on unix) through a temp-then-rename,
+  pruned oldest-first before each write, and off by default.
+
+  `autumn replay` compiles the app and runs it in a replay mode that forces
+  in-memory sessions and skips migrations, storage preflight, the cache
+  backend, the job runtime, the scheduler, the mailer and the fail-fast
+  configuration gates — the clock and the database come from the capsule, so
+  the only remaining variable is the code. The verdict is JSON on stdout and a
+  human summary on stderr: exit 0 `reproduced`, exit 1 `mismatch` (the tape
+  lined up, the outcome changed — what a fix looks like) or `diverged` (the
+  code asked the database something the recording never asked, so the run was
+  not a fair comparison), exit 2 `refused` for a truncated capsule, a
+  `format_version` this build does not understand, an unreadable file, or a
+  PostgreSQL tape handed to a sqlite build. A divergence names the connection,
+  the position in its tape and the SQL involved; a 401/403 where the recording
+  answered a server error is called out as the redaction limit it is, not left
+  as a puzzle.
+
+  Overhead is measured, not asserted. `failure_capsule_overhead.rs` drives
+  2 000 requests per phase in interleaved rounds against a local PostgreSQL 16
+  and prints both numbers that matter: on a route that does nothing else,
+  capture costs +55 µs p50 / +76 µs p95 (479 → 533 µs p50); on a route doing
+  one bound `SELECT`, +80 µs p50 / +62 µs p95 (1 922 → 2 002 µs p50) — tens of
+  microseconds, or 3–6% of a request that talks to a database once. A repeat
+  run put the same p50 deltas at +43 µs and +128 µs, which is a fair measure of
+  the noise. Indicative only: CI-class virtualized hardware, unoptimized build,
+  database on localhost.
+
+  Slice-1 limitations are enumerated rather than implied: authenticated and
+  CSRF-protected routes do not replay faithfully (their credentials are
+  masked, so the replay stops at the auth layer); one request per capsule;
+  same-commit replay is what is tested, and a framework-version difference
+  warns; concurrent connections within one request may diverge on ordering;
+  capture needs plaintext TCP PostgreSQL, so a `sslmode` URL, a Unix-socket
+  URL, a sqlite build, a custom `DatabasePoolProvider` or a shard pool disables
+  the database tape (the capsule says so in its notes); `LISTEN`/`NOTIFY` is
+  unsupported on capture-enabled request pools; `COPY` streams mark the capsule
+  truncated; and successful requests are never captured. `ErrorEvent` gains a
+  `capsule` field whose file is already on disk by the time a reporter runs.
+  See `docs/guide/failure-capsules.md`.
+
 - **generate scaffold:** the generated list view ships a working **Export
   CSV** download (#1315). Autumn already had the hard half — `export_csv` +
   the `CsvSchema` trait, landed in #808 — but the generator never wired it,
