@@ -189,6 +189,36 @@ pub fn plan_model_with_options(
     // the SQL migration and schema.rs block include the nullable column.
     let schema_fields = augment_fields_for_soft_delete(&fields, options.soft_delete)?;
 
+    // Issue #1318: `lock_version` is managed by the database, so it contributes
+    // nothing to `New{Model}` — and neither does any `--default` column. A model
+    // whose columns are ALL database-managed therefore emits an empty
+    // `New{Model}`, whose Diesel `Insertable` derive does not compile, so the
+    // generated project is dead on arrival.
+    //
+    // The check is on the EFFECTIVE set rather than the declared token count:
+    // `Post title:String lock_version:i32 --default title=x` declares two
+    // columns and leaves zero. `metadata.defaults` carries both the explicit
+    // `--default` columns and (from `parse_model_metadata`) the lock column.
+    //
+    // Scoped to lock-version models deliberately. A model whose every column is
+    // `--default`ed — or one declared with no fields at all — has always emitted
+    // this same uncompilable struct; widening the refusal to those pre-existing
+    // cases is a separate change from wiring #1318, and would move a fieldless
+    // `generate scaffold Post` from a compile error to a planning error that an
+    // existing test pins.
+    if lock_version_field(&fields).is_some()
+        && fields
+            .iter()
+            .all(|f| metadata.defaults().contains_key(&f.name))
+    {
+        return Err(GenerateError::Config(format!(
+            "this model has no insertable columns: `{LOCK_VERSION_COLUMN}` is managed by the \
+             database (and so is every `--default` column), so the generated \
+             New{pascal_name} struct would have no fields at all and the project would not \
+             compile. Declare at least one ordinary column alongside `{LOCK_VERSION_COLUMN}`."
+        )));
+    }
+
     let mut plan = Plan::new(project_root);
     // Issue #1318: `lock_version` is a magic column name — declaring it changes
     // the model's semantics (DB-managed, kept out of `New{Model}`, carried on
@@ -5508,6 +5538,56 @@ autumn-web = \"0.3\"\n";
             msg.contains("lock_version") && msg.contains("i32"),
             "the error must name the field and the supported types: {msg}"
         );
+    }
+
+    #[test]
+    fn a_model_with_no_insertable_columns_is_rejected() {
+        // Every column DB-managed => an empty `NewPost`, whose Diesel
+        // `Insertable` derive does not compile. `generate model` reaches this
+        // as easily as `generate scaffold` did, and the scaffold delegates here,
+        // so the guard belongs on this path.
+        let tmp = project();
+        let err = plan_model(
+            tmp.path(),
+            "Post",
+            &["lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no insertable columns") && msg.contains("NewPost"),
+            "got: {msg}"
+        );
+
+        // The mixed case: two columns declared, none left after `--default`
+        // drops one and `#[lock_version]` drops the other.
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+            &ModelOptions {
+                defaults: vec!["title=x".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("no insertable columns"),
+            "got: {err}"
+        );
+
+        // One ordinary column alongside is enough.
+        let tmp = project();
+        plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+        )
+        .expect("a lock column plus an ordinary column must generate");
     }
 
     #[test]

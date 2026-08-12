@@ -16,6 +16,7 @@ use std::path::Path;
 
 use super::dsl::FieldKind;
 use super::emit::Plan;
+use super::model::LOCK_VERSION_COLUMN;
 use super::naming::{pascal, snake};
 use super::schema_edit::{add_mod_declaration, singularize, update_main_rs};
 use super::{GenerateError, ensure_project_root, read_or_empty};
@@ -180,6 +181,23 @@ pub fn plan_pull(
             )));
         }
 
+        // Issue #1318: a `lock_version` column normally comes back annotated, but
+        // `render_model` declines when annotating would leave the model with no
+        // insertable columns at all (the attribute drops it from `New{Model}`).
+        // Say so rather than letting the counter come back as a plain integer
+        // with the conflict check quietly missing.
+        if let Some(col) = table.columns.iter().find(|c| is_lock_version_column(c))
+            && !annotate_lock_version(&table.columns, col)
+        {
+            plan.warn(format!(
+                "table '{}' has a `{}` column, but it is the only insertable column — pulling it \
+                 as `#[lock_version]` would leave New{pascal_name} empty and the project would \
+                 not compile, so it came back as an ordinary integer with no conflict checking. \
+                 Add another column, or hand-write the attribute once the table has one.",
+                table.table, LOCK_VERSION_COLUMN,
+            ));
+        }
+
         // (a) src/models/<snake>.rs
         plan.create(
             models_dir.join(format!("{snake_name}.rs")),
@@ -301,7 +319,7 @@ pub fn render_model(pascal_name: &str, table: &str, columns: &[Column]) -> Strin
     for col in columns {
         if col.is_pk {
             out.push_str("    #[id]\n");
-        } else if is_lock_version_column(col) {
+        } else if annotate_lock_version(columns, col) {
             // Issue #1318: `lock_version` is the framework's optimistic-locking
             // counter, so pulling a table that has one must reproduce the
             // attribute `generate model` would have emitted — otherwise a
@@ -337,6 +355,27 @@ fn inferred_table_name(pascal_name: &str) -> String {
 /// separately by `#[id]` (which takes precedence in `render_model`).
 fn is_write_excluded(col: &Column) -> bool {
     col.is_db_generated() || col.is_generated || (col.name == "created_at" && col.has_default)
+}
+
+/// Whether `col` should carry `#[lock_version]` in the pulled model.
+///
+/// [`is_lock_version_column`] answers "is this the counter"; this additionally
+/// asks whether annotating it would leave the model with **nothing** to insert.
+/// The attribute excludes the column from `New{Model}`, so on a degenerate table
+/// whose only non-key column is the counter, annotating produces an empty struct
+/// whose Diesel `Insertable` derive does not compile — turning a pulled project
+/// that used to build into one that doesn't. `db pull` mirrors a database it does
+/// not control, so it declines the annotation there rather than refusing the
+/// table; `plan_pull` records a warning so the downgrade is not silent. A
+/// greenfield-generated table can never hit this: `plan_model_with_options`
+/// refuses to emit a model with no insertable columns in the first place.
+fn annotate_lock_version(columns: &[Column], col: &Column) -> bool {
+    if !is_lock_version_column(col) {
+        return false;
+    }
+    columns
+        .iter()
+        .any(|other| !other.is_pk && !is_write_excluded(other) && !is_lock_version_column(other))
 }
 
 /// Whether an introspected column is the framework's optimistic-locking counter
@@ -1647,17 +1686,59 @@ mod tests {
         }
     }
 
+    /// An ordinary, insertable column — a greenfield table always has at least
+    /// one, which is what keeps the lock annotation from emptying `New{Model}`.
+    fn title_column() -> Column {
+        Column {
+            name: "title".into(),
+            kind: FieldKind::String,
+            nullable: false,
+            is_pk: false,
+            has_default: false,
+            has_sequence_default: false,
+            is_generated: false,
+            is_identity: false,
+        }
+    }
+
     #[test]
     fn pulling_a_generated_lock_version_column_reproduces_the_attribute() {
         // A greenfield-generated table carries `lock_version INTEGER NOT NULL
-        // DEFAULT 0`, so pulling it must give back the same model — otherwise
-        // `db pull` silently downgrades the column to a plain editable integer
-        // and the conflict check disappears.
-        let model = render_model("Post", "posts", &[id_column(), lock_version_column(true)]);
+        // DEFAULT 0` alongside its real columns, so pulling it must give back the
+        // same model — otherwise `db pull` silently downgrades the column to a
+        // plain editable integer and the conflict check disappears.
+        let model = render_model(
+            "Post",
+            "posts",
+            &[id_column(), title_column(), lock_version_column(true)],
+        );
         assert!(
             model.contains("#[lock_version]\n    pub lock_version: i32,"),
             "model:\n{model}"
         );
+    }
+
+    #[test]
+    fn pulling_a_lock_only_table_declines_the_annotation_rather_than_emitting_an_empty_insert() {
+        // A table whose only non-key column is the counter: annotating would drop
+        // it from `NewPost`, leaving an empty struct whose `Insertable` derive
+        // does not compile — turning a project that used to build into one that
+        // does not. `db pull` mirrors a database it does not own, so it declines
+        // the attribute instead of refusing the table.
+        let model = render_model("Post", "posts", &[id_column(), lock_version_column(true)]);
+        assert!(
+            !model.contains("#[lock_version]"),
+            "annotating would empty NewPost:\n{model}"
+        );
+        assert!(model.contains("pub lock_version: i32,"), "model:\n{model}");
+
+        // One ordinary column alongside and the annotation comes back.
+        let model = render_model(
+            "Post",
+            "posts",
+            &[id_column(), title_column(), lock_version_column(true)],
+        );
+        assert!(model.contains("#[lock_version]"), "model:\n{model}");
     }
 
     #[test]
@@ -1666,7 +1747,11 @@ mod tests {
         // database default. Annotating would drop the column from `New{Model}`
         // — and `db pull` emits no migration to add a default — so every insert
         // would then violate the NOT NULL constraint. Pull it as-is instead.
-        let model = render_model("Post", "posts", &[id_column(), lock_version_column(false)]);
+        let model = render_model(
+            "Post",
+            "posts",
+            &[id_column(), title_column(), lock_version_column(false)],
+        );
         assert!(
             !model.contains("#[lock_version]"),
             "a defaultless column must not be annotated:\n{model}"

@@ -562,28 +562,10 @@ fn plan_scaffold_with_options_impl(
         .filter(|field| !metadata.defaults().contains_key(&field.name))
         .cloned()
         .collect::<Vec<_>>();
-    // Issue #1318: `lock_version` is DB-managed, so it contributes nothing to
-    // the insert struct — and neither does any `--default` column. A scaffold
-    // whose columns are ALL database-managed therefore builds an empty
-    // `New{Model}`, which does not implement `Insertable` and fails to compile.
-    // Counting declared tokens would miss the mixed case (`title:String
-    // lock_version:i32 --default title=x` declares two and leaves none), so the
-    // guard is on the effective set — `form_fields` is exactly the columns that
-    // survive into `New{Model}`.
-    //
-    // Scoped to lock-version scaffolds deliberately: an all-`--default` scaffold
-    // has always emitted this same broken struct, and widening the refusal to
-    // that pre-existing case is a separate change from wiring #1318.
-    if form_fields.is_empty() && super::model::lock_version_field(&fields).is_some() {
-        return Err(GenerateError::Config(format!(
-            "this scaffold has no insertable columns: `{col}` is managed by the database (and \
-             so is every `--default` column), so the generated New{pascal} struct would have no \
-             fields at all and the app would not compile. Declare at least one ordinary column \
-             alongside `{col}`.",
-            col = super::model::LOCK_VERSION_COLUMN,
-            pascal = pascal(name),
-        )));
-    }
+    // The equivalent guard for the insert struct (issue #1318) lives in
+    // `plan_model_with_options`, which the scaffold delegates to above — so a
+    // lock-only scaffold is refused before it reaches here, and `generate model`
+    // gets the same refusal without the scaffold planner having to be involved.
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let plural = pluralize(&snake_name);

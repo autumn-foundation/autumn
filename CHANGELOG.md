@@ -56,9 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now print a warning saying what declaring it changed and how to opt out
   (rename it). A `lock_version` that is not a non-nullable `i32`/`i64`, one
   marked `unique` (it is DB-managed and defaults to 0, so a unique index would
-  reject the second row ever created), and one declared as a scaffold's *only*
-  column (the insert struct would be empty and would not compile) are all
-  rejected at generation time rather than silently mis-generated. On HTML scaffolds,
+  reject the second row ever created), and and one that would leave a model with **no
+  insertable columns at all** (every column database-managed means an empty
+  `New{Model}`, whose Diesel `Insertable` derive does not compile) are all
+  rejected at generation time rather than silently mis-generated — on the
+  `generate model` path as well as `generate scaffold`, since the scaffold
+  delegates its model planning there. `autumn db pull` declines the attribute
+  in that same degenerate case (it mirrors a database it does not own, so it
+  warns and pulls an ordinary integer rather than emitting a project that will
+  not build). On HTML scaffolds,
   `--live`, `--sharded`, a `slug` column, and scaffolds with an `Attachment`
   column write through paths that do not route via the guarded statement, so
   combining them with `lock_version` is refused up front instead of emitting an
