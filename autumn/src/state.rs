@@ -517,7 +517,7 @@ impl AppState {
 
     /// Replace the clock (builder / test helper).
     ///
-    /// Also re-stamps [`started_at`](Self::started_at) from the new clock, so
+    /// Also re-stamps the app's start instant from the new clock, so
     /// [`uptime`](Self::uptime) is measured on the timeline that is actually
     /// installed. Without this, a state built with the default [`SystemClock`]
     /// and then handed a virtual clock would compare a *virtual* `now` against a

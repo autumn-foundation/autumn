@@ -986,7 +986,7 @@ where
     Fut: std::future::Future<Output = Result<T, diesel::result::Error>>,
 {
     run_instrumented_with_clock(
-        std::sync::Arc::clone(&DEFAULT_SYSTEM_CLOCK),
+        &crate::time::SystemClock,
         sql,
         route_key,
         slow_threshold,
@@ -998,21 +998,34 @@ where
 
 /// [`run_instrumented`], timing the query on an injected clock.
 ///
-/// The determinism-seam twin (#1797): pass `state.clock()`'s handle
-/// (`AppState`'s `clock_arc`, or the `Arc<dyn ClockSource>` a subsystem already
-/// holds) and the recorded latency follows virtual time under a
-/// [`#[sim_test]`](crate::sim_test) instead of the real machine clock.
+/// The determinism-seam twin (#1797): pass `state.clock()` and the recorded
+/// latency follows virtual time under a [`#[sim_test]`](crate::sim_test)
+/// instead of the real machine clock.
+///
+/// ```rust,ignore
+/// let rows = autumn_web::db::run_instrumented_with_clock(
+///     state.clock(),
+///     "SELECT …",
+///     "GET /users",
+///     slow_threshold,
+///     state.metrics(),
+///     || users::table.load(&mut conn),
+/// )
+/// .await?;
+/// ```
 ///
 /// # Parameters
 ///
 /// As [`run_instrumented`], plus `clock`: the source both timing readings are
-/// taken from.
+/// taken from. Borrowed rather than owned so
+/// [`AppState::clock`](crate::state::AppState::clock) — which hands out a
+/// `&dyn ClockSource` — is directly usable; no `Arc` handle is needed.
 ///
 /// # Errors
 ///
 /// As [`run_instrumented`].
 pub async fn run_instrumented_with_clock<F, Fut, T>(
-    clock: std::sync::Arc<dyn crate::time::ClockSource>,
+    clock: &dyn crate::time::ClockSource,
     sql: &str,
     route_key: &str,
     slow_threshold: std::time::Duration,
