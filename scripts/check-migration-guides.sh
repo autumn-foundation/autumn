@@ -472,6 +472,26 @@ function reference_target(text, at,   rest, label, close_at) {
   return (label in md_link_defs) ? md_link_defs[label] : ""
 }
 
+function inside_image_label(text, at,   i, ch, depth, slashes) {
+  # Walk outward from an opening `[` looking for a label that encloses it. A
+  # link nested in an *image* label is flattened into alt text, so its
+  # destination is not somewhere the reader can go — and checking only the
+  # candidate\047s own bracket for a preceding `!` misses that entirely.
+  depth = 0
+  for (i = at - 1; i >= 1; i--) {
+    ch = substr(text, i, 1)
+    if (ch != "[" && ch != "]") continue
+    slashes = 0
+    while (i - slashes - 1 >= 1 && substr(text, i - slashes - 1, 1) == "\\") slashes++
+    if (slashes % 2 == 1) continue
+    if (ch == "]") { depth++; continue }
+    if (depth > 0) { depth--; continue }
+    # An unmatched `[`, so it encloses `at`. Keep walking outward past it.
+    if (i > 1 && substr(text, i - 1, 1) == "!") return 1
+  }
+  return 0
+}
+
 function links_to(text, path,   at, i, ch, start, slashes, depth, open_at, dest) {
   # Every `]` that closes a link label is a candidate. What follows decides how
   # the destination is found: `(` means an inline link, anything else means a
@@ -500,6 +520,7 @@ function links_to(text, path,   at, i, ch, start, slashes, depth, open_at, dest)
     # An unescaped `!` before the bracket makes this an image, which renders a
     # picture rather than a path the reader can follow.
     if (open_at > 1 && substr(text, open_at - 1, 1) == "!") continue
+    if (inside_image_label(text, open_at)) continue
     md_link_label = substr(text, open_at + 1, at - open_at - 1)
     if (substr(text, at + 1, 1) == "(") {
       dest = link_destination(text, at + 2)
@@ -694,7 +715,12 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # on a blank line or a block-level construct. Headings count as closing it:
   # a type-7 tag directly under one does open a block, which is why "was the
   # previous line blank" is not the same question.
-  md_paragraph_open = (body ~ /[^[:space:]]/ && heading_text(body) !~ /^#+[ \t]/) ? 1 : 0
+  # A link reference definition is not a paragraph: it neither opens one nor,
+  # where one is already open, stops being ordinary text. That second half is
+  # what keeps a run of definitions working — only the first follows a blank
+  # line.
+  md_paragraph_open = (body ~ /[^[:space:]]/ && heading_text(body) !~ /^#+[ \t]/ &&
+                       !(md_paragraph_open == 0 && is_link_definition(line))) ? 1 : 0
   return scan_comments(line)
 }
 
@@ -758,8 +784,12 @@ collect_link_defs() {
   awk "$AWK_MARKDOWN_LIB"'
     {
       if (!md_in_fence) track_block_indent($0)
+      # Whether a paragraph was open *before* this line: a definition-shaped
+      # line continuing one is literal text and defines nothing.
+      was_paragraph = md_paragraph_open
       visible = visible_text($0)
       if (md_fence_hit || md_in_fence) next
+      if (was_paragraph) next
       if (!is_link_definition(visible)) next
       body = block_body(visible)
       close_at = unescaped_index(body, "]", 2)

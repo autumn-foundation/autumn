@@ -5130,3 +5130,78 @@ fn migration_guide_gate_does_not_treat_a_breaking_section_note_as_an_entry() {
         gate_report(&output),
     );
 }
+
+// --- Review round 35: image labels, definitions in a paragraph ------------
+
+#[test]
+fn migration_guide_gate_ignores_a_link_nested_in_an_image_label() {
+    // CommonMark flattens a link inside an image label into alt text — the
+    // reference implementation renders `alt="diagram showing migration
+    // guide"` and no anchor. The image guard only checked the candidate's own
+    // bracket, so a nested one slipped through.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. \
+           ![diagram showing [migration guide](docs/migrations/0.7.0.md)](diagram.png)\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "alt text is not a link the reader can follow",
+    );
+}
+
+#[test]
+fn migration_guide_gate_ignores_a_definition_continuing_a_paragraph() {
+    // A link reference definition cannot interrupt a paragraph: following
+    // ordinary text it is literal, so the reference above it never resolves
+    // and the entry has no clickable guide.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration guide][upgrade].\n  \
+         more prose here.\n  [upgrade]: docs/migrations/0.7.0.md\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a definition cannot interrupt a paragraph",
+    );
+}
+
+#[test]
+fn migration_guide_gate_collects_consecutive_link_definitions() {
+    // The counterpart, and the regression the paragraph rule invites: a run of
+    // definitions is normal markdown. Only the *first* follows a blank line,
+    // so treating a definition as opening a paragraph would swallow the rest.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration guide][upgrade].\n\n\
+         [other]: https://example.invalid\n\
+         [upgrade]: docs/migrations/0.7.0.md\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a definition does not open a paragraph\n{}",
+        gate_report(&output),
+    );
+}
