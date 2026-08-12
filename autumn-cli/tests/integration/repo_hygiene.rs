@@ -4919,3 +4919,136 @@ fn migration_guides_never_show_plugin_check_without_its_required_flag() {
         offenders.join("\n"),
     );
 }
+
+// --- Review round 33: item boundaries, empty tags, marked paragraphs ------
+
+#[test]
+fn migration_guide_gate_ends_an_entry_at_an_outdented_fence() {
+    // A column-zero fence ends the list item, so the link after it renders in
+    // its own paragraph, outside the entry. Skipping fence lines without
+    // closing the item let that link be absorbed as a lazy continuation.
+    //
+    // No blank lines anywhere: a blank line before the fence would already
+    // have closed the item paragraph and the entry would flush correctly. It
+    // is the fence *itself* that has to end the item here, which is what the
+    // reference implementation does — it renders the link in its own `<p>`,
+    // outside the `<ul>`.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** removed API.\n\
+         ```\nsample\n```\n\
+         [migration guide](docs/migrations/0.7.0.md)\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a link outside the item cannot supply that item's guide link",
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_count_empty_inline_tags_as_content() {
+    // `<span></span>` has source text but renders nothing, so a required
+    // section holding only it is empty to a reader — the same hollow-guide
+    // failure as an HTML comment or a bare reference definition.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace("Why this release breaks.", "<span></span>");
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "tag-only inline HTML renders nothing\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_keeps_prose_wrapped_in_inline_tags() {
+    // The counterpart: stripping tags must not strip the words between them,
+    // or a guide that marks up its prose starts failing as empty.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace(
+        "Why this release breaks.",
+        "Why <em>this</em> release breaks, in <code>detail</code>.",
+    );
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "marked-up prose is still prose\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_counts_a_breaking_marker_in_a_plain_paragraph() {
+    // The convention is the inline marker, not the bullet. A section that
+    // declares a break in an ordinary paragraph produced zero entries, so it
+    // could ship with no guide at all while following the documented rule.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         **Breaking:** the `page` trait method is gone.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a marked paragraph declares a break and needs a guide\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_a_marked_paragraph_that_links_its_guide() {
+    // And it must be satisfiable the same way a bullet is, or the fix above
+    // would just be a new way to fail with no route to green.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         **Breaking:** the `page` trait method is gone. See the\n\
+         [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a marked paragraph that links its guide is covered\n{}",
+        gate_report(&output),
+    );
+}

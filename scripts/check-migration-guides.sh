@@ -314,6 +314,16 @@ function block_body(text,   strip) {
   return dedent3(substr(expand_tabs(text), strip + 1))
 }
 
+function strip_inline_tags(text,   out) {
+  # What a reader is left with once the tags are gone. `<span></span>` has
+  # source text but renders nothing, so a required section holding only it is
+  # as empty as one holding `<!-- TODO -->`. The words *between* tags survive,
+  # which is the point: marked-up prose is still prose.
+  out = mask_html_attributes(text)
+  gsub(/<\/?[a-zA-Z][a-zA-Z0-9-]*[[:space:]]*\/?>/, " ", out)
+  return out
+}
+
 function is_link_definition(text,   body, close_at) {
   # `[label]: destination "title"` renders nothing at all, so a required
   # section holding only these is empty to a reader — which is the whole thing
@@ -849,6 +859,7 @@ findings="$(
     }
     entry = ""
     entry_visible = ""
+    entry_is_paragraph = 0
   }
 
   # One call keeps fence and comment state; see AWK_MARKDOWN_LIB above for
@@ -860,7 +871,19 @@ findings="$(
   {
     md_block_indent = (entry == "") ? 0 : item_content_indent
     visible = visible_text($0)
-    if (md_fence_hit || md_in_fence) next
+    if (md_fence_hit || md_in_fence) {
+      # A fence opening left of the item content column ends the item, so what
+      # follows is a sibling block. Skipping fence lines outright left the item
+      # paragraph open, and the next unindented line was then absorbed as a
+      # lazy continuation — including a guide link that renders outside the
+      # entry entirely.
+      if (md_fence_hit && entry != "" && !md_in_fence &&
+          leading_spaces(visible) < entry_content_indent) {
+        flush_entry()
+        entry_paragraph_open = 0
+      }
+      next
+    }
   }
 
   heading_text(visible) ~ /^##[ \t]/ {
@@ -924,10 +947,32 @@ findings="$(
     entry_content_indent = entry_indent + list_marker_width(dedent3(visible))
     item_content_indent = entry_content_indent
     entry_paragraph_open = 1
+    entry_is_paragraph = 0
+    next
+  }
+
+  # The convention is the inline marker, not the bullet, so a marked paragraph
+  # is a declaration too. Without this a section could follow the documented
+  # rule and still demand no guide, because nothing was ever counted as an
+  # entry. Scoped to the explicit inline marker: a bare paragraph under a
+  # `### Breaking Changes` heading is usually the intro to the list below it.
+  entry == "" && tolower(strip_code_spans(visible)) ~ /\*\*breaking(:\*\*|\*\*:)/ {
+    entry_line = FNR
+    entry_breaking_heading = breaking_heading
+    entry = $0
+    entry_visible = visible
+    entry_indent = 0
+    entry_content_indent = 0
+    item_content_indent = 0
+    entry_paragraph_open = 1
+    entry_is_paragraph = 1
     next
   }
 
   {
+    # A paragraph entry ends at the blank line that ends the paragraph. A list
+    # item has its content column to bound it; this one does not.
+    if (entry != "" && entry_is_paragraph && visible !~ /[^[:space:]]/) flush_entry()
     if (entry != "") {
       # A non-blank line indented less than the item content column sits
       # outside the list item — markdown renders it as a sibling block, so it
@@ -1202,7 +1247,7 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             pending_title = 1
           } else if (pending_title && is_orphan_title(visible)) {
             pending_title = 0
-          } else if (visible ~ /[^[:space:]]/) {
+          } else if (strip_inline_tags(visible) ~ /[^[:space:]]/) {
             pending_title = 0
             for (lvl = 1; lvl <= 6; lvl++) {
               if (open_heading[lvl] != "") content[open_heading[lvl]] = 1

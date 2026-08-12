@@ -30,6 +30,9 @@ A breaking change is declared **either** with the inline `**Breaking:**` token
 heading starting with the word. Nothing else counts: the gate reads the
 changelog, and prose it cannot see strands users.
 
+The token is what declares, not the bullet: a marked *paragraph* is an entry
+too, and needs its own guide and link exactly as a marked bullet does.
+
 ```markdown
 - **repository:** **Breaking:** `with_pool` is renamed to `with_pool_untracked`.
   Uses on generated repositories must be updated (only the name changes). See
@@ -105,7 +108,8 @@ It fails when:
   walkthrough* — or has a heading with nothing under it, still carries
   `TEMPLATE.md`'s banner or any placeholder token `TEMPLATE.md` itself emits
   (an HTML comment is not content — `<!-- TODO -->` under a heading is a stub,
-  and neither is a link reference definition, which renders nothing at all)
+  and neither is a link reference definition or a bare `<span></span>`, which
+  render nothing at all; the words *between* tags do count)
   (the vocabulary is read from the template, so `{:?}` and `Route { .. }` in a
   guide are fine and `{X.Y.Z}` in a code sample is not), or is not linked from
   the Index above (a mention elsewhere in this file is not an index entry);
