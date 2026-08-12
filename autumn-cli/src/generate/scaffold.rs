@@ -443,6 +443,86 @@ fn plan_scaffold_with_options_impl(
             ));
         }
     }
+    // Gate (issue #1318): a `lock_version` column rewrites the HTML `update`
+    // handler's write into a `WHERE lock_version = $expected` guarded statement
+    // and adds a 409 re-render branch. That rewrite is wired for the standard
+    // raw-diesel write only. `--live`/`--sharded` write through the repository
+    // extractor and the attachment path writes after a multipart blob save;
+    // generating those would emit an edit form that *looks* concurrency-safe
+    // while the write still clobbers. Refuse the combination up front rather
+    // than ship silently lossy code (same posture as the `slug` gates above).
+    //
+    // `--api` is exempt outright — including `--api --live`, `--api --sharded`
+    // and the rest. Those variants only ever change the HTML surface, and an
+    // `--api` scaffold emits no routes file at all, so there is no form and no
+    // raw-diesel update to be inconsistent with. The model's `#[lock_version]`
+    // still lands, which is what makes the repository's own JSON update
+    // conflict-check. Refusing them would break combinations that generated
+    // fine before this feature existed.
+    // `for_revert` skips the whole gate: `autumn destroy scaffold` recomputes the
+    // plan it is about to revert, and a scaffold created before these refusals
+    // existed (`lock_version:i32 --live`, say) must still be removable. The
+    // refusal would fire during the recompute — before `Plan::revert` ever sees
+    // `--force` — and strand exactly the files the user asked to delete. Same
+    // posture as the shared-layout preflight below (issue #1834).
+    if !for_revert && !options.api && super::model::lock_version_field(&fields).is_some() {
+        // `--live-validation` is supported: it changes only how the form's
+        // controls are rendered (raw htmx inputs instead of `form_for`), while
+        // its `update` still writes through the same raw-diesel statement.
+        let unsupported = if options.live {
+            Some((
+                "--live",
+                "the SSE live scaffold writes through the repository extractor, not the \
+                 guarded `diesel::update(...).filter(lock_version.eq(...))` statement",
+                "Drop `--live`",
+            ))
+        } else if options.model.sharded {
+            Some((
+                "--sharded",
+                "the sharded scaffold writes through `Pg{Model}Repository::from_shard`, not \
+                 the guarded `diesel::update(...).filter(lock_version.eq(...))` statement",
+                "Drop `--sharded`",
+            ))
+        } else if has_attachment_fields(&fields) {
+            Some((
+                "an `attachment` field",
+                "the multipart update handler saves the blob before the row write, so a \
+                 rejected stale submit would leave an orphaned upload behind",
+                "Drop the attachment column",
+            ))
+        } else if fields.iter().any(|f| f.kind.is_slug()) {
+            // A slug scaffold keys its `update` off the slug, not the primary
+            // key (issue #1260), so the guarded statement would read
+            // `WHERE slug = $1 AND lock_version = $2`. That pair is not a stable
+            // row identity: the slug is editable and re-derivable, and every new
+            // row starts at version 0. Rename a row's slug, let a *different*
+            // row take the freed slug, and a stale submit against the old slug
+            // matches the new row at its default version — committing one
+            // author's edit over an unrelated record and reporting success.
+            // Keying the guard off the primary key instead is the real fix and
+            // needs the update handler to resolve the row first on every slug
+            // variant (including `--no-policy`, which loads nothing today);
+            // refuse the pair until that lands rather than ship the swap.
+            Some((
+                "a `slug` column",
+                "a slug scaffold keys its update off the (editable, reusable) slug rather \
+                 than the primary key, so `WHERE slug = ... AND lock_version = ...` does not \
+                 identify a stable row — a renamed slug reclaimed by a new row would let a \
+                 stale submit commit over that unrelated record",
+                "Drop the slug column (the scaffold keys off `id`)",
+            ))
+        } else {
+            None
+        };
+        if let Some((variant, why, remedy)) = unsupported {
+            return Err(GenerateError::Config(format!(
+                "a `lock_version` column is not yet supported together with {variant}: {why}. \
+                 {remedy} to get the conflict-aware edit form, or rename the `lock_version` \
+                 column if optimistic locking was not intended."
+            )));
+        }
+    }
+
     // Resolve shard key before planning the model (propagates to model render).
     let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;
     let model_options_with_key = ModelOptions {
@@ -457,13 +537,23 @@ fn plan_scaffold_with_options_impl(
         live_validation: options.live_validation,
         no_policy: options.no_policy,
     };
-    let mut plan = plan_model_with_options(
-        project_root,
-        name,
-        field_tokens,
-        timestamp,
-        &options_with_key.model,
-    )?;
+    let mut plan = if for_revert {
+        super::model::plan_model_with_options_for_revert(
+            project_root,
+            name,
+            field_tokens,
+            timestamp,
+            &options_with_key.model,
+        )?
+    } else {
+        plan_model_with_options(
+            project_root,
+            name,
+            field_tokens,
+            timestamp,
+            &options_with_key.model,
+        )?
+    };
     let metadata = parse_model_metadata(&fields, &options_with_key.model)?;
     // A `--default field=value` column is dropped from `form_fields` (see
     // below) and therefore from the generated `New{Pascal}` insert struct
@@ -488,6 +578,10 @@ fn plan_scaffold_with_options_impl(
         .filter(|field| !metadata.defaults().contains_key(&field.name))
         .cloned()
         .collect::<Vec<_>>();
+    // The equivalent guard for the insert struct (issue #1318) lives in
+    // `plan_model_with_options`, which the scaffold delegates to above — so a
+    // lock-only scaffold is refused before it reaches here, and `generate model`
+    // gets the same refusal without the scaffold planner having to be involved.
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let plural = pluralize(&snake_name);
@@ -2212,6 +2306,16 @@ fn render_routes_file(
         .filter(|f| f.state_machine.is_some())
         .collect();
     let has_state_machine = !sm_fields.is_empty();
+    // Issue #1318: the optimistic-locking column, read from `all_fields` —
+    // `fields` is the FORM field list, and `lock_version` is deliberately absent
+    // from it (the version is carried in a hidden input, never as an editable
+    // control; see `plan_scaffold`'s `form_fields` filter). `None` for the
+    // overwhelming common case, which keeps every emission below byte-identical
+    // to the pre-#1318 output.
+    let lock_version: Option<&Field> = super::model::lock_version_field(all_fields);
+    // The Rust type of the version counter (`i32`/`i64`), used for the hidden
+    // field's parse target and the shared `form_for` helper's parameter.
+    let lock_version_ty: String = lock_version.map(Field::rust_type).unwrap_or_default();
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
@@ -2431,9 +2535,40 @@ fn render_routes_file(
             )
         }
     } else {
+        // Issue #1318: when the model declares `lock_version`, the write becomes
+        // a compare-and-swap — the expected version is part of the `WHERE`
+        // clause and the bump is part of the same `SET`, so the check and the
+        // increment are one atomic statement with no read-modify-write window.
+        // A concurrent writer that got there first leaves this `UPDATE` matching
+        // zero rows, which the `updated == 0` branch turns into a 409 re-render.
+        // Both fragments are empty without the column, so the emitted statement
+        // stays byte-identical for every other scaffold.
+        let lock_filter = lock_version.map_or_else(String::new, |_| {
+            format!(".filter({plural}::lock_version.eq(expected_lock_version))")
+        });
+        // A scaffold whose every other column is transition-only (issue #1326)
+        // has an empty `update_columns`, so the separator is conditional or the
+        // emitted tuple would start with a stray comma.
+        //
+        // The bump is a plain SQL `+ 1`, which DIVERGES from the repository
+        // path's `wrapping_add(1)` at the column's ceiling: Postgres raises
+        // `integer out of range` where the Rust path would wrap to the minimum.
+        // That is deliberate. Wrapping a lock version is not obviously the safer
+        // behaviour — a wrapped counter can collide with a stale client holding
+        // the same value from a previous cycle, which is the exact failure this
+        // guard exists to prevent — and emulating it would put a `CASE WHEN` in
+        // every scaffolded update forever. Reaching the ceiling organically
+        // takes 2^31 saves of one row; `lock_version:i64` is the answer for a
+        // row that churns that hard. The one *reachable* way to hit it, seeding
+        // a `--default` at the maximum, is refused by
+        // `validate_lock_version_field`.
+        let lock_bump = lock_version.map_or_else(String::new, |_| {
+            let sep = if update_columns.is_empty() { "" } else { ", " };
+            format!("{sep}{plural}::lock_version.eq({plural}::lock_version + 1)")
+        });
         format!(
-            "let updated = diesel::update({plural}::table.{find_expr})\n        \
-             .set(({update_columns}))\n        \
+            "let updated = diesel::update({plural}::table.{find_expr}{lock_filter})\n        \
+             .set(({update_columns}{lock_bump}))\n        \
              .execute(&mut *db)\n        .await?;"
         )
     };
@@ -2868,6 +3003,18 @@ fn render_routes_file(
     // once the changeset has been seeded from it.
     let edit_current_bind = if has_attachments {
         "// `current` is the name the shared edit body — and `update`, which\n             // re-renders that same body at 422 — reads the row through, so the\n             // stored-attachment block below can't drift between the two.\n             let current = row;\n    "
+    } else {
+        ""
+    };
+    // Issue #1318: the two bindings the shared edit body reads for optimistic
+    // locking. `edit_form` renders the row's live version and never shows the
+    // conflict banner — it is the *first* look at the record, so there is
+    // nothing to have lost a race to yet. `update`'s re-render branches bind the
+    // same two names to their own values (see `update_lock_version_preamble` and
+    // `update_zero_rows_block`), which is what lets one body serve all three
+    // sites without drifting.
+    let edit_lock_binds = if lock_version.is_some() {
+        "let lock_version_value = row.lock_version;\n    let lock_conflict = false;\n    "
     } else {
         ""
     };
@@ -3310,6 +3457,66 @@ mod attachment_read_back_tests {
     // carry zero per-column code. `--live-validation` keeps the per-field
     // emission path: its htmx inline-validation inputs (`text_input_htmx`)
     // have no `FieldControl` equivalent for `form_for` to dispatch to.
+    // Issue #1318 (AC3): the inline conflict banner. Rendered above the edit
+    // form by BOTH form-rendering paths, gated on the `lock_conflict` binding
+    // every splice site provides — so a stale submit lands the author back on
+    // their own edits with an explanation, never on a dead-end error page. The
+    // wording states what happened and what to do, because a bare "409
+    // Conflict" tells a non-technical author nothing.
+    let lock_conflict_banner = if lock_version.is_some() {
+        "@if lock_conflict {\n            \
+         p class=\"autumn-flash autumn-flash--error\" role=\"alert\" {\n                \
+         \"This record was changed by someone else since you opened it. \
+         Your changes are shown below — review them and save again to apply them.\"\n            \
+         }\n        \
+         }\n        "
+    } else {
+        ""
+    };
+    // The `--live-validation` form is raw markup rather than a `form_for` call,
+    // so its hidden version input is spliced straight into the `<form>` body.
+    let lock_version_hidden_input = if lock_version.is_some() {
+        "            input type=\"hidden\" name=\"lock_version\" value=(lock_version_value);\n"
+    } else {
+        ""
+    };
+    // The hidden field is read straight off the raw body rather than through
+    // `{Pascal}Form`: the version is not one of the model's editable columns, so
+    // it has no place on the form struct (which would render it as a visible
+    // control and let a submit set it like any other value). `serde_urlencoded`
+    // ignores the unknown pair when decoding the form, so the two coexist.
+    //
+    // A missing or unparsable value is a 400, not a silent `0`: `0` would be a
+    // *plausible* version that could match a freshly created row and wave a
+    // hand-crafted submit straight past the guard.
+    //
+    // It scans EVERY `lock_version` pair for the first that parses as an
+    // integer, rather than taking the first pair and parsing that. The CSRF and
+    // submit-token field names are app-configurable (`[security.csrf]` /
+    // `[security.submit_token] field_name`), so an app may legitimately name one
+    // of them `lock_version` — and those hidden inputs are prepended, so they
+    // land in the body FIRST. Stopping at the first pair would read a UUID,
+    // fail to parse it, and 400 every single update even though the real
+    // version was right there a few bytes later.
+    let lock_version_parser = lock_version.map_or_else(String::new, |_| {
+        format!(
+            "\n/// Read the hidden `lock_version` the edit form was rendered with\n\
+             /// (issue #1318).\n\
+             ///\n\
+             /// This is the version the author was looking at, NOT the version to\n\
+             /// write — the `UPDATE` uses it as a `WHERE` guard and increments the\n\
+             /// column itself, so a row that moved on in the meantime matches zero\n\
+             /// rows and the handler re-renders at 409.\n\
+             fn parse_lock_version(body: &Bytes) -> AutumnResult<{lock_version_ty}> {{\n    \
+             url::form_urlencoded::parse(body.as_ref())\n        \
+             .filter(|(key, _)| key == \"lock_version\")\n        \
+             .find_map(|(_, value)| value.parse::<{lock_version_ty}>().ok())\n        \
+             .ok_or_else(|| AutumnError::bad_request_msg(\n            \
+             \"missing or invalid lock_version: re-open the edit form and try again\",\n        \
+             ))\n\
+             }}\n"
+        )
+    });
     let (new_form_body, edit_form_body, form_for_helper) = if live_validation {
         // Issue #1124: `new_form`, `edit_form`, and both 422 re-render
         // branches render the same inputs from a `Changeset<{Pascal}Form>`
@@ -3357,10 +3564,11 @@ mod attachment_read_back_tests {
         let edit_form_layout = format!(
             "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
              h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
+             {lock_conflict_banner}\
              {edit_current_attachment_markup}\
              form action=(paths::update(*id)) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
-             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{changeset_inputs}            \
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{lock_version_hidden_input}{changeset_inputs}            \
              (autumn_web::a11y::Button::new(\"Save\").submit())\n        \
              }}\n        \
              form action=(paths::delete(*id)) method=\"post\" {{\n            \
@@ -3405,17 +3613,27 @@ mod attachment_read_back_tests {
         // no extra argument, keeping the pre-#1326 call byte-identical.
         let form_exclude_create = if has_state_machine { ", false" } else { "" };
         let form_exclude_edit = if has_state_machine { ", true" } else { "" };
+        // Issue #1318: the same shape for the optimistic-locking version — the
+        // edit call hands the helper the version to hide in the form, the create
+        // call `None` (no row, no version). Absent entirely without the column.
+        let form_lock_create = if lock_version.is_some() { ", None" } else { "" };
+        let form_lock_edit = if lock_version.is_some() {
+            ", Some(lock_version_value)"
+        } else {
+            ""
+        };
         let new_form_layout = format!(
             "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
              h1 {{ \"New {pascal_name}\" }}\n        \
-             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_create}))\n    \
+             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_create}{form_lock_create}))\n    \
              }})"
         );
         let edit_form_layout = format!(
             "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", {id_value_expr}), {cp_edit}{flash_arg}, html! {{\n        \
              h1 {{ \"Edit {pascal_name} #\" ({id_value_expr}) }}\n        \
+             {lock_conflict_banner}\
              {edit_current_attachment_markup}\
-             ({snake_name}_form_for(&changeset, paths::update({id_value_expr}), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}))\n        \
+             ({snake_name}_form_for(&changeset, paths::update({id_value_expr}), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}{form_lock_edit}))\n        \
              form action=(paths::delete({id_value_expr})) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
@@ -3431,8 +3649,13 @@ mod attachment_read_back_tests {
         (
             new_form_body,
             edit_form_body,
-            render_form_for_helper(pascal_name, snake_name, fields, missing_reference_targets)
-                + &render_reference_option_loaders(&reference_fields, db_ty, &reference_displays),
+            render_form_for_helper(
+                pascal_name,
+                snake_name,
+                fields,
+                missing_reference_targets,
+                lock_version.map(|_| lock_version_ty.as_str()),
+            ) + &render_reference_option_loaders(&reference_fields, db_ty, &reference_displays),
         )
     };
     let form_model_impl = render_form_model_impl(pascal_name);
@@ -3517,6 +3740,67 @@ mod attachment_read_back_tests {
          }}\n"
     );
 
+    // What the `update` handler does when its `UPDATE` matched no rows.
+    //
+    // Without optimistic locking that can only mean the row is gone: 404, as
+    // before. With a `lock_version` guard (issue #1318) it is ambiguous — the
+    // row may be missing OR the version may have moved on under us — so the
+    // handler re-reads it to tell the two apart:
+    //
+    //   * still there  → someone else committed a newer version between the
+    //     edit-form load and this submit. Re-render the SAME edit body at 409
+    //     with the user's submitted values intact, an inline banner, and the
+    //     row's CURRENT version in the hidden field. Carrying the stale version
+    //     forward instead would make the form permanently unsavable — every
+    //     resubmit would lose the same race again.
+    //   * gone → the pre-#1318 404.
+    //
+    // `{blob_cleanup}` and the id expression differ per branch, so both are
+    // parameters; without a lock column the output is the pre-#1318 text
+    // verbatim.
+    // The re-read row is re-authorized before anything from it is used. The
+    // policy check at the top of `update` ran against the snapshot this request
+    // loaded; a record policy can depend on mutable row data, so the concurrent
+    // write that moved the version may also have moved the row out of this
+    // actor's reach. Only the version integer crosses over here (the re-render
+    // shows the author's own submitted values), but re-checking costs one call
+    // and removes the whole class rather than arguing about how sensitive a
+    // counter is. Empty without a policy.
+    let conflict_reauthz = if authorize {
+        format!(
+            "            autumn_web::authorization::authorize::<{pascal_name}>({create_update_state_expr}, &session, \"update\", &current).await?;\n"
+        )
+    } else {
+        String::new()
+    };
+    let update_zero_rows_block = |blob_cleanup: &str, id_expr: &str| -> String {
+        let not_found = format!(
+            "{blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
+             \"{pascal_name} with id {{}} not found\", {id_expr}\n        \
+             )));"
+        );
+        if lock_version.is_none() {
+            return not_found;
+        }
+        format!(
+            "{blob_cleanup}let current: Option<{pascal_name}> = {plural}::table\n            \
+             .{find_expr}\n            \
+             .select({pascal_name}::as_select())\n            \
+             .first(&mut *db)\n            \
+             .await\n            \
+             .optional()?;\n        \
+             if let Some(current) = current {{\n            \
+             // Lost the race: re-render this author's edits over the row as it\n            \
+             // now stands, so nothing they typed is thrown away.\n\
+             {conflict_reauthz}            \
+             let lock_version_value = current.lock_version;\n            \
+             let lock_conflict = true;\n            \
+             return Ok((autumn_web::reexports::http::StatusCode::CONFLICT, {edit_form_body}).into_response());\n        \
+             }}\n        \
+             {not_found}"
+        )
+    };
+
     // A slug field is always `unique` (issue #1260), so a slug scaffold
     // always takes THIS branch — the `has_attachments`/plain branches below
     // still hard-code the pre-#1260 `*id` literal, safe only because they're
@@ -3543,12 +3827,11 @@ mod attachment_read_back_tests {
              }}\n    \
              }};\n    \
              if updated == 0 {{\n        \
-             {blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
-             \"{pascal_name} with id {{}} not found\", {id_value_expr}\n        \
-             )));\n    \
+             {zero_rows}\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&paths::show({update_redirect_expr})).into_response())"
+             Ok(autumn_web::Redirect::to(&paths::show({update_redirect_expr})).into_response())",
+            zero_rows = update_zero_rows_block(blob_cleanup, &id_value_expr),
         )
     } else if has_attachments {
         // Issue #1872: no unique constraints, but the update write and the
@@ -3565,23 +3848,21 @@ mod attachment_read_back_tests {
              }}\n    \
              }};\n    \
              if updated == 0 {{\n        \
-             {blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
-             \"{pascal_name} with id {{}} not found\", *id\n        \
-             )));\n    \
+             {zero_rows}\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
+             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())",
+            zero_rows = update_zero_rows_block(blob_cleanup, "*id"),
         )
     } else {
         format!(
             "{update_stmt}\n    \
              if updated == 0 {{\n        \
-             return Err(AutumnError::not_found_msg(format!(\n            \
-             \"{pascal_name} with id {{}} not found\", *id\n        \
-             )));\n    \
+             {zero_rows}\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
+             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())",
+            zero_rows = update_zero_rows_block("", "*id"),
         )
     };
     // Issue #1125/#1830: load the target row and run the policy check *before*
@@ -3643,11 +3924,32 @@ mod attachment_read_back_tests {
     } else {
         String::new()
     };
+    // Issue #1318: read the version the edit form was rendered against out of
+    // its hidden field, and seed the two bindings the shared edit body renders
+    // from. Both are re-bound (shadowed) by the 409 branch in
+    // `update_zero_rows_block`; on the 422 branches they keep these values, so a
+    // validation failure hands the same version back and the author's next
+    // submit still races against the row they actually opened.
+    let update_lock_version_preamble = lock_version.map_or_else(String::new, |_| {
+        "let expected_lock_version = parse_lock_version(&body)?;\n    \
+         let lock_version_value = expected_lock_version;\n    \
+         let lock_conflict = false;\n    "
+            .to_owned()
+    });
+    let update_doc_locking = if lock_version.is_some() {
+        "/// Optimistic locking (issue #1318): the `UPDATE` is guarded by the\n\
+         /// `lock_version` the edit form was rendered against, so a submit that\n\
+         /// lost a race to a concurrent editor matches zero rows and re-renders\n\
+         /// the form at 409 instead of silently overwriting their work.\n"
+    } else {
+        ""
+    };
     let update_fn = format!(
         "/// `POST /{plural}/{{{id_url_segment}}}/update` — validate and apply form data to a row,\n\
          /// or re-render the edit form at 422 with inline errors and preserved input.\n\
          /// Uses column-by-column `diesel::update().set(...)` (same convention as\n\
          /// `examples/todo-app`) so we don't need `AsChangeset` on `New{pascal_name}`.\n\
+         {update_doc_locking}\
          #[secured]\n\
          #[post(\"/{plural}/{{{id_url_segment}}}/update\")]\n\
          pub async fn update(\n    \
@@ -3655,6 +3957,7 @@ mod attachment_read_back_tests {
          ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
          use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
          {authz_update_preamble}\
+         {update_lock_version_preamble}\
          {form_decode_block}\n    \
          {update_load_and_authorize_block}\
          let changeset = form.into_changeset();\n    \
@@ -5129,6 +5432,105 @@ pub async fn show(
             } else {
                 String::new()
             };
+            // Issue #1318: a state transition is a read-modify-write — it loads
+            // the row, asks `transition_{field}_to` whether the edge is legal
+            // from the state it just read, then writes. With a lock column in
+            // play that whole sequence becomes a compare-and-swap against the
+            // version it read, for two reasons:
+            //
+            //   * the GUARD stops two concurrent transitions out of the same
+            //     source state from both committing. Both would pass the
+            //     legality check against the stale row they each loaded, and an
+            //     `id`-only `WHERE` would let the second silently overwrite the
+            //     first's transition;
+            //   * the BUMP makes the transition visible to everyone else
+            //     guarding on the version — without it, an author holding an
+            //     edit form opened before the transition saves successfully and
+            //     is never told the record moved on, which is exactly the
+            //     "changed by someone else" case the 409 banner promises.
+            //
+            // Every fragment is empty without a lock column, including the tuple
+            // parentheses: the emitted `.set(...)` must stay the
+            // single-expression pre-#1318 form byte for byte.
+            let (transition_set_open, transition_lock_bump, transition_set_close) =
+                if lock_version.is_some() {
+                    (
+                        "(",
+                        format!(", {plural}::lock_version.eq({plural}::lock_version + 1)"),
+                        ")",
+                    )
+                } else {
+                    ("", String::new(), "")
+                };
+            let transition_update_bind = if lock_version.is_some() {
+                "let updated = "
+            } else {
+                ""
+            };
+            let transition_lock_filter = lock_version.map_or_else(String::new, |_| {
+                format!(".filter({plural}::lock_version.eq(row.lock_version))")
+            });
+            // Zero rows is ambiguous: the version moved between the load and
+            // the write, or the row was deleted outright. The block re-reads to
+            // tell them apart — 409 with the detail page re-rendered for a
+            // record someone else changed, 404 for one that is gone — rather
+            // than redirecting with a success flash for a transition that never
+            // happened, or offering a conflict page whose suggested reload
+            // cannot succeed. It renders the RE-READ row, not this request's
+            // snapshot: the reader is deciding again, and the legal edges may
+            // no longer be the ones they were shown.
+            // The re-read row must be re-authorized before it is rendered. The
+            // policy check earlier in this handler ran against `row`, the
+            // snapshot this request loaded; a record policy can depend on
+            // mutable row data (the generated owner policy does), so the very
+            // concurrent write that moved the version may also have moved the
+            // row out of this actor's reach. Rendering `current` unchecked would
+            // hand them its current properties and transition controls. Empty
+            // without a policy, where there is nothing to re-check.
+            let transition_conflict_reauthz = if authorize {
+                format!(
+                    "                autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"update\", &current).await?;\n"
+                )
+            } else {
+                String::new()
+            };
+            let transition_conflict_block = lock_version.map_or_else(String::new, |_| {
+                format!(
+                    "            if updated == 0 {{\n                \
+                     // Zero rows is ambiguous — the version moved on, or the row\n                \
+                     // is gone entirely. Re-read to tell them apart, exactly as the\n                \
+                     // `update` handler does: a 409 for a record someone else\n                \
+                     // changed, a 404 for one that no longer exists. Without this a\n                \
+                     // concurrent delete would render a conflict page for a row that\n                \
+                     // cannot be reloaded.\n                \
+                     let current: Option<{pascal_name}> = {plural}::table\n                    \
+                     .find(*id)\n                    \
+                     .select({pascal_name}::as_select())\n                    \
+                     .first(&mut *db)\n                    \
+                     .await\n                    \
+                     .optional()?;\n                \
+                     let Some(current) = current else {{\n                    \
+                     return Err(AutumnError::not_found_msg(format!(\n                        \
+                     \"{pascal_name} with id {{}} not found\", *id\n                    \
+                     )));\n                \
+                     }};\n\
+                     {transition_conflict_reauthz}                \
+                     flash.error(\"This {snake_name} was changed by someone else since this page was loaded. Reload and try again.\").await;\n                \
+                     // Render the row as it NOW stands, not the snapshot this\n                \
+                     // request loaded: the reader is deciding again, and the legal\n                \
+                     // transitions may well be different from the ones they saw.\n                \
+                     let view = show_view(\n                    \
+                     db,\n                    \
+                     &current,\n                    \
+                     flash_messages(&flash.consume().await),\n                    \
+                     csrf.as_ref(),\n                    \
+                     csrf_field.as_ref(){show_view_state_arg_call},\n                \
+                     )\n                \
+                     .await?;\n                \
+                     return Ok((autumn_web::reexports::http::StatusCode::CONFLICT, view).into_response());\n            \
+                     }}\n"
+                )
+            });
             let mut transition_handlers = String::new();
             for f in &sm_fields {
                 let field = &f.name;
@@ -5159,11 +5561,11 @@ pub async fn transition_{field}(
     let target = submitted.get("{field}").cloned().unwrap_or_default();
     match row.transition_{field}_to(&target) {{
         Ok(new_state) => {{
-            diesel::update({plural}::table.find(*id))
-                .set({plural}::{field}.eq(new_state))
+            {transition_update_bind}diesel::update({plural}::table.find(*id){transition_lock_filter})
+                .set({transition_set_open}{plural}::{field}.eq(new_state){transition_lock_bump}{transition_set_close})
                 .execute(&mut *db)
                 .await?;
-            flash.success("{pascal_name} {field} updated").await;
+{transition_conflict_block}            flash.success("{pascal_name} {field} updated").await;
             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())
         }}
         Err(err) => {{
@@ -5277,7 +5679,7 @@ pub async fn edit_form(
         .await
         .map_err(AutumnError::not_found)?;
     {authz_edit_call}let changeset = Changeset::new({pascal_name}Form::from(&row));
-    {edit_current_bind}Ok({edit_form_body})
+    {edit_lock_binds}{edit_current_bind}Ok({edit_form_body})
 }}
 
 {update_fn}
@@ -5328,7 +5730,7 @@ pub async fn destroy(
 fn is_nullable_form_field(name: &str) -> bool {{
     {nullable_field_match}
 }}
-"#
+{lock_version_parser}"#
         )
     } + &if live {
         format!(
@@ -5504,6 +5906,9 @@ fn render_form_for_helper(
     snake_name: &str,
     fields: &[Field],
     missing_reference_targets: &BTreeSet<String>,
+    // The Rust type of the model's `lock_version` counter (issue #1318), or
+    // `None` when the model declares no optimistic-locking column.
+    lock_version_ty: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
     let mut extra_params = String::new();
@@ -5778,6 +6183,24 @@ fn render_form_for_helper(
         }
         format!("\n    if exclude_state_fields {{{excludes}\n    }}\n    ")
     };
+    // Issue #1318: the optimistic-locking version travels as a hidden field
+    // INSIDE the form, so it must be injected here rather than around the
+    // helper's call — `form_for` renders the whole `<form>` element. The edit
+    // call passes `Some(version)` and the create call `None`: a row that does
+    // not exist yet has no version to guard against. A model with no
+    // `lock_version` column emits neither the parameter nor the block, keeping
+    // the pre-#1318 helper byte-identical.
+    let lock_version_block = lock_version_ty.map_or_else(String::new, |ty| {
+        let _ = write!(extra_params, ",\n    lock_version: Option<{ty}>");
+        // Prepended AFTER the submit token above, so the token stays the very
+        // first field in the URL-encoded body: `prepend` pushes onto a list
+        // rendered in call order, and `SubmitTokenLayer` only scans the body's
+        // first chunk (issue #1360).
+        "    if let Some(version) = lock_version {\n        \
+         form = form.prepend(html! { input type=\"hidden\" name=\"lock_version\" value=(version); });\n    \
+         }\n    "
+            .to_owned()
+    });
     format!(
         "/// Render the create/edit form in a single `form_for` call (issue #1135).\n\
          ///\n\
@@ -5802,7 +6225,7 @@ fn render_form_for_helper(
          // `SubmitTokenLayer` only scans the first chunk of the URL-encoded body,\n    \
          // so a large earlier textarea could otherwise push an appended token past\n    \
          // the scan cap and leave duplicate submits unguarded.\n    \
-         form = form.prepend(submit_token_input(submit_token, submit_field));\n    \
+         form = form.prepend(submit_token_input(submit_token, submit_field));\n{lock_version_block}    \
          if let Some(csrf) = csrf {{\n        \
          form = form.csrf(csrf.token());\n    \
          }}\n    \
@@ -7420,6 +7843,16 @@ fn render_smoke_test(
         base + &render_write_path_smoke_test(pascal_name, plural, bulk_delete)
     };
 
+    // Issue #1318 (AC6): a scaffold that opted into optimistic locking gets a
+    // dedicated stale-write test — the one behavior a reader would otherwise
+    // have to take on trust, and the one a later refactor is most likely to
+    // silently drop.
+    let base = if !api && super::model::lock_version_field(fields).is_some() {
+        base + &render_optimistic_lock_smoke_test(plural)
+    } else {
+        base
+    };
+
     // Issue #1236 (AC6): attachment scaffolds additionally get a multipart
     // write-path test that drives a zero-JS `multipart/form-data` create through
     // the real `Multipart` extractor, streams the uploaded file to a real
@@ -7849,6 +8282,156 @@ fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
 /// `form_for`-rendered forms (PR #1587) auto-inject a hidden CSRF field for the
 /// browser; the in-process harness does not require it, and this comment
 /// records that so the absent token reads as intentional, not a gap.
+/// Render the optimistic-locking stale-write test (issue #1318, AC6).
+///
+/// Emitted only for a scaffold whose model declares `lock_version`, alongside
+/// [`render_write_path_smoke_test`] and in the same in-process style: a
+/// process-local store stands in for the persistence layer, so it runs with no
+/// database and is a visible green rather than an `#[ignore]`d one.
+///
+/// The stand-in `update` mirrors the generated handler's contract — a
+/// compare-and-swap on the submitted version, a 409 re-render carrying the
+/// author's own input plus the row's CURRENT version, and a version bump only on
+/// the winning write:
+///
+/// * a submit carrying a stale version responds 409, re-renders the author's
+///   input, and leaves the stored row EXACTLY as the other writer left it;
+/// * a submit carrying the current version redirects (303) and bumps the
+///   version, so the next stale submit is rejected against the new value.
+///
+/// The 409 body hands back the fresh version deliberately: re-rendering the
+/// stale one would make the form permanently unsavable, since every resubmit
+/// would lose the same race again.
+///
+/// SCOPE, stated plainly: like every #1127-style generated test this exercises
+/// the *request mechanism* against a stand-in, not the app's own handler (a
+/// `tests/*.rs` binary cannot import a binary crate's modules). It pins the
+/// contract a reader can then hold the handler to; it does NOT fail if the
+/// emitted `WHERE lock_version = ...` guard is removed. Two other tests cover
+/// that: `lock_version_update_guards_the_write_and_bumps_the_version` in the
+/// generator's own suite asserts the emitted statement, and
+/// `autumn-cli/tests/integration/generate_lock_version_postgres.rs` runs the
+/// generated migration and statement against real Postgres — including two
+/// concurrent transactions — to prove the semantics.
+fn render_optimistic_lock_smoke_test(plural: &str) -> String {
+    const TEMPLATE: &str = r#"
+
+// -- optimistic locking: stale write is rejected (issue #1318) --------------
+//
+// Two authors open the same row; the second one to save must not silently
+// clobber the first. Exercises the generated update handler's contract against
+// a stand-in resource: compare-and-swap on the submitted `lock_version`, a 409
+// re-render (never a redirect, never a dead-end error page) when it is stale,
+// and a version bump only on the write that wins.
+#[tokio::test]
+async fn __PLURAL___optimistic_lock_conflict() {
+    use autumn_web::test::{TestApp, TestClient};
+
+    // `(id, name, lock_version)` — the process-local stand-in for the row.
+    static ROW: std::sync::Mutex<(i64, String, i32)> =
+        std::sync::Mutex::new((1, String::new(), 0));
+
+    #[get("/__PLURAL__/{id}")]
+    async fn show(id: Path<i64>) -> Markup {
+        let _ = id;
+        let row = ROW.lock().unwrap();
+        html! { p { "name=" (row.1.as_str()) " lock_version=" (row.2) } }
+    }
+
+    #[post("/__PLURAL__/{id}/update")]
+    async fn update(id: Path<i64>, body: autumn_web::reexports::axum::body::Bytes) -> impl IntoResponse {
+        let expected: i32 = url::form_urlencoded::parse(body.as_ref())
+            .find(|(key, _)| key == "lock_version")
+            .and_then(|(_, value)| value.parse().ok())
+            .unwrap_or(-1);
+        let submitted: String = url::form_urlencoded::parse(body.as_ref())
+            .find(|(key, _)| key == "name")
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_default();
+
+        let mut row = ROW.lock().unwrap();
+        // Compare-and-swap, exactly like the generated
+        // `WHERE lock_version = $expected ... SET lock_version = lock_version + 1`.
+        if row.2 != expected {
+            // Stale: re-render the author's own input with the CURRENT version,
+            // so a second Save applies their edit on top of the newer row.
+            return (
+                StatusCode::CONFLICT,
+                html! {
+                    p role="alert" { "This record was changed by someone else since you opened it." }
+                    input type="hidden" name="lock_version" value=(row.2);
+                    input type="text" name="name" value=(submitted.as_str());
+                },
+            )
+                .into_response();
+        }
+        row.1 = submitted;
+        row.2 += 1;
+        Redirect::to(&format!("/__PLURAL__/{}", *id)).into_response()
+    }
+
+    let client: TestClient = TestApp::new().routes(routes![show, update]).build();
+
+    // Both authors opened the row at version 0. The first save wins: 303 to the
+    // show page, and the version is bumped to 1.
+    client
+        .post("/__PLURAL__/1/update")
+        .form("name=first-author&lock_version=0")
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PLURAL__/1");
+    client
+        .get("/__PLURAL__/1")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("name=first-author")
+        .assert_body_contains("lock_version=1");
+
+    // The second author still holds version 0. Their save is rejected with a
+    // 409 re-render that keeps what they typed and carries the row's CURRENT
+    // version, so the next Save can succeed instead of losing forever.
+    client
+        .post("/__PLURAL__/1/update")
+        .form("name=second-author&lock_version=0")
+        .send()
+        .await
+        .assert_status(409)
+        .assert_body_contains("changed by someone else")
+        .assert_body_contains("second-author")
+        .assert_body_contains("value=\"1\"");
+
+    // The stale submit changed nothing: the first author's value and the
+    // version they produced both stand.
+    client
+        .get("/__PLURAL__/1")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("name=first-author")
+        .assert_body_contains("lock_version=1");
+
+    // Re-submitting against the version the 409 handed back succeeds and bumps
+    // again — the conflict is recoverable, not a dead end.
+    client
+        .post("/__PLURAL__/1/update")
+        .form("name=second-author&lock_version=1")
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .get("/__PLURAL__/1")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("name=second-author")
+        .assert_body_contains("lock_version=2");
+}
+"#;
+    TEMPLATE.replace("__PLURAL__", plural)
+}
+
 #[allow(clippy::too_many_lines)] // the emitted test body is one raw-string template
 fn render_write_path_smoke_test(pascal_name: &str, plural: &str, bulk_delete: bool) -> String {
     const TEMPLATE: &str = r#"
@@ -16602,5 +17185,648 @@ exempt_paths = [
                 "the --live scaffold must carry no `{needle}` artifact: {routes}"
             );
         }
+    }
+
+    // ── optimistic locking on the edit form (issue #1318) ───────────────────
+    //
+    // A scaffold whose field set declares `lock_version` must carry the version
+    // through the edit form and guard the UPDATE with it, so two concurrent
+    // editors get a 409 re-render instead of silently clobbering each other.
+
+    /// A slug column token, held in a const so its `{from:title}` braces never
+    /// sit inside a macro invocation (clippy reads them as a format argument).
+    const SLUG_COL: &str = "slug:slug{from:title}";
+
+    /// The `Post` scaffold field list with a `lock_version` column.
+    fn lock_fields() -> Vec<String> {
+        vec!["title:String".into(), "lock_version:i32".into()]
+    }
+
+    fn lock_plan(options: &ScaffoldOptions) -> Result<Plan, GenerateError> {
+        let tmp = project_with_main(default_main());
+        // The TempDir must outlive the plan's file reads, which all happen
+        // during planning — `action_contents` reads from the in-memory plan.
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            options,
+        );
+        drop(tmp);
+        plan
+    }
+
+    /// The routes source of a default `Post` scaffold carrying `lock_version`.
+    fn lock_routes() -> String {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap();
+        action_contents(&plan, "src/routes/posts.rs")
+    }
+
+    #[test]
+    fn lock_version_edit_form_renders_hidden_version_input() {
+        // AC 1: the edit form carries the row's current `lock_version` as a
+        // hidden input so the submit says which version the user was editing.
+        let routes = lock_routes();
+        assert!(
+            routes.contains("name=\"lock_version\""),
+            "edit form must render a hidden lock_version input: {routes}"
+        );
+        let edit = handler_slice(&routes, "edit_form");
+        assert!(
+            edit.contains("row.lock_version"),
+            "edit_form must seed the hidden input from the loaded row: {edit}"
+        );
+        // The create form must NOT carry it: a new row has no version yet.
+        let new_form = handler_slice(&routes, "new_form");
+        assert!(
+            !new_form.contains("lock_version"),
+            "new_form must not carry a lock_version: {new_form}"
+        );
+    }
+
+    #[test]
+    fn lock_version_is_excluded_from_the_editable_form_struct() {
+        // The version is machinery, not content: it must not surface as a
+        // "Lock version" text box, and it must not be settable from user input
+        // through the ordinary column path.
+        let routes = lock_routes();
+        assert!(
+            !routes.contains("pub lock_version: i32,\n}"),
+            "lock_version must not be a PostForm column: {routes}"
+        );
+        assert!(
+            !routes.contains("posts::lock_version.eq(new.lock_version"),
+            "lock_version must not be set from the submitted form value: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_update_guards_the_write_and_bumps_the_version() {
+        // AC 2 + AC 4: the UPDATE carries a `WHERE lock_version = $expected`
+        // guard and increments the column in the same statement, so the check
+        // and the bump are atomic.
+        let routes = lock_routes();
+        let update = handler_slice(&routes, "update");
+        assert!(
+            update.contains("posts::lock_version.eq(expected_lock_version)"),
+            "the UPDATE must be guarded by the expected version: {update}"
+        );
+        assert!(
+            update.contains("posts::lock_version.eq(posts::lock_version + 1)"),
+            "a successful UPDATE must increment the version: {update}"
+        );
+        assert!(
+            routes.contains("fn parse_lock_version("),
+            "the routes file must parse the submitted version out of the body: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_parser_survives_a_colliding_security_field_name() {
+        // The CSRF and submit-token field names are app-configurable, so an app
+        // may legitimately name one of them `lock_version` — and those hidden
+        // inputs are prepended, landing in the body BEFORE the real version.
+        // Taking the first `lock_version` pair would read a UUID, fail to parse
+        // it, and 400 every update. The parser scans for the first pair that
+        // parses instead.
+        let routes = lock_routes();
+        assert!(
+            routes.contains(".filter(|(key, _)| key == \"lock_version\")")
+                && routes.contains(".find_map(|(_, value)| value.parse::<i32>().ok())"),
+            "the parser must scan every lock_version pair, not stop at the first: {routes}"
+        );
+        assert!(
+            !routes.contains(".find(|(key, _)| key == \"lock_version\")"),
+            "a first-match-wins parse is the collision bug: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_conflict_rerenders_the_edit_form_at_409() {
+        // AC 3: a stale submit is not a dead-end error page — it re-renders the
+        // edit form at 409 with the submitted values and an inline banner, and
+        // it is distinguished from a genuinely missing row (404).
+        let routes = lock_routes();
+        let update = handler_slice(&routes, "update");
+        assert!(
+            update.contains("StatusCode::CONFLICT"),
+            "a stale submit must respond 409: {update}"
+        );
+        assert!(
+            update.contains("lock_conflict"),
+            "the 409 branch must flag the shared edit body to show the banner: {update}"
+        );
+        assert!(
+            update.contains("not_found_msg"),
+            "a genuinely missing row must still be a 404, not a 409: {update}"
+        );
+        assert!(
+            routes.contains("changed by someone else"),
+            "the re-rendered form must carry an inline conflict banner: {routes}"
+        );
+        assert!(
+            routes.contains("role=\"alert\""),
+            "the banner must be announced to assistive tech: {routes}"
+        );
+    }
+
+    #[test]
+    fn a_re_read_row_is_re_authorized_before_it_is_used() {
+        // Both guarded writes re-read the row when they match zero. The policy
+        // check earlier in each handler ran against the snapshot that request
+        // loaded — and a record policy can depend on mutable row data (the
+        // generated owner policy does), so the very write that moved the version
+        // may also have moved the row out of this actor's reach. Rendering or
+        // reading the re-read row unchecked would leak it.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "user:references".into(),
+                "status:String:states(draft->published)".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let needle = "authorize::<Post>(&state, &session, \"update\", &current)";
+
+        // The transition path renders the whole row, so this is the sharp case.
+        let transition = handler_slice(&routes, "transition_status");
+        let conflict_at = transition
+            .find("if updated == 0")
+            .expect("transition conflict branch");
+        assert!(
+            transition[conflict_at..].contains(needle),
+            "the transition 409 must re-authorize before rendering: {transition}"
+        );
+        let reauthz_at = conflict_at + transition[conflict_at..].find(needle).unwrap();
+        let render_at = transition[conflict_at..]
+            .find("show_view(")
+            .map(|i| conflict_at + i)
+            .expect("show_view in the conflict branch");
+        assert!(
+            reauthz_at < render_at,
+            "the check must come BEFORE the render: {transition}"
+        );
+
+        // The update path only carries the version integer across, but re-checks
+        // for the same reason rather than arguing about how sensitive it is.
+        let update = handler_slice(&routes, "update");
+        let uconflict = update
+            .find("if updated == 0")
+            .expect("update conflict branch");
+        assert!(
+            update[uconflict..].contains(needle),
+            "the update 409 must re-authorize the re-read row: {update}"
+        );
+    }
+
+    #[test]
+    fn a_no_policy_scaffold_emits_no_conflict_reauthorization() {
+        // Nothing to re-check without a policy, and the emitted branch must not
+        // reference a `state`/`session` the handler never took.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            &ScaffoldOptions {
+                no_policy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            !routes.contains("authorize::<Post>"),
+            "a --no-policy scaffold must emit no authorize calls: {routes}"
+        );
+        assert!(
+            handler_slice(&routes, "update").contains("StatusCode::CONFLICT"),
+            "the 409 branch is still emitted: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_conflict_rerender_carries_the_fresh_version() {
+        // Re-rendering with the STALE version would make the form unsavable
+        // forever: the user would resubmit the same losing version and conflict
+        // again. The 409 body carries the row's current version so a second
+        // Save applies the user's values on top of the newer row.
+        let routes = lock_routes();
+        let update = handler_slice(&routes, "update");
+        assert!(
+            update.contains("let lock_version_value = current.lock_version;"),
+            "the 409 re-render must carry the freshly-read version: {update}"
+        );
+    }
+
+    #[test]
+    fn lock_version_scaffold_emits_a_stale_write_smoke_test() {
+        // AC 6: the generated suite proves the contract — a stale submit yields
+        // a 409 re-render and leaves the row untouched; a fresh submit succeeds
+        // and bumps the version.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap();
+        let test_file = action_contents(&plan, "tests/post.rs");
+        assert!(
+            test_file.contains("async fn posts_optimistic_lock_conflict()"),
+            "an optimistic-lock write-path test must be emitted: {test_file}"
+        );
+        assert!(
+            test_file.contains("assert_status(409)"),
+            "the stale submit must assert a 409: {test_file}"
+        );
+        assert!(
+            test_file.contains("assert_status(303)"),
+            "the fresh submit must still redirect: {test_file}"
+        );
+    }
+
+    #[test]
+    fn scaffold_without_lock_version_carries_no_locking_artifacts() {
+        // AC 5: zero behavior change for the overwhelming common case.
+        let routes = bulk_routes_default();
+        for needle in [
+            "lock_version",
+            "lock_conflict",
+            "CONFLICT",
+            "changed by someone else",
+        ] {
+            assert!(
+                !routes.contains(needle),
+                "a scaffold with no lock_version column must carry no `{needle}`: {routes}"
+            );
+        }
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let test_file = action_contents(&plan, "tests/post.rs");
+        assert!(
+            !test_file.contains("lock_version"),
+            "the generated test suite must carry no locking artifacts: {test_file}"
+        );
+    }
+
+    #[test]
+    fn lock_version_is_refused_on_variants_whose_update_path_is_not_wired() {
+        // `--live`/`--sharded` write through the repository extractor and the
+        // attachment path writes after a multipart save; neither routes through
+        // the guarded statement, so generating them would emit silently lossy
+        // code. Refuse up front instead (same posture as the `slug` gates).
+        for (label, options) in [
+            (
+                "--live",
+                ScaffoldOptions {
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--sharded",
+                ScaffoldOptions {
+                    model: ModelOptions {
+                        sharded: true,
+                        shard_key: Some("title".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let err = lock_plan(&options).expect_err("{label} + lock_version must be refused");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("lock_version"),
+                "the {label} refusal must name lock_version: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn api_scaffolds_are_exempt_from_every_variant_gate() {
+        // `--api` emits no routes file, so none of the HTML-surface variants
+        // can be inconsistent with a guarded update that does not exist. These
+        // combinations generated fine before #1318 and must keep doing so; the
+        // model attribute still lands, which is what conflict-checks the JSON
+        // update. (`--api` is NOT exempt from the empty-insert-struct guard —
+        // that one is about `New{Model}`, which every variant emits.)
+        for (label, cols, options) in [
+            (
+                "--api --live",
+                vec!["title:String".to_owned(), "lock_version:i32".to_owned()],
+                ScaffoldOptions {
+                    api: true,
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--api --sharded",
+                vec!["title:String".to_owned(), "lock_version:i32".to_owned()],
+                ScaffoldOptions {
+                    api: true,
+                    model: ModelOptions {
+                        sharded: true,
+                        shard_key: Some("title".to_owned()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "--api + attachment",
+                vec![
+                    "title:String".to_owned(),
+                    "cover:Attachment".to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+                ScaffoldOptions {
+                    api: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let tmp = project_with_main(default_main());
+            let plan =
+                plan_scaffold_with_options(tmp.path(), "Post", &cols, "20260427000000", &options);
+            assert!(
+                plan.is_ok(),
+                "{label} + lock_version must still generate: {:?}",
+                plan.err()
+            );
+        }
+    }
+
+    #[test]
+    fn destroying_a_legacy_lock_version_scaffold_is_never_blocked_by_the_new_gates() {
+        // A scaffold generated before these refusals existed must stay
+        // removable. `destroy` recomputes the plan it is about to revert, so a
+        // refusal here lands BEFORE `Plan::revert` sees `--force` — stranding
+        // exactly the files the user asked to delete, with no way out.
+        for (label, cols, options) in [
+            (
+                "--live",
+                lock_fields(),
+                ScaffoldOptions {
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--sharded",
+                lock_fields(),
+                ScaffoldOptions {
+                    model: ModelOptions {
+                        sharded: true,
+                        shard_key: Some("title".to_owned()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "slug",
+                vec![
+                    "title:String".to_owned(),
+                    SLUG_COL.to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+                ScaffoldOptions::default(),
+            ),
+            (
+                "attachment",
+                vec![
+                    "title:String".to_owned(),
+                    "cover:Attachment".to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+                ScaffoldOptions::default(),
+            ),
+        ] {
+            let tmp = project_with_main(default_main());
+            let plan = plan_scaffold_with_options_for_revert(
+                tmp.path(),
+                "Post",
+                &cols,
+                "20260427000000",
+                &options,
+            );
+            assert!(
+                plan.is_ok(),
+                "destroying a legacy {label} + lock_version scaffold must plan: {:?}",
+                plan.err()
+            );
+        }
+    }
+
+    #[test]
+    fn lock_version_is_refused_alongside_a_slug_column() {
+        // A slug scaffold keys `update` off the slug, not the primary key, so
+        // `WHERE slug = ... AND lock_version = ...` does not identify a stable
+        // row: rename a slug, let a new row (version 0) claim the freed value,
+        // and a stale submit would commit over that unrelated record while
+        // reporting success. Refuse the pair rather than ship the swap.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "slug:slug{from:title}".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lock_version") && msg.contains("slug"),
+            "the refusal must name both columns: {msg}"
+        );
+    }
+
+    #[test]
+    fn lock_version_scaffold_with_no_insertable_columns_is_refused() {
+        // Counting declared tokens would miss this: two columns are declared,
+        // but `--default` drops `title` from the insert struct and
+        // `#[lock_version]` drops the version, leaving `NewPost` empty — which
+        // does not implement `Insertable` and would not compile.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    defaults: vec!["title=x".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no insertable columns") && msg.contains("NewPost"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn lock_version_cannot_be_the_only_column() {
+        // The column is DB-managed, so it contributes no form field — a
+        // scaffold declaring only `lock_version` would emit an empty
+        // `NewPost`, which is not `Insertable` and does not compile.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no insertable columns") && msg.contains("NewPost"),
+            "the refusal must explain why one column is not enough: {msg}"
+        );
+    }
+
+    #[test]
+    fn state_transition_is_a_compare_and_swap_on_the_version() {
+        // A transition is a read-modify-write: it loads the row, checks the edge
+        // is legal from the state it read, then writes. Without a guard, two
+        // concurrent transitions out of the same source state both pass the
+        // check and both commit — the second silently overwriting the first.
+        // The bump alone does not prevent that; the WHERE does.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:String:states(draft->published)".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let transition = handler_slice(&routes, "transition_status");
+        assert!(
+            transition.contains(".filter(posts::lock_version.eq(row.lock_version))"),
+            "the transition write must be guarded by the version it read: {transition}"
+        );
+        assert!(
+            transition.contains("if updated == 0") && transition.contains("StatusCode::CONFLICT"),
+            "a lost transition race must 409, not report success: {transition}"
+        );
+        assert!(
+            transition.contains("changed by someone else"),
+            "the 409 must explain itself: {transition}"
+        );
+        // Zero rows is ambiguous: the version moved, or the row was deleted
+        // between the load and the write. The transition path re-reads to tell
+        // them apart, exactly as `update` does — otherwise a concurrent delete
+        // renders a conflict page for a row that can no longer be reloaded.
+        assert!(
+            transition.contains(".optional()?") && transition.contains("not_found_msg"),
+            "a concurrent delete must 404, not 409: {transition}"
+        );
+        // And the 409 shows the row as it now stands, not this request's stale
+        // snapshot — the legal transitions may have changed.
+        assert!(
+            transition.contains("&current,"),
+            "the 409 must render the re-read row: {transition}"
+        );
+    }
+
+    #[test]
+    fn state_transition_bumps_the_lock_version() {
+        // The bump is the other half: it makes the transition visible to anyone
+        // else guarding on the version, so an author whose edit form predates
+        // the transition is told the record moved on instead of saving over it.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:String:states(draft->published)".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let transition = handler_slice(&routes, "transition_status");
+        assert!(
+            transition.contains("posts::lock_version.eq(posts::lock_version + 1)"),
+            "the transition write must bump the version: {transition}"
+        );
+    }
+
+    #[test]
+    fn lock_version_hidden_input_is_prepended_after_the_submit_token() {
+        // `prepend` renders in call order, and `SubmitTokenLayer` only scans the
+        // body's first chunk (issue #1360) — so the token must still be the
+        // first field, with the version input behind it.
+        let routes = lock_routes();
+        let token_at = routes
+            .find("form = form.prepend(submit_token_input(")
+            .expect("submit token prepend");
+        let lock_at = routes
+            .find("input type=\"hidden\" name=\"lock_version\" value=(version);")
+            .expect("lock version prepend");
+        assert!(
+            token_at < lock_at,
+            "the submit token must be prepended before the lock version:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_is_refused_alongside_attachment_fields() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "cover:attachment".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("lock_version"), "got: {msg}");
     }
 }

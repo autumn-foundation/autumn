@@ -125,17 +125,57 @@ pub fn plan_model(
 ///
 /// # Errors
 /// Surfaces project-layout, DSL, naming, and metadata errors before any file is written.
-#[allow(
-    clippy::too_many_lines,
-    reason = "linear sequence of independent file/revert steps mirroring the files this \
-              generator emits; splitting it up would not make any single step clearer"
-)]
 pub fn plan_model_with_options(
     project_root: &Path,
     name: &str,
     field_tokens: &[String],
     timestamp: &str,
     options: &ModelOptions,
+) -> Result<Plan, GenerateError> {
+    plan_model_with_options_impl(project_root, name, field_tokens, timestamp, options, false)
+}
+
+/// [`plan_model_with_options`], but for `autumn destroy model` (and the
+/// scaffold's own destroy path), which recomputes the plan it is about to
+/// revert.
+///
+/// Skips the *generation-only* semantic checks: a model created before those
+/// checks existed — a `lock_version:String` column, say, or a lock-only model —
+/// must still be removable. Refusing during the recompute happens before
+/// [`Plan::revert`] ever sees `--force`, so it would strand exactly the files
+/// the user is asking to delete. Same posture as the scaffold's shared-layout
+/// preflight (issue #1834) and the migration destroy fallback (issue #1048).
+///
+/// Structural errors (project layout, bad field syntax, name collisions) still
+/// apply: without them there is no plan to revert at all.
+///
+/// # Errors
+/// Surfaces project-layout, DSL, and naming errors before any file is touched.
+pub fn plan_model_with_options_for_revert(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    options: &ModelOptions,
+) -> Result<Plan, GenerateError> {
+    plan_model_with_options_impl(project_root, name, field_tokens, timestamp, options, true)
+}
+
+/// Shared implementation of [`plan_model_with_options`]. `for_revert` skips the
+/// generation-only compatibility checks — see
+/// [`plan_model_with_options_for_revert`].
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear sequence of independent file/revert steps mirroring the files this \
+              generator emits; splitting it up would not make any single step clearer"
+)]
+fn plan_model_with_options_impl(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    options: &ModelOptions,
+    for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     validate_resource_name(name)?;
@@ -189,7 +229,57 @@ pub fn plan_model_with_options(
     // the SQL migration and schema.rs block include the nullable column.
     let schema_fields = augment_fields_for_soft_delete(&fields, options.soft_delete)?;
 
+    // Issue #1318: `lock_version` is managed by the database, so it contributes
+    // nothing to `New{Model}` — and neither does any `--default` column. A model
+    // whose columns are ALL database-managed therefore emits an empty
+    // `New{Model}`, whose Diesel `Insertable` derive does not compile, so the
+    // generated project is dead on arrival.
+    //
+    // The check is on the EFFECTIVE set rather than the declared token count:
+    // `Post title:String lock_version:i32 --default title=x` declares two
+    // columns and leaves zero. `metadata.defaults` carries both the explicit
+    // `--default` columns and (from `parse_model_metadata`) the lock column.
+    //
+    // Scoped to lock-version models deliberately. A model whose every column is
+    // `--default`ed — or one declared with no fields at all — has always emitted
+    // this same uncompilable struct; widening the refusal to those pre-existing
+    // cases is a separate change from wiring #1318, and would move a fieldless
+    // `generate scaffold Post` from a compile error to a planning error that an
+    // existing test pins.
+    if !for_revert {
+        validate_lock_version_field(&fields, &options.defaults)?;
+    }
+    if !for_revert
+        && lock_version_field(&fields).is_some()
+        && fields
+            .iter()
+            .all(|f| metadata.defaults().contains_key(&f.name))
+    {
+        return Err(GenerateError::Config(format!(
+            "this model has no insertable columns: `{LOCK_VERSION_COLUMN}` is managed by the \
+             database (and so is every `--default` column), so the generated \
+             New{pascal_name} struct would have no fields at all and the project would not \
+             compile. Declare at least one ordinary column alongside `{LOCK_VERSION_COLUMN}`."
+        )));
+    }
+
     let mut plan = Plan::new(project_root);
+    // Issue #1318: `lock_version` is a magic column name — declaring it changes
+    // the model's semantics (DB-managed, kept out of `New{Model}`, carried on
+    // `Update{Model}` as the expected version, conflict-checked by the
+    // repository, and hidden from a scaffold's form). That is the whole point
+    // for someone who wanted optimistic locking, and a nasty surprise for
+    // someone who just wanted a counter with that name — so say so out loud
+    // rather than letting the reinterpretation happen silently.
+    if lock_version_field(&fields).is_some() {
+        plan.warn(format!(
+            "`{LOCK_VERSION_COLUMN}` opts this model into optimistic locking: the column is \
+             managed by the database (excluded from New{pascal_name}, carried on \
+             Update{pascal_name} as the expected version, defaulted to 0 in the migration) and \
+             a scaffolded form carries it in a hidden field rather than an editable control. \
+             Rename the column if you wanted an ordinary integer you set yourself."
+        ));
+    }
     check_reference_targets(
         &mut plan,
         project_root,
@@ -1626,6 +1716,26 @@ pub fn parse_model_metadata(
         metadata.defaults.insert(field_name.to_owned(), sql);
     }
 
+    // Issue #1318: a `lock_version` column opts the model into the framework's
+    // optimistic-locking primitive. `#[lock_version]` makes the column
+    // DB-managed — it is excluded from `New{Model}`, so the INSERT never names
+    // it and the SQL column needs a `DEFAULT` or every create would fail the
+    // NOT NULL constraint. Recording it as a default here also drops the column
+    // from the scaffold's generated HTML form (`plan_scaffold`'s `form_fields`
+    // filter): the version is machinery the handler carries in a hidden field,
+    // not content the author edits. An explicit `--default lock_version=<n>`
+    // wins, so a project seeding versions from a non-zero base keeps its value.
+    // NOT validated here: `validate_lock_version_field` is a *generation* policy,
+    // and this function also runs while planning a `destroy`, where refusing a
+    // legacy column would strand files the user is trying to remove. The
+    // planning entry points call it themselves when they are generating.
+    if fields.iter().any(is_lock_version_column) {
+        metadata
+            .defaults
+            .entry(LOCK_VERSION_COLUMN.to_owned())
+            .or_insert_with(|| "0".to_owned());
+    }
+
     // Full-text search's generated `search_page` (in the repository macro)
     // hardcodes an `i64`/`BigInt` primary key: it collects `SearchId { id: i64 }`
     // rows into a `Vec<i64>`, filters with `id.eq_any(&ids)`, and dedups through
@@ -1718,6 +1828,124 @@ fn split_key_value(token: &str, sep: char) -> Result<(&str, &str), GenerateError
 
 pub fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a Field> {
     fields.iter().find(|field| field.name == name)
+}
+
+/// The column name a model declares to opt into optimistic concurrency
+/// (issue #1318).
+///
+/// The framework's optimistic-locking primitive (issue #575) keys off the
+/// `#[lock_version]` field attribute, not off a name — but the *generators*
+/// need a nameless-DSL way to opt in, and `lock_version` is the name Rails,
+/// Ecto, and this framework's own docs (`docs/guide/cloud-native.md`) already
+/// use. Declaring `lock_version:i32` in a `generate model`/`generate scaffold`
+/// field list is therefore the opt-in: the generator wires the attribute, the
+/// SQL default, and (for scaffolds) the conflict-aware edit form.
+pub const LOCK_VERSION_COLUMN: &str = "lock_version";
+
+/// The model's optimistic-locking column, if it declares one (issue #1318).
+///
+/// Callers can assume the returned field passed [`validate_lock_version_field`]
+/// — every planning entry point runs that check before rendering.
+#[must_use]
+pub fn lock_version_field(fields: &[Field]) -> Option<&Field> {
+    field_by_name(fields, LOCK_VERSION_COLUMN)
+}
+
+/// Whether `field` is a usable optimistic-locking column (issue #1318): named
+/// `lock_version`, non-nullable, and an integer counter.
+///
+/// The stricter test than [`lock_version_field`], for the call sites that must
+/// decide what SQL/attribute to emit rather than whether to complain. A field
+/// named `lock_version` that fails this predicate is rejected by
+/// [`validate_lock_version_field`] on every planning path, so the two agree —
+/// but the emission sites stay independently safe if a future entry point
+/// forgets the check.
+#[must_use]
+pub fn is_lock_version_column(field: &Field) -> bool {
+    field.name == LOCK_VERSION_COLUMN
+        && !field.nullable
+        && matches!(field.kind, FieldKind::I32 | FieldKind::I64)
+}
+
+/// Reject a `lock_version` column the locking primitive can't actually use.
+///
+/// `#[lock_version]`'s generated comparison reads the column as an `i64`, so a
+/// non-integer or nullable column would either fail to compile in the emitted
+/// model or silently never conflict-check. Failing here — before any file is
+/// written — beats handing the author a scaffold that *looks* concurrency-safe
+/// and isn't.
+///
+/// # Errors
+/// Returns [`GenerateError::InvalidField`] when a field named `lock_version`
+/// is not a non-nullable `i32`/`i64`.
+pub fn validate_lock_version_field(
+    fields: &[Field],
+    defaults: &[String],
+) -> Result<(), GenerateError> {
+    let Some(field) = lock_version_field(fields) else {
+        return Ok(());
+    };
+    if !is_lock_version_column(field) {
+        return Err(GenerateError::InvalidField {
+            token: format!("{}:{}", field.name, field.rust_type()),
+            reason: format!(
+                "the `{LOCK_VERSION_COLUMN}` column opts the model into optimistic locking \
+                 (issue #575), so it must be a non-nullable `i32` or `i64` counter — the \
+                 generated comparison reads it as an integer. Declare it as \
+                 `{LOCK_VERSION_COLUMN}:i32` (or `{LOCK_VERSION_COLUMN}:i64`), or rename the \
+                 column if it was not meant to be a lock version."
+            ),
+        });
+    }
+    // `unique` + a defaulted column is already rejected for explicit
+    // `--default` flags above, for the reason that bites hardest here: the lock
+    // column is DB-managed, so EVERY insert takes the same `DEFAULT 0` and the
+    // second row created collides with the first. The check above runs before
+    // the lock column's default is injected, so it never sees this pairing —
+    // catch it here instead of emitting a table that accepts exactly one row.
+    if field.unique {
+        return Err(GenerateError::InvalidField {
+            token: format!("{}:unique", field.name),
+            reason: format!(
+                "`{LOCK_VERSION_COLUMN}` cannot be `unique`: it is managed by the database \
+                 and defaults to 0 on every insert, so a unique index on it would reject the \
+                 second row ever created. Drop the `unique` marker."
+            ),
+        });
+    }
+    // A seed the counter cannot be incremented from. The generated `UPDATE`
+    // evaluates `lock_version + 1` in SQL, and Postgres raises `integer out of
+    // range` rather than wrapping — so seeding at the column's maximum makes the
+    // FIRST update on every row a 500. Rejecting the seed is the only fix that
+    // keeps the emitted statement simple; see the note on `lock_bump` about why
+    // the generated SQL deliberately does not emulate the repository's
+    // `wrapping_add`.
+    let ceiling = if field.kind == FieldKind::I64 {
+        i64::MAX
+    } else {
+        i64::from(i32::MAX)
+    };
+    for default in defaults {
+        let Some((name, value)) = default.split_once('=') else {
+            continue;
+        };
+        if name.trim() != LOCK_VERSION_COLUMN {
+            continue;
+        }
+        if value.trim().parse::<i64>() == Ok(ceiling) {
+            return Err(GenerateError::InvalidField {
+                token: default.clone(),
+                reason: format!(
+                    "`{LOCK_VERSION_COLUMN}` cannot be seeded at {ceiling}, the largest value \
+                     `{ty}` can hold: the generated UPDATE increments the column in SQL, so the \
+                     first save on every row would fail with `integer out of range`. Seed a \
+                     lower value, or declare `{LOCK_VERSION_COLUMN}:i64` for more headroom.",
+                    ty = field.rust_type(),
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Apply `--unique FIELD` flags (issue #1032) to already-parsed fields,
@@ -2157,7 +2385,16 @@ fn render_model_file(
                 let _ = writeln!(out, "    #[validate({validation})]");
             }
         }
-        if metadata.defaults.contains_key(&f.name) {
+        // Issue #1318: the optimistic-locking column carries `#[lock_version]`
+        // rather than `#[default]`. Both mark the column DB-managed (excluded
+        // from `New{Model}`), but only `#[lock_version]` puts the expected
+        // version on `Update{Model}` and makes `#[repository]`'s update raise
+        // `RepositoryError::Conflict` on a stale write — the whole point of
+        // declaring the column. `parse_model_metadata` records its SQL
+        // `DEFAULT 0` separately, so the migration still backfills the INSERT.
+        if is_lock_version_column(f) {
+            out.push_str("    #[lock_version]\n");
+        } else if metadata.defaults.contains_key(&f.name) {
             out.push_str("    #[default]\n");
         }
         // A `:states(…)` DSL modifier (issue #1326) re-emits as a
@@ -5276,5 +5513,350 @@ autumn-web = \"0.3\"\n";
         )
         .unwrap();
         assert!(up.contains("category_id BIGINT NOT NULL REFERENCES categories(id)"));
+    }
+
+    // ── optimistic locking: `lock_version` (issue #1318) ────────────────────
+    //
+    // A model opts into optimistic concurrency by declaring a field literally
+    // named `lock_version`. The generator wires the framework's shipped
+    // primitive (`#[lock_version]`, issue #575) rather than leaving it an inert
+    // integer column.
+
+    #[test]
+    fn lock_version_field_emits_lock_version_attribute() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            model.contains("#[lock_version]\n    pub lock_version: i32,"),
+            "a `lock_version` column must carry the framework's `#[lock_version]` \
+             attribute so `#[repository]` update raises RepositoryError::Conflict: {model}"
+        );
+    }
+
+    #[test]
+    fn lock_version_column_gets_sql_default_zero() {
+        // `#[lock_version]` excludes the column from `NewPost`, so the INSERT
+        // omits it — without a SQL DEFAULT every create would fail on the
+        // NOT NULL constraint.
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("lock_version INTEGER NOT NULL DEFAULT 0"),
+            "got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn lock_version_bigint_is_also_supported() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i64".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            model.contains("#[lock_version]\n    pub lock_version: i64,"),
+            "got:\n{model}"
+        );
+    }
+
+    #[test]
+    fn model_without_lock_version_emits_no_lock_version_attribute() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(!model.contains("lock_version"), "got:\n{model}");
+    }
+
+    #[test]
+    fn lock_version_with_non_integer_type_is_rejected() {
+        // Silently ignoring the field would leave the author believing they
+        // opted into optimistic locking when they did not.
+        let tmp = project();
+        let err = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:String".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lock_version") && msg.contains("i32"),
+            "the error must name the field and the supported types: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_model_with_no_insertable_columns_is_rejected() {
+        // Every column DB-managed => an empty `NewPost`, whose Diesel
+        // `Insertable` derive does not compile. `generate model` reaches this
+        // as easily as `generate scaffold` did, and the scaffold delegates here,
+        // so the guard belongs on this path.
+        let tmp = project();
+        let err = plan_model(
+            tmp.path(),
+            "Post",
+            &["lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no insertable columns") && msg.contains("NewPost"),
+            "got: {msg}"
+        );
+
+        // The mixed case: two columns declared, none left after `--default`
+        // drops one and `#[lock_version]` drops the other.
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+            &ModelOptions {
+                defaults: vec!["title=x".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("no insertable columns"),
+            "got: {err}"
+        );
+
+        // One ordinary column alongside is enough.
+        let tmp = project();
+        plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+        )
+        .expect("a lock column plus an ordinary column must generate");
+    }
+
+    #[test]
+    fn destroying_a_legacy_lock_version_model_is_never_blocked_by_the_new_checks() {
+        // Same hazard as the scaffold gates: `destroy model` recomputes the plan
+        // it is about to revert, so a generation-only refusal would fire before
+        // `Plan::revert` ever sees `--force`, permanently stranding the files.
+        for cols in [
+            vec!["title:String".to_owned(), "lock_version:String".to_owned()],
+            vec![
+                "title:String".to_owned(),
+                "lock_version:Option<i32>".to_owned(),
+            ],
+            vec!["lock_version:i32".to_owned()],
+        ] {
+            let tmp = project();
+            let plan = plan_model_with_options_for_revert(
+                tmp.path(),
+                "Post",
+                &cols,
+                "20260427000000",
+                &ModelOptions::default(),
+            );
+            assert!(
+                plan.is_ok(),
+                "destroying a legacy model with {cols:?} must plan: {:?}",
+                plan.err()
+            );
+        }
+
+        // Structural errors still apply on the revert path — without a valid
+        // field list there is no plan to revert at all.
+        let tmp = project();
+        assert!(
+            plan_model_with_options_for_revert(
+                tmp.path(),
+                "Post",
+                &["title:NotAType".to_owned()],
+                "20260427000000",
+                &ModelOptions::default(),
+            )
+            .is_err(),
+            "a malformed field list must still fail on the revert path"
+        );
+    }
+
+    #[test]
+    fn a_lock_version_seeded_at_its_ceiling_is_rejected() {
+        // The generated UPDATE increments the column in SQL, and Postgres raises
+        // `integer out of range` rather than wrapping — verified against
+        // Postgres 16 — so seeding at the maximum makes the FIRST save on every
+        // row a 500, not a distant theoretical overflow.
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+            &ModelOptions {
+                defaults: vec!["lock_version=2147483647".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("2147483647") && msg.contains("i64"),
+            "the refusal must name the ceiling and the way out: {msg}"
+        );
+
+        // `i64` has its own, much higher ceiling.
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i64".into()],
+            "20260427000000",
+            &ModelOptions {
+                defaults: vec!["lock_version=9223372036854775807".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("9223372036854775807"),
+            "got: {err}"
+        );
+
+        // An i32 ceiling is fine on an i64 column, and any seed below the
+        // ceiling is fine on either — the counter can still be incremented.
+        for (ty, seed) in [
+            ("lock_version:i64", "lock_version=2147483647"),
+            ("lock_version:i32", "lock_version=2147483646"),
+            ("lock_version:i32", "lock_version=5"),
+        ] {
+            let tmp = project();
+            plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), ty.into()],
+                "20260427000000",
+                &ModelOptions {
+                    defaults: vec![seed.into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{ty} seeded {seed} must be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn unique_lock_version_is_rejected() {
+        // The column is DB-managed and defaults to 0 on every insert, so a
+        // unique index on it would reject the second row ever created — and
+        // the `--default` + `unique` guard above never sees the pairing,
+        // because the lock column's default is injected after it runs.
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+            &ModelOptions {
+                uniques: vec!["lock_version".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lock_version") && msg.contains("unique"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn lock_version_emits_a_plan_warning_so_the_opt_in_is_never_silent() {
+        // `lock_version` is a magic name: declaring it changes what the column
+        // *is*. Someone who wanted an ordinary counter must be told.
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("optimistic locking") && w.contains("Rename")),
+            "expected an opt-in warning naming the escape hatch: {:?}",
+            plan.warnings
+        );
+
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("lock")),
+            "a model without the column must not warn: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn nullable_lock_version_is_rejected() {
+        // `Option<i32>`, not `i32?` — the latter is not this DSL's nullable
+        // spelling, so it fails in the type parser and never reaches the
+        // optimistic-locking guard this test is about.
+        let tmp = project();
+        let err = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:Option<i32>".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lock_version") && msg.contains("non-nullable"),
+            "the nullability guard must be what rejects it: {msg}"
+        );
     }
 }

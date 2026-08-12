@@ -72,7 +72,6 @@ pub fn plan_migration_with_options(
     super::model::validate_resource_name(name)?;
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, uniques)?;
-
     // Determine the target app's database backend so the emitted ALTER TABLE
     // DDL is backend-aware (SQLite foundation, issue #1614).
     let backend = detect_backend(project_root);
@@ -98,6 +97,18 @@ pub fn plan_migration_with_options(
             // anywhere the generator can see — a self-reference here is left
             // unvalidated rather than guessed at.
             super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            // Issue #1318: a `lock_version` token means optimistic locking here
+            // too — `add_columns_up_sql_for` gives it the `DEFAULT 0` the
+            // DB-managed column needs — so validate it exactly as `generate
+            // model`/`generate scaffold` do. Scoped to the ADD shape on
+            // purpose: a REMOVE migration names a column that already exists,
+            // and dropping a legacy `lock_version` whose name now collides with
+            // the magic one is a legitimate (indeed, the recommended) thing to
+            // do. Its rollback re-adds the column with the type the user
+            // supplied, so rejecting `RemoveLockVersionFromPosts
+            // lock_version:String` would block the very escape hatch the other
+            // error messages point at.
+            super::model::validate_lock_version_field(&fields, &[])?;
             // A field kind with no working diesel SQLite conversion (Uuid,
             // Attachment, Decimal) would leak an uncompilable column into the
             // generated SQLite app, so reject it here too — same guard as
@@ -285,6 +296,7 @@ fn pascalish(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::generate::Flags;
+    use crate::generate::emit::Action;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1173,5 +1185,84 @@ pub struct Post {
         .unwrap_err();
         assert!(err.to_string().contains("UUID"));
         assert!(err.to_string().contains("self-referential"));
+    }
+
+    // ── optimistic locking (issue #1318) ────────────────────────────────────
+
+    /// The contents of the planned `up.sql`/`down.sql` action.
+    fn sql_action(plan: &Plan, file: &str) -> String {
+        plan.actions
+            .iter()
+            .find(|a| a.path().file_name().is_some_and(|n| n == file))
+            .map_or_else(
+                || panic!("no {file} action"),
+                |a| match a {
+                    Action::Create { contents, .. } | Action::Modify { contents, .. } => {
+                        contents.clone()
+                    }
+                    _ => String::new(),
+                },
+            )
+    }
+
+    #[test]
+    fn adding_a_lock_version_column_carries_the_default_that_makes_it_usable() {
+        // The retrofit path — "add optimistic locking to a resource I already
+        // shipped" — is how this column normally arrives. `#[lock_version]`
+        // keeps it out of `New{Model}`, so a bare NOT NULL add would leave
+        // every later insert failing; the DEFAULT also backfills existing rows.
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "AddLockVersionToPosts",
+            &["lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let up = sql_action(&plan, "up.sql");
+        assert!(
+            up.contains("ADD COLUMN lock_version INTEGER NOT NULL DEFAULT 0;"),
+            "up.sql:\n{up}"
+        );
+    }
+
+    #[test]
+    fn adding_a_lock_version_column_of_the_wrong_type_is_rejected() {
+        // Same DSL token, same feedback as `generate model`/`generate scaffold`
+        // — otherwise the diagnosis depends only on which subcommand you typed.
+        let tmp = project();
+        let err = plan_migration(
+            tmp.path(),
+            "AddLockVersionToPosts",
+            &["lock_version:String".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lock_version") && msg.contains("i32"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn removing_a_legacy_lock_version_column_is_never_type_checked() {
+        // Dropping a pre-existing ordinary `lock_version` is exactly the escape
+        // hatch the other error messages point at, and the rollback re-adds the
+        // column with the type the caller supplied. Applying the optimistic-lock
+        // type restriction to a REMOVE migration would block it.
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "RemoveLockVersionFromPosts",
+            &["lock_version:String".into()],
+            "20260427000000",
+        )
+        .expect("a removal migration must not be type-checked as a lock version");
+        let down = sql_action(&plan, "down.sql");
+        assert!(
+            down.contains("ADD COLUMN lock_version TEXT"),
+            "the rollback must restore the caller's original type:\n{down}"
+        );
     }
 }

@@ -789,6 +789,108 @@ selection (HTML forbids nesting forms). To confirm a batch, post the
 selection to an interstitial page that lists the affected rows and asks
 for a second, explicit submit.
 
+### Concurrent edits: `lock_version` (optimistic locking)
+
+Declare a column named `lock_version` and the scaffold wires the
+framework's [optimistic-concurrency
+primitive](./cloud-native.md#optimistic-concurrency-via-lock_version)
+through the HTML edit flow (issue #1318) — no extra flag, no extra code:
+
+`lock_version` is a **magic column name**, like `slug` and `deleted_at`.
+Declaring it changes what the column *is*, so the generator prints a
+warning saying so; rename the column if you wanted an ordinary integer
+counter you set yourself.
+
+```bash
+autumn generate scaffold Post title:String body:Text lock_version:i32
+```
+
+- The **model** gets `#[lock_version]`, so the column is DB-managed:
+  excluded from `NewPost`, carried on `UpdatePost` as the *expected*
+  version, and compared by `#[repository]`'s update (which is what makes
+  the JSON API path conflict-check too).
+- The **migration** declares it `NOT NULL DEFAULT 0` (`INTEGER` for
+  `i32`, `BIGINT` for `i64`), since the INSERT never names it. Pass
+  `--default lock_version=<n>` to seed from a different base (a seed at the
+  column's maximum is refused — the generated `UPDATE` increments in SQL, and
+  Postgres raises `integer out of range` rather than wrapping, so the first
+  save on every row would fail). A counter that reaches its ceiling
+  organically needs 2³¹ saves of one row; use `lock_version:i64` for anything
+  that churns that hard.
+  `autumn generate migration AddLockVersionToPosts lock_version:i32`
+  gets the same `DEFAULT 0`, so retrofitting an existing table also
+  backfills its rows in one statement.
+- The **edit form** carries the row's current version in a hidden
+  `lock_version` input. The new form does not — a row that does not exist
+  yet has no version to guard against — and the version never appears as
+  an editable control.
+- The **update handler** turns the write into a compare-and-swap:
+
+  ```rust,ignore
+  let updated = diesel::update(
+      posts::table.find(*id).filter(posts::lock_version.eq(expected_lock_version)),
+  )
+      .set((
+          posts::title.eq(new.title.clone()),
+          posts::lock_version.eq(posts::lock_version + 1),
+      ))
+      .execute(&mut *db)
+      .await?;
+  ```
+
+  The guard and the bump are one statement, so there is no
+  read-modify-write window between them.
+- A **stale submit** matches zero rows. The handler re-reads the row to
+  tell "someone else got there first" (409) from "the row is gone" (404).
+  On 409 it re-renders the *same* edit form with the author's own input
+  intact, an inline `role="alert"` banner, and — deliberately — the row's
+  **current** version in the hidden field, so a second Save applies their
+  edit on top of the newer row. Handing the stale version back would make
+  the form permanently unsavable.
+- The generated `tests/<snake>.rs` gains a
+  `<plural>_optimistic_lock_conflict` test covering exactly that
+  sequence: first write wins and bumps, stale write 409s and changes
+  nothing, retry against the returned version succeeds.
+
+- A `:states(...)` **transition** is guarded the same way. It is itself a
+  read-modify-write — load the row, check the edge is legal from the state
+  just read, write — so its `UPDATE` carries `WHERE lock_version =
+  <the version it read>` and 409s (re-rendering the detail page) when it
+  loses the race, instead of letting two concurrent transitions out of the
+  same state both commit. It bumps the version too, so an author holding an
+  edit form opened before the transition is told the record moved on.
+- `autumn db pull` reproduces the attribute when it finds a
+  `lock_version` column, so a pulled table round-trips to the same model.
+
+The column must be a non-nullable `i32` or `i64`; anything else is
+rejected at generation time rather than silently ignored.
+`--live-validation` is supported (it changes only how the controls are
+rendered; its `update` writes through the same guarded statement).
+
+**Also affects `--api`.** `#[lock_version]` puts a **required**
+`lock_version` on `UpdatePost`, so JSON `PUT`/`PATCH` clients must send
+the version they read — a deliberate contract change, and how the API
+path gets conflict-checking. Existing clients that omit it will fail
+deserialization.
+
+**Not covered by the guard.** The scaffolded **admin** update
+(`autumn generate admin`) and the **delete** actions bump or write
+without a `WHERE lock_version = …` guard — the admin handler
+deserializes `NewPost`, which excludes the column, so the expected
+version never reaches it, and locking across deletes is out of scope
+(issues #1021/#1312). Both remain last-write-wins.
+
+**Not yet wired (HTML scaffolds only):** `--live`, `--sharded`, a `slug`
+column, and scaffolds with an `Attachment` column write through paths that
+do not route via the guarded statement, so combining them with
+`lock_version` is refused up front instead of emitting an edit form that
+only looks concurrency-safe. `--api` is exempt from all of these — it emits
+no routes file, so there is no form to be inconsistent with, and
+`--api --live` and friends keep generating.
+(`slug` is refused because a slug scaffold keys its update off the
+editable, reusable slug rather than the primary key, so
+`WHERE slug = … AND lock_version = …` does not identify a stable row.)
+
 ### Export CSV from the list view
 
 Every standard HTML scaffold's index also ships a working **Export CSV**
