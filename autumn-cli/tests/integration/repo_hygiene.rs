@@ -6431,3 +6431,55 @@ fn migration_guide_gate_rejects_a_definition_label_with_a_stray_bracket() {
         "an invalid label defines nothing",
     );
 }
+
+// --- Review round 51: comment openers inside link metadata ----------------
+
+#[test]
+fn migration_guide_gate_ignores_a_comment_opener_inside_a_link_title() {
+    // A `<!--` in a link title is tooltip text, not an HTML comment: the
+    // reference implementation renders it as a `title` attribute and the entry
+    // below it as a normal bullet. Reading it as a comment both swallowed the
+    // rest of the file and reported an unclosed comment.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md \"<!-- tooltip\").\n\n\
+         - **api:** a later entry.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a tooltip is not a comment, and the link is real\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_reads_a_comment_beside_a_link() {
+    // The counterpart: masking link metadata must leave a genuine comment on
+    // the same line readable, which is how commented-out entries are written.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **api:** an addition, see [notes](https://example.invalid). \
+           <!-- **Breaking:** parked, not shipped -->\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a marker inside a real comment declares nothing\n{}",
+        gate_report(&output),
+    );
+}

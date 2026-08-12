@@ -926,11 +926,14 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
 }
 
 function scan_comments(text,   out, masked, pos, close_at, head, tail) {
-  # Comment delimiters are located in a code-span-masked copy so prose that
-  # *shows* `<!--` does not open one, and escaped openers are skipped. Offsets
-  # are preserved by the mask, so the slices apply to the original text.
+  # Comment delimiters are located in a masked copy so prose that *shows*
+  # `<!--` does not open one, and escaped openers are skipped. Code spans are
+  # masked because they render literally; link destinations and titles because
+  # they are metadata — an opener in a tooltip is not a comment, and reading it
+  # as one swallowed the rest of the file and reported it unclosed. Both masks
+  # preserve offsets, so the slices apply to the original text.
   out = text
-  masked = mask_code_spans(out)
+  masked = mask_link_metadata(mask_code_spans(out))
   while ((pos = unescaped_index(masked, "<!--", 1)) > 0) {
     head = substr(out, 1, pos - 1)
     tail = substr(out, pos)
