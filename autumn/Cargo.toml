@@ -273,7 +273,7 @@ libsqlite3-sys = { workspace = true, optional = true }
 # this in lockstep risks the oracle silently diverging from axum's real accept/
 # panic behavior. The `matchit_agrees_with_axum_route_conflicts` parity test in
 # `router.rs` is the guard — it fails loudly if the two ever disagree.
-matchit = "=0.8.4"
+matchit = "=0.9.2"
 maud = { workspace = true, optional = true }
 moka = { workspace = true, optional = true }
 multer = { workspace = true }
