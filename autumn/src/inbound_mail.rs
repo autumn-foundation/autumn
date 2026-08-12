@@ -1521,20 +1521,30 @@ const MAX_MIME_DEPTH: usize = 16;
 /// Extract the MIME boundary parameter from a `Content-Type` header value.
 ///
 /// Returns `None` for a boundary that RFC 2046 §5.1.1 does not permit — empty,
-/// or longer than 70 characters — so the caller falls back to its single-part
-/// path instead of scanning the body for a delimiter that cannot be legitimate.
+/// all-whitespace or trailing-whitespace (the final byte must be
+/// `bcharsnospace`), or longer than 70 characters — so the caller falls back to
+/// its single-part path instead of scanning the body for a delimiter that
+/// cannot be legitimate.
+///
+/// Only the **first** `boundary` parameter is considered, matching every
+/// conformant parser. Validating the first and stopping (rather than skipping a
+/// rejected first `boundary` to find a later acceptable one) prevents a
+/// content-smuggling differential where an upstream scanner and Autumn split the
+/// same message on different delimiters.
 fn extract_boundary(content_type: &str) -> Option<String> {
-    content_type.split(';').skip(1).find_map(|part| {
+    let first_boundary = content_type.split(';').skip(1).find_map(|part| {
         let (key, val) = part.trim().split_once('=')?;
-        if !key.trim().eq_ignore_ascii_case("boundary") {
-            return None;
-        }
-        let val = val.trim().trim_matches('"');
-        if val.is_empty() || val.len() > MAX_BOUNDARY_LEN {
-            return None;
-        }
-        Some(val.to_string())
-    })
+        key.trim()
+            .eq_ignore_ascii_case("boundary")
+            .then(|| val.trim().trim_matches('"'))
+    })?;
+    if first_boundary.is_empty()
+        || first_boundary.len() > MAX_BOUNDARY_LEN
+        || first_boundary.ends_with([' ', '\t'])
+    {
+        return None;
+    }
+    Some(first_boundary.to_string())
 }
 
 /// Split a MIME multipart body and return `(text/plain, text/html, attachments)`.
@@ -1565,6 +1575,11 @@ fn extract_multipart_bodies_at(
     let mut text_body: Option<String> = None;
     let mut html_body: Option<String> = None;
     let mut attachments: Vec<Attachment> = Vec::new();
+    // Latch the depth-cap warning so a body with many sibling `multipart/*`
+    // parts at the cap emits one WARN per level, not one per part — otherwise a
+    // crafted body turns the unauthenticated inbound path into a log-flood
+    // amplifier (issue #1611).
+    let mut depth_cap_warned = false;
 
     // The first segment is the preamble (everything before the opening boundary).
     for part in split_mime_parts(body, delimiter.as_bytes())
@@ -1623,11 +1638,12 @@ fn extract_multipart_bodies_at(
             let s = String::from_utf8_lossy(part_body_bytes).into_owned();
             html_body = Some(decode_transfer_encoding(&s, &part_cte));
         } else if is_attachment || !part_ct_lower.starts_with("text/") {
-            if part_ct_lower.starts_with("multipart/") {
+            if part_ct_lower.starts_with("multipart/") && !depth_cap_warned {
+                depth_cap_warned = true;
                 tracing::warn!(
                     max_depth = MAX_MIME_DEPTH,
                     "inbound_mail: MIME nesting depth cap reached; \
-                     keeping the remaining subtree as an opaque attachment"
+                     keeping the remaining subtree(s) at this level as opaque attachments"
                 );
             }
             // Collect attachment parts; use raw bytes to avoid UTF-8 corruption.
@@ -3430,6 +3446,42 @@ mod tests {
             extract_multipart_bodies(b"whatever", "multipart/mixed; boundary=\"\"");
         assert_eq!(text.as_deref(), Some("whatever"));
         assert!(atts.is_empty());
+    }
+
+    #[test]
+    fn extract_boundary_rejects_whitespace_only_and_trailing_space_boundary() {
+        // F6: RFC 2046 §5.1.1 requires the final boundary byte to be
+        // `bcharsnospace`, so an all-whitespace or trailing-whitespace boundary
+        // is not permitted even though it is non-empty.
+        assert_eq!(extract_boundary("multipart/mixed; boundary=\" \""), None);
+        assert_eq!(extract_boundary("multipart/mixed; boundary=\"ab \""), None);
+        assert_eq!(extract_boundary("multipart/mixed; boundary=\"ab\t\""), None);
+        // A boundary with interior (non-trailing) whitespace is still legal.
+        assert_eq!(
+            extract_boundary("multipart/mixed; boundary=\"a b\"").as_deref(),
+            Some("a b")
+        );
+    }
+
+    #[test]
+    fn extract_boundary_validates_the_first_parameter_not_a_later_fallback() {
+        // F5: every conformant parser takes the FIRST `boundary` parameter. A
+        // rejected first boundary must NOT fall through to a later acceptable
+        // one — otherwise Autumn and an upstream scanner split the same message
+        // on different delimiters (content smuggling).
+        let over_len = "A".repeat(MAX_BOUNDARY_LEN + 1);
+        assert_eq!(
+            extract_boundary(&format!(
+                "multipart/mixed; boundary=\"{over_len}\"; boundary=ok"
+            )),
+            None,
+            "must reject on the first (invalid) boundary, not adopt the later 'ok'"
+        );
+        // First boundary valid → used, later one ignored.
+        assert_eq!(
+            extract_boundary("multipart/mixed; boundary=first; boundary=second").as_deref(),
+            Some("first")
+        );
     }
 
     #[test]
