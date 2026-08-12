@@ -126,18 +126,19 @@ pub struct DbBuffer {
 impl DbBuffer {
     /// The tape for a connection, created on first use.
     pub fn tape_mut(&mut self, connection_id: u64) -> &mut ConnectionTape {
-        self.tapes.entry(connection_id).or_insert_with(|| {
-            let mut tape = ConnectionTape::default();
-            tape.id = connection_id;
-            tape
-        })
+        self.tapes
+            .entry(connection_id)
+            .or_insert_with(|| ConnectionTape {
+                id: connection_id,
+                ..ConnectionTape::default()
+            })
     }
 
     /// Charge `bytes` against the capsule budget.
     ///
     /// Returns `false` once the budget is exhausted, at which point the caller
     /// must stop recording and mark the capsule truncated.
-    pub fn charge(&mut self, bytes: usize, budget: usize) -> bool {
+    pub const fn charge(&mut self, bytes: usize, budget: usize) -> bool {
         self.bytes = self.bytes.saturating_add(bytes);
         self.bytes <= budget
     }
@@ -165,6 +166,9 @@ impl DbBuffer {
         })
     }
 }
+
+/// Most clock readings one capsule will hold.
+const MAX_CLOCK_READINGS: usize = 10_000;
 
 /// Everything one in-flight request has offered up for its capsule.
 #[derive(Debug)]
@@ -225,9 +229,17 @@ impl CaptureScope {
     }
 
     /// Append a clock reading.
+    ///
+    /// Bounded: a pathological loop reading `now()` must not grow the buffer
+    /// without limit, and a capsule that long is not replayable anyway.
     pub fn record_clock(&self, reading: DateTime<Utc>) {
-        // stub: recording lands in the GREEN step.
-        let _ = reading;
+        if let Ok(mut readings) = self.clock.lock() {
+            if readings.len() >= MAX_CLOCK_READINGS {
+                self.truncated.store(true, Ordering::Relaxed);
+                return;
+            }
+            readings.push(reading);
+        }
     }
 
     /// The clock readings taken during the request, in order.
@@ -289,7 +301,7 @@ pub struct CaptureHandle(Arc<CaptureScope>);
 impl CaptureHandle {
     /// The scope this handle keeps alive.
     #[must_use]
-    pub fn scope(&self) -> &Arc<CaptureScope> {
+    pub const fn scope(&self) -> &Arc<CaptureScope> {
         &self.0
     }
 }
@@ -410,12 +422,93 @@ where
         // Clone-and-replace so the polled-ready service moves into the future.
         let cloned = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, cloned);
-        let _settings = Arc::clone(&self.settings);
-        let _filter = Arc::clone(&self.filter);
+        let settings = Arc::clone(&self.settings);
+        let filter = Arc::clone(&self.filter);
 
-        // stub: scope establishment lands in the GREEN step.
-        Box::pin(async move { inner.call(req).await })
+        Box::pin(async move {
+            let id = scope_id(&req);
+            let route = req
+                .extensions()
+                .get::<MatchedPath>()
+                .map(|matched| matched.as_str().to_owned());
+            let (mut req, body) = buffer_body(req, settings.max_body_bytes).await;
+
+            let scope = Arc::new(CaptureScope::new(id, settings, filter));
+            scope.set_request(RawRequest {
+                method: req.method().as_str().to_owned(),
+                uri: req.uri().clone(),
+                version: req.version(),
+                headers: req.headers().clone(),
+                route,
+                body,
+            });
+            register(&scope);
+            let _guard = RegistryGuard(scope.id().to_owned());
+            req.extensions_mut()
+                .insert(CaptureHandle(Arc::clone(&scope)));
+
+            // The scope ends when the response future resolves, so effects a
+            // streaming body produces afterwards are not captured — everything
+            // a failure needs happens during handler execution.
+            CAPSULE_SCOPE.scope(scope, inner.call(req)).await
+        })
     }
+}
+
+/// The capsule id for a request: its request id when
+/// [`RequestIdLayer`](crate::middleware::RequestIdLayer) (installed outer to
+/// this one) has already assigned one, else a fresh id.
+fn scope_id(req: &Request<Body>) -> String {
+    req.extensions()
+        .get::<crate::middleware::RequestId>()
+        .map(std::string::ToString::to_string)
+        .filter(|id| is_valid_scope_id(id))
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
+/// Buffer the request body up to the cap, rebuilding the request so the
+/// handler still receives it.
+///
+/// A body that is declared larger than the cap — or whose length is unknown
+/// (chunked) — is never consumed at all, so an upload streams to the handler
+/// exactly as it would without capture.
+async fn buffer_body(req: Request<Body>, max_body_bytes: usize) -> (Request<Body>, CapturedBody) {
+    let declared_len = body_length(&req);
+
+    match declared_len {
+        Some(0) => (req, CapturedBody::Absent),
+        None if !has_streamed_body(&req) => (req, CapturedBody::Absent),
+        Some(len) if len <= max_body_bytes => {
+            let (parts, body) = req.into_parts();
+            if let Ok(bytes) = axum::body::to_bytes(body, max_body_bytes).await {
+                let rebuilt = Request::from_parts(parts, Body::from(bytes.clone()));
+                (rebuilt, CapturedBody::Buffered(bytes))
+            } else {
+                // The body is gone either way; hand the handler an empty one
+                // and record that nothing was captured.
+                let rebuilt = Request::from_parts(parts, Body::empty());
+                (rebuilt, CapturedBody::Skipped { declared_len })
+            }
+        }
+        declared_len => (req, CapturedBody::Skipped { declared_len }),
+    }
+}
+
+/// The request body's length, from `Content-Length` or — for a body already in
+/// memory, as an in-process test client or a body-buffering outer layer
+/// produces — the body's own exact size hint.
+fn body_length(req: &Request<Body>) -> Option<usize> {
+    req.headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .or_else(|| usize::try_from(http_body::Body::size_hint(req.body()).exact()?).ok())
+}
+
+/// Whether the request declares a body whose length is not known up front.
+fn has_streamed_body(req: &Request<Body>) -> bool {
+    req.headers()
+        .contains_key(axum::http::header::TRANSFER_ENCODING)
 }
 
 #[cfg(test)]

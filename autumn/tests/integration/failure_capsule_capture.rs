@@ -18,12 +18,13 @@ use std::time::Duration;
 
 use chrono::TimeZone as _;
 
+use autumn_web::AppState;
 use autumn_web::capsule::{Capsule, CapsuleBody, CapsuleOutcome};
 use autumn_web::config::AutumnConfig;
 use autumn_web::reporting::{ErrorEvent, ErrorReporter, ReportFuture};
 use autumn_web::test::TestApp;
-use autumn_web::time::Clock;
 use autumn_web::{get, post, routes};
+use axum::extract::State;
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
@@ -49,11 +50,16 @@ async fn missing() -> Result<&'static str, autumn_web::AutumnError> {
     Err(autumn_web::AutumnError::not_found_msg("no such thing"))
 }
 
+/// Reads the framework clock three times before failing. The `Clock` extractor
+/// snapshots a single instant, so this goes through the state's clock source
+/// directly — the same seam the framework's own internals read.
 #[get("/clock-fail")]
-async fn clock_fail(clock: Clock) -> Result<&'static str, autumn_web::AutumnError> {
-    let first = clock.now();
-    let second = clock.now();
-    let third = clock.now();
+async fn clock_fail(
+    State(state): State<AppState>,
+) -> Result<&'static str, autumn_web::AutumnError> {
+    let first = state.clock().now();
+    let second = state.clock().now();
+    let third = state.clock().now();
     Err(autumn_web::AutumnError::internal_server_error_msg(format!(
         "{first} {second} {third}"
     )))
@@ -71,8 +77,10 @@ async fn echo_fail(body: String) -> Result<&'static str, autumn_web::AutumnError
 
 /// A test config with capture pointed at `dir`.
 fn capture_config(dir: &Path) -> AutumnConfig {
-    let mut config = AutumnConfig::default();
-    config.profile = Some("test".into());
+    let mut config = AutumnConfig {
+        profile: Some("test".into()),
+        ..AutumnConfig::default()
+    };
     config.security.csrf.enabled = false;
     config.failure_capture.enabled = true;
     config.failure_capture.dir = dir.to_string_lossy().into_owned();
@@ -114,9 +122,13 @@ fn read_capsule(path: &Path) -> Capsule {
 
 /// A reporter that records, for each event, whether the referenced capsule
 /// file already existed at the moment `report` ran.
+/// One observation: the capsule path the event referenced (if any), and
+/// whether that file already existed when the reporter ran.
+type Observation = (Option<PathBuf>, bool);
+
 #[derive(Clone, Default)]
 struct CapsuleWitness {
-    seen: Arc<Mutex<Vec<(Option<PathBuf>, bool)>>>,
+    seen: Arc<Mutex<Vec<Observation>>>,
 }
 
 impl ErrorReporter for CapsuleWitness {
@@ -180,7 +192,9 @@ async fn enabled_capture_persists_capsule_on_500() {
                 "the capsule must carry the real error message, got {message}"
             );
         }
-        other => panic!("a 500 must record a Status outcome, got {other:?}"),
+        outcome @ CapsuleOutcome::Panic { .. } => {
+            panic!("a 500 must record a Status outcome, got {outcome:?}")
+        }
     }
     assert!(!capsule.truncated);
 }
@@ -209,7 +223,9 @@ async fn enabled_capture_persists_capsule_on_panic() {
                 "the capsule must carry the panic payload, got {payload}"
             );
         }
-        other => panic!("a panic must record a Panic outcome, got {other:?}"),
+        outcome @ CapsuleOutcome::Status { .. } => {
+            panic!("a panic must record a Panic outcome, got {outcome:?}")
+        }
     }
 }
 

@@ -49,9 +49,11 @@ impl RecordingClock {
 
 impl ClockSource for RecordingClock {
     fn now(&self) -> DateTime<Utc> {
-        // stub: teeing into the scope lands in the GREEN step.
-        let _ = current_scope;
-        self.inner.now()
+        let reading = self.inner.now();
+        if let Some(scope) = current_scope() {
+            scope.record_clock(reading);
+        }
+        reading
     }
 }
 

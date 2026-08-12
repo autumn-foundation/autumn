@@ -65,9 +65,9 @@ mod experiments_pg_integration;
 mod extractors;
 mod factory_fake;
 mod factory_integration;
-mod fake_generators;
 #[cfg(feature = "reporting")]
 mod failure_capsule_capture;
+mod fake_generators;
 mod feature_flags_integration;
 mod feed;
 mod form_for_derive;

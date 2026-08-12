@@ -4063,8 +4063,31 @@ impl AutumnConfig {
 
     #[cfg(feature = "reporting")]
     fn apply_failure_capture_env_overrides_with_env(&mut self, env: &dyn Env) {
-        // stub: overrides land in the GREEN step.
-        let _ = env;
+        parse_env_bool(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__ENABLED",
+            &mut self.failure_capture.enabled,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__DIR",
+            &mut self.failure_capture.dir,
+        );
+        parse_env(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__MAX_BODY_BYTES",
+            &mut self.failure_capture.max_body_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__MAX_CAPSULE_BYTES",
+            &mut self.failure_capture.max_capsule_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__MAX_CAPSULES",
+            &mut self.failure_capture.max_capsules,
+        );
     }
 
     fn apply_dev_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -10453,8 +10476,7 @@ path = "/healthz"
         }
 
         let schema = AutumnConfig::get_schema_keys();
-        let errors =
-            AutumnConfig::validate_toml("[failure_capture]\nenabledd = true\n", &schema);
+        let errors = AutumnConfig::validate_toml("[failure_capture]\nenabledd = true\n", &schema);
         assert!(
             errors
                 .iter()

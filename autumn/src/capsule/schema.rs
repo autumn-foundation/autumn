@@ -109,12 +109,16 @@ impl Capsule {
     /// Returns [`CapsuleError::Malformed`] when the JSON does not match the
     /// schema and [`CapsuleError::VersionMismatch`] when the document was
     /// written by an incompatible build.
-    pub fn from_json(_json: &str) -> Result<Self, CapsuleError> {
-        // stub: parsing + version gate land in the GREEN step.
-        Err(CapsuleError::VersionMismatch {
-            found: 0,
-            expected: CAPSULE_FORMAT_VERSION,
-        })
+    pub fn from_json(json: &str) -> Result<Self, CapsuleError> {
+        let capsule: Self = serde_json::from_str(json).map_err(CapsuleError::Malformed)?;
+        if capsule.format_version == CAPSULE_FORMAT_VERSION {
+            Ok(capsule)
+        } else {
+            Err(CapsuleError::VersionMismatch {
+                found: capsule.format_version,
+                expected: CAPSULE_FORMAT_VERSION,
+            })
+        }
     }
 }
 
@@ -277,13 +281,11 @@ pub(crate) mod b64 {
     use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize as _, Deserializer, Serializer};
 
-    pub(crate) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&STANDARD.encode(bytes))
     }
 
-    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<u8>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
         let encoded = String::deserialize(deserializer)?;
         STANDARD
             .decode(encoded.as_bytes())
@@ -332,7 +334,7 @@ pub mod test_support {
 
     /// A connection tape carrying only request exchanges.
     #[must_use]
-    pub fn connection_tape(id: u64, exchanges: Vec<Exchange>) -> ConnectionTape {
+    pub const fn connection_tape(id: u64, exchanges: Vec<Exchange>) -> ConnectionTape {
         ConnectionTape {
             id,
             prologue: Vec::new(),
@@ -476,8 +478,7 @@ mod tests {
         let json = serde_json::to_string(&capsule).expect("capsule serializes");
 
         let error = Capsule::from_json(&json)
-            .err()
-            .expect("a future format version must be rejected, not silently read");
+            .expect_err("a future format version must be rejected, not silently read");
         match error {
             CapsuleError::VersionMismatch { found, expected } => {
                 assert_eq!(found, CAPSULE_FORMAT_VERSION + 1);

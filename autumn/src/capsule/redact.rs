@@ -33,6 +33,8 @@
 
 use std::collections::BTreeSet;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 
 use crate::capsule::schema::{BindValue, CapsuleBody, CapsuleRequest};
@@ -115,29 +117,231 @@ pub fn redact_request(
     raw: &RawRequest,
     filter: &ParameterFilter,
 ) -> (CapsuleRequest, RedactedValues) {
-    // stub: real masking lands in the GREEN step.
-    let _ = filter;
+    let mut values = RedactedValues::default();
+    let mut keys = BTreeSet::new();
+
+    let headers = redact_headers(&raw.headers, filter, &mut values, &mut keys);
+    let uri = redact_uri(&raw.uri, filter, &mut values, &mut keys);
+    let body = redact_body(raw, filter, &mut values, &mut keys);
+
     let request = CapsuleRequest {
         method: raw.method.clone(),
-        uri: raw.uri.to_string(),
+        uri,
         route: raw.route.clone(),
         http_version: format!("{:?}", raw.version),
-        headers: Vec::new(),
-        body: match &raw.body {
-            CapturedBody::Absent | CapturedBody::Buffered(_) => CapsuleBody::Absent,
-            CapturedBody::Skipped { declared_len } => CapsuleBody::Skipped {
-                declared_len: *declared_len,
-            },
-        },
-        redacted_keys: Vec::new(),
+        headers,
+        body,
+        redacted_keys: keys.into_iter().collect(),
     };
-    (request, RedactedValues::default())
+    (request, values)
 }
 
 /// Mask any bind parameter whose bytes exactly echo a redacted request value.
 pub fn mask_binds(binds: &mut [BindValue], redacted: &RedactedValues) {
-    // stub: real masking lands in the GREEN step.
-    let _ = (binds, redacted);
+    if redacted.is_empty() {
+        return;
+    }
+    for bind in binds {
+        if let BindValue::Value(bytes) = bind
+            && redacted.contains(bytes)
+        {
+            *bind = BindValue::Masked;
+        }
+    }
+}
+
+/// Copy the headers in wire order, replacing sensitive values.
+fn redact_headers(
+    headers: &axum::http::HeaderMap,
+    filter: &ParameterFilter,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        let name = name.as_str().to_owned();
+        if filter.matches_key(&name) {
+            values.insert(value.as_bytes());
+            keys.insert(format!("header:{name}"));
+            out.push((name, FILTERED_PLACEHOLDER.to_owned()));
+        } else {
+            let value = value.to_str().unwrap_or(NON_UTF8_PLACEHOLDER).to_owned();
+            out.push((name, value));
+        }
+    }
+    out
+}
+
+/// Placeholder for a header value that is not valid UTF-8, mirroring the dev
+/// error page's rendering of the same case.
+const NON_UTF8_PLACEHOLDER: &str = "<non-utf8>";
+
+/// Re-serialize the request target with sensitive query parameters masked.
+fn redact_uri(
+    uri: &axum::http::Uri,
+    filter: &ParameterFilter,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+) -> String {
+    let Some(query) = uri.query() else {
+        return uri.to_string();
+    };
+    let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    if pairs.is_empty() {
+        return uri.to_string();
+    }
+
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in pairs {
+        if key_is_sensitive(&key, filter) {
+            values.insert(value.as_bytes());
+            keys.insert(format!("query:{key}"));
+            serializer.append_pair(&key, FILTERED_PLACEHOLDER);
+        } else {
+            serializer.append_pair(&key, &value);
+        }
+    }
+    let redacted_query = serializer.finish();
+    let path = uri.path();
+    format!("{path}?{redacted_query}")
+}
+
+/// Whether a form/query key names a sensitive value.
+///
+/// Bracket and dot notation are expanded first so `user[password]` matches on
+/// its `password` leaf, the same expansion the dev error page applies before
+/// scrubbing a form body.
+fn key_is_sensitive(key: &str, filter: &ParameterFilter) -> bool {
+    key_segments(key)
+        .iter()
+        .any(|segment| filter.matches_key(segment))
+}
+
+/// Split a form key on bracket or dot notation into path segments.
+fn key_segments(key: &str) -> Vec<String> {
+    if let Some((head, rest)) = key.split_once('[') {
+        let mut parts = vec![head.to_owned()];
+        for segment in rest.split('[') {
+            let segment = segment.trim_end_matches(']');
+            if !segment.is_empty() {
+                parts.push(segment.to_owned());
+            }
+        }
+        parts
+    } else if key.contains('.') {
+        key.split('.')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        vec![key.to_owned()]
+    }
+}
+
+/// Redact the request body according to its content type.
+fn redact_body(
+    raw: &RawRequest,
+    filter: &ParameterFilter,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+) -> CapsuleBody {
+    let bytes = match &raw.body {
+        CapturedBody::Absent => return CapsuleBody::Absent,
+        CapturedBody::Skipped { declared_len } => {
+            return CapsuleBody::Skipped {
+                declared_len: *declared_len,
+            };
+        }
+        CapturedBody::Buffered(bytes) => bytes,
+    };
+    if bytes.is_empty() {
+        return CapsuleBody::Absent;
+    }
+
+    let content_type = raw
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if content_type.contains("json")
+        && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(bytes)
+    {
+        let scrubbed = scrub_value(&parsed, filter, "body", values, keys);
+        return serde_json::to_string(&scrubbed).map_or(CapsuleBody::Absent, CapsuleBody::Text);
+    }
+
+    if content_type.contains("application/x-www-form-urlencoded") {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in url::form_urlencoded::parse(bytes) {
+            if key_is_sensitive(&key, filter) {
+                values.insert(value.as_bytes());
+                keys.insert(format!("body:{key}"));
+                serializer.append_pair(&key, FILTERED_PLACEHOLDER);
+            } else {
+                serializer.append_pair(&key, &value);
+            }
+        }
+        return CapsuleBody::Text(serializer.finish());
+    }
+
+    // Anything else has no key structure to match on, so it is copied
+    // verbatim — see the module docs on what redaction does not cover.
+    std::str::from_utf8(bytes).map_or_else(
+        |_| CapsuleBody::Base64(STANDARD.encode(bytes)),
+        |text| CapsuleBody::Text(text.to_owned()),
+    )
+}
+
+/// Recursively mask sensitive leaves of a JSON body, recording what was hit.
+fn scrub_value(
+    value: &serde_json::Value,
+    filter: &ParameterFilter,
+    path: &str,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, child) in map {
+                let child_path = format!("{path}.{key}");
+                if filter.matches_key(key) {
+                    record_masked_value(child, values);
+                    keys.insert(child_path);
+                    out.insert(
+                        key.clone(),
+                        serde_json::Value::String(FILTERED_PLACEHOLDER.to_owned()),
+                    );
+                } else {
+                    out.insert(
+                        key.clone(),
+                        scrub_value(child, filter, &child_path, values, keys),
+                    );
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| scrub_value(item, filter, path, values, keys))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Retain the bytes of a masked JSON leaf so a bind echoing it is masked too.
+fn record_masked_value(value: &serde_json::Value, values: &mut RedactedValues) {
+    match value {
+        serde_json::Value::String(text) => values.insert(text.as_bytes()),
+        serde_json::Value::Null => {}
+        other => values.insert(other.to_string().as_bytes()),
+    }
 }
 
 #[cfg(test)]
@@ -173,8 +377,10 @@ mod tests {
             .headers
             .iter()
             .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
-            .unwrap_or_else(|| panic!("header {name} must be present in the capsule"))
+            .map_or_else(
+                || panic!("header {name} must be present in the capsule"),
+                |(_, value)| value.as_str(),
+            )
     }
 
     #[test]
@@ -188,7 +394,10 @@ mod tests {
             &filter_with(&[]),
         );
 
-        assert_eq!(header_value(&request, "authorization"), FILTERED_PLACEHOLDER);
+        assert_eq!(
+            header_value(&request, "authorization"),
+            FILTERED_PLACEHOLDER
+        );
         assert_eq!(header_value(&request, "cookie"), FILTERED_PLACEHOLDER);
         assert_eq!(
             header_value(&request, "accept"),
@@ -242,7 +451,10 @@ mod tests {
         );
 
         let CapsuleBody::Text(body) = &request.body else {
-            panic!("a JSON body must be captured as text, got {:?}", request.body);
+            panic!(
+                "a JSON body must be captured as text, got {:?}",
+                request.body
+            );
         };
         assert!(
             body.contains(FILTERED_PLACEHOLDER),
@@ -282,10 +494,8 @@ mod tests {
     #[test]
     fn form_body_bracket_keys_are_masked() {
         let (request, values) = redact(
-            Request::post("/users").header(
-                header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            ),
+            Request::post("/users")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded"),
             CapturedBody::Buffered(Bytes::from_static(
                 b"user%5Bemail%5D=ada%40example.com&user%5Bpassword%5D=hunter2secret",
             )),
@@ -293,7 +503,10 @@ mod tests {
         );
 
         let CapsuleBody::Text(body) = &request.body else {
-            panic!("a form body must be captured as text, got {:?}", request.body);
+            panic!(
+                "a form body must be captured as text, got {:?}",
+                request.body
+            );
         };
         assert!(
             !body.contains("hunter2secret"),
@@ -325,7 +538,10 @@ mod tests {
         );
 
         let CapsuleBody::Text(body) = &request.body else {
-            panic!("a JSON body must be captured as text, got {:?}", request.body);
+            panic!(
+                "a JSON body must be captured as text, got {:?}",
+                request.body
+            );
         };
         assert!(
             !body.contains("deep-secret-value"),

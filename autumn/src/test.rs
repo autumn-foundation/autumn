@@ -1846,14 +1846,12 @@ impl TestApp {
         // itself is installed by the shared router builder, but the recording
         // clock replaces the state's clock, which the router never owns.
         #[cfg(feature = "reporting")]
-        let state = if self.config.failure_capture.enabled {
-            let recording = std::sync::Arc::new(crate::capsule::RecordingClock::new(
-                state.clock_arc(),
-            )) as std::sync::Arc<dyn crate::time::ClockSource>;
-            state.with_clock(recording)
-        } else {
-            state
-        };
+        if self.config.failure_capture.enabled {
+            let recording =
+                std::sync::Arc::new(crate::capsule::RecordingClock::new(state.clock_arc()))
+                    as std::sync::Arc<dyn crate::time::ClockSource>;
+            state = state.with_clock(recording);
+        }
 
         for register in self.policy_registrations {
             register(state.policy_registry());

@@ -3108,9 +3108,9 @@ impl AppBuilder {
         // Mirrored by `TestApp::build` so test apps exercise the same wiring.
         #[cfg(feature = "reporting")]
         if config.failure_capture.enabled {
-            let recording = std::sync::Arc::new(crate::capsule::RecordingClock::new(
-                state.clock_arc(),
-            )) as std::sync::Arc<dyn crate::time::ClockSource>;
+            let recording =
+                std::sync::Arc::new(crate::capsule::RecordingClock::new(state.clock_arc()))
+                    as std::sync::Arc<dyn crate::time::ClockSource>;
             state = state.with_clock(recording);
         }
 
