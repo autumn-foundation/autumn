@@ -378,17 +378,33 @@ function is_orphan_title(text,   body, first, last, sq) {
   return (first == "\"" || first == sq) && last == first
 }
 
-function is_standalone_tag(text,   masked) {
-  # A complete tag alone on its line. Quoting matters: `<x-widget title=">">`
-  # ends at the *last* `>`, so a naive `[^<>]*` rejects a real opener and the
-  # lines it should have made literal get scanned as markdown instead.
+function is_standalone_tag(text,   n, i, ch, quote, sq) {
+  # A complete tag alone on its line. Attributes are optional and so are their
+  # values: `<x-widget>`, `<x-widget disabled>` and `<x-widget title=">">` are
+  # all complete tags and all open a raw block.
   #
-  # mask_html_attributes already parses quoted values, so a tag *with*
-  # attributes is recognised by it having masked the whole line. A tag without
-  # any cannot contain a quoted `>` and needs no parsing.
-  if (text ~ /^<\/?[a-zA-Z][a-zA-Z0-9-]*[[:space:]]*\/?>[[:space:]]*$/) return 1
-  masked = mask_html_attributes(text)
-  return (masked ~ /^[[:space:]]*$/ && text ~ /^</)
+  # Scanned rather than pattern-matched, because a quoted attribute value may
+  # contain `>` without ending the tag, and because a valueless attribute is
+  # neither an attribute-free tag nor a `name=value` one — the two shapes the
+  # earlier patterns between them recognised.
+  sq = sprintf("%c", 39)
+  if (text !~ /^<\/?[a-zA-Z]/) return 0
+  n = length(text)
+  quote = ""
+  for (i = 2; i <= n; i++) {
+    ch = substr(text, i, 1)
+    if (quote != "") {
+      if (ch == quote) quote = ""
+      continue
+    }
+    if (ch == "\"" || ch == sq) { quote = ch; continue }
+    # A second `<` means this was never a tag: `Vec<Route>` alone on a line is
+    # prose, and swallowing it would hide entries the lint has to read.
+    if (ch == "<") return 0
+    if (ch == ">") break
+  }
+  if (i > n) return 0
+  return substr(text, i + 1) ~ /^[[:space:]]*$/
 }
 
 function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {

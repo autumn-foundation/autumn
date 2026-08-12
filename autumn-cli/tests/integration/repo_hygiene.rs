@@ -5729,3 +5729,55 @@ fn migration_guide_gate_counts_a_linked_declaration_after_a_list() {
         gate_report(&output),
     );
 }
+
+// --- Review round 43: boolean attributes in a type-7 opener ---------------
+
+#[test]
+fn migration_guide_gate_opens_a_type_seven_tag_with_a_boolean_attribute() {
+    // `<x-widget disabled>` is a complete tag, so it opens a raw block and the
+    // link below it renders literally. The opener accepted attribute-free tags
+    // and tags carrying `name=value`, and a valueless attribute is neither.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+         <x-widget disabled>\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a valueless attribute still makes a complete tag",
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_open_a_block_on_nested_angle_brackets() {
+    // The counterpart that keeps the opener from swallowing prose: a generic
+    // standing alone on its line is not a tag, and treating it as one would
+    // hide the entries the unmarked-break lint has to read.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed.\n\n  \
+         <Vec<Route>>\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "nested angle brackets are not a complete tag\n{}",
+        gate_report(&output),
+    );
+}
