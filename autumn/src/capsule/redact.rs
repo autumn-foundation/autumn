@@ -40,9 +40,13 @@ use bytes::Bytes;
 use crate::capsule::schema::{BindValue, CapsuleBody, CapsuleRequest};
 use crate::log::filter::{FILTERED_PLACEHOLDER, ParameterFilter};
 
-/// The unredacted request the capture layer snapshotted, held in memory until
-/// the request either succeeds (and the snapshot is dropped) or fails (and
-/// this is redacted into a [`CapsuleRequest`]).
+/// The unredacted request *head* the capture layer snapshotted, held in memory
+/// until the request either succeeds (and the snapshot is dropped) or fails
+/// (and this is redacted into a [`CapsuleRequest`]).
+///
+/// The body is not part of the snapshot: it is copied while the handler reads
+/// it (see [`CaptureScope::captured_body`](crate::capsule::CaptureScope::captured_body))
+/// and composed with this head at persist time.
 #[derive(Debug, Clone)]
 pub struct RawRequest {
     /// HTTP method.
@@ -55,18 +59,17 @@ pub struct RawRequest {
     pub headers: axum::http::HeaderMap,
     /// Matched route template, when routing had already resolved one.
     pub route: Option<String>,
-    /// The request body, as far as it was safe to buffer it.
-    pub body: CapturedBody,
 }
 
 /// The request body as the capture layer obtained it.
 #[derive(Debug, Clone)]
 pub enum CapturedBody {
-    /// No body was present (or the method never carries one).
+    /// No body was present, or none of it had been read when the request
+    /// failed.
     Absent,
-    /// The body was buffered in full.
+    /// The body was copied as the handler read it.
     Buffered(Bytes),
-    /// The body was over the cap and deliberately left unconsumed.
+    /// The body was over the cap and deliberately not copied.
     Skipped {
         /// `Content-Length` the client declared, when it declared one.
         declared_len: Option<usize>,
@@ -103,6 +106,16 @@ impl RedactedValues {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// The recorded values, longest first.
+    ///
+    /// Longest-first matters for substring masking: masking `"hunter2"` before
+    /// `"hunter2secret"` would leave the tail of the longer secret behind.
+    fn longest_first(&self) -> Vec<&[u8]> {
+        let mut values: Vec<&[u8]> = self.0.iter().map(Vec::as_slice).collect();
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        values
+    }
 }
 
 /// Shortest value worth echo-matching against bind parameters.
@@ -110,11 +123,16 @@ const MIN_ECHO_LEN: usize = 4;
 
 /// Build the capsule's request record, masking every sensitive value.
 ///
+/// Takes the request head and the body separately, because the capture layer
+/// obtains them at different times: the head up front, the body as the handler
+/// streams it.
+///
 /// Returns the redacted record plus the set of pre-mask values, for
-/// [`mask_binds`].
+/// [`mask_binds`] and [`mask_echoes`].
 #[must_use]
 pub fn redact_request(
     raw: &RawRequest,
+    raw_body: &CapturedBody,
     filter: &ParameterFilter,
 ) -> (CapsuleRequest, RedactedValues) {
     let mut values = RedactedValues::default();
@@ -122,7 +140,7 @@ pub fn redact_request(
 
     let headers = redact_headers(&raw.headers, filter, &mut values, &mut keys);
     let uri = redact_uri(&raw.uri, filter, &mut values, &mut keys);
-    let body = redact_body(raw, filter, &mut values, &mut keys);
+    let body = redact_body(&raw.headers, raw_body, filter, &mut values, &mut keys);
 
     let request = CapsuleRequest {
         method: raw.method.clone(),
@@ -134,6 +152,34 @@ pub fn redact_request(
         redacted_keys: keys.into_iter().collect(),
     };
     (request, values)
+}
+
+/// Replace every occurrence of a redacted request value inside `text` with the
+/// filtered placeholder.
+///
+/// Where [`mask_binds`] compares whole values, this looks for them *inside* a
+/// string: a handler that fails with `"could not store password=hunter2"` — or
+/// panics with the submitted value in its payload — would otherwise write back
+/// out, in the capsule's outcome, exactly what redaction removed from the
+/// request. Same minimum-length rule as the rest of the echo set, so short
+/// values cannot shred unrelated prose.
+#[must_use]
+pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
+    if redacted.is_empty() || text.is_empty() {
+        return text.to_owned();
+    }
+    let mut masked = text.to_owned();
+    for value in redacted.longest_first() {
+        // Only values that were UTF-8 to begin with can appear in a message;
+        // binary secrets are handled by `mask_binds`.
+        let Ok(needle) = std::str::from_utf8(value) else {
+            continue;
+        };
+        if needle.len() >= MIN_ECHO_LEN && masked.contains(needle) {
+            masked = masked.replace(needle, FILTERED_PLACEHOLDER);
+        }
+    }
+    masked
 }
 
 /// Mask any bind parameter whose bytes exactly echo a redacted request value.
@@ -242,12 +288,13 @@ fn key_segments(key: &str) -> Vec<String> {
 
 /// Redact the request body according to its content type.
 fn redact_body(
-    raw: &RawRequest,
+    headers: &axum::http::HeaderMap,
+    raw_body: &CapturedBody,
     filter: &ParameterFilter,
     values: &mut RedactedValues,
     keys: &mut BTreeSet<String>,
 ) -> CapsuleBody {
-    let bytes = match &raw.body {
+    let bytes = match raw_body {
         CapturedBody::Absent => return CapsuleBody::Absent,
         CapturedBody::Skipped { declared_len } => {
             return CapsuleBody::Skipped {
@@ -260,8 +307,7 @@ fn redact_body(
         return CapsuleBody::Absent;
     }
 
-    let content_type = raw
-        .headers
+    let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
@@ -354,6 +400,10 @@ mod tests {
         ParameterFilter::new(&extra, &[])
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "fixture bodies read better handed over than borrowed at every call site"
+    )]
     fn redact(
         builder: axum::http::request::Builder,
         body: CapturedBody,
@@ -367,9 +417,8 @@ mod tests {
             version: parts.version,
             headers: parts.headers,
             route: None,
-            body,
         };
-        redact_request(&raw, filter)
+        redact_request(&raw, &body, filter)
     }
 
     fn header_value<'a>(request: &'a CapsuleRequest, name: &str) -> &'a str {
@@ -585,6 +634,53 @@ mod tests {
             );
         };
         assert_eq!(encoded, "//4AAQ==");
+    }
+
+    #[test]
+    fn outcome_text_echoing_a_redacted_value_is_masked() {
+        // A handler that fails while talking about what it was given hands the
+        // secret straight back: `redact_request` masked it out of the body, so
+        // the outcome must not smuggle it into the capsule.
+        let (_, values) = redact(
+            Request::post("/users")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded"),
+            CapturedBody::Buffered(Bytes::from_static(b"email=ada&password=hunter2secret")),
+            &filter_with(&[]),
+        );
+
+        let masked = mask_echoes("could not store password=hunter2secret for ada", &values);
+
+        assert!(
+            !masked.contains("hunter2secret"),
+            "a value redaction removed must not reappear in the outcome, got {masked}"
+        );
+        assert!(
+            masked.contains(FILTERED_PLACEHOLDER),
+            "the echo must be replaced by the placeholder, got {masked}"
+        );
+        assert!(
+            masked.contains("for ada"),
+            "the rest of the message must survive, got {masked}"
+        );
+    }
+
+    #[test]
+    fn mask_echoes_prefers_the_longest_match_and_ignores_short_values() {
+        let mut values = RedactedValues::default();
+        values.insert(b"hunter2secret");
+        values.insert(b"hunter2");
+        // Below `MIN_ECHO_LEN`: never recorded, so it cannot shred prose.
+        values.insert(b"ada");
+
+        let masked = mask_echoes("ada tried hunter2secret twice", &values);
+
+        assert_eq!(masked, format!("ada tried {FILTERED_PLACEHOLDER} twice"));
+    }
+
+    #[test]
+    fn mask_echoes_is_a_no_op_without_redactions() {
+        let values = RedactedValues::default();
+        assert_eq!(mask_echoes("nothing to hide", &values), "nothing to hide");
     }
 
     #[test]

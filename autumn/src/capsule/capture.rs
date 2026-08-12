@@ -170,6 +170,42 @@ impl DbBuffer {
 /// Most clock readings one capsule will hold.
 const MAX_CLOCK_READINGS: usize = 10_000;
 
+/// How the capture layer is treating one request's body.
+///
+/// The layer never reads the body itself (see [`TeeBody`]), so this is the
+/// running state of a copy the *handler* is driving.
+#[derive(Debug, Default)]
+enum BodyTap {
+    /// Nothing to copy: no body was declared, or it was declared empty.
+    #[default]
+    Absent,
+    /// Deliberately not copied — the declared length was over the cap, so the
+    /// body streams to the handler untouched.
+    Skipped {
+        /// Length the client declared, when it declared one.
+        declared_len: Option<usize>,
+    },
+    /// Being copied frame by frame as the handler reads it.
+    Teeing {
+        /// Length the client declared, when it declared one.
+        declared_len: Option<usize>,
+        /// Bytes copied so far.
+        buf: Vec<u8>,
+        /// Whether the handler read the body all the way to its end.
+        end_stream: bool,
+        /// Whether the copy was abandoned for exceeding `max_body_bytes`.
+        overflowed: bool,
+    },
+}
+
+/// Note recorded when a streaming body grew past `max_body_bytes`.
+const BODY_OVERFLOW_NOTE: &str =
+    "request body exceeded max_body_bytes while streaming; it was not captured";
+
+/// Note recorded when the handler stopped reading the body before its end.
+const BODY_PARTIAL_NOTE: &str =
+    "request body was not read to its end before the failure; the captured body is incomplete";
+
 /// Everything one in-flight request has offered up for its capsule.
 #[derive(Debug)]
 pub struct CaptureScope {
@@ -177,10 +213,12 @@ pub struct CaptureScope {
     settings: Arc<CaptureSettings>,
     filter: Arc<ParameterFilter>,
     request: OnceLock<RawRequest>,
+    body: Mutex<BodyTap>,
     clock: Mutex<Vec<DateTime<Utc>>>,
     db: Mutex<DbBuffer>,
     notes: Mutex<Vec<String>>,
     truncated: AtomicBool,
+    closed: AtomicBool,
 }
 
 impl CaptureScope {
@@ -192,10 +230,12 @@ impl CaptureScope {
             settings,
             filter,
             request: OnceLock::new(),
+            body: Mutex::new(BodyTap::Absent),
             clock: Mutex::new(Vec::new()),
             db: Mutex::new(DbBuffer::default()),
             notes: Mutex::new(Vec::new()),
             truncated: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -223,9 +263,91 @@ impl CaptureScope {
     }
 
     /// The unredacted request snapshot, if the layer recorded one.
+    ///
+    /// The snapshot is the request *head* only; the body arrives separately
+    /// through [`captured_body`](Self::captured_body), because it is copied
+    /// while the handler reads it rather than up front.
     #[must_use]
     pub fn raw_request(&self) -> Option<&RawRequest> {
         self.request.get()
+    }
+
+    /// Decide how this request's body will be treated, before the handler runs.
+    fn arm_body(&self, tap: BodyTap) {
+        if let Ok(mut current) = self.body.lock() {
+            *current = tap;
+        }
+    }
+
+    /// Copy a data frame the handler has just read.
+    ///
+    /// Bounded by `max_body_bytes`: the frame that would cross the cap ends
+    /// the copy and releases what was collected, so an unexpectedly large
+    /// streamed upload cannot be buffered in memory by the mere presence of
+    /// capture.
+    fn tee_body_chunk(&self, chunk: &[u8]) {
+        let limit = self.settings.max_body_bytes;
+        if let Ok(mut tap) = self.body.lock()
+            && let BodyTap::Teeing {
+                buf, overflowed, ..
+            } = &mut *tap
+            && !*overflowed
+        {
+            if buf.len().saturating_add(chunk.len()) > limit {
+                *overflowed = true;
+                *buf = Vec::new();
+            } else {
+                buf.extend_from_slice(chunk);
+            }
+        }
+    }
+
+    /// Record that the handler read the body all the way to its end.
+    fn mark_body_end(&self) {
+        if let Ok(mut tap) = self.body.lock()
+            && let BodyTap::Teeing { end_stream, .. } = &mut *tap
+        {
+            *end_stream = true;
+        }
+    }
+
+    /// The request body, as far as the handler read it before the failure.
+    #[must_use]
+    pub fn captured_body(&self) -> CapturedBody {
+        let Ok(tap) = self.body.lock() else {
+            return CapturedBody::Absent;
+        };
+        match &*tap {
+            BodyTap::Absent => CapturedBody::Absent,
+            // Declared over the cap up front, or discovered to be over it
+            // mid-stream: either way the capsule records a skip, not a body.
+            BodyTap::Skipped { declared_len }
+            | BodyTap::Teeing {
+                declared_len,
+                overflowed: true,
+                ..
+            } => CapturedBody::Skipped {
+                declared_len: *declared_len,
+            },
+            BodyTap::Teeing { buf, .. } if buf.is_empty() => CapturedBody::Absent,
+            BodyTap::Teeing { buf, .. } => CapturedBody::Buffered(bytes::Bytes::from(buf.clone())),
+        }
+    }
+
+    /// A note explaining a body the capsule reader should not trust as
+    /// complete, if this request produced one.
+    #[must_use]
+    pub fn body_note(&self) -> Option<&'static str> {
+        let tap = self.body.lock().ok()?;
+        match &*tap {
+            BodyTap::Teeing {
+                overflowed: true, ..
+            } => Some(BODY_OVERFLOW_NOTE),
+            BodyTap::Teeing {
+                end_stream: false, ..
+            } => Some(BODY_PARTIAL_NOTE),
+            _ => None,
+        }
     }
 
     /// Append a clock reading.
@@ -281,6 +403,27 @@ impl CaptureScope {
             .unwrap_or_default()
     }
 
+    /// Stop accepting effects: the request this scope belongs to is over.
+    ///
+    /// Called when the capture layer's future resolves — normally or through a
+    /// panic unwind. The scope itself lives on until the capsule is written,
+    /// so this is what stops *late* effects from joining it. Chiefly the
+    /// connection pool's liveness check: `pool.get()` pings the connection
+    /// before [`Db::checkout`](crate::db::Db::checkout) sends the next
+    /// request's attribution marker, so without a close the ping would be
+    /// recorded against whoever held that connection last, and replay of that
+    /// capsule would then expect a query its handler never issued (F2).
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the request is over and the capsule is no longer accepting
+    /// effects.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+
     /// Mark the capsule as incomplete; replay must refuse it.
     pub fn mark_truncated(&self) {
         self.truncated.store(true, Ordering::Relaxed);
@@ -334,13 +477,17 @@ fn deregister(id: &str) {
     }
 }
 
-/// Removes a scope from the registry when the request's future is dropped,
-/// including when it is dropped by a panic unwind.
-struct RegistryGuard(String);
+/// Closes a scope and removes it from the registry when the request's future
+/// is dropped, including when it is dropped by a panic unwind.
+struct RegistryGuard(Arc<CaptureScope>);
 
 impl Drop for RegistryGuard {
     fn drop(&mut self) {
-        deregister(&self.0);
+        // Order matters: closing first means a connection recorder that is
+        // mid-append when the request ends cannot slip an effect in between
+        // the two steps.
+        self.0.close();
+        deregister(self.0.id());
     }
 }
 
@@ -431,8 +578,6 @@ where
                 .extensions()
                 .get::<MatchedPath>()
                 .map(|matched| matched.as_str().to_owned());
-            let (mut req, body) = buffer_body(req, settings.max_body_bytes).await;
-
             let scope = Arc::new(CaptureScope::new(id, settings, filter));
             scope.set_request(RawRequest {
                 method: req.method().as_str().to_owned(),
@@ -440,10 +585,11 @@ where
                 version: req.version(),
                 headers: req.headers().clone(),
                 route,
-                body,
             });
+            // Note the body is *teed*, never pre-read: see `arm_body_capture`.
+            let mut req = arm_body_capture(req, &scope);
             register(&scope);
-            let _guard = RegistryGuard(scope.id().to_owned());
+            let _guard = RegistryGuard(Arc::clone(&scope));
             req.extensions_mut()
                 .insert(CaptureHandle(Arc::clone(&scope)));
 
@@ -466,31 +612,92 @@ fn scope_id(req: &Request<Body>) -> String {
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string())
 }
 
-/// Buffer the request body up to the cap, rebuilding the request so the
-/// handler still receives it.
+/// Arrange for the request body to be copied into the scope *as the handler
+/// reads it*, rather than buffered here.
 ///
-/// A body that is declared larger than the cap — or whose length is unknown
-/// (chunked) — is never consumed at all, so an upload streams to the handler
-/// exactly as it would without capture.
-async fn buffer_body(req: Request<Body>, max_body_bytes: usize) -> (Request<Body>, CapturedBody) {
+/// This layer is installed outer to the request-timeout layer (see the layer
+/// order in `router.rs`), so anything it reads off the socket is read before
+/// the deadline starts: pre-buffering even a small body would let a client
+/// drip-feed it forever and hold a worker open — a slow-loris vector that
+/// would exist only when capture is enabled. Teeing leaves the read where it
+/// belongs, inside the handler, where the timeout already bounds it.
+///
+/// A body declared larger than `max_body_bytes` is not wrapped at all, so an
+/// upload streams to the handler exactly as it would without capture.
+fn arm_body_capture(req: Request<Body>, scope: &Arc<CaptureScope>) -> Request<Body> {
+    let max_body_bytes = scope.settings().max_body_bytes;
     let declared_len = body_length(&req);
 
     match declared_len {
-        Some(0) => (req, CapturedBody::Absent),
-        None if !has_streamed_body(&req) => (req, CapturedBody::Absent),
-        Some(len) if len <= max_body_bytes => {
-            let (parts, body) = req.into_parts();
-            if let Ok(bytes) = axum::body::to_bytes(body, max_body_bytes).await {
-                let rebuilt = Request::from_parts(parts, Body::from(bytes.clone()));
-                (rebuilt, CapturedBody::Buffered(bytes))
-            } else {
-                // The body is gone either way; hand the handler an empty one
-                // and record that nothing was captured.
-                let rebuilt = Request::from_parts(parts, Body::empty());
-                (rebuilt, CapturedBody::Skipped { declared_len })
-            }
+        Some(0) => {
+            scope.arm_body(BodyTap::Absent);
+            req
         }
-        declared_len => (req, CapturedBody::Skipped { declared_len }),
+        None if !has_streamed_body(&req) => {
+            scope.arm_body(BodyTap::Absent);
+            req
+        }
+        Some(len) if len > max_body_bytes => {
+            scope.arm_body(BodyTap::Skipped { declared_len });
+            req
+        }
+        _ => {
+            scope.arm_body(BodyTap::Teeing {
+                declared_len,
+                buf: Vec::new(),
+                end_stream: false,
+                overflowed: false,
+            });
+            let (parts, body) = req.into_parts();
+            let teed = Body::new(TeeBody {
+                inner: body,
+                scope: Arc::clone(scope),
+            });
+            Request::from_parts(parts, teed)
+        }
+    }
+}
+
+/// Request body that copies each data frame into the capture scope on its way
+/// through to the handler.
+///
+/// Every method delegates, so the handler sees the body it would have seen
+/// without capture — same frames, same order, same end-of-stream, same size
+/// hint. The copy is bounded by `max_body_bytes` and stops there.
+struct TeeBody {
+    inner: Body,
+    scope: Arc<CaptureScope>,
+}
+
+impl http_body::Body for TeeBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.scope.tee_body_chunk(data);
+                }
+            }
+            // The handler read the body to its end: what was copied is whole.
+            Poll::Ready(None) => this.scope.mark_body_end(),
+            Poll::Ready(Some(Err(_))) | Poll::Pending => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::Body::size_hint(&self.inner)
     }
 }
 
@@ -514,6 +721,265 @@ fn has_streamed_body(req: &Request<Body>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use bytes::Bytes;
+    use http_body::Frame;
+
+    /// Ordered log of who touched what, shared between a test body and the
+    /// service it is sent through.
+    #[derive(Clone, Default)]
+    struct Trace(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Trace {
+        fn record(&self, what: &'static str) {
+            if let Ok(mut entries) = self.0.lock() {
+                entries.push(what);
+            }
+        }
+
+        fn entries(&self) -> Vec<&'static str> {
+            self.0
+                .lock()
+                .map(|entries| entries.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    /// A request body that logs every poll, so a test can see exactly when the
+    /// bytes were read relative to the handler running.
+    struct WatchedBody {
+        trace: Trace,
+        chunks: Vec<&'static [u8]>,
+    }
+
+    impl http_body::Body for WatchedBody {
+        type Data = Bytes;
+        type Error = axum::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            this.trace.record("body-polled");
+            if this.chunks.is_empty() {
+                Poll::Ready(None)
+            } else {
+                let chunk = this.chunks.remove(0);
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(chunk)))))
+            }
+        }
+    }
+
+    fn test_layer(settings: CaptureSettings) -> CaptureLayer {
+        CaptureLayer::new(settings, Arc::new(ParameterFilter::new(&[], &[])))
+    }
+
+    /// Run a request through the capture layer with an inner service that
+    /// records its entry, optionally drains the body, and hands back the
+    /// capture handle it found in the extensions.
+    async fn run_capture(
+        settings: CaptureSettings,
+        request: Request<Body>,
+        trace: Trace,
+        read_body: bool,
+    ) -> Arc<CaptureScope> {
+        let seen: Arc<Mutex<Option<CaptureHandle>>> = Arc::new(Mutex::new(None));
+        let inner_seen = Arc::clone(&seen);
+        let inner_trace = trace.clone();
+        let inner = tower::service_fn(move |req: Request<Body>| {
+            let seen = Arc::clone(&inner_seen);
+            let trace = inner_trace.clone();
+            async move {
+                trace.record("inner-called");
+                if let Some(handle) = req.extensions().get::<CaptureHandle>().cloned()
+                    && let Ok(mut slot) = seen.lock()
+                {
+                    *slot = Some(handle);
+                }
+                if read_body {
+                    let _ = axum::body::to_bytes(req.into_body(), usize::MAX).await;
+                    trace.record("handler-read-body");
+                }
+                Ok::<_, std::convert::Infallible>(Response::new(Body::empty()))
+            }
+        });
+
+        let mut service = test_layer(settings).layer(inner);
+        let _response = service
+            .call(request)
+            .await
+            .expect("inner service is infallible");
+        let handle = seen
+            .lock()
+            .expect("handle slot")
+            .clone()
+            .expect("the capture layer must publish a handle in the request extensions");
+        Arc::clone(handle.scope())
+    }
+
+    #[tokio::test]
+    async fn call_does_not_read_the_body_before_the_inner_service_runs() {
+        // The capture layer sits *outside* the request-timeout layer, so any
+        // byte it reads off the socket itself is read before the deadline
+        // starts. A slow client dripping a small body would otherwise hold a
+        // worker open forever. Bytes must only be read by the handler.
+        let trace = Trace::default();
+        let request = Request::post("/x")
+            .header(axum::http::header::CONTENT_LENGTH, "7")
+            .body(Body::new(WatchedBody {
+                trace: trace.clone(),
+                chunks: vec![b"payload"],
+            }))
+            .expect("request builds");
+
+        let _scope = run_capture(CaptureSettings::default(), request, trace.clone(), true).await;
+
+        let entries = trace.entries();
+        assert_eq!(
+            entries.first(),
+            Some(&"inner-called"),
+            "capture must not touch the request body before the inner service \
+             (and therefore the request timeout) is running, got {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn teed_body_is_captured_whole_when_the_handler_reads_it() {
+        let trace = Trace::default();
+        let request = Request::post("/x")
+            .header(axum::http::header::CONTENT_LENGTH, "10")
+            .body(Body::new(WatchedBody {
+                trace: trace.clone(),
+                chunks: vec![b"hello", b"world"],
+            }))
+            .expect("request builds");
+
+        let scope = run_capture(CaptureSettings::default(), request, trace, true).await;
+
+        match scope.captured_body() {
+            CapturedBody::Buffered(bytes) => assert_eq!(&bytes[..], b"helloworld"),
+            other => panic!("a fully read body must be captured whole, got {other:?}"),
+        }
+        assert_eq!(
+            scope.body_note(),
+            None,
+            "a complete body needs no caveat in the capsule"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_the_handler_never_reads_leaves_a_note_not_a_capture() {
+        let trace = Trace::default();
+        let request = Request::post("/x")
+            .header(axum::http::header::CONTENT_LENGTH, "7")
+            .body(Body::new(WatchedBody {
+                trace: trace.clone(),
+                chunks: vec![b"payload"],
+            }))
+            .expect("request builds");
+
+        let scope = run_capture(CaptureSettings::default(), request, trace.clone(), false).await;
+
+        assert!(
+            !trace.entries().contains(&"body-polled"),
+            "nothing may read a body the handler ignored, got {:?}",
+            trace.entries()
+        );
+        assert!(matches!(scope.captured_body(), CapturedBody::Absent));
+        assert_eq!(
+            scope.body_note(),
+            Some(BODY_PARTIAL_NOTE),
+            "the capsule must say the body is incomplete rather than imply the \
+             request had none"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_body_over_the_cap_is_dropped_mid_stream() {
+        // No declared length, so the layer cannot skip up front: the cap has to
+        // hold while the frames arrive.
+        let trace = Trace::default();
+        let request = Request::post("/x")
+            .header(axum::http::header::TRANSFER_ENCODING, "chunked")
+            .body(Body::new(WatchedBody {
+                trace: trace.clone(),
+                chunks: vec![b"1234", b"5678", b"9012"],
+            }))
+            .expect("request builds");
+
+        let settings = CaptureSettings {
+            max_body_bytes: 6,
+            ..CaptureSettings::default()
+        };
+        let scope = run_capture(settings, request, trace, true).await;
+
+        assert!(
+            matches!(
+                scope.captured_body(),
+                CapturedBody::Skipped { declared_len: None }
+            ),
+            "a body that outgrows the cap mid-stream must be dropped, got {:?}",
+            scope.captured_body()
+        );
+        assert_eq!(scope.body_note(), Some(BODY_OVERFLOW_NOTE));
+    }
+
+    #[tokio::test]
+    async fn body_declared_over_the_cap_is_never_wrapped() {
+        let trace = Trace::default();
+        let request = Request::post("/x")
+            .header(axum::http::header::CONTENT_LENGTH, "4096")
+            .body(Body::new(WatchedBody {
+                trace: trace.clone(),
+                chunks: vec![b"1234"],
+            }))
+            .expect("request builds");
+
+        let settings = CaptureSettings {
+            max_body_bytes: 16,
+            ..CaptureSettings::default()
+        };
+        let scope = run_capture(settings, request, trace, true).await;
+
+        assert!(
+            matches!(
+                scope.captured_body(),
+                CapturedBody::Skipped {
+                    declared_len: Some(4096)
+                }
+            ),
+            "an oversized upload must be recorded as skipped, got {:?}",
+            scope.captured_body()
+        );
+        assert_eq!(
+            scope.body_note(),
+            None,
+            "skipping a declared-oversized body is the documented behaviour, \
+             not a degraded capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scope_closes_when_the_request_ends() {
+        // The scope outlives the request — the reporting layer writes the
+        // capsule from a detached task — so "closed" is what stops a pooled
+        // connection's next liveness ping from being recorded as something
+        // this request did.
+        let request = Request::get("/x")
+            .body(Body::empty())
+            .expect("request builds");
+        let scope = run_capture(CaptureSettings::default(), request, Trace::default(), false).await;
+
+        assert!(
+            scope.is_closed(),
+            "a finished request must stop accepting effects"
+        );
+        assert!(
+            scope_by_id(scope.id()).is_none(),
+            "and must no longer be reachable by a connection marker"
+        );
+    }
 
     #[test]
     fn scope_ids_are_bounded_and_charset_checked() {

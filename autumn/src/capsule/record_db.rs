@@ -609,8 +609,15 @@ impl ConnectionRecorder {
 
     /// Observe bytes the client wrote.
     /// The scope this connection is attributed to, if it is still alive.
+    /// A closed scope is deliberately treated as absent: the request is over,
+    /// its capsule is being written, and the next thing this connection does
+    /// (the pool's liveness ping, before the next request's marker arrives) is
+    /// not part of what that request did.
     fn scope(&self) -> Option<Arc<CaptureScope>> {
-        self.bound.as_ref().and_then(Weak::upgrade)
+        self.bound
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .filter(|scope| !scope.is_closed())
     }
 
     fn on_frontend(&mut self, bytes: &[u8]) {

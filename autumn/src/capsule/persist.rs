@@ -7,6 +7,16 @@
 //! reader never sees a half-written file, and an oldest-first prune so an
 //! error storm cannot fill a disk.
 //!
+//! Retention deliberately errs towards keeping too much. `max_capsules` is
+//! clamped to at least one, pruning runs *before* the new capsule is written
+//! (so the capsule this request just produced can never be the one deleted to
+//! make room for it), and a capsule written within [`PRUNE_GRACE`] is spared
+//! even when it is over the cap — an error storm hands several capsules to
+//! reporters at once, and a path in an already-dispatched
+//! [`ErrorEvent`](crate::reporting::ErrorEvent) must still resolve when the
+//! reporter gets round to reading it. The cap is a disk-space guard, not a
+//! promise of an exact file count.
+//!
 //! Persistence is best-effort by construction. Every failure path logs and
 //! returns `None`: a capsule that cannot be written must never turn a 500 into
 //! a worse 500.
@@ -31,12 +41,24 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use chrono::Utc;
+use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::capsule::capture::CaptureScope;
+use crate::capsule::redact::RedactedValues;
 use crate::capsule::schema::{
     AppInfo, CAPSULE_FORMAT_VERSION, Capsule, CapsuleError, CapsuleOutcome,
 };
+
+/// How long a capsule is protected from retention pruning after it was
+/// written.
+///
+/// A capsule's path travels to reporters on
+/// [`ErrorEvent::capsule`](crate::reporting::ErrorEvent::capsule), and a
+/// reporter may be an HTTP call that takes seconds to get round to reading it.
+/// Deleting a capsule that recent to honour a count cap would turn the link
+/// into a dangling path — the one thing the ordering guarantee exists to
+/// prevent.
+const PRUNE_GRACE: TimeDelta = TimeDelta::minutes(1);
 
 /// Where a persisted capsule ended up.
 ///
@@ -75,6 +97,14 @@ pub fn persist(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<CapsuleR
     };
 
     let path = dir.join(file_name(&capsule));
+    // Make room *first*, so the capsule about to be written is not a candidate
+    // for the deletion that makes room for it, and a zero cap cannot mean
+    // "record the failure, then immediately throw it away".
+    prune(
+        &dir,
+        retained_before_write(settings.max_capsules),
+        Utc::now(),
+    );
     if let Err(error) = write_atomically(&dir, &path, &json) {
         tracing::error!(
             %error,
@@ -83,7 +113,6 @@ pub fn persist(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<CapsuleR
         );
         return None;
     }
-    prune(&dir, settings.max_capsules);
 
     Some(CapsuleRef {
         id: capsule.id,
@@ -97,7 +126,15 @@ pub fn persist(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<CapsuleR
 /// scope — there is nothing replayable to write.
 fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     let raw = scope.raw_request()?;
-    let (request, redacted) = crate::capsule::redact::redact_request(raw, scope.filter());
+    // The head was snapshotted when the request arrived; the body was copied
+    // as the handler read it, so it is only final now. A body the handler
+    // never finished reading is kept, with a note saying so.
+    let raw_body = scope.captured_body();
+    if let Some(note) = scope.body_note() {
+        scope.note(note);
+    }
+    let (request, redacted) =
+        crate::capsule::redact::redact_request(raw, &raw_body, scope.filter());
 
     let mut db = scope.db_snapshot();
     if let Some(db) = db.as_mut() {
@@ -125,12 +162,47 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
             profile: settings.profile.clone(),
         },
         request,
-        outcome,
+        outcome: scrub_outcome(outcome, &redacted),
         clock: scope.clock_readings(),
         db,
         truncated: scope.is_truncated(),
         notes: scope.notes(),
     })
+}
+
+/// Mask any redacted request value the failure quoted back at us.
+///
+/// Redaction removes a secret from the request record, but a handler that
+/// fails while talking about what it was given — `could not store
+/// password=hunter2`, or a panic payload carrying the submitted value — writes
+/// it straight back into the capsule through the outcome. The outcome is
+/// free-form text, so this is a substring replacement rather than the
+/// whole-value comparison bind masking uses.
+fn scrub_outcome(outcome: CapsuleOutcome, redacted: &RedactedValues) -> CapsuleOutcome {
+    use crate::capsule::redact::mask_echoes;
+
+    match outcome {
+        CapsuleOutcome::Status {
+            code,
+            message,
+            problem_type,
+        } => CapsuleOutcome::Status {
+            code,
+            message: mask_echoes(&message, redacted),
+            // A problem type is a stable URI naming a *class* of failure, not
+            // request content; masking it would only break the link.
+            problem_type,
+        },
+        CapsuleOutcome::Panic {
+            status,
+            payload,
+            backtrace,
+        } => CapsuleOutcome::Panic {
+            status,
+            payload: mask_echoes(&payload, redacted),
+            backtrace: backtrace.map(|frames| mask_echoes(&frames, redacted)),
+        },
+    }
 }
 
 /// Capsule file name: sortable timestamp, a process-local sequence number to
@@ -179,11 +251,29 @@ fn write_atomically(dir: &Path, path: &Path, json: &[u8]) -> std::io::Result<()>
     std::fs::rename(&temp, path)
 }
 
-/// Delete the oldest capsules beyond the retention cap.
+/// How many existing capsules may remain when a new one is about to be
+/// written, so that the directory settles at `max_capsules` afterwards.
+///
+/// `max_capsules` is user input and a zero would otherwise mean "capture the
+/// failure and delete it again", so it is clamped to at least one — retention
+/// tunes how much history to keep, it is not an off switch for capture.
+fn retained_before_write(max_capsules: usize) -> usize {
+    max_capsules.max(1).saturating_sub(1)
+}
+
+/// Delete the oldest capsules beyond `keep`, sparing anything written within
+/// [`PRUNE_GRACE`].
 ///
 /// File names begin with a sortable timestamp, so lexical order is
-/// chronological order.
-fn prune(dir: &Path, max_capsules: usize) {
+/// chronological order and the same prefix gives each file's age without a
+/// `stat` — and, more importantly, without trusting an mtime that a copy or a
+/// restore may have rewritten.
+///
+/// Sparing a recent file means the directory can sit *above* the cap for a
+/// grace window. That is the intended trade: the cap exists to stop an error
+/// storm filling a disk, and overshooting it by a minute's worth of capsules
+/// costs far less than breaking the path a reporter is about to follow.
+fn prune(dir: &Path, keep: usize, now: DateTime<Utc>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -192,12 +282,15 @@ fn prune(dir: &Path, max_capsules: usize) {
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .collect();
-    if names.len() <= max_capsules {
+    if names.len() <= keep {
         return;
     }
     names.sort();
-    let excess = names.len().saturating_sub(max_capsules);
+    let excess = names.len().saturating_sub(keep);
     for path in names.into_iter().take(excess) {
+        if written_within_grace(&path, now) {
+            continue;
+        }
         if let Err(error) = std::fs::remove_file(&path) {
             tracing::warn!(
                 %error,
@@ -206,6 +299,26 @@ fn prune(dir: &Path, max_capsules: usize) {
             );
         }
     }
+}
+
+/// Whether a capsule file's name says it was written less than
+/// [`PRUNE_GRACE`] ago.
+///
+/// A name this writer did not produce has no readable timestamp; it is not a
+/// capsule anyone is about to follow a link to, so it is left prunable rather
+/// than pinned in the directory forever.
+fn written_within_grace(path: &Path, now: DateTime<Utc>) -> bool {
+    let Some(stamp) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split('-').next())
+    else {
+        return false;
+    };
+    let Ok(written) = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S%.f") else {
+        return false;
+    };
+    now.signed_duration_since(written.and_utc()) < PRUNE_GRACE
 }
 
 /// Read a capsule back from disk.
@@ -229,6 +342,53 @@ mod tests {
             capsule_dir("tmp/autumn-capsules"),
             PathBuf::from("tmp/autumn-capsules")
         );
+    }
+
+    #[test]
+    fn retention_always_leaves_room_for_the_capsule_being_written() {
+        assert_eq!(
+            retained_before_write(0),
+            0,
+            "a zero cap still keeps the new one"
+        );
+        assert_eq!(retained_before_write(1), 0);
+        assert_eq!(retained_before_write(50), 49);
+    }
+
+    #[test]
+    fn file_age_comes_from_the_name_the_writer_stamped() {
+        let now = Utc::now();
+        let capsule = test_capsule();
+        let fresh = PathBuf::from(file_name(&capsule));
+        assert!(
+            written_within_grace(&fresh, now),
+            "a capsule stamped now is inside the grace window"
+        );
+
+        let old = PathBuf::from(file_name(&Capsule {
+            captured_at: now - TimeDelta::hours(1),
+            ..test_capsule()
+        }));
+        assert!(
+            !written_within_grace(&old, now),
+            "an hour-old capsule is prunable"
+        );
+
+        assert!(
+            !written_within_grace(Path::new("not-a-capsule.json"), now),
+            "a name this writer did not produce must not be pinned in the directory"
+        );
+    }
+
+    fn test_capsule() -> Capsule {
+        crate::capsule::schema::test_support::capsule(
+            crate::capsule::schema::test_support::request("GET", "/boom"),
+            CapsuleOutcome::Status {
+                code: 500,
+                message: "boom".to_owned(),
+                problem_type: None,
+            },
+        )
     }
 
     #[test]

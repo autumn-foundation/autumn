@@ -73,6 +73,24 @@ async fn echo_fail(body: String) -> Result<&'static str, autumn_web::AutumnError
     )))
 }
 
+/// Fails without ever extracting the body — the common shape of a handler that
+/// rejects a request before reading it.
+#[post("/ignore-body-fail")]
+async fn ignore_body_fail() -> Result<&'static str, autumn_web::AutumnError> {
+    Err(autumn_web::AutumnError::internal_server_error_msg(
+        "rejected before reading the body",
+    ))
+}
+
+/// Fails with the submitted payload quoted back in the error message — the way
+/// a real "could not store X" error usually reads.
+#[post("/store-secret")]
+async fn store_secret(body: String) -> Result<&'static str, autumn_web::AutumnError> {
+    Err(autumn_web::AutumnError::internal_server_error_msg(format!(
+        "could not store {body}"
+    )))
+}
+
 // ── Harness ─────────────────────────────────────────────────────────────────
 
 /// A test config with capture pointed at `dir`.
@@ -111,6 +129,31 @@ async fn await_capsules(dir: &Path, expected: usize) -> Vec<PathBuf> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     capsule_paths(dir)
+}
+
+/// Drop a placeholder capsule file into `dir` whose name carries a timestamp
+/// `age_secs` in the past.
+///
+/// Pruning reads a file's age from the timestamp prefix the writer puts in the
+/// name, so a seeded name is all it takes to make a file look old — no clock
+/// mocking, no `filetime`.
+fn write_aged_capsule(dir: &Path, age_secs: i64, sequence: u32) -> PathBuf {
+    let stamp =
+        (chrono::Utc::now() - chrono::Duration::seconds(age_secs)).format("%Y%m%dT%H%M%S%.6f");
+    let path = dir.join(format!("{stamp}-{sequence:06}-seeded.json"));
+    std::fs::write(&path, b"{}").expect("seeded capsule writes");
+    path
+}
+
+/// Poll until `settled` holds; capsules are written (and pruned) on a detached
+/// task, so a directory's final shape only arrives after the response does.
+async fn await_settled(settled: impl Fn() -> bool) {
+    for _ in 0..100 {
+        if settled() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn read_capsule(path: &Path) -> Capsule {
@@ -357,24 +400,162 @@ async fn capsule_body_is_bounded() {
 }
 
 #[tokio::test]
+async fn handler_that_never_reads_the_body_still_gets_a_capsule() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = TestApp::new()
+        .config(capture_config(dir.path()))
+        .routes(routes![ignore_body_fail])
+        .build();
+
+    client
+        .post("/ignore-body-fail")
+        .body("payload the handler never looks at")
+        .send()
+        .await
+        .assert_status(500);
+
+    let paths = await_capsules(dir.path(), 1).await;
+    assert_eq!(paths.len(), 1, "an unread body must not cost the capsule");
+    let capsule = read_capsule(&paths[0]);
+
+    assert_eq!(capsule.request.method, "POST");
+    assert_eq!(capsule.request.uri, "/ignore-body-fail");
+    match capsule.outcome {
+        CapsuleOutcome::Status { code, .. } => assert_eq!(code, 500),
+        outcome @ CapsuleOutcome::Panic { .. } => panic!("expected a 500, got {outcome:?}"),
+    }
+    // Body capture is a tee off the handler's own read, so a handler that never
+    // reads gives the capsule nothing — which the capsule has to say out loud
+    // rather than pass off as "the request had no body".
+    assert!(
+        matches!(
+            capsule.request.body,
+            CapsuleBody::Absent | CapsuleBody::Text(_)
+        ),
+        "got {:?}",
+        capsule.request.body
+    );
+    assert!(
+        capsule.notes.iter().any(|note| note.contains("body")),
+        "an incomplete body must be flagged in the capsule notes, got {:?}",
+        capsule.notes
+    );
+}
+
+#[tokio::test]
+async fn outcome_does_not_echo_a_redacted_request_value() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = TestApp::new()
+        .config(capture_config(dir.path()))
+        .routes(routes![store_secret])
+        .build();
+
+    client
+        .post("/store-secret")
+        .form("email=ada&password=hunter2secret")
+        .send()
+        .await
+        .assert_status(500);
+
+    let paths = await_capsules(dir.path(), 1).await;
+    let capsule = read_capsule(&paths[0]);
+    let CapsuleOutcome::Status { message, .. } = &capsule.outcome else {
+        panic!("expected a 500, got {:?}", capsule.outcome);
+    };
+    assert!(
+        !message.contains("hunter2secret"),
+        "the outcome must not smuggle back a value redaction removed from the \
+         request body, got {message}"
+    );
+    assert!(
+        message.contains("[FILTERED]"),
+        "the echoed value must be replaced by the placeholder, got {message}"
+    );
+
+    let whole = std::fs::read_to_string(&paths[0]).expect("capsule readable");
+    assert!(
+        !whole.contains("hunter2secret"),
+        "no part of the capsule may contain the redacted value"
+    );
+}
+
+#[tokio::test]
 async fn max_capsules_prunes_oldest() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = capture_config(dir.path());
     config.failure_capture.max_capsules = 2;
     let client = TestApp::new().config(config).routes(routes![fail]).build();
 
-    for _ in 0..5 {
-        client.get("/fail").send().await.assert_status(500);
-        // Serialize the writes so "oldest" is unambiguous.
-        tokio::time::sleep(Duration::from_millis(30)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Seeded with names old enough to be outside the prune grace window, so
+    // "oldest" is unambiguous and pruning is free to act on them.
+    let oldest = write_aged_capsule(dir.path(), 3 * 3600, 0);
+    let middle = write_aged_capsule(dir.path(), 2 * 3600, 1);
+    let newest_seed = write_aged_capsule(dir.path(), 3600, 2);
 
+    client.get("/fail").send().await.assert_status(500);
+    await_settled(|| !middle.exists()).await;
     let paths = capsule_paths(dir.path());
+
+    assert!(!oldest.exists(), "the oldest capsule must be pruned first");
+    assert!(
+        !middle.exists(),
+        "retention must prune down to max_capsules"
+    );
+    assert!(
+        newest_seed.exists(),
+        "pruning stops at the cap; the newest retained capsule must survive"
+    );
     assert_eq!(
         paths.len(),
         2,
-        "retention must prune down to max_capsules, found {paths:?}"
+        "retention must leave exactly max_capsules, found {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn max_capsules_zero_still_keeps_the_new_capsule() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = capture_config(dir.path());
+    // Nonsensical, but configuration is user input: a zero cap must not mean
+    // "record the failure and immediately delete it".
+    config.failure_capture.max_capsules = 0;
+    let client = TestApp::new().config(config).routes(routes![fail]).build();
+
+    client.get("/fail").send().await.assert_status(500);
+
+    let paths = await_capsules(dir.path(), 1).await;
+    assert_eq!(
+        paths.len(),
+        1,
+        "max_capsules is clamped to at least one, found {paths:?}"
+    );
+    assert_eq!(read_capsule(&paths[0]).request.uri, "/fail");
+}
+
+#[tokio::test]
+async fn prune_spares_recent_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = capture_config(dir.path());
+    config.failure_capture.max_capsules = 1;
+    let client = TestApp::new().config(config).routes(routes![fail]).build();
+
+    let ancient = write_aged_capsule(dir.path(), 24 * 3600, 0);
+
+    client.get("/fail").send().await.assert_status(500);
+    await_settled(|| !ancient.exists() && capsule_paths(dir.path()).len() == 1).await;
+    client.get("/fail").send().await.assert_status(500);
+    await_settled(|| capsule_paths(dir.path()).len() == 2).await;
+    let paths = capsule_paths(dir.path());
+
+    assert!(
+        !ancient.exists(),
+        "an aged capsule beyond the cap must be pruned"
+    );
+    assert_eq!(
+        paths.len(),
+        2,
+        "a capsule written seconds ago may still be on its way to a reporter, \
+         so retention overshoots rather than deleting it, found {paths:?}"
     );
 }
 
