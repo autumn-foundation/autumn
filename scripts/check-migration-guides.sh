@@ -213,6 +213,29 @@ function expand_tabs(text,   out, i, n, ch, col) {
   return out
 }
 
+function is_empty_list_item(text,   body, ch, n) {
+  # A bare `-` renders as an empty `<li>`: a marker with nothing after it
+  # carries no words, so it cannot populate a required section on its own.
+  #
+  # The marker is re-read here rather than reused from list_marker_width,
+  # which requires whitespace after the marker and so does not recognise the
+  # empty item at all — the very shape this has to catch.
+  body = block_body(text)
+  sub(/[[:space:]]+$/, "", body)
+  ch = substr(body, 1, 1)
+  if (ch == "-" || ch == "*" || ch == "+") {
+    n = 1
+  } else {
+    n = 0
+    while (substr(body, n + 1, 1) ~ /^[0-9]$/) n++
+    if (n == 0) return 0
+    ch = substr(body, n + 1, 1)
+    if (ch != "." && ch != ")") return 0
+    n++
+  }
+  return substr(body, n + 1) ~ /^[[:space:]]*$/
+}
+
 function is_thematic_break(text,   body, ch, n, i, c) {
   # Three or more `-`, `*` or `_`, spaces permitted between them and nothing
   # else on the line. It ends the block before it, list item included.
@@ -883,7 +906,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # anything — `<div>example` opens a block just as `<div>` does. The list is
   # what keeps this narrow: any-tag-name would swallow `Vec<Route>` and
   # `<MyWidget>` in prose along with the entries the lint reads there.
-  if (tolower(body) ~ /^<\/?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)([[:space:]>]|\/|$)/) {
+  if (tolower(body) ~ /^<\/?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)([[:space:]>]|\/>|$)/) {
     md_in_html_block = 1
     md_html_type = 6
     md_paragraph_open = 0
@@ -1628,7 +1651,7 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             # The destination, alone on the line below its opener.
             pending_title = 0
           } else if (strip_inline_tags(visible) ~ /[^[:space:]]/ &&
-                     !is_thematic_break(visible)) {
+                     !is_thematic_break(visible) && !is_empty_list_item(visible)) {
             pending_title = 0
             for (lvl = 1; lvl <= 6; lvl++) {
               if (open_heading[lvl] != "") content[open_heading[lvl]] = 1

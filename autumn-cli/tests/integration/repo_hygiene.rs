@@ -6483,3 +6483,103 @@ fn migration_guide_gate_still_reads_a_comment_beside_a_link() {
         gate_report(&output),
     );
 }
+
+// --- Review round 52: `/>` as a unit, empty list items --------------------
+
+#[test]
+fn migration_guide_gate_requires_a_closing_slash_bracket_to_open_type_six() {
+    // A type-6 opener ends in whitespace, `>`, `/>` or end of line. A bare
+    // slash is none of those, so `<div/not-a-tag` renders as a paragraph and
+    // the bullet below it is a real entry — accepting `/` alone swallowed it.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         <div/not-a-tag\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a bare slash does not open a block, so the entry is visible",
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_opens_type_six_on_a_self_closing_tag() {
+    // The counterpart: `<div/>` *is* an opener, so the entry beneath it is
+    // literal and supplies nothing.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+         <div/>\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "`<div/>` opens a block and the link inside it is literal",
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_count_an_empty_list_item_as_content() {
+    // A bare `-` renders as an empty `<li>` and carries no instructions, so a
+    // required section holding only one is a stub.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace("Why this release breaks.", "-");
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an empty bullet is not migration guidance\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_counts_a_bullet_that_carries_words() {
+    // The counterpart: a bullet with content is content. Excluding empty ones
+    // must not exclude the ordinary case, which is how guides are written.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace(
+        "Why this release breaks.",
+        "- The repository trait changed.",
+    );
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a bullet with words in it is content\n{}",
+        gate_report(&output),
+    );
+}
