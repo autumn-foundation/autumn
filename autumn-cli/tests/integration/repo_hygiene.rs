@@ -5675,3 +5675,57 @@ fn migration_guide_gate_accepts_a_nested_index_entry() {
         gate_report(&output),
     );
 }
+
+// --- Review round 42: prose after a list is still an entry ----------------
+
+#[test]
+fn migration_guide_gate_counts_breaking_prose_that_follows_a_list() {
+    // Holding prose until the section ends was meant to spare an *introduction*
+    // to a list. Prose that comes after the list introduces nothing — it is a
+    // second declaration, and discarding it let a break ship with no link.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Breaking Changes\n\n\
+         - **db:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n\n\
+         The `page` trait method is also gone, with no link of its own.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "prose after the list is a declaration, not an introduction\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_counts_a_linked_declaration_after_a_list() {
+    // And it has to be satisfiable: the same paragraph carrying its own link
+    // passes, so the rule adds a check rather than an unavoidable failure.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Breaking Changes\n\n\
+         - **db:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n\n\
+         The `page` trait method is also gone. See the\n\
+         [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a linked declaration after the list is covered\n{}",
+        gate_report(&output),
+    );
+}

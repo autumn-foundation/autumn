@@ -922,10 +922,9 @@ findings="$(
   function release_held(   i) {
     # Called at every heading and at EOF: the section is over, so it is now
     # known whether the prose was introducing a list or standing in for one.
-    if (!section_has_list) {
-      for (i = 0; i < held_n; i++) {
-        printf "BREAKING\t%s\t%d\t%d\t%s\n", held_section, held_line[i], held_link[i], held_guide
-      }
+    for (i = 0; i < held_n; i++) {
+      if (section_has_list && !held_after_list[i]) continue
+      printf "BREAKING\t%s\t%d\t%d\t%s\n", held_section, held_line[i], held_link[i], held_guide
     }
     held_n = 0
     section_has_list = 0
@@ -993,6 +992,10 @@ findings="$(
         held_guide = guide_path
         held_line[held_n] = entry_line
         held_link[held_n] = has_link
+        # Only prose *before* the first list in a section can be introducing
+        # it. After the list there is nothing left to introduce, so such a
+        # paragraph is a second declaration and is checked like any other.
+        held_after_list[held_n] = section_has_list
         held_n++
       } else {
         if (entry_is_paragraph == 0) section_has_list = 1
@@ -1125,15 +1128,14 @@ findings="$(
   # rule and still demand no guide, because nothing was ever counted as an
   # entry. Scoped to the explicit inline marker: a bare paragraph under a
   # `### Breaking Changes` heading is usually the intro to the list below it.
-  # Any ordinary paragraph is a candidate. flush_entry decides what it is: the
-  # marker makes it a declaration, the word "breaking" without one makes it an
-  # unmarked break, and prose with neither produces nothing at all. Restricting
-  # this to marked prose meant the lint never saw a paragraph, so a break
-  # described in prose was invisible to every check.
-  #
-  # Block quotes stay out: they carry this changelog\047s section notes, which
-  # are asides rather than entries.
-  entry == "" && block_body(visible) ~ /[^[:space:]]/ && block_body(visible) !~ /^[> ]/ {
+  function paragraph_entry_candidate(vis) {
+    # Ordinary prose: not blank, not a quoted aside, not indented code. Under a
+    # breaking heading the heading declares for it; otherwise it needs the
+    # inline marker, and either way flush_entry still runs the unmarked lint.
+    return (block_body(vis) ~ /[^[:space:]]/ && block_body(vis) !~ /^[> ]/)
+  }
+
+  function start_paragraph_entry() {
     entry_line = FNR
     entry_breaking_heading = breaking_heading
     entry = $0
@@ -1143,9 +1145,20 @@ findings="$(
     item_content_indent = 0
     entry_paragraph_open = 1
     entry_is_paragraph = 1
-    next
   }
 
+  # Any ordinary paragraph is a candidate. flush_entry decides what it is: the
+  # marker makes it a declaration, the word "breaking" without one makes it an
+  # unmarked break, and prose with neither produces nothing at all. Restricting
+  # this to marked prose meant the lint never saw a paragraph, so a break
+  # described in prose was invisible to every check.
+  #
+  # Block quotes stay out: they carry this changelog\047s section notes, which
+  # are asides rather than entries.
+  entry == "" && paragraph_entry_candidate(visible) {
+    start_paragraph_entry()
+    next
+  }
   {
     # A paragraph entry ends at the blank line that ends the paragraph. A list
     # item has its content column to bound it; this one does not.
@@ -1157,6 +1170,13 @@ findings="$(
       if (visible ~ /[^[:space:]]/ && leading_spaces(visible) < entry_content_indent &&
           entry_paragraph_open == 0) {
         flush_entry()
+        # This line ended the item, so it is a block of its own — and the
+        # paragraph rule above already ran, while the item was still open. A
+        # declaration written after a list would otherwise be dropped outright.
+        if (paragraph_entry_candidate(visible)) {
+          start_paragraph_entry()
+          next
+        }
       } else {
         # A nested bullet opens an item of its own; blocks after it are
         # measured from *its* content column, not the outer one.
