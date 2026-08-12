@@ -91,12 +91,18 @@ pub struct RedactedValues(BTreeSet<Vec<u8>>);
 
 impl RedactedValues {
     /// Record a value that was masked out of the request.
+    ///
+    /// Every masked value is kept, however short. The length floor lives in
+    /// [`mask_echoes`] alone, where it earns its keep: masking a three-letter
+    /// value *inside* free-form prose would shred unrelated words. Bind masking
+    /// compares whole values, so there is nothing to shred — and a three-digit
+    /// CVV or a short PIN the filter removed from the request must not travel
+    /// on in the tape simply for being short.
     pub fn insert(&mut self, value: &[u8]) {
-        // A one- or two-byte "secret" would mask half the binds in the tape for
-        // no security benefit, so only substantial values participate.
-        if value.len() >= MIN_ECHO_LEN {
-            self.0.insert(value.to_vec());
+        if value.is_empty() {
+            return;
         }
+        self.0.insert(value.to_vec());
     }
 
     /// Whether these bytes were masked out of the request.
@@ -122,7 +128,8 @@ impl RedactedValues {
     }
 }
 
-/// Shortest value worth echo-matching against bind parameters.
+/// Shortest value worth looking for *inside* free-form text (see
+/// [`mask_echoes`]); whole-value bind masking has no such floor.
 const MIN_ECHO_LEN: usize = 4;
 
 /// Build the capsule's request record, masking every sensitive value.
@@ -174,7 +181,8 @@ pub fn redact_request(
 /// panics with the submitted value in its payload — would otherwise write back
 /// out, in the capsule's outcome, exactly what redaction removed from the
 /// request. Same minimum-length rule as the rest of the echo set, so short
-/// values cannot shred unrelated prose.
+/// values cannot shred unrelated prose — a floor that applies here and nowhere
+/// else.
 #[must_use]
 pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
     if redacted.is_empty() || text.is_empty() {
@@ -306,6 +314,11 @@ const UNPARSEABLE_BODY_KEY: &str = "body:<unparseable>";
 const UNPARSEABLE_JSON_NOTE: &str = "request body declared a JSON content type but did not parse as JSON; it was masked out of \
      the capsule rather than copied verbatim, because there are no keys to redact on";
 
+/// Note recorded when a body declared a multipart form.
+const MULTIPART_BODY_NOTE: &str = "request body declared a multipart content type, which this slice does not parse; it was \
+     masked out of the capsule rather than copied verbatim, because its fields (and any uploaded \
+     file) cannot be redacted without parsing them";
+
 /// Note recorded when a body declared a urlencoded form but did not parse as
 /// one.
 const UNPARSEABLE_FORM_NOTE: &str = "request body declared a urlencoded form but did not parse as one; it was masked out of the \
@@ -373,6 +386,16 @@ fn redact_body(
             }
         }
         return CapsuleBody::Text(serializer.finish());
+    }
+
+    // A multipart body *has* key structure — a file upload's form fields are
+    // exactly the kind of thing `filter_parameters` names — but this slice does
+    // not parse multipart, and copying it verbatim would write every part
+    // through unredacted, password field and uploaded file alike. Skip it: the
+    // capsule records the length and says why, rather than becoming the one
+    // place a submitted secret survives in the clear.
+    if content_type.starts_with("multipart/") || content_type.contains("multipart/form-data") {
+        return unparseable_body(bytes, MULTIPART_BODY_NOTE, keys, notes);
     }
 
     // Anything else has no key structure to match on, so it is copied
@@ -548,6 +571,74 @@ mod tests {
                 || panic!("header {name} must be present in the capsule"),
                 |(_, value)| value.as_str(),
             )
+    }
+
+    /// A multipart body is the one shape that carries both form fields and
+    /// file contents, and this slice cannot parse it — so it must never be
+    /// copied. Copying it verbatim made the capsule the one place a submitted
+    /// password survived unmasked.
+    #[test]
+    fn a_multipart_body_is_never_copied_into_the_capsule() {
+        let body = "--X\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n\
+                    hunter2-in-the-clear\r\n--X--\r\n";
+        let (request, _values, notes) = redact_with_notes(
+            Request::post("/upload")
+                .header(header::CONTENT_TYPE, "multipart/form-data; boundary=X"),
+            CapturedBody::Buffered(Bytes::from_static(body.as_bytes())),
+            &filter_with(&[]),
+        );
+
+        match &request.body {
+            CapsuleBody::Skipped { declared_len } => {
+                assert_eq!(*declared_len, Some(body.len()));
+            }
+            other => panic!("a multipart body must be skipped, got {other:?}"),
+        }
+        let rendered = serde_json::to_string(&request).expect("request serializes");
+        assert!(
+            !rendered.contains("hunter2-in-the-clear") && !rendered.contains("password"),
+            "no part of a multipart body may reach the capsule: {rendered}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("multipart")),
+            "the capsule must say why the body is missing, got {notes:?}"
+        );
+    }
+
+    /// The echo set has no length floor: a three-character CVV the filter
+    /// removed from the request must not travel on in the tape. The floor
+    /// belongs to substring masking of prose, and to nothing else.
+    #[test]
+    fn a_short_masked_value_still_masks_its_bind() {
+        let (_request, values) = redact(
+            Request::post("/pay").header(header::CONTENT_TYPE, "application/json"),
+            CapturedBody::Buffered(Bytes::from_static(b"{\"cvv\":\"123\",\"amount\":10}")),
+            &filter_with(&["cvv"]),
+        );
+
+        let mut binds = vec![
+            BindValue::Value(b"123".to_vec()),
+            BindValue::Value(b"10".to_vec()),
+        ];
+        mask_binds(&mut binds, &values);
+        assert_eq!(
+            binds.first(),
+            Some(&BindValue::Masked),
+            "a short value the filter removed must still be masked out of the binds"
+        );
+        assert_eq!(
+            binds.get(1),
+            Some(&BindValue::Value(b"10".to_vec())),
+            "unrelated binds are untouched"
+        );
+
+        // …but short values are still not hunted for inside free-form prose,
+        // where they would shred unrelated words.
+        assert_eq!(
+            mask_echoes("the 123rd attempt", &values),
+            "the 123rd attempt",
+            "substring masking keeps its length floor"
+        );
     }
 
     #[test]

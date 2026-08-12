@@ -69,7 +69,9 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::capsule::replay::{Divergence, DivergenceKind, DivergenceLog, TapeProgress};
 use crate::capsule::schema::{BindValue, Capsule, ConnectionTape, Exchange};
-use crate::capsule::wire::{FrameSplitter, FrontendMessage, build, is_catalog_sql, parse_frontend};
+use crate::capsule::wire::{
+    self, FrameSplitter, FrontendMessage, build, is_catalog_sql, parse_frontend,
+};
 use crate::db::PoolError;
 
 /// `SQLSTATE` reported to the client when the tape cannot answer a statement.
@@ -89,6 +91,14 @@ const DUPLEX_CAPACITY: usize = 64 * 1024;
 /// Read chunk size for the frontend half.
 const READ_CHUNK: usize = 8 * 1024;
 
+/// How long a replayed checkout waits for a pool slot before failing.
+///
+/// Nothing here dials a socket, so any wait at all means the replayed code is
+/// holding more connections at once than the recording did. A bounded wait
+/// turns that into a reported divergence; an unbounded one (deadpool's default)
+/// turns it into a hung `autumn replay`.
+const REPLAY_CHECKOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Placeholder connection URL. Never dialled — [`pool_from_capsule`] replaces
 /// the manager's establish step wholesale, and the port is one nothing can
 /// bind, so a regression that *did* dial would fail loudly.
@@ -104,21 +114,23 @@ fn close_complete() -> Vec<u8> {
 /// checkout. They are answered synthetically rather than from the tape: the
 /// recording's values (a statement timeout, a capsule id) are not the values
 /// this run uses, and neither carries application meaning.
+///
+/// Deliberately the recorder's own predicate
+/// ([`wire::is_session_housekeeping`]), not a second spelling of it: a
+/// statement the recorder classifies as housekeeping is *absent* from the tape,
+/// so a stub that disagreed would answer it from the tape it is not on. That
+/// includes the empty batch, which is housekeeping to neither: an empty simple
+/// `Query` gets its own `EmptyQueryResponse` (see [`StubServer::simple_query`])
+/// rather than being acknowledged as a `SET` nobody sent.
 fn is_housekeeping(sql: &str) -> bool {
-    split_statements(sql).iter().all(|statement| {
-        let upper = statement.trim().to_ascii_uppercase();
-        upper.starts_with("SET TIME ZONE")
-            || upper.starts_with("SET CLIENT_ENCODING")
-            || upper.starts_with("SET STATEMENT_TIMEOUT")
-            || upper.starts_with("SET AUTUMN.CAPSULE_REQUEST")
-    })
+    wire::is_session_housekeeping(sql)
 }
 
-/// Split a possibly multi-statement simple-protocol query on `;`, dropping
-/// empty fragments. Good enough for the housekeeping check, which only ever
-/// sees framework-generated SQL.
+/// Split a possibly multi-statement simple-protocol query at top-level `;`,
+/// dropping empty fragments — the quote-aware split the recorder uses.
 fn split_statements(sql: &str) -> Vec<&str> {
-    sql.split(';')
+    wire::split_statements(sql)
+        .into_iter()
         .map(str::trim)
         .filter(|statement| !statement.is_empty())
         .collect()
@@ -277,6 +289,15 @@ impl StubServer {
     /// Simple-protocol `Query` — one statement (or a `;`-joined batch),
     /// answered as one blob up to `ReadyForQuery` (F8).
     fn simple_query(&self, sql: &str) -> Vec<u8> {
+        if split_statements(sql).is_empty() {
+            // A blank simple `Query` is not housekeeping and not on any tape:
+            // a real backend answers it with `EmptyQueryResponse`, and that is
+            // what the driver is waiting for. Acknowledging it as a `SET`
+            // would put a `CommandComplete` on the wire that never happened.
+            let mut reply = build::empty_query_response();
+            reply.extend_from_slice(&build::ready_for_query(b'I'));
+            return reply;
+        }
         if is_housekeeping(sql) {
             let mut reply = Vec::new();
             for _ in split_statements(sql) {
@@ -298,6 +319,7 @@ impl StubServer {
         let mut describe_sql = None;
         let mut has_describe = false;
         let mut has_execute = false;
+        let mut unknown_statement: Option<String> = None;
 
         for message in batch {
             match message {
@@ -310,7 +332,17 @@ impl StubServer {
                     statement,
                     params,
                 } => {
-                    let sql = self.statements.get(statement).cloned().unwrap_or_default();
+                    // A `Bind` naming a statement this connection never
+                    // `Parse`d is not something the tape can answer. Treating
+                    // the missing SQL as the empty string used to make the
+                    // batch look like housekeeping (`is_housekeeping("")` was
+                    // true) and it was acknowledged as a `SET` — the client
+                    // then decoded whatever came next against a statement the
+                    // stub had never resolved.
+                    let Some(sql) = self.statements.get(statement).cloned() else {
+                        unknown_statement = Some(statement.clone());
+                        continue;
+                    };
                     self.portals.insert(portal.clone(), sql.clone());
                     bind = Some((sql, params.clone()));
                 }
@@ -325,6 +357,17 @@ impl StubServer {
                 FrontendMessage::Execute => has_execute = true,
                 _ => {}
             }
+        }
+
+        if let Some(name) = unknown_statement {
+            return self.diverge(self.divergence(
+                DivergenceKind::UnknownStatement,
+                None,
+                "",
+                format!(
+                    "the code bound prepared statement {name:?}, which this connection never                      parsed during the replay; the capsule cannot say what it was"
+                ),
+            ));
         }
 
         let sql = bind
@@ -391,10 +434,43 @@ impl StubServer {
 
     /// Answer a `Bind`/`Execute` (or a simple `Query`) from the tape.
     ///
+    /// The **ordered cursor is consulted first**, and the keyed buckets
+    /// (`prologue`, `catalog`) only answer statements the cursor is not
+    /// expecting. The other way round, any statement that appears in both — a
+    /// `BEGIN` in the connection's prologue and again as the request's own
+    /// first exchange is the ordinary case — would be answered from the keyed
+    /// bucket without advancing the cursor, and the tape would then be one
+    /// behind for the rest of the run: an `SqlMismatch` on the next statement
+    /// and `UnconsumedExchanges` at the end, on a capsule that recorded
+    /// everything perfectly.
+    ///
     /// Takes `&self`: the tape cursor moved into the shared [`TapeProgress`],
     /// which the driver reads after the run, so advancing it no longer needs
     /// exclusive access to the server.
     fn resolve_execute(&self, sql: &str, params: &[Option<Vec<u8>>]) -> Resolution {
+        let expected = self.tape.exchanges.get(self.progress.consumed());
+        if let Some(expected) = expected.filter(|expected| expected.sql == sql) {
+            if !binds_match(&expected.binds, params) {
+                let expected_binds = describe_binds(&expected.binds);
+                let actual_binds = describe_params(params);
+                let expected_sql = expected.sql.clone();
+                return Resolution::Diverged(self.divergence(
+                    DivergenceKind::BindMismatch,
+                    Some(expected_sql),
+                    sql,
+                    format!(
+                        "{sql:?} was recorded with binds {expected_binds} but the code bound \
+                         {actual_binds}"
+                    ),
+                ));
+            }
+            let response = expected.response.clone();
+            self.progress.advance();
+            return Resolution::Recorded(response);
+        }
+
+        // Not what the tape expects next: it may still be something the
+        // connection had already done before the request began.
         if let Some(exchange) = find_by_sql(&self.tape.prologue, sql) {
             return Resolution::Recorded(exchange.response.clone());
         }
@@ -407,7 +483,7 @@ impl StubServer {
             return Resolution::Recorded(exchange.response.clone());
         }
 
-        let Some(expected) = self.tape.exchanges.get(self.progress.consumed()) else {
+        let Some(expected) = expected else {
             // A driver catalog probe is never an *ordering* problem: it is a
             // type-info lookup the recorded connection's cache already had, so
             // it is reported as unrecorded with the F4 hint rather than as a
@@ -432,42 +508,21 @@ impl StubServer {
             ));
         };
 
-        if expected.sql != sql {
-            let kind = if self.tape_mentions(sql) {
-                DivergenceKind::SqlMismatch
-            } else {
-                DivergenceKind::UnrecordedQuery
-            };
-            let expected_sql = expected.sql.clone();
-            let detail = if kind == DivergenceKind::SqlMismatch {
-                format!(
-                    "the tape expected {expected_sql:?} next but the code sent {sql:?}; the \
-                     statements have been reordered since the recording"
-                )
-            } else {
-                unrecorded_detail(sql)
-            };
-            return Resolution::Diverged(self.divergence(kind, Some(expected_sql), sql, detail));
-        }
-
-        if !binds_match(&expected.binds, params) {
-            let expected_binds = describe_binds(&expected.binds);
-            let actual_binds = describe_params(params);
-            let expected_sql = expected.sql.clone();
-            return Resolution::Diverged(self.divergence(
-                DivergenceKind::BindMismatch,
-                Some(expected_sql),
-                sql,
-                format!(
-                    "{sql:?} was recorded with binds {expected_binds} but the code bound \
-                     {actual_binds}"
-                ),
-            ));
-        }
-
-        let response = expected.response.clone();
-        self.progress.advance();
-        Resolution::Recorded(response)
+        let kind = if self.tape_mentions(sql) {
+            DivergenceKind::SqlMismatch
+        } else {
+            DivergenceKind::UnrecordedQuery
+        };
+        let expected_sql = expected.sql.clone();
+        let detail = if kind == DivergenceKind::SqlMismatch {
+            format!(
+                "the tape expected {expected_sql:?} next but the code sent {sql:?}; the \
+                 statements have been reordered since the recording"
+            )
+        } else {
+            unrecorded_detail(sql)
+        };
+        Resolution::Diverged(self.divergence(kind, Some(expected_sql), sql, detail))
     }
 
     /// Whether the tape mentions this SQL anywhere at all.
@@ -536,7 +591,7 @@ fn synthesize(batch: &[FrontendMessage], command_tag: Option<&str>) -> Vec<u8> {
             FrontendMessage::Execute => {
                 reply.extend_from_slice(&build::command_complete(command_tag.unwrap_or("SET")));
             }
-            FrontendMessage::Close => reply.extend_from_slice(&close_complete()),
+            FrontendMessage::Close { .. } => reply.extend_from_slice(&close_complete()),
             FrontendMessage::Sync => reply.extend_from_slice(&build::ready_for_query(b'I')),
             _ => {}
         }
@@ -629,8 +684,8 @@ fn hex_preview(bytes: &[u8]) -> String {
 
 /// Build a connection pool that serves `capsule`'s recorded database traffic.
 ///
-/// The pool is sized to the number of connections the capsule recorded (at
-/// least one), and each connection the pool establishes claims the next
+/// The pool is sized one slot *above* the number of connections the capsule
+/// recorded, and each connection the pool establishes claims the next
 /// unclaimed tape. This is why
 /// [`DbBuffer`](crate::capsule::DbBuffer) records tapes in the order the
 /// request *first used* each connection rather than by connection id: the
@@ -638,7 +693,14 @@ fn hex_preview(bytes: &[u8]) -> String {
 /// other ordering swaps the tapes and diverges on traffic that was recorded
 /// perfectly. A request that opens *more* connections than the recording did
 /// gets an empty tape, on which every statement is a divergence — the honest
-/// answer, since nothing was recorded for it (F12).
+/// answer, since nothing was recorded for it (F12). That path is only
+/// reachable because of the spare slot and the wait timeout below: sized to the
+/// recording exactly and with deadpool's default (unbounded) wait, a replayed
+/// handler that held two connections at once would block forever on the second
+/// checkout and `autumn replay` would hang instead of reporting the
+/// divergence. Oversubscription past the spare slot fails the checkout after
+/// [`REPLAY_CHECKOUT_TIMEOUT`], which the handler surfaces as an error and the
+/// verdict as a mismatch.
 ///
 /// Recycling is set to [`RecyclingMethod::Fast`] so returning a connection to
 /// the pool does not issue a `SELECT 1` ping the tape never recorded.
@@ -663,7 +725,9 @@ pub fn pool_from_capsule(
             .map(|db| db.connections.clone())
             .unwrap_or_default(),
     );
-    let max_size = tapes.len().max(1);
+    // One spare slot beyond the recording: see the note above on why replay
+    // must never be able to block on its own pool.
+    let max_size = tapes.len().saturating_add(1);
     let next_tape = Arc::new(AtomicUsize::new(0));
     let progress: Arc<Vec<Arc<TapeProgress>>> = Arc::new(
         tapes
@@ -721,6 +785,8 @@ pub fn pool_from_capsule(
         AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(REPLAY_URL, config);
     Ok(Pool::builder(manager)
         .max_size(max_size)
+        .wait_timeout(Some(REPLAY_CHECKOUT_TIMEOUT))
+        .create_timeout(Some(REPLAY_CHECKOUT_TIMEOUT))
         .runtime(deadpool::Runtime::Tokio1)
         .build()?)
 }
@@ -833,6 +899,148 @@ mod tests {
         assert!(
             log.unconsumed().is_empty(),
             "a fully replayed tape must leave nothing outstanding"
+        );
+    }
+
+    /// The ordered cursor is consulted before the keyed buckets. A statement
+    /// that appears in both — `BEGIN` in the connection prologue and again as
+    /// the request's own first exchange — would otherwise be answered from the
+    /// prologue without advancing the cursor, and the tape would be one behind
+    /// for the rest of the run: a mismatch and a pile of unconsumed exchanges
+    /// on a capsule that recorded everything perfectly.
+    #[test]
+    fn the_ordered_cursor_is_consulted_before_the_keyed_buckets() {
+        let tape = ConnectionTape {
+            id: 11,
+            prologue: vec![exchange("BEGIN", Vec::new())],
+            statements: Vec::new(),
+            catalog: Vec::new(),
+            exchanges: vec![
+                exchange("BEGIN", Vec::new()),
+                exchange("SELECT 1", Vec::new()),
+            ],
+        };
+        let log = Arc::new(DivergenceLog::new());
+        let server = StubServer::new(tape, Arc::clone(&log));
+
+        assert!(matches!(
+            server.resolve_execute("BEGIN", &[]),
+            Resolution::Recorded(_)
+        ));
+        assert_eq!(
+            server.progress.consumed(),
+            1,
+            "answering the exchange the tape expects must consume it, even when the same \
+             SQL is also in the prologue"
+        );
+        assert!(matches!(
+            server.resolve_execute("SELECT 1", &[]),
+            Resolution::Recorded(_)
+        ));
+        assert!(
+            log.unconsumed().is_empty(),
+            "the whole tape must be consumable: {:?}",
+            log.unconsumed()
+        );
+        assert!(
+            log.is_empty(),
+            "and nothing may diverge: {:?}",
+            log.entries()
+        );
+
+        // The prologue still answers a statement the cursor is *not* expecting.
+        assert!(matches!(
+            server.resolve_execute("BEGIN", &[]),
+            Resolution::Recorded(_)
+        ));
+    }
+
+    /// A `Bind` naming a statement the replay never parsed is a divergence, not
+    /// a synthesized `SET`: the empty SQL it used to fall back to looked like
+    /// housekeeping to the allowlist and was acknowledged as one.
+    #[test]
+    fn a_bind_for_an_unknown_statement_diverges() {
+        let log = Arc::new(DivergenceLog::new());
+        let mut server = StubServer::new(ConnectionTape::default(), Arc::clone(&log));
+        let reply = server.extended_batch(&[
+            FrontendMessage::Bind {
+                portal: String::new(),
+                statement: "s7".to_owned(),
+                params: Vec::new(),
+            },
+            FrontendMessage::Execute,
+            FrontendMessage::Sync,
+        ]);
+
+        assert_eq!(
+            log.entries().first().map(|entry| entry.kind),
+            Some(DivergenceKind::UnknownStatement),
+            "an unparsed statement name must be reported, got {:?}",
+            log.entries()
+        );
+        assert!(
+            reply.starts_with(b"E"),
+            "the client must get an ErrorResponse rather than a fabricated CommandComplete"
+        );
+    }
+
+    /// An empty simple `Query` is what a real backend answers with
+    /// `EmptyQueryResponse`. It is not housekeeping — nothing is there to be
+    /// the framework's own — so it must not be acknowledged as a `SET`.
+    #[test]
+    fn an_empty_simple_query_gets_an_empty_query_response() {
+        let server = StubServer::new(ConnectionTape::default(), Arc::new(DivergenceLog::new()));
+        let reply = server.simple_query("   ");
+        assert_eq!(
+            reply.first(),
+            Some(&b'I'),
+            "an empty query is answered with EmptyQueryResponse, got {reply:?}"
+        );
+        assert!(!is_housekeeping(""), "an empty batch is not housekeeping");
+        assert!(
+            !is_housekeeping("SET statement_timeout = 0; SELECT 1"),
+            "a batch is only housekeeping when every statement in it is"
+        );
+    }
+
+    /// A capsule that recorded one connection must still answer a handler that
+    /// holds two at once: the pool is sized one above the recording and waits
+    /// with a timeout, so oversubscription is reported rather than deadlocked.
+    /// Sized to the recording exactly, this test never returned.
+    #[tokio::test]
+    async fn a_replay_pool_never_blocks_on_itself() {
+        let mut capsule = crate::capsule::schema::test_support::capsule(
+            crate::capsule::schema::test_support::request("GET", "/boom"),
+            crate::capsule::schema::CapsuleOutcome::Status {
+                code: 500,
+                message: "boom".to_owned(),
+                problem_type: None,
+            },
+        );
+        capsule.db = Some(crate::capsule::schema::CapsuleDb {
+            connections: vec![ConnectionTape {
+                id: 1,
+                ..ConnectionTape::default()
+            }],
+        });
+
+        let pool = pool_from_capsule(&capsule, Arc::new(DivergenceLog::new()))
+            .expect("the replay pool builds");
+        assert_eq!(
+            pool.status().max_size,
+            2,
+            "one spare slot beyond the recording keeps a two-connection handler moving"
+        );
+
+        let (first, second) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            futures::future::join(pool.get(), pool.get()),
+        )
+        .await
+        .expect("two concurrent checkouts must not deadlock the replay pool");
+        assert!(
+            first.is_ok() && second.is_ok(),
+            "both checkouts must resolve"
         );
     }
 

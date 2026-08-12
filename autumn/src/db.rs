@@ -2723,6 +2723,13 @@ impl Db {
             crate::capsule::record_db::note_shard_capture_gap();
         }
 
+        // The same honesty rule for a backend that has no wire capture at all:
+        // a `SQLite` build tees nothing (F18), so a capsule for a request that
+        // used the database is missing that request's effects and must be
+        // refused by replay rather than presented as complete.
+        #[cfg(all(feature = "reporting", feature = "sqlite"))]
+        crate::capsule::note_backend_capture_gap();
+
         let pool = params.pool;
         let mut checkout_future: std::pin::Pin<
             Box<

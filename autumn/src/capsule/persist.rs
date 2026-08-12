@@ -150,6 +150,17 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
                 .chain(tape.exchanges.iter_mut())
             {
                 crate::capsule::redact::mask_binds(&mut exchange.binds, &redacted);
+                // A backend error message is free-form text that quotes the
+                // statement's own values back: a unique-violation `DETAIL`
+                // names the conflicting key, a check-constraint failure names
+                // the row. That is the one place a masked bind reappears in
+                // the clear, so it is scrubbed like the outcome. (The raw
+                // response frames are left byte-verbatim — replay writes them
+                // back to a real driver, which would reject a rewritten
+                // `ErrorResponse` — and the capsule documentation says so.)
+                if let Some(error) = exchange.error.as_mut() {
+                    *error = crate::capsule::redact::mask_echoes(error, &redacted);
+                }
             }
         }
     }
@@ -234,12 +245,29 @@ fn sanitize_id(id: &str) -> String {
 
 /// Write owner-only, through a temp file, so a reader never sees a partial
 /// capsule and the contents are never group- or world-readable.
+///
+/// The same shape as [`acme::store`](crate::acme) uses for private keys, and
+/// for the same reason — the bytes are secret:
+///
+/// * the directory is created (and, on unix, *re-set*) `0o700`, because
+///   `create_dir_all` applies the process umask and a permissive umask would
+///   leave a world-readable directory of production request data;
+/// * the temp file is opened `create_new` under a random name, so the write
+///   can never follow a symlink an attacker planted at a predictable path, and
+///   never truncates a file it did not create;
+/// * its mode is set explicitly after the open, because `OpenOptions::mode` is
+///   also umask-masked.
 fn write_atomically(dir: &Path, path: &Path, json: &[u8]) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let temp = path.with_extension("json.tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let temp = temp_path(path);
 
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -248,10 +276,32 @@ fn write_atomically(dir: &Path, path: &Path, json: &[u8]) -> std::io::Result<()>
 
     {
         let mut file = options.open(&temp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(json)?;
         file.sync_all()?;
     }
-    std::fs::rename(&temp, path)
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
+    }
+}
+
+/// An unpredictable sibling path for the temp file.
+///
+/// `<capsule>.json.tmp` is guessable, and `create_new` on a guessable path
+/// fails outright once something already sits there — a denial of capture, and
+/// on a shared `tmp/` a way to point the write somewhere else. The suffix comes
+/// from the same entropy the framework uses elsewhere.
+fn temp_path(path: &Path) -> PathBuf {
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    path.with_extension(format!("json.{nonce}.tmp"))
 }
 
 /// How many existing capsules may remain when a new one is about to be
@@ -448,6 +498,178 @@ mod tests {
             load_capsule(&reference.path).expect("loads").request.uri,
             "/boom"
         );
+    }
+
+    /// The recorded backend error is free-form text that quotes the
+    /// statement's own values back — a unique-violation `DETAIL` names the
+    /// conflicting key. Bind masking blanks the parameter; without this the
+    /// same bytes travelled on in the error beside it.
+    #[tokio::test]
+    async fn a_backend_error_quoting_a_masked_value_is_scrubbed() {
+        use std::sync::Arc;
+
+        use crate::capsule::CaptureSettings;
+        use crate::capsule::redact::RawRequest;
+        use crate::capsule::schema::{BindValue, ConnectionTape, Exchange, ExchangeProtocol};
+        use crate::log::filter::ParameterFilter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = Arc::new(CaptureScope::new(
+            "req-error".to_owned(),
+            Arc::new(CaptureSettings {
+                dir: dir.path().to_string_lossy().into_owned(),
+                ..CaptureSettings::default()
+            }),
+            Arc::new(ParameterFilter::new(&["token".to_owned()], &[])),
+        ));
+        scope.set_request(RawRequest {
+            method: "POST".to_owned(),
+            uri: "/tokens?token=sekrit-token-value"
+                .parse()
+                .expect("uri parses"),
+            version: axum::http::Version::HTTP_11,
+            headers: axum::http::HeaderMap::new(),
+            route: Some("/tokens".to_owned()),
+        });
+        scope.with_db(|db| {
+            *db.tape_mut(1) = ConnectionTape {
+                id: 1,
+                exchanges: vec![Exchange {
+                    protocol: ExchangeProtocol::Extended,
+                    sql: "INSERT INTO tokens (value) VALUES ($1)".to_owned(),
+                    binds: vec![BindValue::Value(b"sekrit-token-value".to_vec())],
+                    response: Vec::new(),
+                    row_count: 0,
+                    error: Some(
+                        "23505: duplicate key value violates unique constraint \"tokens_value_key\" \
+                         DETAIL: Key (value)=(sekrit-token-value) already exists."
+                            .to_owned(),
+                    ),
+                }],
+                ..ConnectionTape::default()
+            };
+        });
+
+        let reference = persist(
+            &scope,
+            CapsuleOutcome::Status {
+                code: 500,
+                message: "insert failed".to_owned(),
+                problem_type: None,
+            },
+        )
+        .expect("the capsule is written");
+        let written = std::fs::read_to_string(&reference.path).expect("capsule readable");
+
+        assert!(
+            !written.contains("sekrit-token-value"),
+            "a masked request value must not survive in the recorded backend error: {written}"
+        );
+        let capsule = load_capsule(&reference.path).expect("capsule loads");
+        let error = capsule
+            .db
+            .as_ref()
+            .and_then(|db| db.connections.first())
+            .and_then(|tape| tape.exchanges.first())
+            .and_then(|exchange| exchange.error.clone())
+            .expect("the exchange kept its error");
+        assert!(
+            error.contains("duplicate key") && error.contains("[FILTERED]"),
+            "the error must stay readable with the value masked, got {error}"
+        );
+    }
+
+    /// Capsules are production request data: the directory and the file are
+    /// owner-only, and the temp file is created fresh under an unpredictable
+    /// name so the write cannot be redirected through a planted symlink.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capsules_are_written_owner_only_into_an_owner_only_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::Arc;
+
+        use crate::capsule::CaptureSettings;
+        use crate::capsule::redact::RawRequest;
+        use crate::log::filter::ParameterFilter;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        // A directory that does not exist yet, so `write_atomically` creates it
+        // under whatever umask this process happens to have.
+        let dir = root.path().join("capsules");
+        let scope = Arc::new(CaptureScope::new(
+            "req-perms".to_owned(),
+            Arc::new(CaptureSettings {
+                dir: dir.to_string_lossy().into_owned(),
+                ..CaptureSettings::default()
+            }),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        ));
+        scope.set_request(RawRequest {
+            method: "GET".to_owned(),
+            uri: "/boom".parse().expect("uri parses"),
+            version: axum::http::Version::HTTP_11,
+            headers: axum::http::HeaderMap::new(),
+            route: None,
+        });
+
+        let reference = persist(
+            &scope,
+            CapsuleOutcome::Status {
+                code: 500,
+                message: "boom".to_owned(),
+                problem_type: None,
+            },
+        )
+        .expect("the capsule is written");
+
+        let file_mode = std::fs::metadata(&reference.path)
+            .expect("capsule metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "a capsule must be readable only by its owner"
+        );
+        let dir_mode = std::fs::metadata(&dir)
+            .expect("directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "the capsule directory must not be listable by anyone else"
+        );
+        assert!(
+            !dir.join(format!(
+                "{}.tmp",
+                reference
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+            ))
+            .exists(),
+            "the temp file must not be left behind"
+        );
+    }
+
+    #[test]
+    fn a_temp_path_is_unpredictable_and_ends_in_tmp() {
+        let path = Path::new("tmp/capsules/20250101T000000-000000-req.json");
+        let first = temp_path(path);
+        let second = temp_path(path);
+        assert_ne!(
+            first, second,
+            "a predictable temp path can be pre-created or symlinked by anyone \
+             who can write the directory"
+        );
+        for candidate in [&first, &second] {
+            assert!(
+                candidate.to_string_lossy().ends_with(".tmp"),
+                "the temp file must not look like a capsule to the pruner: {candidate:?}"
+            );
+        }
     }
 
     #[test]

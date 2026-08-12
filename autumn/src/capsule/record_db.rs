@@ -65,17 +65,22 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use deadpool::managed::{Hook, HookError};
 use diesel::{ConnectionError, ConnectionResult};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
+use diesel_async::pooled_connection::{
+    AsyncDieselConnectionManager, ManagerConfig, RecyclingMethod,
+};
 use futures::FutureExt as _;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::capsule::capture::{CaptureScope, scope_by_id};
 use crate::capsule::schema::{BindValue, ConnectionTape, Exchange, ExchangeProtocol};
-use crate::capsule::wire::{self, FrameSplitter, FrontendMessage, MarkerId};
+use crate::capsule::wire::{
+    self, FrameSplitter, FrontendMessage, MarkerId, is_session_housekeeping,
+};
 use crate::config::{AutumnConfig, DatabaseConfig};
 use crate::db::{DatabaseTopology, PoolError};
 
@@ -87,6 +92,32 @@ const MAX_MEMO_ENTRIES: usize = 256;
 /// Byte ceiling on one connection's memo, independent of the per-capsule
 /// budget (the memo lives as long as the connection does).
 const MAX_MEMO_BYTES: usize = 1024 * 1024;
+
+/// Fraction of a capsule's byte budget the connection memo may claim.
+///
+/// The memo is *history* — traffic that happened before the captured request —
+/// so it must never crowd out the request's own exchanges. Without this share
+/// a warm connection whose memo has grown to [`MAX_MEMO_BYTES`] (the same size
+/// as the default `max_capsule_bytes`) would exhaust the whole budget on the
+/// first copy, and every capsule that connection produced would be refused as
+/// truncated before recording a single statement of the request.
+const MEMO_BUDGET_SHARE: usize = 4;
+
+/// Most live prepared-statement names one connection's recorder tracks.
+///
+/// `Close` removes an entry, so this is a ceiling on *live* statements rather
+/// than on statements ever prepared. A connection that blows through it is
+/// given up on: a `Bind` whose statement name is unknown would be recorded with
+/// no SQL, which is worse than an honest refusal.
+const MAX_STATEMENT_NAMES: usize = 1024;
+
+/// The statement that unbinds a connection from whatever capsule it was last
+/// attributed to.
+///
+/// Kept as a literal because the pool hooks below run on the checkout hot path;
+/// [`clearing_marker_is_the_wire_marker`](tests::clearing_marker_is_the_wire_marker)
+/// pins it to [`wire::marker_set_sql`]'s clearing form.
+const CLEAR_MARKER_SQL: &str = "SET autumn.capsule_request = ''";
 
 /// Most exchanges awaiting a response on one connection. `AsyncPgConnection`
 /// takes `&mut self` per query so application traffic is strictly sequential,
@@ -145,19 +176,19 @@ fn disable_db_capture(reason: &str) {
     let _ = UNAVAILABLE_NOTE.set(format!("db capture unavailable: {reason}"));
 }
 
-/// The process-wide "no database tape, and here is why" note, when one applies.
-#[must_use]
-pub fn db_capture_unavailable_note() -> Option<&'static str> {
-    UNAVAILABLE_NOTE.get().map(String::as_str)
-}
-
-/// Copy that note onto a capture scope, so the capsule explains itself.
+/// Copy that note onto a capture scope, so the capsule explains itself — and
+/// mark the capsule truncated, because it is missing effects the request had.
 ///
 /// Called from the connection-checkout path, which is the one place that knows
-/// a request is about to use a database at all.
+/// a request is about to use a database at all. The truncation mirrors
+/// [`note_shard_capture_gap`]: a capsule whose request talked to a database
+/// none of whose traffic was recorded holds strictly less than the request did,
+/// so [`refusal_reason`](crate::capsule::refusal_reason) must refuse it rather
+/// than let a replay report divergences that only reflect the missing tape.
 pub fn note_db_capture_unavailable(scope: &CaptureScope) {
     if let Some(note) = UNAVAILABLE_NOTE.get() {
         scope.note(note.clone());
+        scope.mark_truncated();
     }
 }
 
@@ -178,8 +209,14 @@ pub const SHARD_CAPTURE_NOTE: &str = "shard database traffic is not captured in 
 ///
 /// Called from the connection-checkout path, which is the one place that knows
 /// a *particular request* touched a shard — a coarser "shards are configured"
-/// test would truncate capsules for requests that never went near one.
+/// test would truncate capsules for requests that never went near one. That
+/// path runs on every shard checkout, capture armed or not, so the process-wide
+/// arming flag is read first: an unarmed process pays one relaxed atomic load
+/// instead of a task-local lookup.
 pub fn note_shard_capture_gap() {
+    if !crate::capsule::db_capture_enabled() {
+        return;
+    }
     if let Some(scope) = crate::capsule::current_scope() {
         scope.note(SHARD_CAPTURE_NOTE);
         scope.mark_truncated();
@@ -204,6 +241,35 @@ pub type CapturePoolProvider = Box<
 /// cannot tell it apart from [`crate::db::create_pool`]'s — built through a
 /// `custom_setup` callback that opens the socket itself so it can wrap it.
 ///
+/// # Attribution at the pool boundary
+///
+/// [`Db::checkout`](crate::db::Db::checkout) sends the attribution marker, but
+/// it is not the only way a connection leaves this pool: the job runtime, the
+/// mailer, job tracking and the app's own `state.pool().get()` all take
+/// connections straight from it. Nothing about those callers says "no capsule",
+/// so without help the recorder would keep the *previous* borrower's binding
+/// and file their statements into a stranger's capsule — or, on a connection
+/// they were the first to touch, write their SQL into the connection prologue
+/// that [`ConnectionRecorder::copy_memo`] then copies into every later capsule.
+///
+/// Both are closed here, at the boundary every borrower crosses: the
+/// `post_create` and `pre_recycle` hooks issue [`CLEAR_MARKER_SQL`] so the
+/// recorder unbinds (and ends its prologue) *before* the borrower's first
+/// statement. `deadpool` applies `pre_recycle` before the manager's recycle
+/// check and `post_create` before the object is handed out, so no user
+/// statement can precede it. The marker statement is housekeeping and is never
+/// itself recorded. The cost is one extra round trip per checkout on a
+/// recording pool, which is capture's price for correct attribution — ordinary
+/// pools are untouched.
+///
+/// Recycling is [`RecyclingMethod::Fast`] rather than deadpool's default
+/// `Verified`: the `SELECT $1` ping the verified method issues would be teed
+/// like any other statement, and — being sent before the next borrower's marker
+/// rebinds the connection — recorded into the *previous* request's exchanges. A
+/// replay of that capsule never issues it, so the tape would mismatch on the
+/// second checkout of a one-slot pool. The pre-recycle unbind above makes that
+/// harmless, and dropping the ping removes the round trip as well.
+///
 /// # Errors
 ///
 /// Returns [`PoolError::UnsupportedBackend`] when `url` is not recordable (see
@@ -220,6 +286,7 @@ pub fn build_recording_pool(
         )));
     }
     let mut manager_config = ManagerConfig::<AsyncPgConnection>::default();
+    manager_config.recycling_method = RecyclingMethod::Fast;
     manager_config.custom_setup = Box::new(|url: &str| {
         let url = url.to_owned();
         async move { establish_recording(&url).await }.boxed()
@@ -230,8 +297,37 @@ pub fn build_recording_pool(
         .max_size(max_size.max(1))
         .wait_timeout(Some(connect_timeout))
         .create_timeout(Some(connect_timeout))
+        .post_create(unbind_hook())
+        .pre_recycle(unbind_hook())
         .runtime(deadpool::Runtime::Tokio1)
         .build()?)
+}
+
+/// A pool hook that unbinds the connection from any capsule before the next
+/// borrower touches it (see [`build_recording_pool`]).
+///
+/// A failure is reported to `deadpool`, which drops the connection and takes
+/// the next one: a connection that cannot be unbound must not be handed out,
+/// because everything it goes on to do would be filed under a stranger's
+/// capsule.
+fn unbind_hook() -> Hook<AsyncDieselConnectionManager<AsyncPgConnection>> {
+    Hook::async_fn(|conn: &mut AsyncPgConnection, _metrics| {
+        Box::pin(async move {
+            use diesel_async::SimpleAsyncConnection as _;
+
+            conn.batch_execute(CLEAR_MARKER_SQL).await.map_err(|error| {
+                tracing::debug!(
+                    %error,
+                    "a recorded connection could not be unbound from its capsule; it will be \
+                     discarded rather than handed out still attributed"
+                );
+                HookError::message(format!(
+                    "the failure-capsule recording pool could not clear a connection's capsule \
+                     binding: {error}"
+                ))
+            })
+        })
+    })
 }
 
 /// Open one recorded connection: raw socket → tee → `tokio-postgres` →
@@ -398,12 +494,6 @@ impl<S> RecordingStream<S> {
             recorder: ConnectionRecorder::new(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)),
         }
     }
-
-    /// This connection's recorder-assigned identifier.
-    #[must_use]
-    pub const fn connection_id(&self) -> u64 {
-        self.recorder.id
-    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for RecordingStream<S> {
@@ -489,6 +579,26 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for RecordingStream<S> {
 }
 
 // ── The recorder ────────────────────────────────────────────────────────────
+
+/// What a capsule says when the connection it borrowed had already stopped
+/// recording.
+const POISONED_CONNECTION_NOTE: &str = "db capture stopped earlier on the connection this request borrowed, so its queries are \
+     absent from the tape";
+
+/// What a capsule says when the connection memo did not fit its budget share.
+const MEMO_SHARE_NOTE: &str = "db capture: the connection's remembered history did not fit this capsule's budget share, so \
+     some of its prepared-statement metadata was left out; replay may report an unknown statement";
+
+/// The result of copying a connection memo into a capsule window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoCopy {
+    /// Everything the capsule needed was copied.
+    Copied,
+    /// Some buckets were left out to stay inside the memo's budget share.
+    Partial,
+    /// The capsule budget itself is exhausted; the capsule is truncated.
+    OverBudget,
+}
 
 /// Which part of a tape an exchange belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -605,6 +715,11 @@ impl ConnectionMemo {
 /// per-connection and needs no locking; the only shared thing it touches is the
 /// [`CaptureScope`] it is currently bound to.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the flags (first-marker window, disabled, poisoned) are independent \
+              lifecycle facts about one connection, not an encodable state machine"
+)]
 pub struct ConnectionRecorder {
     id: u64,
     frontend: FrameSplitter,
@@ -629,8 +744,16 @@ pub struct ConnectionRecorder {
     /// Set when the capsule budget ran out; recording resumes at the next
     /// window.
     stopped: bool,
-    /// Set when the stream stopped making sense; this connection is done.
-    disabled: bool,
+    /// Set when the stream stopped making sense: nothing on this connection is
+    /// recorded again. Markers are still watched (see
+    /// [`Self::watch_marker_while_poisoned`]) so the capsules of *later*
+    /// requests that borrow this connection are told their tape is missing,
+    /// instead of being written out as complete.
+    poisoned: bool,
+    /// Set when the *client* half stopped framing. Marker watching needs frames,
+    /// so this is the one failure the recorder cannot warn later requests
+    /// about; it is also the one a well-behaved driver cannot cause.
+    frontend_lost: bool,
 }
 
 impl ConnectionRecorder {
@@ -646,7 +769,8 @@ impl ConnectionRecorder {
             bound: None,
             before_first_marker: true,
             stopped: false,
-            disabled: false,
+            poisoned: false,
+            frontend_lost: false,
         }
     }
 
@@ -664,22 +788,31 @@ impl ConnectionRecorder {
     }
 
     fn on_frontend(&mut self, bytes: &[u8]) {
-        if self.disabled {
+        if self.frontend_lost {
             return;
         }
         let frames = self.frontend.push(bytes);
         if self.frontend.is_unrecordable() {
+            self.frontend_lost = true;
             self.give_up("the client stream could not be framed");
             return;
         }
         for frame in frames {
-            self.on_frontend_frame(&frame);
+            if self.poisoned {
+                // Recording is over for this connection, but attribution
+                // markers still matter: the next request to borrow it must be
+                // told its capsule has no tape (F13's honesty rule), not handed
+                // a capsule that looks complete because nothing was recorded.
+                Self::watch_marker_while_poisoned(&frame);
+            } else {
+                self.on_frontend_frame(&frame);
+            }
         }
     }
 
     /// Observe bytes the server wrote.
     fn on_backend(&mut self, bytes: &[u8]) {
-        if self.disabled {
+        if self.poisoned {
             return;
         }
         let frames = self.backend.push(bytes);
@@ -692,9 +825,38 @@ impl ConnectionRecorder {
         }
     }
 
+    /// While poisoned, the only thing worth reading off the client half is the
+    /// attribution marker: a request that binds this connection is a request
+    /// whose capsule will be missing everything it does here.
+    fn watch_marker_while_poisoned(frame: &wire::Frame) {
+        let FrontendMessage::Query(sql) = wire::parse_frontend(frame) else {
+            return;
+        };
+        let Some(MarkerId::Set(id)) = wire::marker_request_id(&sql) else {
+            return;
+        };
+        let Some(scope) = scope_by_id(&id) else {
+            return;
+        };
+        scope.note(POISONED_CONNECTION_NOTE);
+        scope.mark_truncated();
+    }
+
     fn on_frontend_frame(&mut self, frame: &wire::Frame) {
         match wire::parse_frontend(frame) {
             FrontendMessage::Parse { name, sql, .. } => {
+                if self.statement_sql.len() >= MAX_STATEMENT_NAMES
+                    && !self.statement_sql.contains_key(&name)
+                {
+                    // Recording a `Bind` whose statement we no longer know the
+                    // SQL for would put an empty-SQL exchange on the tape, and
+                    // replay would answer the wrong statement from it.
+                    self.give_up(
+                        "this connection holds more live prepared statements than \
+                                  capture tracks",
+                    );
+                    return;
+                }
                 self.statement_sql.insert(name, sql.clone());
                 let pending = self.building.get_or_insert_with(Pending::extended);
                 if pending.sql.is_empty() {
@@ -727,7 +889,15 @@ impl ConnectionRecorder {
             // gets a slot in the queue that is discarded when it completes,
             // rather than being ignored here and letting its `ReadyForQuery`
             // cut short whatever exchange is queued behind it.
-            FrontendMessage::Close => {
+            //
+            // Closing a *statement* also retires its name: the SQL behind it
+            // is no longer reachable by any later `Bind`, so keeping the entry
+            // would grow the map for the life of the connection (a long-lived
+            // pooled connection prepares and drops statements indefinitely).
+            FrontendMessage::Close { kind, name } => {
+                if kind == b'S' {
+                    self.statement_sql.remove(&name);
+                }
                 self.building
                     .get_or_insert_with(Pending::extended)
                     .housekeeping = true;
@@ -853,12 +1023,22 @@ impl ConnectionRecorder {
 
         let recorded = scope
             .with_db(|db| {
+                // Re-checked under the buffer's own lock: `scope()` tested this
+                // before the lock was taken, and the request can finish in
+                // between. Closing and appending must not interleave, or a late
+                // effect lands in a capsule that is already being written.
+                if scope.is_closed() {
+                    return true;
+                }
                 let tape = db.tape_mut(id);
                 let entries = tape_bucket(tape, bucket);
-                if entries
-                    .iter()
-                    .any(|entry| entry.sql == exchange.sql && entry.binds == exchange.binds)
-                    && bucket != Bucket::Request
+                // The ordered `exchanges` bucket never deduplicates — a request
+                // may legitimately run the same statement twice — so the scan
+                // is skipped for it entirely rather than run and discarded.
+                if bucket != Bucket::Request
+                    && entries
+                        .iter()
+                        .any(|entry| entry.sql == exchange.sql && entry.binds == exchange.binds)
                 {
                     // Already carried over from the memo; the connection's
                     // history holds one entry per statement, not one per use.
@@ -912,55 +1092,86 @@ impl ConnectionRecorder {
     }
 
     /// Copy the connection's history into the freshly opened capsule window.
+    ///
+    /// The memo may only claim `max_capsule_bytes / MEMO_BUDGET_SHARE` of the
+    /// capsule's budget. It is history, not the request's own work, and a warm
+    /// connection's memo can reach [`MAX_MEMO_BYTES`] — the size of the whole
+    /// default budget — at which point copying it wholesale would exhaust the
+    /// budget before the request recorded a single statement, and *every*
+    /// capsule that connection produced would be refused as truncated. Buckets
+    /// past the share are skipped in ascending order of replay value
+    /// (statements, then catalog, then prologue) and the capsule says so.
     fn copy_memo(&mut self) {
         let Some(scope) = self.scope() else {
             return;
         };
         let budget = scope.settings().max_capsule_bytes;
+        let allowance = budget / MEMO_BUDGET_SHARE;
         let id = self.id;
-        let prologue = self.memo.prologue.clone();
-        let statements = self.memo.statements.clone();
-        let catalog = self.memo.catalog.clone();
+        let memo = &self.memo;
 
-        let copied = scope
+        let outcome = scope
             .with_db(|db| {
-                let tape = db.tape_mut(id);
-                let want_prologue = tape.prologue.is_empty() && !prologue.is_empty();
-                let want_statements = tape.statements.is_empty() && !statements.is_empty();
-                let want_catalog = tape.catalog.is_empty() && !catalog.is_empty();
-                let mut cost = 0usize;
-                if want_prologue {
-                    cost = cost.saturating_add(total_bytes(&prologue));
-                }
-                if want_statements {
-                    cost = cost.saturating_add(total_bytes(&statements));
-                }
-                if want_catalog {
-                    cost = cost.saturating_add(total_bytes(&catalog));
-                }
-                if cost == 0 {
-                    return true;
-                }
-                if !db.charge(cost, budget) {
-                    return false;
+                if scope.is_closed() {
+                    return MemoCopy::Copied;
                 }
                 let tape = db.tape_mut(id);
-                if want_prologue {
-                    tape.prologue = prologue;
-                }
-                if want_statements {
-                    tape.statements = statements;
-                }
-                if want_catalog {
-                    tape.catalog = catalog;
-                }
-                true
-            })
-            .unwrap_or(false);
+                // Only buckets this capsule has none of are worth copying, and
+                // the clone is deferred until that is known: the memo can hold
+                // up to a megabyte, and cloning it to discard it was the
+                // dominant cost of every marker on a warm connection.
+                let want_statements = tape.statements.is_empty() && !memo.statements.is_empty();
+                let want_catalog = tape.catalog.is_empty() && !memo.catalog.is_empty();
+                let want_prologue = tape.prologue.is_empty() && !memo.prologue.is_empty();
 
-        if !copied {
-            scope.mark_truncated();
-            self.stopped = true;
+                let mut spent = 0usize;
+                let mut skipped = false;
+                let mut fits = |wanted: bool, entries: &[Exchange]| {
+                    if !wanted {
+                        return false;
+                    }
+                    let cost = total_bytes(entries);
+                    if spent.saturating_add(cost) > allowance {
+                        skipped = true;
+                        return false;
+                    }
+                    spent = spent.saturating_add(cost);
+                    true
+                };
+                let take_statements = fits(want_statements, &memo.statements);
+                let take_catalog = fits(want_catalog, &memo.catalog);
+                let take_prologue = fits(want_prologue, &memo.prologue);
+
+                if spent > 0 {
+                    if !db.charge(spent, budget) {
+                        return MemoCopy::OverBudget;
+                    }
+                    let tape = db.tape_mut(id);
+                    if take_statements {
+                        tape.statements.clone_from(&memo.statements);
+                    }
+                    if take_catalog {
+                        tape.catalog.clone_from(&memo.catalog);
+                    }
+                    if take_prologue {
+                        tape.prologue.clone_from(&memo.prologue);
+                    }
+                }
+                if skipped {
+                    MemoCopy::Partial
+                } else {
+                    MemoCopy::Copied
+                }
+            })
+            .unwrap_or(MemoCopy::OverBudget);
+
+        match outcome {
+            MemoCopy::Copied => {}
+            MemoCopy::Partial => scope.note(MEMO_SHARE_NOTE),
+            MemoCopy::OverBudget => {
+                scope.mark_truncated();
+                self.stopped = true;
+            }
         }
     }
 
@@ -968,9 +1179,13 @@ impl ConnectionRecorder {
     ///
     /// A partial tape is worse than none: replay would answer the request's
     /// queries with the wrong bytes. The capsule is marked truncated so replay
-    /// refuses it outright.
+    /// refuses it outright — and so is the capsule of every *later* request
+    /// that binds this connection, which is why poisoning is tracked separately
+    /// from "stop parsing" (see [`Self::watch_marker_while_poisoned`]). Giving
+    /// up before any marker has arrived used to leave later requests with
+    /// capsules that carried no tape and claimed to be complete.
     fn give_up(&mut self, reason: &str) {
-        self.disabled = true;
+        self.poisoned = true;
         self.building = None;
         self.in_flight.clear();
         self.memo = ConnectionMemo::default();
@@ -992,45 +1207,6 @@ impl ConnectionRecorder {
             scope.mark_truncated();
         }
     }
-}
-
-/// Whether every statement in `sql` is session housekeeping that the replay
-/// stub answers synthetically rather than from the tape.
-///
-/// A batch is housekeeping only if *all* of its statements are: `SET
-/// statement_timeout = 5000; SELECT 1` is the request's work and must be
-/// recorded whole. Splitting on `;` is naive, but only in the safe direction —
-/// a statement with a quoted semicolon simply fails to match and is recorded.
-fn is_session_housekeeping(sql: &str) -> bool {
-    let mut saw_statement = false;
-    for statement in sql.split(';') {
-        let statement = statement.trim();
-        if statement.is_empty() {
-            continue;
-        }
-        saw_statement = true;
-        if !is_housekeeping_statement(statement) {
-            return false;
-        }
-    }
-    saw_statement
-}
-
-/// Whether one statement is a session setting replay reproduces on its own.
-fn is_housekeeping_statement(statement: &str) -> bool {
-    let statement = statement.to_ascii_uppercase();
-    let Some(setting) = statement.strip_prefix("SET ") else {
-        return false;
-    };
-    let setting = setting.trim_start();
-    [
-        "TIME ZONE",
-        "CLIENT_ENCODING",
-        "STATEMENT_TIMEOUT",
-        "AUTUMN.CAPSULE_REQUEST",
-    ]
-    .iter()
-    .any(|name| setting.starts_with(name))
 }
 
 /// The tape vector a bucket writes into.
@@ -1193,6 +1369,172 @@ mod tests {
         );
     }
 
+    /// The hooks send the same statement the checkout path does, so the
+    /// recorder recognises it as its own housekeeping and never records it.
+    #[test]
+    fn clearing_marker_is_the_wire_marker() {
+        assert_eq!(
+            wire::marker_set_sql("").as_deref(),
+            Some(CLEAR_MARKER_SQL),
+            "the pool hooks must send exactly the clearing marker the recorder parses"
+        );
+        assert!(
+            is_session_housekeeping(CLEAR_MARKER_SQL),
+            "the unbind statement is Autumn's own bookkeeping and must never reach a tape"
+        );
+        assert_eq!(
+            wire::marker_request_id(CLEAR_MARKER_SQL),
+            Some(MarkerId::Clear)
+        );
+    }
+
+    /// A connection that stopped recording must say so to the *next* request
+    /// that borrows it. Otherwise that request's capsule is written with no
+    /// database tape and `truncated: false` — a capsule that claims the handler
+    /// never touched the database.
+    #[tokio::test]
+    async fn a_poisoned_connection_tells_the_next_request_its_tape_is_missing() {
+        let scope = scope_for_test("later-request");
+        crate::capsule::capture::register(&scope);
+
+        let (client, _server) = tokio::io::duplex(1024 * 1024);
+        let mut stream = RecordingStream::new(client);
+        stream.write_all(&startup()).await.expect("write startup");
+        // Overrun the in-flight queue: the backend answers nothing, so every
+        // query stays pending until the recorder gives up.
+        for index in 0..=MAX_IN_FLIGHT {
+            stream
+                .write_all(&query(&format!("SELECT {index}")))
+                .await
+                .expect("write query");
+        }
+        assert!(
+            stream.recorder.poisoned,
+            "an unbounded in-flight queue must stop recording"
+        );
+
+        // The next request checks the connection out and binds it.
+        stream
+            .write_all(&query("SET autumn.capsule_request = 'later-request'"))
+            .await
+            .expect("write marker");
+
+        assert!(
+            scope
+                .notes()
+                .iter()
+                .any(|note| note == POISONED_CONNECTION_NOTE),
+            "the later request's capsule must explain the missing tape, got {:?}",
+            scope.notes()
+        );
+        assert!(
+            scope.is_truncated(),
+            "a capsule with no tape because recording had already stopped must be refused \
+             by replay, not presented as a request that used no database"
+        );
+    }
+
+    /// `Close` retires a prepared statement name, so a long-lived pooled
+    /// connection's name map tracks live statements rather than every statement
+    /// it ever prepared.
+    #[tokio::test]
+    async fn closing_a_prepared_statement_forgets_its_sql() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let mut stream = RecordingStream::new(client);
+        stream.write_all(&startup()).await.expect("write startup");
+
+        let mut parse = b"s1\0".to_vec();
+        parse.extend_from_slice(b"SELECT $1::text\0");
+        parse.extend_from_slice(&0i16.to_be_bytes());
+        stream
+            .write_all(&tagged(b'P', &parse))
+            .await
+            .expect("write parse");
+        assert_eq!(
+            stream.recorder.statement_sql.get("s1").map(String::as_str),
+            Some("SELECT $1::text")
+        );
+
+        stream
+            .write_all(&tagged(b'C', b"Ss1\0"))
+            .await
+            .expect("write close");
+        assert!(
+            stream.recorder.statement_sql.is_empty(),
+            "closing the statement must retire its name, got {:?}",
+            stream.recorder.statement_sql
+        );
+    }
+
+    /// The memo is the connection's *history*: it may claim a share of the
+    /// capsule budget, never all of it. A warm connection whose memo had grown
+    /// to the size of the whole budget used to exhaust it on the first marker,
+    /// so every capsule that connection produced was refused as truncated
+    /// before the request recorded a single statement.
+    #[tokio::test]
+    async fn a_warm_memo_cannot_eat_the_whole_capsule_budget() {
+        let settings = Arc::new(crate::capsule::CaptureSettings {
+            max_capsule_bytes: 4_000,
+            ..crate::capsule::CaptureSettings::default()
+        });
+        let scope = Arc::new(CaptureScope::new(
+            "budget".to_owned(),
+            settings,
+            Arc::new(crate::log::filter::ParameterFilter::new(&[], &[])),
+        ));
+
+        let mut recorder = ConnectionRecorder::new(7);
+        recorder.bound = Some(Arc::downgrade(&scope));
+        // A memo far bigger than the whole budget.
+        for index in 0..20 {
+            recorder.memo.remember(
+                Bucket::Statements,
+                &Exchange {
+                    protocol: ExchangeProtocol::Extended,
+                    sql: format!("SELECT {index} FROM big"),
+                    binds: Vec::new(),
+                    response: vec![0u8; 500],
+                    row_count: 0,
+                    error: None,
+                },
+            );
+        }
+        recorder.copy_memo();
+
+        assert!(!recorder.stopped, "the memo must not stop recording");
+        assert!(
+            !scope.is_truncated(),
+            "a big memo must not refuse the capsule before the request has run"
+        );
+        let charged = scope.with_db(|db| db.charged_bytes()).expect("db lock");
+        assert!(
+            charged <= 1_000,
+            "the memo may claim at most a quarter of the 4000-byte budget, charged {charged}"
+        );
+        assert!(
+            scope.notes().iter().any(|note| note == MEMO_SHARE_NOTE),
+            "a capsule whose memo was trimmed must say so, got {:?}",
+            scope.notes()
+        );
+
+        // And the request's own work still fits.
+        recorder.append(
+            Bucket::Request,
+            Exchange {
+                protocol: ExchangeProtocol::Extended,
+                sql: "SELECT 1".to_owned(),
+                binds: Vec::new(),
+                response: vec![0u8; 100],
+                row_count: 1,
+                error: None,
+            },
+        );
+        assert!(
+            !scope.is_truncated(),
+            "the request's own exchange must fit the budget the memo did not take"
+        );
+    }
+
     #[test]
     fn catalog_probes_and_prepared_statements_land_in_their_own_buckets() {
         let mut memo = ConnectionMemo::default();
@@ -1267,11 +1609,13 @@ mod tests {
     #[tokio::test]
     async fn a_shard_checkout_notes_and_truncates_the_in_flight_capsule() {
         let scope = scope_for_test("shard-gap");
-        crate::capsule::CAPSULE_SCOPE
+        crate::capsule::capture::set_db_capture_enabled(true);
+        crate::capsule::capture::CAPSULE_SCOPE
             .scope(Arc::clone(&scope), async {
                 note_shard_capture_gap();
             })
             .await;
+        crate::capsule::capture::set_db_capture_enabled(false);
 
         assert!(
             scope.notes().iter().any(|note| note == SHARD_CAPTURE_NOTE),

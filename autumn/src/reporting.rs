@@ -600,13 +600,20 @@ fn report_response(response: &Response, context: RequestContext, chain: &Arc<Rep
         |info| (info.message.clone(), info.problem_type.map(str::to_owned)),
     );
 
-    let capture = context.capture.map(|handle| CaptureContext {
-        handle,
-        outcome: crate::capsule::CapsuleOutcome::Status {
-            code: response.status().as_u16(),
-            message: message.clone(),
-            problem_type: problem_type.clone(),
-        },
+    let capture = context.capture.map(|handle| {
+        // Close the scope here rather than leaving it to the capture layer's
+        // registry guard: persistence starts as soon as this is dispatched, and
+        // a connection recorder still appending effects would be racing the
+        // snapshot. Closing first makes the capsule's contents final.
+        handle.scope().close();
+        CaptureContext {
+            handle,
+            outcome: crate::capsule::CapsuleOutcome::Status {
+                code: response.status().as_u16(),
+                message: message.clone(),
+                problem_type: problem_type.clone(),
+            },
+        }
     });
 
     chain.dispatch(
@@ -636,13 +643,19 @@ fn handle_panic(
         .and_then(|captured| captured.backtrace);
 
     if let Some(context) = context {
-        let capture = context.capture.map(|handle| CaptureContext {
-            handle,
-            outcome: crate::capsule::CapsuleOutcome::Panic {
-                status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-                payload: message.clone(),
-                backtrace: backtrace.clone(),
-            },
+        let capture = context.capture.map(|handle| {
+            // Same reason as `report_response`: seal the scope before the
+            // capsule is built, so nothing can append to it while it is
+            // being written.
+            handle.scope().close();
+            CaptureContext {
+                handle,
+                outcome: crate::capsule::CapsuleOutcome::Panic {
+                    status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    payload: message.clone(),
+                    backtrace: backtrace.clone(),
+                },
+            }
         });
         chain.dispatch(
             ErrorEvent {

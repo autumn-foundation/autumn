@@ -38,23 +38,31 @@ pub mod replay;
 pub mod schema;
 
 // DB wire submodules (PostgreSQL only; the sqlite backend has no wire capture).
+// Crate-private like `wire`: these are the recorder and the replay stub, not an
+// extension point, and everything a caller needs is re-exported below.
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
-pub mod record_db;
+pub(crate) mod record_db;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
-pub mod replay_db;
+pub(crate) mod replay_db;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 pub(crate) mod wire;
 
+#[cfg(feature = "test-support")]
+pub use capture::with_capture_scope;
 pub use capture::{
-    CAPSULE_SCOPE, CaptureHandle, CaptureLayer, CaptureScope, CaptureSettings, DbBuffer,
-    current_scope, db_capture_enabled, install_from_config, is_valid_scope_id, scope_by_id,
+    CaptureHandle, CaptureLayer, CaptureScope, CaptureSettings, DbBuffer, current_scope,
+    db_capture_enabled, is_valid_scope_id, scope_by_id, set_db_capture_enabled,
 };
 pub use clock::{RecordingClock, ReplayClock};
 pub use persist::{CapsuleRef, capsule_dir, load_capsule, persist};
 /// The recording pool, re-exported for tests that drive capture against a live
 /// database without reaching into the submodule path.
 #[cfg(all(feature = "test-support", feature = "db", not(feature = "sqlite")))]
-pub use record_db::build_recording_pool;
+pub use record_db::{build_recording_pool, maybe_capture_pool_provider};
+/// Why database capture cannot record a given URL, re-exported for tests and
+/// for `autumn doctor`-style preflight checks.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+pub use record_db::{capture_unavailable_reason, note_db_capture_unavailable};
 pub use replay::{
     Divergence, DivergenceKind, DivergenceLog, EXIT_DIVERGED, EXIT_REFUSED, EXIT_REPRODUCED,
     ReplayOutcome, TapeProgress, Verdict, execute, print_refusal, print_verdict, refusal_exit_code,
@@ -62,6 +70,32 @@ pub use replay::{
 };
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 pub use replay_db::{StubServer, pool_from_capsule};
+
+/// What a capsule says when the database backend has no wire capture at all.
+///
+/// `SQLite` connections carry no `PostgreSQL` protocol to tee (F18), so a
+/// request that used one produces a capsule with no database tape.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+pub const BACKEND_CAPTURE_NOTE: &str = "database capture is not available on the sqlite backend: this request's queries are absent \
+     from the tape";
+
+/// Record that the in-flight request used a database this build cannot record.
+///
+/// The `PostgreSQL` builds' equivalent is
+/// `record_db::note_db_capture_unavailable`; this is the `sqlite` sibling, and
+/// like it the capsule is **marked truncated** as well as noted — a capsule
+/// that is missing the request's database effects must be refused by replay,
+/// not presented as replayable.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+pub fn note_backend_capture_gap() {
+    if !db_capture_enabled() {
+        return;
+    }
+    if let Some(scope) = current_scope() {
+        scope.note(BACKEND_CAPTURE_NOTE);
+        scope.mark_truncated();
+    }
+}
 pub use schema::{
     AppInfo, BindValue, CAPSULE_FORMAT_VERSION, Capsule, CapsuleBody, CapsuleDb, CapsuleError,
     CapsuleOutcome, CapsuleRequest, ConnectionTape, Exchange, ExchangeProtocol,

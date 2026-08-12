@@ -3798,11 +3798,17 @@ fn apply_middleware(
     // context — the scope is what the reporting layer seals into a capsule when
     // the request turns out to have failed. Off unless
     // `[failure_capture] enabled = true`; capsules hold real request data.
+    //
+    // The connection-checkout marker is armed (or *disarmed*) unconditionally
+    // from this build's own configuration: the flag is process-wide, so a test
+    // app built with capture off has to clear what a previous test's app armed,
+    // or every later checkout in that process keeps paying for — and
+    // attributing to — a capture nobody asked for. Production arms it earlier,
+    // before the pool is built, from `App::run`.
+    #[cfg(feature = "reporting")]
+    crate::capsule::set_db_capture_enabled(config.failure_capture.enabled);
     #[cfg(feature = "reporting")]
     if config.failure_capture.enabled {
-        // Arm the connection-checkout marker for test apps too: production
-        // arms it earlier (before the pool is built) from `App::run`.
-        crate::capsule::install_from_config(true);
         // Same filter composition as the log context below, so one
         // `[log] filter_parameters` list governs both.
         let mut capture_filter_parameters = config.log.filter_parameters.clone();

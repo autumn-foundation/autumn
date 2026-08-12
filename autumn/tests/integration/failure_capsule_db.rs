@@ -94,6 +94,59 @@ async fn db_fail_with_orphan(
     Err(AutumnError::internal_server_error_msg("exploded"))
 }
 
+/// Reads a row, then — as the job poller, the mailer and job tracking all do —
+/// takes a connection **straight from the pool**, with no `Db::checkout` and so
+/// no capsule marker, and runs a query on it. That query belongs to nobody and
+/// must not join this request's capsule.
+#[get("/db-fail-with-raw-pool-user")]
+async fn db_fail_with_raw_pool_user(
+    State(state): State<autumn_web::AppState>,
+) -> Result<&'static str, AutumnError> {
+    let pool = state
+        .pool()
+        .ok_or_else(|| AutumnError::internal_server_error_msg("no pool"))?
+        .clone();
+
+    read_label(&pool, "alpha").await?;
+    raw_pool_query(&pool, "mid-request-poller").await?;
+    read_label(&pool, "beta").await?;
+
+    Err(AutumnError::internal_server_error_msg("exploded"))
+}
+
+/// Checks a connection out, releases it, and checks it out again inside one
+/// request. With a single-slot pool the second checkout recycles the same
+/// connection while this request's scope is still bound to it.
+#[get("/db-fail-twice")]
+async fn db_fail_twice(
+    State(state): State<autumn_web::AppState>,
+) -> Result<&'static str, AutumnError> {
+    let pool = state
+        .pool()
+        .ok_or_else(|| AutumnError::internal_server_error_msg("no pool"))?
+        .clone();
+    read_label(&pool, "first").await?;
+    read_label(&pool, "second").await?;
+    Err(AutumnError::internal_server_error_msg("exploded twice"))
+}
+
+/// A pooled connection used the way every internal subsystem uses one: no
+/// `Db::checkout`, no marker, no capsule scope.
+async fn raw_pool_query(
+    pool: &diesel_async::pooled_connection::deadpool::Pool<autumn_web::db::RuntimeConnection>,
+    tag: &str,
+) -> Result<(), AutumnError> {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|error| AutumnError::internal_server_error_msg(format!("pool: {error}")))?;
+    conn.batch_execute(&format!("SELECT '{tag}'::text"))
+        .await
+        .map_err(|error| AutumnError::internal_server_error_msg(format!("raw query: {error}")))
+}
+
 async fn read_label(
     pool: &diesel_async::pooled_connection::deadpool::Pool<autumn_web::db::RuntimeConnection>,
     tag: &str,
@@ -495,6 +548,107 @@ async fn marker_clears_previous_request_binding() {
     );
 }
 
+/// The marker is sent by `Db::checkout`, but that is not the only door out of
+/// the pool: the job poller, the mailer, job tracking and any
+/// `state.pool().get()` take connections directly. Nothing about those callers
+/// says "no capsule", so the pool boundary itself has to unbind the connection
+/// — otherwise their statements are filed under whoever borrowed it last, and a
+/// raw user that is first to touch a fresh connection writes its SQL into the
+/// connection prologue that is then copied into *every* later capsule.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn raw_pool_users_are_never_recorded_into_a_capsule() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // One slot: every checkout in this test is the same connection.
+    let pool =
+        autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
+            .expect("recording pool builds");
+
+    // Before any request: the connection is born in a raw user's hands, so its
+    // statement would otherwise become part of the connection's prologue.
+    raw_pool_query(&pool, "prologue-poller")
+        .await
+        .expect("the raw query runs");
+
+    let client = TestApp::new()
+        .config(capture_config(dir.path()))
+        .routes(routes![db_fail_with_raw_pool_user])
+        .with_db(pool)
+        .build();
+
+    client
+        .get("/db-fail-with-raw-pool-user")
+        .send()
+        .await
+        .assert_status(500);
+
+    let paths = await_capsules(dir.path(), 1).await;
+    let capsule = read_capsule(&paths[0]);
+    let tape = only_tape(&capsule);
+    let recorded = all_sql(tape);
+
+    assert!(
+        recorded.iter().any(|sql| sql.contains("SELECT $1::text")),
+        "the request's own queries must still be recorded, got {recorded:?}"
+    );
+    for stray in ["prologue-poller", "mid-request-poller"] {
+        assert!(
+            !recorded.iter().any(|sql| sql.contains(stray)),
+            "a raw pool user's query ({stray}) must never reach a capsule — not as an \
+             exchange and not as connection history: {recorded:?}"
+        );
+    }
+}
+
+/// deadpool's default recycling pings the connection with `SELECT $1` before
+/// handing it out. The ping crosses the wire like any other statement, *before*
+/// the next checkout's marker rebinds the connection — so it is recorded
+/// against whoever holds the binding, and a replay (which never issues it)
+/// mismatches on the very next statement. The recording pool therefore recycles
+/// without a ping, and unbinds before recycling either way.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_pools_liveness_ping_is_never_recorded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool =
+        autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
+            .expect("recording pool builds");
+
+    let client = TestApp::new()
+        .config(capture_config(dir.path()))
+        .routes(routes![db_fail_twice])
+        .with_db(pool)
+        .build();
+
+    client.get("/db-fail-twice").send().await.assert_status(500);
+
+    let paths = await_capsules(dir.path(), 1).await;
+    let capsule = read_capsule(&paths[0]);
+    let tape = only_tape(&capsule);
+    let recorded = all_sql(tape);
+
+    assert!(
+        !recorded.iter().any(|sql| sql.trim() == "SELECT $1"),
+        "the pool's liveness ping is not something the handler did and replay never \
+         issues it: {recorded:?}"
+    );
+    let bound: Vec<String> = tape
+        .exchanges
+        .iter()
+        .flat_map(|exchange| exchange.binds.iter())
+        .filter_map(|bind| match bind {
+            autumn_web::capsule::BindValue::Value(bytes) => {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        bound.iter().any(|value| value == "first") && bound.iter().any(|value| value == "second"),
+        "both checkouts' work must be recorded, got {bound:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn exceeding_max_capsule_bytes_marks_truncated() {
@@ -536,7 +690,6 @@ async fn exceeding_max_capsule_bytes_marks_truncated() {
 #[tokio::test]
 async fn a_shard_checkout_marks_the_capsule_truncated_with_a_note() {
     use autumn_web::AppState;
-    use autumn_web::capsule::CAPSULE_SCOPE;
     use autumn_web::config::ShardConfig;
     use autumn_web::sharding::{HashShardRouter, ShardKeyOverride, ShardedDb, create_shard_set};
     use axum::extract::FromRequestParts as _;
@@ -567,21 +720,26 @@ async fn a_shard_checkout_marks_the_capsule_truncated_with_a_note() {
         Arc::new(autumn_web::log::filter::ParameterFilter::new(&[], &[])),
     ));
 
-    CAPSULE_SCOPE
-        .scope(Arc::clone(&scope), async {
-            let (mut parts, ()) = axum::http::Request::builder()
-                .uri("/orders")
-                .body(())
-                .expect("request builds")
-                .into_parts();
-            parts
-                .extensions
-                .insert(ShardKeyOverride("tenant-1".to_owned()));
-            // The checkout cannot succeed (no server); flagging the scope must
-            // not depend on it succeeding.
-            let _ = ShardedDb::from_request_parts(&mut parts, &state).await;
-        })
-        .await;
+    // The checkout path reads the process-wide arming flag before it reaches
+    // for a scope, so this test has to arm it the way a capture-enabled app
+    // does. Restored below.
+    let previously_armed = autumn_web::capsule::db_capture_enabled();
+    autumn_web::capsule::set_db_capture_enabled(true);
+    autumn_web::capsule::with_capture_scope(Arc::clone(&scope), async {
+        let (mut parts, ()) = axum::http::Request::builder()
+            .uri("/orders")
+            .body(())
+            .expect("request builds")
+            .into_parts();
+        parts
+            .extensions
+            .insert(ShardKeyOverride("tenant-1".to_owned()));
+        // The checkout cannot succeed (no server); flagging the scope must
+        // not depend on it succeeding.
+        let _ = ShardedDb::from_request_parts(&mut parts, &state).await;
+    })
+    .await;
+    autumn_web::capsule::set_db_capture_enabled(previously_armed);
 
     assert!(
         scope
@@ -605,7 +763,7 @@ async fn a_shard_checkout_marks_the_capsule_truncated_with_a_note() {
 /// lazily), so this needs no Docker.
 #[tokio::test]
 async fn tls_database_url_disables_db_capture_with_note() {
-    let reason = autumn_web::capsule::record_db::capture_unavailable_reason(
+    let reason = autumn_web::capsule::capture_unavailable_reason(
         "postgres://user:pw@db.example.com:5432/app?sslmode=require",
     )
     .expect("a TLS-required URL must not be recordable");
@@ -614,7 +772,7 @@ async fn tls_database_url_disables_db_capture_with_note() {
         "the reason must name TLS so an operator can act on it, got {reason:?}"
     );
     assert!(
-        autumn_web::capsule::record_db::capture_unavailable_reason(
+        autumn_web::capsule::capture_unavailable_reason(
             "postgres://user:pw@db.example.com:5432/app"
         )
         .is_none(),
@@ -628,7 +786,7 @@ async fn tls_database_url_disables_db_capture_with_note() {
         ..Default::default()
     };
 
-    let provider = autumn_web::capsule::record_db::maybe_capture_pool_provider(None, &config)
+    let provider = autumn_web::capsule::maybe_capture_pool_provider(None, &config)
         .expect("capture is enabled, so the provider is installed");
     let topology = provider(database)
         .await
@@ -643,7 +801,7 @@ async fn tls_database_url_disables_db_capture_with_note() {
         Arc::new(CaptureSettings::default()),
         Arc::new(autumn_web::log::filter::ParameterFilter::new(&[], &[])),
     );
-    autumn_web::capsule::record_db::note_db_capture_unavailable(&scope);
+    autumn_web::capsule::note_db_capture_unavailable(&scope);
     assert!(
         scope
             .notes()
@@ -652,5 +810,11 @@ async fn tls_database_url_disables_db_capture_with_note() {
         "capsules recorded on a TLS-database app must explain the missing DB tape, \
          got {:?}",
         scope.notes()
+    );
+    assert!(
+        scope.is_truncated(),
+        "a capsule whose request used a database none of whose traffic could be recorded \
+         is missing effects the request had: replay must refuse it, exactly as it does \
+         for an unrecorded shard"
     );
 }

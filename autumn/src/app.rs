@@ -2949,7 +2949,7 @@ impl AppBuilder {
         // — most importantly the database pool, whose factory decides here
         // whether to tee the connection stream (#1598).
         #[cfg(feature = "reporting")]
-        crate::capsule::install_from_config(config.failure_capture.enabled);
+        crate::capsule::set_db_capture_enabled(config.failure_capture.enabled);
 
         #[cfg(feature = "mail")]
         if mount_unsubscribe_endpoint {
@@ -5644,8 +5644,8 @@ impl AppBuilder {
     ///   [`pool_from_capsule`](crate::capsule::pool_from_capsule), which answers
     ///   from the capsule's recorded wire traffic over an in-process pipe.
     /// * Capture is never armed —
-    ///   [`install_from_config`](crate::capsule::install_from_config) is not
-    ///   called and `[failure_capture]` is forced off — so the replay neither
+    ///   [`set_db_capture_enabled`](crate::capsule::set_db_capture_enabled) is
+    ///   not called and `[failure_capture]` is forced off — so the replay neither
     ///   points the checkout marker at the stub pool nor writes a capsule of
     ///   itself.
     /// * The session store is forced to memory and the process cache is
@@ -5654,6 +5654,22 @@ impl AppBuilder {
     ///   rather than forwarded: it outranks the config in `apply_session_layer`,
     ///   so passing it through would let a replay reach — and write to — the
     ///   application's real session backend.
+    /// * Channels are forced in-process and a backend installed with
+    ///   [`with_channels_backend`](Self::with_channels_backend) is **dropped**,
+    ///   for the same reason as the session store: the Redis backend spawns a
+    ///   publisher and a listener against the application's live fan-out as
+    ///   soon as the state is built.
+    /// * The global request timeout is cleared. A replay's inputs all come from
+    ///   the capsule, but the timeout layer runs on real tokio timers, so a
+    ///   breakpoint held in a debugger would otherwise cancel the handler and
+    ///   report a mismatch that never happened. (A per-route
+    ///   `#[timeout(...)]` override lives in the route table and still applies.)
+    /// * Outbound HTTP is blocked wholesale
+    ///   (`http_client::block_outbound_for_replay`). The state carries the
+    ///   application's real `reqwest` client, and a capsule records no HTTP
+    ///   responses — so a handler that calls a third party gets a clear error
+    ///   naming the block, which surfaces as a mismatch rather than as a
+    ///   request to a live service.
     /// * No job runtime, no scheduler, no startup/shutdown hooks, and only
     ///   *sync* event listeners (a durable listener needs the job runtime).
     /// * No storage preflight, no mailer, no fail-fast configuration gates: a
@@ -5688,8 +5704,14 @@ impl AppBuilder {
             policy_registrations,
             #[cfg(feature = "db")]
             db_interceptor,
+            // F15, same reasoning as the session store: a backend installed
+            // with `with_channels_backend(...)` outranks `config.channels`, so
+            // forwarding it would let a replay publish into — and subscribe to
+            // — the application's live Redis fan-out. Replay builds its state
+            // with no custom backend, so the in-process backend
+            // `force_offline_replay_config` selects is what actually applies.
             #[cfg(feature = "ws")]
-            channels_backend,
+                channels_backend: _replay_ignores_custom_channels_backend,
             #[cfg(feature = "i18n")]
             i18n_bundle,
             #[cfg(feature = "i18n")]
@@ -5703,6 +5725,12 @@ impl AppBuilder {
             plugin_config_roots,
             ..
         } = self;
+
+        // Nothing outside the capsule may be reached from here on: the router
+        // this rebuilds is the real one, with the application's real outbound
+        // HTTP client in its state (AC4).
+        #[cfg(feature = "http-client")]
+        crate::http_client::block_outbound_for_replay();
 
         let path = std::path::PathBuf::from(&capsule_path);
         let capsule = match crate::capsule::load_capsule(&path) {
@@ -5744,7 +5772,7 @@ impl AppBuilder {
             #[cfg(feature = "db")]
             None,
             #[cfg(feature = "ws")]
-            channels_backend,
+            None,
         );
 
         // Time is an input like any other: serve the readings the capture took,
@@ -5918,6 +5946,20 @@ const fn force_offline_replay_config(config: &mut AutumnConfig) {
     // memory-in-production warning is noise for a one-shot replay.
     config.session.backend = crate::session::SessionBackend::Memory;
     config.session.allow_memory_in_production = true;
+    // Channels in process memory for the same reason: the Redis backend spawns
+    // a publisher and a listener task against the application's live fan-out
+    // the moment the state is built.
+    config.channels.backend = crate::config::ChannelBackend::InProcess;
+    // No wall-clock deadline. Everything a replay consumes comes from the
+    // capsule — including the clock the handler reads — but the request-timeout
+    // layer runs on real tokio timers, so the one thing still measured in real
+    // seconds is how long the replay takes. That matters the moment someone
+    // attaches a debugger: a breakpoint held for longer than the app's
+    // `request_timeout_ms` cancels the handler mid-replay and prints a
+    // mismatch that is an artefact of the debugging session. A per-route
+    // `#[timeout(...)]` override still applies — it is part of the route table,
+    // not the configuration — so a route that sets its own deadline keeps it.
+    config.server.timeouts.request_timeout_ms = None;
 }
 
 /// The database topology a replay runs against: an in-process pool answering
@@ -10886,7 +10928,7 @@ mod tests {
                 && !handler.contains("initialize_job_runtime")
                 && !handler.contains("start_task_scheduler")
                 && !handler.contains("preflight_storage(")
-                && !handler.contains("install_from_config("),
+                && !handler.contains("set_db_capture_enabled("),
             "replay must not run migrations, job workers, storage preflight or capture"
         );
         assert!(
@@ -10907,6 +10949,84 @@ mod tests {
         assert!(
             forcer.contains("failure_capture.enabled = false"),
             "replay must not capture a capsule of the replay itself"
+        );
+    }
+
+    /// A replay must not reach anything the capsule does not contain. Three
+    /// live-service escapes are closed here, in the same structural style as
+    /// the session store below: the outbound HTTP client (a handler that calls
+    /// a third party would otherwise call the *real* one), the channels backend
+    /// (whose Redis form spawns a publisher and a listener against the
+    /// application's live fan-out as soon as the state is built), and the
+    /// request timeout (real tokio timers, so a debugger breakpoint would
+    /// cancel the handler and print a mismatch that never happened).
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_reaches_nothing_outside_the_capsule() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let handler = replay_mode_source(&source);
+
+        assert!(
+            handler.contains("crate::http_client::block_outbound_for_replay();"),
+            "the replay handler must block outbound HTTP before rebuilding the app"
+        );
+        assert!(
+            handler.contains("channels_backend: _replay_ignores_custom_channels_backend,"),
+            "the replay handler must drop a custom channels backend, which outranks the \
+             forced in-process one"
+        );
+        assert!(
+            !handler.contains("            channels_backend,\n"),
+            "the replay handler must not forward the builder's channels backend"
+        );
+
+        let forcer_start = source
+            .find("fn force_offline_replay_config(")
+            .expect("the offline-knob helper exists");
+        let forcer = source
+            .get(forcer_start..forcer_start.saturating_add(3_000))
+            .unwrap_or_default();
+        assert!(
+            forcer.contains("config.channels.backend = crate::config::ChannelBackend::InProcess;"),
+            "replay must force the in-process channels backend (no Redis fan-out)"
+        );
+        assert!(
+            forcer.contains("config.server.timeouts.request_timeout_ms = None;"),
+            "replay must clear the wall-clock request deadline"
+        );
+    }
+
+    /// The knobs the helper forces, checked on a real configuration rather than
+    /// on its source: everything a replay must not honour, in one place.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_offline_replay_config_reaches_no_live_service() {
+        let mut config = AutumnConfig::default();
+        config.failure_capture.enabled = true;
+        config.session.backend = crate::session::SessionBackend::Redis;
+        config.channels.backend = crate::config::ChannelBackend::Redis;
+        config.server.timeouts.request_timeout_ms = Some(30_000);
+
+        force_offline_replay_config(&mut config);
+
+        assert!(
+            !config.failure_capture.enabled,
+            "a replay must not capture a capsule of itself"
+        );
+        assert_eq!(
+            config.session.backend,
+            crate::session::SessionBackend::Memory
+        );
+        assert!(config.session.allow_memory_in_production);
+        assert_eq!(
+            config.channels.backend,
+            crate::config::ChannelBackend::InProcess,
+            "a replayed app must not dial the application's Redis fan-out"
+        );
+        assert_eq!(
+            config.server.timeouts.request_timeout_ms, None,
+            "a deterministic offline replay has no wall-clock deadline — and a \
+             breakpoint held in a debugger must not cancel the handler"
         );
     }
 

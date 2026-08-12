@@ -560,16 +560,39 @@ fn parse_version(text: &str) -> Version {
 
 /// Whether the replayed outcome counts as the recorded one.
 ///
+/// Two failures are the same failure when they have the same *identity*, not
+/// merely the same status: a 500 whose message and problem type differ is a
+/// different bug, and reporting it as a reproduction is exactly the wrong
+/// answer for a tool whose job is telling you whether the bug is still there.
+/// So a status outcome compares code, problem type **and** message. The
+/// comparison is fair because both sides went through the same redaction: the
+/// replayed request carries the capsule's `[FILTERED]` literals, so a message
+/// that echoes request content echoes the same masked content.
+///
 /// A recorded panic compares by payload when the replayed panic also escaped
-/// (substring either way, so a payload the recorder truncated still matches),
-/// and by status when a panic-catching middleware turned one side into a plain
-/// response — which is the ordinary case for an Autumn router.
+/// (substring either way, so a payload the recorder truncated still matches —
+/// but only when there is something to match: an *empty* recorded payload is a
+/// substring of everything, so it demands equality instead), and by status when
+/// a panic-catching middleware turned one side into a plain response — which is
+/// the ordinary case for an Autumn router.
 fn outcomes_match(expected: &CapsuleOutcome, actual: &CapsuleOutcome) -> bool {
     match (expected, actual) {
         (
-            CapsuleOutcome::Status { code: expected, .. },
-            CapsuleOutcome::Status { code: actual, .. },
-        ) => expected == actual,
+            CapsuleOutcome::Status {
+                code: expected_code,
+                message: expected_message,
+                problem_type: expected_type,
+            },
+            CapsuleOutcome::Status {
+                code: actual_code,
+                message: actual_message,
+                problem_type: actual_type,
+            },
+        ) => {
+            expected_code == actual_code
+                && expected_type == actual_type
+                && expected_message == actual_message
+        }
         (
             CapsuleOutcome::Panic {
                 payload: expected, ..
@@ -577,12 +600,64 @@ fn outcomes_match(expected: &CapsuleOutcome, actual: &CapsuleOutcome) -> bool {
             CapsuleOutcome::Panic {
                 payload: actual, ..
             },
-        ) => expected == actual || actual.contains(expected) || expected.contains(actual),
+        ) => panic_payloads_match(expected, actual),
         (CapsuleOutcome::Panic { status, .. }, CapsuleOutcome::Status { code, .. })
         | (CapsuleOutcome::Status { code, .. }, CapsuleOutcome::Panic { status, .. }) => {
             status == code
         }
     }
+}
+
+/// Whether two panic payloads describe the same panic.
+///
+/// Substring matching only applies when the recorded payload has something to
+/// match on. An empty recorded payload — a panic whose payload was neither a
+/// `&str` nor a `String`, or one the recorder could not format — is a substring
+/// of every string, so it would silently accept any panic at all; and the
+/// placeholder the formatter falls back to (`handler panicked`) says nothing
+/// about *which* panic, so it only matches itself.
+fn panic_payloads_match(expected: &str, actual: &str) -> bool {
+    const PLACEHOLDER: &str = "handler panicked";
+    if expected.is_empty() || expected == PLACEHOLDER || actual.is_empty() {
+        return expected == actual;
+    }
+    expected == actual || actual.contains(expected) || expected.contains(actual)
+}
+
+/// The one-line explanation for a verdict whose status lined up but whose
+/// failure identity did not, so a reader is not left comparing two `500`s.
+fn identity_mismatch_note(expected: &CapsuleOutcome, actual: &CapsuleOutcome) -> Option<String> {
+    let (
+        CapsuleOutcome::Status {
+            code: expected_code,
+            message: expected_message,
+            problem_type: expected_type,
+        },
+        CapsuleOutcome::Status {
+            code: actual_code,
+            message: actual_message,
+            problem_type: actual_type,
+        },
+    ) = (expected, actual)
+    else {
+        return None;
+    };
+    if expected_code != actual_code {
+        return None;
+    }
+    if expected_type != actual_type {
+        return Some(format!(
+            "the status matched ({expected_code}) but the failure identity did not: the capsule \
+             recorded problem type {expected_type:?} and the replay produced {actual_type:?}"
+        ));
+    }
+    (expected_message != actual_message).then(|| {
+        format!(
+            "the status matched ({expected_code}) but the failure identity did not: the capsule \
+             recorded {expected_message:?} and the replay produced {actual_message:?} — same \
+             status, different failure"
+        )
+    })
 }
 
 /// Warn when the capsule came from a different build (F23, soft half).
@@ -678,8 +753,36 @@ pub fn print_refusal(reason: &str, capsule_path: &Path) -> i32 {
     });
     println!("{document}");
     eprintln!("REFUSED  {}", capsule_path.display());
-    eprintln!("  {reason}");
+    eprintln!("  {}", printable(reason));
     EXIT_REFUSED
+}
+
+/// Strip C0 control characters from a string that came out of a capsule before
+/// it is written to a terminal.
+///
+/// Capsule text is production request data: an error message, a panic payload
+/// or a SQL string can carry whatever a client sent, including ANSI escape
+/// sequences that would repaint the operator's terminal, hide the rest of the
+/// verdict, or forge a line of output. Newlines and tabs are kept — they are
+/// ordinary in a SQL statement — and everything else in the C0 range, escape
+/// included, becomes a visible placeholder. The JSON document on stdout is
+/// untouched: it is data, and a consumer needs it verbatim.
+fn printable(text: &str) -> String {
+    if !text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return text.to_owned();
+    }
+    text.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Print a replay verdict — JSON on stdout, a human summary on stderr — and
@@ -704,8 +807,19 @@ pub fn print_verdict(outcome: &ReplayOutcome, capsule_path: &Path) -> i32 {
         outcome.verdict.label().to_uppercase(),
         capsule_path.display()
     );
-    eprintln!("  expected: {}", describe_outcome(&outcome.expected));
-    eprintln!("  actual:   {}", describe_outcome(&outcome.actual));
+    eprintln!(
+        "  expected: {}",
+        printable(&describe_outcome(&outcome.expected))
+    );
+    eprintln!(
+        "  actual:   {}",
+        printable(&describe_outcome(&outcome.actual))
+    );
+    if outcome.verdict == Verdict::Mismatch
+        && let Some(note) = identity_mismatch_note(&outcome.expected, &outcome.actual)
+    {
+        eprintln!("  {}", printable(&note));
+    }
     if !outcome.divergences.is_empty() {
         eprintln!("  database divergences ({}):", outcome.divergences.len());
         for divergence in &outcome.divergences {
@@ -714,12 +828,12 @@ pub fn print_verdict(outcome: &ReplayOutcome, capsule_path: &Path) -> i32 {
                 divergence.kind.label(),
                 divergence.connection,
                 divergence.exchange_index,
-                divergence.detail
+                printable(&divergence.detail)
             );
         }
     }
     for warning in &outcome.warnings {
-        eprintln!("  warning: {warning}");
+        eprintln!("  warning: {}", printable(warning));
     }
     outcome.verdict.exit_code()
 }
@@ -815,6 +929,94 @@ mod tests {
             &panic_outcome("boom"),
             &panic_outcome("something else")
         ));
+    }
+
+    /// A failure's identity is more than its status code. Two different 500s
+    /// are two different bugs, and calling the second one a reproduction of the
+    /// first is the wrong answer from a tool whose whole job is telling you
+    /// whether the bug is still there.
+    #[test]
+    fn a_matching_status_with_a_different_failure_is_a_mismatch() {
+        let recorded = CapsuleOutcome::Status {
+            code: 500,
+            message: "order 42 has no shipping address".to_owned(),
+            problem_type: Some("https://errors.example/db".to_owned()),
+        };
+        assert!(outcomes_match(&recorded, &recorded.clone()));
+
+        let other_message = CapsuleOutcome::Status {
+            code: 500,
+            message: "connection pool exhausted".to_owned(),
+            problem_type: Some("https://errors.example/db".to_owned()),
+        };
+        assert!(
+            !outcomes_match(&recorded, &other_message),
+            "a different failure with the same status is not a reproduction"
+        );
+        assert!(
+            identity_mismatch_note(&recorded, &other_message)
+                .is_some_and(|note| note.contains("failure identity")),
+            "the verdict must explain that the status matched but the failure did not"
+        );
+
+        let other_type = CapsuleOutcome::Status {
+            code: 500,
+            message: "order 42 has no shipping address".to_owned(),
+            problem_type: Some("https://errors.example/other".to_owned()),
+        };
+        assert!(!outcomes_match(&recorded, &other_type));
+        assert!(identity_mismatch_note(&recorded, &other_type).is_some());
+
+        // A genuinely different status is reported as such, not as an identity
+        // difference.
+        assert!(identity_mismatch_note(&recorded, &status(503)).is_none());
+    }
+
+    /// An empty recorded payload is a substring of every string. Accepting it
+    /// as a match would make any panic at all reproduce a capsule whose panic
+    /// payload the recorder could not format.
+    #[test]
+    fn an_empty_or_placeholder_panic_payload_only_matches_itself() {
+        assert!(!outcomes_match(
+            &panic_outcome(""),
+            &panic_outcome("something else entirely")
+        ));
+        assert!(outcomes_match(&panic_outcome(""), &panic_outcome("")));
+        assert!(
+            !outcomes_match(
+                &panic_outcome("handler panicked"),
+                &panic_outcome("index out of bounds")
+            ),
+            "the formatter's placeholder for a non-string payload says nothing about \
+             which panic happened, so it cannot stand in for one"
+        );
+        assert!(outcomes_match(
+            &panic_outcome("handler panicked"),
+            &panic_outcome("handler panicked")
+        ));
+        // Truncation on either side still matches.
+        assert!(outcomes_match(
+            &panic_outcome("boom"),
+            &panic_outcome("boom at src/lib.rs:1")
+        ));
+    }
+
+    /// Capsule text is production request data. Printing it to a terminal
+    /// verbatim would let a recorded ANSI escape repaint the operator's screen
+    /// or forge a line of the verdict.
+    #[test]
+    fn control_characters_are_stripped_from_printed_capsule_text() {
+        let scrubbed = printable("boom\u{1b}[2J\u{1b}[1;1HREPRODUCED  clean\u{7}");
+        assert!(
+            !scrubbed.contains('\u{1b}') && !scrubbed.contains('\u{7}'),
+            "escape sequences must not reach the terminal, got {scrubbed:?}"
+        );
+        assert!(scrubbed.starts_with("boom"), "the text itself is kept");
+        assert_eq!(
+            printable("SELECT 1\n\tFROM t"),
+            "SELECT 1\n\tFROM t",
+            "newlines and tabs are ordinary in SQL and must survive"
+        );
     }
 
     #[test]
@@ -982,7 +1184,14 @@ mod tests {
     #[tokio::test]
     async fn a_capsule_without_a_database_reproduces_unaffected() {
         let router = axum::Router::new().route("/orders", axum::routing::get(|| async { "ok" }));
-        let mut capsule = fixture(status(200));
+        // The recorded outcome is the one this router produces, message and
+        // all: a reproduction means the same failure, not merely the same
+        // status code.
+        let mut capsule = fixture(CapsuleOutcome::Status {
+            code: 200,
+            message: "OK".to_owned(),
+            problem_type: None,
+        });
         capsule.db = None;
         let outcome = execute(router, &capsule, Arc::new(DivergenceLog::new()), None).await;
         assert_eq!(outcome.verdict, Verdict::Reproduced, "{outcome:?}");

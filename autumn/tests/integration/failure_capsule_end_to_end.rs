@@ -29,6 +29,7 @@ use autumn_web::config::AutumnConfig;
 use autumn_web::db::Db;
 use autumn_web::test::{TestApp, TestDb};
 use autumn_web::{get, routes};
+use axum::extract::State;
 use chrono::{DateTime, Utc};
 use diesel_async::RunQueryDsl as _;
 
@@ -76,6 +77,32 @@ async fn widgets_panic(mut db: Db) -> String {
         .await
         .expect("the seeded rows must load");
     panic!("kaboom after reading {} widget(s)", widgets.len());
+}
+
+/// Reads through **two** checkouts of a one-slot pool: the connection is
+/// returned to the pool and taken out again while this request's capture scope
+/// is still open, which is where the pool's own recycling traffic would land if
+/// it were recorded.
+#[get("/widgets/twice")]
+async fn widgets_twice(State(state): State<autumn_web::AppState>) -> Result<String, AutumnError> {
+    let pool = state
+        .pool()
+        .ok_or_else(|| AutumnError::internal_server_error_msg("no pool"))?
+        .clone();
+
+    let mut first = Db::connect_for_test(&pool).await?;
+    let tools = load_widgets(&mut first, "tool").await?;
+    drop(first);
+
+    let mut second = Db::connect_for_test(&pool).await?;
+    let toys = load_widgets(&mut second, "toy").await?;
+    drop(second);
+
+    Err(AutumnError::internal_server_error_msg(format!(
+        "read {} tool(s) and {} toy(s) and then exploded",
+        tools.len(),
+        toys.len()
+    )))
 }
 
 // ── Harness ─────────────────────────────────────────────────────────────────
@@ -291,6 +318,76 @@ async fn forced_500_on_a_db_reading_route_is_captured_and_replayed_identically()
         replayed_message, recorded_message,
         "the replayed handler must have decoded the same rows out of the tape"
     );
+}
+
+/// Two checkouts of a single-slot pool inside one request. deadpool's default
+/// recycling would ping the connection with `SELECT $1` between them — recorded
+/// into this request's tape, because the marker that rebinds only comes
+/// afterwards — and the replayed run, which never issues it, would mismatch on
+/// the very next statement. The whole loop is the assertion: the tape carries
+/// no ping, and it replays.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_request_that_checks_out_twice_records_no_pool_traffic_and_replays() {
+    let db = TestDb::shared().await;
+    seed(db).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let recording_pool =
+        autumn_web::capsule::build_recording_pool(db.url(), 1, Duration::from_secs(10))
+            .expect("recording pool builds");
+    let client = TestApp::new()
+        .config(capture_config(dir.path()))
+        .routes(routes![widgets_twice])
+        .with_db(recording_pool)
+        .build();
+
+    client.get("/widgets/twice").send().await.assert_status(500);
+
+    let path = await_one_capsule(dir.path()).await;
+    let capsule = load_capsule(&path).expect("the written capsule must load");
+    assert!(!capsule.truncated, "two small reads must fit the budget");
+
+    let recorded: Vec<&str> = capsule
+        .db
+        .as_ref()
+        .expect("the capsule carries the traffic")
+        .connections
+        .iter()
+        .flat_map(|connection| {
+            connection
+                .prologue
+                .iter()
+                .chain(&connection.statements)
+                .chain(&connection.catalog)
+                .chain(&connection.exchanges)
+        })
+        .map(|exchange| exchange.sql.as_str())
+        .collect();
+    assert!(
+        !recorded.iter().any(|sql| sql.trim() == "SELECT $1"),
+        "the pool's liveness ping is not part of what the handler did: {recorded:?}"
+    );
+
+    let divergences = Arc::new(DivergenceLog::new());
+    let replay_pool =
+        pool_from_capsule(&capsule, Arc::clone(&divergences)).expect("replay pool builds");
+    let clock = replay_clock(&capsule);
+    let router = TestApp::new()
+        .config(replay_config())
+        .routes(routes![widgets_twice])
+        .with_db(replay_pool)
+        .with_clock(SharedClock(Arc::clone(&clock)))
+        .build()
+        .into_router();
+
+    let outcome = execute(router, &capsule, divergences, Some(clock.as_ref())).await;
+    assert!(
+        outcome.divergences.is_empty(),
+        "a request that reused its connection must still replay on the tape: {:?}",
+        outcome.divergences
+    );
+    assert_eq!(outcome.verdict, Verdict::Reproduced, "{outcome:?}");
 }
 
 #[tokio::test]

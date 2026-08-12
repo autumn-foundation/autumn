@@ -51,7 +51,7 @@ use crate::log::filter::ParameterFilter;
 
 tokio::task_local! {
     /// The capture scope of the request currently being served on this task.
-    pub static CAPSULE_SCOPE: Arc<CaptureScope>;
+    pub(crate) static CAPSULE_SCOPE: Arc<CaptureScope>;
 }
 
 /// The capture scope of the request being served on this task, if any.
@@ -72,14 +72,25 @@ pub fn db_capture_enabled() -> bool {
     DB_CAPTURE_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Arm or disarm process-wide capture from the resolved configuration.
+/// Arm or disarm process-wide database capture.
 ///
 /// Idempotent and last-writer-wins. Called early in
 /// [`App::run`](crate::app::AppBuilder::run) — before the database pool is
 /// built, because the pool factory consults it — and again at router-build
-/// time so test apps observe the same wiring.
-pub fn install_from_config(enabled: bool) {
+/// time, unconditionally, so a test app built with capture off also *disarms*
+/// whatever an earlier test in the same process armed.
+pub fn set_db_capture_enabled(enabled: bool) {
     DB_CAPTURE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Run `future` with `scope` established as the current capture scope.
+///
+/// The task-local itself is crate-private (a request's scope is the framework's
+/// bookkeeping, not an extension point); this is the seam integration tests use
+/// to drive effect sources that read [`current_scope`].
+#[cfg(feature = "test-support")]
+pub async fn with_capture_scope<F: Future>(scope: Arc<CaptureScope>, future: F) -> F::Output {
+    CAPSULE_SCOPE.scope(scope, future).await
 }
 
 /// Immutable knobs a scope needs to bound and place its capsule.
@@ -337,6 +348,10 @@ impl CaptureScope {
     #[must_use]
     pub fn captured_body(&self) -> CapturedBody {
         let Ok(tap) = self.body.lock() else {
+            // A poisoned lock means a body copy was interrupted mid-write.
+            // Reporting "no body" as though the request had none would be a
+            // falsification, so the capsule is marked incomplete instead.
+            self.mark_truncated();
             return CapturedBody::Absent;
         };
         match &*tap {
@@ -401,9 +416,19 @@ impl CaptureScope {
     }
 
     /// Snapshot the recorded database traffic for serialization.
+    ///
+    /// A poisoned buffer lock yields no tape *and* marks the capsule
+    /// truncated: "this request did no database work" and "the recorded
+    /// database work is unreachable" must not look the same to replay.
     #[must_use]
     pub fn db_snapshot(&self) -> Option<CapsuleDb> {
-        self.db.lock().ok().and_then(|db| db.snapshot())
+        self.db.lock().map_or_else(
+            |_| {
+                self.mark_truncated();
+                None
+            },
+            |db| db.snapshot(),
+        )
     }
 
     /// Note a degraded-capture condition for the capsule reader.
@@ -435,15 +460,18 @@ impl CaptureScope {
     /// request's attribution marker, so without a close the ping would be
     /// recorded against whoever held that connection last, and replay of that
     /// capsule would then expect a query its handler never issued (F2).
+    /// Release/Acquire rather than Relaxed: closing publishes everything the
+    /// request recorded, and a connection recorder on another thread that
+    /// observes the close must also observe those writes.
     pub fn close(&self) {
-        self.closed.store(true, Ordering::Relaxed);
+        self.closed.store(true, Ordering::Release);
     }
 
     /// Whether the request is over and the capsule is no longer accepting
     /// effects.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Relaxed)
+        self.closed.load(Ordering::Acquire)
     }
 
     /// Mark the capsule as incomplete; replay must refuse it.
@@ -487,7 +515,7 @@ pub fn scope_by_id(id: &str) -> Option<Arc<CaptureScope>> {
         .and_then(|registry| registry.get(id).and_then(Weak::upgrade))
 }
 
-fn register(scope: &Arc<CaptureScope>) {
+pub(crate) fn register(scope: &Arc<CaptureScope>) {
     if let Ok(mut registry) = REGISTRY.lock() {
         registry.insert(scope.id().to_owned(), Arc::downgrade(scope));
     }
@@ -1056,6 +1084,48 @@ mod tests {
         assert!(
             scope_by_id(scope.id()).is_none(),
             "and must no longer be reachable by a connection marker"
+        );
+    }
+
+    /// A lock poisoned by a panic mid-record means the capsule is missing
+    /// whatever was being written. Returning the degraded value alone would
+    /// make that indistinguishable from "the request did none of this".
+    #[test]
+    fn a_poisoned_buffer_marks_the_capsule_truncated() {
+        let scope = Arc::new(CaptureScope::new(
+            "poisoned".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        ));
+        let panicking = Arc::clone(&scope);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panicking.with_db(|_| panic!("recording interrupted"));
+        }));
+
+        assert!(
+            scope.db_snapshot().is_none(),
+            "an unreachable buffer yields no tape"
+        );
+        assert!(
+            scope.is_truncated(),
+            "and the capsule must say it is incomplete rather than imply the request \
+             never touched the database"
+        );
+
+        let body_scope = Arc::new(CaptureScope::new(
+            "poisoned-body".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        ));
+        let panicking = Arc::clone(&body_scope);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = panicking.body.lock();
+            panic!("body copy interrupted");
+        }));
+        assert!(matches!(body_scope.captured_body(), CapturedBody::Absent));
+        assert!(
+            body_scope.is_truncated(),
+            "a body that could not be read back is a truncated capture, not an absent body"
         );
     }
 

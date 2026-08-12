@@ -105,6 +105,10 @@ pub const PROTOCOL_VERSION_3: u32 = 196_608;
 /// The GUC Autumn sets to bind a pooled connection to a capsule scope.
 pub const MARKER_GUC: &str = "autumn.capsule_request";
 
+/// [`MARKER_GUC`] upper-cased, for matching against a normalised statement.
+/// Pinned to the real GUC by `marker_guc_upper_matches_the_guc`.
+const MARKER_GUC_UPPER: &str = "AUTUMN.CAPSULE_REQUEST";
+
 /// Smallest legal `len` field of a tagged message (the four length bytes with
 /// an empty payload).
 const MIN_TAGGED_LEN: usize = 4;
@@ -435,8 +439,13 @@ pub enum FrontendMessage {
     Sync,
     /// `Flush`.
     Flush,
-    /// `Close`.
-    Close,
+    /// `Close` — drops a prepared statement (`S`) or a portal (`P`).
+    Close {
+        /// `b'S'` or `b'P'`.
+        kind: u8,
+        /// Statement or portal name.
+        name: String,
+    },
     /// `Terminate`.
     Terminate,
     /// Any other tag, or a message whose payload did not parse.
@@ -463,7 +472,7 @@ pub fn parse_frontend(frame: &Frame) -> FrontendMessage {
         b'E' => Some(FrontendMessage::Execute),
         b'S' => Some(FrontendMessage::Sync),
         b'H' => Some(FrontendMessage::Flush),
-        b'C' => Some(FrontendMessage::Close),
+        b'C' => parse_close(&mut reader),
         b'X' => Some(FrontendMessage::Terminate),
         _ => None,
     };
@@ -520,6 +529,16 @@ fn parse_describe(reader: &mut Reader<'_>) -> Option<FrontendMessage> {
     Some(FrontendMessage::Describe { kind, name })
 }
 
+/// `Close`: same shape as `Describe` — one kind byte then a cstring name.
+///
+/// The recorder needs the name: closing a statement retires the
+/// name-to-SQL entry it learnt from the matching `Parse`.
+fn parse_close(reader: &mut Reader<'_>) -> Option<FrontendMessage> {
+    let kind = reader.u8()?;
+    let name = reader.cstr()?;
+    Some(FrontendMessage::Close { kind, name })
+}
+
 /// The outcome of scanning SQL for the capsule attribution marker.
 ///
 /// `None` from [`marker_request_id`] means "no marker statement here at all";
@@ -572,9 +591,58 @@ pub fn marker_set_sql(id: &str) -> Option<String> {
     }
 }
 
+/// Whether every statement in `sql` is session housekeeping — a setting the
+/// framework issues on its own behalf, which the replay stub answers
+/// synthetically rather than from the tape.
+///
+/// One definition, used by both halves: the recorder keeps these statements out
+/// of a capsule's ordered `exchanges` (a recorded copy would leave replay's
+/// cursor a step ahead of the client for the rest of the tape) and the stub
+/// answers exactly the same set. Two spellings of "housekeeping" would mean a
+/// statement dropped at record time and demanded at replay time.
+///
+/// A batch counts only if *every* statement in it does: `SET statement_timeout
+/// = 5000; SELECT 1` is the request's work. An empty batch is **not**
+/// housekeeping — there is nothing there to be the framework's own — so a
+/// caller cannot pass a blank string and have arbitrary handling applied.
+pub fn is_session_housekeeping(sql: &str) -> bool {
+    let mut saw_statement = false;
+    for statement in split_statements(sql) {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        saw_statement = true;
+        if !is_housekeeping_statement(statement) {
+            return false;
+        }
+    }
+    saw_statement
+}
+
+/// Whether one statement is a session setting replay reproduces on its own.
+///
+/// Whitespace-tolerant on both sides of the setting name, so `SET  TIME ZONE`
+/// is classified identically by the recorder and the stub.
+fn is_housekeeping_statement(statement: &str) -> bool {
+    let statement = statement.trim().to_ascii_uppercase();
+    let Some(setting) = strip_keyword(&statement, "SET") else {
+        return false;
+    };
+    let setting = setting.trim_start();
+    [
+        "TIME ZONE",
+        "CLIENT_ENCODING",
+        "STATEMENT_TIMEOUT",
+        MARKER_GUC_UPPER,
+    ]
+    .iter()
+    .any(|name| setting.starts_with(name))
+}
+
 /// Split a SQL batch at top-level semicolons, ignoring semicolons inside
 /// single-quoted literals and double-quoted identifiers.
-fn split_statements(sql: &str) -> Vec<&str> {
+pub fn split_statements(sql: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut in_single = false;
@@ -1699,7 +1767,10 @@ mod tests {
                 },
                 FrontendMessage::Execute,
                 FrontendMessage::Sync,
-                FrontendMessage::Close,
+                FrontendMessage::Close {
+                    kind: b'S',
+                    name: String::new()
+                },
                 FrontendMessage::Terminate,
             ]
         );
