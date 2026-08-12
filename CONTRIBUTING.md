@@ -10,8 +10,11 @@ cross-package break is caught locally instead of on the PR:
 ```
 
 It mirrors CI's always-on `lint` + `test` jobs (`.github/workflows/ci.yml`) —
+`./scripts/check-panic-gate.sh` (the [#1611][issue-1611] request-path panic
+gate; first because it needs no toolchain and finishes in about a second),
 `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
-warnings`, a **compile-only** `cargo test --workspace --no-run`, and a
+warnings`, a `--lib` clippy run over the gated request-path features, a
+**compile-only** `cargo test --workspace --no-run`, and a
 `cargo test --workspace --doc` doctest leg. The compile-only step is the
 important one: CI's blocking gate is `cargo test --workspace`, which links
 **every** workspace test target including the autumn-web consolidated
@@ -222,7 +225,7 @@ the same scrutiny as deleting a lint.
 Run it locally with `./scripts/check-panic-gate.sh` — the default invocation runs
 its own `--self-test` (synthetic fixtures in a temp dir, asserting the checker
 still *fails* on each spoof it claims to catch) before checking the real tree, and
-both legs together take under a second. `./scripts/pre-push-check.sh` runs it as
+both legs together take about a second. `./scripts/pre-push-check.sh` runs it as
 its first step, alongside the gated-features clippy run.
 
 ### Falsifying the gate (AC1)
