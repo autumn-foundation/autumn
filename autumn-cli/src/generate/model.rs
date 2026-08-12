@@ -190,6 +190,22 @@ pub fn plan_model_with_options(
     let schema_fields = augment_fields_for_soft_delete(&fields, options.soft_delete)?;
 
     let mut plan = Plan::new(project_root);
+    // Issue #1318: `lock_version` is a magic column name — declaring it changes
+    // the model's semantics (DB-managed, kept out of `New{Model}`, carried on
+    // `Update{Model}` as the expected version, conflict-checked by the
+    // repository, and hidden from a scaffold's form). That is the whole point
+    // for someone who wanted optimistic locking, and a nasty surprise for
+    // someone who just wanted a counter with that name — so say so out loud
+    // rather than letting the reinterpretation happen silently.
+    if lock_version_field(&fields).is_some() {
+        plan.warn(format!(
+            "`{LOCK_VERSION_COLUMN}` opts this model into optimistic locking: the column is \
+             managed by the database (excluded from New{pascal_name}, carried on \
+             Update{pascal_name} as the expected version, defaulted to 0 in the migration) and \
+             a scaffolded form carries it in a hidden field rather than an editable control. \
+             Rename the column if you wanted an ordinary integer you set yourself."
+        ));
+    }
     check_reference_targets(
         &mut plan,
         project_root,
@@ -1758,6 +1774,22 @@ pub fn lock_version_field(fields: &[Field]) -> Option<&Field> {
     field_by_name(fields, LOCK_VERSION_COLUMN)
 }
 
+/// Whether `field` is a usable optimistic-locking column (issue #1318): named
+/// `lock_version`, non-nullable, and an integer counter.
+///
+/// The stricter test than [`lock_version_field`], for the call sites that must
+/// decide what SQL/attribute to emit rather than whether to complain. A field
+/// named `lock_version` that fails this predicate is rejected by
+/// [`validate_lock_version_field`] on every planning path, so the two agree —
+/// but the emission sites stay independently safe if a future entry point
+/// forgets the check.
+#[must_use]
+pub fn is_lock_version_column(field: &Field) -> bool {
+    field.name == LOCK_VERSION_COLUMN
+        && !field.nullable
+        && matches!(field.kind, FieldKind::I32 | FieldKind::I64)
+}
+
 /// Reject a `lock_version` column the locking primitive can't actually use.
 ///
 /// `#[lock_version]`'s generated comparison reads the column as an `i64`, so a
@@ -1773,7 +1805,7 @@ pub fn validate_lock_version_field(fields: &[Field]) -> Result<(), GenerateError
     let Some(field) = lock_version_field(fields) else {
         return Ok(());
     };
-    if field.nullable || !matches!(field.kind, FieldKind::I32 | FieldKind::I64) {
+    if !is_lock_version_column(field) {
         return Err(GenerateError::InvalidField {
             token: format!("{}:{}", field.name, field.rust_type()),
             reason: format!(
@@ -1782,6 +1814,22 @@ pub fn validate_lock_version_field(fields: &[Field]) -> Result<(), GenerateError
                  generated comparison reads it as an integer. Declare it as \
                  `{LOCK_VERSION_COLUMN}:i32` (or `{LOCK_VERSION_COLUMN}:i64`), or rename the \
                  column if it was not meant to be a lock version."
+            ),
+        });
+    }
+    // `unique` + a defaulted column is already rejected for explicit
+    // `--default` flags above, for the reason that bites hardest here: the lock
+    // column is DB-managed, so EVERY insert takes the same `DEFAULT 0` and the
+    // second row created collides with the first. The check above runs before
+    // the lock column's default is injected, so it never sees this pairing —
+    // catch it here instead of emitting a table that accepts exactly one row.
+    if field.unique {
+        return Err(GenerateError::InvalidField {
+            token: format!("{}:unique", field.name),
+            reason: format!(
+                "`{LOCK_VERSION_COLUMN}` cannot be `unique`: it is managed by the database \
+                 and defaults to 0 on every insert, so a unique index on it would reject the \
+                 second row ever created. Drop the `unique` marker."
             ),
         });
     }
@@ -5459,6 +5507,66 @@ autumn-web = \"0.3\"\n";
         assert!(
             msg.contains("lock_version") && msg.contains("i32"),
             "the error must name the field and the supported types: {msg}"
+        );
+    }
+
+    #[test]
+    fn unique_lock_version_is_rejected() {
+        // The column is DB-managed and defaults to 0 on every insert, so a
+        // unique index on it would reject the second row ever created — and
+        // the `--default` + `unique` guard above never sees the pairing,
+        // because the lock column's default is injected after it runs.
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+            &ModelOptions {
+                uniques: vec!["lock_version".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lock_version") && msg.contains("unique"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn lock_version_emits_a_plan_warning_so_the_opt_in_is_never_silent() {
+        // `lock_version` is a magic name: declaring it changes what the column
+        // *is*. Someone who wanted an ordinary counter must be told.
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("optimistic locking") && w.contains("Rename")),
+            "expected an opt-in warning naming the escape hatch: {:?}",
+            plan.warnings
+        );
+
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("lock")),
+            "a model without the column must not warn: {:?}",
+            plan.warnings
         );
     }
 

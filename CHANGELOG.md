@@ -32,17 +32,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the *same* edit form with the author's own input intact, an inline
   `role="alert"` banner, and the row's **current** version in the hidden field —
   so a second Save applies their edit on top of the newer row. Handing the stale
-  version back would leave the form permanently unsavable. The generated
-  `tests/<snake>.rs` gains a `<plural>_optimistic_lock_conflict` test asserting
-  exactly that sequence, and `generate admin`'s existing `#[lock_version]`
-  detection now composes with scaffolded models for free.
+  version back would leave the form permanently unsavable. A `:states(...)`
+  transition bumps the version too, so an author holding an older edit form
+  learns the record moved on instead of saving over it.
 
-  A `lock_version` column that is not a non-nullable `i32`/`i64` is rejected at
-  generation time rather than silently ignored. `--live`, `--sharded`, and
-  scaffolds with an `Attachment` column write through paths that do not route
-  via the guarded statement, so combining them with `lock_version` is refused up
-  front instead of emitting an edit form that only looks concurrency-safe. A
-  scaffold with no `lock_version` column is byte-identical to before.
+  Coverage: the generated `tests/<snake>.rs` gains a
+  `<plural>_optimistic_lock_conflict` test pinning the contract;
+  `autumn-cli/tests/integration/scaffold_lock_version.rs` drives the real CLI
+  and asserts the emitted model, migration, form and handler; and
+  `generate_lock_version_postgres.rs` runs the generated migration and statement
+  against real Postgres — including two concurrent transactions that both read
+  the same version, where exactly one write lands.
+
+  The retrofit path works too: `autumn generate migration AddLockVersionToPosts
+  lock_version:i32` emits `ADD COLUMN ... NOT NULL DEFAULT 0`, which backfills
+  existing rows in the same statement, and `autumn db pull` reproduces the
+  attribute so a pulled table round-trips to the same model.
+
+  Because the column name is load-bearing, `generate model`/`generate scaffold`
+  now print a warning saying what declaring it changed and how to opt out
+  (rename it). A `lock_version` that is not a non-nullable `i32`/`i64`, one
+  marked `unique` (it is DB-managed and defaults to 0, so a unique index would
+  reject the second row ever created), and one declared as a scaffold's *only*
+  column (the insert struct would be empty and would not compile) are all
+  rejected at generation time rather than silently mis-generated. `--live`,
+  `--sharded`, a `slug` column, and scaffolds with an `Attachment` column write
+  through paths that do not route via the guarded statement, so combining them
+  with `lock_version` is refused up front instead of emitting an edit form that
+  only looks concurrency-safe. (`slug` in particular keys the update off an
+  editable, reusable identifier, so `WHERE slug = ... AND lock_version = ...`
+  would not pin a stable row.) The scaffolded **admin** update and the delete
+  actions still bump-or-write without a guard and remain last-write-wins;
+  locking across deletes is out of scope (#1021/#1312).
+
+  A scaffold with no `lock_version` column is byte-identical to before, verified
+  by diffing pre- and post-change generator output across twelve variants.
 
 - **generate scaffold:** the generated list view ships a working **Export
   CSV** download (#1315). Autumn already had the hard half — `export_csv` +
@@ -1362,6 +1386,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generator adapts from.
 
 ### Changed
+
+- **generate model / generate scaffold:** `lock_version` is now a load-bearing
+  column name (#1318) — see the Added entry above for the full behaviour. What
+  *changes* for anyone who already declared a column with that name: it becomes
+  database-managed (dropped from `New{Model}`, so it can no longer be set on
+  create), it disappears from a scaffold's HTML form in favour of a hidden
+  field, the model gains a derived `etag()` method, and a scaffold that pairs it
+  with `--live`, `--sharded`, a `slug` column, or an `Attachment` column — or
+  that declares it as the only column, marks it `unique`, or types it as
+  anything but a non-nullable `i32`/`i64` — is now refused rather than
+  generated. Generation prints a warning naming the escape hatch (rename the
+  column) whenever the name is detected.
+
+  **Breaking for `--api` scaffolds on a `lock_version` model:**
+  `#[lock_version]` puts a *required* `lock_version` on `Update{Model}`, so JSON
+  `PUT`/`PATCH` clients must now send the version they read. That is what gives
+  the JSON path conflict-checking, but existing clients that omit the field will
+  fail deserialization.
 
 - **generate:** finished the zero-JS file-upload slice (#1236) on the read-back
   side. A scaffold with an `Attachment` column now *shows* what it stored: the

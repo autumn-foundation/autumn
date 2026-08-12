@@ -72,6 +72,12 @@ pub fn plan_migration_with_options(
     super::model::validate_resource_name(name)?;
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, uniques)?;
+    // Issue #1318: a `lock_version` token means optimistic locking here too —
+    // `add_columns_up_sql_for` gives it the `DEFAULT 0` the DB-managed column
+    // needs. Validate it the same way `generate model`/`generate scaffold` do,
+    // so the same DSL token doesn't give different feedback depending only on
+    // which subcommand declared it.
+    super::model::validate_lock_version_field(&fields)?;
 
     // Determine the target app's database backend so the emitted ALTER TABLE
     // DDL is backend-aware (SQLite foundation, issue #1614).

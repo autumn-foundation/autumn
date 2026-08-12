@@ -301,6 +301,15 @@ pub fn render_model(pascal_name: &str, table: &str, columns: &[Column]) -> Strin
     for col in columns {
         if col.is_pk {
             out.push_str("    #[id]\n");
+        } else if is_lock_version_column(col) {
+            // Issue #1318: `lock_version` is the framework's optimistic-locking
+            // counter, so pulling a table that has one must reproduce the
+            // attribute `generate model` would have emitted — otherwise a
+            // `db pull` of a greenfield-generated table silently downgrades the
+            // column to a plain editable integer, losing the conflict check and
+            // the derived `etag()`, and breaking the byte-identical round-trip
+            // property this function documents above.
+            out.push_str("    #[lock_version]\n");
         } else if is_write_excluded(col) {
             // Read-only / framework-managed columns are kept out of `NewX` and
             // the update set via `#[default]`: a `created_at` with a DB default,
@@ -328,6 +337,18 @@ fn inferred_table_name(pascal_name: &str) -> String {
 /// separately by `#[id]` (which takes precedence in `render_model`).
 fn is_write_excluded(col: &Column) -> bool {
     col.is_db_generated() || col.is_generated || (col.name == "created_at" && col.has_default)
+}
+
+/// Whether an introspected column is the framework's optimistic-locking counter
+/// (issue #1318): the `lock_version` name, non-nullable, and an integer.
+///
+/// Mirrors [`super::model::is_lock_version_column`], which makes the same call
+/// on a DSL `Field`; the two must agree or `generate model` and `db pull` would
+/// disagree about the same table.
+fn is_lock_version_column(col: &Column) -> bool {
+    col.name == super::model::LOCK_VERSION_COLUMN
+        && !col.nullable
+        && matches!(col.kind, FieldKind::I32 | FieldKind::I64)
 }
 
 /// Build a `diesel::table!` block from introspected columns.

@@ -793,9 +793,13 @@ for a second, explicit submit.
 
 Declare a column named `lock_version` and the scaffold wires the
 framework's [optimistic-concurrency
-primitive](./cloud-native.md#optimistic-concurrency-via-lock_version) all
-the way through the HTML edit flow (issue #1318) — no extra flag, no
-extra code:
+primitive](./cloud-native.md#optimistic-concurrency-via-lock_version)
+through the HTML edit flow (issue #1318) — no extra flag, no extra code:
+
+`lock_version` is a **magic column name**, like `slug` and `deleted_at`.
+Declaring it changes what the column *is*, so the generator prints a
+warning saying so; rename the column if you wanted an ordinary integer
+counter you set yourself.
 
 ```bash
 autumn generate scaffold Post title:String body:Text lock_version:i32
@@ -805,8 +809,12 @@ autumn generate scaffold Post title:String body:Text lock_version:i32
   excluded from `NewPost`, carried on `UpdatePost` as the *expected*
   version, and compared by `#[repository]`'s update (which is what makes
   the JSON API path conflict-check too).
-- The **migration** declares it `INTEGER NOT NULL DEFAULT 0`, since the
-  INSERT never names it.
+- The **migration** declares it `NOT NULL DEFAULT 0` (`INTEGER` for
+  `i32`, `BIGINT` for `i64`), since the INSERT never names it. Pass
+  `--default lock_version=<n>` to seed from a different base.
+  `autumn generate migration AddLockVersionToPosts lock_version:i32`
+  gets the same `DEFAULT 0`, so retrofitting an existing table also
+  backfills its rows in one statement.
 - The **edit form** carries the row's current version in a hidden
   `lock_version` input. The new form does not — a row that does not exist
   yet has no version to guard against — and the version never appears as
@@ -839,13 +847,37 @@ autumn generate scaffold Post title:String body:Text lock_version:i32
   sequence: first write wins and bumps, stale write 409s and changes
   nothing, retry against the returned version succeeds.
 
+- A `:states(...)` **transition** bumps the version too, so an author
+  holding an edit form opened before someone else advanced the state is
+  told about it on save rather than saving over a record that moved on.
+- `autumn db pull` reproduces the attribute when it finds a
+  `lock_version` column, so a pulled table round-trips to the same model.
+
 The column must be a non-nullable `i32` or `i64`; anything else is
 rejected at generation time rather than silently ignored.
+`--live-validation` is supported (it changes only how the controls are
+rendered; its `update` writes through the same guarded statement).
 
-**Not yet wired:** `--live`, `--sharded`, and scaffolds with an
-`Attachment` column write through paths that do not route via the guarded
-statement, so combining them with `lock_version` is refused up front
-instead of emitting an edit form that only looks concurrency-safe.
+**Also affects `--api`.** `#[lock_version]` puts a **required**
+`lock_version` on `UpdatePost`, so JSON `PUT`/`PATCH` clients must send
+the version they read — a deliberate contract change, and how the API
+path gets conflict-checking. Existing clients that omit it will fail
+deserialization.
+
+**Not covered by the guard.** The scaffolded **admin** update
+(`autumn generate admin`) and the **delete** actions bump or write
+without a `WHERE lock_version = …` guard — the admin handler
+deserializes `NewPost`, which excludes the column, so the expected
+version never reaches it, and locking across deletes is out of scope
+(issues #1021/#1312). Both remain last-write-wins.
+
+**Not yet wired:** `--live`, `--sharded`, a `slug` column, and scaffolds
+with an `Attachment` column write through paths that do not route via the
+guarded statement, so combining them with `lock_version` is refused up
+front instead of emitting an edit form that only looks concurrency-safe.
+(`slug` is refused because a slug scaffold keys its update off the
+editable, reusable slug rather than the primary key, so
+`WHERE slug = … AND lock_version = …` does not identify a stable row.)
 
 ### Export CSV from the list view
 
