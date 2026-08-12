@@ -15,7 +15,7 @@
 #   1. Every manifest module exists and carries the `autumn-panic-gate:` marker.
 #   2. The marker is IMMEDIATELY followed (blank/comment lines aside) by the
 #      `#![cfg_attr(` gate header, and THAT block is the one validated.
-#   3. STRUCTURAL header shape: after stripping `//` comments and all whitespace,
+#   3. STRUCTURAL header shape: after stripping `//` and `/* … */` comments and all whitespace,
 #      the header must open EXACTLY `#![cfg_attr(not(test),deny(` — a widened
 #      predicate like `all(not(test), any())` (whose deny never compiles) or a
 #      `not(test)` that lives only in a comment therefore fail. The block must
@@ -252,15 +252,32 @@ gate_header_block() {
       started = 1
     }
     started {
+      # Strip BOTH `//` line comments and `/* … */` block comments (which may
+      # span header lines) with a single left-to-right scan that carries block
+      # state in `inblk`. Doing this before the lint/shape checks stops a
+      # required lint that is commented out — `/* clippy::panic, */` — from
+      # surviving into `norm` and satisfying the token grep while rustc ignores
+      # the (commented-out) denial.
       line = $0
-      sub(/\/\/.*/, "", line)        # strip // comment before anything else
+      out = ""; i = 1; n = length(line)
+      while (i <= n) {
+        c = substr(line, i, 2)
+        if (inblk) {
+          if (c == "*/") { inblk = 0; i += 2 } else { i += 1 }
+        } else if (c == "/*") { inblk = 1; i += 2 }
+        else if (c == "//")   { break }   # rest of the line is a line comment
+        else { out = out substr(line, i, 1); i += 1 }
+      }
+      line = out
       t = line
       gsub(/"[^"]*"/, "", t)         # brackets inside string literals do not count
       depth += gsub(/\[/, "[", t)
       depth -= gsub(/\]/, "]", t)
       gsub(/[[:space:]]/, "", line)  # remove all whitespace
       norm = norm line
-      if (depth <= 0) { printf "%s", norm; rc = 0; exit }
+      # Only terminate on a balanced header that is NOT mid-block-comment; an
+      # unterminated `/*` in the header runs to EOF and fails as malformed.
+      if (!inblk && depth <= 0) { printf "%s", norm; rc = 0; exit }
     }
     END {
       if (!seen)          { rc = 3 }
@@ -779,6 +796,15 @@ EOF
   sed -i '/clippy::string_slice/d' "$d3/src/thin.rs"
   check_fail "header missing one required lint fails" "missing required panic lint" \
     gate_check "$d3" "$wf" Cargo.toml 1 src src/thin.rs:default
+
+  # 3b. Required lint commented out with a `/* … */` BLOCK comment. rustc stops
+  # applying the denial, so the token must not survive into the normalized
+  # header (line comments were already handled; this pins the block-comment case).
+  local d3b="$tmp/d3b"; make_fixture "$d3b"
+  write_module "$d3b/src/blockcomment.rs" </dev/null
+  sed -i 's#clippy::panic,#/* clippy::panic, */#' "$d3b/src/blockcomment.rs"
+  check_fail "required lint commented out with a block comment fails" "missing required panic lint" \
+    gate_check "$d3b" "$wf" Cargo.toml 1 src src/blockcomment.rs:default
 
   # 4. Header opener never closed.
   local d4="$tmp/d4"; make_fixture "$d4"
