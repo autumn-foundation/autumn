@@ -357,6 +357,38 @@ version different from the recording's, a handler reading the clock more times
 than the recording did (the last reading is repeated), and the redacted-auth
 hint below.
 
+### Step-debugging a replay in VS Code
+
+`autumn replay` is a thin wrapper: it compiles your app and runs the binary
+with `AUTUMN_REPLAY_CAPSULE` set. Point a debugger at the binary with that
+variable and you can step through the failing handler with the database served
+from the capsule and the clock replayed — the same code path on every run,
+because the inputs are identical every time. "Going back in time" is
+restarting the debug session.
+
+With the [CodeLLDB] extension:
+
+```jsonc
+// .vscode/launch.json
+{
+  "type": "lldb",
+  "request": "launch",
+  "name": "Debug capsule replay",
+  "cargo": { "args": ["build", "--bin", "my-app"] },
+  "env": {
+    "AUTUMN_REPLAY_CAPSULE": "${workspaceFolder}/tmp/autumn-capsules/<id>.json",
+    "AUTUMN_ENV": "dev"
+  }
+}
+```
+
+Breakpoint pauses are safe: replay clears the global request timeout (a
+deterministic offline run has no wall-clock deadline), and the in-process
+stub database waits indefinitely. The verdict still prints when you resume to
+completion.
+
+[CodeLLDB]: https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb
+
 ---
 
 ## Linking capsules to your error reporter
