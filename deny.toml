@@ -67,6 +67,33 @@ ignore = [
     # (build) postgresql_embedded -> autumn-web. Not a runtime vulnerability and no
     # safe upgrade (author recommends web-time). Review-by: 2026-10-01.
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive via postgresql_embedded (managed-pg-bundled feature); no safe upgrade; review-by 2026-10-01" },
+    # RUSTSEC-2026-0253 — `lru`'s `LruCache::pop()` is not panic-safe: a stored
+    # key whose `Drop` panics mid-pop skips `detach()` and leaves a dangling
+    # pointer for a later eviction to write through.
+    #
+    # FIXED, not ignored, for the copy Autumn controls: the workspace's own `lru`
+    # moved 0.18.1 -> 0.18.2 (the advisory's fixed release) in this same commit.
+    # This entry covers only the SECOND copy in the graph, lru 0.16.4, which
+    # arrives through aws-sdk-s3 1.122. That SDK is deliberately pinned
+    # (`>=1.122, <1.123` in autumn-storage-s3 / autumn-media-plugin) because
+    # 1.122 is the last release compatible with this workspace's 1.88.0 MSRV and
+    # the aws-smithy-* ceilings beside it, and the advisory's only fix is
+    # `>=0.18.2` — there is no patched 0.16.x. So the choice is this ignore or
+    # dropping the MSRV floor, which is a much larger decision than one advisory.
+    #
+    # Exposure is nil rather than merely limited, on two INDEPENDENT counts, both
+    # checked against the vendored 1.122 source (`src/s3_express.rs`):
+    #   1. The advisory's UB requires a key type with a potentially-panicking
+    #      `Drop`. The only `lru` use in the SDK is `S3ExpressIdentityCache`,
+    #      whose key is `CacheKey(String)`; `String`'s `Drop` cannot panic.
+    #   2. The unsound function is `pop()`. That cache never calls it — its only
+    #      mutating operation is `get_or_insert_mut()`.
+    # Neither precondition holds, so the dangling-pointer state the advisory
+    # describes is unreachable through this path. It is also S3 Express One Zone
+    # (directory buckets) only, which nothing in the workspace exercises by
+    # default. Review-by: 2026-10-01, or whenever the MSRV floor rises far enough
+    # to take an aws-sdk-s3 that resolves a fixed `lru`.
+    { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only, via MSRV-pinned aws-sdk-s3 1.122 (no patched 0.16.x exists; workspace's own lru is fixed at 0.18.2); S3 Express cache keys are String and pop() is never called, so neither UB precondition holds; review-by 2026-10-01" },
 ]
 
 [licenses]

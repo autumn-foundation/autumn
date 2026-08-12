@@ -57,6 +57,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<!-- migration-guide-gate: reason -->` suppression — as this one does.
   [no-plugin] <!-- migration-guide-gate: describes the gate itself -->
 
+- **generate scaffold:** the generated list view ships a working **Export
+  CSV** download (#1315). Autumn already had the hard half — `export_csv` +
+  the `CsvSchema` trait, landed in #808 — but the generator never wired it,
+  so every app author had to discover the trait, hand-write an impl, add a
+  route, get the `Content-Disposition` quoting right and add a link, for
+  every single model. `autumn generate scaffold` now emits all four: a
+  `CsvSchema` impl covering `id`, every scaffolded column in declaration
+  order and `created_at` (the `show` view's column set); a
+  `#[get("/<plural>/export.csv")]` handler; an **Export CSV** link on the
+  index; and a database-free generated test asserting 200, `text/csv`, an
+  `attachment` disposition and the model's header row. `autumn-web`'s `csv`
+  feature is enabled automatically (and removed again by `autumn destroy
+  scaffold`).
+
+  The export honours the **same** allowlisted `?sort=`/`?filter[col]=`
+  params as the index, through the same `ListQuery` extractor and the same
+  `repo.list` call (#1126) — and the index's link carries the current query
+  string, so *filter → sort → export* downloads exactly the rows on screen.
+  `?page=`/`?size=` are ignored: an export spans every page of the current
+  filter. On a `--searchable` scaffold the link renders **inside** the
+  `#<plural>-search-results` container rather than beside "New …", so the htmx
+  swap that shows search results takes the link away with them: the search box
+  pushes no URL and `ListQuery` has no full-text field, so a link left outside
+  would survive the swap still pointing at the unsearched set and hand back the
+  rows the user had just excluded. Searched results offer no export; clearing
+  the search restores the list and its link. Rows are read in `MAX_PAGE_SIZE` batches and capped at
+  `MAX_EXPORT_ROWS` (10 000), a constant in the generated file. An export that
+  hits the cap is truncated rather than failed, but never silently: it logs a
+  `warn!` and sets `x-export-truncated: true`. Distinguishing a complete export
+  of exactly `MAX_EXPORT_ROWS` rows from a truncated one takes evidence a row
+  exists past the cap, so the loop reads one batch beyond it and trims the
+  surplus before writing the CSV. Consistency is per batch, not per export —
+  offset batches take no shared snapshot, so a concurrent insert or delete can
+  duplicate or skip a row — and the emitted docs say so rather than let the
+  file imply a point-in-time read.
+
+  Row-set posture mirrors the index exactly, so no new data path is opened: an
+  owner-scoped scaffold's export is `#[secured]` and reads through the
+  repository's owner-scoped `list_scoped`, never the unscoped `list`; a
+  scaffold whose index carries no `#[secured]` gets an export that carries none
+  either. COST does not mirror the index, so the handler additionally carries
+  `#[throttle(limit = 6, per = "1m", key = "ip")]`: one export reads up to
+  10 000 rows over ~100 page queries plus ~100 filtered `COUNT(*)`s — `list`
+  counts before every page, and the export never reads the count but cannot
+  opt out of it — where one index page costs two round trips. An inline
+  throttle applies regardless of `security.rate_limit.enabled`. The emitted
+  docs state that arithmetic so the cap, the throttle and the auth posture can
+  be tuned against the real number rather than the row count.
+
+  `NULL` columns serialize to an empty cell rather than the literal `None`, and
+  commas/quotes/newlines are RFC 4180 quoted by `export_csv`. Text-backed
+  columns additionally pass through an emitted `csv_text_cell` guard that
+  prefixes an apostrophe to a value starting `=`, `+`, `-`, `@`, TAB or CR —
+  RFC 4180 says nothing about formulas, and Excel executes them even inside
+  quotes, so a row one user typed could otherwise exfiltrate the sheet when a
+  colleague opens the download. Numeric, boolean, UUID, timestamp and enum
+  columns are deliberately not guarded: they render from typed values and
+  guarding them would corrupt a negative number.
+
+  Emitted wherever the index's row set is a repository call the export can
+  reuse verbatim — the plain `repo.list` index (including
+  `--live-validation`) and the owner-scoped `list_scoped` one. Gated off for
+  `--live`, `--sharded`, owner-scoped `--live-validation` and `--api`, whose
+  output stays byte-identical. Two documented non-mirrors: a `--searchable`
+  scaffold's export does not honour the search term (`ListQuery` carries no
+  full-text query and the search box swaps results without changing the URL),
+  and a `references` column exports the raw foreign key rather than the parent
+  label the views resolve. See `docs/guide/generators.md`.
+
+  `examples/bookmarks` drops its hand-rolled RFC 4180 quoting for the same
+  `CsvSchema` + `export_csv` pair, keeping its range-capable `Download` demo.
 
 - **system-tests:** `SystemTest::layer(...)` registers app-wide Tower
   middleware on the router a browser test serves (#1456). Applications whose
