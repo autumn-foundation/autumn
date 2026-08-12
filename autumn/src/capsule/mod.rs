@@ -34,7 +34,9 @@ pub mod persist;
 pub mod redact;
 pub mod schema;
 
-// DB wire submodules are declared by the record/replay stages.
+// DB wire submodules (PostgreSQL only; the sqlite backend has no wire capture).
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+pub(crate) mod wire;
 
 pub use capture::{
     CAPSULE_SCOPE, CaptureHandle, CaptureLayer, CaptureScope, CaptureSettings, DbBuffer,
