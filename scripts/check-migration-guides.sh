@@ -490,6 +490,16 @@ function decode_space_entities(text,   out) {
   return out
 }
 
+function strip_empty_links(text,   out) {
+  # `[](url)` renders as an anchor with no text. The destination is already
+  # metadata; with an empty label there is nothing left for a reader to see.
+  out = text
+  while (match(out, /\[[[:space:]]*\]\([^()]*\)/)) {
+    out = substr(out, 1, RSTART - 1) " " substr(out, RSTART + RLENGTH)
+  }
+  return out
+}
+
 function strip_inline_tags(text,   out, i, n, at) {
   # What a reader is left with once the tags are gone. `<span></span>` has
   # source text but renders nothing, so a required section holding only it is
@@ -610,6 +620,46 @@ function tag_end(text, start,   n, i, ch, sq, closing) {
   return 0
 }
 
+function decode_char_refs(text,   out, i, n, semi, body, code) {
+  # `next&#x2e;md` is `next.md` once rendered, so a destination carrying
+  # character references still points at the guide.
+  out = ""
+  i = 1
+  n = length(text)
+  while (i <= n) {
+    if (substr(text, i, 2) != "&#") { out = out substr(text, i, 1); i++; continue }
+    semi = index(substr(text, i), ";")
+    if (semi == 0) { out = out substr(text, i, 1); i++; continue }
+    body = substr(text, i + 2, semi - 3)
+    if (body ~ /^[xX][0-9a-fA-F]+$/) {
+      code = hex_value(substr(body, 2))
+    } else if (body ~ /^[0-9]+$/) {
+      code = body + 0
+    } else {
+      out = out substr(text, i, 1)
+      i++
+      continue
+    }
+    # Only the printable ASCII range: anything else is left as written rather
+    # than guessed at, since this only has to recognise a path.
+    if (code >= 32 && code <= 126) out = out sprintf("%c", code)
+    else out = out substr(text, i, semi)
+    i += semi
+  }
+  return out
+}
+
+function hex_value(text,   i, n, ch, digits, v) {
+  digits = "0123456789abcdef"
+  v = 0
+  n = length(text)
+  for (i = 1; i <= n; i++) {
+    ch = tolower(substr(text, i, 1))
+    v = v * 16 + index(digits, ch) - 1
+  }
+  return v
+}
+
 function parens_balanced(text,   i, n, ch, depth) {
   n = length(text)
   depth = 0
@@ -728,7 +778,7 @@ function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
   # text: link syntax written inside one renders as characters, and rescanning
   # it turned a tooltip into a guide link the reader never gets.
   md_link_end = p
-  return dest
+  return decode_char_refs(dest)
 }
 
 function normalize_label(text,   out) {
@@ -1186,7 +1236,7 @@ collect_link_defs() {
       # Parentheses must balance in a bare destination, or CommonMark creates
       # no definition at all and the reference above it resolves to nothing.
       if (!parens_balanced(dest)) { pending = ""; return }
-      dest = unescape_punctuation(dest)
+      dest = decode_char_refs(unescape_punctuation(dest))
       gap = (rest ~ /^[[:space:]]/)
       sub(/^[[:space:]]+/, "", rest)
       if (rest != "") {
@@ -1281,7 +1331,10 @@ findings="$(
     # entry documenting the convention must not declare itself breaking.
     prose = strip_code_spans(entry_visible)
 
-    lower = tolower(prose)
+    # Destinations and titles are metadata: a marker inside a URL renders as
+    # part of the URL, and reading it there turned an ordinary entry into a
+    # declaration. The link check below still reads the unmasked prose.
+    lower = tolower(mask_link_metadata(prose))
     marked = (lower ~ /\*\*breaking(:\*\*|\*\*:)/) || entry_breaking_heading
 
     # A marker that exists in the raw text but not after stripping is either a
@@ -1290,7 +1343,7 @@ findings="$(
     # downstream app. Ask for one token rather than guess — the suppression
     # below settles it for a mention, fixing the backticks settles it for a
     # declaration.
-    marker_in_span = (!marked && tolower(entry_visible) ~ /\*\*breaking(:\*\*|\*\*:)/)
+    marker_in_span = (!marked && tolower(mask_link_metadata(entry_visible)) ~ /\*\*breaking(:\*\*|\*\*:)/)
 
     # The suppression is for entries that talk *about* breaking changes. It
     # must never override an explicit declaration: one comment on a parent
@@ -1814,7 +1867,7 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           } else if (pending_title && strip_inline_tags(visible) ~ /^[[:space:]]*[^[:space:]]+[[:space:]]*$/) {
             # The destination, alone on the line below its opener.
             pending_title = 0
-          } else if (strip_inline_tags(decode_space_entities(visible)) ~ /[^[:space:]]/ &&
+          } else if (strip_inline_tags(strip_empty_links(decode_space_entities(visible))) ~ /[^[:space:]]/ &&
                      !is_thematic_break(visible) && !is_empty_list_item(visible)) {
             pending_title = 0
             for (lvl = 1; lvl <= 6; lvl++) {

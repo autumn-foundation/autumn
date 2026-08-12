@@ -7155,3 +7155,119 @@ fn migration_guide_gate_counts_prose_containing_an_entity() {
         gate_report(&output),
     );
 }
+
+// --- Review round 59: markers in metadata, char refs, empty links ---------
+
+#[test]
+fn migration_guide_gate_ignores_a_marker_inside_a_link_destination() {
+    // The marker renders as part of a URL, not as changelog prose — the
+    // reference implementation emits it inside `href`. Reading it there turned
+    // an ordinary entry into a declaration and demanded a guide for it.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **api:** an addition, see \
+           [details](https://example.invalid/**Breaking:**/notes).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a marker in a URL declares nothing\n{}",
+        gate_report(&output),
+    );
+    let listed = bash_command()
+        .args(["scripts/check-migration-guides.sh", "--list"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run --list");
+    let inventory = String::from_utf8_lossy(&listed.stdout).to_string();
+    assert!(
+        inventory
+            .lines()
+            .any(|line| line.starts_with("0.7.0") && line.ends_with('0')),
+        "the section must report zero breaking entries:\n{inventory}",
+    );
+}
+
+#[test]
+fn migration_guide_gate_resolves_a_character_reference_in_a_destination() {
+    // `next&#x2e;md` renders as `next.md`, so the link points at the guide.
+    // Comparing the encoded source text rejected a link that works.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0&#x2e;7&#46;0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a character reference resolves to the guide path\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_count_an_empty_link_as_content() {
+    // `[](url)` renders as an anchor with no text, so a required section
+    // holding only one shows the reader nothing.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0")
+        .replace("Why this release breaks.", "[](https://example.invalid)");
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an anchor with no text is not guidance\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_counts_a_link_that_has_text() {
+    // The counterpart: a link with a label is content, which is how guides
+    // point at upstream notes.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace(
+        "Why this release breaks.",
+        "See [the upstream notes](https://example.invalid).",
+    );
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a labelled link is visible content\n{}",
+        gate_report(&output),
+    );
+}
