@@ -332,6 +332,30 @@ back to the model's default order, and an invalid `dir` falls back to `asc`
 so only real columns can reach SQL (unknown sort/filter columns are ignored, not
 injected).
 
+## Optimistic concurrency (`#[lock_version]`)
+
+Declare a non-nullable `i32`/`i64` field named `lock_version` on a `#[model]`
+and mark it `#[lock_version]`. The column becomes database-managed: it is
+excluded from `New{Model}`, carried on `Update{Model}` as the **expected**
+version (a plain required field, not a `Patch<T>`, so JSON `PUT`/`PATCH`
+clients must send it), and `#[repository]`'s update raises
+`RepositoryError::Conflict` — mapped to HTTP 409 — when the stored version
+moved on. The model also gains a derived `etag()`.
+
+**(unreleased — trunk-dev, #1318)** `autumn generate model` / `generate
+scaffold` wire this from the field name alone: the attribute, an
+`INTEGER/BIGINT NOT NULL DEFAULT 0` column (the INSERT never names it), a
+hidden `lock_version` input on the scaffolded edit form, an `update` handler
+whose write is `WHERE lock_version = $expected` + `SET lock_version =
+lock_version + 1` in one statement, and a **409 re-render** of that same form —
+author's input intact, inline `role="alert"` banner, the row's *current*
+version in the hidden field so a second Save applies their edit on top. A
+missing row is still 404. `:states(...)` transitions bump the version too.
+Refused (not silently half-wired) with `--live`, `--sharded`, a `slug` column,
+an `Attachment` field, as the only column, or marked `:unique`;
+`--live-validation` is supported. The scaffolded **admin** update and the
+delete actions remain last-write-wins.
+
 ## Db transactions
 
 - `Db::tx(f)` — READ COMMITTED, one attempt (published 0.5.0).
