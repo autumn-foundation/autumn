@@ -600,6 +600,18 @@ function tag_end(text, start,   n, i, ch, sq, closing) {
   return 0
 }
 
+function parens_balanced(text,   i, n, ch, depth) {
+  n = length(text)
+  depth = 0
+  for (i = 1; i <= n; i++) {
+    ch = substr(text, i, 1)
+    if (ch == "\\" && i < n && escapable(substr(text, i + 1, 1))) { i++; continue }
+    if (ch == "(") depth++
+    else if (ch == ")") { depth--; if (depth < 0) return 0 }
+  }
+  return depth == 0
+}
+
 function unescape_punctuation(text,   out, i, n, ch) {
   out = ""
   n = length(text)
@@ -1161,6 +1173,9 @@ collect_link_defs() {
       # Escapable punctuation resolves the same way here as in an inline
       # destination: `0.7.0\.md` is the guide, and keeping the backslash
       # rejected a reference link that renders.
+      # Parentheses must balance in a bare destination, or CommonMark creates
+      # no definition at all and the reference above it resolves to nothing.
+      if (!parens_balanced(dest)) { pending = ""; return }
       dest = unescape_punctuation(dest)
       gap = (rest ~ /^[[:space:]]/)
       sub(/^[[:space:]]+/, "", rest)
@@ -1892,7 +1907,11 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             # enclosing content column is a sample of an index entry, not one.
             # The same four spaces *under* a bullet is a nested item and does
             # index the guide, which is why this measures from the container.
+            # A definition renders nothing, so it is not an index entry — and
+            # its own label must not resolve as a shortcut reference and report
+            # the guide as indexed. Same rule the entry scan follows.
             in_index && block_body(visible) !~ /^ / &&
+            !is_link_definition(visible) && !is_definition_opener(visible) &&
             links_to(mask_html_attributes(visible), want_path) > 0 { found = 1 }
             END { exit found ? 0 : 1 }
           ' "$index_file"; then

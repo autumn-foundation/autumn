@@ -6938,3 +6938,117 @@ fn migration_guide_gate_still_opens_a_block_on_a_quoted_equals() {
         "a quoted `=` is fine, so the block opens and the link is literal",
     );
 }
+
+// --- Review round 57: definition destinations, index definitions ----------
+
+#[test]
+fn migration_guide_gate_rejects_an_unbalanced_paren_in_a_definition() {
+    // An unbalanced `(` makes the destination invalid, so CommonMark creates
+    // no definition — both lines render as paragraphs — and the reference
+    // above resolves to nothing.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration guide][upgrade].\n\n\
+         [upgrade]: docs/migrations/0.7.0.md#(unterminated\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an invalid destination defines nothing",
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_accepts_balanced_parens_in_a_definition() {
+    // The counterpart: parentheses are legal in a destination when balanced,
+    // so this one still resolves.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration guide][upgrade].\n\n\
+         [upgrade]: docs/migrations/0.7.0.md\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a well-formed definition still resolves\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_index_a_guide_by_definition_alone() {
+    // A definition renders nothing, so an Index holding only one has no
+    // clickable entry — but its own label was resolving as a shortcut
+    // reference and reporting the guide as indexed. The same fix the entry
+    // scan got in round 53, in the parser that was still missing it.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("docs/migrations/0.7.0.md"),
+        valid_migration_guide("0.7.0"),
+    )
+    .expect("guide");
+    std::fs::write(
+        tmp.path().join("docs/migrations/README.md"),
+        "# Migration Guides\n\n\
+         ## Index\n\n\
+         - [`next.md`](next.md)\n\n\
+         [0.7.0.md]: 0.7.0.md\n",
+    )
+    .expect("index");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a definition is not an index entry a reader can click\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_treats_a_lowercase_declaration_as_a_raw_block() {
+    // Declared behaviour, not a fix. CommonMark since 0.30 opens a type-4
+    // block on `<!` plus any ASCII letter, and the reference implementation
+    // renders `<!foo` and `<!FOO` identically — both raw. A review round
+    // asked for uppercase-only; this pins the spec-current behaviour so the
+    // question does not get reopened from memory.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         <!foo\n\
+         - **db:** **Breaking:** renamed, with no guide anywhere.\n\
+         >\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a lowercase declaration opens a block, so the bullet is literal\n{}",
+        gate_report(&output),
+    );
+}
