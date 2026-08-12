@@ -6632,3 +6632,79 @@ fn migration_guide_gate_reads_a_changelog_containing_non_ascii() {
         gate_report(&output),
     );
 }
+
+// --- Review round 53: attributed inline tags, definitions as links --------
+
+#[test]
+fn migration_guide_gate_strips_attributed_inline_tags_from_content() {
+    // `<span disabled></span>` renders nothing a reader can use, but tag
+    // stripping only removed bare tags, so the attributed opener survived and
+    // marked the section populated.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0")
+        .replace("Why this release breaks.", "<span disabled></span>");
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an attributed empty tag renders no guidance\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_read_a_definition_as_its_own_link() {
+    // A definition inside the item renders no anchor at all, so the entry has
+    // no clickable guide. Scanning the definition line for links resolved its
+    // own label as a shortcut reference and satisfied the entry with it.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+         [upgrade]: docs/migrations/0.7.0.md\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a definition is not a link the reader can follow",
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_resolves_a_reference_the_entry_actually_uses() {
+    // The counterpart: the definition still *defines*. An entry that uses the
+    // reference is linked, which is the round-30 behaviour and must survive.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration guide][upgrade].\n\n\
+         [upgrade]: docs/migrations/0.7.0.md\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a reference the entry uses still resolves\n{}",
+        gate_report(&output),
+    );
+}

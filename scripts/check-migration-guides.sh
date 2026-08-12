@@ -440,13 +440,26 @@ function block_body(text,   strip) {
   return dedent3(substr(expand_tabs(text), strip + 1))
 }
 
-function strip_inline_tags(text,   out) {
+function strip_inline_tags(text,   out, i, n, at) {
   # What a reader is left with once the tags are gone. `<span></span>` has
   # source text but renders nothing, so a required section holding only it is
   # as empty as one holding `<!-- TODO -->`. The words *between* tags survive,
   # which is the point: marked-up prose is still prose.
-  out = mask_html_attributes(text)
-  gsub(/<\/?[a-zA-Z][a-zA-Z0-9-]*[[:space:]]*\/?>/, " ", out)
+  out = ""
+  i = 1
+  n = length(text)
+  while (i <= n) {
+    if (substr(text, i, 1) == "<") {
+      at = tag_end(text, i)
+      if (at > 0) {
+        out = out " "
+        i = at
+        continue
+      }
+    }
+    out = out substr(text, i, 1)
+    i++
+  }
   return out
 }
 
@@ -486,11 +499,12 @@ function is_orphan_title(text,   body, first, last, sq) {
   return (first == "\"" || first == sq) && last == first
 }
 
-function is_standalone_tag(text,   n, i, ch, sq, closing) {
-  # A *well-formed* complete tag alone on its line, which is what CommonMark
-  # requires of a type-7 opener. Accepting anything tag-shaped let `<x =>`
-  # open a raw block and swallow the entry beneath it, though it renders as
-  # literal text.
+function tag_end(text, start,   n, i, ch, sq, closing) {
+  # The index just past a well-formed tag beginning at `start`, or 0 if there
+  # is not one. One grammar, two callers: the type-7 opener asks whether a
+  # whole line is a tag, and the inline stripper walks a line removing them —
+  # and an attributed tag has to be recognised by both, or `<span disabled>`
+  # survives stripping and passes for guidance.
   #
   #   open:     < name attribute* space* /? >
   #   closing:  </ name space* >
@@ -499,8 +513,8 @@ function is_standalone_tag(text,   n, i, ch, sq, closing) {
   #   value:    unquoted, or single- or double-quoted
   sq = sprintf("%c", 39)
   n = length(text)
-  if (substr(text, 1, 1) != "<") return 0
-  i = 2
+  if (substr(text, start, 1) != "<") return 0
+  i = start + 1
   closing = 0
   if (substr(text, i, 1) == "/") { closing = 1; i++ }
   if (substr(text, i, 1) !~ /^[a-zA-Z]$/) return 0
@@ -508,15 +522,15 @@ function is_standalone_tag(text,   n, i, ch, sq, closing) {
   if (closing) {
     while (i <= n && substr(text, i, 1) ~ /^[[:space:]]$/) i++
     if (substr(text, i, 1) != ">") return 0
-    return substr(text, i + 1) ~ /^[[:space:]]*$/
+    return i + 1
   }
   while (i <= n) {
     ch = substr(text, i, 1)
-    if (ch == ">") return substr(text, i + 1) ~ /^[[:space:]]*$/
+    if (ch == ">") return i + 1
     if (ch == "/") {
       i++
       if (substr(text, i, 1) != ">") return 0
-      return substr(text, i + 1) ~ /^[[:space:]]*$/
+      return i + 1
     }
     # Anything else has to be an attribute, and attributes are introduced by
     # whitespace — `<x =>` has none before its `=`, which is what makes it
@@ -550,6 +564,13 @@ function escapable(ch) {
   # else — a letter, say — stays in the text, so dropping every backslash
   # turned a link to a nonexistent path into one that matched the guide.
   return index("!\"#$%&" sprintf("%c", 39) "()*+,-./:;<=>?@[\\]^_`{|}~", ch) > 0
+}
+
+function is_standalone_tag(text,   at) {
+  # A complete tag alone on its line, which is what CommonMark requires of a
+  # type-7 opener.
+  at = tag_end(text, 1)
+  return at > 0 && substr(text, at) ~ /^[[:space:]]*$/
 }
 
 function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
@@ -1399,6 +1420,11 @@ findings="$(
         # block: literal text, so it neither adds prose nor supplies a link.
         if (visible ~ /[^[:space:]]/ && leading_spaces(visible) >= item_content_indent + 4) next
         entry = entry " " $0
+        # A definition inside the item renders no anchor, so its own label must
+        # not be scanned as a shortcut reference and counted as the entry link.
+        # It still *defines* — the collection pass is separate — so a reference
+        # the entry actually uses continues to resolve.
+        if (is_link_definition(visible) || is_definition_opener(visible)) next
         entry_visible = entry_visible " " visible
       }
     }
