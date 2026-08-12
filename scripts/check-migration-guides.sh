@@ -156,6 +156,46 @@ function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
   return out
 }
 
+function span_close_at(text, run, from,   n, j, run2) {
+  # Where a run of exactly `run` backticks closes, at or after `from`; 0 if it
+  # does not close on this line.
+  n = length(text)
+  j = from
+  while (j <= n) {
+    if (substr(text, j, 1) != "`") { j++; continue }
+    run2 = 0
+    while (j + run2 <= n && substr(text, j + run2, 1) == "`") run2++
+    if (run2 == run) return j
+    j += run2
+  }
+  return 0
+}
+
+function span_state_after(text, enter,   n, i, ch, run, j) {
+  # The backtick run left open at the end of this line, carrying `enter` in
+  # from the line before. A code span may cross a newline, and a `<!--` inside
+  # one is literal code — scanning each line from a clean slate opened a
+  # comment there and swallowed every entry after it.
+  n = length(text)
+  enter = enter + 0
+  i = 1
+  if (enter > 0) {
+    j = span_close_at(text, enter, 1)
+    if (j == 0) return enter
+    i = j + enter
+  }
+  while (i <= n) {
+    ch = substr(text, i, 1)
+    if (ch != "`") { i++; continue }
+    run = 0
+    while (i + run <= n && substr(text, i + run, 1) == "`") run++
+    j = span_close_at(text, run, i + run)
+    if (j == 0) return run
+    i = j + run
+  }
+  return 0
+}
+
 function unescaped_index(text, needle, start,   pos, at, slashes) {
   # First occurrence of needle at or after start that is not backslash-escaped.
   # A `\<!--` renders as literal text, so it neither opens a comment nor acts
@@ -554,7 +594,8 @@ function tag_end(text, start,   n, i, ch, sq, closing) {
       continue
     }
     if (ch == "" || ch ~ /^[[:space:]]$/ || ch == ">" || ch == "<" || ch == "`") return 0
-    while (i <= n && substr(text, i, 1) !~ /^[[:space:]">`<]$/ && substr(text, i, 1) != sq) i++
+    # `=` is excluded from an unquoted value, so `<x foo=a=b>` is not a tag.
+    while (i <= n && substr(text, i, 1) !~ /^[[:space:]">`<=]$/ && substr(text, i, 1) != sq) i++
   }
   return 0
 }
@@ -788,7 +829,7 @@ function links_to(text, path,   at, i, ch, start, slashes, depth, open_at, dest)
   return 0
 }
 
-function mask_code_spans(text,   out, i, n, ch, run, j, run2, found, k) {
+function mask_code_spans(text, enter,   out, i, n, ch, run, j, run2, found, k) {
   # Same scan as strip_code_spans, but each span becomes an equal-length run of
   # spaces so offsets still line up with the original text. visible_text needs
   # that: it has to know *where* a real `<!--` sits in `line`, while ignoring
@@ -796,20 +837,25 @@ function mask_code_spans(text,   out, i, n, ch, run, j, run2, found, k) {
   out = ""
   i = 1
   n = length(text)
+  enter = enter + 0
+  if (enter > 0) {
+    # A span opened on an earlier line: everything up to its closing run is
+    # code, and if it does not close here the whole line is.
+    j = span_close_at(text, enter, 1)
+    if (j == 0) {
+      for (k = 1; k <= n; k++) out = out " "
+      return out
+    }
+    for (k = 1; k < j + enter; k++) out = out " "
+    i = j + enter
+  }
   while (i <= n) {
     ch = substr(text, i, 1)
     if (ch != "`") { out = out ch; i++; continue }
     run = 0
     while (i + run <= n && substr(text, i + run, 1) == "`") run++
-    j = i + run
-    found = 0
-    while (j <= n) {
-      if (substr(text, j, 1) != "`") { j++; continue }
-      run2 = 0
-      while (j + run2 <= n && substr(text, j + run2, 1) == "`") run2++
-      if (run2 == run) { found = 1; break }
-      j += run2
-    }
+    j = span_close_at(text, run, i + run)
+    found = (j > 0)
     if (found) {
       for (k = i; k < j + run; k++) out = out " "
       i = j + run
@@ -821,7 +867,7 @@ function mask_code_spans(text,   out, i, n, ch, run, j, run2, found, k) {
   return out
 }
 
-function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close_at, strip) {
+function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close_at, strip, span_before) {
   md_fence_hit = 0
 
   # Whichever construct opened first wins, and while one is open the other is
@@ -848,6 +894,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
 
   if (md_in_html_block) {
     md_paragraph_open = 0
+    md_span_open = 0
     if (md_html_type == 1) {
       if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
     } else if (md_html_end != "") {
@@ -906,7 +953,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
     }
     return ""
   }
-  if (md_in_fence) { md_paragraph_open = 0; return "" }
+  if (md_in_fence) { md_paragraph_open = 0; md_span_open = 0; return "" }
 
   # A raw HTML block leaves its contents literal, so a link written inside one
   # is not clickable. The end condition varies by kind, and using the wrong one
@@ -1016,14 +1063,17 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # nor, where one is already open, stops being ordinary text. That second half
   # is what keeps a run of definitions working — only the first follows a blank
   # line.
-  out = scan_comments(line)
+  # The span state entering this line, and the one the next line inherits.
+  span_before = md_span_open
+  md_span_open = span_state_after(line, span_before)
+  out = scan_comments(line, span_before)
   md_paragraph_open = (block_body(out) ~ /[^[:space:]]/ &&
                        !is_atx_heading(block_body(out)) &&
                        !(md_paragraph_open == 0 && is_link_definition(out))) ? 1 : 0
   return out
 }
 
-function scan_comments(text,   out, masked, pos, close_at, head, tail) {
+function scan_comments(text, enter,   out, masked, pos, close_at, head, tail) {
   # Comment delimiters are located in a masked copy so prose that *shows*
   # `<!--` does not open one, and escaped openers are skipped. Code spans are
   # masked because they render literally; link destinations and titles because
@@ -1031,7 +1081,7 @@ function scan_comments(text,   out, masked, pos, close_at, head, tail) {
   # as one swallowed the rest of the file and reported it unclosed. Both masks
   # preserve offsets, so the slices apply to the original text.
   out = text
-  masked = mask_link_metadata(mask_code_spans(out))
+  masked = mask_link_metadata(mask_code_spans(out, enter))
   while ((pos = unescaped_index(masked, "<!--", 1)) > 0) {
     head = substr(out, 1, pos - 1)
     tail = substr(out, pos)
@@ -1042,7 +1092,7 @@ function scan_comments(text,   out, masked, pos, close_at, head, tail) {
       return head
     }
     out = head substr(tail, close_at + 3)
-    masked = mask_link_metadata(mask_code_spans(out))
+    masked = mask_link_metadata(mask_code_spans(out, enter))
   }
   return out
 }

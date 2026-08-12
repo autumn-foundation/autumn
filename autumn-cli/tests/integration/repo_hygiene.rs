@@ -6851,3 +6851,90 @@ fn migration_guide_gate_remasks_link_metadata_after_a_comment() {
         gate_report(&output),
     );
 }
+
+// --- Review round 56: multi-line code spans, `=` in attribute values ------
+
+#[test]
+fn migration_guide_gate_carries_code_span_state_across_lines() {
+    // A code span may cross a newline. When it does, a `<!--` inside it is
+    // literal code — the reference implementation renders
+    // `<code>a span and &lt;!-- still code</code>` — and the entry below is a
+    // real declaration. Masking spans one line at a time opened a comment and
+    // swallowed it.
+    //
+    // The `<!--` must not start its line: one that does opens a type-2 block
+    // legitimately, ends the paragraph, and leaves the backtick literal. That
+    // shape is not this bug, and the gate already handles it.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **api:** an addition with `a span\n  \
+         and <!-- still code` here.\n\n\
+         - **db:** **Breaking:** renamed, with no guide anywhere.\n",
+    )
+    .expect("changelog");
+
+    // Asserted on the inventory, not the exit status: the unclosed-comment
+    // guard fires on this input too, so the gate exits non-zero either way and
+    // a status-only assertion passes while the entry is still being swallowed.
+    let listed = bash_command()
+        .args(["scripts/check-migration-guides.sh", "--list"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run --list");
+    let inventory = String::from_utf8_lossy(&listed.stdout).to_string();
+    assert!(
+        inventory
+            .lines()
+            .any(|line| line.starts_with("0.7.0") && line.ends_with('1')),
+        "the entry below a multi-line code span is a real declaration:\n{inventory}",
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_an_equals_in_an_unquoted_attribute() {
+    // CommonMark excludes `=` from unquoted attribute values, so `<x foo=a=b>`
+    // is not a tag: it renders as a paragraph and the bullet below it is a
+    // real entry. Consuming the second `=` opened a block and hid it.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         <x foo=a=b>\n\
+         - **db:** **Breaking:** renamed, with no guide anywhere.\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a malformed attribute value means this is not a tag",
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_opens_a_block_on_a_quoted_equals() {
+    // The counterpart: `=` inside a *quoted* value is ordinary, so this is a
+    // tag and does open a block.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+         <x foo=\"a=b\">\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a quoted `=` is fine, so the block opens and the link is literal",
+    );
+}
