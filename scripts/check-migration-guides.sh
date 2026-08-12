@@ -1334,7 +1334,7 @@ findings="$(
     # Destinations and titles are metadata: a marker inside a URL renders as
     # part of the URL, and reading it there turned an ordinary entry into a
     # declaration. The link check below still reads the unmasked prose.
-    lower = tolower(mask_link_metadata(prose))
+    lower = tolower(mask_html_attributes(mask_link_metadata(prose)))
     marked = (lower ~ /\*\*breaking(:\*\*|\*\*:)/) || entry_breaking_heading
 
     # A marker that exists in the raw text but not after stripping is either a
@@ -1343,7 +1343,8 @@ findings="$(
     # downstream app. Ask for one token rather than guess — the suppression
     # below settles it for a mention, fixing the backticks settles it for a
     # declaration.
-    marker_in_span = (!marked && tolower(mask_link_metadata(entry_visible)) ~ /\*\*breaking(:\*\*|\*\*:)/)
+    marker_in_span = (!marked &&
+                      tolower(mask_html_attributes(mask_link_metadata(entry_visible))) ~ /\*\*breaking(:\*\*|\*\*:)/)
 
     # The suppression is for entries that talk *about* breaking changes. It
     # must never override an explicit declaration: one comment on a parent
@@ -1393,10 +1394,11 @@ findings="$(
       }
     } else {
       if (entry_is_paragraph == 0) section_has_list = 1
-      # Link destinations and titles are metadata, not rendered prose: a URL
-      # ending `/breaking-changes` describes nothing, and reading it rejected
-      # ordinary documentation entries.
-      lower = tolower(mask_link_metadata(prose))
+      # Link destinations and titles are metadata, not rendered prose, and so
+      # are HTML attribute values: a URL ending `/breaking-changes` and a
+      # `title="...breaking change..."` both describe nothing, and reading
+      # either one rejected ordinary documentation entries.
+      lower = tolower(mask_html_attributes(mask_link_metadata(prose)))
       # Fold to alpha-only words so "non-breaking" and "non breaking" are the
       # same token and word boundaries need no \b (mawk has none).
       gsub(/[^a-z]+/, " ", lower)

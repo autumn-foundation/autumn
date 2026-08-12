@@ -7271,3 +7271,96 @@ fn migration_guide_gate_counts_a_link_that_has_text() {
         gate_report(&output),
     );
 }
+
+// --- Review round 60: markers in HTML attributes --------------------------
+
+#[test]
+fn migration_guide_gate_ignores_a_marker_inside_an_html_attribute() {
+    // The marker renders inside a `title` attribute, not as prose — the
+    // reference implementation emits it as an attribute value. Reading it
+    // there turned a documentation entry into a declaration demanding a guide.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **docs:** a documentation change. \
+           <span title=\"**Breaking:** internal term\">tooltip</span>\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a marker in an attribute declares nothing\n{}",
+        gate_report(&output),
+    );
+    let listed = bash_command()
+        .args(["scripts/check-migration-guides.sh", "--list"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run --list");
+    let inventory = String::from_utf8_lossy(&listed.stdout).to_string();
+    assert!(
+        inventory
+            .lines()
+            .any(|line| line.starts_with("0.7.0") && line.ends_with('0')),
+        "the section must report zero breaking entries:\n{inventory}",
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_lint_breaking_prose_in_an_attribute() {
+    // The same rule for the unmarked-break lint: wording inside an attribute
+    // is metadata, so it must not be read as prose describing a break.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **docs:** a documentation change. \
+           <span title=\"describes a breaking change elsewhere\">tooltip</span>\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "attribute text is not prose describing a break\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_an_indented_definition_continuation() {
+    // Declared behaviour, not a fix. A review round asked for a definition
+    // continuation indented four spaces to be rejected as indented code. It is
+    // not: indented code cannot interrupt a paragraph, and the reference
+    // implementation resolves the reference at three *and* four spaces. Pinned
+    // so the question is not reopened from memory.
+    for indent in ["   ", "    "] {
+        let tmp = migration_gate_fixture("0.7.0");
+        write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            format!(
+                "# Changelog\n\n\
+                 ## [0.7.0] - 2026-09-01\n\n\
+                 ### Changed\n\n\
+                 - **db:** **Breaking:** renamed. See the [migration guide][upgrade].\n\n\
+                 [upgrade]:\n{indent}docs/migrations/0.7.0.md\n"
+            ),
+        )
+        .expect("changelog");
+
+        let output = run_migration_gate(tmp.path());
+        assert!(
+            output.status.success(),
+            "a continuation indented {} spaces still defines\n{}",
+            indent.len(),
+            gate_report(&output),
+        );
+    }
+}
