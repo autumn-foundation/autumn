@@ -18,7 +18,7 @@
 //!   * blowing the capsule byte budget marks the capsule truncated (F13);
 //!   * a TLS-required database URL turns DB capture off with a note (F7).
 //!
-//! All but the last need a live PostgreSQL, so they are Docker-gated.
+//! All but the last need a live `PostgreSQL`, so they are Docker-gated.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -546,8 +546,10 @@ async fn tls_database_url_disables_db_capture_with_note() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let config = capture_config(dir.path());
-    let mut database = DatabaseConfig::default();
-    database.primary_url = Some("postgres://user:pw@127.0.0.1:1/app?sslmode=require".to_owned());
+    let database = DatabaseConfig {
+        primary_url: Some("postgres://user:pw@127.0.0.1:1/app?sslmode=require".to_owned()),
+        ..Default::default()
+    };
 
     let provider = autumn_web::capsule::record_db::maybe_capture_pool_provider(None, &config)
         .expect("capture is enabled, so the provider is installed");
