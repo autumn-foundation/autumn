@@ -5433,10 +5433,30 @@ pub async fn show(
             let transition_conflict_block = lock_version.map_or_else(String::new, |_| {
                 format!(
                     "            if updated == 0 {{\n                \
+                     // Zero rows is ambiguous — the version moved on, or the row\n                \
+                     // is gone entirely. Re-read to tell them apart, exactly as the\n                \
+                     // `update` handler does: a 409 for a record someone else\n                \
+                     // changed, a 404 for one that no longer exists. Without this a\n                \
+                     // concurrent delete would render a conflict page for a row that\n                \
+                     // cannot be reloaded.\n                \
+                     let current: Option<{pascal_name}> = {plural}::table\n                    \
+                     .find(*id)\n                    \
+                     .select({pascal_name}::as_select())\n                    \
+                     .first(&mut *db)\n                    \
+                     .await\n                    \
+                     .optional()?;\n                \
+                     let Some(current) = current else {{\n                    \
+                     return Err(AutumnError::not_found_msg(format!(\n                        \
+                     \"{pascal_name} with id {{}} not found\", *id\n                    \
+                     )));\n                \
+                     }};\n                \
                      flash.error(\"This {snake_name} was changed by someone else since this page was loaded. Reload and try again.\").await;\n                \
+                     // Render the row as it NOW stands, not the snapshot this\n                \
+                     // request loaded: the reader is deciding again, and the legal\n                \
+                     // transitions may well be different from the ones they saw.\n                \
                      let view = show_view(\n                    \
                      db,\n                    \
-                     &row,\n                    \
+                     &current,\n                    \
                      flash_messages(&flash.consume().await),\n                    \
                      csrf.as_ref(),\n                    \
                      csrf_field.as_ref(){show_view_state_arg_call},\n                \
@@ -17519,6 +17539,20 @@ exempt_paths = [
         assert!(
             transition.contains("changed by someone else"),
             "the 409 must explain itself: {transition}"
+        );
+        // Zero rows is ambiguous: the version moved, or the row was deleted
+        // between the load and the write. The transition path re-reads to tell
+        // them apart, exactly as `update` does — otherwise a concurrent delete
+        // renders a conflict page for a row that can no longer be reloaded.
+        assert!(
+            transition.contains(".optional()?") && transition.contains("not_found_msg"),
+            "a concurrent delete must 404, not 409: {transition}"
+        );
+        // And the 409 shows the row as it now stands, not this request's stale
+        // snapshot — the legal transitions may have changed.
+        assert!(
+            transition.contains("&current,"),
+            "the 409 must render the re-read row: {transition}"
         );
     }
 
