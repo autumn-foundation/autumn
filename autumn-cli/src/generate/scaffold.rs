@@ -5425,11 +5425,15 @@ pub async fn show(
             let transition_lock_filter = lock_version.map_or_else(String::new, |_| {
                 format!(".filter({plural}::lock_version.eq(row.lock_version))")
             });
-            // Zero rows means the version moved between the load and the write.
-            // Re-render the detail page at 409 rather than redirecting with a
-            // success flash for a transition that never happened. `row` is the
-            // pre-transition snapshot, which is the honest thing to show: the
-            // reader reloads and decides again.
+            // Zero rows is ambiguous: the version moved between the load and
+            // the write, or the row was deleted outright. The block re-reads to
+            // tell them apart — 409 with the detail page re-rendered for a
+            // record someone else changed, 404 for one that is gone — rather
+            // than redirecting with a success flash for a transition that never
+            // happened, or offering a conflict page whose suggested reload
+            // cannot succeed. It renders the RE-READ row, not this request's
+            // snapshot: the reader is deciding again, and the legal edges may
+            // no longer be the ones they were shown.
             let transition_conflict_block = lock_version.map_or_else(String::new, |_| {
                 format!(
                     "            if updated == 0 {{\n                \
