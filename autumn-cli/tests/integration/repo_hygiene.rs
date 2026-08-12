@@ -6708,3 +6708,92 @@ fn migration_guide_gate_still_resolves_a_reference_the_entry_actually_uses() {
         gate_report(&output),
     );
 }
+
+// --- Review round 54: definition escapes, line-initial comments -----------
+
+#[test]
+fn migration_guide_gate_unescapes_punctuation_in_a_definition_destination() {
+    // Punctuation is escapable, so `docs/migrations/0.7.0\.md` resolves to the
+    // guide. Inline destinations learned this in round 49; the definitions
+    // collector kept the backslash and rejected a link that renders.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration guide][upgrade].\n\n\
+         [upgrade]: docs/migrations/0.7.0\\.md\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "an escaped dot in a definition still resolves\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_treats_a_line_initial_comment_as_a_raw_block() {
+    // A line beginning with `<!--` is a type-2 HTML block, so the whole line
+    // is raw — the reference implementation emits it verbatim, link syntax and
+    // all. Stripping just the comment handed the rest back as markdown and
+    // counted a link that renders as text.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         <!-- note --> **Breaking:** renamed. \
+         [guide](docs/migrations/0.7.0.md)\n\n\
+         - **api:** an addition.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a raw line declares nothing, so nothing is required\n{}",
+        gate_report(&output),
+    );
+    let listed = bash_command()
+        .args(["scripts/check-migration-guides.sh", "--list"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run --list");
+    let inventory = String::from_utf8_lossy(&listed.stdout).to_string();
+    assert!(
+        inventory
+            .lines()
+            .any(|line| line.starts_with("0.7.0") && line.ends_with('0')),
+        "the raw line must not count as a breaking entry:\n{inventory}",
+    );
+}
+
+#[test]
+fn migration_guide_gate_keeps_an_inline_comment_inline() {
+    // The counterpart: a comment that does not start the line is inline HTML,
+    // the paragraph is ordinary markdown, and its guide link is real.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. <!-- note --> See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "an inline comment leaves the rest of the line markdown\n{}",
+        gate_report(&output),
+    );
+}

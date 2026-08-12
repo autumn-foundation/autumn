@@ -559,6 +559,21 @@ function tag_end(text, start,   n, i, ch, sq, closing) {
   return 0
 }
 
+function unescape_punctuation(text,   out, i, n, ch) {
+  out = ""
+  n = length(text)
+  for (i = 1; i <= n; i++) {
+    ch = substr(text, i, 1)
+    if (ch == "\\" && i < n && escapable(substr(text, i + 1, 1))) {
+      out = out substr(text, i + 1, 1)
+      i++
+      continue
+    }
+    out = out ch
+  }
+  return out
+}
+
 function escapable(ch) {
   # CommonMark escapes only ASCII punctuation. A backslash before anything
   # else — a letter, say — stays in the text, so dropping every backslash
@@ -825,6 +840,26 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
     return scan_comments(out)
   }
 
+  if (md_in_html_block) {
+    md_paragraph_open = 0
+    if (md_html_type == 1) {
+      if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
+    } else if (md_html_end != "") {
+      if (index(line, md_html_end) > 0) md_in_html_block = 0
+    } else if (body ~ /^[[:space:]]*$/) {
+      # Measured on the container-normalised body: inside a block quote the
+      # blank line that ends the block is written `>`, and testing the raw
+      # line kept the block open and swallowed the link after it.
+      md_in_html_block = 0
+    }
+    return ""
+  }
+
+  # The in-block branch sits above fence handling: an open raw block consumes
+  # its lines whole, so a fence delimiter *inside* one is block content, not a
+  # fence. Whichever opened first wins — a block can only open below, where a
+  # fence is already known to be closed.
+
   # Fences first. A closing fence uses the same character and is at least as
   # long as its opener, so a ````markdown block may contain a ``` sample.
   # Four or more leading spaces makes these backticks literal text, not a
@@ -881,20 +916,6 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # item indentation before interpreting the blocks inside it, so four spaces
   # under a `- ` item is a two-space indent and opens a block. This is the same
   # measurement the fence rule above uses.
-  if (md_in_html_block) {
-    md_paragraph_open = 0
-    if (md_html_type == 1) {
-      if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
-    } else if (md_html_end != "") {
-      if (index(line, md_html_end) > 0) md_in_html_block = 0
-    } else if (body ~ /^[[:space:]]*$/) {
-      # Measured on the container-normalised body: inside a block quote the
-      # blank line that ends the block is written `>`, and testing the raw
-      # line kept the block open and swallowed the link after it.
-      md_in_html_block = 0
-    }
-    return ""
-  }
   # Type 1 opens on its tag name alone: the rest of the line may be anything,
   # which is why `<pre>x</pre>` both opens and closes here.
   if (tolower(body) ~ /^<(script|style|pre|textarea)([[:space:]>]|$)/) {
@@ -904,6 +925,20 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
     md_paragraph_open = 0
     md_html_opened_at = FNR
     if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
+    return ""
+  }
+  # Type 2: a line that *begins* with a comment is a raw block, so everything
+  # after `-->` on it is literal too. A comment further along a line is inline
+  # HTML and leaves the rest of the line markdown — that distinction is the
+  # difference between a guide link counting and rendering as text.
+  if (substr(body, 1, 4) == "<!--") {
+    md_in_html_block = 1
+    md_html_type = 2
+    md_html_end = "-->"
+    md_html_opened_at = FNR
+    # Like every other raw block, it interrupts the paragraph above it.
+    md_paragraph_open = 0
+    if (index(substr(body, 5), "-->") > 0) md_in_html_block = 0
     return ""
   }
   # Types 5, 3 and 4: CDATA, a processing instruction, and a declaration. None
@@ -1068,6 +1103,10 @@ collect_link_defs() {
         sub(/[[:space:]].*$/, "", dest)
         rest = substr(rest, length(dest) + 1)
       }
+      # Escapable punctuation resolves the same way here as in an inline
+      # destination: `0.7.0\.md` is the guide, and keeping the backslash
+      # rejected a reference link that renders.
+      dest = unescape_punctuation(dest)
       gap = (rest ~ /^[[:space:]]/)
       sub(/^[[:space:]]+/, "", rest)
       if (rest != "") {
@@ -1446,7 +1485,9 @@ findings="$(
     # CDATA. A tag-opened block (type 6/7) ends at a blank line or at end of
     # document, so reaching EOF inside one is ordinary markdown, not a sign the
     # file was misread, and failing it would reject valid changelogs.
-    if (md_in_html_block && md_html_type != 6)
+    if (md_in_html_block && md_html_type == 2)
+      printf "UNCLOSED\t-\t%d\tHTML comment opened here is never closed\n", md_html_opened_at
+    else if (md_in_html_block && md_html_type != 6)
       printf "UNCLOSED\t-\t%d\traw HTML block opened here is never closed\n", md_html_opened_at
   }
   ' "$CHANGELOG"
