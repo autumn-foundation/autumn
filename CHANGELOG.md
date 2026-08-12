@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generate scaffold / generate model:** a `lock_version` column now wires
+  optimistic locking end to end, so two people editing the same scaffolded
+  record can no longer silently clobber each other (#1318). Autumn already
+  shipped the hard half — `#[lock_version]` plus the `RepositoryError::Conflict`
+  the repository raises on a stale write (#575) — but the generator routed
+  around it: the update handler hand-wrote an unconditional
+  `diesel::update(table.find(id)).set(...)` and the edit form carried no
+  version, so on a `lock_version`-bearing model the last write always won.
+
+  Declaring the column (`autumn generate scaffold Post title:String
+  lock_version:i32`) is now the whole opt-in. The model gets `#[lock_version]`
+  and the migration `INTEGER NOT NULL DEFAULT 0` (the column is DB-managed, so
+  the INSERT never names it). The edit form carries the row's current version
+  in a hidden field — never as an editable control, and never on the *new*
+  form. The `update` handler turns the write into a compare-and-swap,
+  `WHERE lock_version = $expected` with `SET lock_version = lock_version + 1`
+  in the same statement, so there is no read-modify-write window.
+
+  A stale submit matches zero rows; the handler re-reads to distinguish "someone
+  else got there first" (409) from "the row is gone" (404). The 409 re-renders
+  the *same* edit form with the author's own input intact, an inline
+  `role="alert"` banner, and the row's **current** version in the hidden field —
+  so a second Save applies their edit on top of the newer row. Handing the stale
+  version back would leave the form permanently unsavable. The generated
+  `tests/<snake>.rs` gains a `<plural>_optimistic_lock_conflict` test asserting
+  exactly that sequence, and `generate admin`'s existing `#[lock_version]`
+  detection now composes with scaffolded models for free.
+
+  A `lock_version` column that is not a non-nullable `i32`/`i64` is rejected at
+  generation time rather than silently ignored. `--live`, `--sharded`, and
+  scaffolds with an `Attachment` column write through paths that do not route
+  via the guarded statement, so combining them with `lock_version` is refused up
+  front instead of emitting an edit form that only looks concurrency-safe. A
+  scaffold with no `lock_version` column is byte-identical to before.
+
 - **generate scaffold:** the generated list view ships a working **Export
   CSV** download (#1315). Autumn already had the hard half — `export_csv` +
   the `CsvSchema` trait, landed in #808 — but the generator never wired it,

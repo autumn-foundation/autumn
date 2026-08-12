@@ -1626,6 +1626,23 @@ pub fn parse_model_metadata(
         metadata.defaults.insert(field_name.to_owned(), sql);
     }
 
+    // Issue #1318: a `lock_version` column opts the model into the framework's
+    // optimistic-locking primitive. `#[lock_version]` makes the column
+    // DB-managed — it is excluded from `New{Model}`, so the INSERT never names
+    // it and the SQL column needs a `DEFAULT` or every create would fail the
+    // NOT NULL constraint. Recording it as a default here also drops the column
+    // from the scaffold's generated HTML form (`plan_scaffold`'s `form_fields`
+    // filter): the version is machinery the handler carries in a hidden field,
+    // not content the author edits. An explicit `--default lock_version=<n>`
+    // wins, so a project seeding versions from a non-zero base keeps its value.
+    validate_lock_version_field(fields)?;
+    if lock_version_field(fields).is_some() {
+        metadata
+            .defaults
+            .entry(LOCK_VERSION_COLUMN.to_owned())
+            .or_insert_with(|| "0".to_owned());
+    }
+
     // Full-text search's generated `search_page` (in the repository macro)
     // hardcodes an `i64`/`BigInt` primary key: it collects `SearchId { id: i64 }`
     // rows into a `Vec<i64>`, filters with `id.eq_any(&ids)`, and dedups through
@@ -1718,6 +1735,57 @@ fn split_key_value(token: &str, sep: char) -> Result<(&str, &str), GenerateError
 
 pub fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a Field> {
     fields.iter().find(|field| field.name == name)
+}
+
+/// The column name a model declares to opt into optimistic concurrency
+/// (issue #1318).
+///
+/// The framework's optimistic-locking primitive (issue #575) keys off the
+/// `#[lock_version]` field attribute, not off a name — but the *generators*
+/// need a nameless-DSL way to opt in, and `lock_version` is the name Rails,
+/// Ecto, and this framework's own docs (`docs/guide/cloud-native.md`) already
+/// use. Declaring `lock_version:i32` in a `generate model`/`generate scaffold`
+/// field list is therefore the opt-in: the generator wires the attribute, the
+/// SQL default, and (for scaffolds) the conflict-aware edit form.
+pub const LOCK_VERSION_COLUMN: &str = "lock_version";
+
+/// The model's optimistic-locking column, if it declares one (issue #1318).
+///
+/// Callers can assume the returned field passed [`validate_lock_version_field`]
+/// — every planning entry point runs that check before rendering.
+#[must_use]
+pub fn lock_version_field(fields: &[Field]) -> Option<&Field> {
+    field_by_name(fields, LOCK_VERSION_COLUMN)
+}
+
+/// Reject a `lock_version` column the locking primitive can't actually use.
+///
+/// `#[lock_version]`'s generated comparison reads the column as an `i64`, so a
+/// non-integer or nullable column would either fail to compile in the emitted
+/// model or silently never conflict-check. Failing here — before any file is
+/// written — beats handing the author a scaffold that *looks* concurrency-safe
+/// and isn't.
+///
+/// # Errors
+/// Returns [`GenerateError::InvalidField`] when a field named `lock_version`
+/// is not a non-nullable `i32`/`i64`.
+pub fn validate_lock_version_field(fields: &[Field]) -> Result<(), GenerateError> {
+    let Some(field) = lock_version_field(fields) else {
+        return Ok(());
+    };
+    if field.nullable || !matches!(field.kind, FieldKind::I32 | FieldKind::I64) {
+        return Err(GenerateError::InvalidField {
+            token: format!("{}:{}", field.name, field.rust_type()),
+            reason: format!(
+                "the `{LOCK_VERSION_COLUMN}` column opts the model into optimistic locking \
+                 (issue #575), so it must be a non-nullable `i32` or `i64` counter — the \
+                 generated comparison reads it as an integer. Declare it as \
+                 `{LOCK_VERSION_COLUMN}:i32` (or `{LOCK_VERSION_COLUMN}:i64`), or rename the \
+                 column if it was not meant to be a lock version."
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Apply `--unique FIELD` flags (issue #1032) to already-parsed fields,
@@ -2157,7 +2225,16 @@ fn render_model_file(
                 let _ = writeln!(out, "    #[validate({validation})]");
             }
         }
-        if metadata.defaults.contains_key(&f.name) {
+        // Issue #1318: the optimistic-locking column carries `#[lock_version]`
+        // rather than `#[default]`. Both mark the column DB-managed (excluded
+        // from `New{Model}`), but only `#[lock_version]` puts the expected
+        // version on `Update{Model}` and makes `#[repository]`'s update raise
+        // `RepositoryError::Conflict` on a stale write — the whole point of
+        // declaring the column. `parse_model_metadata` records its SQL
+        // `DEFAULT 0` separately, so the migration still backfills the INSERT.
+        if f.name == LOCK_VERSION_COLUMN {
+            out.push_str("    #[lock_version]\n");
+        } else if metadata.defaults.contains_key(&f.name) {
             out.push_str("    #[default]\n");
         }
         // A `:states(…)` DSL modifier (issue #1326) re-emits as a
@@ -5276,5 +5353,126 @@ autumn-web = \"0.3\"\n";
         )
         .unwrap();
         assert!(up.contains("category_id BIGINT NOT NULL REFERENCES categories(id)"));
+    }
+
+    // ── optimistic locking: `lock_version` (issue #1318) ────────────────────
+    //
+    // A model opts into optimistic concurrency by declaring a field literally
+    // named `lock_version`. The generator wires the framework's shipped
+    // primitive (`#[lock_version]`, issue #575) rather than leaving it an inert
+    // integer column.
+
+    #[test]
+    fn lock_version_field_emits_lock_version_attribute() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            model.contains("#[lock_version]\n    pub lock_version: i32,"),
+            "a `lock_version` column must carry the framework's `#[lock_version]` \
+             attribute so `#[repository]` update raises RepositoryError::Conflict: {model}"
+        );
+    }
+
+    #[test]
+    fn lock_version_column_gets_sql_default_zero() {
+        // `#[lock_version]` excludes the column from `NewPost`, so the INSERT
+        // omits it — without a SQL DEFAULT every create would fail on the
+        // NOT NULL constraint.
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("lock_version INTEGER NOT NULL DEFAULT 0"),
+            "got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn lock_version_bigint_is_also_supported() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i64".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            model.contains("#[lock_version]\n    pub lock_version: i64,"),
+            "got:\n{model}"
+        );
+    }
+
+    #[test]
+    fn model_without_lock_version_emits_no_lock_version_attribute() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(!model.contains("lock_version"), "got:\n{model}");
+    }
+
+    #[test]
+    fn lock_version_with_non_integer_type_is_rejected() {
+        // Silently ignoring the field would leave the author believing they
+        // opted into optimistic locking when they did not.
+        let tmp = project();
+        let err = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:String".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lock_version") && msg.contains("i32"),
+            "the error must name the field and the supported types: {msg}"
+        );
+    }
+
+    #[test]
+    fn nullable_lock_version_is_rejected() {
+        let tmp = project();
+        let err = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32?".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("lock_version"), "got: {msg}");
     }
 }

@@ -789,6 +789,64 @@ selection (HTML forbids nesting forms). To confirm a batch, post the
 selection to an interstitial page that lists the affected rows and asks
 for a second, explicit submit.
 
+### Concurrent edits: `lock_version` (optimistic locking)
+
+Declare a column named `lock_version` and the scaffold wires the
+framework's [optimistic-concurrency
+primitive](./cloud-native.md#optimistic-concurrency-via-lock_version) all
+the way through the HTML edit flow (issue #1318) — no extra flag, no
+extra code:
+
+```bash
+autumn generate scaffold Post title:String body:Text lock_version:i32
+```
+
+- The **model** gets `#[lock_version]`, so the column is DB-managed:
+  excluded from `NewPost`, carried on `UpdatePost` as the *expected*
+  version, and compared by `#[repository]`'s update (which is what makes
+  the JSON API path conflict-check too).
+- The **migration** declares it `INTEGER NOT NULL DEFAULT 0`, since the
+  INSERT never names it.
+- The **edit form** carries the row's current version in a hidden
+  `lock_version` input. The new form does not — a row that does not exist
+  yet has no version to guard against — and the version never appears as
+  an editable control.
+- The **update handler** turns the write into a compare-and-swap:
+
+  ```rust,ignore
+  let updated = diesel::update(
+      posts::table.find(*id).filter(posts::lock_version.eq(expected_lock_version)),
+  )
+      .set((
+          posts::title.eq(new.title.clone()),
+          posts::lock_version.eq(posts::lock_version + 1),
+      ))
+      .execute(&mut *db)
+      .await?;
+  ```
+
+  The guard and the bump are one statement, so there is no
+  read-modify-write window between them.
+- A **stale submit** matches zero rows. The handler re-reads the row to
+  tell "someone else got there first" (409) from "the row is gone" (404).
+  On 409 it re-renders the *same* edit form with the author's own input
+  intact, an inline `role="alert"` banner, and — deliberately — the row's
+  **current** version in the hidden field, so a second Save applies their
+  edit on top of the newer row. Handing the stale version back would make
+  the form permanently unsavable.
+- The generated `tests/<snake>.rs` gains a
+  `<plural>_optimistic_lock_conflict` test covering exactly that
+  sequence: first write wins and bumps, stale write 409s and changes
+  nothing, retry against the returned version succeeds.
+
+The column must be a non-nullable `i32` or `i64`; anything else is
+rejected at generation time rather than silently ignored.
+
+**Not yet wired:** `--live`, `--sharded`, and scaffolds with an
+`Attachment` column write through paths that do not route via the guarded
+statement, so combining them with `lock_version` is refused up front
+instead of emitting an edit form that only looks concurrency-safe.
+
 ### Export CSV from the list view
 
 Every standard HTML scaffold's index also ships a working **Export CSV**
