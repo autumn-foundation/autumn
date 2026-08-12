@@ -3018,6 +3018,14 @@ impl AppBuilder {
         );
 
         // 5. Create database pool and run migrations (if configured)
+        //
+        // With `[failure_capture] enabled = true`, the pool is built through
+        // the recording factory so a failing request's database traffic is
+        // captured at the wire (#1598). An app that installed its own
+        // `DatabasePoolProvider` keeps it, and DB capture stands down.
+        #[cfg(all(feature = "db", feature = "reporting", not(feature = "sqlite")))]
+        let pool_provider_factory =
+            crate::capsule::record_db::maybe_capture_pool_provider(pool_provider_factory, &config);
         #[cfg(feature = "db")]
         let database = setup_database(
             &config,

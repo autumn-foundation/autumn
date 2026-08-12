@@ -2639,6 +2639,41 @@ pub(crate) struct DbCheckoutParams<'a> {
     pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
 }
 
+/// The capsule attribution marker to merge into the checkout round trip, or
+/// `None` when failure-capsule capture is not armed.
+///
+/// The marker is sent on **every** checkout, including the clearing form
+/// (`SET autumn.capsule_request = ''`) when no request scope is active: a
+/// pooled connection outlives the request that borrowed it, so leaving a stale
+/// binding in place would attribute the next borrower's queries to a capsule
+/// that has nothing to do with them (#1598, F2). An id that would not survive
+/// interpolation yields `None` rather than a quoted-string escape (F24).
+#[cfg(not(feature = "sqlite"))]
+fn capsule_checkout_marker() -> Option<String> {
+    #[cfg(feature = "reporting")]
+    {
+        if !crate::capsule::db_capture_enabled() {
+            return None;
+        }
+        let scope = crate::capsule::current_scope();
+        if let Some(scope) = scope.as_ref() {
+            // If capture had to step aside for this database (TLS, a custom
+            // pool provider), say so in the capsule rather than leaving a
+            // reader to wonder where the DB tape went.
+            crate::capsule::record_db::note_db_capture_unavailable(scope);
+        }
+        let id = scope
+            .map(|scope| scope.id().to_owned())
+            .filter(|id| crate::capsule::is_valid_scope_id(id))
+            .unwrap_or_default();
+        crate::capsule::wire::marker_set_sql(&id)
+    }
+    #[cfg(not(feature = "reporting"))]
+    {
+        None
+    }
+}
+
 impl Db {
     /// Check a connection out of `params.pool` with full instrumentation.
     ///
@@ -2751,14 +2786,30 @@ impl Db {
 
         // Postgres-only per-checkout initialization; see the gating note above.
         // SQLite builds skip it entirely (it would 503 every `Db`-using route).
+        //
+        // When failure-capsule capture is armed (#1598), the capsule
+        // attribution marker rides along in this SAME round trip as one simple
+        // batch, so recording costs no extra latency on the checkout path. With
+        // capture off — the default — the statement issued here is byte-for-byte
+        // what it has always been.
         #[cfg(not(feature = "sqlite"))]
-        diesel::sql_query(format!("SET statement_timeout = {timeout_ms}"))
-            .execute(&mut conn)
-            .await
-            .map_err(|e| {
+        {
+            let outcome = match capsule_checkout_marker() {
+                Some(marker) => {
+                    use diesel_async::SimpleAsyncConnection as _;
+                    conn.batch_execute(&format!("SET statement_timeout = {timeout_ms}; {marker}"))
+                        .await
+                }
+                None => diesel::sql_query(format!("SET statement_timeout = {timeout_ms}"))
+                    .execute(&mut conn)
+                    .await
+                    .map(|_| ()),
+            };
+            outcome.map_err(|e| {
                 tracing::error!("Failed to set database statement_timeout to {timeout_ms}ms: {e}");
                 AutumnError::service_unavailable_msg(format!("Database initialization error: {e}"))
             })?;
+        }
 
         let start_time = std::time::Instant::now();
         let is_test_tx = params
@@ -4936,7 +4987,10 @@ mod tests {
 /// silently ignoring the CA file: `libpq` documents that combination as
 /// upgrading to certificate verification, so dropping the file would
 /// silently weaken what the operator asked for.
-mod tls {
+// `pub(crate)` so the failure-capsule recording pool can reuse the same
+// `sslmode` classification when deciding whether a database URL can be teed
+// (#1598) instead of re-implementing the parse.
+pub(crate) mod tls {
     use std::sync::Arc;
 
     use diesel::{ConnectionError, ConnectionResult};
@@ -4952,7 +5006,7 @@ mod tls {
     /// TLS posture derived from the connection string's `sslmode` (and
     /// `sslrootcert`). See the [module docs](self) for the full table.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(super) enum TlsPosture {
+    pub enum TlsPosture {
         /// No TLS machinery: keep diesel-async's default `NoTls` setup path.
         Off,
         /// Encrypt without verifying the server certificate chain
@@ -4971,7 +5025,7 @@ mod tls {
 
     impl TlsPosture {
         /// Classify a database URL / keyword-value connection string.
-        pub(super) fn from_database_url(database_url: &str) -> Self {
+        pub fn from_database_url(database_url: &str) -> Self {
             let params = ssl_params(database_url);
             // Last occurrence wins, matching libpq/tokio-postgres semantics.
             let get = |key: &str| {

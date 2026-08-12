@@ -45,11 +45,11 @@ pub use capture::{
     current_scope, db_capture_enabled, install_from_config, is_valid_scope_id, scope_by_id,
 };
 pub use clock::{RecordingClock, ReplayClock};
+pub use persist::{CapsuleRef, capsule_dir, load_capsule, persist};
 /// The recording pool, re-exported for tests that drive capture against a live
 /// database without reaching into the submodule path.
 #[cfg(all(feature = "test-support", feature = "db", not(feature = "sqlite")))]
 pub use record_db::build_recording_pool;
-pub use persist::{CapsuleRef, capsule_dir, load_capsule, persist};
 pub use schema::{
     BindValue, CAPSULE_FORMAT_VERSION, Capsule, CapsuleBody, CapsuleDb, CapsuleError,
     CapsuleOutcome, CapsuleRequest, ConnectionTape, Exchange, ExchangeProtocol,

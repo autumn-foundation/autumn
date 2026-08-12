@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use autumn_web::AutumnError;
 use autumn_web::capsule::{
-    CaptureScope, CaptureSettings, Capsule, ConnectionTape, Exchange, ExchangeProtocol,
+    Capsule, CaptureScope, CaptureSettings, ConnectionTape, Exchange, ExchangeProtocol,
 };
 use autumn_web::config::{AutumnConfig, DatabaseConfig};
 use autumn_web::db::Db;
@@ -57,7 +57,9 @@ async fn db_fail(mut db: Db, Query(params): Query<TagParams>) -> Result<&'static
         .bind::<diesel::sql_types::Text, _>(tag)
         .get_result(&mut db)
         .await
-        .map_err(|error| AutumnError::internal_server_error_msg(format!("query failed: {error}")))?;
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!("query failed: {error}"))
+        })?;
     Err(AutumnError::internal_server_error_msg(format!(
         "read {} then exploded",
         row.label
@@ -99,7 +101,9 @@ async fn read_label(
         .bind::<diesel::sql_types::Text, _>(tag)
         .get_result(&mut db)
         .await
-        .map_err(|error| AutumnError::internal_server_error_msg(format!("query failed: {error}")))?;
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!("query failed: {error}"))
+        })?;
     Ok(row.label)
 }
 
@@ -205,8 +209,9 @@ fn frame_tags(response: &[u8]) -> Vec<u8> {
 #[ignore = "requires Docker (testcontainers)"]
 async fn capsule_records_db_query_results() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pool = autumn_web::capsule::build_recording_pool(&db_url().await, 2, Duration::from_secs(10))
-        .expect("recording pool builds");
+    let pool =
+        autumn_web::capsule::build_recording_pool(&db_url().await, 2, Duration::from_secs(10))
+            .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -214,10 +219,18 @@ async fn capsule_records_db_query_results() {
         .with_db(pool)
         .build();
 
-    client.get("/db-fail?tag=alpha").send().await.assert_status(500);
+    client
+        .get("/db-fail?tag=alpha")
+        .send()
+        .await
+        .assert_status(500);
 
     let paths = await_capsules(dir.path(), 1).await;
-    assert_eq!(paths.len(), 1, "the failing DB request must leave a capsule");
+    assert_eq!(
+        paths.len(),
+        1,
+        "the failing DB request must leave a capsule"
+    );
     let capsule = read_capsule(&paths[0]);
     assert!(
         !capsule.truncated,
@@ -260,14 +273,46 @@ async fn capsule_records_db_query_results() {
         "the text bind must be recorded, got {:?}",
         select.binds
     );
+
+    // Replay answers a `Bind` out of `statements`, and tokio-postgres rejects
+    // a `Bind` whose arity disagrees with the `ParameterDescription` it was
+    // given — client-side, before the stub ever sees it. So every
+    // extended-protocol exchange needs its prepared-statement metadata
+    // recorded alongside it, keyed by the identical SQL text.
+    for exchange in &tape.exchanges {
+        if exchange.protocol != ExchangeProtocol::Extended {
+            continue;
+        }
+        let described = tape
+            .statements
+            .iter()
+            .find(|statement| statement.sql == exchange.sql)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no prepared-statement metadata recorded for {:?}; replay cannot \
+                     answer its Bind. statements held: {:?}",
+                    exchange.sql,
+                    tape.statements
+                        .iter()
+                        .map(|statement| statement.sql.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            frame_tags(&described.response).last() == Some(&b'Z'),
+            "prepared-statement metadata must run through ReadyForQuery, got {:?}",
+            frame_tags(&described.response)
+        );
+    }
 }
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn capsule_excludes_housekeeping_marker_exchange() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pool = autumn_web::capsule::build_recording_pool(&db_url().await, 2, Duration::from_secs(10))
-        .expect("recording pool builds");
+    let pool =
+        autumn_web::capsule::build_recording_pool(&db_url().await, 2, Duration::from_secs(10))
+            .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -300,8 +345,9 @@ async fn second_request_on_a_pooled_connection_carries_statement_metadata() {
     let dir = tempfile::tempdir().expect("tempdir");
     // One slot: the second request is guaranteed the same, already-warm
     // connection.
-    let pool = autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
-        .expect("recording pool builds");
+    let pool =
+        autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
+            .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -309,9 +355,17 @@ async fn second_request_on_a_pooled_connection_carries_statement_metadata() {
         .with_db(pool)
         .build();
 
-    client.get("/db-fail?tag=first").send().await.assert_status(500);
+    client
+        .get("/db-fail?tag=first")
+        .send()
+        .await
+        .assert_status(500);
     await_capsules(dir.path(), 1).await;
-    client.get("/db-fail?tag=second").send().await.assert_status(500);
+    client
+        .get("/db-fail?tag=second")
+        .send()
+        .await
+        .assert_status(500);
 
     let paths = await_capsules(dir.path(), 2).await;
     assert_eq!(paths.len(), 2, "each failing request leaves one capsule");
@@ -351,8 +405,9 @@ async fn second_request_on_a_pooled_connection_carries_statement_metadata() {
 #[ignore = "requires Docker (testcontainers)"]
 async fn capsule_records_connection_prologue() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pool = autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
-        .expect("recording pool builds");
+    let pool =
+        autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
+            .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -391,8 +446,9 @@ async fn capsule_records_connection_prologue() {
 #[ignore = "requires Docker (testcontainers)"]
 async fn marker_clears_previous_request_binding() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pool = autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
-        .expect("recording pool builds");
+    let pool =
+        autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
+            .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -446,8 +502,9 @@ async fn exceeding_max_capsule_bytes_marks_truncated() {
     // than write a capsule that looks complete.
     config.failure_capture.max_capsule_bytes = 16;
 
-    let pool = autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
-        .expect("recording pool builds");
+    let pool =
+        autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
+            .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(config)
