@@ -7669,3 +7669,49 @@ fn migration_guide_gate_accepts_a_label_at_the_length_limit() {
         gate_report(&output),
     );
 }
+
+// --- Review round 64: `--` inside a comment ------------------------------
+
+#[test]
+fn migration_guide_gate_treats_a_comment_containing_dashes_as_a_comment() {
+    // Declared behaviour, not a fix. CommonMark 0.30 dropped the rule that a
+    // comment may not contain `--`; a comment now runs from `<!--` to the
+    // first `-->`. The reference implementation renders both of these as
+    // comments, so the marker inside declares nothing and the section needs no
+    // guide. A review round asked for the pre-0.30 reading; this pins the
+    // spec-current one so it is not reopened from memory.
+    for entry in [
+        "- <!-- bad-- **Breaking:** renamed without guide. -->",
+        "- an entry <!-- bad-- **Breaking:** renamed without guide. --> tail",
+    ] {
+        let tmp = migration_gate_fixture("0.7.0");
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            format!(
+                "# Changelog\n\n\
+                 ## [0.7.0] - 2026-09-01\n\n\
+                 ### Changed\n\n{entry}\n"
+            ),
+        )
+        .expect("changelog");
+
+        let output = run_migration_gate(tmp.path());
+        assert!(
+            output.status.success(),
+            "a marker inside a comment declares nothing\n{}",
+            gate_report(&output),
+        );
+        let listed = bash_command()
+            .args(["scripts/check-migration-guides.sh", "--list"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("run --list");
+        let inventory = String::from_utf8_lossy(&listed.stdout).to_string();
+        assert!(
+            inventory
+                .lines()
+                .any(|line| line.starts_with("0.7.0") && line.ends_with('0')),
+            "the section must report zero breaking entries:\n{inventory}",
+        );
+    }
+}
