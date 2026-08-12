@@ -3758,6 +3758,21 @@ mod attachment_read_back_tests {
     // `{blob_cleanup}` and the id expression differ per branch, so both are
     // parameters; without a lock column the output is the pre-#1318 text
     // verbatim.
+    // The re-read row is re-authorized before anything from it is used. The
+    // policy check at the top of `update` ran against the snapshot this request
+    // loaded; a record policy can depend on mutable row data, so the concurrent
+    // write that moved the version may also have moved the row out of this
+    // actor's reach. Only the version integer crosses over here (the re-render
+    // shows the author's own submitted values), but re-checking costs one call
+    // and removes the whole class rather than arguing about how sensitive a
+    // counter is. Empty without a policy.
+    let conflict_reauthz = if authorize {
+        format!(
+            "            autumn_web::authorization::authorize::<{pascal_name}>({create_update_state_expr}, &session, \"update\", &current).await?;\n"
+        )
+    } else {
+        String::new()
+    };
     let update_zero_rows_block = |blob_cleanup: &str, id_expr: &str| -> String {
         let not_found = format!(
             "{blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
@@ -3776,7 +3791,8 @@ mod attachment_read_back_tests {
              .optional()?;\n        \
              if let Some(current) = current {{\n            \
              // Lost the race: re-render this author's edits over the row as it\n            \
-             // now stands, so nothing they typed is thrown away.\n            \
+             // now stands, so nothing they typed is thrown away.\n\
+             {conflict_reauthz}            \
              let lock_version_value = current.lock_version;\n            \
              let lock_conflict = true;\n            \
              return Ok((autumn_web::reexports::http::StatusCode::CONFLICT, {edit_form_body}).into_response());\n        \
@@ -5463,6 +5479,21 @@ pub async fn show(
             // cannot succeed. It renders the RE-READ row, not this request's
             // snapshot: the reader is deciding again, and the legal edges may
             // no longer be the ones they were shown.
+            // The re-read row must be re-authorized before it is rendered. The
+            // policy check earlier in this handler ran against `row`, the
+            // snapshot this request loaded; a record policy can depend on
+            // mutable row data (the generated owner policy does), so the very
+            // concurrent write that moved the version may also have moved the
+            // row out of this actor's reach. Rendering `current` unchecked would
+            // hand them its current properties and transition controls. Empty
+            // without a policy, where there is nothing to re-check.
+            let transition_conflict_reauthz = if authorize {
+                format!(
+                    "                autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"update\", &current).await?;\n"
+                )
+            } else {
+                String::new()
+            };
             let transition_conflict_block = lock_version.map_or_else(String::new, |_| {
                 format!(
                     "            if updated == 0 {{\n                \
@@ -5482,7 +5513,8 @@ pub async fn show(
                      return Err(AutumnError::not_found_msg(format!(\n                        \
                      \"{pascal_name} with id {{}} not found\", *id\n                    \
                      )));\n                \
-                     }};\n                \
+                     }};\n\
+                     {transition_conflict_reauthz}                \
                      flash.error(\"This {snake_name} was changed by someone else since this page was loaded. Reload and try again.\").await;\n                \
                      // Render the row as it NOW stands, not the snapshot this\n                \
                      // request loaded: the reader is deciding again, and the legal\n                \
@@ -17304,6 +17336,88 @@ exempt_paths = [
         assert!(
             routes.contains("role=\"alert\""),
             "the banner must be announced to assistive tech: {routes}"
+        );
+    }
+
+    #[test]
+    fn a_re_read_row_is_re_authorized_before_it_is_used() {
+        // Both guarded writes re-read the row when they match zero. The policy
+        // check earlier in each handler ran against the snapshot that request
+        // loaded — and a record policy can depend on mutable row data (the
+        // generated owner policy does), so the very write that moved the version
+        // may also have moved the row out of this actor's reach. Rendering or
+        // reading the re-read row unchecked would leak it.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "user:references".into(),
+                "status:String:states(draft->published)".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let needle = "authorize::<Post>(&state, &session, \"update\", &current)";
+
+        // The transition path renders the whole row, so this is the sharp case.
+        let transition = handler_slice(&routes, "transition_status");
+        let conflict_at = transition
+            .find("if updated == 0")
+            .expect("transition conflict branch");
+        assert!(
+            transition[conflict_at..].contains(needle),
+            "the transition 409 must re-authorize before rendering: {transition}"
+        );
+        let reauthz_at = conflict_at + transition[conflict_at..].find(needle).unwrap();
+        let render_at = transition[conflict_at..]
+            .find("show_view(")
+            .map(|i| conflict_at + i)
+            .expect("show_view in the conflict branch");
+        assert!(
+            reauthz_at < render_at,
+            "the check must come BEFORE the render: {transition}"
+        );
+
+        // The update path only carries the version integer across, but re-checks
+        // for the same reason rather than arguing about how sensitive it is.
+        let update = handler_slice(&routes, "update");
+        let uconflict = update
+            .find("if updated == 0")
+            .expect("update conflict branch");
+        assert!(
+            update[uconflict..].contains(needle),
+            "the update 409 must re-authorize the re-read row: {update}"
+        );
+    }
+
+    #[test]
+    fn a_no_policy_scaffold_emits_no_conflict_reauthorization() {
+        // Nothing to re-check without a policy, and the emitted branch must not
+        // reference a `state`/`session` the handler never took.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            &ScaffoldOptions {
+                no_policy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            !routes.contains("authorize::<Post>"),
+            "a --no-policy scaffold must emit no authorize calls: {routes}"
+        );
+        assert!(
+            handler_slice(&routes, "update").contains("StatusCode::CONFLICT"),
+            "the 409 branch is still emitted: {routes}"
         );
     }
 
