@@ -127,6 +127,13 @@ pub struct ErrorEvent {
     /// Panic details, present only when the failure originated from a caught
     /// handler panic.
     pub panic: Option<PanicInfo>,
+    /// The replay capsule written for this failure, when
+    /// `[failure_capture] enabled = true` and persistence succeeded.
+    ///
+    /// The capsule file already exists on disk by the time a reporter is
+    /// invoked, so a reporter may safely attach the path (or read the file)
+    /// while handling the event.
+    pub capsule: Option<crate::capsule::CapsuleRef>,
 }
 
 /// Details of a caught handler panic.
@@ -208,8 +215,16 @@ struct ReporterChain {
 impl ReporterChain {
     /// Decide whether to deliver this event, then dispatch it on a detached
     /// task so reporting never blocks (or breaks) the client response.
-    fn dispatch(self: &Arc<Self>, event: ErrorEvent) {
-        if !self.enabled || !sampled(self.sample_rate) {
+    ///
+    /// Capsule persistence rides along here rather than in the capture layer
+    /// because it must happen on the same detached task and *before* any
+    /// reporter runs: a reporter that receives
+    /// [`ErrorEvent::capsule`](ErrorEvent::capsule) must find the file already
+    /// on disk. That also means persistence is not gated on `enabled` or the
+    /// sample rate — an app with reporting turned off still writes capsules.
+    fn dispatch(self: &Arc<Self>, event: ErrorEvent, capture: Option<CaptureContext>) {
+        let deliver = self.enabled && sampled(self.sample_rate);
+        if !deliver && capture.is_none() {
             return;
         }
         // Reporting is best-effort: if we're somehow off-runtime, drop it
@@ -217,7 +232,13 @@ impl ReporterChain {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let chain = Arc::clone(self);
             handle.spawn(async move {
-                chain.report_all(&event).await;
+                let mut event = event;
+                if let Some(capture) = capture {
+                    event.capsule = persist_capsule(capture);
+                }
+                if deliver {
+                    chain.report_all(&event).await;
+                }
             });
         }
     }
@@ -238,6 +259,20 @@ impl ReporterChain {
             }
         }
     }
+}
+
+/// A request's capture scope plus the outcome that seals it.
+///
+/// Passed to [`ReporterChain::dispatch`] alongside the event so the capsule is
+/// written on the reporting task, before reporters see the event.
+struct CaptureContext {
+    handle: crate::capsule::CaptureHandle,
+    outcome: crate::capsule::CapsuleOutcome,
+}
+
+/// Write the capsule for a failed request, if capture was armed for it.
+fn persist_capsule(capture: CaptureContext) -> Option<crate::capsule::CapsuleRef> {
+    crate::capsule::persist(capture.handle.scope(), capture.outcome)
 }
 
 thread_local! {
@@ -342,6 +377,9 @@ struct RequestContext {
     method: String,
     route: Option<String>,
     request_id: Option<String>,
+    /// Handle to the request's capsule buffer, snapshotted here for the same
+    /// reason the rest of this struct is: it must survive a handler unwind.
+    capture: Option<crate::capsule::CaptureHandle>,
 }
 
 /// Tower [`Layer`] that catches handler panics and reports panics + 5xx
@@ -422,10 +460,15 @@ where
             .extensions()
             .get::<RequestId>()
             .map(std::string::ToString::to_string);
+        let capture = req
+            .extensions()
+            .get::<crate::capsule::CaptureHandle>()
+            .cloned();
         let context = Some(RequestContext {
             method,
             route,
             request_id,
+            capture,
         });
 
         // Catch panics raised synchronously while the inner service constructs
@@ -524,15 +567,28 @@ fn report_response(response: &Response, context: RequestContext, chain: &Arc<Rep
         |info| (info.message.clone(), info.problem_type.map(str::to_owned)),
     );
 
-    chain.dispatch(ErrorEvent {
-        status: response.status(),
-        message,
-        problem_type,
-        request_id: context.request_id,
-        route: context.route,
-        method: Some(context.method),
-        panic: None,
+    let capture = context.capture.map(|handle| CaptureContext {
+        handle,
+        outcome: crate::capsule::CapsuleOutcome::Status {
+            code: response.status().as_u16(),
+            message: message.clone(),
+            problem_type: problem_type.clone(),
+        },
     });
+
+    chain.dispatch(
+        ErrorEvent {
+            status: response.status(),
+            message,
+            problem_type,
+            request_id: context.request_id,
+            route: context.route,
+            method: Some(context.method),
+            panic: None,
+            capsule: None,
+        },
+        capture,
+    );
 }
 
 /// Convert a caught panic into a sanitized 500 response and report it.
@@ -547,18 +603,30 @@ fn handle_panic(
         .and_then(|captured| captured.backtrace);
 
     if let Some(context) = context {
-        chain.dispatch(ErrorEvent {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.clone(),
-            problem_type: None,
-            request_id: context.request_id,
-            route: context.route,
-            method: Some(context.method),
-            panic: Some(PanicInfo {
-                payload: message,
-                backtrace,
-            }),
+        let capture = context.capture.map(|handle| CaptureContext {
+            handle,
+            outcome: crate::capsule::CapsuleOutcome::Panic {
+                status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                payload: message.clone(),
+                backtrace: backtrace.clone(),
+            },
         });
+        chain.dispatch(
+            ErrorEvent {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: message.clone(),
+                problem_type: None,
+                request_id: context.request_id,
+                route: context.route,
+                method: Some(context.method),
+                panic: Some(PanicInfo {
+                    payload: message,
+                    backtrace,
+                }),
+                capsule: None,
+            },
+            capture,
+        );
     }
 
     // The client gets a clean, sanitized Problem Details 500 — the panic
@@ -655,15 +723,19 @@ mod tests {
             enabled: false,
             sample_rate: 1.0,
         });
-        chain.dispatch(ErrorEvent {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "x".into(),
-            problem_type: None,
-            request_id: None,
-            route: None,
-            method: None,
-            panic: None,
-        });
+        chain.dispatch(
+            ErrorEvent {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "x".into(),
+                problem_type: None,
+                request_id: None,
+                route: None,
+                method: None,
+                panic: None,
+                capsule: None,
+            },
+            None,
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(*count.lock().unwrap(), 0);
     }
@@ -677,6 +749,7 @@ mod tests {
             route: Some("/x".into()),
             method: Some("GET".into()),
             panic: None,
+            capsule: None,
         }
     }
 
@@ -692,6 +765,7 @@ mod tests {
                 payload: "kaboom".into(),
                 backtrace: Some("<backtrace>".into()),
             }),
+            capsule: None,
         }
     }
 
@@ -750,6 +824,6 @@ mod tests {
             enabled: true,
             sample_rate: 1.0,
         });
-        chain.dispatch(server_error_event());
+        chain.dispatch(server_error_event(), None);
     }
 }

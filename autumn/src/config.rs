@@ -157,6 +157,11 @@
 //! | `AUTUMN_AUTH__MAGIC_LINK__TTL_MINUTES` | `auth.magic_link.ttl_minutes` | `u64` |
 //! | `AUTUMN_AUTH__MAGIC_LINK__EMAIL_COOLDOWN_SECS` | `auth.magic_link.email_cooldown_secs` | `u64` |
 //! | `AUTUMN_TIME_ZONE__IDENTIFIER` | `time_zone.identifier` | IANA id `String` |
+//! | `AUTUMN_FAILURE_CAPTURE__ENABLED` | `failure_capture.enabled` | `bool` |
+//! | `AUTUMN_FAILURE_CAPTURE__DIR` | `failure_capture.dir` | `String` |
+//! | `AUTUMN_FAILURE_CAPTURE__MAX_BODY_BYTES` | `failure_capture.max_body_bytes` | `usize` |
+//! | `AUTUMN_FAILURE_CAPTURE__MAX_CAPSULE_BYTES` | `failure_capture.max_capsule_bytes` | `usize` |
+//! | `AUTUMN_FAILURE_CAPTURE__MAX_CAPSULES` | `failure_capture.max_capsules` | `usize` |
 
 use std::path::{Path, PathBuf};
 
@@ -1015,6 +1020,27 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub deploy: Option<DeployConfig>,
 
+    /// Deterministic replay capsule settings (`[failure_capture]` section,
+    /// issue #1598).
+    ///
+    /// Off by default. When enabled, each failing request is written to disk
+    /// as a replayable capsule; see [`FailureCaptureConfig`] and
+    /// `docs/guide/failure-capsules.md` (capsules contain real request data —
+    /// read the security section before turning this on).
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// Declared here, before [`database`](Self::database), for the same reason
+    /// [`deploy`](Self::deploy) is: `DatabaseConfig`'s `deserialize_with`
+    /// duration field aborts the `SchemaDeserializer` traversal, so a section
+    /// declared after it is recorded only as an opaque root leaf and strict
+    /// unknown-key validation never descends into its children. The regression
+    /// guard `failure_capture_child_keys_are_strictly_validated` fails if this
+    /// ordering breaks.
+    #[cfg(feature = "reporting")]
+    #[serde(default)]
+    pub failure_capture: FailureCaptureConfig,
+
     /// Database connection settings (URL, pool size, timeouts).
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -1549,6 +1575,99 @@ const fn default_reporting_enabled() -> bool {
 #[cfg(feature = "reporting")]
 const fn default_reporting_sample_rate() -> f64 {
     1.0
+}
+
+/// Deterministic replay capsule settings (`[failure_capture]` section in
+/// `autumn.toml`, issue #1598).
+///
+/// # Example `autumn.toml`
+///
+/// ```toml
+/// [failure_capture]
+/// enabled = true                  # record capsules for failing requests (default: false)
+/// dir = "tmp/autumn-capsules"     # where capsules are written (project-relative)
+/// max_body_bytes = 65536          # largest request body copied into a capsule
+/// max_capsule_bytes = 1048576     # effect budget before a capsule is marked truncated
+/// max_capsules = 50               # retained capsules; oldest are pruned
+/// ```
+///
+/// **A capsule holds real production request data and real database rows.**
+/// Sensitive headers, query parameters and structured body fields are masked
+/// through `[log] filter_parameters`, but unstructured bodies, URL paths and
+/// result rows are not. Read `docs/guide/failure-capsules.md` before enabling
+/// this outside development.
+#[cfg(feature = "reporting")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct FailureCaptureConfig {
+    /// Whether failing requests are recorded as capsules.
+    ///
+    /// Defaults to `false` — capture costs a buffered request body and a
+    /// teed database stream on every request, and the artifacts contain
+    /// production data.
+    #[serde(default = "default_failure_capture_enabled")]
+    pub enabled: bool,
+
+    /// Directory capsules are written to, project-relative by default
+    /// (mirroring `tmp/autumn-maintenance.json`).
+    #[serde(default = "default_failure_capture_dir")]
+    pub dir: String,
+
+    /// Largest request body copied into a capsule, in bytes.
+    ///
+    /// A body larger than this is never consumed at all — the handler still
+    /// receives it intact and the capsule records it as skipped.
+    #[serde(default = "default_failure_capture_max_body_bytes")]
+    pub max_body_bytes: usize,
+
+    /// Budget for recorded effects before a capsule is marked truncated.
+    ///
+    /// Recording stops at the ceiling; the capsule is still written (so the
+    /// failure is not lost) but replay refuses it.
+    #[serde(default = "default_failure_capture_max_capsule_bytes")]
+    pub max_capsule_bytes: usize,
+
+    /// How many capsules to retain in `dir`; the oldest beyond this are
+    /// pruned after each write so an error storm cannot fill a disk.
+    #[serde(default = "default_failure_capture_max_capsules")]
+    pub max_capsules: usize,
+}
+
+#[cfg(feature = "reporting")]
+impl Default for FailureCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_failure_capture_enabled(),
+            dir: default_failure_capture_dir(),
+            max_body_bytes: default_failure_capture_max_body_bytes(),
+            max_capsule_bytes: default_failure_capture_max_capsule_bytes(),
+            max_capsules: default_failure_capture_max_capsules(),
+        }
+    }
+}
+
+#[cfg(feature = "reporting")]
+const fn default_failure_capture_enabled() -> bool {
+    false
+}
+
+#[cfg(feature = "reporting")]
+fn default_failure_capture_dir() -> String {
+    "tmp/autumn-capsules".to_owned()
+}
+
+#[cfg(feature = "reporting")]
+const fn default_failure_capture_max_body_bytes() -> usize {
+    65_536
+}
+
+#[cfg(feature = "reporting")]
+const fn default_failure_capture_max_capsule_bytes() -> usize {
+    1_048_576
+}
+
+#[cfg(feature = "reporting")]
+const fn default_failure_capture_max_capsules() -> usize {
+    50
 }
 
 /// Developer-experience settings (`[dev]` section in `autumn.toml`).
@@ -3757,6 +3876,8 @@ impl AutumnConfig {
         self.apply_actuator_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
         self.apply_reporting_env_overrides_with_env(env);
+        #[cfg(feature = "reporting")]
+        self.apply_failure_capture_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
         self.apply_backup_env_overrides_with_env(env);
@@ -3938,6 +4059,12 @@ impl AutumnConfig {
             "AUTUMN_REPORTING__SAMPLE_RATE",
             &mut self.reporting.sample_rate,
         );
+    }
+
+    #[cfg(feature = "reporting")]
+    fn apply_failure_capture_env_overrides_with_env(&mut self, env: &dyn Env) {
+        // stub: overrides land in the GREEN step.
+        let _ = env;
     }
 
     fn apply_dev_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -10263,6 +10390,78 @@ path = "/healthz"
         config.apply_env_overrides_with_env(&env);
         assert!(!config.reporting.enabled);
         assert!((config.reporting.sample_rate - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn failure_capture_defaults_are_off() {
+        let config = AutumnConfig::default();
+        assert!(
+            !config.failure_capture.enabled,
+            "capture writes production request data to disk; it must be opt-in"
+        );
+        assert_eq!(config.failure_capture.dir, "tmp/autumn-capsules");
+        assert_eq!(config.failure_capture.max_body_bytes, 65_536);
+        assert_eq!(config.failure_capture.max_capsule_bytes, 1_048_576);
+        assert_eq!(config.failure_capture.max_capsules, 50);
+    }
+
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn failure_capture_env_overrides_apply() {
+        let env = MockEnv::new()
+            .with("AUTUMN_FAILURE_CAPTURE__ENABLED", "true")
+            .with("AUTUMN_FAILURE_CAPTURE__DIR", "/var/tmp/capsules")
+            .with("AUTUMN_FAILURE_CAPTURE__MAX_BODY_BYTES", "1024")
+            .with("AUTUMN_FAILURE_CAPTURE__MAX_CAPSULE_BYTES", "2048")
+            .with("AUTUMN_FAILURE_CAPTURE__MAX_CAPSULES", "5");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.failure_capture.enabled);
+        assert_eq!(config.failure_capture.dir, "/var/tmp/capsules");
+        assert_eq!(config.failure_capture.max_body_bytes, 1024);
+        assert_eq!(config.failure_capture.max_capsule_bytes, 2048);
+        assert_eq!(config.failure_capture.max_capsules, 5);
+    }
+
+    /// Regression guard for the `[failure_capture]` field ordering.
+    ///
+    /// Mirrors `deploy_child_keys_are_strictly_validated`: the strict
+    /// unknown-key validator only descends into a config.rs-internal section
+    /// declared *before* `database`, because `DatabaseConfig`'s
+    /// `deserialize_with` duration field aborts the schema walk. If someone
+    /// moves `failure_capture` below `database`, its child keys silently
+    /// vanish from the schema and this fails.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn failure_capture_child_keys_are_strictly_validated() {
+        let leaves = AutumnConfig::schema_leaf_paths();
+        for key in [
+            "failure_capture.enabled",
+            "failure_capture.dir",
+            "failure_capture.max_body_bytes",
+            "failure_capture.max_capsule_bytes",
+            "failure_capture.max_capsules",
+        ] {
+            assert!(
+                leaves.contains(key),
+                "{key} must be a schema leaf so strict validation descends into \
+                 [failure_capture]; if this fails, the section was likely moved below \
+                 `database` in AutumnConfig"
+            );
+        }
+
+        let schema = AutumnConfig::get_schema_keys();
+        let errors =
+            AutumnConfig::validate_toml("[failure_capture]\nenabledd = true\n", &schema);
+        assert!(
+            errors
+                .iter()
+                .any(|(path, _)| path == "failure_capture.enabledd"),
+            "a bogus [failure_capture] child key must be rejected by strict validation, \
+             got: {errors:?}"
+        );
     }
 
     #[test]

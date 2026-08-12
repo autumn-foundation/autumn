@@ -3745,8 +3745,9 @@ fn apply_middleware(
     //   TraceContext → AccessLog-fallback (applied in apply_startup_barrier) →
     //   StartupBarrier → Compression → Metrics → ExceptionFilter → ErrorPageContext →
     //   Session → SecurityHeaders → RequestId → LogContext → AccessLog-primary →
-    //   Timeout → [user layers] → Tenancy → BodyLimit/UploadConfig →
-    //   MethodOverride → RateLimit → CSRF → CORS → handler
+    //   FailureCapture → Reporting → Timeout → [user layers] → Tenancy →
+    //   BodyLimit/UploadConfig → MethodOverride → RateLimit → CSRF → CORS →
+    //   handler
     // `mirror_cors = true`: this layer is outside `CorsLayer` (CORS is applied
     // earlier, hence inner), so its timeout 503 must carry CORS headers itself.
     //
@@ -3789,6 +3790,30 @@ fn apply_middleware(
             state.error_reporters(),
             config.reporting.enabled,
             config.reporting.sample_rate,
+        ));
+    }
+
+    // Failure-capsule capture (#1598). Outer to the reporting layer, because a
+    // request's capture scope has to exist before that layer snapshots its
+    // context — the scope is what the reporting layer seals into a capsule when
+    // the request turns out to have failed. Off unless
+    // `[failure_capture] enabled = true`; capsules hold real request data.
+    #[cfg(feature = "reporting")]
+    if config.failure_capture.enabled {
+        // Arm the connection-checkout marker for test apps too: production
+        // arms it earlier (before the pool is built) from `App::run`.
+        crate::capsule::install_from_config(true);
+        // Same filter composition as the log context below, so one
+        // `[log] filter_parameters` list governs both.
+        let mut capture_filter_parameters = config.log.filter_parameters.clone();
+        capture_filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+        let capture_filter = Arc::new(crate::log::filter::ParameterFilter::new(
+            &capture_filter_parameters,
+            &config.log.unfilter_parameters,
+        ));
+        router = router.layer(crate::capsule::CaptureLayer::new(
+            crate::capsule::settings_from_config(config),
+            capture_filter,
         ));
     }
 

@@ -2919,6 +2919,12 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
+        // Arm failure-capsule capture before anything that consults it is built
+        // — most importantly the database pool, whose factory decides here
+        // whether to tee the connection stream (#1598).
+        #[cfg(feature = "reporting")]
+        crate::capsule::install_from_config(config.failure_capture.enabled);
+
         #[cfg(feature = "mail")]
         if mount_unsubscribe_endpoint {
             config.mail.mount_unsubscribe_endpoint = true;
@@ -3096,6 +3102,17 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+
+        // Tee clock reads into the capsule of whatever request took them, so a
+        // replayed handler sees the same `now()` sequence the failure did.
+        // Mirrored by `TestApp::build` so test apps exercise the same wiring.
+        #[cfg(feature = "reporting")]
+        if config.failure_capture.enabled {
+            let recording = std::sync::Arc::new(crate::capsule::RecordingClock::new(
+                state.clock_arc(),
+            )) as std::sync::Arc<dyn crate::time::ClockSource>;
+            state = state.with_clock(recording);
+        }
 
         // Wire the in-memory log capture buffer from the telemetry guard into the
         // app state so the `/actuator/logfile` endpoint can serve it.
@@ -6476,6 +6493,7 @@ fn make_acme_reporter(
                 route: Some("acme-renewal".to_owned()),
                 method: None,
                 panic: None,
+                capsule: None,
             };
             for reporter in &reporters {
                 reporter.report(&event).await;
