@@ -53,7 +53,7 @@ fn mailgun_form(key: &str, ts: &str, token: &str, extra: &[(&str, &str)]) -> Str
     }
 }
 
-/// Dummy route so TestApp is happy (it requires at least one route).
+/// Dummy route so `TestApp` is happy (it requires at least one route).
 #[get("/_ping")]
 async fn ping() -> &'static str {
     "pong"
