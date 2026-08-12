@@ -1505,11 +1505,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generated. Generation prints a warning naming the escape hatch (rename the
   column) whenever the name is detected.
 
-  **Breaking for `--api` scaffolds on a `lock_version` model:**
+  **Breaking:** on an `--api` scaffold over a `lock_version` model,
   `#[lock_version]` puts a *required* `lock_version` on `Update{Model}`, so JSON
   `PUT`/`PATCH` clients must now send the version they read. That is what gives
   the JSON path conflict-checking, but existing clients that omit the field will
-  fail deserialization.
+  fail deserialization. See the
+  [migration guide](docs/migrations/next.md).
 
 - **generate:** finished the zero-JS file-upload slice (#1236) on the read-back
   side. A scaffold with an `Attachment` column now *shows* what it stored: the
