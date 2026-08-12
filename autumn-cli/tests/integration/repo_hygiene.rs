@@ -7765,3 +7765,85 @@ fn migration_guide_gate_accepts_a_link_wrapped_within_a_paragraph() {
         gate_report(&output),
     );
 }
+
+// --- Review round 66: text inside a visible raw HTML block ---------------
+
+#[test]
+fn migration_guide_gate_counts_text_inside_a_raw_html_container() {
+    // A `<div>` renders its contents, so instructions written inside one are
+    // guidance a reader can read. Treating every line of a raw block as
+    // invisible rejected a guide that says what to do.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace(
+        "Why this release breaks.",
+        "<div>\nUpgrade by changing the API call.\n</div>",
+    );
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "words inside a container are still words\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_count_text_inside_a_comment_block() {
+    // The counterpart: a comment shows nothing, so the same words inside one
+    // leave the section a stub.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace(
+        "Why this release breaks.",
+        "<!--\nUpgrade by changing the API call.\n-->",
+    );
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a commented-out instruction is not guidance\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_ignores_links_inside_a_raw_html_container() {
+    // Counting the *text* must not start counting the *markdown*: a guide link
+    // written inside a container still renders as literal text, so it cannot
+    // satisfy an entry.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+         <div>\n  See the [migration guide](docs/migrations/0.7.0.md).\n  </div>\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "markdown inside a container is still literal",
+    );
+}

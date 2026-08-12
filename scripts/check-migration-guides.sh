@@ -1066,6 +1066,9 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
     md_html_type = 1
     md_html_end = ""
     md_paragraph_open = 0
+    # `<pre>` and `<textarea>` show their contents; `<script>` and `<style>`
+    # do not, so their text is not guidance a reader can read.
+    md_html_visible = (tolower(body) ~ /^<(pre|textarea)([[:space:]>]|$)/)
     md_html_opened_at = FNR
     if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
     return ""
@@ -1076,6 +1079,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # difference between a guide link counting and rendering as text.
   if (substr(body, 1, 4) == "<!--") {
     md_in_html_block = 1
+    md_html_visible = 0
     md_html_type = 2
     md_html_end = "-->"
     md_html_opened_at = FNR
@@ -1101,6 +1105,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   }
   if (md_html_end != "") {
     md_in_html_block = 1
+    md_html_visible = 0
     md_paragraph_open = 0
     md_html_opened_at = FNR
     # The terminator may sit on the opening line, after the opener itself —
@@ -1122,6 +1127,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   if (tolower(body) ~ /^<\/?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)([[:space:]>]|\/>|$)/) {
     md_in_html_block = 1
     md_html_type = 6
+    md_html_visible = 1
     md_paragraph_open = 0
     md_html_opened_at = FNR
     return ""
@@ -1137,6 +1143,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   if (!md_paragraph_open && is_standalone_tag(body) && body !~ /^<!/) {
     md_in_html_block = 1
     md_html_type = 6
+    md_html_visible = 1
     md_paragraph_open = 0
     md_html_opened_at = FNR
     return ""
@@ -1855,6 +1862,19 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           if (!md_in_fence) track_block_indent($0)
           visible = visible_text($0)
           if (md_fence_hit) next
+          # Text inside a `<div>` or `<details>` renders: markdown syntax in
+          # there is literal, but the words are guidance a reader can read, and
+          # rejecting them turned a perfectly good guide into a stub. Comments,
+          # `<script>`, `<style>` and the non-tag blocks show nothing, so their
+          # contents are not counted.
+          if (md_in_html_block && md_html_visible) {
+            if (rendered_content($0) ~ /[^[:space:]]/) {
+              for (lvl = 1; lvl <= 6; lvl++) {
+                if (open_heading[lvl] != "") content[open_heading[lvl]] = 1
+              }
+            }
+            next
+          }
           if (md_in_fence) {
             if ($0 ~ /[^[:space:]]/) {
               for (lvl = 1; lvl <= 6; lvl++) {
