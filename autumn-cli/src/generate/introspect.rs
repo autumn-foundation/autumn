@@ -45,6 +45,22 @@ pub struct Column {
     /// constant default such as `DEFAULT 0`, which would collide on insert since
     /// the macros exclude `#[id]` from `NewX`.
     pub has_sequence_default: bool,
+    /// True when the column default is a plain integer literal (`DEFAULT 0`,
+    /// `DEFAULT 1`, `DEFAULT 0::integer`).
+    ///
+    /// [`has_default`](Self::has_default) only says a default *expression*
+    /// exists, which is not the same as "the database will supply a usable
+    /// value": `DEFAULT nullif(0,0)` reports a default and still violates a
+    /// `NOT NULL` constraint on every insert that omits the column. Anywhere a
+    /// decision depends on the default actually initializing the column — the
+    /// `#[lock_version]` annotation in [`render_model`] — it must read this
+    /// instead. Same reasoning as `has_sequence_default`: when the *content* of
+    /// the default matters, inspect it rather than trusting its presence.
+    ///
+    /// (A literal `DEFAULT NULL` never reaches here: Postgres normalizes a
+    /// constant-NULL default away, reporting no `column_default` at all, so
+    /// `has_default` is already false for it.)
+    pub default_is_integer_literal: bool,
     /// True when the column is a stored generated column
     /// (`GENERATED ALWAYS AS (...) STORED`). Such columns are read-only, so they
     /// are annotated `#[default]` to keep them out of inserts and updates.
@@ -397,7 +413,13 @@ fn is_lock_version_column(col: &Column) -> bool {
         // always carries `DEFAULT 0` (see `parse_model_metadata`), so the
         // round-trip property still holds; a defaultless legacy column is
         // pulled as the ordinary integer it has always been.
-        && col.has_default
+        //
+        // It must be a real integer default, not merely *a* default: a
+        // `NOT NULL` column defaulted to a NULL-valued expression
+        // (`DEFAULT nullif(0,0)`) reports `has_default` and still fails every
+        // insert that omits it, so annotating would break a project that
+        // previously worked by always supplying the column.
+        && col.default_is_integer_literal
 }
 
 /// Build a `diesel::table!` block from introspected columns.
@@ -654,6 +676,7 @@ mod tests {
             is_pk,
             has_default: false,
             has_sequence_default: false,
+            default_is_integer_literal: false,
             is_generated: false,
             is_identity: false,
         }
@@ -669,6 +692,7 @@ mod tests {
             is_pk: true,
             has_default: true,
             has_sequence_default: true,
+            default_is_integer_literal: true,
             is_generated: false,
             is_identity: false,
         }
@@ -684,6 +708,7 @@ mod tests {
             is_pk: false,
             has_default: true,
             has_sequence_default: false,
+            default_is_integer_literal: false,
             is_generated: false,
             is_identity: false,
         }
@@ -1000,6 +1025,7 @@ mod tests {
                     is_pk: true,
                     has_default: true,
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: false,
                     is_identity: false,
                 },
@@ -1104,6 +1130,7 @@ mod tests {
                     is_pk: false,
                     has_default: true, // e.g. DEFAULT 'draft'
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: false,
                     is_identity: false,
                 },
@@ -1115,6 +1142,7 @@ mod tests {
                     is_pk: false,
                     has_default: false,
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: true,
                     is_identity: false,
                 },
@@ -1236,6 +1264,7 @@ mod tests {
                     is_pk: true,
                     has_default: false,
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: false,
                     is_identity: false,
                 },
@@ -1271,6 +1300,7 @@ mod tests {
                     is_pk: true,
                     has_default: false,
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: false,
                     is_identity: true,
                 },
@@ -1282,6 +1312,7 @@ mod tests {
                     is_pk: false,
                     has_default: false,
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: false,
                     is_identity: true,
                 },
@@ -1314,6 +1345,7 @@ mod tests {
                     is_pk: false,
                     has_default: true,
                     has_sequence_default: true,
+                    default_is_integer_literal: true,
                     is_generated: false,
                     is_identity: false,
                 },
@@ -1564,6 +1596,7 @@ mod tests {
                     is_pk: true,
                     has_default: true,
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: false,
                     is_identity: false,
                 },
@@ -1646,6 +1679,7 @@ mod tests {
                 // Irrelevant to render_model (byte-identity test); the id's
                 // sequence default only gates plan_pull's PK acceptance.
                 has_sequence_default: *is_pk,
+                default_is_integer_literal: false,
                 is_generated: false,
                 is_identity: false,
             })
@@ -1668,6 +1702,7 @@ mod tests {
             is_pk: false,
             has_default,
             has_sequence_default: false,
+            default_is_integer_literal: has_default,
             is_generated: false,
             is_identity: false,
         }
@@ -1681,6 +1716,7 @@ mod tests {
             is_pk: true,
             has_default: true,
             has_sequence_default: true,
+            default_is_integer_literal: true,
             is_generated: false,
             is_identity: false,
         }
@@ -1696,6 +1732,7 @@ mod tests {
             is_pk: false,
             has_default: false,
             has_sequence_default: false,
+            default_is_integer_literal: false,
             is_generated: false,
             is_identity: false,
         }
@@ -1739,6 +1776,28 @@ mod tests {
             &[id_column(), title_column(), lock_version_column(true)],
         );
         assert!(model.contains("#[lock_version]"), "model:\n{model}");
+    }
+
+    #[test]
+    fn pulling_a_lock_version_defaulted_to_a_null_valued_expression_leaves_it_ordinary() {
+        // `has_default` says a default EXPRESSION exists, not that the database
+        // will supply a usable value. A `NOT NULL` column defaulted to
+        // `nullif(0,0)` reports `column_default = "NULLIF(0, 0)"` and still
+        // violates the constraint on every insert that omits it — verified
+        // against Postgres 16 — so annotating would break a project that
+        // previously worked by always supplying the column itself.
+        //
+        // (A literal `DEFAULT NULL` cannot reach here at all: Postgres
+        // normalizes a constant-NULL default away and reports no
+        // `column_default`, so `has_default` is already false.)
+        let mut col = lock_version_column(true);
+        col.default_is_integer_literal = false;
+        let model = render_model("Post", "posts", &[id_column(), title_column(), col]);
+        assert!(
+            !model.contains("#[lock_version]"),
+            "a default that does not initialize the column must not be annotated:\n{model}"
+        );
+        assert!(model.contains("pub lock_version: i32,"), "model:\n{model}");
     }
 
     #[test]
