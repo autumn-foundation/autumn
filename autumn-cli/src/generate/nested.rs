@@ -332,6 +332,20 @@ fn show_signature(src: &str) -> Option<String> {
     )
 }
 
+/// Whether `src` carries `child_plural`'s injection marker.
+///
+/// Matched as a COMPLETE line trailer, never as a bare substring: the markers
+/// are a shared namespace, and `// autumn:nested:posts` is a prefix of
+/// `// autumn:nested:postscripts`. A substring test would let a `postscripts`
+/// section make a flat `Post` scaffold believe it was nested — mounting
+/// `routes::posts::nested_index` against a module that emits no such handler.
+/// Every injected line puts the marker last, before and after `rustfmt`, so
+/// "ends the line" is the exact test.
+fn carries_child_marker(src: &str, child_plural: &str) -> bool {
+    let marker = child_marker(child_plural);
+    src.lines().any(|line| line.trim_end().ends_with(&marker))
+}
+
 /// Every `src/routes/*.rs` in `project_root` still carrying `child_plural`'s
 /// injection marker.
 ///
@@ -342,7 +356,6 @@ fn show_signature(src: &str) -> Option<String> {
 /// `crate::routes::comments::children_section(…)` behind in the parent would
 /// leave the project uncompilable.
 pub(super) fn parents_carrying_child(project_root: &Path, child_plural: &str) -> Vec<PathBuf> {
-    let marker = child_marker(child_plural);
     let routes_dir = project_root.join("src").join("routes");
     let Ok(entries) = std::fs::read_dir(&routes_dir) else {
         return Vec::new();
@@ -351,7 +364,9 @@ pub(super) fn parents_carrying_child(project_root: &Path, child_plural: &str) ->
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .filter(|path| std::fs::read_to_string(path).is_ok_and(|src| src.contains(marker.as_str())))
+        .filter(|path| {
+            std::fs::read_to_string(path).is_ok_and(|src| carries_child_marker(&src, child_plural))
+        })
         .collect();
     // Stable order so a recomputed plan is deterministic across filesystems.
     found.sort();
@@ -450,7 +465,7 @@ fn injection_anchors(src: &str) -> Option<(usize, usize, usize)> {
 /// binding + one render line per child and a single shared extractor edit.
 pub(super) fn inject_into_parent_show(parent_src: &str, child_plural: &str) -> String {
     let marker = child_marker(child_plural);
-    if parent_src.contains(&marker) {
+    if carries_child_marker(parent_src, child_plural) {
         return parent_src.to_owned();
     }
     let (source, endings) = Endings::split(parent_src);
@@ -846,6 +861,31 @@ mod tests {
             "the signature must survive an unrecognised splice:\n{out}"
         );
         assert!(out.contains("-> AutumnResult<Markup> {"), "{out}");
+    }
+
+    #[test]
+    fn a_marker_is_never_matched_as_a_prefix_of_a_longer_plural() {
+        // `// autumn:nested:posts` is a prefix of `// autumn:nested:postscripts`.
+        // A substring test would make a flat `Post` scaffold believe it was
+        // nested — and mount `routes::posts::nested_index` against a module
+        // that emits no such handler.
+        let with_longer = inject_into_parent_show(PARENT, "postscripts");
+        assert!(with_longer.contains("// autumn:nested:postscripts"));
+        assert!(
+            !carries_child_marker(&with_longer, "posts"),
+            "a `postscripts` section must not read as a `posts` one:\n{with_longer}"
+        );
+        assert!(carries_child_marker(&with_longer, "postscripts"));
+        // …and the idempotency check keys off the same test, so nesting
+        // `posts` under that parent still injects rather than silently
+        // skipping.
+        let both = inject_into_parent_show(&with_longer, "posts");
+        assert!(both.contains("__autumn_children_posts ="), "{both}");
+        assert!(both.contains("__autumn_children_postscripts ="), "{both}");
+        // Removing one leaves the other intact.
+        let after = remove_nested_child_section(&both, "posts");
+        assert!(!after.contains("__autumn_children_posts ="), "{after}");
+        assert!(after.contains("__autumn_children_postscripts ="), "{after}");
     }
 
     #[test]
