@@ -5308,3 +5308,79 @@ fn migration_guide_gate_leaves_ordinary_prose_paragraphs_alone() {
         gate_report(&output),
     );
 }
+
+// --- Review round 37: comments interrupt paragraphs, deep headings --------
+
+#[test]
+fn migration_guide_gate_closes_a_paragraph_at_an_interrupting_comment() {
+    // A complete HTML comment is a raw block that interrupts a paragraph, so
+    // the standalone tag after it opens a block of its own and everything
+    // inside is literal — the reference implementation renders the link as
+    // text. Paragraph state was read from the line *before* the comment was
+    // removed, so the comment looked like ordinary prose.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n  \
+         <!-- note -->\n  <x-widget>\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a comment interrupts the paragraph it follows",
+    );
+}
+
+#[test]
+fn migration_guide_gate_ends_an_entry_at_a_deeper_outdented_heading() {
+    // `##` and `###` flushed the open item and the deeper levels did not, so a
+    // link under an outdented `####` was appended to the entry above it even
+    // though it renders outside that list entirely.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\
+         #### Notes\n\
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a link under a later heading is not that entry's link",
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_read_a_deep_heading_as_an_entry() {
+    // The counterpart to admitting paragraphs to the lint: a `####` heading is
+    // a heading, not prose, so wording like "Breaking down latency" in one
+    // must not be linted as an unmarked break.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         #### Breaking down request latency\n\n\
+         - **api:** an addition.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a heading is not an entry\n{}",
+        gate_report(&output),
+    );
+}

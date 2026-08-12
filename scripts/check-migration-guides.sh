@@ -726,13 +726,19 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # on a blank line or a block-level construct. Headings count as closing it:
   # a type-7 tag directly under one does open a block, which is why "was the
   # previous line blank" is not the same question.
-  # A link reference definition is not a paragraph: it neither opens one nor,
-  # where one is already open, stops being ordinary text. That second half is
-  # what keeps a run of definitions working — only the first follows a blank
+  # Paragraph state is decided on what survives, not on the source line: a
+  # complete HTML comment is a raw block that interrupts a paragraph, and
+  # reading the line before the comment was cut made it look like prose.
+  #
+  # A link reference definition is not a paragraph either: it neither opens one
+  # nor, where one is already open, stops being ordinary text. That second half
+  # is what keeps a run of definitions working — only the first follows a blank
   # line.
-  md_paragraph_open = (body ~ /[^[:space:]]/ && heading_text(body) !~ /^#+[ \t]/ &&
-                       !(md_paragraph_open == 0 && is_link_definition(line))) ? 1 : 0
-  return scan_comments(line)
+  out = scan_comments(line)
+  md_paragraph_open = (block_body(out) ~ /[^[:space:]]/ &&
+                       heading_text(block_body(out)) !~ /^#+[ \t]/ &&
+                       !(md_paragraph_open == 0 && is_link_definition(out))) ? 1 : 0
+  return out
 }
 
 function scan_comments(text,   out, masked, pos, close_at, head, tail) {
@@ -1009,6 +1015,15 @@ findings="$(
     # additive bullet demanded a migration guide.
     breaking_heading = (tolower(heading_text(visible)) ~ /^###[[:space:]]+breaking[[:space:]]+changes$/)
     next
+  }
+
+  # `##` and `###` carry meaning for this gate and are handled above. The deeper
+  # levels still end whatever preceded them, and are never entries themselves:
+  # left of an open item they close it, and a heading is not prose, so
+  # "#### Breaking down latency" must not reach the unmarked-break lint.
+  heading_text(visible) ~ /^#+[ \t]/ {
+    if (entry != "" && leading_spaces(visible) < entry_content_indent) flush_entry()
+    if (entry == "") next
   }
 
   # `-`, `*` and `+` are all legal markdown bullets, and markdown allows a tab
