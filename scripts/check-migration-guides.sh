@@ -747,12 +747,17 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
     if (index(substr(body, md_html_type == 5 ? 10 : 3), md_html_end) > 0) md_in_html_block = 0
     return ""
   }
+  # The `/` is an alternative rather than a member of the bracket expression:
+  # the one-true-awk lexer that ships as macOS /usr/bin/awk ends the regex
+  # literal at a `/` inside `[...]` and rejects the whole program. gawk and
+  # mawk accept it, so this only ever failed on macOS.
+  #
   # Type 6 opens on one of a fixed list of block tag names followed by
   # whitespace, `>`, `/>` or end of line, and the rest of the line may be
   # anything — `<div>example` opens a block just as `<div>` does. The list is
   # what keeps this narrow: any-tag-name would swallow `Vec<Route>` and
   # `<MyWidget>` in prose along with the entries the lint reads there.
-  if (tolower(body) ~ /^<\/?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)([[:space:]/>]|$)/) {
+  if (tolower(body) ~ /^<\/?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)([[:space:]>]|\/|$)/) {
     md_in_html_block = 1
     md_html_type = 6
     md_paragraph_open = 0

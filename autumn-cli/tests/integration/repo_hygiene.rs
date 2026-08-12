@@ -5781,3 +5781,48 @@ fn migration_guide_gate_does_not_open_a_block_on_nested_angle_brackets() {
         gate_report(&output),
     );
 }
+
+// --- Portability: awk regex literals across implementations ---------------
+
+#[test]
+fn shell_scripts_keep_slashes_out_of_awk_bracket_expressions() {
+    // The one-true-awk that ships as macOS `/usr/bin/awk` ends a regex literal
+    // at a `/` inside `[...]` and rejects the whole program:
+    //
+    //   awk: nonterminated character class ^</?(address|articl
+    //
+    // gawk and mawk accept it, so `[[:space:]/>]` ran clean on Linux and took
+    // out every migration-gate test on macOS at once. Write the slash as an
+    // alternative — `([[:space:]>]|\/|$)` — and it parses everywhere.
+    let root = workspace_root();
+    let mut scripts = Vec::new();
+    shell_scripts(&root.join("scripts"), &mut scripts);
+    assert!(!scripts.is_empty(), "expected scripts/ to contain scripts");
+
+    let mut offenders = Vec::new();
+    for path in scripts {
+        let body = std::fs::read_to_string(&path).expect("read script");
+        for (idx, line) in body.lines().enumerate() {
+            // A POSIX class opens a bracket expression; a `/` before the `]`
+            // that closes it is the construct macOS cannot parse.
+            let Some(open) = line.find("[[:") else {
+                continue;
+            };
+            let rest = &line[open + 3..];
+            let Some(class_end) = rest.find(":]") else {
+                continue;
+            };
+            let after_class = &rest[class_end + 2..];
+            let bracket_end = after_class.find(']').unwrap_or(after_class.len());
+            if after_class[..bracket_end].contains('/') {
+                offenders.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "macOS awk cannot parse a `/` inside a bracket expression:\n{}",
+        offenders.join("\n"),
+    );
+}
