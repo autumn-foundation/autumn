@@ -110,6 +110,33 @@ REQUEST_PATH_MODULES=(
 # cannot quietly shrink the gate's surface.
 MODULE_COUNT_FLOOR=30
 
+# Gated modules whose feature is KNOWINGLY not enabled by any CI clippy lane,
+# as `<path>:<feature>`. Their headers are real but unenforced: the deny block
+# is never compiled, so clippy cannot fail on a panic-class site there.
+#
+# This list exists so that hole is *visible and reviewed* rather than hidden by
+# mislabelling the module as `default`. The check prints a NOTE for every entry
+# on every run, refuses an entry whose module is not in the manifest, and — so
+# the list cannot rot — refuses an entry whose feature has since become
+# reachable. Adding an entry is a deliberate, reviewable act; the honest default
+# for a request-path module is to be linted.
+#
+#   middleware/trace_context.rs (#[cfg(feature = "telemetry-otlp")],
+#   autumn/src/middleware/mod.rs:32) — telemetry-otlp pulls prost/tonic, whose
+#   build scripts need `protoc`, which the `lint` runner does not install (see
+#   the docs.rs note at autumn/Cargo.toml:385 and the explicit protoc steps in
+#   feature-combinations.yml / publish-gate.yml). Adding the feature to the
+#   gated-features clippy step therefore also means adding a protoc install step
+#   to the `lint` job. Verified locally with protoc present that
+#   `cargo clippy -p autumn-web --features telemetry-otlp --lib -- -D warnings`
+#   is already clean, so the burn-down is a workflow change, not a code change.
+FEATURE_LINT_EXEMPT=(
+  autumn/src/middleware/trace_context.rs:telemetry-otlp
+)
+
+# What the checks below actually read; the self-test points it at its own list.
+GATE_FEATURE_EXEMPT=("${FEATURE_LINT_EXEMPT[@]}")
+
 # Source roots swept by the reverse-manifest check.
 SCAN_DIRS="autumn/src,autumn-search/src"
 
@@ -365,12 +392,17 @@ check_reverse_manifest() {
 # check_feature_reachability <dir> <ci workflow> <cargo manifest> <module…>
 #
 # A module gated behind a feature no CI clippy run enables is never compiled
-# with its deny block, so the gate is decorative there. Hard failure, because
-# the failure mode is invisible: CI stays green while the module is unguarded.
+# with its deny block, so the gate is decorative there. Hard failure by default,
+# because the failure mode is invisible: CI stays green while the module is
+# unguarded. The only way past it is an explicit entry in FEATURE_LINT_EXEMPT
+# (see the comment on that array), which is announced on every run.
+#
+# Reads the GATE_FEATURE_EXEMPT array so the self-test can supply its own.
 check_feature_reachability() {
   local dir="$1" ci_file="$2" cargo_toml="$3"
   shift 3
   local modules=("$@")
+  local exempt=(${GATE_FEATURE_EXEMPT[@]+"${GATE_FEATURE_EXEMPT[@]}"})
 
   [[ -f "$dir/$ci_file" ]] || die "cannot read $ci_file (feature-reachability check)"
   [[ -f "$dir/$cargo_toml" ]] || die "cannot read $cargo_toml (feature-reachability check)"
@@ -383,6 +415,34 @@ check_feature_reachability() {
   are linted at all."
   default_feats="$(cargo_default_features "$dir/$cargo_toml")"
 
+  # A feature is "linted" if it is on in a default-feature build or named by
+  # some CI clippy lane.
+  linted() {
+    [[ "$1" == "default" ]] && return 0
+    grep -qxF "$1" <<<"$default_feats" && return 0
+    grep -qxF "$1" <<<"$ci_feats" && return 0
+    return 1
+  }
+
+  # Validate the exemption list BEFORE using it, so it cannot rot into a
+  # permanent blind spot: every entry must still be in the manifest and must
+  # still be genuinely unreachable.
+  local manifest_entries ex ex_path ex_feat
+  manifest_entries="$(printf '%s\n' "${modules[@]}")"
+  for ex in ${exempt[@]+"${exempt[@]}"}; do
+    ex_path="${ex%:*}"
+    ex_feat="${ex##*:}"
+    grep -qxF "$ex" <<<"$manifest_entries" \
+      || die "FEATURE_LINT_EXEMPT names '$ex', which is not a REQUEST_PATH_MODULES entry.
+  An exemption for a module (or a feature) the manifest no longer has is dead weight —
+  delete it."
+    if linted "$ex_feat"; then
+      die "FEATURE_LINT_EXEMPT still exempts $ex_path, but '$ex_feat' IS now enabled by a
+  CI clippy lane (or is a default feature), so the module is enforced again. Delete the
+  FEATURE_LINT_EXEMPT entry — a stale exemption is how a temporary hole becomes permanent."
+    fi
+  done
+
   local entry path feat
   for entry in "${modules[@]}"; do
     path="${entry%:*}"
@@ -390,15 +450,19 @@ check_feature_reachability() {
     [[ -n "$feat" && "$path" != "$entry" ]] \
       || die "manifest entry '$entry' has no ':<cargo feature>' suffix (use ':default'
   for a module built by a plain \`cargo clippy --workspace\`)"
-    [[ "$feat" == "default" ]] && continue
-    grep -qxF "$feat" <<<"$default_feats" && continue
-    grep -qxF "$feat" <<<"$ci_feats" && continue
+    linted "$feat" && continue
+    if grep -qxF "$entry" <<<"$(printf '%s\n' ${exempt[@]+"${exempt[@]}"})"; then
+      echo "panic-gate: NOTE — $path is gated behind '$feat', which no CI clippy lane" \
+        "enables, so its deny block is NOT enforced (documented in FEATURE_LINT_EXEMPT)."
+      continue
+    fi
     die "$path is gated behind the '$feat' cargo feature, but no 'cargo clippy … --features'
   invocation in $ci_file enables it and it is not a default feature. Its
   #![cfg_attr(not(test), deny(…))] block is therefore NEVER compiled and the panic gate
   does not apply to it. Fix by adding '$feat' to the gated-features clippy step in
-  $ci_file (installing any system deps that feature needs), or, if the module is not
-  really request-path, remove it from REQUEST_PATH_MODULES and drop its marker."
+  $ci_file (installing any system deps that feature needs); if that is genuinely not
+  affordable, add '$entry' to FEATURE_LINT_EXEMPT with the reason; or, if the module is
+  not really request-path, remove it from REQUEST_PATH_MODULES and drop its marker."
   done
 }
 
@@ -446,6 +510,11 @@ self_test() {
   # shellcheck disable=SC2064 -- expand now: $tmp is function-local.
   trap "rm -rf '$tmp'" EXIT
   local pass=0 total=0
+  # Shadow the real exemption list for the whole self-test (bash's dynamic
+  # scoping reaches gate_check and the subshells the checks run in), so fixtures
+  # are judged by the checker's rules alone and the real list is restored on
+  # return — the default invocation runs the real check straight afterwards.
+  local -a GATE_FEATURE_EXEMPT=()
 
   # Emit a valid 9-lint gate header (byte-identical in shape to the real ones).
   valid_header() {
@@ -671,6 +740,48 @@ EOF
   write_module "$d17/src/good.rs" </dev/null
   check_fail "bad reverse-manifest scan root fails" "scan root" \
     gate_check "$d17" "$wf" Cargo.toml 1 nosuchdir src/good.rs:default
+
+  # Run gate_check with a specific FEATURE_LINT_EXEMPT list. Assigning the
+  # global is safe because check_pass/check_fail run their command in a subshell.
+  with_exempt() {
+    local list="$1"
+    shift
+    # shellcheck disable=SC2206 -- deliberate word splitting of a space-separated list.
+    GATE_FEATURE_EXEMPT=($list)
+    gate_check "$@"
+  }
+
+  # 18. An unlinted feature passes when it is documented in FEATURE_LINT_EXEMPT…
+  local d18="$tmp/d18"; make_fixture "$d18"
+  write_module "$d18/src/good.rs" </dev/null
+  check_pass "documented feature-lint exemption passes" \
+    with_exempt "src/good.rs:unlinted-feat" \
+    "$d18" "$wf" Cargo.toml 1 src src/good.rs:unlinted-feat
+
+  # 19. …and the run says so out loud rather than passing silently.
+  local d19="$tmp/d19"; make_fixture "$d19"
+  write_module "$d19/src/good.rs" </dev/null
+  if [[ "$(with_exempt "src/good.rs:unlinted-feat" \
+      "$d19" "$wf" Cargo.toml 1 src src/good.rs:unlinted-feat 2>&1)" == *"NOTE"* ]]; then
+    record ok "feature-lint exemption announces itself"
+  else
+    record no "feature-lint exemption announces itself" "no NOTE line in the output"
+  fi
+
+  # 20. A stale exemption — one whose feature IS linted now — is rejected, so a
+  #     temporary hole cannot quietly become permanent.
+  local d20="$tmp/d20"; make_fixture "$d20"
+  write_module "$d20/src/good.rs" </dev/null
+  check_fail "stale feature-lint exemption fails" "IS now enabled" \
+    with_exempt "src/good.rs:cifeat" \
+    "$d20" "$wf" Cargo.toml 1 src src/good.rs:cifeat
+
+  # 21. An exemption for a module the manifest no longer lists is rejected too.
+  local d21="$tmp/d21"; make_fixture "$d21"
+  write_module "$d21/src/good.rs" </dev/null
+  check_fail "exemption for an unlisted module fails" "not a REQUEST_PATH_MODULES entry" \
+    with_exempt "src/gone.rs:unlinted-feat" \
+    "$d21" "$wf" Cargo.toml 1 src src/good.rs:default
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]] || die "panic-gate self-test failed — the checker is not

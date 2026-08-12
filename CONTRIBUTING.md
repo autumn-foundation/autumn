@@ -206,6 +206,19 @@ exists":
   have that feature enabled by one of `ci.yml`'s `cargo clippy` invocations,
   otherwise its deny block is never compiled and the gate is decorative there.
 
+The last one has exactly one exemption today, spelled out in the script's
+`FEATURE_LINT_EXEMPT` array: `middleware/trace_context.rs` is
+`#[cfg(feature = "telemetry-otlp")]`, and that feature pulls prost/tonic, whose
+build scripts need `protoc` — which the `lint` runner does not install. So its
+header is real but unenforced, and every run prints a `NOTE` line saying so.
+Burning it down is a workflow change, not a code change (a `protoc` install step
+plus the feature in the gated-features clippy step; the module already lints
+clean with the feature on). Exemptions are validated, not merely tolerated: the
+script rejects one whose module has left the manifest, and rejects one whose
+feature has since become linted, so a temporary hole cannot quietly become
+permanent. Adding a module to that array — rather than getting it linted — needs
+the same scrutiny as deleting a lint.
+
 Run it locally with `./scripts/check-panic-gate.sh` — the default invocation runs
 its own `--self-test` (synthetic fixtures in a temp dir, asserting the checker
 still *fails* on each spoof it claims to catch) before checking the real tree, and

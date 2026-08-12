@@ -1721,7 +1721,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   helpers). `scripts/check-panic-gate.sh` gains header anchoring, anti-spoof
   checks for module-wide `allow`s, `reason =` hygiene on per-site allows,
   reverse-manifest drift detection, a module-count floor, a CI
-  feature-reachability check, and a `--self-test` mode that runs by default;
+  feature-reachability check (with a validated, self-expiring exemption list —
+  `middleware/trace_context.rs` is behind `telemetry-otlp`, which the lint runner
+  cannot enable without `protoc`, and the gate now says so on every run instead
+  of leaving it silently unenforced), and a `--self-test` mode that runs by
+  default;
   `scripts/pre-push-check.sh` now runs the gate and the gated-features clippy
   lane. CI lints the `inbound-mail`/`inbound-mailgun`/`inbound-ses`/`storage`
   features and runs the inbound-mail test suites. [no-plugin]
