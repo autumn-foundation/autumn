@@ -183,6 +183,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -1556,7 +1558,7 @@ pub fn inputs_for<P, C: NestedChild>(
                 }
             }
             @for k in 0..blank_count {
-                @let index = rows.len() + k;
+                @let index = rows.len().saturating_add(k);
                 @let scope = RowScope { collection, index, row: None };
                 div class="nested-fields__row" data-index=(index) {
                     (render_row(&scope))

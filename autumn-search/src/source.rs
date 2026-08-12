@@ -105,7 +105,10 @@ impl MemoryDocumentSource {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for id in ids {
-            *guard.entry(*id).or_insert(0) += 1;
+            guard
+                .entry(*id)
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
         }
     }
 }

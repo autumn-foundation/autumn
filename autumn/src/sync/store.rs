@@ -13,6 +13,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -353,7 +355,7 @@ fn apply_remote_rows_inner(
     conn: &mut SqliteConnection,
     rows: &[RemoteRow],
 ) -> Result<usize, diesel::result::Error> {
-    let mut applied = 0;
+    let mut applied = 0_usize;
     for row in rows {
         if has_pending(conn, &row.collection, &row.pk)? {
             continue;
@@ -362,7 +364,7 @@ fn apply_remote_rows_inner(
             continue;
         }
         upsert_remote_row(conn, row)?;
-        applied += 1;
+        applied = applied.saturating_add(1);
     }
     Ok(applied)
 }
@@ -433,7 +435,7 @@ impl SyncStore {
         // lock (a deliberate deadlock-avoidance rule). Concurrent first
         // opens of one file hit exactly this, so retry the conversion +
         // schema DDL briefly instead of failing the open.
-        let mut attempts = 0;
+        let mut attempts = 0_u32;
         loop {
             let result = conn
                 .batch_execute(
@@ -445,7 +447,7 @@ impl SyncStore {
             match result {
                 Ok(()) => break,
                 Err(err) if attempts < 100 && err.to_string().contains("database is locked") => {
-                    attempts += 1;
+                    attempts = attempts.saturating_add(1);
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(err) => return Err(store_err(err)),

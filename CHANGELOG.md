@@ -1819,6 +1819,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`gated`, `public`, `framework`), completing the deferred items from #1604's
   first slice (#1850).
 
+### Security
+
+- **inbound_mail:** cap `multipart/*` nesting at 16 levels (`MAX_MIME_DEPTH`). A
+  deeply nested MIME body on an unauthenticated inbound-mail webhook could
+  previously recurse until the stack overflowed, aborting the process. Past the
+  cap the remaining subtree is kept verbatim as an opaque attachment — never
+  dropped (#1611).
+- **inbound_mail:** reject MIME boundaries RFC 2046 §5.1.1 does not permit —
+  empty, or longer than 70 characters. Such a `Content-Type` now takes the
+  existing single-part fallback instead of driving a boundary scan (#1611).
+
+### Fixed
+
+- **inbound_mail:** quoted MIME parameter values are no longer Latin-1 mangled
+  (`filename="café.pdf"` came back as `cafÃ©.pdf`); the parser scans `char`s
+  instead of casting bytes (#1611).
+- **jobs:** a large `jobs.tracking.ttl_secs` no longer panics the process — the
+  tracking stores clamp the TTL and every expiry stamp instead of hitting
+  `TimeDelta::seconds`' out-of-bounds panic and `DateTime + TimeDelta` overflow
+  (#1611).
+- **jobs:** retry on the in-process backend no longer underflows computing
+  exponential backoff for a zero attempt counter; the local backend now matches
+  the Redis/Postgres backends' saturating exponent (#1611).
+- **jobs:** pathological `#[job(unique_for = ...)]` windows and Redis maintenance
+  intervals clamp their deadlines instead of overflowing `Instant + Duration`
+  (#1611).
+
+### Changed
+
+- **panic gate:** the request-path panic gate (#1611) now also denies
+  `clippy::string_slice` and `clippy::arithmetic_side_effects` in every gated
+  module, and the manifest grows to 30 modules (adds `inbound_mail.rs`,
+  `nested_form.rs` — which carried the header but had drifted out of the
+  manifest — and the new crate-private `time_math` saturating-arithmetic
+  helpers). `scripts/check-panic-gate.sh` gains header anchoring, anti-spoof
+  checks for module-wide `allow`s, `reason =` hygiene on per-site allows,
+  reverse-manifest drift detection, a module-count floor, a CI
+  feature-reachability check (with a validated, self-expiring exemption list —
+  `middleware/trace_context.rs` is behind `telemetry-otlp`, which the lint runner
+  cannot enable without `protoc`, and the gate now says so on every run instead
+  of leaving it silently unenforced), and a `--self-test` mode that runs by
+  default;
+  `scripts/pre-push-check.sh` now runs the gate and the gated-features clippy
+  lane. CI lints the `inbound-mail`/`inbound-mailgun`/`inbound-ses`/`storage`
+  features and runs the inbound-mail test suites. [no-plugin]
+- **panic gate:** hardened `scripts/check-panic-gate.sh` against a set of
+  reviewer-confirmed bypasses that had passed both the script and `cargo clippy
+  -- -D warnings` while shipping a production panic (#1611). Header validation is
+  now structural (the block must open *exactly* `#![cfg_attr(not(test), deny(`
+  after comment/whitespace stripping), so a widened `all(not(test), any())`
+  predicate or a `not(test)` living only in a comment no longer passes. A new
+  tree-wide inner-suppression scan rejects any `#![allow(…)]`/`#![expect(…)]`
+  (including the `cfg_attr(…, allow(…))` form) that re-permits a gated lint or a
+  blanket group (`restriction`/`all`/`pedantic`/`nursery`) across **every** `*.rs`
+  under the scan roots — closing the unmarked-submodule hole — while exempting
+  `#[cfg(test)]` scopes; the scan roots now include the sibling framework crates
+  (`autumn-admin-plugin`, `autumn-media-plugin`, `autumn-storage-s3`,
+  `autumn-cache-redis`). Per-site allows must now carry a **non-empty** reason,
+  and the feature-reachability check only counts an *enforcing* CI clippy lane
+  (`-p autumn-web` + `-D warnings`, not commented out), so a stubbed lane can no
+  longer fake coverage. The `--self-test` suite grows to 34 cases, one per bypass.
+  CONTRIBUTING.md documents the enforced-subset scoping (the manifest is an
+  incremental subset of the request path, not the whole of it) and the
+  `macro_rules!` expansion blind spot the gate cannot see. [no-plugin]
+- **inbound_mail:** `compute_mailgun_signature` delegates to
+  `security::config::hmac_sha256_hex` (output byte-identical); removed a dead
+  re-parse in the SNS certificate DER reader (#1611). [no-plugin]
+
 ## [0.6.0] - 2026-07-18
 
 ### Added

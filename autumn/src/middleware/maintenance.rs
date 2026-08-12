@@ -38,6 +38,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -91,7 +93,7 @@ pub(crate) fn prefix_with_trailing_slash(prefix: &str) -> String {
     if prefix.is_empty() || prefix.ends_with('/') {
         prefix.to_owned()
     } else {
-        let mut s = String::with_capacity(prefix.len() + 1);
+        let mut s = String::with_capacity(prefix.len().saturating_add(1));
         s.push_str(prefix);
         s.push('/');
         s

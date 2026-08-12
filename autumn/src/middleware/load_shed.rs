@@ -33,6 +33,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -214,9 +216,12 @@ where
                     )),
                 };
             }
+            // `current < limit` is checked immediately above, so the bump is
+            // exact; `saturating_add` only guards the theoretical `usize::MAX`
+            // limit, where sticking at MAX beats aborting the request.
             match in_flight.compare_exchange_weak(
                 current,
-                current + 1,
+                current.saturating_add(1),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {

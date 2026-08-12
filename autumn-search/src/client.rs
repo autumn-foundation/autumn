@@ -916,8 +916,8 @@ impl SearchClient {
                 .index_unless_newer(definition, &prepared, watermark.as_deref())
                 .await?;
 
-            report.indexed += count;
-            report.batches += 1;
+            report.indexed = report.indexed.saturating_add(count);
+            report.batches = report.batches.saturating_add(1);
 
             // No early exit on a short batch. `DocumentSource::scan` returns
             // **up to** `limit` documents, so a short-but-non-empty batch does

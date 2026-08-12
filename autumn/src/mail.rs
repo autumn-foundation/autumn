@@ -17,6 +17,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -1276,7 +1278,7 @@ pub mod unsubscribe {
                 plaintext(subscriber, list_id, expiry_unix).as_bytes(),
             )
             .expect("AES-GCM encryption cannot fail for valid inputs");
-        let mut blob = Vec::with_capacity(1 + NONCE_LEN + ciphertext.len());
+        let mut blob = Vec::with_capacity(ciphertext.len().saturating_add(1 + NONCE_LEN));
         blob.push(TOKEN_VERSION);
         blob.extend_from_slice(&nonce_bytes);
         blob.extend_from_slice(&ciphertext);
@@ -2414,8 +2416,9 @@ fn base64_wrap76(bytes: &[u8]) -> String {
     if encoded.len() <= 76 {
         return encoded;
     }
-    let newlines = (encoded.len() - 1) / 76;
-    let mut wrapped = String::with_capacity(encoded.len() + newlines);
+    // One newline between each pair of 76-column chunks.
+    let newlines = encoded.len().div_ceil(76).saturating_sub(1);
+    let mut wrapped = String::with_capacity(encoded.len().saturating_add(newlines));
     for chunk in encoded.as_bytes().chunks(76) {
         if !wrapped.is_empty() {
             wrapped.push('\n');
@@ -2936,7 +2939,26 @@ fn parse_multipart_mixed(
 /// `filename="a;b.txt"` is not mistaken for two parameters.
 fn split_mime_params(value: &str) -> Vec<&str> {
     let mut parts = Vec::new();
-    let mut start = 0;
+    let mut rest = value;
+    // Peel one parameter off the front at a time. Quote/escape state is always
+    // "outside a quoted string" at an unquoted `;`, so restarting the scan on
+    // the remainder is equivalent to carrying the state across the whole
+    // string — and it keeps every boundary a `split_at_checked` result rather
+    // than hand-computed index arithmetic.
+    while let Some(sep) = unquoted_semicolon(rest) {
+        let Some((param, after)) = rest.split_at_checked(sep) else {
+            break;
+        };
+        parts.push(param.trim());
+        rest = after.strip_prefix(';').unwrap_or(after);
+    }
+    parts.push(rest.trim());
+    parts
+}
+
+/// Byte offset of the first `;` in `value` that sits outside an RFC 2045
+/// quoted string, if there is one.
+fn unquoted_semicolon(value: &str) -> Option<usize> {
     let mut in_quotes = false;
     let mut escaped = false;
     for (i, ch) in value.char_indices() {
@@ -2947,15 +2969,11 @@ fn split_mime_params(value: &str) -> Vec<&str> {
         match ch {
             '\\' if in_quotes => escaped = true,
             '"' => in_quotes = !in_quotes,
-            ';' if !in_quotes => {
-                parts.push(value[start..i].trim());
-                start = i + ch.len_utf8();
-            }
+            ';' if !in_quotes => return Some(i),
             _ => {}
         }
     }
-    parts.push(value[start..].trim());
-    parts
+    None
 }
 
 /// Reverses RFC 2045 quoted-string escaping (`\\` → `\`, `\"` → `"`), the
