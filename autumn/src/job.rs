@@ -2354,19 +2354,30 @@ fn job_now() -> chrono::DateTime<chrono::Utc> {
     )
 }
 
-/// Convert a relative delay into an absolute due instant, measured from the
-/// injected clock (see [`job_now`]).
+/// Convert a relative delay into an absolute due instant, measured from `now`.
 ///
 /// Saturates to `DateTime::MAX` on overflow (practically impossible).
-fn delay_to_when(delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
+fn due_at_from(
+    now: chrono::DateTime<chrono::Utc>,
+    delay: std::time::Duration,
+) -> chrono::DateTime<chrono::Utc> {
     // chrono::TimeDelta::from_std returns Err on overflow (>i64::MAX nanoseconds).
     // Fall back to MAX_UTC rather than panicking.
     let Ok(delta) = chrono::TimeDelta::from_std(delay) else {
         return chrono::DateTime::<chrono::Utc>::MAX_UTC;
     };
-    job_now()
-        .checked_add_signed(delta)
+    now.checked_add_signed(delta)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+}
+
+/// Convert a relative delay into an absolute due instant, measured from the
+/// injected clock of the running job runtime (see [`job_now`]).
+///
+/// For a caller that already holds a [`JobClient`], prefer
+/// [`JobClient::delay_to_when`] — it reads that client's own clock instead of
+/// resolving the process-global handle again.
+fn delay_to_when(delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
+    due_at_from(job_now(), delay)
 }
 
 /// Enqueue a one-shot job to run once after `delay` elapses.
@@ -2644,6 +2655,16 @@ pub async fn enqueue_in_tx<A: serde::Serialize>(
 }
 
 impl JobClient {
+    /// Convert a relative delay into an absolute due instant on **this
+    /// client's** injected clock.
+    ///
+    /// The instance-scoped twin of the free `delay_to_when`, for callers that
+    /// already hold the client. It shares the overflow-clamp body, so the two
+    /// can never disagree about a pathological delay.
+    fn delay_to_when(&self, delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
+        due_at_from(self.clock.now(), delay)
+    }
+
     /// Enqueue a job by name with a JSON payload.
     ///
     /// # Errors
@@ -3076,7 +3097,12 @@ impl JobClient {
             // AfterCommitDue::After delay is measured from commit time.
             let due_at = match due {
                 AfterCommitDue::At(at) => at,
-                AfterCommitDue::After(d) => Some(delay_to_when(d)),
+                // This client's own clock, not the process-global one: an
+                // after-commit enqueue belongs to the app whose transaction just
+                // committed, and resolving the global handle again here would
+                // both take a second `RwLock` round-trip and read a different
+                // app's clock in a multi-app test process.
+                AfterCommitDue::After(d) => Some(client.delay_to_when(d)),
             };
             async move { client.enqueue_due(&name, payload, due_at).await }
         });
@@ -3535,6 +3561,76 @@ struct LocalJobCoordinationInner {
 struct LocalUniqueHold {
     job_id: String,
     expires_at: Option<crate::time::MonotonicInstant>,
+}
+
+#[cfg(test)]
+mod local_unique_hold_clock_tests {
+    use super::{JobUniquenessWindow, LocalJobCoordination};
+    use crate::time::TickingClock;
+    use chrono::{TimeZone, Utc};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// The `unique_for` window must expire on the clock the runtime was built
+    /// with, so a `#[sim_test]` can cross it with `Sim::advance` instead of
+    /// waiting out real time (issue #1797).
+    ///
+    /// This is the assertion that pins the TTL to the seam: before the
+    /// migration the hold's `expires_at` came from `std::time::Instant::now()`,
+    /// which no injected clock — and no paused tokio runtime — can move.
+    #[test]
+    fn unique_hold_ttl_expires_on_the_injected_clock() {
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let clock = TickingClock::starting_at(epoch);
+        let coordination = LocalJobCoordination::with_clock(Arc::new(clock.clone()));
+        let window = JobUniquenessWindow::TtlMs(300_000); // five minutes
+
+        assert!(
+            coordination.try_acquire_unique("probe", "k", "job-1", window),
+            "the first acquire takes the hold"
+        );
+        assert!(
+            !coordination.try_acquire_unique("probe", "k", "job-2", window),
+            "a second acquire inside the window must coalesce"
+        );
+
+        // Four virtual minutes: still inside the window, and — crucially — the
+        // machine clock has not moved at all.
+        clock.advance(Duration::from_secs(240));
+        assert!(
+            !coordination.try_acquire_unique("probe", "k", "job-3", window),
+            "the window must not expire early"
+        );
+
+        // Past five minutes of VIRTUAL time. Nothing here sleeps.
+        clock.advance(Duration::from_secs(120));
+        assert!(
+            coordination.try_acquire_unique("probe", "k", "job-4", window),
+            "the hold must expire once the injected clock crosses the TTL"
+        );
+    }
+
+    /// Two coordinations on identically-driven clocks must agree exactly — the
+    /// reproducibility half of the same property.
+    #[test]
+    fn unique_hold_expiry_is_reproducible_across_identical_clocks() {
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let window = JobUniquenessWindow::TtlMs(1_000);
+        let outcome = |steps: &[u64]| {
+            let clock = TickingClock::starting_at(epoch);
+            let coordination = LocalJobCoordination::with_clock(Arc::new(clock.clone()));
+            let mut seen = Vec::new();
+            seen.push(coordination.try_acquire_unique("p", "k", "a", window));
+            for step in steps {
+                clock.advance(Duration::from_millis(*step));
+                seen.push(coordination.try_acquire_unique("p", "k", "b", window));
+            }
+            seen
+        };
+        let steps = [200, 300, 600, 100];
+        assert_eq!(outcome(&steps), outcome(&steps));
+        assert_eq!(outcome(&steps), vec![true, false, false, true, false]);
+    }
 }
 
 fn local_unique_hold_key(name: &str, unique_key: &str) -> String {

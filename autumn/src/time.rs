@@ -114,13 +114,24 @@ static MONOTONIC_ORIGIN: LazyLock<std::time::Instant> = LazyLock::new(std::time:
 ///   meaningless. [`saturating_duration_since`](Self::saturating_duration_since)
 ///   never panics and never underflows.
 ///
+/// # Taking two readings
+///
+/// Measuring elapsed time needs a *start* and an *end*. The [`Clock`] extractor
+/// is a **snapshot** taken when the extractor resolved, so
+/// [`Clock::monotonic`] gives you the request-start instant and never moves —
+/// calling it twice returns the same value. Take the closing reading from the
+/// live source, [`AppState::monotonic`](crate::state::AppState::monotonic):
+///
 /// ```rust,ignore
+/// use autumn_web::prelude::*;
 /// use autumn_web::time::Clock;
 ///
-/// async fn handler(clock: Clock) -> String {
-///     let start = clock.monotonic();
+/// #[get("/work")]
+/// async fn handler(clock: Clock, state: AppState) -> String {
+///     let start = clock.monotonic();           // request start (a snapshot)
 ///     // ... work ...
-///     let elapsed = clock.monotonic().saturating_duration_since(start);
+///     let elapsed = state.monotonic()          // live reading
+///         .saturating_duration_since(start);
 ///     format!("took {}ms", elapsed.as_millis())
 /// }
 /// ```
@@ -245,14 +256,20 @@ impl Clock {
     }
 
     /// Returns the *monotonic* instant captured when this extractor was
-    /// resolved — the deterministic replacement for [`std::time::Instant::now`]
-    /// when measuring how long something took.
+    /// resolved — i.e. the **request-start** instant, and the deterministic
+    /// replacement for [`std::time::Instant::now`] as the start of an elapsed
+    /// measurement.
     ///
-    /// Pair two readings with
-    /// [`MonotonicInstant::saturating_duration_since`]. Under a
-    /// [`#[sim_test]`](crate::sim_test) this moves only when
-    /// [`Sim::advance`](crate::sim::Sim::advance) steps virtual time, so an
-    /// elapsed measurement is reproducible from the seed.
+    /// Like [`now`](Self::now) this is a **snapshot**, not a live handle:
+    /// calling it twice on the same `Clock` returns the same value. Take the
+    /// closing reading from the live source —
+    /// [`AppState::monotonic`](crate::state::AppState::monotonic) — and subtract
+    /// with [`MonotonicInstant::saturating_duration_since`]. See
+    /// [`MonotonicInstant`]'s "Taking two readings" for a worked example.
+    ///
+    /// Under a [`#[sim_test]`](crate::sim_test) the underlying clock moves only
+    /// when [`Sim::advance`](crate::sim::Sim::advance) steps virtual time, so the
+    /// resulting measurement is reproducible from the seed.
     #[must_use]
     pub const fn monotonic(&self) -> MonotonicInstant {
         self.1
@@ -289,8 +306,12 @@ impl axum::extract::FromRequestParts<crate::state::AppState> for Clock {
 ///
 /// It deliberately does **not** override [`ClockSource::monotonic`]: the trait's
 /// default body already reads the real process-monotonic clock, so an elapsed
-/// measurement taken through this clock is exactly the `std::time::Instant`
-/// reading it replaced — same monotonicity guarantee, same cost.
+/// measurement taken through this clock is derived from the same
+/// [`std::time::Instant`] reading it replaced — the identical monotonicity
+/// guarantee, plus one relaxed atomic load (the process-origin
+/// [`std::sync::LazyLock`]) and one [`Duration`] subtraction. That is a few
+/// nanoseconds on top of the `Instant::now()` call itself, and it is *not* on
+/// the per-request path unless a caller asks for elapsed time.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
@@ -615,6 +636,24 @@ mod tests {
         );
         // And it is the same timeline the free helper reads.
         assert!(monotonic_now() >= second);
+
+        // The default body must read a REAL clock. Without this, a body that
+        // simply returned `ORIGIN` would keep every other test in this file
+        // green while silently making production elapsed-time measurements
+        // always zero. Bounded spin rather than a sleep, so the test stays fast
+        // and never depends on scheduler behaviour.
+        let base = clock.monotonic();
+        let mut advanced = base;
+        for _ in 0..50_000_000u64 {
+            advanced = clock.monotonic();
+            if advanced > base {
+                break;
+            }
+        }
+        assert!(
+            advanced > base,
+            "ClockSource::monotonic's default body must advance with real time"
+        );
     }
 
     #[test]

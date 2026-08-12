@@ -388,7 +388,7 @@ The gate makes that a compile error instead of a code-review hope.
 | Instead of | Use | Reachable from |
 |---|---|---|
 | `chrono::Utc::now()` | `state.clock().now()` | anything holding an `AppState`; the `Clock` extractor in a handler |
-| `std::time::Instant::now()` (measuring elapsed) | `state.monotonic()` / `clock.monotonic()` / `Clock::monotonic`, then `MonotonicInstant::saturating_duration_since` | same |
+| `std::time::Instant::now()` (measuring elapsed) | `clock.monotonic()` for the start reading and `state.monotonic()` for the closing one, then `MonotonicInstant::saturating_duration_since`. The `Clock` extractor **snapshots** at request start, so calling `Clock::monotonic` twice returns the same value | same |
 | `std::time::Instant::now()` (a deadline whose counterparty is `tokio::time::sleep`) | `tokio::time::Instant::now()` | anywhere — tokio's paused runtime already virtualizes it |
 | `std::time::SystemTime::now()` | `time::clock_unix_secs(clock)` / `time::clock_unix_duration(clock)` | same |
 | `uuid::Uuid::new_v4()` | `state.entropy().uuid_v4()`; the `Rng` extractor in a handler | same |
@@ -440,10 +440,14 @@ carrying the header above.
 **Honest scoping — the manifest is the *enforced* subset.** The modules listed in
 `GATED_MODULES` in `scripts/check-determinism-gate.sh` are the ones enforced
 today, not a claim that the rest of the crate is on-seam. `autumn/src` still
-contains roughly 150 ungated production call sites — `idempotency.rs` and
-`circuit_breaker.rs` (whose TTL/breaker windows gate *control flow*, so they are
-the highest-value next batch), the `middleware/` request timers,
-`webhook_outbound.rs`, `notifications.rs`, `storage/local.rs`, and others. The
+contains roughly 150 ungated production call sites. The highest-value next batch
+is the code whose elapsed-time reads gate *control flow* or are observable in a
+response: `idempotency.rs` (replay-window TTLs — note its `IdempotencyEntry`
+exposes `expires_at: Instant` as a **public** field, so migrating it is a
+breaking change and needs a migration-guide entry), `circuit_breaker.rs`
+(open/half-open transitions), and the per-request `middleware/access_log.rs`,
+`middleware/metrics.rs`, and `middleware/server_timing.rs` timers. Then
+`webhook_outbound.rs`, `notifications.rs`, `storage/local.rs`, and the rest. The
 manifest grows monotonically and never shrinks (`MODULE_COUNT_FLOOR`); do not
 read a module's absence from it as a promise that it is on-seam.
 
@@ -463,6 +467,16 @@ Known-open gaps, named rather than hidden:
 - **`app.rs`'s TLS `now_unix`** reads real wall time on purpose. Certificate
   validity is a fact about the real world; a simulation clock pinned to the sim
   epoch must not be able to declare a live certificate expired.
+
+**Grandfathered crates.** "In-scope crates" is `autumn` (published as
+`autumn-web`) and nothing else today. Every other workspace member is
+grandfathered by a package-level `[lints.clippy] disallowed_methods = "allow"`
+(or by the workspace table, for members that opt into it), and several of them do
+carry production off-seam sites: `autumn-media-plugin` (room/session ids and
+timestamps), `autumn-admin-plugin`, `autumn-cache-redis`, and `autumn-cli`. That
+is a scoping decision, not an audit result — the sim drives an `autumn` app, so
+`autumn` is where determinism is load-bearing first. Gating a plugin crate means
+migrating its sites, adding the header, and adding it to `GATED_MODULES`.
 
 Exempt surfaces mirror the panic gate: `#[cfg(test)]` code (the
 `cfg_attr(not(test), …)` scope handles it automatically), benches, examples,

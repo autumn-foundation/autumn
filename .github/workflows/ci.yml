@@ -42,12 +42,15 @@ jobs:
         # the gated modules with no new services.)
         #
         # `tls` is in the list for the determinism seam gate (#1797), not the
-        # panic gate: `app.rs`'s `#[cfg(feature = "tls")] fn now_unix` is the one
-        # gated-module site that reads real wall time on purpose (certificate
-        # validity is a fact about the real world), and its justifying
-        # `#[allow(clippy::disallowed_methods, reason = "…")]` is only *compiled*
-        # — and therefore only checked for being still-necessary — when `tls` is
-        # on.
+        # panic gate. `app.rs` is a gated module, and its
+        # `#[cfg(feature = "tls")] fn now_unix` is the one site in it that reads
+        # real wall time on purpose (certificate validity is a fact about the
+        # real world). That function — and the `#[allow(clippy::disallowed_methods,
+        # reason = "…")]` justifying it — is only COMPILED when `tls` is on, so
+        # without it here the module's deny never sees the site and a later
+        # off-seam read added next to it would ship unlinted.
+        # Side effect worth knowing: this also lints `autumn/src/tls.rs` (and the
+        # rest of the `tls`-gated tree) under `-D warnings` for the first time.
         #
         # `inbound-mail`/`inbound-mailgun`/`inbound-ses` gate `inbound_mail`, which
         # parses untrusted RFC 5322 / MIME bodies straight off an unauthenticated

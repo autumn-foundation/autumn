@@ -661,6 +661,15 @@ where
 /// Trait to abstract the state requirement for the `Db` extractor.
 /// This breaks the circular dependency between the database extractor
 /// and the central `AppState`.
+/// Process-wide handle to the real system clock, cloned by
+/// [`DbState::clock`]'s default body and by the state-less checkout paths.
+///
+/// A fresh `Arc::new(SystemClock)` per DB extraction would heap-allocate for a
+/// zero-sized type on every request; cloning one shared handle is a relaxed
+/// refcount bump.
+static DEFAULT_SYSTEM_CLOCK: std::sync::LazyLock<std::sync::Arc<dyn crate::time::ClockSource>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(crate::time::SystemClock));
+
 pub trait DbState {
     /// Returns the database connection pool, if configured.
     fn pool(&self) -> Option<&Pool<RuntimeConnection>>;
@@ -709,7 +718,7 @@ pub trait DbState {
     /// with the clock the app was built with, which is what makes DB timings
     /// virtual (and reproducible) under a `#[sim_test]`.
     fn clock(&self) -> std::sync::Arc<dyn crate::time::ClockSource> {
-        std::sync::Arc::new(crate::time::SystemClock)
+        std::sync::Arc::clone(&DEFAULT_SYSTEM_CLOCK)
     }
 
     /// Returns the slow query threshold.
@@ -946,6 +955,11 @@ pub fn scrub_sql(sql: &str) -> String {
 /// fingerprint, record metrics, and map Postgres `57014` (statement timeout)
 /// to [`AutumnError::query_timeout`].
 ///
+/// Times the query on the **real** system clock. Prefer
+/// [`run_instrumented_with_clock`] where an injected clock is reachable, so the
+/// recorded latency follows virtual time under a
+/// [`#[sim_test]`](crate::sim_test).
+///
 /// # Parameters
 /// - `sql`: The raw SQL string for slow-query fingerprinting (scrubbed before logging).
 /// - `route_key`: Label string used for metrics, e.g. `"GET /users"`.
@@ -971,18 +985,47 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, diesel::result::Error>>,
 {
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "`run_instrumented` is a published `pub` API taking no state and \
-                  no clock, so threading the seam in would be a breaking change \
-                  to the crate's public surface. The instant never escapes (only \
-                  `elapsed_ms: u64` does) and the framework itself has no caller. \
-                  Tracked as a known-open gap in CONTRIBUTING.md's determinism \
-                  seam gate section (#1797)."
-    )]
-    let start = std::time::Instant::now();
+    run_instrumented_with_clock(
+        std::sync::Arc::clone(&DEFAULT_SYSTEM_CLOCK),
+        sql,
+        route_key,
+        slow_threshold,
+        metrics,
+        query,
+    )
+    .await
+}
+
+/// [`run_instrumented`], timing the query on an injected clock.
+///
+/// The determinism-seam twin (#1797): pass `state.clock()`'s handle
+/// (`AppState`'s `clock_arc`, or the `Arc<dyn ClockSource>` a subsystem already
+/// holds) and the recorded latency follows virtual time under a
+/// [`#[sim_test]`](crate::sim_test) instead of the real machine clock.
+///
+/// # Parameters
+///
+/// As [`run_instrumented`], plus `clock`: the source both timing readings are
+/// taken from.
+///
+/// # Errors
+///
+/// As [`run_instrumented`].
+pub async fn run_instrumented_with_clock<F, Fut, T>(
+    clock: std::sync::Arc<dyn crate::time::ClockSource>,
+    sql: &str,
+    route_key: &str,
+    slow_threshold: std::time::Duration,
+    metrics: &crate::middleware::metrics::MetricsCollector,
+    query: F,
+) -> Result<T, AutumnError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, diesel::result::Error>>,
+{
+    let start = clock.monotonic();
     let result = query().await;
-    let elapsed = start.elapsed();
+    let elapsed = clock.monotonic().saturating_duration_since(start);
     let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
 
     // Record metrics regardless of success/failure
@@ -2890,7 +2933,7 @@ impl Db {
             // No `AppState` here by construction — this helper exists so a test
             // can drive `Db::tx` against a bare pool. The real clock matches the
             // behaviour this path had before the clock became injectable.
-            clock: std::sync::Arc::new(crate::time::SystemClock),
+            clock: std::sync::Arc::clone(&DEFAULT_SYSTEM_CLOCK),
         })
         .await
     }

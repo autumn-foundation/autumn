@@ -329,7 +329,7 @@ pub use crate::state::AppState;
 ///
 /// Use in handlers instead of `chrono::Utc::now()` to make time-sensitive
 /// logic testable without sleeping. Override via `TestApp::with_clock`.
-pub use crate::time::Clock;
+pub use crate::time::{Clock, MonotonicInstant};
 
 // ── Feature flags ─────────────────────────────────────────────────
 /// The main feature-flag service, typically stored as an `AppState` extension.

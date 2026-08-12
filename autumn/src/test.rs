@@ -1773,7 +1773,6 @@ impl TestApp {
         let probes = crate::probe::ProbeState::ready_for_test();
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
-        #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
         // Resolve the injected clock BEFORE the state literal so `started_at`
         // is stamped on the same timeline the app will read time from. A sim
         // installs a virtual clock here, and uptime has to start at that
@@ -1783,6 +1782,7 @@ impl TestApp {
             .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock));
         let started_at = clock.monotonic();
 
+        #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
         let mut state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),

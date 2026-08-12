@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **sim-testing:** closed the **monotonic gap** — the last documented source of
+- **sim-testing:** closed the **monotonic gap** — the last raw-`Instant` source of
   nondeterminism inside a `#[sim_test]` (#1797). `ClockSource` modelled only
   `DateTime<Utc>`, so every framework site that measured a *duration* (uptime,
   scheduled-task run times, DB checkout and per-statement timings, job
@@ -26,7 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Reach it from a handler via the `Clock` extractor's new `.monotonic()`, from
   framework internals via `AppState::monotonic()`, and — where no clock is
   reachable at all — via `time::monotonic_now()`. `AppState::uptime()` /
-  `uptime_display()` keep their exact signatures.
+  `uptime_display()` keep their exact signatures. This is a *seam* migration, not
+  full coverage: CONTRIBUTING.md's new "Determinism seam gate" section names the
+  ~150 production call sites still off-seam and the known-open gaps.
 - **sim-testing:** a **determinism seam gate** now bans direct `Utc::now()`,
   `Instant::now()`, `SystemTime::now()`, and `Uuid::new_v4()` on the production
   code path of the modules that carry it (#1797). `clippy.toml` supplies the
@@ -40,44 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the header shape, per-site `reason` hygiene, the config's completeness, the
   absence of a module-wide `allow` spoof or a crate-local `clippy.toml` that
   would shadow the config entirely, and feature reachability. The manifest is a
-  ratchet — it may grow, never shrink — and CONTRIBUTING.md's new "Determinism
-  seam gate" section names the ungated remainder and the known-open gaps rather
-  than implying full coverage.
-
-### Fixed
-
-- **sim-testing:** `job::enqueue_in` / `enqueue_at`'s delayed enqueues now
-  resolve their absolute due instant from the running job runtime's **injected**
-  clock instead of `chrono::Utc::now()` (#1797). This was a silent hole rather
-  than a cosmetic one: the runtime filters due-at against the injected clock, so
-  under a `#[sim_test]` a job asked to run one virtual minute out was stamped due
-  years past the sim epoch and **never became due at all** — no amount of
-  `Sim::advance` would run it.
-- **sim-testing:** `sim::Chaos::clock_skew` no longer leaks real wall-clock time
-  into elapsed-time measurements (#1797). Clock skew models a machine whose
-  calendar disagrees with reality, which a real monotonic clock is immune to, so
-  the skew wrapper forwards `ClockSource::monotonic` to the wrapped virtual clock
-  unskewed. Previously it inherited the trait default and read the real machine
-  clock.
-- **jobs:** the redis worker's maintenance throttles (retry promotion, stale
-  recovery, blocked promotion) now hold their deadlines on `tokio::time::Instant`
-  rather than `std::time::Instant` (#1797). The loop is woken by
-  `tokio::time::sleep`, so the throttle and its counterparty now share one
-  timeline — and both are virtualized by a paused runtime for free.
-- **jobs:** the admin dashboard's sort key no longer calls `Utc::now()` for a
-  record carrying no timestamps at all; it uses `DateTime::MAX_UTC`, which
-  expresses the same "sorts newest" intent without making a list's ordering
-  depend on when it was rendered (#1797).
-
-### Deprecated
-
-- **scheduler:** `scheduler::now_unix_secs` and `scheduler::now_unix_duration`
-  read real wall time off the injected-clock seam, so a tick key derived from
-  them is not reproducible under a `#[sim_test]`. Use
-  `time::clock_unix_secs(state.clock())` / `time::clock_unix_duration(state.clock())`
-  instead — which is what the framework's own scheduler already does. Neither
-  function has a remaining production caller inside autumn (#1797).
-
+  ratchet — it may grow, never shrink.
 - **release:** every release with a breaking change now ships a migration guide,
   enforced by `scripts/check-migration-guides.sh` (#1588). Autumn ships every
   2–4 weeks and, pre-1.0, most releases can break existing apps, but the only
@@ -1955,6 +1920,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **inbound_mail:** `compute_mailgun_signature` delegates to
   `security::config::hmac_sha256_hex` (output byte-identical); removed a dead
   re-parse in the SNS certificate DER reader (#1611). [no-plugin]
+
+### Fixed
+
+- **sim-testing:** `job::enqueue_in` / `enqueue_at`'s delayed enqueues now
+  resolve their absolute due instant from the running job runtime's **injected**
+  clock instead of `chrono::Utc::now()` (#1797). This was a silent hole rather
+  than a cosmetic one: the runtime filters due-at against the injected clock, so
+  under a `#[sim_test]` a job asked to run one virtual minute out was stamped due
+  years past the sim epoch and **never became due at all** — no amount of
+  `Sim::advance` would run it.
+- **sim-testing:** `sim::Chaos::clock_skew` no longer leaks real wall-clock time
+  into elapsed-time measurements (#1797). Clock skew models a machine whose
+  calendar disagrees with reality, which a real monotonic clock is immune to, so
+  the skew wrapper forwards `ClockSource::monotonic` to the wrapped virtual clock
+  unskewed. Previously it inherited the trait default and read the real machine
+  clock.
+- **jobs:** the redis worker's maintenance throttles (retry promotion, stale
+  recovery, blocked promotion) now hold their deadlines on `tokio::time::Instant`
+  rather than `std::time::Instant` (#1797). The loop is woken by
+  `tokio::time::sleep`, so the throttle and its counterparty now share one
+  timeline — and both are virtualized by a paused runtime for free.
+- **jobs:** the admin dashboard's sort key no longer calls `Utc::now()` for a
+  record carrying no timestamps at all; it uses `DateTime::MAX_UTC`, which
+  expresses the same "sorts newest" intent without making a list's ordering
+  depend on when it was rendered (#1797).
+- **repo:** `.gitignore`'s blanket `*.sh` silently excluded newly-added
+  `scripts/*.sh` from commits, so a CI step invoking one would fail with exit 127
+  on a fresh clone while passing locally. `scripts/`, `scripts/lib/`, and
+  `scripts/self-hosted-runner/` are now negated back in.
+
+### Deprecated
+
+- **scheduler:** `scheduler::now_unix_secs` and `scheduler::now_unix_duration`
+  read real wall time off the injected-clock seam, so a tick key derived from
+  them is not reproducible under a `#[sim_test]`. Use
+  `time::clock_unix_secs(state.clock())` / `time::clock_unix_duration(state.clock())`
+  instead — which is what the framework's own scheduler already does. Neither
+  function has a remaining production caller inside autumn (#1797). See
+  [the migration guide](docs/migrations/next.md).
+
 
 ## [0.6.0] - 2026-07-18
 

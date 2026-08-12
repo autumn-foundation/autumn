@@ -250,6 +250,31 @@ We prefer a long deprecation ramp over abrupt removal:
 
 Deprecations never change behavior — only signal intent.
 
+### Deterministic clock/entropy seam (issue #1797)
+
+`autumn_web::time` gained a monotonic counterpart to the existing wall-clock
+seam, all of it additive:
+
+- `time::MonotonicInstant` — an instant on a clock's own monotonic timeline,
+  with `saturating_duration_since` / `saturating_add` / `checked_add`.
+- `ClockSource::monotonic` — a **defaulted** trait method, so every existing
+  `impl ClockSource` keeps compiling and keeps reading the real
+  process-monotonic clock. A custom clock whose `now()` is virtual should
+  override it.
+- `Clock::monotonic` — the request-start instant, snapshotted with the
+  extractor.
+- `AppState::monotonic` — the live reading.
+- `time::monotonic_now` — the real monotonic clock, for code with no
+  `ClockSource` in scope.
+- `DbState::clock` — a **defaulted** trait method returning the real system
+  clock, so an existing `impl DbState` needs no change.
+
+Deprecated in the same change: `scheduler::now_unix_secs` and
+`scheduler::now_unix_duration`, superseded by
+`time::clock_unix_secs(state.clock())` / `time::clock_unix_duration(state.clock())`.
+They follow the ramp above — the warning lands in a minor release and removal is
+a major-release event.
+
 ### Config-key deprecations
 
 Config key deprecations (TOML schema and `AUTUMN_*` env vars) are tracked in

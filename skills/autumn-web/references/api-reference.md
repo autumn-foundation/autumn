@@ -811,6 +811,32 @@ double-submits and replays.
 | `with_shard_router(router)` | Sharding router (**unreleased**) |
 | `run()` | Start server |
 
+## Deterministic time and entropy (`autumn_web::time`, `autumn_web::entropy`)
+
+Read time and mint ids through the injected seams, never `Utc::now()` /
+`Instant::now()` / `Uuid::new_v4()` directly — that is what lets a `#[sim_test]`
+replay a run byte-for-byte from its seed, and what makes elapsed-time math immune
+to a wall-clock jump in production.
+
+| API | Purpose |
+|---|---|
+| `Clock` extractor -> `.now()` | Wall-clock instant, snapshotted at request start |
+| `Clock` extractor -> `.monotonic()` | Monotonic *request-start* instant (**unreleased**) |
+| `AppState::monotonic()` | Live monotonic reading — the closing half of an elapsed measurement (**unreleased**) |
+| `MonotonicInstant::saturating_duration_since(earlier)` | Elapsed duration; never negative, never panics (**unreleased**) |
+| `MonotonicInstant::saturating_add(dur)` | Deadline arithmetic without `Instant + Duration`'s panic (**unreleased**) |
+| `time::monotonic_now()` | Real monotonic clock, for code with no `ClockSource` in scope (**unreleased**) |
+| `time::clock_unix_secs(clock)` / `clock_unix_duration(clock)` | Unix time from the injected clock |
+| `ClockSource::now` / `ClockSource::monotonic` | The trait; `monotonic` is defaulted to real time, so a **virtual** clock must override it (**unreleased**) |
+| `Rng` extractor -> `.uuid_v4()` / `.uuid_v7(ms)` / `.next_u64()` | Ids and randomness from the injected `Entropy` source |
+| `AppState::entropy()` | The same source, for framework/job code |
+| `SystemClock` / `FixedClock` / `TickingClock` | Real, pinned, and steppable `ClockSource` implementations |
+
+`tokio::time::pause()` virtualizes `tokio::time::Instant`, **not**
+`std::time::Instant` — a raw `std::time::Instant` reads the real machine clock
+even inside a `#[sim_test]`. For a deadline whose counterparty is
+`tokio::time::sleep`, use `tokio::time::Instant`.
+
 ## SystemTest builder (`autumn_web::system_test`, feature `system-tests`)
 
 Browser-driven tests: boots the app on an ephemeral port, launches managed

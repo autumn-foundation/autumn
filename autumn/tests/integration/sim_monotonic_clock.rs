@@ -45,8 +45,9 @@ async fn now_route(clock: Clock) -> String {
 
 #[sim_test]
 async fn uptime_is_measured_on_the_virtual_clock(mut sim: Sim) {
-    assert_eq!(sim.seed, 0);
-
+    // No `assert_eq!(sim.seed, 0)`: every assertion below is seed-independent
+    // (the sim epoch is pinned regardless of seed), so the test stays runnable
+    // under the `AUTUMN_SIM_SEED=…` replay line the harness prints on failure.
     sim.build(TestApp::new().routes(routes![now_route]));
 
     // Uptime starts at (virtually) zero: the app was mounted at the sim epoch.

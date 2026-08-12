@@ -8,10 +8,12 @@
 //! [`ClockSource::monotonic`] to the wrapped clock **unskewed**.
 //!
 //! Without that forward, `SkewClock` would inherit the trait's default body,
-//! which reads the *real* process-monotonic clock. Every elapsed measurement in
-//! a chaos run (uptime, request latency, job durations, throttle windows) would
-//! silently revert to real time — reopening, on the chaos path, the very gap
-//! this work closes. The current skew is a single constant that would cancel
+//! which reads the *real* process-monotonic clock. Every elapsed measurement
+//! that is on the seam today — uptime, DB checkout and per-statement timings,
+//! scheduled-task durations, the shutdown drain window, local job uniqueness
+//! windows — would silently revert to real time on the chaos path, reopening
+//! the very gap this work closes. (Per-request latency middleware is not yet on
+//! the seam; see CONTRIBUTING.md's ungated remainder.) The current skew is a single constant that would cancel
 //! under subtraction anyway; this test is what makes that an invariant rather
 //! than a coincidence, so a future drifting or jittering skew cannot quietly
 //! break it.
