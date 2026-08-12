@@ -45,18 +45,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column name); any SQL bind whose bytes echo a masked value is blanked, and so
   is any masked value quoted back inside an outcome message, panic payload or
   backtrace. What is *not* masked is stated just as plainly: database result
-  rows, URL path segments, unstructured bodies. A body that declares structure
+  rows, URL path segments, unstructured bodies, the SQL statement text as sent
+  (rewriting it would break the key replay matches tapes on, so a value your
+  code interpolates instead of binding lands in the capsule) and the raw
+  backend `ErrorResponse` frames, which PostgreSQL fills with the offending row
+  values. Filter matching is by equality after normalization, so `x-api-key`,
+  `proxy-authorization` and `x-auth-token` do *not* match the built-in
+  `api_key`/`authorization` keys and have to be added to `filter_parameters` —
+  the guide gives the table and the snippet. A body that declares structure
   but does not parse as it is dropped entirely rather than recorded unmasked.
   Capsules are written owner-only (0600 on unix) through a temp-then-rename,
-  pruned oldest-first before each write, and off by default.
+  pruned oldest-first before each write, and off by default. `autumn new` now
+  gitignores `/tmp/`, where capsules and the other runtime flag files live.
 
   `autumn replay` compiles the app and runs it in a replay mode that forces
-  in-memory sessions and skips migrations, storage preflight, the cache
-  backend, the job runtime, the scheduler, the mailer and the fail-fast
-  configuration gates — the clock and the database come from the capsule, so
-  the only remaining variable is the code. The verdict is JSON on stdout and a
-  human summary on stderr: exit 0 `reproduced`, exit 1 `mismatch` (the tape
-  lined up, the outcome changed — what a fix looks like) or `diverged` (the
+  in-memory sessions, refuses outbound HTTP and channel delivery, and skips
+  migrations, storage preflight, the cache backend, the job runtime, the
+  scheduler, the mailer and the fail-fast configuration gates — the clock and
+  the database come from the capsule, so the only remaining variable is the
+  code. Your handlers, extractors and custom layers *do* still run, against the
+  bytes in the file, so replay capsules you trust (the guide says this in the
+  security section). The verdict is JSON on stdout and a
+  human summary on stderr: exit 0 `reproduced` (same status code, message and
+  Problem Details type, and no database divergence), exit 1 `mismatch` (the
+  tape lined up, the outcome changed — what a fix looks like) or `diverged` (the
   code asked the database something the recording never asked, so the run was
   not a fair comparison), exit 2 `refused` for a truncated capsule, a
   `format_version` this build does not understand, an unreadable file, or a
@@ -70,21 +82,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and prints both numbers that matter: on a route that does nothing else,
   capture costs +55 µs p50 / +76 µs p95 (479 → 533 µs p50); on a route doing
   one bound `SELECT`, +80 µs p50 / +62 µs p95 (1 922 → 2 002 µs p50) — tens of
-  microseconds, or 3–6% of a request that talks to a database once. A repeat
-  run put the same p50 deltas at +43 µs and +128 µs, which is a fair measure of
-  the noise. Indicative only: CI-class virtualized hardware, unoptimized build,
-  database on localhost.
+  microseconds, or 2.6–4.2% of a request that talks to a database once and
+  11.5–12.6% of one that does nothing at all. A repeat run put the two p50
+  deltas at +43 µs and +128 µs, widening those to roughly 3–7% and 9–13%, which
+  is a fair measure of the noise. **The benchmark is serial** — one request in
+  flight at a time — so it cannot show contention on the process-wide scope
+  registry (locked twice per request and once per checkout); concurrent-load
+  cost is not characterized. Indicative only: CI-class virtualized hardware,
+  unoptimized build, database on localhost.
 
   Slice-1 limitations are enumerated rather than implied: authenticated and
   CSRF-protected routes do not replay faithfully (their credentials are
   masked, so the replay stops at the auth layer); one request per capsule;
   same-commit replay is what is tested, and a framework-version difference
-  warns; concurrent connections within one request may diverge on ordering;
-  capture needs plaintext TCP PostgreSQL, so a `sslmode` URL, a Unix-socket
-  URL, a sqlite build, a custom `DatabasePoolProvider` or a shard pool disables
-  the database tape (the capsule says so in its notes); `LISTEN`/`NOTIFY` is
-  unsupported on capture-enabled request pools; `COPY` streams mark the capsule
-  truncated; and successful requests are never captured. `ErrorEvent` gains a
+  warns; concurrent connections within one request — including a request handed
+  two different connections under pool contention — may diverge on ordering;
+  capture needs plaintext TCP PostgreSQL, so `sslmode=require`/`verify-ca`/
+  `verify-full` (but not `prefer`, `disable` or an absent `sslmode`), a
+  Unix-socket URL, a sqlite build, a custom `DatabasePoolProvider` or a shard
+  pool disables the database tape (the capsule says so in its notes);
+  `LISTEN`/`NOTIFY` is unsupported on capture-enabled request pools; `COPY`
+  streams mark the capsule truncated, as do 10 000 clock readings, 64
+  exchanges in flight on one connection and an 8 MiB protocol frame; and
+  successful requests are never captured. `ErrorEvent` gains a
   `capsule` field whose file is already on disk by the time a reporter runs.
   See `docs/guide/failure-capsules.md`.
 

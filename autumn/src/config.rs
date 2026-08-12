@@ -1601,7 +1601,7 @@ const fn default_reporting_sample_rate() -> f64 {
 pub struct FailureCaptureConfig {
     /// Whether failing requests are recorded as capsules.
     ///
-    /// Defaults to `false` — capture costs a buffered request body and a
+    /// Defaults to `false` — capture costs a teed request body and a
     /// teed database stream on every request, and the artifacts contain
     /// production data.
     #[serde(default = "default_failure_capture_enabled")]

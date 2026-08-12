@@ -36,7 +36,7 @@ error page use. It cannot mask what has no name attached.
 
 | Masked | How |
 | --- | --- |
-| Headers whose name matches the filter | `authorization`, `cookie`, `set-cookie`, plus `[log] filter_parameters` |
+| Headers whose name *equals* a filter key | `authorization`, `cookie`, `set-cookie`, plus `[log] filter_parameters` — see [exact matching](#names-are-matched-exactly) |
 | Query-string parameters matching the filter | `?password=…` → `[FILTERED]` |
 | Form and JSON body fields matching the filter | recursively, including `user[password]` bracket keys |
 | Encrypted-column names | every column registered by `#[encrypted]` is added to the filter |
@@ -51,6 +51,8 @@ error page use. It cannot mask what has no name attached.
 | Unstructured bodies | No keys to match against |
 | Bind parameters that echo nothing masked | A bind is only blanked when its bytes equal a value redaction already removed |
 | Response bodies | Not recorded at all — only the status, message and Problem Details type |
+| **SQL statement text** | Stored as your code sent it. Autumn does not run its log-line literal scrubber (`scrub_sql`) here, because rewriting the statement would change the key replay matches tapes on. A value your code *interpolated into the SQL* instead of binding lands in the capsule in the clear — bind your parameters |
+| **Backend error payloads** | The raw `ErrorResponse` frames stay in the tape byte for byte. `PostgreSQL` quotes offending data back at you: a unique-violation `DETAIL` names the column *and the value* that collided. The exchange's `error` string is masked where it echoes a value redaction already removed; the recorded bytes are not |
 
 Out of the box the filter covers `password`, `password_confirmation`, `token`,
 `secret`, `authorization`, `api_key`, `access_token`, `refresh_token`, `cookie`,
@@ -60,12 +62,50 @@ Autumn writes request data down, so anything you add for the access log applies
 here too. `[log] unfilter_parameters` opts one of the built-in keys back *out*,
 which un-masks it here as well.
 
+### Names are matched exactly
+
+A name matches a filter key by **equality**, after normalization — lowercased,
+with every non-alphanumeric character removed. So `api_key`, `API-KEY`,
+`apiKey` and `api key` are all the same key, but a *prefixed* name is a
+different key entirely. It is not a substring or prefix match.
+
+That catches people out on headers, because the ones that carry credentials in
+real deployments are almost all prefixed:
+
+| Header | Normalizes to | Matches a default? |
+| --- | --- | --- |
+| `authorization` | `authorization` | yes |
+| `cookie` | `cookie` | yes |
+| `x-api-key` | `xapikey` | **no** — recorded verbatim |
+| `x-auth-token` | `xauthtoken` | **no** — recorded verbatim |
+| `proxy-authorization` | `proxyauthorization` | **no** — recorded verbatim |
+| `x-amz-security-token` | `xamzsecuritytoken` | **no** — recorded verbatim |
+
+If your app, your proxy or your SDK sends any of those, add them yourself
+before you enable capture:
+
+```toml
+[log]
+filter_parameters = [
+  "x-api-key",
+  "x-auth-token",
+  "proxy-authorization",
+  "x-amz-security-token",
+]
+```
+
+The same holds for query and body keys: `stripe_secret_key` is not `secret`.
+When in doubt, send a request through a route with the dev error page on and
+look at what it shows — it uses this same list.
+
 ### Handling capsules safely
 
 - Capsule files are written **owner-only** (`0600` on unix), through a temp file
   and a rename, so no reader ever sees a half-written capsule.
 - The directory defaults to `tmp/autumn-capsules`, project-relative. **Do not
-  commit it**, and do not serve it — add it to `.gitignore` alongside `tmp/`.
+  commit it**, and do not serve it. `autumn new` ignores `/tmp/` for you; if
+  your project predates that, add it (or the capsule directory itself) to
+  `.gitignore` before you enable capture.
 - `max_capsules` (default 50) prunes oldest-first *before* each write, so an
   error storm cannot fill a disk. A capsule written in the last minute is spared
   even when it is over the cap, so a path already handed to a reporter still
@@ -76,6 +116,22 @@ which un-masks it here as well.
 - Turning capture on in production is a deliberate decision. Turning it on in
   staging, or on demand during an incident, gets you most of the value at a
   fraction of the exposure.
+
+### Replay only capsules you trust
+
+A capsule is **input to your own code**. `autumn replay` builds your
+application and runs its handlers against the request and the database answers
+the file contains, on a machine that is holding your real configuration and
+credentials. Replay forces the obvious things offline — sessions are in-memory,
+the database is an in-process stub fed from the tape, outbound HTTP and channel
+delivery are blocked, and no port is bound — but your handlers, your extractors
+and your custom middleware still execute, and they execute against bytes an
+attacker chose if the capsule came from somewhere you do not control.
+
+So treat a capsule the way you would treat a request fixture someone emailed
+you: replay the ones you recorded (or a colleague did), and if you must replay
+one from outside, do it in a sandbox — a container or a scratch checkout —
+whose environment holds no production credentials.
 
 ---
 
@@ -191,6 +247,24 @@ none, because replay would answer real queries with the wrong bytes. Truncated
 capsules are refused by replay with exit code 2. The `notes` array explains
 every such decision in plain English.
 
+`max_capsule_bytes` is not the only ceiling. Four fixed caps exist so that a
+pathological request cannot turn capture into an unbounded allocation, and each
+one changes what you get back:
+
+| Cap | Limit | What happens |
+| --- | --- | --- |
+| Clock readings per capsule | 10 000 | A handler that reads `state.clock()` in a loop stops being recorded past the cap and the capsule is marked `truncated` — so replay refuses it |
+| Exchanges in flight on one connection | 64 | More pipelined-but-unanswered exchanges than that and the connection gives up: its tape is dropped, noted, and the capsule marked `truncated` |
+| A single protocol frame | 8 MiB | A frame larger than this cannot be framed; the connection is treated as unrecordable, exactly like a `COPY` stream — tape dropped, capsule `truncated` |
+| Connection memo | 256 entries per bucket, 1 MiB total | The memo is *not* truncation: entries past the cap are simply not remembered, and a replay that then meets a `Bind` against a statement the capsule never described reports it as a **divergence**, not a refusal |
+
+The memo is also bounded on the way *in* to a capsule: copying a connection's
+history into the capsule is charged against `max_capsule_bytes` — and capped
+well below it, so a fat memo cannot crowd out the request's own traffic. A memo
+too large to copy is written down in `notes`; a `max_capsule_bytes` that then
+runs out mid-request truncates as above. If you see either on a route you care
+about, raise `max_capsule_bytes` rather than guessing at what was lost.
+
 ---
 
 ## Replaying
@@ -219,7 +293,13 @@ normal boot in exactly the ways that keep a replay offline and deterministic:
   configuration gate runs;
 - only **sync** event listeners are registered (a durable one needs the job
   runtime);
+- outbound HTTP and channel delivery are refused, so replaying a capsule cannot
+  call a third-party API or notify anyone;
 - no port is bound, and capture is forced off so a replay cannot capsule itself.
+
+What still runs is your code: handlers, extractors, custom middleware and any
+`Layer` you installed. That is the point — and the reason to
+[replay only capsules you trust](#replay-only-capsules-you-trust).
 
 Telemetry *is* initialized, so your tracing setup behaves as it normally would.
 
@@ -241,8 +321,8 @@ A verdict is machine-readable JSON on **stdout** and a human summary on
 
 | Verdict | Meaning | Exit |
 | --- | --- | --- |
-| `reproduced` | Same outcome, and the database traffic matched the tape. The bug is still there. | `0` |
-| `mismatch` | The tape lined up but the outcome differs. Usually what you want after a fix. | `1` |
+| `reproduced` | Same outcome — status code, message and Problem Details type — and the database traffic matched the tape. The bug is still there. | `0` |
+| `mismatch` | The tape lined up but the outcome differs, in the code, the message or the problem type. Usually what you want after a fix. | `1` |
 | `diverged` | The code asked the database something the recording never asked, so the run was not a fair comparison. A divergence outranks a matching status. | `1` |
 | `refused` | Nothing was replayed — a truncated capsule, an unknown `format_version`, an unreadable file, or a `PostgreSQL` tape handed to a `sqlite` build. | `2` |
 
@@ -323,7 +403,14 @@ tee. Only failing requests pay for redaction and the write.
 
 Measured by `autumn/tests/integration/failure_capsule_overhead.rs` — 2 000
 requests per phase over two interleaved rounds, against a local `PostgreSQL` 16,
-dev profile. Two routes, because they answer different questions:
+dev profile. **Measured serially: the benchmark awaits each request before
+issuing the next, so there is never more than one request in flight.** Nothing
+below captures contention. Capture takes a process-wide registry lock twice per
+request (once to register the scope, once to drop it) and once per database
+checkout; under real concurrent load those acquisitions are shared, and these
+figures say nothing about what that costs.
+
+Two routes, because they answer different questions:
 
 **A route that does nothing else** (no database), isolating what the request
 layer of capture costs — the scope, the registry entry, the head snapshot, the
@@ -344,10 +431,14 @@ attribution marker on top of the above:
 | capture on | 2 002 µs | 2 444 µs | 2 059 µs |
 | delta | +80 µs | +62 µs | +82 µs |
 
-So: **tens of microseconds per request** — around 10% of a request that does
-nothing at all, and 3–6% of one that talks to a database once. A repeat run put
-the same p50 deltas at +43 µs and +128 µs, which is the honest measure of how
-much run-to-run noise there is here; treat ±50 µs as indistinguishable.
+So: **tens of microseconds per request.** As percentages of the same tables,
+that is **11.5–12.6%** of a request that does nothing at all (55/479 at p50,
+76/606 at p95, 62/491 on the mean) and **2.6–4.2%** of one that talks to a
+database once (80/1 922, 62/2 382, 82/1 976). A repeat run put the two p50
+deltas at +43 µs and +128 µs instead — 9.0% and 6.7% — so across both runs the
+honest ranges are roughly **9–13%** and **3–7%**. That spread *is* the finding:
+treat ±50 µs as indistinguishable here, and re-measure rather than quoting these
+percentages as a budget.
 
 These numbers are *indicative*, measured on CI-class virtualized hardware in an
 unoptimized build, with a database on localhost — a real deployment's network
@@ -390,11 +481,19 @@ This is the first slice. What it does not do, stated plainly:
   and a different interleaving shows up as a divergence. Connections a request
   uses one after another are fine: tapes are recorded — and handed back on
   replay — in the order the request *first used* each connection, not by
-  connection id.
-- **`PostgreSQL` only, over plaintext TCP.** A `sslmode` URL, a Unix-socket URL,
-  or a `sqlite` build disables database capture: the capsule still records the
-  request, clock and outcome, and says in `notes` why it has no tape. A
-  `PostgreSQL` tape handed to a `sqlite` build is refused outright.
+  connection id. Pool contention can produce the same effect without any
+  concurrency in your code: a request that checked out twice and happened to be
+  handed two *different* connections under load records two tapes, while the
+  replay — which has no contention — may serve the whole request from one. That
+  is a faithful capsule reporting a divergence, not a corrupt one.
+- **`PostgreSQL` only, over plaintext TCP.** Capture frames protocol messages,
+  and it cannot frame ciphertext, so a database URL asking for TLS —
+  `sslmode=require`, `verify-ca` or `verify-full` — disables database capture,
+  as do a Unix-socket URL and a `sqlite` build. `sslmode=prefer`, `disable`, or
+  no `sslmode` at all do *not*: Autumn connects in plaintext for those, and
+  capture works. When it is off the capsule still records the request, clock and
+  outcome, and says in `notes` why it has no tape. A `PostgreSQL` tape handed to
+  a `sqlite` build is refused outright.
 - **A custom `DatabasePoolProvider` disables database capture.** Autumn will not
   second-guess a pool you built; it logs a warning and notes it on every capsule.
 - **`LISTEN`/`NOTIFY` is unsupported on capture-enabled request pools.** The
@@ -404,9 +503,9 @@ This is the first slice. What it does not do, stated plainly:
   the connection's tape is dropped and the capsule marked truncated.
 - **Shard pools are not recorded.** `[[database.shards]]` connections are built
   separately; a request that checks one out has its capsule noted and truncated.
-- **A handler that extracts a subsystem replay does not boot** — a `Mailer`, a
-  `BlobStore` — fails during replay and is reported as a mismatch rather than
-  taking the replay process down.
+- **A handler that extracts a subsystem the replay does not boot** — a
+  `Mailer`, a `BlobStore` — fails during replay and is reported as a mismatch
+  rather than taking the replay process down.
 - **Only failures are captured.** There is no way to capsule a successful
   request, by design: the buffer for a request that succeeds is dropped at the
   response boundary.
