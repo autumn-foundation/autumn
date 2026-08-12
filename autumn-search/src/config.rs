@@ -335,7 +335,7 @@ fn resolve_profile_input(env: &dyn Env) -> String {
     let args: Vec<String> = std::env::args().collect();
     for (index, arg) in args.iter().enumerate() {
         if arg == "--profile"
-            && let Some(profile) = args.get(index + 1)
+            && let Some(profile) = args.get(index.saturating_add(1))
             && !profile.trim().is_empty()
         {
             return profile.trim().to_owned();
@@ -430,7 +430,7 @@ fn deep_merge_at(base: &mut toml::Value, overlay: toml::Value, depth: usize) {
             overlay_value.is_table() && base_table.get(&key).is_some_and(toml::Value::is_table);
         if recurse {
             if let Some(base_value) = base_table.get_mut(&key) {
-                deep_merge_at(base_value, overlay_value, depth + 1);
+                deep_merge_at(base_value, overlay_value, depth.saturating_add(1));
             }
         } else {
             base_table.insert(key, overlay_value);
