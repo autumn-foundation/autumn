@@ -470,29 +470,68 @@ self_test() {
 EOF
   }
 
+  # A fixture root holds ONLY the module(s) a scenario is about: every negative
+  # case must have exactly one marker-carrying file, so it cannot pass on some
+  # other check's error (an early version seeded every root with a spare valid
+  # module, and the reverse-manifest check then masked the failures the cases
+  # were actually testing).
   make_fixture() {
     local dir="$1"
     mkdir -p "$dir/src" "$dir/.github/workflows"
     printf 'default = ["deffeat"]\n' >"$dir/Cargo.toml"
     printf '        run: cargo clippy -p autumn-web --features "cifeat,other" --all-targets -- -D warnings\n' \
       >"$dir/.github/workflows/ci.yml"
-    { valid_header; printf '\npub fn ok() {}\n'; } >"$dir/src/good.rs"
   }
 
-  # check <name> <pass|fail> <cmd…>
-  check() {
-    local name="$1" expected="$2"
-    shift 2
+  # Write a valid gated module at $1, optionally followed by extra body lines
+  # supplied on stdin.
+  write_module() {
+    local out="$1"
+    valid_header >"$out"
+    if [[ ! -t 0 ]]; then cat >>"$out"; fi
+  }
+
+  record() {
+    local outcome="$1" name="$2" detail="${3-}"
     total=$((total + 1))
-    local got=0
-    ("$@") >/dev/null 2>&1 || got=$?
-    if [[ ("$expected" == pass && "$got" -eq 0) || ("$expected" == fail && "$got" -ne 0) ]]; then
+    if [[ "$outcome" == ok ]]; then
       echo "self-test PASS: $name"
       pass=$((pass + 1))
     else
-      echo "self-test FAIL: $name (expected $expected, exit=$got)" >&2
-      # Re-run visibly so the failure is diagnosable from the CI log.
-      ("$@") >&2 || true
+      echo "self-test FAIL: $name — $detail" >&2
+    fi
+  }
+
+  # check_pass <name> <cmd…>
+  check_pass() {
+    local name="$1"
+    shift
+    local out got=0
+    out="$( ("$@") 2>&1 )" || got=$?
+    if [[ "$got" -eq 0 ]]; then
+      record ok "$name"
+    else
+      record no "$name" "expected success, exit=$got: $out"
+    fi
+  }
+
+  # check_fail <name> <expected message substring> <cmd…>
+  #
+  # Asserting the MESSAGE, not just the exit code, is the point: it pins each
+  # scenario to the specific check it exercises, so a checker that has been
+  # defanged (a lint dropped from REQUIRED_PANIC_LINTS, say) cannot keep the
+  # self-test green by failing the fixture for an unrelated reason.
+  check_fail() {
+    local name="$1" want="$2"
+    shift 2
+    local out got=0
+    out="$( ("$@") 2>&1 )" || got=$?
+    if [[ "$got" -eq 0 ]]; then
+      record no "$name" "expected failure, but the check passed"
+    elif [[ "$out" != *"$want"* ]]; then
+      record no "$name" "failed for the wrong reason (wanted '$want'): $out"
+    else
+      record ok "$name"
     fi
   }
 
@@ -500,38 +539,47 @@ EOF
 
   # 1. A fully valid fixture passes.
   local d1="$tmp/d1"; make_fixture "$d1"
-  check "valid gated module passes" pass \
+  write_module "$d1/src/good.rs" <<<'pub fn ok() {}'
+  check_pass "valid gated module passes" \
     gate_check "$d1" "$wf" Cargo.toml 1 src src/good.rs:default
 
   # 2. Manifest entry with no gate header at all.
   local d2="$tmp/d2"; make_fixture "$d2"
   printf 'pub fn nope() {}\n' >"$d2/src/bare.rs"
-  check "module without a gate header fails" fail \
+  check_fail "module without a gate header fails" "missing gate marker" \
     gate_check "$d2" "$wf" Cargo.toml 1 src src/bare.rs:default
 
   # 3. Header missing one required lint (the newest one, string_slice).
   local d3="$tmp/d3"; make_fixture "$d3"
-  grep -v 'clippy::string_slice' "$d3/src/good.rs" >"$d3/src/thin.rs"
-  check "header missing one required lint fails" fail \
+  write_module "$d3/src/thin.rs" </dev/null
+  sed -i '/clippy::string_slice/d' "$d3/src/thin.rs"
+  check_fail "header missing one required lint fails" "missing required panic lint" \
     gate_check "$d3" "$wf" Cargo.toml 1 src src/thin.rs:default
 
   # 4. Header opener never closed.
   local d4="$tmp/d4"; make_fixture "$d4"
-  grep -v '^)\]$' "$d4/src/good.rs" >"$d4/src/unterminated.rs"
-  check "unterminated header fails" fail \
+  write_module "$d4/src/unterminated.rs" </dev/null
+  sed -i '/^)\]$/d' "$d4/src/unterminated.rs"
+  check_fail "unterminated header fails" "unterminated" \
     gate_check "$d4" "$wf" Cargo.toml 1 src src/unterminated.rs:default
 
   # 5. Module-wide inner allow after the header (spoof).
   local d5="$tmp/d5"; make_fixture "$d5"
-  { valid_header; printf '\n#![allow(clippy::unwrap_used)]\n\npub fn x() {}\n'; } >"$d5/src/spoof.rs"
-  check "inner #![allow] spoof after the header fails" fail \
+  write_module "$d5/src/spoof.rs" <<'EOF'
+
+#![allow(clippy::unwrap_used)]
+
+pub fn x() {}
+EOF
+  check_fail "inner #![allow] spoof after the header fails" "module-wide inner attribute" \
     gate_check "$d5" "$wf" Cargo.toml 1 src src/spoof.rs:default
 
   # 6. allow() smuggled into the gate's own cfg_attr block.
   local d6="$tmp/d6"; make_fixture "$d6"
-  sed 's/^        clippy::string_slice,$/        clippy::string_slice,\n    ),\n    allow(clippy::indexing_slicing/' \
-    "$d6/src/good.rs" >"$d6/src/inblock.rs"
-  check "allow() inside the cfg_attr block fails" fail \
+  write_module "$d6/src/inblock.rs" </dev/null
+  sed -i 's/^        clippy::string_slice,$/        clippy::string_slice,\n    ),\n    allow(clippy::indexing_slicing/' \
+    "$d6/src/inblock.rs"
+  check_fail "allow() inside the cfg_attr block fails" "contains an 'allow('" \
     gate_check "$d6" "$wf" Cargo.toml 1 src src/inblock.rs:default
 
   # 7. Marker separated from the header by real code.
@@ -542,63 +590,87 @@ EOF
     valid_header | tail -n +4
     printf '\npub fn x() {}\n'
   } >"$d7/src/detached.rs"
-  check "marker not adjacent to the header fails" fail \
+  check_fail "marker not adjacent to the header fails" "not immediately followed" \
     gate_check "$d7" "$wf" Cargo.toml 1 src src/detached.rs:default
 
-  # 8. Marker-carrying file that is not in the manifest (drift).
+  # 8. Marker-carrying file that is not in the manifest (drift). The only
+  #    scenario that deliberately has two marker files in one root.
   local d8="$tmp/d8"; make_fixture "$d8"
-  cp "$d8/src/good.rs" "$d8/src/unlisted.rs"
-  check "marker file missing from the manifest fails" fail \
+  write_module "$d8/src/good.rs" </dev/null
+  write_module "$d8/src/unlisted.rs" </dev/null
+  check_fail "marker file missing from the manifest fails" "is NOT in" \
     gate_check "$d8" "$wf" Cargo.toml 1 src src/good.rs:default
 
   # 9. Per-site allow of a gated lint with no reason.
   local d9="$tmp/d9"; make_fixture "$d9"
-  { valid_header; printf '\n#[allow(clippy::indexing_slicing)]\npub fn x() {}\n'; } >"$d9/src/noreason.rs"
-  check "per-site #[allow] without a reason fails" fail \
+  write_module "$d9/src/noreason.rs" <<'EOF'
+
+#[allow(clippy::indexing_slicing)]
+pub fn x() {}
+EOF
+  check_fail "per-site #[allow] without a reason fails" "carries no 'reason" \
     gate_check "$d9" "$wf" Cargo.toml 1 src src/noreason.rs:default
 
   # 10. …and the same allow WITH a reason passes, even rustfmt-wrapped across
   #     lines (the flattening in attr_blocks() is what makes that work).
   local d10="$tmp/d10"; make_fixture "$d10"
-  {
-    valid_header
-    printf '\n#[allow(\n    clippy::indexing_slicing,\n    reason = "bounds proven by the caller"\n)]\npub fn x() {}\n'
-  } >"$d10/src/good.rs"
-  check "wrapped per-site #[allow(…, reason)] passes" pass \
+  write_module "$d10/src/good.rs" <<'EOF'
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds proven by the caller"
+)]
+pub fn x() {}
+EOF
+  check_pass "wrapped per-site #[allow(…, reason)] passes" \
     gate_check "$d10" "$wf" Cargo.toml 1 src src/good.rs:default
 
   # 11. Manifest shrunk below the floor.
   local d11="$tmp/d11"; make_fixture "$d11"
-  check "manifest below the module-count floor fails" fail \
+  write_module "$d11/src/good.rs" </dev/null
+  check_fail "manifest below the module-count floor fails" "below the committed floor" \
     gate_check "$d11" "$wf" Cargo.toml 2 src src/good.rs:default
 
   # 12. Feature-gated module whose feature no CI clippy run enables.
   local d12="$tmp/d12"; make_fixture "$d12"
-  check "module gated behind a feature CI never lints fails" fail \
+  write_module "$d12/src/good.rs" </dev/null
+  check_fail "module gated behind a feature CI never lints fails" "NEVER compiled" \
     gate_check "$d12" "$wf" Cargo.toml 1 src src/good.rs:unlinted-feat
 
   # 13. …and it passes once that feature is in a CI clippy feature list.
   local d13="$tmp/d13"; make_fixture "$d13"
-  check "module gated behind a CI-linted feature passes" pass \
+  write_module "$d13/src/good.rs" </dev/null
+  check_pass "module gated behind a CI-linted feature passes" \
     gate_check "$d13" "$wf" Cargo.toml 1 src src/good.rs:cifeat
 
   # 14. …or is part of the crate's default feature set.
   local d14="$tmp/d14"; make_fixture "$d14"
-  check "module gated behind a default feature passes" pass \
+  write_module "$d14/src/good.rs" </dev/null
+  check_pass "module gated behind a default feature passes" \
     gate_check "$d14" "$wf" Cargo.toml 1 src src/good.rs:deffeat
 
   # 15. Manifest entry pointing at a file that does not exist.
   local d15="$tmp/d15"; make_fixture "$d15"
-  check "missing manifest file fails" fail \
+  check_fail "missing manifest file fails" "module is missing" \
     gate_check "$d15" "$wf" Cargo.toml 1 src src/gone.rs:default
 
   # 16. A commented-out example attribute must not be mistaken for a real one
   #     (the marker comment block itself contains such an example).
   local d16="$tmp/d16"; make_fixture "$d16"
-  { valid_header; printf '\n// #[allow(clippy::unwrap_used)] would need a reason.\npub fn x() {}\n'; } \
-    >"$d16/src/good.rs"
-  check "commented-out #[allow] example is ignored" pass \
+  write_module "$d16/src/good.rs" <<'EOF'
+
+// #[allow(clippy::unwrap_used)] would need a reason.
+pub fn x() {}
+EOF
+  check_pass "commented-out #[allow] example is ignored" \
     gate_check "$d16" "$wf" Cargo.toml 1 src src/good.rs:default
+
+  # 17. A reverse-manifest sweep that finds nothing because its scan root is
+  #     wrong must fail loudly rather than silently checking zero files.
+  local d17="$tmp/d17"; make_fixture "$d17"
+  write_module "$d17/src/good.rs" </dev/null
+  check_fail "bad reverse-manifest scan root fails" "scan root" \
+    gate_check "$d17" "$wf" Cargo.toml 1 nosuchdir src/good.rs:default
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]] || die "panic-gate self-test failed — the checker is not
