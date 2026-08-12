@@ -1197,8 +1197,8 @@ pub fn __fuzz_parse_mailgun_form_data(body: &[u8], content_type: &str) {
 
 /// Minimal RFC 5322 parser.
 ///
-/// Handles folded headers, plain-text and HTML bodies (single-part only).
-/// Multi-part MIME bodies are accepted but only the first part is extracted.
+/// Handles folded headers, plain-text and HTML bodies, and `multipart/*` bodies
+/// (nested up to [`MAX_MIME_DEPTH`] levels — see [`extract_multipart_bodies`]).
 fn parse_rfc5322(raw: Bytes) -> InboundEmail {
     // Split at the byte level so body bytes are preserved exactly for binary attachments.
     let (header_bytes, body_bytes): (&[u8], &[u8]) =
@@ -3278,7 +3278,7 @@ mod tests {
         // The QP-decoded body retains the trailing CRLF from the message line.
         let decoded = std::str::from_utf8(att.data.as_ref()).unwrap_or("<non-utf8>");
         assert_eq!(
-            decoded.trim_end_matches(|c| c == '\r' || c == '\n'),
+            decoded.trim_end_matches(['\r', '\n']),
             "Hello World",
             "QP-encoded attachment must be decoded: got {decoded:?}"
         );
@@ -3324,7 +3324,9 @@ mod tests {
         let result = parse_ses(&Bytes::from(sns.to_string()));
         let email = match result.unwrap() {
             SnsParseResult::Email(e) => *e,
-            other => panic!("expected Email, got {other:?}"),
+            other @ SnsParseResult::SubscriptionConfirmation { .. } => {
+                panic!("expected Email, got {other:?}")
+            }
         };
         assert!(
             email.to.iter().any(|a| a == "Replies+ABC@app.example"),
@@ -3340,18 +3342,22 @@ mod tests {
     /// Each level costs ~55 bytes, so a 50 MB request body (the route's
     /// `DefaultBodyLimit`) buys roughly a million levels of recursion.
     fn nested_multipart_bomb(depth: usize) -> Vec<u8> {
+        use std::fmt::Write as _;
+
         let mut raw = String::new();
         raw.push_str("From: a@b.example\r\nSubject: nest\r\n");
         raw.push_str("Content-Type: multipart/mixed; boundary=\"b0\"\r\n\r\n");
         for i in 0..depth {
             let next = i + 1;
-            raw.push_str(&format!(
+            let _ = write!(
+                raw,
                 "--b{i}\r\nContent-Type: multipart/mixed; boundary=\"b{next}\"\r\n\r\n"
-            ));
+            );
         }
-        raw.push_str(&format!(
+        let _ = write!(
+            raw,
             "--b{depth}\r\nContent-Type: text/plain\r\n\r\ninnermost\r\n"
-        ));
+        );
         raw.into_bytes()
     }
 
