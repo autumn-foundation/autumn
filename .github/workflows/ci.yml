@@ -53,6 +53,25 @@ jobs:
         # job on any real product finding.
         run: cargo run -p autumn-cli --bin autumn -- a11y verify .
 
+  migration-guides:
+    name: Migration guide coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Migration guide coverage gate
+        # Pre-1.0, most releases can break existing apps, and the only prior
+        # check keyed off a `### Breaking` CHANGELOG heading this repo has
+        # never written — so it never fired, and 0.6.0 shipped the `with_pool`
+        # -> `with_pool_untracked` rename with no guide entry. This runs on
+        # every PR (not just at tag time) so the guide is written by the author
+        # of the break, while the change is still in review. See issue #1588.
+        #
+        # Its own job on purpose: docs-only, no toolchain and no cache, so it
+        # reports in seconds under its own name in the checks UI instead of
+        # queueing behind ~20 minutes of workspace clippy in `lint` — and a
+        # clippy failure can't stop it from running.
+        run: ./scripts/check-migration-guides.sh
+
   supply-chain:
     name: Supply chain (cargo-deny)
     runs-on: ubuntu-latest

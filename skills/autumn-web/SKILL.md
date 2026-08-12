@@ -2070,7 +2070,8 @@ touched crate so examples compile from an external-consumer perspective.
 - `CHANGELOG.md`
 - `RELEASE_NOTES.md`
 - `STABILITY.md`
-- `docs/migrations/0.4.0.md`
+- `docs/migrations/README.md` (per-release upgrade guides; `next.md` is the
+  rolling draft for unreleased breaking changes)
 - `docs/release-checklist.md`
 - `docs/guide/getting-started.md`
 - `docs/guide/docs-smoke.md`
