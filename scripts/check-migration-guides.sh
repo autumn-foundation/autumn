@@ -490,6 +490,15 @@ function decode_space_entities(text,   out) {
   return out
 }
 
+function rendered_content(text,   body) {
+  # What a reader is actually left with on this line: container markers gone,
+  # whitespace entities decoded, anchors with no text and tags removed. A bare
+  # `>` renders an empty quote and shows nothing, so the marker must not count
+  # as the content of a required section.
+  body = strip_quote_markers(block_body(text))
+  return strip_inline_tags(strip_empty_links(decode_space_entities(body)))
+}
+
 function strip_empty_links(text,   out) {
   # `[](url)` renders as an anchor with no text. The destination is already
   # metadata; with an empty label there is nothing left for a reader to see.
@@ -884,6 +893,14 @@ function links_to(text, path,   at, i, ch, start, slashes, depth, open_at, dest)
     }
     if (inside_image_label(text, open_at)) continue
     md_link_label = substr(text, open_at + 1, at - open_at - 1)
+    # An anchor with no text renders as nothing to click: the destination may
+    # be right, but it is not an upgrade path a reader can reach.
+    #
+    # Emptiness, not whitespace: callers strip code spans before scanning, and
+    # that collapses a span to a single space — so a perfectly good
+    # `` [`0.7.0.md`](0.7.0.md) `` index entry arrives here with a whitespace
+    # label. An image label is visible and non-empty, so it still counts.
+    if (md_link_label == "") { start = at + 1; continue }
     if (substr(text, at + 1, 1) == "(") {
       dest = link_destination(text, at + 2)
       # Resume after the whole construct — destination and title — but only
@@ -1869,7 +1886,7 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           } else if (pending_title && strip_inline_tags(visible) ~ /^[[:space:]]*[^[:space:]]+[[:space:]]*$/) {
             # The destination, alone on the line below its opener.
             pending_title = 0
-          } else if (strip_inline_tags(strip_empty_links(decode_space_entities(visible))) ~ /[^[:space:]]/ &&
+          } else if (rendered_content(visible) ~ /[^[:space:]]/ &&
                      !is_thematic_break(visible) && !is_empty_list_item(visible)) {
             pending_title = 0
             for (lvl = 1; lvl <= 6; lvl++) {

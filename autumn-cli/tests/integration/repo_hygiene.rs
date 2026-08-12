@@ -7364,3 +7364,141 @@ fn migration_guide_gate_accepts_an_indented_definition_continuation() {
         );
     }
 }
+
+// --- Review round 61: empty block quotes, invisible links -----------------
+
+#[test]
+fn migration_guide_gate_does_not_count_an_empty_block_quote_as_content() {
+    // A bare `>` renders as an empty blockquote, so a required section holding
+    // only one shows the reader nothing. Quote markers were stripped for block
+    // detection but not for the emptiness test.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace("Why this release breaks.", ">");
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an empty quote is not migration guidance\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_counts_a_quote_that_carries_words() {
+    // The counterpart: a quote with prose in it is content, which is how the
+    // real guides carry their backfill notes.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace(
+        "Why this release breaks.",
+        "> Backfilled from the release notes.",
+    );
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a quoted note is visible content\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_an_invisible_guide_link() {
+    // `[](path)` renders an anchor with no text: the destination is right and
+    // there is nothing for the reader to click, so it is not the upgrade path
+    // the entry has to carry.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed API. [](docs/migrations/0.7.0.md)\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an anchor with no text is not a link the reader can follow",
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_an_invisible_index_entry() {
+    // The same rule in the index scan: an entry nobody can see does not make
+    // the guide findable.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("docs/migrations/0.7.0.md"),
+        valid_migration_guide("0.7.0"),
+    )
+    .expect("guide");
+    std::fs::write(
+        tmp.path().join("docs/migrations/README.md"),
+        "# Migration Guides\n\n\
+         ## Index\n\n\
+         - [`next.md`](next.md)\n\
+         - [](0.7.0.md)\n",
+    )
+    .expect("index");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an invisible index entry does not index the guide\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_an_image_labelled_guide_link() {
+    // The boundary the label rule must not cross: an image *is* something the
+    // reader sees, so a link labelled with one is a real link.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed API. \
+           [![upgrade](icon.png)](docs/migrations/0.7.0.md)\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "an image label is visible, so the link counts\n{}",
+        gate_report(&output),
+    );
+}
