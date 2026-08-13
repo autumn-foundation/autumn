@@ -50,8 +50,8 @@ pub(crate) mod wire;
 #[cfg(feature = "test-support")]
 pub use capture::with_capture_scope;
 pub use capture::{
-    CaptureHandle, CaptureLayer, CaptureScope, CaptureSettings, DbBuffer, current_scope,
-    db_capture_enabled, is_valid_scope_id, scope_by_id, set_db_capture_enabled,
+    CaptureHandle, CaptureLayer, CaptureScope, CaptureSettings, CapturedClientIdentity, DbBuffer,
+    current_scope, db_capture_enabled, is_valid_scope_id, scope_by_id, set_db_capture_enabled,
 };
 pub use clock::{RecordingClock, ReplayClock};
 pub use persist::{CapsuleRef, capsule_dir, load_capsule, persist};

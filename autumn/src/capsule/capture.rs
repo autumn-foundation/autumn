@@ -93,6 +93,23 @@ pub async fn with_capture_scope<F: Future>(scope: Arc<CaptureScope>, future: F) 
     CAPSULE_SCOPE.scope(scope, future).await
 }
 
+/// The client identity the trusted-proxies resolver settled on for a request.
+///
+/// All three fields are recorded so replay can restore the whole
+/// `ResolvedClientIdentity` — the address alone is not enough: behind trusted
+/// proxies the resolved *public* client IP is itself untrusted, so a replayed
+/// resolver run would ignore the recorded forwarded headers and settle on a
+/// different host and scheme than the failing request saw.
+#[derive(Debug, Clone, Default)]
+pub struct CapturedClientIdentity {
+    /// Resolved client IP, when one was resolved.
+    pub addr: Option<std::net::IpAddr>,
+    /// Resolved external host.
+    pub host: Option<String>,
+    /// Resolved external scheme (`"http"`/`"https"`).
+    pub scheme: Option<String>,
+}
+
 /// Immutable knobs a scope needs to bound and place its capsule.
 #[derive(Debug, Clone)]
 pub struct CaptureSettings {
@@ -248,7 +265,7 @@ pub struct CaptureScope {
     request: OnceLock<RawRequest>,
     body: Mutex<BodyTap>,
     clock: Mutex<Vec<DateTime<Utc>>>,
-    client_addr: OnceLock<Option<std::net::IpAddr>>,
+    client_identity: OnceLock<CapturedClientIdentity>,
     db: Mutex<DbBuffer>,
     notes: Mutex<Vec<String>>,
     truncated: AtomicBool,
@@ -266,7 +283,7 @@ impl CaptureScope {
             request: OnceLock::new(),
             body: Mutex::new(BodyTap::Absent),
             clock: Mutex::new(Vec::new()),
-            client_addr: OnceLock::new(),
+            client_identity: OnceLock::new(),
             db: Mutex::new(DbBuffer::default()),
             notes: Mutex::new(Vec::new()),
             truncated: AtomicBool::new(false),
@@ -391,16 +408,16 @@ impl CaptureScope {
 
     /// Append a clock reading.
     ///
-    /// Record the client address the trusted-proxies resolver settled on.
+    /// Record the client identity the trusted-proxies resolver settled on.
     /// Only the first call takes — one resolution per request.
-    pub fn set_client_addr(&self, addr: Option<std::net::IpAddr>) {
-        let _ = self.client_addr.set(addr);
+    pub fn set_client_identity(&self, identity: CapturedClientIdentity) {
+        let _ = self.client_identity.set(identity);
     }
 
-    /// The resolved client address, when the resolver ran under this scope.
+    /// The resolved client identity, when the resolver ran under this scope.
     #[must_use]
-    pub fn client_addr(&self) -> Option<std::net::IpAddr> {
-        self.client_addr.get().copied().flatten()
+    pub fn client_identity(&self) -> Option<&CapturedClientIdentity> {
+        self.client_identity.get()
     }
 
     /// Bounded: a pathological loop reading `now()` must not grow the buffer

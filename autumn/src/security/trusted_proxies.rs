@@ -560,19 +560,32 @@ where
     }
 
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
-        let identity = ResolvedClientIdentity {
-            addr: self.resolver.resolve_client_addr(&req),
-            host: self.resolver.resolve_client_host(&req),
-            scheme: self.resolver.resolve_client_scheme(&req),
-        };
-        // A failure capsule records the *resolved* client address, so replay
-        // can re-anchor `ClientAddr` without re-running trust evaluation
-        // against a peer socket it does not have (issue #1598).
-        #[cfg(feature = "reporting")]
-        if let Some(scope) = crate::capsule::current_scope() {
-            scope.set_client_addr(identity.addr);
+        // An identity already present was put there by in-process code —
+        // extensions never arrive off the wire — today only the capsule
+        // replay driver, restoring the resolution the failing request had.
+        // Honor it rather than re-resolving against a synthetic peer that
+        // would (correctly, but uselessly) distrust the recorded forwarded
+        // headers (issue #1598).
+        if req.extensions().get::<ResolvedClientIdentity>().is_none() {
+            let identity = ResolvedClientIdentity {
+                addr: self.resolver.resolve_client_addr(&req),
+                host: self.resolver.resolve_client_host(&req),
+                scheme: self.resolver.resolve_client_scheme(&req),
+            };
+            // A failure capsule records the *resolved* client identity, so
+            // replay can restore `ClientAddr`/`ClientHost`/`ClientScheme`
+            // without re-running trust evaluation against a peer socket it
+            // does not have (issue #1598).
+            #[cfg(feature = "reporting")]
+            if let Some(scope) = crate::capsule::current_scope() {
+                scope.set_client_identity(crate::capsule::CapturedClientIdentity {
+                    addr: identity.addr,
+                    host: identity.host.clone(),
+                    scheme: identity.scheme.clone(),
+                });
+            }
+            req.extensions_mut().insert(identity);
         }
-        req.extensions_mut().insert(identity);
 
         let mut inner = self.inner.clone();
         std::mem::swap(&mut self.inner, &mut inner);

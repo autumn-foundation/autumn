@@ -172,6 +172,8 @@ pub fn redact_request(
         // Filled in by persist from the capture scope; redaction only sees
         // the request head.
         client_addr: None,
+        client_host: None,
+        client_scheme: None,
     };
     (request, values, notes)
 }
@@ -284,6 +286,25 @@ fn redact_uri(
             serializer.append_pair(&key, FILTERED_PLACEHOLDER);
         } else {
             serializer.append_pair(&key, &value);
+        }
+    }
+    // The echo set holds *decoded* values, but an error that echoes the raw
+    // request target carries the percent-encoded form — `?token=a%2Fb`
+    // decodes to `a/b`, and `mask_echoes` cannot find `a/b` inside `a%2Fb`.
+    // Walk the raw query text and retain the on-the-wire value of every
+    // sensitive key too, so both spellings scrub.
+    for raw_pair in query.split('&') {
+        let (raw_key, raw_value) = raw_pair
+            .split_once('=')
+            .map_or((raw_pair, ""), |(key, value)| (key, value));
+        if raw_value.is_empty() {
+            continue;
+        }
+        let decoded_key: String = url::form_urlencoded::parse(raw_key.as_bytes())
+            .map(|(key, _)| key.into_owned())
+            .collect();
+        if key_is_sensitive(&decoded_key, filter) {
+            values.insert(raw_value.as_bytes());
         }
     }
     let redacted_query = serializer.finish();
@@ -756,6 +777,35 @@ mod tests {
         );
         assert!(!body.contains("123-45-6789"), "the value must be gone");
         assert!(body.contains("Ada"), "non-sensitive fields must survive");
+    }
+
+    #[test]
+    fn encoded_query_value_forms_join_the_echo_set() {
+        let (request, values) = redact(
+            Request::get("/callback?token=a%2Fb%2Bc&page=2"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        assert!(
+            !request.uri.contains("a%2Fb"),
+            "the encoded value must be masked out of the capsule uri, got {}",
+            request.uri
+        );
+        assert!(
+            values.contains(b"a/b+c"),
+            "the decoded value must be in the echo set"
+        );
+        assert!(
+            values.contains(b"a%2Fb%2Bc"),
+            "the on-the-wire encoded value must be in the echo set too — an error \
+             that echoes the raw request target carries this spelling"
+        );
+        assert_eq!(
+            mask_echoes("failed on /callback?token=a%2Fb%2Bc", &values),
+            format!("failed on /callback?token={FILTERED_PLACEHOLDER}"),
+            "an echoed raw request target must scrub"
+        );
     }
 
     #[test]

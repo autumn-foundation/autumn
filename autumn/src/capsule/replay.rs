@@ -68,6 +68,26 @@ pub const EXIT_REFUSED: i32 = 2;
 /// Largest response body read back for the verdict's error message.
 const MAX_BODY_PEEK: usize = 64 * 1024;
 
+/// Longest the verdict waits for a replayed response body to finish.
+///
+/// The request timeout is deliberately cleared in replay mode, and a route
+/// whose failure was *fixed* may now stream a body that never ends (an SSE
+/// endpoint, say) — without a deadline of its own the drain would hang and
+/// `autumn replay` would never print a verdict. Judging a still-streaming
+/// response after this long is sound: the status and error identity are in
+/// the head, which has already arrived.
+const BODY_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Drain up to [`MAX_BODY_PEEK`] of a replayed response body, giving up —
+/// without failing the verdict — when it does not complete in time.
+async fn drain_body(body: Body) {
+    let _ = tokio::time::timeout(
+        BODY_DRAIN_DEADLINE,
+        axum::body::to_bytes(body, MAX_BODY_PEEK),
+    )
+    .await;
+}
+
 // ── Divergences ─────────────────────────────────────────────────────────────
 
 /// Why the replayed database traffic did not line up with the tape.
@@ -467,7 +487,7 @@ async fn outcome_from_response(response: axum::response::Response) -> CapsuleOut
     // than letting any same-status response pass for it.
     if let Some(caught) = response.extensions().get::<crate::reporting::CaughtPanic>() {
         let payload = caught.payload.clone();
-        let _ = axum::body::to_bytes(response.into_body(), MAX_BODY_PEEK).await;
+        drain_body(response.into_body()).await;
         return CapsuleOutcome::Panic {
             status: status.as_u16(),
             payload,
@@ -490,8 +510,9 @@ async fn outcome_from_response(response: axum::response::Response) -> CapsuleOut
         |info| (info.message.clone(), info.problem_type.map(str::to_owned)),
     );
     // Draining the body keeps a streaming handler from being judged before it
-    // has actually produced anything.
-    let _ = axum::body::to_bytes(response.into_body(), MAX_BODY_PEEK).await;
+    // has actually produced anything — but only up to a deadline, so a body
+    // that never ends cannot hang the verdict.
+    drain_body(response.into_body()).await;
     CapsuleOutcome::Status {
         code: status.as_u16(),
         message,
@@ -550,12 +571,23 @@ fn rebuild_request(
         .method(method)
         .uri(uri)
         .version(parse_version(&recorded.http_version));
-    // Re-anchor client identity: the recorded *resolved* address becomes the
-    // replayed peer, so the trusted-proxies resolver — which runs during
-    // replay but has no real socket — settles on the same `ClientAddr` the
-    // production request had. (The resolved address is not a proxy, so the
-    // resolver returns the peer itself rather than re-walking forwarded
-    // headers against it.)
+    // Restore client identity: the recorded *resolved* identity is
+    // pre-inserted whole, and `TrustedProxiesLayer` honors a pre-existing
+    // `ResolvedClientIdentity` rather than re-resolving — re-running trust
+    // evaluation against a synthetic peer would (correctly) distrust the
+    // recorded forwarded headers and settle on a different host and scheme
+    // than the failing request saw. `ConnectInfo` is anchored too, for
+    // anything reading the peer directly.
+    if recorded.client_addr.is_some()
+        || recorded.client_host.is_some()
+        || recorded.client_scheme.is_some()
+    {
+        builder = builder.extension(crate::security::ResolvedClientIdentity {
+            addr: recorded.client_addr,
+            host: recorded.client_host.clone(),
+            scheme: recorded.client_scheme.clone(),
+        });
+    }
     if let Some(addr) = recorded.client_addr {
         builder = builder.extension(axum::extract::ConnectInfo(std::net::SocketAddr::new(
             addr, 0,
@@ -927,6 +959,8 @@ mod tests {
                 body: CapsuleBody::Absent,
                 redacted_keys: Vec::new(),
                 client_addr: None,
+                client_host: None,
+                client_scheme: None,
             },
             outcome,
             clock: Vec::new(),
@@ -947,6 +981,14 @@ mod tests {
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .expect("the recorded client address must anchor the replayed peer");
         assert_eq!(peer.0.ip(), std::net::IpAddr::from([203, 0, 113, 9]));
+        let identity = request
+            .extensions()
+            .get::<crate::security::ResolvedClientIdentity>()
+            .expect("the full resolved identity must be restored");
+        assert_eq!(
+            identity.addr,
+            Some(std::net::IpAddr::from([203, 0, 113, 9]))
+        );
 
         let anonymous = crate::capsule::schema::test_support::request("GET", "/whoami");
         let request = rebuild_request(&anonymous, &mut warnings).expect("request rebuilds");

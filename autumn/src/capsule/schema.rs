@@ -158,6 +158,15 @@ pub struct CapsuleRequest {
     /// handlers reproduce without a real peer socket.
     #[serde(default)]
     pub client_addr: Option<std::net::IpAddr>,
+    /// The external host the resolver settled on, restored so `ClientHost`
+    /// replays the value the failing request saw rather than re-deriving one
+    /// from an untrusted synthetic peer.
+    #[serde(default)]
+    pub client_host: Option<String>,
+    /// The external scheme the resolver settled on, restored for
+    /// `ClientScheme` for the same reason.
+    #[serde(default)]
+    pub client_scheme: Option<String>,
 }
 
 /// A captured request body.
@@ -361,6 +370,8 @@ pub mod test_support {
             body: CapsuleBody::Absent,
             redacted_keys: Vec::new(),
             client_addr: None,
+            client_host: None,
+            client_scheme: None,
         }
     }
 
