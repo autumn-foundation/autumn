@@ -595,6 +595,24 @@ fn record_masked_value(value: &serde_json::Value, values: &mut RedactedValues) {
     match value {
         serde_json::Value::String(text) => values.insert(text.as_bytes()),
         serde_json::Value::Null => {}
+        // A masked container's *leaves* are what a handler extracts, echoes,
+        // or binds — `{"value":"hunter2"}` in the set would never match the
+        // `hunter2` an error quotes or an INSERT binds. Keep the container's
+        // serialization (an error may echo the whole thing) and recurse so
+        // every scalar beneath the matched key is retained too. Depth is
+        // bounded by serde_json's own recursion limit at parse time.
+        serde_json::Value::Object(map) => {
+            values.insert(value.to_string().as_bytes());
+            for child in map.values() {
+                record_masked_value(child, values);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            values.insert(value.to_string().as_bytes());
+            for child in items {
+                record_masked_value(child, values);
+            }
+        }
         other => values.insert(other.to_string().as_bytes()),
     }
 }
@@ -937,6 +955,50 @@ mod tests {
             mask_echoes("bad form field token=a%2Fb%2Bc", &values),
             format!("bad form field token={FILTERED_PLACEHOLDER}"),
             "an echoed raw form body must scrub"
+        );
+    }
+
+    /// A sensitive key whose value is an object or array masks the whole
+    /// container — but a handler extracts, echoes, or binds the *leaves*, so
+    /// each scalar beneath the matched key must join the echo set alongside
+    /// the container's serialization.
+    #[test]
+    fn leaf_values_of_a_masked_json_container_join_the_echo_set() {
+        let raw = br#"{"secret":{"value":"hunter2secret","attempts":42},"keep":"public"}"#;
+        let (request, values) = redact(
+            Request::post("/hook").header(header::CONTENT_TYPE, "application/json"),
+            CapturedBody::Buffered(Bytes::from_static(raw)),
+            &filter_with(&[]),
+        );
+
+        let CapsuleBody::Text(body) = &request.body else {
+            panic!(
+                "a JSON body must be captured as text, got {:?}",
+                request.body
+            );
+        };
+        assert!(
+            !body.contains("hunter2secret"),
+            "the nested value must be masked out of the body, got {body}"
+        );
+        assert!(body.contains("public"), "unmatched fields must survive");
+        assert!(
+            values.contains(b"hunter2secret"),
+            "a string leaf under a masked container must be in the echo set"
+        );
+        assert!(
+            values.contains(b"42"),
+            "a numeric leaf under a masked container must be in the echo set"
+        );
+        assert!(
+            values.contains(br#"{"value":"hunter2secret","attempts":42}"#)
+                || values.contains(br#"{"attempts":42,"value":"hunter2secret"}"#),
+            "the container's own serialization stays in the set too"
+        );
+        assert_eq!(
+            mask_echoes("could not verify hunter2secret", &values),
+            format!("could not verify {FILTERED_PLACEHOLDER}"),
+            "an error echoing an extracted leaf must scrub"
         );
     }
 
