@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generate scaffold:** `--belongs-to <Parent>` scaffolds the parent-side half
+  of a parent → child relationship, which the flat scaffold has always omitted
+  (#1323). Autumn already shipped every piece — the `references:` column
+  (#1026), the belongs_to `<select>` (#1146), `PageRequest`/`Page`,
+  `data_table`, the Changeset re-render (#1124) — but nothing composed them into
+  the one view every CRUD app needs: a parent's show page that lists its
+  children and lets you add one inline. Our own `examples/reddit-clone` spends
+  ~165 hand-written lines on a richer version of exactly that shape.
+
+  ```bash
+  autumn generate scaffold Post title:String
+  autumn generate scaffold Comment body:Text post:references --belongs-to Post
+  ```
+
+  That second command now emits, on top of the usual flat CRUD:
+
+  - `GET /posts/{post_id}/comments` — the child list, scoped to one parent and
+    paginated through the existing `PageRequest` extractor. A parent id that
+    doesn't exist answers 404 rather than a plausible-looking empty list;
+  - `POST /posts/{post_id}/comments` — a `#[secured]` create whose foreign key
+    comes from the **path**, never the submitted body (the nested form renders
+    no control for it, and the handler overwrites the column before validating,
+    so a hand-crafted body cannot re-parent a child). Invalid input re-renders
+    at 422 with inline errors and preserved input; success redirects (PRG) to
+    the parent's show page;
+  - a `pub children_section(…)` helper in the child's routes module — the child
+    list (`data_table`, each row linking to the child's own show view) plus the
+    inline "add" form — which the **parent's generated `show` view** now renders,
+    and which any hand-written page can call too;
+  - a back-link from the child's show view to its parent;
+  - a generated write-path test that pins the whole point of the nesting: create
+    a child under a parent, see it in that parent's list, and see that it does
+    **not** appear under a different parent (plus that a body-supplied foreign
+    key is ignored).
+
+  The parent-side edit is marker-delimited, so re-running the generator never
+  double-injects and `autumn destroy scaffold … --belongs-to Post` takes exactly
+  those lines back out — including when one parent has several nested children. Because
+  the markers record the relationship durably, `--belongs-to` is a one-time
+  flag: a later `generate … --force` without it keeps the nesting (with a
+  warning) instead of half-dismantling it, and `destroy` finds the parent
+  without it. Re-pointing a nested child at a *different* parent, or dropping
+  its foreign key, is refused before anything is written — the parent's section
+  passes its own `row.id`, so the change would leave that call compiling while
+  reading another table's ids. Un-nest with `destroy` first.
+  Regenerating the PARENT re-applies the child sections it carried (and is
+  refused when the re-render would reshape `show` into something the section
+  cannot live in, such as a `--sharded` parent's `ShardedDb`), and destroying a
+  parent that still has nested children is refused with the order to follow.
+  The injected signature carries a reversible `#[allow(clippy::too_many_arguments)]`,
+  since a generated project's own CI runs `cargo clippy --all-targets -- -D warnings`
+  and nine parameters trips it — as the flat `index` and `<snake>_form_for`
+  helpers already did, which this also fixes.
+  When the child carries an owner column, the nested list inherits the flat
+  index's `#[secured]` + owner scoping, so nesting never opens a second, wider
+  door onto the same rows.
+
+  Not supported (refused at generation time with an actionable message) with
+  `--api`, `--live`, `--live-validation`, `--sharded`, an `Attachment` column, a
+  nullable or self-referential parent reference, or a parent that isn't
+  scaffolded, is `slug`-keyed, carries a `:states(…)` column, or has a
+  hand-rewritten `show` view. Single-level nesting only.
+
 - **release:** every release with a breaking change now ships a migration guide,
   enforced by `scripts/check-migration-guides.sh` (#1588). Autumn ships every
   2–4 weeks and, pre-1.0, most releases can break existing apps, but the only
@@ -1457,11 +1520,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generated. Generation prints a warning naming the escape hatch (rename the
   column) whenever the name is detected.
 
-  **Breaking for `--api` scaffolds on a `lock_version` model:**
+  **Breaking:** on an `--api` scaffold over a `lock_version` model,
   `#[lock_version]` puts a *required* `lock_version` on `Update{Model}`, so JSON
   `PUT`/`PATCH` clients must now send the version they read. That is what gives
   the JSON path conflict-checking, but existing clients that omit the field will
-  fail deserialization.
+  fail deserialization. See the
+  [migration guide](docs/migrations/next.md).
 
 - **generate:** finished the zero-JS file-upload slice (#1236) on the read-back
   side. A scaffold with an `Attachment` column now *shows* what it stored: the
