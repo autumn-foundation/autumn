@@ -904,6 +904,21 @@ impl JobRegistry {
         u64::try_from(clock.now().timestamp_millis()).unwrap_or(0)
     }
 
+    /// Whether any job name has been registered against this registry.
+    ///
+    /// Job names are registered when a job runtime starts, so this doubles as
+    /// "has the state owning this registry moved past construction?" — see
+    /// [`AppState::with_clock`](crate::AppState::with_clock), which is only
+    /// meaningful before that point.
+    #[must_use]
+    pub fn is_initialized(&self) -> bool {
+        !self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
     /// Register a job name with initial counters.
     pub fn register(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write() {

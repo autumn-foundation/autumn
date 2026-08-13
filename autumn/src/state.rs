@@ -528,8 +528,40 @@ impl AppState {
     /// never belong to different timelines. A state cloned *before* this call
     /// keeps its own clock and its own registry, equally consistent — the two
     /// simply stop sharing queue gauges from here on.
+    ///
+    /// # Call this before starting a job runtime
+    ///
+    /// Once [`job::start_runtime`](mod@crate::job) has run, the runtime holds its
+    /// own clone of the registry and keeps recording into it, and **no**
+    /// behaviour here is correct:
+    ///
+    /// | if `with_clock` … | then |
+    /// |---|---|
+    /// | re-clocks this handle only | the runtime's clone judges shared marks on the old clock |
+    /// | re-clocks a shared cell | the runtime stamps with the old clock into gauges moved to the new one |
+    /// | takes a fresh registry (what it does) | the runtime keeps writing to the old one, and this state's gauges stay empty |
+    ///
+    /// The operation is simply not meaningful after initialization, so rather
+    /// than pick the least-bad wrong answer this asserts in debug builds and
+    /// logs at `error` in release. It is not silently tolerated.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
+        let already_initialized = self.job_registry.is_initialized();
+        debug_assert!(
+            !already_initialized,
+            "AppState::with_clock is a construction-time builder: by the time job \
+             names are registered a runtime holds its own clone of the registry, \
+             and re-clocking the state can no longer reach it. Install the clock \
+             before starting the job runtime."
+        );
+        if already_initialized {
+            tracing::error!(
+                "AppState::with_clock called after the job registry was populated; the \
+                 job runtime holds its own clone and keeps recording there, so this \
+                 state's actuator gauges will stay empty. Install the clock before \
+                 starting the job runtime."
+            );
+        }
         self.started_at = clock.monotonic();
         // A registry's queue gauges compare ready-at marks against a clock, and
         // the marks come from the job runtime started off *this* state — so the
@@ -542,9 +574,9 @@ impl AppState {
         //   then stamps with its own clock into gauges moved out from under it.
         //
         // Detaching gives every state one clock and one registry that agree,
-        // whichever order states are cloned and re-clocked in. Nothing is lost:
-        // job names are registered when a runtime starts, which is necessarily
-        // after this builder has run.
+        // whichever order states are cloned and re-clocked in. Before a runtime
+        // starts — the only point at which this builder is meaningful, checked
+        // above — the registry is empty, so nothing is dropped.
         self.job_registry = actuator::JobRegistry::new().with_clock(Arc::clone(&clock));
         self.clock = clock;
         self
@@ -1065,6 +1097,25 @@ impl std::fmt::Debug for AppState {
 
 #[cfg(test)]
 mod tests {
+    /// Re-clocking a state that a runtime has already touched is refused loudly.
+    ///
+    /// By the time job names are registered, the runtime holds its own clone of
+    /// the registry and keeps recording there — so no behaviour `with_clock`
+    /// could pick is correct (see its docs for the three-way trade). It asserts
+    /// in debug rather than silently leaving this state's gauges empty.
+    #[test]
+    #[should_panic(expected = "construction-time builder")]
+    fn re_clocking_an_initialized_state_is_refused() {
+        use chrono::{TimeZone, Utc};
+
+        let state = AppState::detached();
+        // What `job::start_runtime` does: register the app's job names.
+        state.job_registry().register_on_queue("probe", "default");
+
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let _ = state.with_clock(Arc::new(crate::time::FixedClock::at(epoch)));
+    }
+
     /// A state's clock and the gauges it judges must never come apart.
     ///
     /// The job runtime started off a state stamps ready-at marks with that
