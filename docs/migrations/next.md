@@ -16,17 +16,20 @@
 - **Expected upgrade effort:** none for application code, beyond two new
   deprecation warnings if you call `scheduler::now_unix_secs` /
   `now_unix_duration` (see *Deprecations* below). Small for **plugins
-  and libraries** that build `autumn_web::Route` values by hand.
+  and libraries** that build `autumn_web::Route` values by hand, and for **JSON
+  API clients** of a scaffolded model that declares a `lock_version` column.
 - **MSRV delta:** `1.88.0` -> `1.88.0` (unchanged so far)
 - **Carried dependency majors:** none so far
 
 ## Summary
 
 Nothing in the unreleased line changes how an application written against
-0.6.x compiles or behaves. The single break is at the *route-construction*
-seam: `Route` and `StaticRouteMeta` gained a field, so code that builds those
-structs with a literal — which in practice means plugins assembling a
-`Vec<Route>` rather than using `routes![]` — has to name it.
+0.6.x compiles or behaves. There are two breaks, both narrow. The first is at
+the *route-construction* seam: `Route` and `StaticRouteMeta` gained a field, so
+code that builds those structs with a literal — which in practice means plugins
+assembling a `Vec<Route>` rather than using `routes![]` — has to name it. The
+second is on the wire, not in Rust: a model declaring a `lock_version` column
+now requires JSON `PUT`/`PATCH` clients to send that version.
 
 ## Before you start
 
@@ -90,44 +93,42 @@ last time this particular field costs you an edit.
 rg -n 'Route \{|StaticRouteMeta \{' src/
 ```
 
-### Optimistic locking on scaffolded models (#1318)
+### JSON API: a `lock_version` model now requires the version on `PUT`/`PATCH`
 
-Only affects apps that (a) declare a column literally named `lock_version` and
-(b) re-run `autumn generate model` / `generate scaffold` over it. `lock_version`
-is now a load-bearing name: the generator treats it as a database-managed
-optimistic-locking column.
+**Why:** declaring a column literally named `lock_version` opts a model into
+optimistic locking (#1318). `#[lock_version]` carries the column on
+`Update{Model}` as the *expected* version, which is what lets the repository
+reject a stale write with `RepositoryError::Conflict` instead of silently
+letting the last writer win.
 
-**What changes**
+This affects you only if **both** are true: your model declares a non-nullable
+`i32`/`i64` column named `lock_version`, and you have JSON clients writing
+through the generated `PUT`/`PATCH /api/<plural>/{id}` endpoints. Browser
+forms on an HTML scaffold are unaffected — the generated edit form carries the
+version in a hidden field for you.
 
-- `lock_version` is dropped from `New{Model}`, so it can no longer be set on
-  create.
-- It disappears from a scaffold's HTML form in favour of a hidden field, and the
-  model gains a derived `etag()` method.
-- Generation is now *refused* — rather than emitting something subtly wrong —
-  when a `lock_version` scaffold is paired with `--live`, `--sharded`, a `slug`
-  column, or an `Attachment` column, or when the column is the only one, is
-  marked `unique`, or is typed as anything but a non-nullable `i32`/`i64`.
-  Generation prints a warning naming the escape hatch whenever the name is
-  detected.
-
-**Breaking for `--api` scaffolds.** `#[lock_version]` puts a *required*
-`lock_version` on `Update{Model}`, so a JSON `PUT`/`PATCH` client must send the
-version it read:
+**Before (`0.6`):** the field was ignored on the wire, so a client could omit
+it.
 
 ```jsonc
-// Before
-{ "title": "New title" }
-
-// After — send the version returned by the previous GET
-{ "title": "New title", "lock_version": 7 }
+{ "title": "Hello" }
 ```
 
-A client that omits the field now fails deserialization with `422`. That
-required field is what gives the JSON path its conflict checking: a stale
-version comes back `409` instead of silently overwriting a concurrent edit.
+**After:** the field is required, and its value must be the version the client
+read. Omitting it fails deserialization (HTTP 422); sending a stale one is
+answered with a conflict rather than an overwrite.
 
-**If you do not want this**, rename the column (for example to `revision`) and
-re-run the generator; the name is the only trigger.
+```jsonc
+{ "title": "Hello", "lock_version": 7 }
+```
+
+Read the current version from the same record's `GET` response (it is a plain
+column) and echo it back on the next write.
+
+**If you did not want optimistic locking**, the column name is the entire
+opt-in: rename it (e.g. to `revision`) and the behaviour goes away. `autumn
+generate` prints a warning naming this escape hatch whenever it detects the
+name.
 
 ## Deprecations (non-breaking)
 
@@ -175,6 +176,10 @@ None so far.
 - A `#[static_get]` route declaring `robots = "noindex"` is now left out of the
   generated `sitemap.xml`. Entries supplied by a `SitemapSource` you register
   are still passed through unfiltered.
+- On a model with a `lock_version` column, a concurrent write no longer wins
+  silently: the HTML scaffold's edit form comes back at **409** with your input
+  intact and the record's current version, and the JSON path answers with a
+  conflict.
 
 ## How to verify
 
@@ -182,10 +187,13 @@ None so far.
 2. `cargo test` — your suite is green.
 3. Plugins: `autumn plugin-check --plugin-name <your-plugin>` passes
    (`--plugin-name` is required).
-4. Serve the app (`cargo run`, default `http://127.0.0.1:3000`) and view-source
+4. If you have a `lock_version` model with JSON clients: `PUT` a record without
+   `lock_version` and confirm it is rejected, then `PUT` it with the version
+   from the record's `GET` and confirm it succeeds.
+5. Serve the app (`cargo run`, default `http://127.0.0.1:3000`) and view-source
    a page whose route declares `seo(...)` — the declared `<title>` / `<meta>`
    values render.
-5. `curl http://127.0.0.1:3000/sitemap.xml` — no `robots = "noindex"` static
+6. `curl http://127.0.0.1:3000/sitemap.xml` — no `robots = "noindex"` static
    route is listed. Substitute your own address if you changed `[server] host`
    or `[server] port`.
 
