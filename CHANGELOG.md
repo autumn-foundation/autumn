@@ -1574,6 +1574,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inert); `autumn/tests/integration/middleware_stack_depth.rs` gates the depth;
   and `autumn/benches/request_pipeline.rs` is the profiler workload.
 
+  [no-plugin] — an internal router-assembly change: no new app-facing API,
+  config key, or pattern for the Claude plugin's skills to describe.
+
 - **generate model / generate scaffold:** `lock_version` is now a load-bearing
   column name (#1318) — see the Added entry above for the full behaviour. What
   *changes* for anyone who already declared a column with that name: it becomes
