@@ -57,6 +57,14 @@ impl ClockSource for RecordingClock {
         }
         reading
     }
+
+    fn monotonic(&self) -> crate::time::MonotonicInstant {
+        let reading = self.inner.monotonic();
+        if let Some(scope) = current_scope() {
+            scope.record_monotonic(reading.since_origin());
+        }
+        reading
+    }
 }
 
 tokio::task_local! {
@@ -102,6 +110,11 @@ pub struct ReplayClock {
     last: Mutex<Option<DateTime<Utc>>>,
     over_reads: std::sync::atomic::AtomicUsize,
     fallback: DateTime<Utc>,
+    /// Recorded [`ClockSource::monotonic`] readings, as offsets from the
+    /// recording clock's origin, served with the same scope-gated,
+    /// repeat-on-over-read discipline as the wall readings.
+    monotonic: Mutex<VecDeque<std::time::Duration>>,
+    last_monotonic: Mutex<Option<std::time::Duration>>,
 }
 
 impl ReplayClock {
@@ -115,6 +128,17 @@ impl ReplayClock {
             last: Mutex::new(None),
             over_reads: std::sync::atomic::AtomicUsize::new(0),
             fallback,
+            monotonic: Mutex::new(VecDeque::new()),
+            last_monotonic: Mutex::new(None),
+        }
+    }
+
+    /// Attach the capsule's recorded monotonic readings.
+    #[must_use]
+    pub fn with_monotonic(self, readings: Vec<std::time::Duration>) -> Self {
+        Self {
+            monotonic: Mutex::new(readings.into()),
+            ..self
         }
     }
 
@@ -165,6 +189,37 @@ impl ClockSource for ReplayClock {
             .ok()
             .and_then(|last| *last)
             .unwrap_or(self.fallback)
+    }
+
+    fn monotonic(&self) -> crate::time::MonotonicInstant {
+        use std::time::Duration;
+
+        let last_or_origin = || {
+            crate::time::MonotonicInstant::from_origin_elapsed(
+                self.last_monotonic
+                    .lock()
+                    .ok()
+                    .and_then(|last| *last)
+                    .unwrap_or(Duration::ZERO),
+            )
+        };
+        if !in_replay_request() {
+            // Same discipline as `now()`: an unattributed read (boot, or a
+            // spawned task) is stable and non-consuming.
+            return last_or_origin();
+        }
+        if let Ok(mut readings) = self.monotonic.lock()
+            && let Some(reading) = readings.pop_front()
+        {
+            if let Ok(mut last) = self.last_monotonic.lock() {
+                *last = Some(reading);
+            }
+            return crate::time::MonotonicInstant::from_origin_elapsed(reading);
+        }
+        // Over-read: repeat rather than drift to the (stub-fast) real
+        // timeline. Not counted separately — a handler that over-reads the
+        // monotonic clock over-reads it deterministically.
+        last_or_origin()
     }
 }
 
@@ -223,6 +278,41 @@ mod tests {
         })
         .await;
         assert_eq!(clock.over_reads(), 1);
+    }
+
+    /// Monotonic readings follow the same discipline as wall readings:
+    /// served in recorded order inside the replay-request scope, repeated on
+    /// over-read, and non-consuming outside the scope — never the process's
+    /// real (stub-fast) monotonic timeline.
+    #[tokio::test]
+    async fn replay_clock_serves_monotonic_readings_scope_gated() {
+        use std::time::Duration;
+
+        let clock = ReplayClock::new(Vec::new(), at(0))
+            .with_monotonic(vec![Duration::from_millis(10), Duration::from_millis(30)]);
+
+        // Outside the scope: origin, non-consuming.
+        assert_eq!(
+            clock.monotonic(),
+            crate::time::MonotonicInstant::ORIGIN,
+            "an unscoped monotonic read must not touch the queue"
+        );
+
+        with_replay_request_scope(async {
+            assert_eq!(
+                clock.monotonic().since_origin(),
+                Duration::from_millis(10),
+                "recorded monotonic readings are served in order"
+            );
+            assert_eq!(clock.monotonic().since_origin(), Duration::from_millis(30));
+            assert_eq!(
+                clock.monotonic().since_origin(),
+                Duration::from_millis(30),
+                "an over-read repeats the last reading instead of drifting to \
+                 the real timeline"
+            );
+        })
+        .await;
     }
 
     /// A clock read from outside the replay-request scope — app boot, or a

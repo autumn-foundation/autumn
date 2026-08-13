@@ -271,6 +271,11 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
         request,
         outcome: scrub_outcome(outcome, &redacted),
         clock: scope.clock_readings(),
+        clock_monotonic_us: scope
+            .monotonic_readings()
+            .into_iter()
+            .map(|offset| u64::try_from(offset.as_micros()).unwrap_or(u64::MAX))
+            .collect(),
         db,
         truncated: scope.is_truncated(),
         notes: scope.notes(),

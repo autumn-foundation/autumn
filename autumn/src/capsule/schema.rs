@@ -90,6 +90,12 @@ pub struct Capsule {
     /// Clock readings taken during the request, in the order they were read.
     #[serde(default)]
     pub clock: Vec<DateTime<Utc>>,
+    /// Monotonic clock readings taken during the request, in read order, as
+    /// microseconds since the recording clock's origin. Serves
+    /// `ClockSource::monotonic` during replay the way `clock` serves `now()`.
+    /// Absent (empty) in capsules written before this field existed.
+    #[serde(default)]
+    pub clock_monotonic_us: Vec<u64>,
     /// Database traffic recorded for the request, when DB capture was active.
     #[serde(default)]
     pub db: Option<CapsuleDb>,
@@ -389,6 +395,7 @@ pub mod test_support {
             request,
             outcome,
             clock: Vec::new(),
+            clock_monotonic_us: Vec::new(),
             db: None,
             truncated: false,
             notes: Vec::new(),

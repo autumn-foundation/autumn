@@ -534,7 +534,10 @@ async fn max_capsules_prunes_oldest() {
     let newest_seed = write_aged_capsule(dir.path(), 3600, 2);
 
     client.get("/fail").send().await.assert_status(500);
-    await_settled(|| !middle.exists()).await;
+    // Settle on the *final* state, not an intermediate one: pruning runs
+    // before the new capsule's write, so "middle is gone" is observable a
+    // beat before the new file lands — a slow runner can see one file there.
+    await_settled(|| !middle.exists() && capsule_paths(dir.path()).len() == 2).await;
     let paths = capsule_paths(dir.path());
 
     assert!(!oldest.exists(), "the oldest capsule must be pruned first");

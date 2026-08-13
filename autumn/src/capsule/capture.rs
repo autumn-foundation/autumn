@@ -244,6 +244,8 @@ pub struct CaptureScope {
     request: OnceLock<RawRequest>,
     body: Mutex<BodyTap>,
     clock: Mutex<Vec<DateTime<Utc>>>,
+    /// Monotonic readings, as offsets from the recording clock's origin.
+    monotonic: Mutex<Vec<std::time::Duration>>,
     client_identity: OnceLock<CapturedClientIdentity>,
     db: Mutex<DbBuffer>,
     notes: Mutex<Vec<String>>,
@@ -262,6 +264,7 @@ impl CaptureScope {
             request: OnceLock::new(),
             body: Mutex::new(BodyTap::Absent),
             clock: Mutex::new(Vec::new()),
+            monotonic: Mutex::new(Vec::new()),
             client_identity: OnceLock::new(),
             db: Mutex::new(DbBuffer::default()),
             notes: Mutex::new(Vec::new()),
@@ -415,6 +418,28 @@ impl CaptureScope {
     #[must_use]
     pub fn clock_readings(&self) -> Vec<DateTime<Utc>> {
         self.clock
+            .lock()
+            .map(|readings| readings.clone())
+            .unwrap_or_default()
+    }
+
+    /// Record a [`ClockSource::monotonic`](crate::time::ClockSource::monotonic)
+    /// reading, as its offset from the recording clock's origin. Bounded like
+    /// [`record_clock`](Self::record_clock), for the same reason.
+    pub fn record_monotonic(&self, since_origin: std::time::Duration) {
+        if let Ok(mut readings) = self.monotonic.lock() {
+            if readings.len() >= MAX_CLOCK_READINGS {
+                self.truncated.store(true, Ordering::Relaxed);
+                return;
+            }
+            readings.push(since_origin);
+        }
+    }
+
+    /// The monotonic readings taken during the request, in order.
+    #[must_use]
+    pub fn monotonic_readings(&self) -> Vec<std::time::Duration> {
+        self.monotonic
             .lock()
             .map(|readings| readings.clone())
             .unwrap_or_default()

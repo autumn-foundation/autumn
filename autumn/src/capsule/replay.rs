@@ -970,6 +970,7 @@ mod tests {
             },
             outcome,
             clock: Vec::new(),
+            clock_monotonic_us: Vec::new(),
             db: None,
             truncated: false,
             notes: Vec::new(),

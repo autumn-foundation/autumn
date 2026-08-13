@@ -1742,6 +1742,11 @@ mod tests {
                 .is_some_and(|reason| reason.contains("TLS")),
             "a TLS URL must be refused with a reason naming TLS"
         );
+        // On Windows tokio-postgres has no `Host::Unix` variant — a socket
+        // path parses as an (unreachable) TCP hostname — so socket detection
+        // is a unix-only behaviour, exactly like the `Host::Unix` match arm
+        // in `tcp_endpoints`.
+        #[cfg(unix)]
         assert!(
             capture_unavailable_reason("postgres:///db?host=/var/run/postgresql").is_some(),
             "a Unix-socket URL has no stream to tee"

@@ -181,6 +181,7 @@ fn capsule(request: CapsuleRequest, outcome: CapsuleOutcome) -> Capsule {
         request,
         outcome,
         clock: Vec::new(),
+        clock_monotonic_us: Vec::new(),
         db: None,
         truncated: false,
         notes: Vec::new(),
@@ -867,7 +868,12 @@ async fn replay_serves_clock_reads_from_the_capsule() {
         .with_clock(SharedClock(Arc::clone(&clock)))
         .build();
 
-    let response = client.get("/clock").send().await;
+    // The real replay driver wraps its router call in the replay-request
+    // scope, which is what entitles the request to consume recorded readings
+    // (reads outside it — boot, spawned tasks — are non-consuming). This
+    // harness stands in for the driver, so it wraps the same way.
+    let response =
+        autumn_web::capsule::clock::with_replay_request_scope(client.get("/clock").send()).await;
     response.assert_ok();
 
     let body = response.text();

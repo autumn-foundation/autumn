@@ -433,6 +433,14 @@ fn redact_body(
         };
         let keys_before = keys.len();
         let scrubbed = scrub_value(&parsed, filter, "body", values, keys);
+        if keys.len() > keys_before {
+            // The echo set holds the *decoded* masked values, but an error
+            // that quotes the raw request body carries the on-wire spelling —
+            // `"token"` does not contain `token`. Walk the raw text's
+            // string literals and retain every spelling whose decoded form
+            // was just masked, so `scrub_outcome` catches either.
+            retain_raw_json_string_spellings(bytes, values);
+        }
         if keys.len() == keys_before {
             // Nothing was masked: keep the exact bytes the client sent.
             // Re-serializing would drift whitespace, number spellings and key
@@ -588,6 +596,60 @@ fn record_masked_value(value: &serde_json::Value, values: &mut RedactedValues) {
         serde_json::Value::String(text) => values.insert(text.as_bytes()),
         serde_json::Value::Null => {}
         other => values.insert(other.to_string().as_bytes()),
+    }
+}
+
+/// Retain the on-wire spelling of every raw JSON string literal whose decoded
+/// value redaction just masked.
+///
+/// A masked value's decoded form is in the echo set, but the client may have
+/// spelled it with escapes — `"token"`, `"line\nbreak"` — and an error
+/// that quotes the *raw* body carries that spelling, which a search for the
+/// decoded bytes cannot find. This walks the raw text's `"`-delimited
+/// literals (honouring backslash escapes), decodes each through serde, and
+/// retains the literal's inner bytes whenever the decoded value is already in
+/// the set and the spellings differ.
+fn retain_raw_json_string_spellings(bytes: &[u8], values: &mut RedactedValues) {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    let mut rest = text;
+    while let Some(start) = rest.find('"') {
+        let Some(after_quote) = rest.get(start.saturating_add(1)..) else {
+            return;
+        };
+        // Find the closing quote, skipping escaped characters.
+        let mut end = None;
+        let mut escape = false;
+        for (index, c) in after_quote.char_indices() {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                end = Some(index);
+                break;
+            }
+        }
+        let Some(end) = end else {
+            return;
+        };
+        let Some(inner) = after_quote.get(..end) else {
+            return;
+        };
+        if inner.contains('\\') {
+            // Only escaped spellings can differ from their decoded form.
+            let literal = format!("\"{inner}\"");
+            if let Ok(decoded) = serde_json::from_str::<String>(&literal)
+                && values.contains(decoded.as_bytes())
+            {
+                values.insert(inner.as_bytes());
+            }
+        }
+        let Some(next) = after_quote.get(end.saturating_add(1)..) else {
+            return;
+        };
+        rest = next;
     }
 }
 
@@ -875,6 +937,44 @@ mod tests {
             mask_echoes("bad form field token=a%2Fb%2Bc", &values),
             format!("bad form field token={FILTERED_PLACEHOLDER}"),
             "an echoed raw form body must scrub"
+        );
+    }
+
+    /// A masked JSON value the client spelled with escapes must scrub in
+    /// *both* spellings: the decoded form (what a handler error usually
+    /// quotes) and the on-wire escaped form (what an error echoing the raw
+    /// body carries).
+    #[test]
+    fn escaped_json_value_spellings_join_the_echo_set() {
+        let raw = br#"{"token":"line\nbreak!"}"#;
+        let (request, values) = redact(
+            Request::post("/hook").header(header::CONTENT_TYPE, "application/json"),
+            CapturedBody::Buffered(Bytes::from_static(raw)),
+            &filter_with(&[]),
+        );
+
+        let CapsuleBody::Text(body) = &request.body else {
+            panic!(
+                "a JSON body must be captured as text, got {:?}",
+                request.body
+            );
+        };
+        assert!(
+            !body.contains("break"),
+            "the value must be masked out of the body, got {body}"
+        );
+        assert!(
+            values.contains(b"line\nbreak!"),
+            "the decoded spelling must be in the echo set"
+        );
+        assert!(
+            values.contains(br"line\nbreak!"),
+            "the on-wire escaped spelling must be in the echo set too"
+        );
+        assert_eq!(
+            mask_echoes(r#"rejected body {"token":"line\nbreak!"}"#, &values),
+            format!(r#"rejected body {{"token":"{FILTERED_PLACEHOLDER}"}}"#),
+            "an error echoing the raw body must scrub the escaped spelling"
         );
     }
 

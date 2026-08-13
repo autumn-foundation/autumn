@@ -5769,6 +5769,28 @@ impl AppBuilder {
         .await;
         force_offline_replay_config(&mut config);
 
+        // A capsule from a *different application* can replay "successfully"
+        // against this one when both expose the same route shape — a verdict
+        // that looks authoritative and is meaningless. Same-name is not
+        // provable (service names drift), so this warns loudly instead of
+        // refusing; the human summary makes the mismatch impossible to miss.
+        if let Some(recorded_app) = capsule.app.name.as_deref() {
+            let this_app = config.telemetry.service_name.as_str();
+            if recorded_app != this_app {
+                tracing::warn!(
+                    recorded_app,
+                    this_app,
+                    "the capsule was recorded by a different application; a verdict against \
+                     this one may be meaningless"
+                );
+                eprintln!(
+                    "warning: capsule was recorded by application {recorded_app:?}, but this \
+                     build is {this_app:?} — if this is not a renamed service, the verdict \
+                     below compares apples to oranges"
+                );
+            }
+        }
+
         #[cfg(feature = "embed-assets")]
         register_embedded_static_dir(embedded_static);
         #[cfg(all(feature = "embed-assets", feature = "i18n"))]
@@ -5800,10 +5822,15 @@ impl AppBuilder {
             .first()
             .copied()
             .unwrap_or(capsule.captured_at);
-        let clock = std::sync::Arc::new(crate::capsule::ReplayClock::new(
-            capsule.clock.clone(),
-            fallback,
-        ));
+        let clock = std::sync::Arc::new(
+            crate::capsule::ReplayClock::new(capsule.clock.clone(), fallback).with_monotonic(
+                capsule
+                    .clock_monotonic_us
+                    .iter()
+                    .map(|us| std::time::Duration::from_micros(*us))
+                    .collect(),
+            ),
+        );
         state = state.with_clock(
             std::sync::Arc::clone(&clock) as std::sync::Arc<dyn crate::time::ClockSource>
         );
