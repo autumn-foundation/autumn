@@ -522,17 +522,30 @@ impl AppState {
     /// installed. Without this, a state built with the default [`SystemClock`]
     /// and then handed a virtual clock would compare a *virtual* `now` against a
     /// *real* origin and report a nonsense uptime.
+    ///
+    /// A construction-time builder: it also gives the state a fresh job registry
+    /// on `clock`, so a state's clock and the queue gauges judged by it can
+    /// never belong to different timelines. A state cloned *before* this call
+    /// keeps its own clock and its own registry, equally consistent — the two
+    /// simply stop sharing queue gauges from here on.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
         self.started_at = clock.monotonic();
-        // The job registry's queue gauges compare ready-at marks the job runtime
-        // stamped from this same clock, so they have to move with it — otherwise
-        // a delayed job under a sim reads as ready the moment it is enqueued.
-        // This writes through the registry's shared clock cell, so a registry
-        // already cloned into a running job client moves too; replacing only
-        // this handle's clock would leave the two judging one set of marks on
-        // two timelines.
-        self.job_registry.install_clock(Arc::clone(&clock));
+        // A registry's queue gauges compare ready-at marks against a clock, and
+        // the marks come from the job runtime started off *this* state — so the
+        // registry has to be the one this state's clock governs, and only that
+        // one. Hence a fresh registry rather than re-clocking the existing one:
+        //
+        // * re-clocking only this handle leaves a clone's runtime stamping on
+        //   the old clock while the shared gauges judge on the new one, and
+        // * re-clocking through a shared cell inverts it — the *other* handle
+        //   then stamps with its own clock into gauges moved out from under it.
+        //
+        // Detaching gives every state one clock and one registry that agree,
+        // whichever order states are cloned and re-clocked in. Nothing is lost:
+        // job names are registered when a runtime starts, which is necessarily
+        // after this builder has run.
+        self.job_registry = actuator::JobRegistry::new().with_clock(Arc::clone(&clock));
         self.clock = clock;
         self
     }
@@ -1052,6 +1065,55 @@ impl std::fmt::Debug for AppState {
 
 #[cfg(test)]
 mod tests {
+    /// A state's clock and the gauges it judges must never come apart.
+    ///
+    /// The job runtime started off a state stamps ready-at marks with that
+    /// state's clock, and the state's registry judges them. Re-clocking a state
+    /// therefore has to move both together. Re-clocking only the handle leaves a
+    /// clone's runtime stamping on the old clock while shared gauges judge on
+    /// the new one; re-clocking through a shared cell inverts it, moving the
+    /// gauges out from under the other handle's runtime. `with_clock` detaches
+    /// instead, so each state keeps a matched pair.
+    #[test]
+    fn re_clocking_a_state_keeps_its_gauges_on_its_own_clock() {
+        use chrono::{TimeZone, Utc};
+
+        let real_state = AppState::detached();
+        let cloned_before = real_state.clone();
+
+        // Behind real time, like a sim epoch: the direction where a stale
+        // judgement calls a not-yet-due job ready.
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let virtual_state = real_state.with_clock(Arc::new(crate::time::FixedClock::at(epoch)));
+
+        // A job the virtual state's runtime would stamp: due a minute after its
+        // epoch, so not yet ready *on that state's clock*.
+        let ready_at = u64::try_from(epoch.timestamp_millis()).unwrap() + 60_000;
+        virtual_state
+            .job_registry()
+            .register_on_queue("probe", "default");
+        virtual_state
+            .job_registry()
+            .record_enqueue_scheduled("probe", ready_at);
+
+        let virtual_depth = virtual_state.job_registry().queue_snapshot()["default"].depth;
+        assert_eq!(
+            virtual_depth, 0,
+            "the state that stamped the mark must judge it as scheduled"
+        );
+
+        // The clone kept the real clock, so it must also have kept its own
+        // registry — otherwise its runtime would stamp real-time deadlines into
+        // gauges now judged against 2020, and every one of them would read as
+        // scheduled for years.
+        let clone_snapshot = cloned_before.job_registry().queue_snapshot();
+        assert!(
+            !clone_snapshot.contains_key("default"),
+            "a state cloned before the clock swap must not share gauges with a \
+             state on a different clock; it saw {clone_snapshot:?}"
+        );
+    }
+
     use super::*;
     #[cfg(feature = "db")]
     use crate::config;
