@@ -779,7 +779,28 @@ struct QueueGaugeState {
     /// keeps the in-memory mark path. Each value is `(ready depth, oldest
     /// ready-at epoch ms)`; the reported age is derived from the timestamp at
     /// snapshot time so it stays fresh between surveys.
+    ///
+    /// **The timestamps here must be on the registry's clock.** The age is
+    /// freshened as `registry_now - ready_at`, so a surveyor whose marks live on
+    /// a different clock has to rebase them before calling
+    /// [`JobRegistry::set_queue_depth_gauges`] — the Postgres survey asks the
+    /// database for an *age* and subtracts it from its own reading of the
+    /// injected clock for exactly this reason, while the redis survey already
+    /// stamps from that clock and passes its marks through unchanged.
     surveyed: Option<HashMap<String, (u64, Option<u64>)>>,
+}
+
+/// Rebase a surveyed age onto the registry's timeline.
+///
+/// A surveyor whose marks live on another clock — the Postgres survey, whose
+/// `run_at` values and readiness filter are both the database's — asks its own
+/// source how long the oldest ready job has waited, then converts that age into
+/// a ready-at instant on the registry's clock with this. Both subtractions then
+/// stay within one timeline: the database's for the age, the registry's for the
+/// freshening at read time.
+#[must_use]
+pub const fn ready_at_from_age(registry_now_ms: u64, age_ms: u64) -> u64 {
+    registry_now_ms.saturating_sub(age_ms)
 }
 
 /// Real epoch milliseconds, for tests that build fixture timestamps against a
@@ -841,7 +862,13 @@ impl JobRegistry {
     }
 
     /// The gauges' current instant in epoch milliseconds, on the injected
-    /// clock — the timeline the waiting marks were stamped on.
+    /// clock — the timeline every mark this registry holds is stamped on.
+    ///
+    /// Both mark sources have to agree with this: the local `waiting` marks come
+    /// from the job runtime's injected clock, and a surveyed mark is rebased
+    /// onto that clock by its surveyor (see [`QueueGaugeState::surveyed`]).
+    /// Mixing in a mark stamped elsewhere — a database `run_at`, a real
+    /// `SystemTime` reading — is what makes an age come back as years or zero.
     fn now_ms(&self) -> u64 {
         u64::try_from(self.clock.now().timestamp_millis()).unwrap_or(0)
     }
@@ -4103,6 +4130,49 @@ mod tests {
         assert_eq!(drained.get("critical").unwrap().depth, 0);
         assert_eq!(drained.get("critical").unwrap().oldest_waiting_age_ms, 0);
         assert_eq!(drained.get("bulk").unwrap().depth, 0);
+    }
+
+    #[test]
+    /// A surveyed age must survive the round trip onto the registry's clock,
+    /// however far that clock sits from real time.
+    ///
+    /// The Postgres survey computes the age in SQL (`NOW() - MIN(run_at)`, both
+    /// operands on the database clock) and rebases it with `ready_at_from_age`.
+    /// The registry then freshens it as `registry_now - ready_at`. Subtracting a
+    /// raw database `MIN(run_at)` from the injected clock instead — what this
+    /// branch briefly did — reports years of waiting age when the clock is
+    /// pinned ahead of the database, or zero when it is behind.
+    fn a_surveyed_age_survives_the_rebase_onto_the_registry_clock() {
+        use chrono::{TimeZone, Utc};
+
+        // The database reports its oldest ready job has waited 5s.
+        const DB_AGE_MS: u64 = 5_000;
+
+        // A clock pinned far from real time in each direction, so a leaked
+        // real-vs-injected subtraction cannot coincidentally pass.
+        for year in [1999, 2036] {
+            let epoch = Utc.with_ymd_and_hms(year, 6, 1, 12, 0, 0).unwrap();
+            let registry = JobRegistry::new()
+                .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+            registry.register_on_queue("probe", "default");
+
+            let registry_now = u64::try_from(epoch.timestamp_millis()).unwrap();
+            let survey = HashMap::from([(
+                "default".to_string(),
+                (3u64, Some(ready_at_from_age(registry_now, DB_AGE_MS))),
+            )]);
+            registry.set_queue_depth_gauges(&survey);
+
+            let snapshot = registry.queue_snapshot();
+            let status = &snapshot["default"];
+            assert_eq!(status.depth, 3, "the survey's depth is authoritative");
+            assert_eq!(
+                status.oldest_waiting_age_ms, DB_AGE_MS,
+                "the database-computed age must come back unchanged with the \
+                 registry clock at {year}; got {}ms",
+                status.oldest_waiting_age_ms
+            );
+        }
     }
 
     #[test]

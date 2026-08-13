@@ -8099,11 +8099,21 @@ struct PgQueueDepthRow {
     name: String,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     count: i64,
-    /// `MIN(run_at)` of the group as epoch milliseconds, `NULL` for an empty
-    /// group (never returned by a `GROUP BY` with matching rows, but modelled
-    /// nullable for safety).
+    /// How long the group's oldest ready job has been waiting, in milliseconds,
+    /// **computed by the database**: `NOW() - MIN(run_at)`.
+    ///
+    /// An age rather than a timestamp on purpose. `run_at` is stamped on the
+    /// database clock and the readiness filter is the database's `NOW()`, so
+    /// subtracting an app-side instant from `MIN(run_at)` mixes two timelines —
+    /// with an injected clock pinned ahead of the database that reports years of
+    /// waiting age, and pinned behind it saturates to zero. Doing the
+    /// subtraction in SQL keeps both operands on the one clock; the caller then
+    /// rebases the age onto the registry's timeline.
+    ///
+    /// `NULL` for an empty group (never returned by a `GROUP BY` with matching
+    /// rows, but modelled nullable for safety).
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
-    oldest_run_at_ms: Option<i64>,
+    oldest_wait_ms: Option<i64>,
 }
 
 /// Survey ready (claimable) enqueued jobs grouped by queue and name and publish
@@ -8124,7 +8134,8 @@ async fn pg_update_queue_depth_gauges(pool: &PgPool, state: &AppState) {
     };
     let rows = diesel::sql_query(
         "SELECT queue, name, COUNT(*) AS count, \
-                CAST(EXTRACT(EPOCH FROM MIN(run_at)) * 1000 AS BIGINT) AS oldest_run_at_ms \
+                CAST(EXTRACT(EPOCH FROM (NOW() - MIN(run_at))) * 1000 AS BIGINT) \
+                    AS oldest_wait_ms \
          FROM autumn_jobs \
          WHERE status = 'enqueued' AND run_at <= NOW() \
          GROUP BY queue, name",
@@ -8133,12 +8144,28 @@ async fn pg_update_queue_depth_gauges(pool: &PgPool, state: &AppState) {
     .await;
     match rows {
         Ok(rows) => {
+            // Rebase the database-computed age onto the registry's timeline: the
+            // registry stores ready-at instants and freshens the age at read
+            // time against its own clock, so hand it an instant that means the
+            // same thing there. `survey_now - age` is the DB's "oldest waited
+            // this long" expressed on the injected clock — both subtractions
+            // stay within a single timeline, which is the whole point.
+            //
+            // The redis survey needs no such translation: its marks already come
+            // from `now_unix_ms(state.clock())`.
+            let survey_now =
+                u64::try_from(crate::time::clock_unix_duration(state.clock()).as_millis())
+                    .unwrap_or(u64::MAX);
             let gauges = aggregate_surveyed_job_gauges(rows.into_iter().map(|row| {
+                let oldest_ready_at = row
+                    .oldest_wait_ms
+                    .and_then(|ms| u64::try_from(ms).ok())
+                    .map(|wait| crate::actuator::ready_at_from_age(survey_now, wait));
                 (
                     row.queue,
                     row.name,
                     u64::try_from(row.count).unwrap_or(0),
-                    row.oldest_run_at_ms.and_then(|ms| u64::try_from(ms).ok()),
+                    oldest_ready_at,
                 )
             }));
             state.job_registry.set_queue_depth_gauges(&gauges.per_queue);
