@@ -9595,6 +9595,9 @@ fn build_state(
         replica_pool: database_topology.and_then(|topology| topology.replica().cloned()),
         #[cfg(feature = "db")]
         shards,
+        #[cfg(all(feature = "db", feature = "reporting"))]
+        db_capture_gap: database_topology
+            .and_then(|topology| topology.capture_gap().map(std::sync::Arc::from)),
         profile: config.profile.clone(),
         role: config.role,
         started_at: std::time::Instant::now(),
@@ -10161,6 +10164,8 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
@@ -12055,6 +12060,8 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
@@ -12171,6 +12178,8 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
@@ -12528,6 +12537,8 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
@@ -12852,6 +12863,8 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
@@ -13008,6 +13021,8 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
@@ -13062,6 +13077,8 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
@@ -13326,6 +13343,8 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
@@ -13404,6 +13423,8 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),

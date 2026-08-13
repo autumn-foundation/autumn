@@ -258,12 +258,15 @@ impl ReporterChain {
                 // Held for the whole reporter chain: the capsule must stay
                 // out of pruning's reach until every reporter has had its
                 // chance to read the referenced file — a slow reporter must
-                // not outlive its evidence.
+                // not outlive its evidence. The pin is taken *inside* the
+                // write (before the file is visible), so a concurrent
+                // failure's prune has no window to delete it first.
                 let _pin = match capture {
                     Some(capture) => {
-                        event.capsule = persist_capsule(capture).await;
-                        event.capsule.as_ref().map(|capsule| {
-                            crate::capsule::persist::pin_for_reporting(&capsule.path)
+                        let written = persist_capsule(capture).await;
+                        written.map(|(reference, pin)| {
+                            event.capsule = Some(reference);
+                            pin
                         })
                     }
                     None => None,
@@ -314,9 +317,14 @@ struct CaptureContext {
 /// A join failure — the blocking task panicked or the runtime is shutting down
 /// — is logged and reported as "no capsule", exactly like a write failure:
 /// capsule persistence must never make a bad request worse.
-async fn persist_capsule(capture: CaptureContext) -> Option<crate::capsule::CapsuleRef> {
+async fn persist_capsule(
+    capture: CaptureContext,
+) -> Option<(
+    crate::capsule::CapsuleRef,
+    crate::capsule::persist::ReportingPin,
+)> {
     let written = tokio::task::spawn_blocking(move || {
-        crate::capsule::persist(capture.handle.scope(), capture.outcome)
+        crate::capsule::persist::persist_pinned(capture.handle.scope(), capture.outcome)
     })
     .await;
     match written {

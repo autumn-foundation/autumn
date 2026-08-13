@@ -421,6 +421,8 @@ mod tests {
             pool: None,
             replica_pool: None,
             shards: None,
+            #[cfg(feature = "reporting")]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),

@@ -784,10 +784,16 @@ async fn tls_database_url_disables_db_capture_with_note() {
         .expect("capture is enabled, so the provider is installed");
     let topology = provider(database)
         .await
-        .expect("a TLS URL must still boot an ordinary pool, not fail the app");
+        .expect("a TLS URL must still boot an ordinary pool, not fail the app")
+        .expect("the app must still get a database pool when capture steps aside");
+    // The reason travels on the app's own topology — not in process state —
+    // so a second, recordable app in the same process is unaffected.
+    let gap = topology
+        .capture_gap()
+        .expect("a topology capture could not record must carry the reason");
     assert!(
-        topology.is_some(),
-        "the app must still get a database pool when capture steps aside"
+        gap.to_ascii_lowercase().contains("tls"),
+        "the topology's gap must name TLS, got {gap:?}"
     );
 
     let scope = CaptureScope::new(
@@ -795,7 +801,7 @@ async fn tls_database_url_disables_db_capture_with_note() {
         Arc::new(CaptureSettings::default()),
         Arc::new(autumn_web::log::filter::ParameterFilter::new(&[], &[])),
     );
-    autumn_web::capsule::note_db_capture_unavailable(&scope);
+    autumn_web::capsule::note_db_capture_unavailable(&scope, gap);
     assert!(
         scope
             .notes()

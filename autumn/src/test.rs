@@ -1808,6 +1808,11 @@ impl TestApp {
             #[cfg(all(feature = "db", feature = "sqlite"))]
             shards: crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
                 .expect("test shard pools should build from config"),
+            // The test harness attaches pools directly (`with_pool`), without
+            // a topology to carry a capture gap; a DB test that needs the gap
+            // noted asserts through the production seam instead.
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: self.config.profile.clone(),
             role: self.config.role,
             started_at: std::time::Instant::now(),

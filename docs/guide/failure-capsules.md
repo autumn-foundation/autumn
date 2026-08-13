@@ -107,10 +107,14 @@ look at what it shows — it uses this same list.
   your project predates that, add it (or the capsule directory itself) to
   `.gitignore` before you enable capture.
 - `max_capsules` (default 50) prunes oldest-first *before* each write, so an
-  error storm cannot fill a disk. A capsule written in the last minute is spared
-  even when it is over the cap, so a path already handed to a reporter still
-  resolves when the reporter gets round to reading it. The cap is a disk guard,
-  not an exact file count.
+  error storm cannot fill a disk. A capsule handed to the error reporters is
+  pinned from the instant it is written until the whole reporter chain
+  finishes, so the path on an `ErrorEvent` always resolves; on top of that a
+  bounded number of the newest over-cap files get a one-minute grace (for a
+  second process sharing the directory, whose pins this one cannot see). The
+  cap is a disk guard, not an exact file count: under a storm the directory
+  can briefly hold up to roughly twice `max_capsules`, plus whatever reporters
+  still hold pinned.
 - Moving a capsule off the failing host moves production data with it. Treat the
   copy the way you would treat the original.
 - Turning capture on in production is a deliberate decision. Turning it on in

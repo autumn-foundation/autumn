@@ -77,6 +77,13 @@ pub struct AppState {
     #[cfg(feature = "db")]
     pub(crate) shards: Option<crate::sharding::ShardSet>,
 
+    /// Why failure-capsule capture cannot record this app's database traffic,
+    /// copied from [`DatabaseTopology::capture_gap`](crate::db::DatabaseTopology::capture_gap)
+    /// when the pools were built. Per-app by construction: another app in the
+    /// same process carries its own state and its own gap.
+    #[cfg(all(feature = "db", feature = "reporting"))]
+    pub(crate) db_capture_gap: Option<Arc<str>>,
+
     /// Active profile name (e.g., "dev", "prod", "staging").
     pub(crate) profile: Option<String>,
 
@@ -754,6 +761,8 @@ impl AppState {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
@@ -809,6 +818,11 @@ impl DbState for AppState {
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         self.replica_pool.as_ref()
+    }
+
+    #[cfg(feature = "reporting")]
+    fn db_capture_gap(&self) -> Option<Arc<str>> {
+        self.db_capture_gap.clone()
     }
 
     fn read_pool(

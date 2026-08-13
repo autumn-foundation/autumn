@@ -642,6 +642,15 @@ pub trait DbState {
     ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {
         Vec::new()
     }
+
+    /// Why failure-capsule capture cannot record this app's database traffic,
+    /// when its pool topology carries a gap (see
+    /// [`DatabaseTopology::capture_gap`]). Defaults to `None`: the pools
+    /// record, or capture is off entirely.
+    #[cfg(feature = "reporting")]
+    fn db_capture_gap(&self) -> Option<std::sync::Arc<str>> {
+        None
+    }
     /// Returns the global statement timeout, if configured.
     fn statement_timeout(&self) -> Option<std::time::Duration> {
         None
@@ -1032,6 +1041,13 @@ pub struct DatabaseTopology {
     /// managed-Postgres provider whose socket URL is only known after boot).
     /// Scoping it to the topology keeps it per-app instead of a process global.
     migration_url: Option<String>,
+    /// Why failure-capsule capture cannot record this topology's traffic, when
+    /// the pool factory had to step aside (a TLS-required URL, a custom
+    /// provider). Scoped to the topology for the same reason as
+    /// `migration_url`: two apps in one process can disagree, and one app's
+    /// gap must never mark the other app's capsules truncated.
+    #[cfg(feature = "reporting")]
+    capture_gap: Option<String>,
 }
 
 impl DatabaseTopology {
@@ -1048,6 +1064,8 @@ impl DatabaseTopology {
             primary,
             replica,
             migration_url: None,
+            #[cfg(feature = "reporting")]
+            capture_gap: None,
         }
     }
 
@@ -1058,6 +1076,8 @@ impl DatabaseTopology {
             primary,
             replica: None,
             migration_url: None,
+            #[cfg(feature = "reporting")]
+            capture_gap: None,
         }
     }
 
@@ -1077,6 +1097,26 @@ impl DatabaseTopology {
     #[must_use]
     pub fn migration_url(&self) -> Option<&str> {
         self.migration_url.as_deref()
+    }
+
+    /// Record why failure-capsule capture cannot record this topology's
+    /// traffic (see [`Self::capture_gap`]).
+    #[cfg(feature = "reporting")]
+    #[must_use]
+    pub fn with_capture_gap(mut self, reason: Option<String>) -> Self {
+        self.capture_gap = reason;
+        self
+    }
+
+    /// Why failure-capsule capture cannot record this topology's traffic, or
+    /// `None` when it can (or capture is off).
+    ///
+    /// Carried on the topology — not in process state — so two apps in one
+    /// process each note their own gap on their own capsules.
+    #[cfg(feature = "reporting")]
+    #[must_use]
+    pub fn capture_gap(&self) -> Option<&str> {
+        self.capture_gap.as_deref()
     }
 
     /// Primary/write role pool.
@@ -2637,38 +2677,46 @@ pub(crate) struct DbCheckoutParams<'a> {
     pub metrics: Option<crate::middleware::MetricsCollector>,
     pub slow_query_threshold: std::time::Duration,
     pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+    /// Why this app's pools cannot record capture traffic, from the state's
+    /// topology (see [`DatabaseTopology::capture_gap`]); `None` when they can.
+    #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+    pub capture_gap: Option<std::sync::Arc<str>>,
 }
 
 /// The capsule attribution marker to merge into the checkout round trip, or
-/// `None` when failure-capsule capture is not armed.
+/// `None` when this checkout has nothing to attribute.
 ///
-/// The marker is sent on **every** checkout, including the clearing form
-/// (`SET autumn.capsule_request = ''`) when no request scope is active: a
-/// pooled connection outlives the request that borrowed it, so leaving a stale
-/// binding in place would attribute the next borrower's queries to a capsule
-/// that has nothing to do with them (#1598, F2). An id that would not survive
-/// interpolation yields `None` rather than a quoted-string escape (F24).
+/// Scope presence is per-request, per-app truth: a scope only exists under a
+/// capture-enabled router's `CaptureLayer`, so two apps with different capture
+/// settings in one process cannot disturb each other. A scope-free checkout
+/// sends nothing — stale bindings are cleared by the recording pool's own
+/// create/recycle hooks, which run before any borrower's first statement
+/// (#1598, F2). An id that would not survive interpolation yields `None`
+/// rather than a quoted-string escape (F24).
+///
+/// `capture_gap` is the app's own pool truth: when the topology could not be
+/// built with recording pools (TLS, a custom provider), the scope is noted
+/// and truncated instead — there is no recorder on the wire for a marker to
+/// reach.
 #[cfg(not(feature = "sqlite"))]
-fn capsule_checkout_marker() -> Option<String> {
+fn capsule_checkout_marker(capture_gap: Option<&str>) -> Option<String> {
     #[cfg(feature = "reporting")]
     {
-        // Scope presence is per-request, per-app truth: a scope only exists
-        // under a capture-enabled router's `CaptureLayer`, so two apps with
-        // different capture settings in one process cannot disturb each
-        // other. A scope-free checkout sends nothing — stale bindings are
-        // cleared by the recording pool's own create/recycle hooks, which run
-        // before any borrower's first statement.
         let scope = crate::capsule::current_scope()?;
-        // If capture had to step aside for this database (TLS, a custom
-        // pool provider), say so in the capsule rather than leaving a
-        // reader to wonder where the DB tape went.
-        crate::capsule::record_db::note_db_capture_unavailable(&scope);
+        if let Some(reason) = capture_gap {
+            // Capture had to step aside for this app's database: say so in
+            // the capsule rather than leaving a reader to wonder where the DB
+            // tape went.
+            crate::capsule::record_db::note_db_capture_unavailable(&scope, reason);
+            return None;
+        }
         Some(scope.id().to_owned())
             .filter(|id| crate::capsule::is_valid_scope_id(id))
             .and_then(|id| crate::capsule::wire::marker_set_sql(&id))
     }
     #[cfg(not(feature = "reporting"))]
     {
+        let _ = capture_gap;
         None
     }
 }
@@ -2813,7 +2861,11 @@ impl Db {
         // what it has always been.
         #[cfg(not(feature = "sqlite"))]
         {
-            let outcome = match capsule_checkout_marker() {
+            #[cfg(feature = "reporting")]
+            let capture_gap = params.capture_gap.as_deref();
+            #[cfg(not(feature = "reporting"))]
+            let capture_gap = None;
+            let outcome = match capsule_checkout_marker(capture_gap) {
                 Some(marker) => {
                     use diesel_async::SimpleAsyncConnection as _;
                     conn.batch_execute(&format!("SET statement_timeout = {timeout_ms}; {marker}"))
@@ -2870,6 +2922,8 @@ impl Db {
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(500),
             interceptors: Vec::new(),
+            #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+            capture_gap: None,
         })
         .await
     }
@@ -2932,6 +2986,8 @@ where
             metrics: ctx.metrics,
             slow_query_threshold: ctx.slow_query_threshold,
             interceptors: ctx.interceptors,
+            #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+            capture_gap: state.db_capture_gap(),
         })
         .await;
         // Notify the RYWW task-local that a primary connection was checked out.

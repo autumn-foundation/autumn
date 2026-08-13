@@ -7,15 +7,21 @@
 //! reader never sees a half-written file, and an oldest-first prune so an
 //! error storm cannot fill a disk.
 //!
-//! Retention deliberately errs towards keeping too much. `max_capsules` is
-//! clamped to at least one, pruning runs *before* the new capsule is written
-//! (so the capsule this request just produced can never be the one deleted to
-//! make room for it), and a capsule written within [`PRUNE_GRACE`] is spared
-//! even when it is over the cap — an error storm hands several capsules to
-//! reporters at once, and a path in an already-dispatched
-//! [`ErrorEvent`](crate::reporting::ErrorEvent) must still resolve when the
-//! reporter gets round to reading it. The cap is a disk-space guard, not a
-//! promise of an exact file count.
+//! Retention errs towards keeping what a reporter is still reading, without
+//! letting that instinct unbound the directory. `max_capsules` is clamped to
+//! at least one, and pruning runs *before* the new capsule is written, so the
+//! capsule this request just produced can never be the one deleted to make
+//! room for it. A capsule handed to the reporting pipeline is **pinned before
+//! its file becomes visible** ([`persist_pinned`]) and stays pinned until the
+//! whole reporter chain finishes, so the path on an
+//! [`ErrorEvent`](crate::reporting::ErrorEvent) always resolves — with no
+//! window between write and pin for a concurrent prune to slip through.
+//! A bounded [`PRUNE_GRACE`] additionally spares a *limited number* of the
+//! newest over-cap files (cross-process writers have no way to see this
+//! process's pins); the bound is what keeps a sub-minute failure storm from
+//! accumulating an unbounded directory. The cap is a disk-space guard, not a
+//! promise of an exact file count: the directory can briefly hold up to
+//! roughly twice `max_capsules`, plus whatever reporters still hold pinned.
 //!
 //! Persistence is best-effort by construction. Every failure path logs and
 //! returns `None`: a capsule that cannot be written must never turn a 500 into
@@ -50,15 +56,27 @@ use crate::capsule::schema::{
 };
 
 /// How long a capsule is protected from retention pruning after it was
-/// written.
+/// written — for a *bounded number* of files (see [`grace_allowance`]).
 ///
-/// A capsule's path travels to reporters on
-/// [`ErrorEvent::capsule`](crate::reporting::ErrorEvent::capsule), and a
-/// reporter may be an HTTP call that takes seconds to get round to reading it.
-/// Deleting a capsule that recent to honour a count cap would turn the link
-/// into a dangling path — the one thing the ordering guarantee exists to
-/// prevent.
+/// In-process readers are protected exactly, by pinning: [`persist_pinned`]
+/// registers the file before it becomes visible, so this window is not what
+/// keeps a reporter's path alive. It exists for writers this process cannot
+/// see — a second app process sharing the capsule directory pins in its own
+/// memory, and pruning a file that process wrote a second ago would break the
+/// path its reporters are about to follow.
 const PRUNE_GRACE: TimeDelta = TimeDelta::minutes(1);
+
+/// How many over-cap files [`PRUNE_GRACE`] may spare in one prune pass.
+///
+/// Ungated, a failure storm faster than the grace window would make every
+/// over-cap file "too recent to delete" and the directory unbounded — the
+/// exact disk-fill the cap exists to stop. Capping the sparing at one cap's
+/// worth bounds the directory at roughly twice `max_capsules` (plus pinned
+/// files), which keeps the cross-process courtesy without giving up the
+/// guard.
+fn grace_allowance(keep: usize) -> usize {
+    keep.max(1)
+}
 
 /// Capsules whose paths a reporter chain is currently reading.
 ///
@@ -125,8 +143,28 @@ pub fn capsule_dir(dir: &str) -> PathBuf {
 ///
 /// Returns `None` when the capsule could not be written; the reason is logged
 /// at `error` level and never propagated to the request.
+///
+/// The file is briefly pinned during the write and released before this
+/// returns; a caller that will *read the file back later* — the reporting
+/// pipeline — must use [`persist_pinned`] instead, so there is no window in
+/// which a concurrent failure's prune can delete the file first.
 #[must_use]
 pub fn persist(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<CapsuleRef> {
+    persist_pinned(scope, outcome).map(|(reference, _pin)| reference)
+}
+
+/// [`persist`], holding the written file pinned against pruning.
+///
+/// The pin is taken **before** the file becomes visible in the directory, so
+/// from the first instant a concurrent [`prune`] can observe the file it is
+/// already unprunable — the write-to-pin race a caller-side pin would leave
+/// open. Dropping the returned [`ReportingPin`] makes the file ordinary
+/// retention fodder again.
+#[must_use]
+pub(crate) fn persist_pinned(
+    scope: &CaptureScope,
+    outcome: CapsuleOutcome,
+) -> Option<(CapsuleRef, ReportingPin)> {
     let capsule = assemble(scope, outcome)?;
     let settings = scope.settings();
     let dir = capsule_dir(&settings.dir);
@@ -148,6 +186,7 @@ pub fn persist(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<CapsuleR
         retained_before_write(settings.max_capsules),
         Utc::now(),
     );
+    let pin = pin_for_reporting(&path);
     if let Err(error) = write_atomically(&dir, &path, &json) {
         tracing::error!(
             %error,
@@ -157,10 +196,13 @@ pub fn persist(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<CapsuleR
         return None;
     }
 
-    Some(CapsuleRef {
-        id: capsule.id,
-        path,
-    })
+    Some((
+        CapsuleRef {
+            id: capsule.id,
+            path,
+        },
+        pin,
+    ))
 }
 
 /// Turn a finished scope into the capsule document.
@@ -362,18 +404,19 @@ fn retained_before_write(max_capsules: usize) -> usize {
     max_capsules.max(1).saturating_sub(1)
 }
 
-/// Delete the oldest capsules beyond `keep`, sparing anything written within
-/// [`PRUNE_GRACE`].
+/// Delete the oldest capsules beyond `keep`, sparing pinned files always and
+/// files written within [`PRUNE_GRACE`] up to [`grace_allowance`].
 ///
 /// File names begin with a sortable timestamp, so lexical order is
 /// chronological order and the same prefix gives each file's age without a
 /// `stat` — and, more importantly, without trusting an mtime that a copy or a
 /// restore may have rewritten.
 ///
-/// Sparing a recent file means the directory can sit *above* the cap for a
-/// grace window. That is the intended trade: the cap exists to stop an error
-/// storm filling a disk, and overshooting it by a minute's worth of capsules
-/// costs far less than breaking the path a reporter is about to follow.
+/// Sparing means the directory can sit *above* the cap — by the bounded grace
+/// allowance, plus whatever reporters still hold pinned. The grace sparing is
+/// deliberately newest-first: when a storm forces a choice among recent
+/// files, the ones most likely to still be in a reporter's hands (in another
+/// process, whose pins this one cannot see) are the newest.
 fn prune(dir: &Path, keep: usize, now: DateTime<Utc>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -388,8 +431,16 @@ fn prune(dir: &Path, keep: usize, now: DateTime<Utc>) {
     }
     names.sort();
     let excess = names.len().saturating_sub(keep);
-    for path in names.into_iter().take(excess) {
-        if written_within_grace(&path, now) || is_pinned_for_reporting(&path) {
+    let mut allowance = grace_allowance(keep);
+    // Walk the excess newest-first so the bounded allowance goes to the most
+    // recently written files; everything past the allowance is deleted even
+    // when it is within the grace window.
+    for path in names.into_iter().take(excess).rev() {
+        if is_pinned_for_reporting(&path) {
+            continue;
+        }
+        if allowance > 0 && written_within_grace(&path, now) {
+            allowance -= 1;
             continue;
         }
         if let Err(error) = std::fs::remove_file(&path) {
@@ -463,6 +514,96 @@ mod tests {
         assert!(
             !pinned.exists(),
             "dropping the pin makes the capsule prunable again"
+        );
+    }
+
+    /// A failure storm faster than the grace window must not make every
+    /// over-cap file "too recent to delete": the grace spares a bounded
+    /// number of the newest files, and the rest prune regardless of age.
+    #[test]
+    fn a_sub_minute_storm_cannot_grow_the_directory_unbounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = Utc::now();
+        // Twenty capsules all stamped within the last few seconds — the
+        // storm case where the old unbounded grace spared every one.
+        let stamp = (now - TimeDelta::seconds(5)).format("%Y%m%dT%H%M%S%.6f");
+        for sequence in 0..20 {
+            let name = format!("{stamp}-{sequence:06}-storm.json");
+            std::fs::write(dir.path().join(name), b"{}").expect("write");
+        }
+
+        let keep = 2;
+        prune(dir.path(), keep, now);
+
+        let survivors = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(
+            survivors,
+            keep + grace_allowance(keep),
+            "the directory must settle at the cap plus the bounded grace \
+             allowance, not at whatever the storm produced"
+        );
+    }
+
+    /// The reporting pipeline's pin is taken inside the write, before the
+    /// file becomes visible — so the moment another failure's prune can see
+    /// the file, it is already unprunable. A caller-side pin would leave a
+    /// window between `persist` returning and the pin being taken.
+    #[test]
+    fn persist_pinned_writes_a_file_that_is_already_pinned() {
+        use std::sync::Arc;
+
+        use crate::capsule::CaptureSettings;
+        use crate::capsule::capture::CaptureScope;
+        use crate::capsule::redact::RawRequest;
+        use crate::log::filter::ParameterFilter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = Arc::new(CaptureScope::new(
+            "req-pinned".to_owned(),
+            Arc::new(CaptureSettings {
+                dir: dir.path().to_string_lossy().into_owned(),
+                max_capsules: 1,
+                ..CaptureSettings::default()
+            }),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        ));
+        scope.set_request(RawRequest {
+            method: "GET".to_owned(),
+            uri: "/boom".parse().expect("uri parses"),
+            version: axum::http::Version::HTTP_11,
+            headers: axum::http::HeaderMap::new(),
+            route: None,
+        });
+
+        let (reference, pin) = persist_pinned(
+            &scope,
+            CapsuleOutcome::Status {
+                code: 500,
+                message: "boom".to_owned(),
+                problem_type: None,
+            },
+        )
+        .expect("the capsule is written");
+
+        assert!(
+            is_pinned_for_reporting(&reference.path),
+            "the file must already be pinned when persist_pinned returns"
+        );
+        // A concurrent failure's prune — zero retention, grace long lapsed
+        // (simulated by pruning far in the future) — must not take it.
+        prune(dir.path(), 0, Utc::now() + TimeDelta::hours(1));
+        assert!(
+            reference.path.exists(),
+            "a pinned capsule survives a concurrent prune even past the grace"
+        );
+
+        drop(pin);
+        assert!(
+            !is_pinned_for_reporting(&reference.path),
+            "dropping the pin releases the file to ordinary retention"
         );
     }
 

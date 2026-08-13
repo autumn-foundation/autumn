@@ -61,7 +61,7 @@ use std::future::Future;
 use std::io::IoSlice;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -134,9 +134,6 @@ const EXCHANGE_OVERHEAD_BYTES: usize = 64;
 
 // ── Capture eligibility ─────────────────────────────────────────────────────
 
-/// The reason DB capture is off for this process, once something turned it off.
-static UNAVAILABLE_NOTE: OnceLock<String> = OnceLock::new();
-
 /// Why `url` cannot be recorded, or `None` when it can.
 ///
 /// Recording needs a plaintext TCP stream: the tee frames `PostgreSQL` protocol
@@ -157,7 +154,7 @@ pub fn capture_unavailable_reason(url: &str) -> Option<String> {
     let Ok(config) = url.parse::<tokio_postgres::Config>() else {
         return Some("the database URL is not a PostgreSQL connection string".to_owned());
     };
-    if first_tcp_endpoint(&config).is_none() {
+    if tcp_endpoints(&config).is_empty() {
         return Some(
             "the database URL names no TCP host (a Unix-socket connection cannot be teed)"
                 .to_owned(),
@@ -166,30 +163,35 @@ pub fn capture_unavailable_reason(url: &str) -> Option<String> {
     None
 }
 
-/// Record — once per process — why DB capture is unavailable, and say so.
-fn disable_db_capture(reason: &str) {
+/// Warn — at the boot that decided it — that this app's DB capture is off.
+///
+/// The reason itself travels on the app's
+/// [`DatabaseTopology`](crate::db::DatabaseTopology) (see
+/// [`DatabaseTopology::capture_gap`](crate::db::DatabaseTopology::capture_gap)),
+/// not in process state: two apps in one process can disagree about whether
+/// their databases record, and one app's gap must never truncate the other's
+/// capsules.
+fn warn_db_capture_unavailable(reason: &str) {
     tracing::warn!(
         reason,
         "failure-capsule database capture is disabled; capsules will record the request, \
          clock and outcome but no database traffic"
     );
-    let _ = UNAVAILABLE_NOTE.set(format!("db capture unavailable: {reason}"));
 }
 
-/// Copy that note onto a capture scope, so the capsule explains itself — and
+/// Note `reason` onto a capture scope, so the capsule explains itself — and
 /// mark the capsule truncated, because it is missing effects the request had.
 ///
 /// Called from the connection-checkout path, which is the one place that knows
-/// a request is about to use a database at all. The truncation mirrors
+/// a request is about to use a database at all; the reason comes from the
+/// app's own pool topology, so it is per-app truth. The truncation mirrors
 /// [`note_shard_capture_gap`]: a capsule whose request talked to a database
 /// none of whose traffic was recorded holds strictly less than the request did,
 /// so [`refusal_reason`](crate::capsule::refusal_reason) must refuse it rather
 /// than let a replay report divergences that only reflect the missing tape.
-pub fn note_db_capture_unavailable(scope: &CaptureScope) {
-    if let Some(note) = UNAVAILABLE_NOTE.get() {
-        scope.note(note.clone());
-        scope.mark_truncated();
-    }
+pub fn note_db_capture_unavailable(scope: &CaptureScope, reason: &str) {
+    scope.note(format!("db capture unavailable: {reason}"));
+    scope.mark_truncated();
 }
 
 /// What a capsule says when its request used a shard connection.
@@ -340,17 +342,16 @@ async fn establish_recording(url: &str) -> ConnectionResult<AsyncPgConnection> {
     let config = url
         .parse::<tokio_postgres::Config>()
         .map_err(|error| ConnectionError::InvalidConnectionUrl(error.to_string()))?;
-    let (host, port) = first_tcp_endpoint(&config).ok_or_else(|| {
-        ConnectionError::InvalidConnectionUrl(
+    let endpoints = tcp_endpoints(&config);
+    if endpoints.is_empty() {
+        return Err(ConnectionError::InvalidConnectionUrl(
             "the recording pool needs a TCP host in the database URL".to_owned(),
-        )
-    })?;
+        ));
+    }
 
-    let stream = TcpStream::connect((host.as_str(), port))
+    let stream = connect_first_reachable(&endpoints)
         .await
-        .map_err(|error| {
-            ConnectionError::BadConnection(format!("failed to connect to {host}:{port}: {error}"))
-        })?;
+        .map_err(ConnectionError::BadConnection)?;
     // Match what tokio-postgres's own connector does: PostgreSQL is a
     // request/response protocol, so Nagle only adds latency.
     let _ = stream.set_nodelay(true);
@@ -369,14 +370,41 @@ async fn establish_recording(url: &str) -> ConnectionResult<AsyncPgConnection> {
     AsyncPgConnection::try_from(client).await
 }
 
-/// The first TCP host/port pair in a parsed connection string.
-fn first_tcp_endpoint(config: &tokio_postgres::Config) -> Option<(String, u16)> {
+/// Connect to the first endpoint that accepts, in configured order.
+///
+/// A multi-host URL is a failover list, and tokio-postgres's own connector
+/// walks it in order — so this one must too, or enabling capture would turn a
+/// healthy HA deployment away whenever its first host is down. What this loop
+/// does *not* reproduce is `target_session_attrs`: it takes the first host
+/// that accepts a TCP connection, without probing whether that host is
+/// writable.
+async fn connect_first_reachable(endpoints: &[(String, u16)]) -> Result<TcpStream, String> {
+    let mut failures: Vec<String> = Vec::new();
+    for (host, port) in endpoints {
+        match TcpStream::connect((host.as_str(), *port)).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => failures.push(format!("{host}:{port}: {error}")),
+        }
+    }
+    Err(format!(
+        "failed to connect to every configured host ({})",
+        failures.join("; ")
+    ))
+}
+
+/// Every TCP host/port pair in a parsed connection string, in configured
+/// order.
+///
+/// Ports pair with hosts the way tokio-postgres pairs them: index-matched when
+/// one port was given per host, the single (or first) port for every host
+/// otherwise.
+fn tcp_endpoints(config: &tokio_postgres::Config) -> Vec<(String, u16)> {
     let ports = config.get_ports();
     config
         .get_hosts()
         .iter()
         .enumerate()
-        .find_map(|(index, host)| match host {
+        .filter_map(|(index, host)| match host {
             tokio_postgres::config::Host::Tcp(name) => Some((
                 name.clone(),
                 ports
@@ -392,6 +420,7 @@ fn first_tcp_endpoint(config: &tokio_postgres::Config) -> Option<(String, u16)> 
             #[cfg(unix)]
             tokio_postgres::config::Host::Unix(_) => None,
         })
+        .collect()
 }
 
 /// Decide whether `App::run` should build its database pools through the
@@ -424,12 +453,20 @@ pub fn maybe_capture_pool_provider(
              `autumn replay` will refuse it"
         );
     }
-    if existing.is_some() {
-        disable_db_capture(
-            "the application installed a custom DatabasePoolProvider, which Autumn does \
-             not wrap",
-        );
-        return existing;
+    if let Some(inner) = existing {
+        // The custom provider is left alone, but the topology it returns is
+        // stamped with the gap so *this app's* capsules — and only this
+        // app's — say why they carry no database tape.
+        const REASON: &str =
+            "the application installed a custom DatabasePoolProvider, which Autumn does not wrap";
+        warn_db_capture_unavailable(REASON);
+        return Some(Box::new(move |database: DatabaseConfig| {
+            Box::pin(async move {
+                inner(database)
+                    .await
+                    .map(|topology| topology.map(|t| t.with_capture_gap(Some(REASON.to_owned()))))
+            })
+        }));
     }
     Some(Box::new(|database: DatabaseConfig| {
         Box::pin(async move { recording_topology(&database) })
@@ -449,8 +486,9 @@ fn recording_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopology
             .and_then(capture_unavailable_reason)
     });
     if let Some(reason) = blocked {
-        disable_db_capture(&reason);
-        return crate::db::create_topology(config);
+        warn_db_capture_unavailable(&reason);
+        return crate::db::create_topology(config)
+            .map(|topology| topology.map(|t| t.with_capture_gap(Some(reason))));
     }
 
     let timeout = Duration::from_secs(config.connect_timeout_secs);
@@ -1244,6 +1282,72 @@ fn total_bytes(exchanges: &[Exchange]) -> usize {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt as _;
+
+    #[test]
+    fn tcp_endpoints_lists_every_configured_host_in_order() {
+        let config = "host=first.example,second.example port=5433,5434 user=app dbname=app"
+            .parse::<tokio_postgres::Config>()
+            .expect("multi-host config parses");
+        assert_eq!(
+            tcp_endpoints(&config),
+            vec![
+                ("first.example".to_owned(), 5433),
+                ("second.example".to_owned(), 5434),
+            ],
+            "a failover list must be preserved in configured order, with ports \
+             paired the way tokio-postgres pairs them"
+        );
+
+        let single_port = "host=first.example,second.example port=6000 user=app"
+            .parse::<tokio_postgres::Config>()
+            .expect("single-port config parses");
+        assert_eq!(
+            tcp_endpoints(&single_port),
+            vec![
+                ("first.example".to_owned(), 6000),
+                ("second.example".to_owned(), 6000),
+            ],
+            "one configured port applies to every host"
+        );
+    }
+
+    /// An HA deployment's first host being down must not turn the recording
+    /// pool away when a later configured host is reachable — tokio-postgres's
+    /// own connector walks the list, so this one has to as well.
+    #[tokio::test]
+    async fn connect_falls_through_to_the_next_configured_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let reachable = listener.local_addr().expect("addr").port();
+
+        let endpoints = vec![
+            // Port 1 is never listening on loopback: connection refused.
+            ("127.0.0.1".to_owned(), 1),
+            ("127.0.0.1".to_owned(), reachable),
+        ];
+        let stream = connect_first_reachable(&endpoints)
+            .await
+            .expect("the second host is up, so the connect must succeed");
+        assert_eq!(
+            stream.peer_addr().expect("peer").port(),
+            reachable,
+            "the stream must be to the first *reachable* host in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausting_every_host_names_each_failed_attempt() {
+        let endpoints = vec![("127.0.0.1".to_owned(), 1), ("127.0.0.1".to_owned(), 2)];
+        let error = connect_first_reachable(&endpoints)
+            .await
+            .expect_err("nothing listens on ports 1 or 2");
+        assert!(
+            error.contains("127.0.0.1:1") && error.contains("127.0.0.1:2"),
+            "the error must name every attempted endpoint so an operator can \
+             see the whole failover list was tried, got {error}"
+        );
+    }
 
     fn tagged(tag: u8, payload: &[u8]) -> Vec<u8> {
         let mut out = vec![tag];
