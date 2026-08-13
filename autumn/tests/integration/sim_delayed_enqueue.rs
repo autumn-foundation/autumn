@@ -121,3 +121,84 @@ async fn delayed_enqueue_becomes_due_under_virtual_time(mut sim: Sim) {
     // own client would have it cleared out from under it.
     job::clear_global_job_client();
 }
+
+/// The queue-depth gauge must judge a delayed job on the same clock that stamped
+/// its ready-at mark.
+///
+/// `record_enqueue_scheduled` stores the due instant the job runtime read from
+/// the **injected** clock, but `JobRegistry`'s gauges used to compare those
+/// marks against `SystemTime::now()`. Under a sim that mixes two timelines: a
+/// job delayed from the 2020 sim epoch looks long-ready against a real 2026
+/// host, so `/actuator/jobs` reports a ready job that cannot run and an
+/// "oldest waiting" age of roughly six years.
+///
+/// Regression test for the P2 raised on #2192. It is the observable half of the
+/// same invariant `sim_delayed_enqueue` covers for execution: whatever decides a
+/// job is ready must read the clock the deadline was written on.
+#[sim_test]
+async fn queue_gauges_judge_a_delayed_job_on_the_virtual_clock(mut sim: Sim) {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+    DELAYED_RUNS.store(0, Ordering::SeqCst);
+
+    sim.build(TestApp::new().plugin(DelayedJobPlugin));
+
+    SimDelayedProbeJob::enqueue_in(ProbeArgs, DELAY)
+        .await
+        .expect("delayed enqueue should succeed");
+
+    // Settle the enqueue (and arm the local delay timer) before reading the
+    // gauge, exactly as the sibling test does before advancing.
+    sim.run_to_idle().await;
+    assert_eq!(
+        DELAYED_RUNS.load(Ordering::SeqCst),
+        0,
+        "the job must not have run before its virtual due instant"
+    );
+
+    // Before the due instant the job is *scheduled*, not ready: it contributes
+    // no ready depth and no waiting age. Reading the real clock here instead
+    // reports depth 1 and an age of years.
+    let scheduled = sim.client().state().job_registry().queue_snapshot();
+    // An absent entry means "nothing waiting", which satisfies the same claim.
+    let (before_depth, before_age) = scheduled
+        .get("default")
+        .map_or((0, 0), |q| (q.depth, q.oldest_waiting_age_ms));
+    assert_eq!(
+        before_depth, 0,
+        "a job that is not due yet must not count toward ready queue depth; \
+         got depth {before_depth} (a real-clock comparison sees the sim-epoch \
+         deadline as long past)"
+    );
+    assert_eq!(
+        before_age, 0,
+        "a not-yet-due job has no waiting age; got {before_age}ms — roughly the \
+         gap between the sim epoch and real time when the timelines are mixed"
+    );
+
+    // Cross the deadline in virtual time. Now the gauge should see it as ready
+    // for the moment before the worker drains it.
+    sim.advance(DELAY + Duration::from_secs(1)).await;
+    sim.run_to_idle().await;
+
+    assert_eq!(
+        DELAYED_RUNS.load(Ordering::SeqCst),
+        1,
+        "the job still has to actually run once virtual time passes the delay"
+    );
+
+    // Drained: the mark is retired, so depth returns to zero on the same clock.
+    let after_depth = sim
+        .client()
+        .state()
+        .job_registry()
+        .queue_snapshot()
+        .get("default")
+        .map_or(0, |q| q.depth);
+    assert_eq!(
+        after_depth, 0,
+        "after the job runs its waiting mark must be retired, not stranded"
+    );
+
+    job::clear_global_job_client();
+}

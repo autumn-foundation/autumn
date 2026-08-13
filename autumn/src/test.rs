@@ -1825,7 +1825,13 @@ impl TestApp {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new(&self.config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
+            // Built from the resolved clock, not `JobRegistry::new()`: the queue
+            // gauges compare ready-at marks the job runtime stamps from this
+            // same clock. This literal bypasses `AppState::with_clock`, so
+            // leaving it on the default real clock is what made a sim's delayed
+            // job read as ready the instant it was enqueued.
+            job_registry: crate::actuator::JobRegistry::new()
+                .with_clock(std::sync::Arc::clone(&clock)),
             config_props: crate::actuator::ConfigProperties::default(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),

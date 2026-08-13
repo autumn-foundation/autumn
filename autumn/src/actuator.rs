@@ -782,6 +782,14 @@ struct QueueGaugeState {
     surveyed: Option<HashMap<String, (u64, Option<u64>)>>,
 }
 
+/// Real epoch milliseconds, for tests that build fixture timestamps against a
+/// default (real-clock) registry.
+///
+/// **Test-only on purpose.** Production gauge code must read
+/// [`JobRegistry::now_ms`] instead: the waiting marks are stamped from the job
+/// runtime's injected clock, and comparing them against the real clock is the
+/// mixed-timeline bug this is confined to prevent.
+#[cfg(test)]
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -793,16 +801,49 @@ fn now_epoch_ms() -> u64 {
 pub struct JobRegistry {
     inner: Arc<RwLock<HashMap<String, JobStatus>>>,
     queues: Arc<RwLock<QueueGaugeState>>,
+    /// Clock the queue gauges stamp and compare their epoch-ms marks on.
+    ///
+    /// The waiting marks hold a *ready-at* instant supplied by the job runtime
+    /// (`record_enqueue_scheduled`), which reads the runtime's injected clock.
+    /// A gauge that compared those marks against `SystemTime::now()` would be
+    /// mixing timelines: under a `#[sim_test]` a job delayed from the 2020 sim
+    /// epoch reads as ready immediately on a 2026 host, and `/actuator/jobs`
+    /// reports a nonzero ready depth with roughly six years of waiting age
+    /// before `Sim::advance` ever reaches the deadline.
+    ///
+    /// Defaults to the real clock; [`AppState::with_clock`](crate::AppState)
+    /// installs the app's.
+    clock: Arc<dyn crate::time::ClockSource>,
 }
 
 impl JobRegistry {
-    /// Create a new empty job registry.
+    /// Create a new empty job registry reading the real system clock.
+    ///
+    /// Use [`Self::with_clock`] to put its gauges on an injected timeline.
     #[must_use]
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             queues: Arc::new(RwLock::new(QueueGaugeState::default())),
+            clock: Arc::new(crate::time::SystemClock),
         }
+    }
+
+    /// Return this registry with its queue gauges reading `clock`.
+    ///
+    /// The registry keeps sharing the same underlying counters — only the clock
+    /// handle is replaced — so an already-cloned registry elsewhere still sees
+    /// the same marks.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn crate::time::ClockSource>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The gauges' current instant in epoch milliseconds, on the injected
+    /// clock — the timeline the waiting marks were stamped on.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.clock.now().timestamp_millis()).unwrap_or(0)
     }
 
     /// Register a job name with initial counters.
@@ -842,7 +883,7 @@ impl JobRegistry {
     /// in-memory marks drive the gauges.
     #[must_use]
     pub fn queue_snapshot(&self) -> HashMap<String, QueueStatus> {
-        let now = now_epoch_ms();
+        let now = self.now_ms();
         self.queues
             .read()
             .map(|g| {
@@ -905,7 +946,7 @@ impl JobRegistry {
 
     /// Record that a new job instance was enqueued and is immediately runnable.
     pub fn record_enqueue(&self, name: &str) {
-        self.record_enqueue_at(name, now_epoch_ms());
+        self.record_enqueue_at(name, self.now_ms());
     }
 
     /// Record a delayed enqueue whose job only becomes claimable at
@@ -1079,7 +1120,7 @@ impl JobRegistry {
     /// oldest mark so every enqueue still has a matching removal (no leak).
     fn pop_waiting(&self, name: &str, prefer_ready: bool) {
         let queue = self.queue_for(name);
-        let now = now_epoch_ms();
+        let now = self.now_ms();
         if let Ok(mut guard) = self.queues.write()
             && let Some(waiting) = guard.waiting.get_mut(&queue)
         {

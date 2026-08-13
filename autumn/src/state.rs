@@ -525,6 +525,10 @@ impl AppState {
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
         self.started_at = clock.monotonic();
+        // The job registry's queue gauges compare ready-at marks the job runtime
+        // stamped from this same clock, so they have to move with it — otherwise
+        // a delayed job under a sim reads as ready the moment it is enqueued.
+        self.job_registry = self.job_registry.clone().with_clock(Arc::clone(&clock));
         self.clock = clock;
         self
     }
