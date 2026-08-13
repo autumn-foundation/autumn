@@ -51,7 +51,7 @@ pub(crate) mod wire;
 pub use capture::with_capture_scope;
 pub use capture::{
     CaptureHandle, CaptureLayer, CaptureScope, CaptureSettings, CapturedClientIdentity, DbBuffer,
-    current_scope, db_capture_enabled, is_valid_scope_id, scope_by_id, set_db_capture_enabled,
+    current_scope, is_valid_scope_id, scope_by_id,
 };
 pub use clock::{RecordingClock, ReplayClock};
 pub use persist::{CapsuleRef, capsule_dir, load_capsule, persist};
@@ -88,9 +88,6 @@ pub const BACKEND_CAPTURE_NOTE: &str = "database capture is not available on the
 /// not presented as replayable.
 #[cfg(all(feature = "db", feature = "sqlite"))]
 pub fn note_backend_capture_gap() {
-    if !db_capture_enabled() {
-        return;
-    }
     if let Some(scope) = current_scope() {
         scope.note(BACKEND_CAPTURE_NOTE);
         scope.mark_truncated();

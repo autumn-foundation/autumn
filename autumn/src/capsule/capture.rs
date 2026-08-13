@@ -60,29 +60,6 @@ pub fn current_scope() -> Option<Arc<CaptureScope>> {
     CAPSULE_SCOPE.try_with(Arc::clone).ok()
 }
 
-/// Whether database effect capture is armed for this process.
-///
-/// Read on the connection-checkout hot path, so it is a plain relaxed atomic
-/// load rather than a config lookup.
-static DB_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Whether the connection-checkout path should attribute queries to a capsule.
-#[must_use]
-pub fn db_capture_enabled() -> bool {
-    DB_CAPTURE_ENABLED.load(Ordering::Relaxed)
-}
-
-/// Arm or disarm process-wide database capture.
-///
-/// Idempotent and last-writer-wins. Called early in
-/// [`App::run`](crate::app::AppBuilder::run) — before the database pool is
-/// built, because the pool factory consults it — and again at router-build
-/// time, unconditionally, so a test app built with capture off also *disarms*
-/// whatever an earlier test in the same process armed.
-pub fn set_db_capture_enabled(enabled: bool) {
-    DB_CAPTURE_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
 /// Run `future` with `scope` established as the current capture scope.
 ///
 /// The task-local itself is crate-private (a request's scope is the framework's

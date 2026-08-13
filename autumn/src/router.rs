@@ -3799,14 +3799,10 @@ fn apply_middleware(
     // the request turns out to have failed. Off unless
     // `[failure_capture] enabled = true`; capsules hold real request data.
     //
-    // The connection-checkout marker is armed (or *disarmed*) unconditionally
-    // from this build's own configuration: the flag is process-wide, so a test
-    // app built with capture off has to clear what a previous test's app armed,
-    // or every later checkout in that process keeps paying for — and
-    // attributing to — a capture nobody asked for. Production arms it earlier,
-    // before the pool is built, from `App::run`.
-    #[cfg(feature = "reporting")]
-    crate::capsule::set_db_capture_enabled(config.failure_capture.enabled);
+    // This layer is the sole arming point for database attribution too: the
+    // connection-checkout marker fires only when a request carries a capture
+    // scope, and scopes exist only under this layer — so two apps with
+    // different capture settings in one process cannot disturb each other.
     #[cfg(feature = "reporting")]
     if config.failure_capture.enabled {
         // Same filter composition as the log context below, so one

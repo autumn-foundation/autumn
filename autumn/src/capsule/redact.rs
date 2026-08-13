@@ -293,7 +293,20 @@ fn redact_uri(
     // decodes to `a/b`, and `mask_echoes` cannot find `a/b` inside `a%2Fb`.
     // Walk the raw query text and retain the on-the-wire value of every
     // sensitive key too, so both spellings scrub.
-    for raw_pair in query.split('&') {
+    retain_raw_sensitive_values(query, filter, values);
+    let redacted_query = serializer.finish();
+    let path = uri.path();
+    format!("{path}?{redacted_query}")
+}
+
+/// Retain the on-the-wire (percent-encoded) spelling of every sensitive value
+/// in a raw `key=value&…` string.
+///
+/// The decoded spelling goes into the echo set where the pairs are parsed;
+/// this walk covers the encoded spelling, which is what an error message that
+/// echoes the raw request target or body carries.
+fn retain_raw_sensitive_values(raw: &str, filter: &ParameterFilter, values: &mut RedactedValues) {
+    for raw_pair in raw.split('&') {
         let (raw_key, raw_value) = raw_pair
             .split_once('=')
             .map_or((raw_pair, ""), |(key, value)| (key, value));
@@ -307,9 +320,6 @@ fn redact_uri(
             values.insert(raw_value.as_bytes());
         }
     }
-    let redacted_query = serializer.finish();
-    let path = uri.path();
-    format!("{path}?{redacted_query}")
 }
 
 /// Whether a form/query key names a sensitive value.
@@ -422,6 +432,12 @@ fn redact_body(
             } else {
                 serializer.append_pair(&key, &value);
             }
+        }
+        // Same encoded-spelling retention as the query string: an error that
+        // echoes the raw form body carries `a%2Fb`, not the decoded `a/b` the
+        // loop above stored. `form_pairs` proved the body is UTF-8.
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            retain_raw_sensitive_values(text, filter, values);
         }
         return CapsuleBody::Text(serializer.finish());
     }
@@ -805,6 +821,41 @@ mod tests {
             mask_echoes("failed on /callback?token=a%2Fb%2Bc", &values),
             format!("failed on /callback?token={FILTERED_PLACEHOLDER}"),
             "an echoed raw request target must scrub"
+        );
+    }
+
+    #[test]
+    fn encoded_form_body_value_forms_join_the_echo_set() {
+        let (request, values) = redact(
+            Request::post("/callback")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded"),
+            CapturedBody::Buffered(Bytes::from_static(b"token=a%2Fb%2Bc&page=2")),
+            &filter_with(&[]),
+        );
+
+        let CapsuleBody::Text(body) = &request.body else {
+            panic!(
+                "a form body must be captured as text, got {:?}",
+                request.body
+            );
+        };
+        assert!(
+            !body.contains("a%2Fb"),
+            "the encoded value must be masked out of the capsule body, got {body}"
+        );
+        assert!(
+            values.contains(b"a/b+c"),
+            "the decoded value must be in the echo set"
+        );
+        assert!(
+            values.contains(b"a%2Fb%2Bc"),
+            "the on-the-wire encoded value must be in the echo set too — an error \
+             that echoes the raw form body carries this spelling"
+        );
+        assert_eq!(
+            mask_echoes("bad form field token=a%2Fb%2Bc", &values),
+            format!("bad form field token={FILTERED_PLACEHOLDER}"),
+            "an echoed raw form body must scrub"
         );
     }
 

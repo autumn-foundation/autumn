@@ -297,9 +297,13 @@ normal boot in exactly the ways that keep a replay offline and deterministic:
   call a third-party API or notify anyone;
 - no port is bound, and capture is forced off so a replay cannot capsule itself.
 
-What still runs is your code: handlers, extractors, custom middleware and any
-`Layer` you installed. That is the point — and the reason to
-[replay only capsules you trust](#replay-only-capsules-you-trust).
+What still runs is your code: handlers, extractors, custom middleware, state
+initializers and any `Layer` you installed. That is the point — and the reason
+to [replay only capsules you trust](#replay-only-capsules-you-trust). It also
+means the offline guarantees above cover the framework's own seams, not your
+code's: a state initializer that dials an external service — a feature-flag
+store, a remote config fetch — will still try to dial it during a replay boot
+(see [Limitations](#limitations)).
 
 Telemetry *is* initialized, so your tracing setup behaves as it normally would.
 
@@ -551,6 +555,13 @@ This is the first slice. What it does not do, stated plainly:
   or message of a 500 (mismatch against unchanged code) or promotes a non-5xx
   to a 5xx (no capsule at all — the same observation-scope trade-off
   documented for error reporting).
+- **State initializers are not fail-closed.** Replay drops the framework's own
+  outbound clients — the session store, channels, the mailer, the `reqwest`
+  client — but a state initializer is your code and runs as written during the
+  replay boot. One that reaches an external service directly (a feature-flag
+  SDK with its own HTTP stack, a remote config fetch) will still try to reach
+  it; point such initializers at a local or stubbed endpoint when replaying, or
+  they become a live dependency the verdict silently depends on.
 - **Only failures are captured.** There is no way to capsule a successful
   request, by design: the buffer for a request that succeeds is dropped at the
   response boundary.

@@ -720,11 +720,6 @@ async fn a_shard_checkout_marks_the_capsule_truncated_with_a_note() {
         Arc::new(autumn_web::log::filter::ParameterFilter::new(&[], &[])),
     ));
 
-    // The checkout path reads the process-wide arming flag before it reaches
-    // for a scope, so this test has to arm it the way a capture-enabled app
-    // does. Restored below.
-    let previously_armed = autumn_web::capsule::db_capture_enabled();
-    autumn_web::capsule::set_db_capture_enabled(true);
     autumn_web::capsule::with_capture_scope(Arc::clone(&scope), async {
         let (mut parts, ()) = axum::http::Request::builder()
             .uri("/orders")
@@ -739,7 +734,6 @@ async fn a_shard_checkout_marks_the_capsule_truncated_with_a_note() {
         let _ = ShardedDb::from_request_parts(&mut parts, &state).await;
     })
     .await;
-    autumn_web::capsule::set_db_capture_enabled(previously_armed);
 
     assert!(
         scope

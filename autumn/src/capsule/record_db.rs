@@ -210,13 +210,9 @@ pub const SHARD_CAPTURE_NOTE: &str = "shard database traffic is not captured in 
 /// Called from the connection-checkout path, which is the one place that knows
 /// a *particular request* touched a shard — a coarser "shards are configured"
 /// test would truncate capsules for requests that never went near one. That
-/// path runs on every shard checkout, capture armed or not, so the process-wide
-/// arming flag is read first: an unarmed process pays one relaxed atomic load
-/// instead of a task-local lookup.
+/// path runs on every shard checkout; a request outside any capture scope
+/// pays one task-local lookup and moves on.
 pub fn note_shard_capture_gap() {
-    if !crate::capsule::db_capture_enabled() {
-        return;
-    }
     if let Some(scope) = crate::capsule::current_scope() {
         scope.note(SHARD_CAPTURE_NOTE);
         scope.mark_truncated();
@@ -1609,13 +1605,11 @@ mod tests {
     #[tokio::test]
     async fn a_shard_checkout_notes_and_truncates_the_in_flight_capsule() {
         let scope = scope_for_test("shard-gap");
-        crate::capsule::capture::set_db_capture_enabled(true);
         crate::capsule::capture::CAPSULE_SCOPE
             .scope(Arc::clone(&scope), async {
                 note_shard_capture_gap();
             })
             .await;
-        crate::capsule::capture::set_db_capture_enabled(false);
 
         assert!(
             scope.notes().iter().any(|note| note == SHARD_CAPTURE_NOTE),

@@ -2652,21 +2652,20 @@ pub(crate) struct DbCheckoutParams<'a> {
 fn capsule_checkout_marker() -> Option<String> {
     #[cfg(feature = "reporting")]
     {
-        if !crate::capsule::db_capture_enabled() {
-            return None;
-        }
-        let scope = crate::capsule::current_scope();
-        if let Some(scope) = scope.as_ref() {
-            // If capture had to step aside for this database (TLS, a custom
-            // pool provider), say so in the capsule rather than leaving a
-            // reader to wonder where the DB tape went.
-            crate::capsule::record_db::note_db_capture_unavailable(scope);
-        }
-        let id = scope
-            .map(|scope| scope.id().to_owned())
+        // Scope presence is per-request, per-app truth: a scope only exists
+        // under a capture-enabled router's `CaptureLayer`, so two apps with
+        // different capture settings in one process cannot disturb each
+        // other. A scope-free checkout sends nothing — stale bindings are
+        // cleared by the recording pool's own create/recycle hooks, which run
+        // before any borrower's first statement.
+        let scope = crate::capsule::current_scope()?;
+        // If capture had to step aside for this database (TLS, a custom
+        // pool provider), say so in the capsule rather than leaving a
+        // reader to wonder where the DB tape went.
+        crate::capsule::record_db::note_db_capture_unavailable(&scope);
+        Some(scope.id().to_owned())
             .filter(|id| crate::capsule::is_valid_scope_id(id))
-            .unwrap_or_default();
-        crate::capsule::wire::marker_set_sql(&id)
+            .and_then(|id| crate::capsule::wire::marker_set_sql(&id))
     }
     #[cfg(not(feature = "reporting"))]
     {

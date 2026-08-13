@@ -2945,12 +2945,6 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
-        // Arm failure-capsule capture before anything that consults it is built
-        // — most importantly the database pool, whose factory decides here
-        // whether to tee the connection stream (#1598).
-        #[cfg(feature = "reporting")]
-        crate::capsule::set_db_capture_enabled(config.failure_capture.enabled);
-
         #[cfg(feature = "mail")]
         if mount_unsubscribe_endpoint {
             config.mail.mount_unsubscribe_endpoint = true;
@@ -5636,6 +5630,10 @@ impl AppBuilder {
     /// error-page renderer, the i18n bundle, the custom session store, policy
     /// and scope registrations, state initializers, the DB interceptor, and the
     /// real router builder ([`try_build_router_inner`](crate::router::try_build_router_inner)).
+    /// Kept app code is *not* fail-closed: a state initializer that dials an
+    /// external service itself (a feature-flag SDK with its own HTTP stack)
+    /// still dials it here — the offline guarantees below cover the
+    /// framework's seams, and the guide's "Limitations" section says so.
     ///
     /// **Dropped** (F15 — a replay is offline by construction):
     ///
@@ -5643,11 +5641,10 @@ impl AppBuilder {
     ///   runs. The pool is
     ///   [`pool_from_capsule`](crate::capsule::pool_from_capsule), which answers
     ///   from the capsule's recorded wire traffic over an in-process pipe.
-    /// * Capture is never armed —
-    ///   [`set_db_capture_enabled`](crate::capsule::set_db_capture_enabled) is
-    ///   not called and `[failure_capture]` is forced off — so the replay neither
-    ///   points the checkout marker at the stub pool nor writes a capsule of
-    ///   itself.
+    /// * Capture is never armed — `[failure_capture]` is forced off, so no
+    ///   [`CaptureLayer`](crate::capsule::CaptureLayer) is installed, no
+    ///   request carries a capture scope, and the replay neither points the
+    ///   checkout marker at the stub pool nor writes a capsule of itself.
     /// * The session store is forced to memory and the process cache is
     ///   cleared, so no Redis or external cache is dialled. A store installed
     ///   with [`with_session_store`](Self::with_session_store) is **dropped**
@@ -10933,9 +10930,8 @@ mod tests {
             !handler.contains("setup_database(")
                 && !handler.contains("initialize_job_runtime")
                 && !handler.contains("start_task_scheduler")
-                && !handler.contains("preflight_storage(")
-                && !handler.contains("set_db_capture_enabled("),
-            "replay must not run migrations, job workers, storage preflight or capture"
+                && !handler.contains("preflight_storage("),
+            "replay must not run migrations, job workers or storage preflight"
         );
         assert!(
             handler.contains("force_offline_replay_config(&mut config);"),
