@@ -743,61 +743,64 @@ fn single_quoted_literal(input: &str) -> Option<String> {
     None
 }
 
-/// Heuristic: does this SQL probe the system catalogs?
+/// Is this SQL one of the *driver's own* type-info probes?
 ///
-/// Catalog round trips (`tokio-postgres` type-info lookups, Diesel's schema
-/// probes) are cached per connection in the [`ConnectionMemo`] rather than
-/// recorded as request exchanges (F3/F4).
+/// These catalog round trips (`tokio-postgres` looks up unknown OIDs lazily)
+/// are cached per connection in the [`ConnectionMemo`] rather than recorded as
+/// request exchanges (F3/F4). The match is exact against the query texts the
+/// driver ships — an *application* statement that happens to read
+/// `pg_settings` or `information_schema` is real request work: it must stay in
+/// the ordered tape, where the consumption audit can notice a revised handler
+/// no longer issuing it.
 ///
 /// [`ConnectionMemo`]: ../record_db/struct.ConnectionMemo.html
 pub fn is_catalog_sql(sql: &str) -> bool {
-    let lowered = sql.to_ascii_lowercase();
-    CATALOG_TOKENS
+    let trimmed = sql.trim();
+    DRIVER_TYPEINFO_QUERIES
         .iter()
-        .any(|token| contains_token(&lowered, token))
+        .any(|query| query.trim() == trimmed)
 }
 
-/// System-catalog relations whose presence marks a statement as a driver probe
-/// rather than application work.
-const CATALOG_TOKENS: &[&str] = &[
-    "pg_catalog",
-    "information_schema",
-    "pg_type",
-    "pg_range",
-    "pg_enum",
-    "pg_attribute",
-    "pg_class",
-    "pg_namespace",
-    "pg_proc",
-    "pg_settings",
-    "pg_database",
+/// The exact type-info queries `tokio-postgres` 0.7 issues from `prepare.rs`
+/// (`TYPEINFO_QUERY` and friends), verbatim. Pinned by
+/// [`driver_typeinfo_probes_are_catalog_sql`](tests::driver_typeinfo_probes_are_catalog_sql);
+/// a driver upgrade that rewrites them shows up as an `UnrecordedQuery`
+/// divergence naming `pg_type`, not as silent misclassification.
+const DRIVER_TYPEINFO_QUERIES: &[&str] = &[
+    // TYPEINFO_QUERY
+    "SELECT t.typname, t.typtype, t.typelem, r.rngsubtype, t.typbasetype, n.nspname, t.typrelid
+FROM pg_catalog.pg_type t
+LEFT OUTER JOIN pg_catalog.pg_range r ON r.rngtypid = t.oid
+INNER JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid
+WHERE t.oid = $1
+",
+    // TYPEINFO_FALLBACK_QUERY (pre-9.2 servers without pg_range)
+    "SELECT t.typname, t.typtype, t.typelem, NULL::OID, t.typbasetype, n.nspname, t.typrelid
+FROM pg_catalog.pg_type t
+INNER JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid
+WHERE t.oid = $1
+",
+    // TYPEINFO_ENUM_QUERY
+    "SELECT enumlabel
+FROM pg_catalog.pg_enum
+WHERE enumtypid = $1
+ORDER BY enumsortorder
+",
+    // TYPEINFO_ENUM_FALLBACK_QUERY (pre-9.0 servers without enumsortorder)
+    "SELECT enumlabel
+FROM pg_catalog.pg_enum
+WHERE enumtypid = $1
+ORDER BY oid
+",
+    // TYPEINFO_COMPOSITE_QUERY
+    "SELECT attname, atttypid
+FROM pg_catalog.pg_attribute
+WHERE attrelid = $1
+AND NOT attisdropped
+AND attnum > 0
+ORDER BY attnum
+",
 ];
-
-/// Substring search that requires identifier boundaries on both sides, so a
-/// user table named `pg_types_of_wine` is not mistaken for `pg_type`.
-fn contains_token(haystack: &str, needle: &str) -> bool {
-    let bytes = haystack.as_bytes();
-    let mut from = 0usize;
-    while let Some(offset) = haystack.get(from..).and_then(|tail| tail.find(needle)) {
-        let start = from.saturating_add(offset);
-        let end = start.saturating_add(needle.len());
-        let boundary_before = start == 0
-            || !bytes
-                .get(start.wrapping_sub(1))
-                .copied()
-                .is_some_and(is_ident);
-        let boundary_after = !bytes.get(end).copied().is_some_and(is_ident);
-        if boundary_before && boundary_after {
-            return true;
-        }
-        from = start.saturating_add(1);
-    }
-    false
-}
-
-const fn is_ident(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
 
 /// `true` when this backend frame closes an exchange (`ReadyForQuery`).
 pub const fn terminates_exchange(frame: &Frame) -> bool {
@@ -1702,19 +1705,28 @@ mod tests {
     }
 
     #[test]
-    fn detects_catalog_probes() {
-        assert!(is_catalog_sql(
-            "SELECT t.oid, t.typname FROM pg_catalog.pg_type t WHERE t.oid = $1"
-        ));
-        assert!(is_catalog_sql("select * from PG_TYPE"));
-        assert!(is_catalog_sql(
+    fn driver_typeinfo_probes_are_catalog_sql() {
+        // The driver's own probes match exactly, whitespace-trimmed as the
+        // recorder sees them off a Parse frame.
+        for query in DRIVER_TYPEINFO_QUERIES {
+            assert!(is_catalog_sql(query), "driver probe must match: {query:?}");
+            assert!(is_catalog_sql(query.trim()));
+        }
+    }
+
+    #[test]
+    fn application_catalog_reads_are_not_catalog_probes() {
+        // An application statement that merely reads a system catalog is real
+        // request work: it belongs in the ordered tape, where the consumption
+        // audit can notice a revised handler no longer issuing it.
+        assert!(!is_catalog_sql("SELECT * FROM pg_settings"));
+        assert!(!is_catalog_sql(
             "SELECT column_name FROM information_schema.columns"
         ));
+        assert!(!is_catalog_sql(
+            "SELECT t.oid, t.typname FROM pg_catalog.pg_type t WHERE t.oid = $1"
+        ));
         assert!(!is_catalog_sql("SELECT id, name FROM users WHERE id = $1"));
-        // Word boundaries: a user table that merely starts the same way is not
-        // a catalog probe.
-        assert!(!is_catalog_sql("SELECT * FROM pg_types_of_wine"));
-        assert!(!is_catalog_sql("SELECT * FROM my_pg_class_audit"));
     }
 
     #[test]

@@ -1067,7 +1067,10 @@ mod tests {
     #[test]
     fn a_catalog_probe_diverges_with_a_type_hint() {
         let server = StubServer::new(ConnectionTape::default(), Arc::new(DivergenceLog::new()));
-        match server.resolve_execute("SELECT typname FROM pg_catalog.pg_type WHERE oid = $1", &[]) {
+        // The driver's real enum type-info probe, verbatim — hand-written
+        // catalog reads are application work and no longer classify.
+        let probe = "SELECT enumlabel\nFROM pg_catalog.pg_enum\nWHERE enumtypid = $1\nORDER BY enumsortorder\n";
+        match server.resolve_execute(probe, &[]) {
             Resolution::Diverged(divergence) => {
                 assert!(
                     divergence.detail.contains("catalog probe"),

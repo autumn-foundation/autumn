@@ -5743,9 +5743,15 @@ impl AppBuilder {
             std::process::exit(crate::capsule::print_refusal(&reason, &path));
         }
 
+        // F15: the configured telemetry provider — the default OTLP batch
+        // exporter, or a custom Datadog/Sentry initializer — is replaced with
+        // a logging-only one. An offline replay must not flush spans to a live
+        // collector, and must not abort before its verdict because that
+        // collector is unreachable from the machine doing the replaying.
+        let _replay_ignores_custom_telemetry_provider = telemetry_provider;
         let (mut config, telemetry_guard) = load_config_and_telemetry(
             config_loader_factory,
-            telemetry_provider,
+            Some(Box::new(crate::telemetry::ReplayTelemetryProvider)),
             plugin_config_roots,
         )
         .await;
