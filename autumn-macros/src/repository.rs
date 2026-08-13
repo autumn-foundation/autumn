@@ -902,7 +902,14 @@ fn generate_derived_query_for_source(
             if soft_delete {
                 quote! {
                     #(#encode_lets)*
-                    #[allow(clippy::disallowed_methods, reason = "generated repository code: the derived soft-delete / timestamp write has no `AppState` in scope, so it cannot reach the injected clock. Emitted here so the expansion never trips a determinism deny-lint in the *calling* crate, whose author did not write this. Known-open gap: autumn #1797 follow-up.")]
+                    // The derived soft-delete / timestamp write has no `AppState`
+                    // in scope, so it cannot reach the injected clock. The allow is
+                    // emitted into the expansion so a determinism deny-lint never
+                    // fires in the *calling* crate, whose author did not write this
+                    // code. Known-open gap, tracked as an autumn #1797 follow-up.
+                    // Keep the emitted `reason` SHORT: it is repeated in every
+                    // generated method in every downstream crate.
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::update(
@@ -1148,7 +1155,7 @@ fn vh_insert_ts(
                     .map_err(::autumn_web::AutumnError::from)?;
                 },
                 sqlite => {
-                    #[allow(clippy::disallowed_methods, reason = "generated repository code: the derived soft-delete / timestamp write has no `AppState` in scope, so it cannot reach the injected clock. Emitted here so the expansion never trips a determinism deny-lint in the *calling* crate, whose author did not write this. Known-open gap: autumn #1797 follow-up.")]
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __vh_recorded_at = ::autumn_web::reexports::chrono::Utc::now();
                     ::autumn_web::reexports::diesel::sql_query(
                         "INSERT INTO _autumn_version_history \
@@ -1268,7 +1275,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let destroy_mutation = if config.soft_delete {
             quote! {
                 #destroy_count_bind = if __parent_soft {
-                    #[allow(clippy::disallowed_methods, reason = "generated repository code: the derived soft-delete / timestamp write has no `AppState` in scope, so it cannot reach the injected clock. Emitted here so the expansion never trips a determinism deny-lint in the *calling* crate, whose author did not write this. Known-open gap: autumn #1797 follow-up.")]
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     ::autumn_web::reexports::diesel::update(
                         #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
@@ -4931,7 +4938,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Both paths still fire before_delete / after_delete_commit hooks.
         let hooked_delete_mutation_stmt = if config.soft_delete {
             quote! {
-                #[allow(clippy::disallowed_methods, reason = "generated repository code: the derived soft-delete / timestamp write has no `AppState` in scope, so it cannot reach the injected clock. Emitted here so the expansion never trips a determinism deny-lint in the *calling* crate, whose author did not write this. Known-open gap: autumn #1797 follow-up.")]
+                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                 let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                 let __autumn_deleted = ::autumn_web::reexports::diesel::update(
                     #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null())
@@ -6923,7 +6930,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                         #tenant_id_setup
                         let mut conn = self.__autumn_acquire_conn().await?;
-                        #[allow(clippy::disallowed_methods, reason = "generated repository code: the derived soft-delete / timestamp write has no `AppState` in scope, so it cannot reach the injected clock. Emitted here so the expansion never trips a determinism deny-lint in the *calling* crate, whose author did not write this. Known-open gap: autumn #1797 follow-up.")]
+                        #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                         let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
 
                         #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
@@ -7639,7 +7646,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     #tenant_id_setup
-                    #[allow(clippy::disallowed_methods, reason = "generated repository code: the derived soft-delete / timestamp write has no `AppState` in scope, so it cannot reach the injected clock. Emitted here so the expansion never trips a determinism deny-lint in the *calling* crate, whose author did not write this. Known-open gap: autumn #1797 follow-up.")]
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
@@ -7682,7 +7689,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
-                    #[allow(clippy::disallowed_methods, reason = "generated repository code: the derived soft-delete / timestamp write has no `AppState` in scope, so it cannot reach the injected clock. Emitted here so the expansion never trips a determinism deny-lint in the *calling* crate, whose author did not write this. Known-open gap: autumn #1797 follow-up.")]
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let delete_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
@@ -7796,7 +7803,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                    #[allow(clippy::disallowed_methods, reason = "generated repository code: the derived soft-delete / timestamp write has no `AppState` in scope, so it cannot reach the injected clock. Emitted here so the expansion never trips a determinism deny-lint in the *calling* crate, whose author did not write this. Known-open gap: autumn #1797 follow-up.")]
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
@@ -7831,7 +7838,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    #[allow(clippy::disallowed_methods, reason = "generated repository code: the derived soft-delete / timestamp write has no `AppState` in scope, so it cannot reach the injected clock. Emitted here so the expansion never trips a determinism deny-lint in the *calling* crate, whose author did not write this. Known-open gap: autumn #1797 follow-up.")]
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let delete_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
@@ -8884,7 +8891,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                         #tenant_id_setup
                         let mut conn = self.__autumn_acquire_conn().await?;
-                        #[allow(clippy::disallowed_methods, reason = "generated repository code: the derived soft-delete / timestamp write has no `AppState` in scope, so it cannot reach the injected clock. Emitted here so the expansion never trips a determinism deny-lint in the *calling* crate, whose author did not write this. Known-open gap: autumn #1797 follow-up.")]
+                        #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                         let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
 
                         #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
@@ -9424,7 +9431,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             };
             quote! {
-                #[allow(clippy::disallowed_methods, reason = "generated repository code: the derived soft-delete / timestamp write has no `AppState` in scope, so it cannot reach the injected clock. Emitted here so the expansion never trips a determinism deny-lint in the *calling* crate, whose author did not write this. Known-open gap: autumn #1797 follow-up.")]
+                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                 let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                 #tenant_scoped_update
                 if __count == 0 {
@@ -19249,6 +19256,25 @@ mod tests {
         );
     }
 
+    /// The generated text for one `async fn`, from its signature to the start of
+    /// the next one (or end of input).
+    ///
+    /// Assertions used to slice a fixed byte count after the signature, which
+    /// made them depend on how much *unrelated* text (attributes, `use` lines)
+    /// the expansion happened to emit first — adding a justified `#[allow(...)]`
+    /// silently pushed the asserted token out of the window and failed a test
+    /// whose subject had not changed. Scope by function instead.
+    fn generated_fn<'a>(generated: &'a str, signature: &str) -> &'a str {
+        let start = generated
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must be generated"));
+        let rest = &generated[start + signature.len()..];
+        let end = rest
+            .find("async fn ")
+            .map_or(generated.len(), |off| start + signature.len() + off);
+        &generated[start..end]
+    }
+
     #[test]
     fn repository_macro_soft_delete_delete_by_id_targets_only_non_deleted() {
         let generated = repository_macro(
@@ -19257,10 +19283,7 @@ mod tests {
         )
         .to_string();
 
-        let delete_pos = generated
-            .find("async fn delete_by_id")
-            .expect("delete_by_id must be generated");
-        let section = &generated[delete_pos..delete_pos + 600];
+        let section = generated_fn(&generated, "async fn delete_by_id");
         assert!(
             section.contains("is_null"),
             "delete_by_id soft-delete UPDATE must add deleted_at IS NULL guard: {section}"
@@ -19303,10 +19326,7 @@ mod tests {
 
         // The derived delete_by_title impl (not the trait signature) must be
         // an UPDATE that sets deleted_at, not a hard DELETE FROM.
-        let impl_delete = generated
-            .find("async fn delete_by_title")
-            .expect("delete_by_title impl must be generated");
-        let section = &generated[impl_delete..impl_delete + 1200];
+        let section = generated_fn(&generated, "async fn delete_by_title");
         assert!(
             section.contains("deleted_at"),
             "derived delete_by_title must reference deleted_at in soft-delete mode: {section}"
@@ -19578,9 +19598,19 @@ mod tests {
             "the SQLite write arm must use uncast $1..$8 placeholders: {generated}"
         );
         // The SQLite write arm binds the explicit timestamp via chrono Utc::now().
+        // Asserted on the call and the binding it flows into, NOT on the old
+        // inline `…(Utc :: now ())` token layout: the call is now hoisted into a
+        // `let` so a justified `#[allow]` can attach to it (an attribute cannot
+        // sit on an arbitrary expression). Same call, same value, same column.
         assert!(
-            generated.contains("Utc :: now ())"),
-            "the SQLite write arm must bind recorded_at explicitly (Utc::now()): {generated}"
+            generated.contains(
+                "__vh_recorded_at = :: autumn_web :: reexports :: chrono :: Utc :: now ()"
+            ),
+            "the SQLite write arm must read recorded_at from chrono Utc::now(): {generated}"
+        );
+        assert!(
+            generated.contains("(__vh_recorded_at)"),
+            "the SQLite write arm must bind the recorded_at value it just read: {generated}"
         );
 
         // ── Read path (SQLite arm drops every Postgres cast) ──────────

@@ -2321,42 +2321,26 @@ pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
     client.enqueue(name, payload).await
 }
 
-/// The instant "now" resolves to for enqueue-side due-time math, read through
-/// the **injected** clock of the running job runtime.
+/// Resolve the process-global [`JobClient`], or the standard "runtime is not
+/// initialized" error.
 ///
-/// The free `enqueue_*` functions take no state, so they reach the clock the
-/// same way they reach the backend: through the process-global [`JobClient`]
-/// installed at runtime start. That client carries the app's
-/// [`crate::time::ClockSource`], so under a `#[sim_test]` this is the virtual
-/// instant — which is what makes a delayed enqueue actually come due when
-/// `Sim::advance` crosses its delay.
-///
-/// Reading `Utc::now()` here instead would be a silent determinism hole rather
-/// than a cosmetic one: the runtime filters due-at against its *injected* clock
-/// (`due_at.filter(|due| *due > self.clock.now())`), so a real-time due instant
-/// sits years beyond the sim epoch and the job never becomes due at all.
-///
-/// Falls back to real time only when no runtime is installed, where there is no
-/// injected clock to read and no job to schedule.
-fn job_now() -> chrono::DateTime<chrono::Utc> {
-    global_job_client().map_or_else(
-        || {
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "no job runtime is installed, so there is no injected clock to read; \
-                          this is the documented real-time fallback"
-            )]
-            {
-                chrono::Utc::now()
-            }
-        },
-        |client| client.clock.now(),
-    )
+/// Callers that need *both* the client's clock and its enqueue path must hold
+/// this one handle across both — see the note in [`enqueue_in`].
+fn require_job_client() -> AutumnResult<Arc<JobClient>> {
+    global_job_client().ok_or_else(|| {
+        AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        ))
+    })
 }
 
 /// Convert a relative delay into an absolute due instant, measured from `now`.
 ///
 /// Saturates to `DateTime::MAX` on overflow (practically impossible).
+///
+/// The single home of the overflow clamp: every enqueue-side due-time
+/// computation reaches it through [`JobClient::delay_to_when`], so a
+/// pathological delay can never panic on one path and clamp on another.
 fn due_at_from(
     now: chrono::DateTime<chrono::Utc>,
     delay: std::time::Duration,
@@ -2368,16 +2352,6 @@ fn due_at_from(
     };
     now.checked_add_signed(delta)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-}
-
-/// Convert a relative delay into an absolute due instant, measured from the
-/// injected clock of the running job runtime (see [`job_now`]).
-///
-/// For a caller that already holds a [`JobClient`], prefer
-/// [`JobClient::delay_to_when`] — it reads that client's own clock instead of
-/// resolving the process-global handle again.
-fn delay_to_when(delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
-    due_at_from(job_now(), delay)
 }
 
 /// Enqueue a one-shot job to run once after `delay` elapses.
@@ -2404,8 +2378,18 @@ pub async fn enqueue_in(
     payload: Value,
     delay: std::time::Duration,
 ) -> AutumnResult<()> {
-    let when = delay_to_when(delay);
-    enqueue_at(name, payload, when).await
+    // Resolve the global client ONCE and both read its clock and submit
+    // through it. Computing the due instant via the free `delay_to_when` and
+    // then calling `enqueue_at` would look up the global twice, and the global
+    // is a swappable `RwLock` (see `global_job_client`): a concurrent
+    // `TestApp::build` between the two lookups would stamp the due instant
+    // from app A's virtual clock and submit it to app B, whose runtime filters
+    // due-at against *its* clock — the job would be years off B's timeline and
+    // never become due. Same failure mode as the real-time bug this migration
+    // fixed, arrived at from the other direction.
+    let client = require_job_client()?;
+    let when = client.delay_to_when(delay);
+    client.enqueue_due(name, payload, Some(when)).await
 }
 
 /// Enqueue a one-shot job to run once at the absolute instant `when`.
@@ -2424,11 +2408,7 @@ pub async fn enqueue_at(
     payload: Value,
     when: chrono::DateTime<chrono::Utc>,
 ) -> AutumnResult<()> {
-    let Some(client) = global_job_client() else {
-        return Err(AutumnError::internal_server_error(std::io::Error::other(
-            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
-        )));
-    };
+    let client = require_job_client()?;
     client.enqueue_due(name, payload, Some(when)).await
 }
 
@@ -2491,8 +2471,18 @@ pub async fn enqueue_in_on_conn<A: serde::Serialize>(
     delay: std::time::Duration,
     conn: &mut diesel_async::AsyncPgConnection,
 ) -> AutumnResult<()> {
-    let when = delay_to_when(delay);
-    enqueue_at_on_conn(name, args, when, conn).await
+    // One global lookup for both the clock read and the enqueue — see the note
+    // in `enqueue_in`.
+    let payload = serde_json::to_value(&args).map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "job args serialization failed: {e}"
+        )))
+    })?;
+    let client = require_job_client()?;
+    let when = client.delay_to_when(delay);
+    client
+        .enqueue_on_conn_due(name, payload, conn, Some(when))
+        .await
 }
 
 /// Transactional delayed enqueue at an absolute instant. See
@@ -2514,11 +2504,7 @@ pub async fn enqueue_at_on_conn<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    let Some(client) = global_job_client() else {
-        return Err(AutumnError::internal_server_error(std::io::Error::other(
-            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
-        )));
-    };
+    let client = require_job_client()?;
     client
         .enqueue_on_conn_due(name, payload, conn, Some(when))
         .await
@@ -9657,6 +9643,79 @@ mod tests {
         assert_ne!(a, c, "a different seed ⇒ different job ids");
     }
 
+    /// A relative-delay enqueue must compute its due instant and submit it
+    /// through the **same** client handle.
+    ///
+    /// `enqueue_in` used to call the free `delay_to_when` (one global lookup,
+    /// to read the clock) and then `enqueue_at` (a second global lookup, to
+    /// submit). The global is a swappable `RwLock`, so a concurrent
+    /// `TestApp::build` landing between the two lookups stamped the due instant
+    /// from app A's virtual clock and handed it to app B — whose runtime filters
+    /// due-at against *its own* clock, leaving the job years off B's timeline
+    /// and never runnable. Same failure mode as the real-time bug this
+    /// migration fixed, reached from the other direction.
+    ///
+    /// The test swaps the global between the two points the old code looked it
+    /// up, then asserts the recorded due instant belongs to the clock of the
+    /// client that actually received the job.
+    #[tokio::test]
+    async fn relative_enqueue_reads_the_clock_of_the_client_it_submits_to() {
+        use chrono::{TimeZone, Utc};
+
+        fn client_at(epoch: chrono::DateTime<chrono::Utc>) -> JobClient {
+            JobClient {
+                local_sender: None,
+                local_coordination: None,
+                #[cfg(feature = "redis")]
+                redis: None,
+                #[cfg(feature = "db")]
+                pg_pool: None,
+                registry: crate::actuator::JobRegistry::new(),
+                job_admin: JobAdminMemoryBackend::new_for_test(32),
+                default_max_attempts: 3,
+                default_initial_backoff_ms: 250,
+                per_job_settings: HashMap::new(),
+                interceptor: None,
+                entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+                clock: std::sync::Arc::new(crate::time::FixedClock::at(epoch)),
+                resilience_config: None,
+            }
+        }
+
+        let epoch_a = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch_b = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        // Install A, take the handle the way `enqueue_in` now does, then swap
+        // the global to B — exactly the window the old two-lookup code left
+        // open between reading the clock and submitting.
+        init_global_job_client(client_at(epoch_a));
+        let held = require_job_client().expect("client A is installed");
+        init_global_job_client(client_at(epoch_b));
+
+        let when = held.delay_to_when(std::time::Duration::from_secs(60));
+        assert_eq!(
+            when,
+            epoch_a + chrono::Duration::seconds(60),
+            "the due instant must come from the clock of the handle we submit \
+             through (A), not from whichever client happens to be global now (B)"
+        );
+
+        // The swap really did land: a fresh resolution returns B, so the
+        // assertion above is about the handle we held, not a no-op.
+        assert_eq!(
+            require_job_client()
+                .expect("client B is installed")
+                .delay_to_when(std::time::Duration::from_secs(60)),
+            epoch_b + chrono::Duration::seconds(60),
+            "a fresh resolution sees B, confirming the global was swapped"
+        );
+
+        clear_global_job_client();
+    }
+
     #[tokio::test]
     async fn global_job_client_survives_concurrent_init_and_clear() {
         fn make_client() -> JobClient {
@@ -16701,38 +16760,53 @@ mod tests {
         crate::circuit_breaker::global_registry().clear();
     }
 
-    // ── delay_to_when unit tests ──────────────────────────────────────────────
+    // ── due-time math unit tests ──────────────────────────────────────────────
+    //
+    // These target `due_at_from`, the single home of the overflow clamp that
+    // `JobClient::delay_to_when` reaches through. They pass an explicit `now`
+    // rather than reading a clock, so they assert exact equality instead of
+    // bracketing a real-time read.
 
     #[test]
-    fn delay_to_when_zero_returns_approximately_now() {
-        let before = chrono::Utc::now();
-        let result = delay_to_when(std::time::Duration::ZERO);
-        let after = chrono::Utc::now();
-        assert!(
-            result >= before && result <= after,
-            "zero delay should resolve to approximately now"
+    fn due_at_from_zero_delay_is_now() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            due_at_from(now, std::time::Duration::ZERO),
+            now,
+            "a zero delay must resolve to exactly the instant passed in"
         );
     }
 
     #[test]
-    fn delay_to_when_overflow_returns_max_utc() {
+    fn due_at_from_overflow_returns_max_utc() {
         // u64::MAX seconds overflows i64 nanoseconds in TimeDelta::from_std.
         let huge = std::time::Duration::from_secs(u64::MAX);
-        let result = delay_to_when(huge);
         assert_eq!(
-            result,
+            due_at_from(chrono::Utc::now(), huge),
             chrono::DateTime::<chrono::Utc>::MAX_UTC,
             "overflow duration must return MAX_UTC rather than panic"
         );
     }
 
     #[test]
-    fn delay_to_when_small_delay_is_in_the_future() {
-        let before = chrono::Utc::now();
-        let result = delay_to_when(std::time::Duration::from_secs(60));
-        assert!(
-            result > before,
-            "a positive delay must resolve to the future"
+    fn due_at_from_saturates_rather_than_wrapping_near_max() {
+        // The other overflow door: the delta converts fine, but adding it to a
+        // near-MAX `now` does not fit.
+        let near_max = chrono::DateTime::<chrono::Utc>::MAX_UTC - chrono::TimeDelta::seconds(1);
+        assert_eq!(
+            due_at_from(near_max, std::time::Duration::from_secs(3600)),
+            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            "adding past MAX must clamp, not wrap"
+        );
+    }
+
+    #[test]
+    fn due_at_from_small_delay_is_exactly_offset() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            due_at_from(now, std::time::Duration::from_secs(60)),
+            now + chrono::TimeDelta::seconds(60),
+            "a positive delay must land exactly `delay` after the given instant"
         );
     }
 
