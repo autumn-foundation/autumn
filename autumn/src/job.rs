@@ -2334,6 +2334,29 @@ fn require_job_client() -> AutumnResult<Arc<JobClient>> {
     })
 }
 
+/// The instant a relative delay is measured from, given which backend will
+/// decide whether the deadline has arrived.
+///
+/// Free function taking the decision as a parameter so both arms are reachable
+/// from a unit test — the Postgres arm otherwise needs a live pool. See
+/// [`JobClient::due_origin`] for why the two arms differ.
+fn due_origin_for(
+    durable_is_pg: bool,
+    clock: &dyn crate::time::ClockSource,
+) -> chrono::DateTime<chrono::Utc> {
+    if durable_is_pg {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the Postgres claim query compares `run_at <= NOW()` on the DATABASE \
+                      clock, so a deadline for that backend has to be measured from the \
+                      same real timeline; the injected clock would put `run_at` years off \
+                      the one it is compared to. See `JobClient::due_origin`."
+        )]
+        return chrono::Utc::now();
+    }
+    clock.now()
+}
+
 /// Convert a relative delay into an absolute due instant, measured from `now`.
 ///
 /// Saturates to `DateTime::MAX` on overflow (practically impossible).
@@ -2699,6 +2722,13 @@ impl JobClient {
     /// Mirrors the backend precedence in `enqueue_with_outcome_due` /
     /// `enqueue_durable_inner`: local, then redis, then Postgres.
     ///
+    /// **Every** decision about a due instant must come from this one function
+    /// — both the stamping in [`Self::delay_to_when`] and the "is it actually in
+    /// the future" filters in `enqueue_with_outcome_due` /
+    /// `enqueue_on_conn_due`. A deadline is only in the future relative to the
+    /// clock that produced it; stamping from one origin and filtering against
+    /// another silently converts a delayed job into an immediate one.
+    ///
     /// The residual app-vs-database clock skew on the Postgres path is the
     /// ordinary NTP-scale condition this queue has always run under, unchanged
     /// by the migration. Computing the deadline in the database itself
@@ -2708,26 +2738,32 @@ impl JobClient {
     /// down to `pg_insert_job`, which is more surgery than this migration
     /// should carry.
     fn due_origin(&self) -> chrono::DateTime<chrono::Utc> {
-        #[cfg(feature = "db")]
-        if self.local_sender.is_none() && self.pg_pool.is_some() {
-            #[cfg(feature = "redis")]
-            let durable_is_pg = self.redis.is_none();
-            #[cfg(not(feature = "redis"))]
-            let durable_is_pg = true;
+        due_origin_for(self.durable_is_pg(), self.clock.as_ref())
+    }
 
-            if durable_is_pg {
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "the Postgres claim query compares `run_at <= NOW()` on the \
-                              DATABASE clock, so a deadline for that backend has to be \
-                              measured from the same real timeline; the injected clock \
-                              would put `run_at` years off the one it is compared to. \
-                              See `JobClient::due_origin`."
-                )]
-                return chrono::Utc::now();
-            }
+    /// Whether a Postgres INSERT — rather than the local channel or the redis
+    /// queue — is what will serve an enqueue on this client.
+    ///
+    /// Mirrors the branch order in `enqueue_with_outcome_due` (local first) and
+    /// `enqueue_durable_inner` (redis before Postgres). Split out so the
+    /// decision and the clock read can each be tested on their own; reaching
+    /// the Postgres arm through this method needs a live pool.
+    const fn durable_is_pg(&self) -> bool {
+        if self.local_sender.is_some() {
+            return false;
         }
-        self.clock.now()
+        #[cfg(feature = "redis")]
+        if self.redis.is_some() {
+            return false;
+        }
+        #[cfg(feature = "db")]
+        {
+            self.pg_pool.is_some()
+        }
+        #[cfg(not(feature = "db"))]
+        {
+            false
+        }
     }
 
     /// Enqueue a job by name with a JSON payload.
@@ -2783,7 +2819,17 @@ impl JobClient {
         // Capture the reference instant once so every downstream decision
         // (filter, admin record status, local-backend sleep) uses a consistent
         // clock reading and near-due jobs cannot be misclassified.
-        let now = self.clock.now();
+        //
+        // This must be [`Self::due_origin`], not `self.clock.now()`: it is the
+        // same instant `delay_to_when` measured the deadline from, and a
+        // deadline is only "in the future" relative to the clock that stamped
+        // it. Reading the injected clock here while the Postgres path stamps
+        // from real time would make a `TestApp` pinned ahead of real time
+        // discard every durable deadline as already past and insert an
+        // immediately-runnable job. For the local and redis backends
+        // `due_origin` *is* `self.clock.now()`, so this is unchanged there —
+        // including the local-backend sleep computed from `now` below.
+        let now = self.due_origin();
         // Only treat a due time strictly in the future as "delayed"; a past or
         // absent due time enqueues for immediate execution exactly as before.
         let due_at = due_at.filter(|due| *due > now);
@@ -3383,7 +3429,8 @@ impl JobClient {
         due_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AutumnResult<()> {
         crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
-        let due_at = due_at.filter(|due| *due > self.clock.now());
+        // Same origin that stamped the deadline — see `enqueue_with_outcome_due`.
+        let due_at = due_at.filter(|due| *due > self.due_origin());
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
@@ -9758,6 +9805,54 @@ mod tests {
             epoch,
             "with no durable backend the injected clock governs"
         );
+
+        // The Postgres arm, reachable here only because the decision is split
+        // out of the clock read — through `JobClient` it needs a live pool.
+        let clock = crate::time::FixedClock::at(epoch);
+        let before = chrono::Utc::now();
+        let pg_origin = due_origin_for(true, &clock);
+        let after = chrono::Utc::now();
+        assert!(
+            pg_origin >= before && pg_origin <= after,
+            "a Postgres-served delay must be measured from real time (the clock its \
+             `run_at <= NOW()` claim query uses), not from the injected {epoch}; got \
+             {pg_origin}"
+        );
+        assert_eq!(
+            due_origin_for(false, &clock),
+            epoch,
+            "every other backend compares against the injected clock, so it stamps from it"
+        );
+    }
+
+    /// The deadline and the "is it in the future?" filter must share an origin.
+    ///
+    /// `enqueue_with_outcome_due` / `enqueue_on_conn_due` drop a `due_at` that
+    /// is not strictly in the future. If the Postgres path stamps from real time
+    /// while that filter reads the injected clock, a `TestApp` pinned *ahead* of
+    /// real time discards every durable deadline as already past and inserts an
+    /// immediately-runnable job instead of a delayed one. Asserted on the pair
+    /// of functions both call sites now go through.
+    #[test]
+    fn a_stamped_deadline_survives_the_filter_that_judges_it() {
+        use chrono::{TimeZone, Utc};
+
+        // A clock pinned a decade ahead of real time — the case that breaks when
+        // the stamp and the filter disagree.
+        let ahead = Utc.with_ymd_and_hms(2036, 1, 1, 0, 0, 0).unwrap();
+        let clock = crate::time::FixedClock::at(ahead);
+        let delay = std::time::Duration::from_secs(60);
+
+        for durable_is_pg in [true, false] {
+            let stamped = due_at_from(due_origin_for(durable_is_pg, &clock), delay);
+            let filter_now = due_origin_for(durable_is_pg, &clock);
+            assert!(
+                stamped > filter_now,
+                "a {delay:?} deadline must still read as delayed when filtered \
+                 (durable_is_pg = {durable_is_pg}); stamped {stamped}, filtered against \
+                 {filter_now}"
+            );
+        }
     }
 
     /// A relative-delay enqueue must compute its due instant and submit it
