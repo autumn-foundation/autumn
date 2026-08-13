@@ -16,7 +16,7 @@
 use autumn_web::config::AutumnConfig;
 use autumn_web::error::AutumnError;
 use autumn_web::test::TestApp;
-use autumn_web::{ClientAddr, get, routes};
+use autumn_web::{ClientAddr, get, post, routes};
 
 #[get("/ok")]
 async fn ok_handler() -> &'static str {
@@ -39,6 +39,35 @@ async fn panic_handler() -> &'static str {
 #[get("/whoami")]
 async fn whoami(client: ClientAddr) -> String {
     client.0.to_string()
+}
+
+/// Consumes a body, so the global `DefaultBodyLimit` is actually enforced —
+/// the limit layer only stamps an extension; body *extractors* apply it.
+#[post("/echo")]
+async fn echo(body: axum::body::Bytes) -> String {
+    body.len().to_string()
+}
+
+/// Reports the `request_id` the log context was seeded with, which is only
+/// populated if `RequestIdLayer` ran *before* `LogContextLayer`.
+#[get("/log-context-request-id")]
+async fn log_context_request_id() -> String {
+    autumn_web::log::context::snapshot()
+        .and_then(|fields| fields.request_id)
+        .unwrap_or_else(|| "unseeded".to_owned())
+}
+
+/// Reports the `UploadConfig` the ingress stack put into request extensions,
+/// so the test can tell "the extension is installed" from "it silently
+/// vanished".
+#[get("/upload-config")]
+async fn upload_config_probe(
+    config: Option<axum::Extension<autumn_web::security::UploadConfig>>,
+) -> String {
+    config.map_or_else(
+        || "missing".to_owned(),
+        |axum::Extension(cfg)| cfg.max_request_size_bytes.to_string(),
+    )
 }
 
 /// INVARIANT: `MetricsLayer` is outer to `ExceptionFilterLayer`, so it records
@@ -205,35 +234,91 @@ async fn disabled_optional_layers_are_inert() {
     }
 }
 
-/// INVARIANT: the request body limit (`DefaultBodyLimit`) and the
-/// `UploadConfig` extension are both installed, inner to the user layers.
+/// INVARIANT: both upload guards are installed, inner to the user layers — the
+/// global `DefaultBodyLimit` and the `UploadConfig` request extension.
 ///
 /// The extension used to be inserted by an `axum::middleware::from_fn`; it is
-/// now an `axum::Extension` layer (issue #2193), which must have the same
-/// effect — the `Multipart` extractor reads per-file limits from it.
+/// now an `axum::Extension` layer (issue #2193), which must have exactly the
+/// same effect — the `Multipart` extractor reads per-file limits and the
+/// allowed MIME-type list from it.
+///
+/// Note that `DefaultBodyLimit` only stamps an extension; the limit is applied
+/// by body *extractors*, so the route under test must actually consume a body
+/// or the check is vacuous.
 #[tokio::test]
-async fn body_limit_still_rejects_oversized_requests() {
+async fn upload_guards_are_installed_in_the_ingress_stack() {
     let mut config = AutumnConfig {
         profile: Some("test".to_owned()),
         ..AutumnConfig::default()
     };
-    config.security.upload.max_request_size_bytes = 64;
+    config.security.upload.max_request_size_bytes = 128;
 
     let client = TestApp::new()
         .config(config)
-        .routes(routes![ok_handler])
+        .routes(routes![echo, upload_config_probe])
         .build();
 
-    let resp = client
-        .post("/ok")
-        .header("content-type", "application/json")
+    // Under the cap: served normally.
+    client
+        .post("/echo")
+        .header("content-type", "application/octet-stream")
+        .body("x".repeat(64))
+        .send()
+        .await
+        .assert_status(200)
+        .assert_body_contains("64");
+
+    // Over the cap: rejected by `DefaultBodyLimit`, and by nothing else — a 405
+    // or 404 here would mean the request never reached the body extractor.
+    client
+        .post("/echo")
+        .header("content-type", "application/octet-stream")
         .body("x".repeat(4096))
         .send()
-        .await;
-    assert!(
-        resp.status.as_u16() == 413 || resp.status.as_u16() == 405,
-        "an oversized body must be rejected by DefaultBodyLimit (413) before \
-         reaching routing, or rejected as a method mismatch (405) — got {}",
-        resp.status
+        .await
+        .assert_status(413);
+
+    // The `UploadConfig` extension reached the handler with the configured value.
+    client
+        .get("/upload-config")
+        .send()
+        .await
+        .assert_status(200)
+        .assert_body_contains("128");
+}
+
+/// INVARIANT: `RequestIdLayer` is OUTER to `LogContextLayer`, so the request id
+/// is available to seed the request-scoped log context — and the context wraps
+/// the handler, so everything it logs correlates with the `x-request-id` the
+/// client sees.
+///
+/// This is the adjacency most at risk from the tuple collapse: the two layers
+/// are the first two elements of the middle group, and swapping them still
+/// compiles (both are `Route -> Route`, `Error = Infallible`) while silently
+/// dropping `request_id` from every log line emitted during the request.
+///
+/// `router.rs`: "RequestId stays here (inner to session) so the request id seeds
+/// the session, logs, and trace context", and `LogContextLayer` is "inner to
+/// `RequestIdLayer` (so the request id is available to seed it)".
+#[tokio::test]
+async fn log_context_is_seeded_with_the_request_id_the_client_sees() {
+    let client = TestApp::new()
+        .routes(routes![log_context_request_id])
+        .build();
+
+    let resp = client.get("/log-context-request-id").send().await;
+    resp.assert_status(200);
+
+    let header_id = resp
+        .header("x-request-id")
+        .expect("RequestIdLayer must stamp x-request-id")
+        .to_owned();
+    let context_id = String::from_utf8(resp.body.clone()).expect("body is utf-8");
+
+    assert_eq!(
+        context_id, header_id,
+        "the log context must be seeded with the same request id the client \
+         receives, which only holds while RequestIdLayer is OUTER to \
+         LogContextLayer and LogContextLayer wraps the handler"
     );
 }

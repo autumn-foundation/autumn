@@ -2833,10 +2833,14 @@ where
 
 /// Build the response-compression layer, or `None` when compression is off.
 ///
-/// Split out from [`apply_compression_middleware`] so [`apply_middleware`] can
-/// place it in the composed ingress stack instead of spending a separate
-/// `Router::layer` call — and therefore a separate `BoxCloneSyncService`
-/// nesting level — on it (issue #2193).
+/// Split out from [`apply_compression_middleware`] for symmetry with the other
+/// `build_*_layer` helpers and so the predicate can be constructed without a
+/// router. Compression deliberately keeps its own `Router::layer` call rather
+/// than joining the composed ingress tuple: `CompressionLayer`'s service changes
+/// the response BODY type, which `Route::layer` absorbs via `IntoResponse` but
+/// `option_layer`'s `Either` cannot (both of its branches must share one
+/// `Response` type). See the note at its application site in
+/// [`apply_middleware`].
 fn build_compression_layer(
     config: &AutumnConfig,
 ) -> Option<
@@ -3161,9 +3165,8 @@ async fn populate_rate_limit_principal(
     next.run(req).await
 }
 
-/// Kept as a router-level wrapper for the `/mcp` envelope and this module's
-/// unit tests; the main ingress stack composes the layer directly (see
-/// `apply_middleware`).
+/// Kept as a router-level wrapper for the `/mcp` envelope; the main ingress
+/// stack composes the layer directly (see `apply_middleware`).
 #[cfg(feature = "mcp")]
 fn apply_trusted_proxies_middleware<S>(
     router: axum::Router<S>,
@@ -3354,8 +3357,11 @@ fn build_maintenance_layer(
 
 /// Build the admission-control ([`LoadShedLayer`](crate::middleware::LoadShedLayer))
 /// layer from config, or `None` when `server.max_concurrent_requests` is unset
-/// or `0` — the default, preserving today's unlimited behavior with zero
-/// overhead (the layer is simply never applied; see [`apply_middleware`]).
+/// or `0` — the default, preserving today's unlimited behavior with effectively
+/// zero overhead. In [`apply_middleware`] the `None` case goes through
+/// `tower::util::option_layer`, contributing an `Either` branch that forwards
+/// straight to the inner service: no allocation, no `Route` box, no nesting
+/// level. The `/mcp` envelope still installs nothing at all.
 ///
 /// Reuses the same probe/actuator bypass list as [`build_maintenance_layer`]
 /// so health/liveness/readiness probes are never shed under load (#1006).
@@ -3611,8 +3617,13 @@ struct RequestTimeoutSettings {
 }
 
 /// Resolve the request-timeout settings, or `None` when no global timeout is
-/// configured and no route declares an override — in which case **no layer at
-/// all** is installed, preserving the documented zero-overhead default.
+/// configured and no route declares an override.
+///
+/// In that case [`apply_request_timeout_middleware`] (the `/mcp` envelope)
+/// installs no layer at all, and [`apply_middleware`] contributes an
+/// `option_layer` `Either` branch that forwards straight to the inner service —
+/// no allocation, no `Route` box, no nesting level. Either way the documented
+/// zero-overhead default holds.
 ///
 /// Split out of [`apply_request_timeout_middleware`] so [`apply_middleware`] can
 /// place the layer in the composed ingress stack (issue #2193).
@@ -3877,10 +3888,15 @@ fn apply_middleware(
 
     // Innermost group: everything from the handler out to (but not including)
     // the user-registered layers. Listed OUTERMOST FIRST.
+    // Built FIRST: this is the only builder that can fail the whole router
+    // build (the production memory-backend guard), and the others have side
+    // effects — `tracing::info!` lines, and a lazy Redis connection manager when
+    // the rate limiter is Redis-backed — that should not run on the way to a
+    // fail-fast `Err`.
+    let submit_token_layer = build_submit_token_layer(config, is_production)?;
     let (body_limit, upload_config) = build_upload_layers(config);
     let trusted_host_policy = TrustedHostPolicy::from_config(config);
     let (rate_limit_layer, rate_limit_principal_keying) = build_rate_limit_layers(config, state);
-    let submit_token_layer = build_submit_token_layer(config, is_production)?;
     let inner_stack = (
         // Insert UploadConfig into extensions so the Multipart extractor can
         // read per-file limits and the allowed MIME-type list.
