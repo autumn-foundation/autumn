@@ -2640,15 +2640,94 @@ pub async fn enqueue_in_tx<A: serde::Serialize>(
     enqueue_on_conn(name, args, conn).await
 }
 
+#[cfg(test)]
 impl JobClient {
-    /// Convert a relative delay into an absolute due instant on **this
-    /// client's** injected clock.
+    /// A `JobClient` with no backend installed, for unit tests that only need
+    /// its clock/entropy seams. Callers set whichever backend field the case is
+    /// about, so a new field lands in one place rather than in every test.
+    fn bare_for_test(clock: Arc<dyn crate::time::ClockSource>) -> Self {
+        Self {
+            local_sender: None,
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 250,
+            per_job_settings: HashMap::new(),
+            interceptor: None,
+            entropy: Arc::new(crate::entropy::OsEntropy),
+            clock,
+            resilience_config: None,
+        }
+    }
+}
+
+impl JobClient {
+    /// Convert a relative delay into an absolute due instant, measured from
+    /// the clock the **serving backend** will later compare it against.
     ///
-    /// The instance-scoped twin of the free `delay_to_when`, for callers that
-    /// already hold the client. It shares the overflow-clamp body, so the two
-    /// can never disagree about a pathological delay.
+    /// See [`Self::due_origin`] for why that is not unconditionally this
+    /// client's injected clock.
     fn delay_to_when(&self, delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
-        due_at_from(self.clock.now(), delay)
+        due_at_from(self.due_origin(), delay)
+    }
+
+    /// The instant a relative delay is measured from.
+    ///
+    /// A due instant is only meaningful against the clock that decides whether
+    /// it has arrived, and the backends do not share one:
+    ///
+    /// * **local** filters `due_at` against `self.clock.now()`, and
+    /// * **redis** scores its delayed set against `now_unix_ms(self.clock)`,
+    ///
+    /// so both must be stamped from the injected clock — that is what makes
+    /// `Sim::advance` bring a delayed job due, and it is the bug the RED test
+    /// `sim_delayed_enqueue` was written for.
+    ///
+    /// **Postgres does not.** Its claim query is `WHERE … run_at <= NOW()`,
+    /// evaluated by the database on the database's wall clock, and `run_at` is
+    /// a shared column every process claims against. Stamping it from a virtual
+    /// clock puts it years off the timeline it is compared to: a clock behind
+    /// the database makes the job claimable immediately, one ahead defers it
+    /// indefinitely. So the durable path keeps measuring from real time —
+    /// exactly as it did before the clock migration.
+    ///
+    /// Mirrors the backend precedence in `enqueue_with_outcome_due` /
+    /// `enqueue_durable_inner`: local, then redis, then Postgres.
+    ///
+    /// The residual app-vs-database clock skew on the Postgres path is the
+    /// ordinary NTP-scale condition this queue has always run under, unchanged
+    /// by the migration. Computing the deadline in the database itself
+    /// (`run_at = NOW() + $delay * INTERVAL '1 millisecond'`, as the backoff
+    /// path at the nack UPDATE already does) would remove even that, and is the
+    /// natural follow-up; it needs the relative/absolute distinction threaded
+    /// down to `pg_insert_job`, which is more surgery than this migration
+    /// should carry.
+    fn due_origin(&self) -> chrono::DateTime<chrono::Utc> {
+        #[cfg(feature = "db")]
+        if self.local_sender.is_none() && self.pg_pool.is_some() {
+            #[cfg(feature = "redis")]
+            let durable_is_pg = self.redis.is_none();
+            #[cfg(not(feature = "redis"))]
+            let durable_is_pg = true;
+
+            if durable_is_pg {
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "the Postgres claim query compares `run_at <= NOW()` on the \
+                              DATABASE clock, so a deadline for that backend has to be \
+                              measured from the same real timeline; the injected clock \
+                              would put `run_at` years off the one it is compared to. \
+                              See `JobClient::due_origin`."
+                )]
+                return chrono::Utc::now();
+            }
+        }
+        self.clock.now()
     }
 
     /// Enqueue a job by name with a JSON payload.
@@ -9641,6 +9720,44 @@ mod tests {
 
         let c = minted_ids(0x1234).await;
         assert_ne!(a, c, "a different seed ⇒ different job ids");
+    }
+
+    /// A relative delay is measured from the clock the **serving backend** will
+    /// compare it against — not unconditionally from the injected one.
+    ///
+    /// Local and redis filter due-at against `self.clock`, so they must read the
+    /// injected clock (this is what `sim_delayed_enqueue` proves end to end).
+    /// Postgres compares `run_at <= NOW()` in the database, so stamping that
+    /// column from a virtual clock would leave it years off the timeline it is
+    /// judged against — claimable immediately if the clock is behind, never if
+    /// it is ahead. Regression test for the P1 raised on #2192.
+    #[test]
+    fn due_origin_follows_the_backend_that_decides_dueness() {
+        use chrono::{TimeZone, Utc};
+
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+
+        // A local-backed client: the injected (2020) clock decides dueness, so
+        // the delay is measured from it.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<QueuedJob>(1);
+        let mut local =
+            JobClient::bare_for_test(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+        local.local_sender = Some(tx);
+        assert_eq!(
+            local.due_origin(),
+            epoch,
+            "a local-backed client measures a delay from its injected clock"
+        );
+
+        // With no backend installed at all there is nothing comparing against a
+        // database, so the injected clock still governs.
+        let bare =
+            JobClient::bare_for_test(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+        assert_eq!(
+            bare.due_origin(),
+            epoch,
+            "with no durable backend the injected clock governs"
+        );
     }
 
     /// A relative-delay enqueue must compute its due instant and submit it
