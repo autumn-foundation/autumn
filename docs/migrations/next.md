@@ -13,7 +13,9 @@
 
 - **Old version:** `autumn-web 0.6.x`
 - **New version:** the next release (unreleased)
-- **Expected upgrade effort:** none for application code. Small for **plugins
+- **Expected upgrade effort:** none for application code, beyond two new
+  deprecation warnings if you call `scheduler::now_unix_secs` /
+  `now_unix_duration` (see *Deprecations* below). Small for **plugins
   and libraries** that build `autumn_web::Route` values by hand, and for **JSON
   API clients** of a scaffolded model that declares a `lock_version` column.
 - **MSRV delta:** `1.88.0` -> `1.88.0` (unchanged so far)
@@ -127,6 +129,36 @@ column) and echo it back on the next write.
 opt-in: rename it (e.g. to `revision`) and the behaviour goes away. `autumn
 generate` prints a warning naming this escape hatch whenever it detects the
 name.
+
+## Deprecations (non-breaking)
+
+### `scheduler::now_unix_secs` / `scheduler::now_unix_duration`
+
+Both read the real system clock directly, off the framework's injected-clock
+seam, so anything derived from them — a scheduled-task tick key, an expiry
+computation — is not reproducible under a `#[sim_test]` and is exposed to a
+wall-clock jump. They still work exactly as before; they now emit a
+deprecation warning.
+
+```rust
+// Before
+let secs = autumn_web::scheduler::now_unix_secs();
+let dur  = autumn_web::scheduler::now_unix_duration();
+
+// After — read the app's injected clock
+let secs = autumn_web::time::clock_unix_secs(state.clock());
+let dur  = autumn_web::time::clock_unix_duration(state.clock());
+```
+
+`state` is any `AppState` (handlers, `#[job]`/`#[scheduled]` bodies, startup
+hooks). If you hold an `Arc<dyn ClockSource>` rather than an `AppState`, pass
+`clock.as_ref()`. If you genuinely have neither in scope and cannot thread one
+in yet, `#[allow(deprecated)]` at the call site is a fine interim step — the
+functions are not scheduled for removal before the next major release (see
+[STABILITY.md](../../STABILITY.md), *Deprecation process*).
+
+The framework's own scheduler already reads the injected clock; neither function
+has a remaining caller inside `autumn`.
 
 ## Compiler error cheat sheet
 

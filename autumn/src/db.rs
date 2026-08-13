@@ -25,6 +25,14 @@
 //! }
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use axum::extract::FromRequestParts;
 use diesel;
 // Named by the default Postgres pool builder/TLS connector and by the
@@ -314,10 +322,43 @@ pub(crate) fn request_query_capture_active() -> bool {
 /// (`server_timing` is a dev/off-by-default feature); apps needing both should
 /// keep it disabled in that environment.
 #[cfg(feature = "db")]
-#[derive(Default, Debug)]
 pub(crate) struct RequestQueryTimer {
     /// The currently in-flight statement (start instant + SQL text), if any.
     pending: Option<PendingQuery>,
+    /// Injected clock supplying the start/finish instants.
+    ///
+    /// Diesel's `Instrumentation::on_connection_event` signature is frozen and
+    /// carries no time, so the only way to reach the app's clock from inside it
+    /// is a field on the timer. Installed per checkout from
+    /// `DbCheckoutParams::clock`, so a `#[sim_test]` sees virtual query
+    /// latencies. It costs one `Arc` deref per statement — and only on
+    /// connections that actually carry a timer, which `Db::checkout` installs
+    /// solely while a query observer is scoped.
+    clock: std::sync::Arc<dyn crate::time::ClockSource>,
+}
+
+#[cfg(feature = "db")]
+impl std::fmt::Debug for RequestQueryTimer {
+    // Hand-written because `dyn ClockSource` is not `Debug`; the clock is an
+    // injected handle with no useful representation here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestQueryTimer")
+            .field("pending", &self.pending)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "db")]
+impl Default for RequestQueryTimer {
+    /// A timer on the real system clock — the behaviour before the clock became
+    /// injectable. Used by the unit tests that drive `on_start`/`on_finish`
+    /// directly with synthetic instants and never read this field.
+    fn default() -> Self {
+        Self {
+            pending: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
+        }
+    }
 }
 
 /// A statement whose `StartQuery` has fired but whose `FinishQuery` has not.
@@ -328,12 +369,20 @@ pub(crate) struct RequestQueryTimer {
 #[cfg(feature = "db")]
 #[derive(Debug)]
 struct PendingQuery {
-    started_at: std::time::Instant,
+    started_at: crate::time::MonotonicInstant,
     sql: String,
 }
 
 #[cfg(feature = "db")]
 impl RequestQueryTimer {
+    /// A timer reading its instants from `clock` (the app's injected clock).
+    fn with_clock(clock: std::sync::Arc<dyn crate::time::ClockSource>) -> Self {
+        Self {
+            pending: None,
+            clock,
+        }
+    }
+
     /// Whether `sql` is a statement that must **not** be counted as an
     /// application query in the `Server-Timing` `db` metric. Two kinds reach
     /// the connection instrumentation but are not application work:
@@ -386,7 +435,7 @@ impl RequestQueryTimer {
     /// know the statement will be counted. Extracted from the event handler so
     /// the start/finish accounting is unit-testable without constructing a
     /// (non-exhaustive, unstable-to-build) `InstrumentationEvent`.
-    fn on_start(&mut self, now: std::time::Instant, sql: impl FnOnce() -> String) {
+    fn on_start(&mut self, now: crate::time::MonotonicInstant, sql: impl FnOnce() -> String) {
         // Probe BOTH lanes: the timing accumulator (`server_timing`) and the
         // query-capture sink (test harness). Either being active means the
         // upcoming statement must be observed. When neither is scoped (the
@@ -414,7 +463,7 @@ impl RequestQueryTimer {
     /// Record the completion of the in-flight statement, accumulating its
     /// elapsed time into the per-request accumulator. A `FinishQuery` without
     /// a matching `StartQuery` is ignored.
-    fn on_finish(&mut self, now: std::time::Instant) {
+    fn on_finish(&mut self, now: crate::time::MonotonicInstant) {
         if let Some(p) = self.pending.take() {
             record_request_db_query(now.saturating_duration_since(p.started_at), Some(&p.sql));
         }
@@ -432,9 +481,13 @@ impl diesel::connection::Instrumentation for RequestQueryTimer {
                 // transaction-control statements (see the type-level docs). The
                 // `to_string()` is deferred behind a closure so an installed but
                 // opted-out timer never pays the allocation — see `on_start`.
-                self.on_start(std::time::Instant::now(), || query.to_string());
+                let now = self.clock.monotonic();
+                self.on_start(now, || query.to_string());
             }
-            InstrumentationEvent::FinishQuery { .. } => self.on_finish(std::time::Instant::now()),
+            InstrumentationEvent::FinishQuery { .. } => {
+                let now = self.clock.monotonic();
+                self.on_finish(now);
+            }
             // Ignore connection-establish, prepared-statement cache, and the
             // dedicated Begin/Commit/RollbackTransaction events — see the
             // type-level docs.
@@ -608,6 +661,15 @@ where
 /// Trait to abstract the state requirement for the `Db` extractor.
 /// This breaks the circular dependency between the database extractor
 /// and the central `AppState`.
+/// Process-wide handle to the real system clock, cloned by
+/// [`DbState::clock`]'s default body and by the state-less checkout paths.
+///
+/// A fresh `Arc::new(SystemClock)` per DB extraction would heap-allocate for a
+/// zero-sized type on every request; cloning one shared handle is a relaxed
+/// refcount bump.
+static DEFAULT_SYSTEM_CLOCK: std::sync::LazyLock<std::sync::Arc<dyn crate::time::ClockSource>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(crate::time::SystemClock));
+
 pub trait DbState {
     /// Returns the database connection pool, if configured.
     fn pool(&self) -> Option<&Pool<RuntimeConnection>>;
@@ -654,6 +716,18 @@ pub trait DbState {
     /// Returns the global statement timeout, if configured.
     fn statement_timeout(&self) -> Option<std::time::Duration> {
         None
+    }
+
+    /// Returns the app's injected clock, used to time connection checkouts and
+    /// individual statements.
+    ///
+    /// Defaults to the real [`crate::time::SystemClock`], which is exactly what
+    /// this timing read was before the clock became injectable — so an existing
+    /// `impl DbState` needs no change. [`crate::state::AppState`] overrides it
+    /// with the clock the app was built with, which is what makes DB timings
+    /// virtual (and reproducible) under a `#[sim_test]`.
+    fn clock(&self) -> std::sync::Arc<dyn crate::time::ClockSource> {
+        std::sync::Arc::clone(&DEFAULT_SYSTEM_CLOCK)
     }
 
     /// Returns the slow query threshold.
@@ -890,6 +964,11 @@ pub fn scrub_sql(sql: &str) -> String {
 /// fingerprint, record metrics, and map Postgres `57014` (statement timeout)
 /// to [`AutumnError::query_timeout`].
 ///
+/// Times the query on the **real** system clock. Prefer
+/// [`run_instrumented_with_clock`] where an injected clock is reachable, so the
+/// recorded latency follows virtual time under a
+/// [`#[sim_test]`](crate::sim_test).
+///
 /// # Parameters
 /// - `sql`: The raw SQL string for slow-query fingerprinting (scrubbed before logging).
 /// - `route_key`: Label string used for metrics, e.g. `"GET /users"`.
@@ -915,9 +994,60 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, diesel::result::Error>>,
 {
-    let start = std::time::Instant::now();
+    run_instrumented_with_clock(
+        &crate::time::SystemClock,
+        sql,
+        route_key,
+        slow_threshold,
+        metrics,
+        query,
+    )
+    .await
+}
+
+/// [`run_instrumented`], timing the query on an injected clock.
+///
+/// The determinism-seam twin (#1797): pass `state.clock()` and the recorded
+/// latency follows virtual time under a [`#[sim_test]`](crate::sim_test)
+/// instead of the real machine clock.
+///
+/// ```rust,ignore
+/// let rows = autumn_web::db::run_instrumented_with_clock(
+///     state.clock(),
+///     "SELECT …",
+///     "GET /users",
+///     slow_threshold,
+///     state.metrics(),
+///     || users::table.load(&mut conn),
+/// )
+/// .await?;
+/// ```
+///
+/// # Parameters
+///
+/// As [`run_instrumented`], plus `clock`: the source both timing readings are
+/// taken from. Borrowed rather than owned so
+/// [`AppState::clock`](crate::state::AppState::clock) — which hands out a
+/// `&dyn ClockSource` — is directly usable; no `Arc` handle is needed.
+///
+/// # Errors
+///
+/// As [`run_instrumented`].
+pub async fn run_instrumented_with_clock<F, Fut, T>(
+    clock: &dyn crate::time::ClockSource,
+    sql: &str,
+    route_key: &str,
+    slow_threshold: std::time::Duration,
+    metrics: &crate::middleware::metrics::MetricsCollector,
+    query: F,
+) -> Result<T, AutumnError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, diesel::result::Error>>,
+{
+    let start = clock.monotonic();
     let result = query().await;
-    let elapsed = start.elapsed();
+    let elapsed = clock.monotonic().saturating_duration_since(start);
     let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
 
     // Record metrics regardless of success/failure
@@ -2226,7 +2356,12 @@ pub struct Db {
     route_key: Option<String>,
     metrics: Option<crate::middleware::MetricsCollector>,
     slow_query_threshold: std::time::Duration,
-    start_time: std::time::Instant,
+    /// Checkout instant on the injected clock's monotonic timeline; `Drop`
+    /// subtracts it from a fresh reading to get the connection-hold duration.
+    start_time: crate::time::MonotonicInstant,
+    /// The app's injected clock, kept so `Drop` can take the closing reading
+    /// from the same timeline `start_time` came from.
+    clock: std::sync::Arc<dyn crate::time::ClockSource>,
     is_test_tx: bool,
 }
 
@@ -2681,6 +2816,11 @@ pub(crate) struct DbCheckoutParams<'a> {
     /// topology (see [`DatabaseTopology::capture_gap`]); `None` when they can.
     #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
     pub capture_gap: Option<std::sync::Arc<str>>,
+    /// The app's injected clock, supplying the checkout-to-release timing and
+    /// the per-statement query timer. Threaded through so connection latency is
+    /// virtual (and reproducible) under a `#[sim_test]` instead of being read
+    /// from a raw `std::time::Instant`.
+    pub clock: std::sync::Arc<dyn crate::time::ClockSource>,
 }
 
 /// The capsule attribution marker to merge into the checkout round trip, or
@@ -2847,7 +2987,9 @@ impl Db {
         {
             use diesel_async::AsyncConnection as _;
             if request_db_timing_active() || request_query_capture_active() {
-                conn.set_instrumentation(RequestQueryTimer::default());
+                conn.set_instrumentation(RequestQueryTimer::with_clock(std::sync::Arc::clone(
+                    &params.clock,
+                )));
             }
         }
 
@@ -2882,7 +3024,7 @@ impl Db {
             })?;
         }
 
-        let start_time = std::time::Instant::now();
+        let start_time = params.clock.monotonic();
         let is_test_tx = params
             .interceptors
             .iter()
@@ -2897,6 +3039,7 @@ impl Db {
             metrics: params.metrics,
             slow_query_threshold: params.slow_query_threshold,
             start_time,
+            clock: params.clock,
             is_test_tx,
         })
     }
@@ -2924,6 +3067,10 @@ impl Db {
             interceptors: Vec::new(),
             #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
             capture_gap: None,
+            // No `AppState` here by construction — this helper exists so a test
+            // can drive `Db::tx` against a bare pool. The real clock matches the
+            // behaviour this path had before the clock became injectable.
+            clock: std::sync::Arc::clone(&DEFAULT_SYSTEM_CLOCK),
         })
         .await
     }
@@ -2941,6 +3088,9 @@ pub(crate) struct RequestDbContext {
     pub metrics: Option<crate::middleware::MetricsCollector>,
     pub slow_query_threshold: std::time::Duration,
     pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+    /// The app's injected clock, carried so a shard-routed checkout times on
+    /// the same seam the plain `Db` extractor does.
+    pub clock: std::sync::Arc<dyn crate::time::ClockSource>,
 }
 
 impl RequestDbContext {
@@ -2958,6 +3108,7 @@ impl RequestDbContext {
             metrics: state.metrics().cloned(),
             slow_query_threshold: state.slow_query_threshold(),
             interceptors: state.db_interceptors(),
+            clock: state.clock(),
         }
     }
 }
@@ -2988,6 +3139,7 @@ where
             interceptors: ctx.interceptors,
             #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
             capture_gap: state.db_capture_gap(),
+            clock: ctx.clock,
         })
         .await;
         // Notify the RYWW task-local that a primary connection was checked out.
@@ -3002,7 +3154,10 @@ where
 impl Drop for Db {
     fn drop(&mut self) {
         if let (Some(route_key), Some(metrics)) = (&self.route_key, &self.metrics) {
-            let elapsed = self.start_time.elapsed();
+            let elapsed = self
+                .clock
+                .monotonic()
+                .saturating_duration_since(self.start_time);
             let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
 
             // Record DB query metric
@@ -3207,17 +3362,17 @@ mod tests {
                 let mut timer = RequestQueryTimer::default();
 
                 // Query 1: 1200µs.
-                let t0 = std::time::Instant::now();
+                let t0 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t0, || "SELECT 1".to_string());
-                timer.on_finish(t0 + Duration::from_micros(1_200));
+                timer.on_finish(t0.saturating_add(Duration::from_micros(1_200)));
 
                 // Query 2: 800µs.
-                let t1 = std::time::Instant::now();
+                let t1 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t1, || "UPDATE users SET name = $1".to_string());
-                timer.on_finish(t1 + Duration::from_micros(800));
+                timer.on_finish(t1.saturating_add(Duration::from_micros(800)));
 
                 // A stray FinishQuery with no matching StartQuery is ignored.
-                timer.on_finish(std::time::Instant::now());
+                timer.on_finish(crate::time::MonotonicInstant::ORIGIN);
             })
             .await;
 
@@ -3239,10 +3394,10 @@ mod tests {
     #[tokio::test]
     async fn request_query_timer_is_noop_off_request() {
         let mut timer = RequestQueryTimer::default();
-        let t0 = std::time::Instant::now();
+        let t0 = crate::time::MonotonicInstant::ORIGIN;
         timer.on_start(t0, || "SELECT 1".to_string());
         // Must not panic even though no task-local accumulator is scoped.
-        timer.on_finish(t0 + Duration::from_micros(500));
+        timer.on_finish(t0.saturating_add(Duration::from_micros(500)));
     }
 
     /// Approach-(b) guarantee: when no `REQUEST_DB_TIMINGS` scope is active,
@@ -3255,7 +3410,7 @@ mod tests {
     async fn request_query_timer_on_start_is_cheap_noop_off_request() {
         let mut timer = RequestQueryTimer::default();
         let invoked = std::cell::Cell::new(false);
-        let t0 = std::time::Instant::now();
+        let t0 = crate::time::MonotonicInstant::ORIGIN;
         timer.on_start(t0, || {
             invoked.set(true);
             "SELECT 1".to_string()
@@ -3265,7 +3420,7 @@ mod tests {
             "off-request, on_start must not format the SQL (no allocation)"
         );
         // No in-flight statement was recorded, so on_finish is a no-op.
-        timer.on_finish(t0 + Duration::from_micros(500));
+        timer.on_finish(t0.saturating_add(Duration::from_micros(500)));
     }
 
     /// Regression for the stale-timer / housekeeping-`SET` bug: a pooled
@@ -3285,9 +3440,9 @@ mod tests {
                 let mut timer = RequestQueryTimer::default();
 
                 // Checkout housekeeping `SET` — must not be counted.
-                let t0 = std::time::Instant::now();
+                let t0 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t0, || "SET statement_timeout = 5000".to_string());
-                timer.on_finish(t0 + Duration::from_millis(3));
+                timer.on_finish(t0.saturating_add(Duration::from_millis(3)));
 
                 assert_eq!(
                     timings.query_count.load(Ordering::Relaxed),
@@ -3301,9 +3456,9 @@ mod tests {
                 );
 
                 // First real application query: 600µs.
-                let t1 = std::time::Instant::now();
+                let t1 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t1, || "SELECT * FROM users".to_string());
-                timer.on_finish(t1 + Duration::from_micros(600));
+                timer.on_finish(t1.saturating_add(Duration::from_micros(600)));
 
                 assert_eq!(
                     timings.query_count.load(Ordering::Relaxed),
@@ -3374,19 +3529,19 @@ mod tests {
 
                 // BEGIN — must not be counted (10_000µs, would dominate if it
                 // leaked into the total).
-                let t0 = std::time::Instant::now();
+                let t0 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t0, || "BEGIN".to_string());
-                timer.on_finish(t0 + Duration::from_millis(10));
+                timer.on_finish(t0.saturating_add(Duration::from_millis(10)));
 
                 // The single real query: 700µs.
-                let t1 = std::time::Instant::now();
+                let t1 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t1, || "SELECT * FROM users".to_string());
-                timer.on_finish(t1 + Duration::from_micros(700));
+                timer.on_finish(t1.saturating_add(Duration::from_micros(700)));
 
                 // COMMIT — must not be counted.
-                let t2 = std::time::Instant::now();
+                let t2 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t2, || "COMMIT".to_string());
-                timer.on_finish(t2 + Duration::from_millis(10));
+                timer.on_finish(t2.saturating_add(Duration::from_millis(10)));
             })
             .await;
 

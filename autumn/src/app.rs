@@ -24,6 +24,14 @@
 //! }
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::any::{Any, TypeId};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -4182,9 +4190,14 @@ impl AppBuilder {
         // Shared timestamp: set by shutdown_task when the listener is cancelled
         // (phase 5). Main reads it after server_task completes to measure only
         // actual drain time for hook budget — not the app's full uptime.
-        let drain_started_at: std::sync::Arc<std::sync::OnceLock<std::time::Instant>> =
+        let drain_started_at: std::sync::Arc<std::sync::OnceLock<crate::time::MonotonicInstant>> =
             std::sync::Arc::new(std::sync::OnceLock::new());
         let drain_started_clone = std::sync::Arc::clone(&drain_started_at);
+        // The shutdown task does not capture `state`, so hand it its own handle
+        // on the injected clock — the drain window is measured on the same
+        // monotonic timeline `hook_budget` is computed from below.
+        let drain_clock = state.clock_arc();
+        let drain_clock_for_task = std::sync::Arc::clone(&drain_clock);
 
         // Notified by main just before server_task.await (after startup hooks
         // complete). If SIGTERM arrives during startup hooks the watchdog waits
@@ -4239,7 +4252,7 @@ impl AppBuilder {
             // Phase 5: stop listener and signal jobs/scheduler to stop dequeuing.
             // Record drain-start before cancelling so main gets the right hook
             // budget even in the startup-overlap case.
-            let _ = drain_started_clone.set(std::time::Instant::now());
+            let _ = drain_started_clone.set(drain_clock_for_task.monotonic());
             shutdown_signal_token.cancel();
 
             // Phase 6: drain watchdog — if in-flight drain exceeds the budget,
@@ -4362,7 +4375,9 @@ impl AppBuilder {
         // so app hooks run before plugin hooks (LIFO = last-registered first).
         let drain_elapsed = drain_started_at
             .get()
-            .map_or(std::time::Duration::ZERO, std::time::Instant::elapsed);
+            .map_or(std::time::Duration::ZERO, |started| {
+                drain_clock.monotonic().saturating_duration_since(*started)
+            });
         let hook_budget =
             std::time::Duration::from_secs(shutdown_timeout).saturating_sub(drain_elapsed);
         run_shutdown_hooks_with_timeout(&shutdown_hooks, hook_budget, hook_budget).await;
@@ -6107,9 +6122,10 @@ fn start_task_scheduler_with_config(
                 let shutdown = shutdown.child_token();
                 tokio::spawn(async move {
                     loop {
-                        state
-                            .task_registry
-                            .record_next_run_at(&name, &format_next_task_run_after(delay));
+                        state.task_registry.record_next_run_at(
+                            &name,
+                            &format_next_task_run_after(state.clock().now(), delay),
+                        );
                         tokio::select! {
                             () = shutdown.cancelled() => break,
                             () = tokio::time::sleep(delay) => {
@@ -6163,7 +6179,7 @@ fn send_ws_sys_task_msg(
         let mut msg = serde_json::json!({
             "event": event,
             "task": name,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "timestamp": state.clock().now().to_rfc3339(),
         });
         if let Some(map) = msg.as_object_mut() {
             for (k, v) in extra {
@@ -6174,10 +6190,19 @@ fn send_ws_sys_task_msg(
     }
 }
 
+/// Milliseconds elapsed since `start` on the app's injected monotonic clock.
+///
+/// Every scheduled-task duration goes through here so a `#[sim_test]` reports
+/// virtual run times (and two same-seed runs agree) instead of real ones.
+fn task_duration_ms(state: &AppState, start: crate::time::MonotonicInstant) -> u64 {
+    let elapsed = state.monotonic().saturating_duration_since(start);
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
 async fn execute_task_result(
     state: &AppState,
     handler: crate::task::TaskHandler,
-    start: std::time::Instant,
+    start: crate::time::MonotonicInstant,
     name: &str,
     schedule: &'static str,
 ) -> Result<u64, (u64, String)> {
@@ -6196,12 +6221,12 @@ async fn execute_task_result(
     })) {
         Ok(future) => future,
         Err(panic) => {
-            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let duration_ms = task_duration_ms(state, start);
             return Err((duration_ms, format_scheduled_task_panic(panic.as_ref())));
         }
     };
     let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
-    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let duration_ms = task_duration_ms(state, start);
 
     match result {
         Ok(Ok(())) => Ok(duration_ms),
@@ -6222,7 +6247,7 @@ fn format_scheduled_task_panic(panic: &(dyn Any + Send)) -> String {
 async fn execute_task_result_with_optional_lease_ttl(
     state: &AppState,
     handler: crate::task::TaskHandler,
-    start: std::time::Instant,
+    start: crate::time::MonotonicInstant,
     name: &str,
     schedule: &'static str,
     lease_ttl: Option<std::time::Duration>,
@@ -6237,7 +6262,7 @@ async fn execute_task_result_with_optional_lease_ttl(
     )
     .await
     .unwrap_or_else(|_| {
-        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let duration_ms = task_duration_ms(state, start);
         Err((
             duration_ms,
             format!(
@@ -6286,7 +6311,7 @@ async fn execute_fixed_delay_task(
 
     send_ws_sys_task_msg(&state, "started", &name, vec![]);
 
-    let start = std::time::Instant::now();
+    let start = state.monotonic();
     let lease_ttl = lease_ttl_for_run(&lease, coordination, lease_ttl);
     match execute_task_result_with_optional_lease_ttl(
         &state,
@@ -6366,7 +6391,7 @@ async fn execute_cron_task(
 
     send_ws_sys_task_msg(&state, "started", &name, vec![]);
 
-    let start = std::time::Instant::now();
+    let start = state.monotonic();
     let lease_ttl = lease_ttl_for_run(&lease, coordination, lease_ttl);
     match execute_task_result_with_optional_lease_ttl(
         &state, handler, start, &name, "cron", lease_ttl,
@@ -6481,10 +6506,10 @@ async fn run_cron_task_loop(
             )
         })
         .unwrap_or(chrono_tz::UTC);
-    let mut cursor = chrono::Utc::now().with_timezone(&timezone);
+    let mut cursor = state.clock().now().with_timezone(&timezone);
 
     loop {
-        let now = chrono::Utc::now().with_timezone(&timezone);
+        let now = state.clock().now().with_timezone(&timezone);
         let scheduled_at = match next_cron_occurrence_after(&cron, &cursor, &now) {
             Ok(scheduled_at) => scheduled_at,
             Err(error) => {
@@ -6496,11 +6521,11 @@ async fn run_cron_task_loop(
             &name,
             &scheduled_at.with_timezone(&chrono::Utc).to_rfc3339(),
         );
-        let sleep_for = cron_sleep_duration_until(&scheduled_at);
+        let sleep_for = cron_sleep_duration_until(state.clock().now(), &scheduled_at);
         tokio::select! {
             () = shutdown.cancelled() => break,
             () = tokio::time::sleep(sleep_for) => {
-                let woke_at = chrono::Utc::now().with_timezone(&timezone);
+                let woke_at = state.clock().now().with_timezone(&timezone);
                 match cron_occurrence_is_overdue(&cron, &scheduled_at, &woke_at) {
                     Ok(true) => {
                         tracing::warn!(
@@ -6534,12 +6559,25 @@ async fn run_cron_task_loop(
     }
 }
 
-fn format_next_task_run_after(delay: std::time::Duration) -> String {
-    let now = chrono::Utc::now();
-    let Ok(delay) = chrono::TimeDelta::from_std(delay) else {
-        return now.to_rfc3339();
-    };
-    (now + delay).to_rfc3339()
+/// Render the next fixed-delay run time, `delay` after `now`.
+///
+/// `now` is passed in (rather than read here) so the caller supplies it from the
+/// app's injected clock and the rendered `next_run_at` follows virtual time
+/// under a `#[sim_test]`.
+///
+/// Goes through [`crate::job::due_at_from`] for the addition rather than `now +
+/// delay`. Once `now` comes from an injected clock it is no longer bounded by
+/// real time, and chrono's `Add` **panics** on overflow — a clock pinned near
+/// `DateTime::MAX_UTC` would kill this scheduler task before its first run, for
+/// a value that only ends up in a log line. `due_at_from` already owns that
+/// clamp for the job queue's deadlines; sharing it keeps the two from drifting
+/// apart, and makes an unrepresentable delay render as the far future rather
+/// than as `now` (which would read as "runs immediately").
+fn format_next_task_run_after(
+    now: chrono::DateTime<chrono::Utc>,
+    delay: std::time::Duration,
+) -> String {
+    crate::job::due_at_from(now, delay).to_rfc3339()
 }
 
 fn next_cron_occurrence_after<Tz: chrono::TimeZone>(
@@ -6560,12 +6598,20 @@ fn cron_occurrence_is_overdue<Tz: chrono::TimeZone>(
     Ok(&next_after_scheduled <= now)
 }
 
+/// How long to sleep from `now` until `scheduled_at`, saturating at zero for a
+/// target already in the past.
+///
+/// `now` is passed in so the caller supplies it from the app's injected clock.
+/// Note the caller must keep this in step with `tokio::time::sleep`: under a
+/// `#[sim_test]` both the injected clock and tokio's timer wheel are advanced
+/// together by `Sim::advance`, which is what keeps the loop from spinning.
 fn cron_sleep_duration_until<Tz: chrono::TimeZone>(
+    now: chrono::DateTime<chrono::Utc>,
     scheduled_at: &chrono::DateTime<Tz>,
 ) -> std::time::Duration {
     scheduled_at
         .with_timezone(&chrono::Utc)
-        .signed_duration_since(chrono::Utc::now())
+        .signed_duration_since(now)
         .to_std()
         .unwrap_or_default()
 }
@@ -6675,7 +6721,21 @@ enum BoundListener {
 }
 
 /// Current UNIX time in seconds, saturating on the (impossible) pre-epoch case.
+///
+/// Deliberately **real** time, not the injected clock: this is the reference
+/// instant TLS certificate validity is judged against
+/// ([`crate::tls::load_certified_key`]). A certificate's `notBefore`/`notAfter`
+/// are facts about the real world, so a test or simulation clock pinned to the
+/// sim epoch must never be able to declare a live certificate not-yet-valid (or
+/// an expired one fine). It also runs at bind time and on a `spawn_blocking`
+/// reload timer, neither of which is on a request path a sim drives.
 #[cfg(feature = "tls")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "TLS certificate validity is judged against real wall time by \
+              design — see this function's doc comment. Injecting a virtual \
+              clock here would let a simulation misjudge a real certificate."
+)]
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9600,7 +9660,7 @@ fn build_state(
             .and_then(|topology| topology.capture_gap().map(std::sync::Arc::from)),
         profile: config.profile.clone(),
         role: config.role,
-        started_at: std::time::Instant::now(),
+        started_at: crate::time::monotonic_now(),
         health_detailed: config.health.detailed,
         probes: crate::probe::ProbeState::pending_startup(),
         metrics: crate::middleware::MetricsCollector::new(),
@@ -9875,6 +9935,41 @@ async fn canary_rollback_signal(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    /// A clock near the end of representable time must not kill the scheduler.
+    ///
+    /// `format_next_task_run_after` runs at the top of every fixed-delay loop.
+    /// While `now` came from real time its sum with an ordinary delay could not
+    /// overflow, but an injected clock is unbounded, and chrono's `Add` panics
+    /// rather than wrapping — so a `FixedClock` near `DateTime::MAX_UTC` would
+    /// take the task down before its first run, over a string for a log line.
+    #[test]
+    fn next_task_run_saturates_instead_of_panicking_at_the_end_of_time() {
+        let max = chrono::DateTime::<chrono::Utc>::MAX_UTC;
+
+        // An ordinary delay that would carry `now` past the representable end.
+        let rendered = super::format_next_task_run_after(max, std::time::Duration::from_secs(60));
+        assert_eq!(
+            rendered,
+            max.to_rfc3339(),
+            "a fixed delay past the end of time must clamp, not panic"
+        );
+
+        // A delay too large for `TimeDelta` at all renders as the far future,
+        // not as `now` — the latter would read as "this task runs immediately".
+        let absurd = super::format_next_task_run_after(
+            chrono::Utc::now(),
+            std::time::Duration::from_secs(u64::MAX),
+        );
+        assert_eq!(absurd, max.to_rfc3339());
+
+        // The ordinary case is unchanged.
+        let epoch = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        assert_eq!(
+            super::format_next_task_run_after(epoch, std::time::Duration::from_secs(60)),
+            (epoch + chrono::TimeDelta::seconds(60)).to_rfc3339()
+        );
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -10168,7 +10263,7 @@ mod tests {
             db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -12064,7 +12159,7 @@ mod tests {
             db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -12182,7 +12277,7 @@ mod tests {
             db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -12541,7 +12636,7 @@ mod tests {
             db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -12867,7 +12962,7 @@ mod tests {
             db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -13025,7 +13120,7 @@ mod tests {
             db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -13081,7 +13176,7 @@ mod tests {
             db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -13347,7 +13442,7 @@ mod tests {
             db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -13427,7 +13522,7 @@ mod tests {
             db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -13488,7 +13583,7 @@ mod tests {
     async fn execute_task_result_ok_returns_duration() {
         let state = AppState::for_test();
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
-        let start = std::time::Instant::now();
+        let start = state.monotonic();
         let result =
             super::execute_task_result(&state, handler, start, "test_task", "fixed_delay").await;
         assert!(result.is_ok(), "expected Ok from successful handler");
@@ -13501,7 +13596,7 @@ mod tests {
         let state = AppState::for_test();
         let handler: crate::task::TaskHandler =
             |_| Box::pin(async { Err(crate::AutumnError::bad_request_msg("test error")) });
-        let start = std::time::Instant::now();
+        let start = state.monotonic();
         let result =
             super::execute_task_result(&state, handler, start, "test_task", "fixed_delay").await;
         assert!(result.is_err(), "expected Err from failing handler");
@@ -13519,7 +13614,7 @@ mod tests {
     #[tokio::test]
     async fn execute_task_result_reports_immediate_handler_panics() {
         let state = AppState::for_test();
-        let start = std::time::Instant::now();
+        let start = state.monotonic();
         let result = super::execute_task_result(
             &state,
             instantly_panicking_scheduled_handler,

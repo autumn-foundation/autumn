@@ -3,6 +3,13 @@
 //! Provides [`JobInfo`] metadata used by `#[job]` and `jobs![]`, plus local
 //! and Redis-backed queue backends.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -1011,11 +1018,20 @@ struct JobAdminStoredRecord {
 }
 
 impl JobAdminStoredRecord {
+    /// Sort key for the admin dashboard: the newest timestamp the record
+    /// carries, newest-first after the caller's `reverse()`.
+    ///
+    /// A record with no timestamp at all sorts as if it were the newest thing
+    /// in the list. That used to be spelled `unwrap_or_else(Utc::now)`, which
+    /// both read the clock off-seam and made an ordering depend on when the
+    /// dashboard happened to be rendered; `MAX_UTC` expresses the same
+    /// "sorts newest" intent as a constant, since every real recorded timestamp
+    /// is in the past.
     fn sort_time(&self) -> chrono::DateTime<chrono::Utc> {
         self.finished_at
             .or(self.started_at)
             .or(self.enqueued_at)
-            .unwrap_or_else(chrono::Utc::now)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
     }
 
     fn to_public(&self) -> JobAdminRecord {
@@ -1816,28 +1832,36 @@ enum RedisStaleRecovery {
     DeadLetter(RedisJobRecord),
 }
 
+/// Rate-limits a periodic maintenance sweep inside the redis worker loop.
+///
+/// Deadlines are [`tokio::time::Instant`]s, not `std::time::Instant`s, because
+/// the thing that wakes this loop is `tokio::time::sleep` — a throttle is only
+/// meaningful against its own counterparty, and putting both on tokio's
+/// timeline keeps them from disagreeing. It also makes the throttle virtual for
+/// free: `Sim::advance` steps tokio's paused timer wheel, so a `#[sim_test]`
+/// drives these sweeps deterministically with no real waiting.
 #[cfg(feature = "redis")]
 struct RedisMaintenanceThrottle {
-    next_run_at: std::time::Instant,
+    next_run_at: tokio::time::Instant,
     interval: std::time::Duration,
 }
 
 #[cfg(feature = "redis")]
 impl RedisMaintenanceThrottle {
-    const fn new(now: std::time::Instant, interval: std::time::Duration) -> Self {
+    const fn new(now: tokio::time::Instant, interval: std::time::Duration) -> Self {
         Self {
             next_run_at: now,
             interval,
         }
     }
 
-    fn take_due(&mut self, now: std::time::Instant) -> bool {
+    fn take_due(&mut self, now: tokio::time::Instant) -> bool {
         if now < self.next_run_at {
             return false;
         }
         // The interval is config-derived (`retry_promotion_interval`), and
         // `Instant + Duration` panics when the sum is not representable.
-        self.next_run_at = crate::time_math::saturating_deadline(now, self.interval);
+        self.next_run_at = crate::time_math::saturating_tokio_deadline(now, self.interval);
         true
     }
 }
@@ -1978,6 +2002,11 @@ struct RedisWorkerConfig {
     default_attempts: u32,
     default_backoff: u64,
     retry_promotion_interval: std::time::Duration,
+    /// The app's injected clock. Redis job records carry absolute
+    /// millisecond timestamps (`enqueued_at_ms`, due-at scores, visibility
+    /// deadlines), so they must be minted from the same clock the rest of the
+    /// runtime reads — never `SystemTime::now()` off-seam.
+    clock: Arc<dyn crate::time::ClockSource>,
 }
 
 #[cfg(feature = "redis")]
@@ -2292,17 +2321,59 @@ pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
     client.enqueue(name, payload).await
 }
 
-/// Convert a relative delay into an absolute due instant.
+/// Resolve the process-global [`JobClient`], or the standard "runtime is not
+/// initialized" error.
+///
+/// Callers that need *both* the client's clock and its enqueue path must hold
+/// this one handle across both — see the note in [`enqueue_in`].
+fn require_job_client() -> AutumnResult<Arc<JobClient>> {
+    global_job_client().ok_or_else(|| {
+        AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        ))
+    })
+}
+
+/// The instant a relative delay is measured from, given which backend will
+/// decide whether the deadline has arrived.
+///
+/// Free function taking the decision as a parameter so both arms are reachable
+/// from a unit test — the Postgres arm otherwise needs a live pool. See
+/// [`JobClient::due_origin`] for why the two arms differ.
+fn due_origin_for(
+    durable_is_pg: bool,
+    clock: &dyn crate::time::ClockSource,
+) -> chrono::DateTime<chrono::Utc> {
+    if durable_is_pg {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the Postgres claim query compares `run_at <= NOW()` on the DATABASE \
+                      clock, so a deadline for that backend has to be measured from the \
+                      same real timeline; the injected clock would put `run_at` years off \
+                      the one it is compared to. See `JobClient::due_origin`."
+        )]
+        return chrono::Utc::now();
+    }
+    clock.now()
+}
+
+/// Convert a relative delay into an absolute due instant, measured from `now`.
 ///
 /// Saturates to `DateTime::MAX` on overflow (practically impossible).
-fn delay_to_when(delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
+///
+/// The single home of the overflow clamp: every enqueue-side due-time
+/// computation reaches it through [`JobClient::delay_to_when`], so a
+/// pathological delay can never panic on one path and clamp on another.
+pub(crate) fn due_at_from(
+    now: chrono::DateTime<chrono::Utc>,
+    delay: std::time::Duration,
+) -> chrono::DateTime<chrono::Utc> {
     // chrono::TimeDelta::from_std returns Err on overflow (>i64::MAX nanoseconds).
     // Fall back to MAX_UTC rather than panicking.
     let Ok(delta) = chrono::TimeDelta::from_std(delay) else {
         return chrono::DateTime::<chrono::Utc>::MAX_UTC;
     };
-    chrono::Utc::now()
-        .checked_add_signed(delta)
+    now.checked_add_signed(delta)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
 }
 
@@ -2330,8 +2401,18 @@ pub async fn enqueue_in(
     payload: Value,
     delay: std::time::Duration,
 ) -> AutumnResult<()> {
-    let when = delay_to_when(delay);
-    enqueue_at(name, payload, when).await
+    // Resolve the global client ONCE and both read its clock and submit
+    // through it. Computing the due instant via the free `delay_to_when` and
+    // then calling `enqueue_at` would look up the global twice, and the global
+    // is a swappable `RwLock` (see `global_job_client`): a concurrent
+    // `TestApp::build` between the two lookups would stamp the due instant
+    // from app A's virtual clock and submit it to app B, whose runtime filters
+    // due-at against *its* clock — the job would be years off B's timeline and
+    // never become due. Same failure mode as the real-time bug this migration
+    // fixed, arrived at from the other direction.
+    let client = require_job_client()?;
+    let when = client.delay_to_when(delay);
+    client.enqueue_due(name, payload, Some(when)).await
 }
 
 /// Enqueue a one-shot job to run once at the absolute instant `when`.
@@ -2350,11 +2431,7 @@ pub async fn enqueue_at(
     payload: Value,
     when: chrono::DateTime<chrono::Utc>,
 ) -> AutumnResult<()> {
-    let Some(client) = global_job_client() else {
-        return Err(AutumnError::internal_server_error(std::io::Error::other(
-            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
-        )));
-    };
+    let client = require_job_client()?;
     client.enqueue_due(name, payload, Some(when)).await
 }
 
@@ -2417,8 +2494,18 @@ pub async fn enqueue_in_on_conn<A: serde::Serialize>(
     delay: std::time::Duration,
     conn: &mut diesel_async::AsyncPgConnection,
 ) -> AutumnResult<()> {
-    let when = delay_to_when(delay);
-    enqueue_at_on_conn(name, args, when, conn).await
+    // One global lookup for both the clock read and the enqueue — see the note
+    // in `enqueue_in`.
+    let payload = serde_json::to_value(&args).map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "job args serialization failed: {e}"
+        )))
+    })?;
+    let client = require_job_client()?;
+    let when = client.delay_to_when(delay);
+    client
+        .enqueue_on_conn_due(name, payload, conn, Some(when))
+        .await
 }
 
 /// Transactional delayed enqueue at an absolute instant. See
@@ -2440,11 +2527,7 @@ pub async fn enqueue_at_on_conn<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    let Some(client) = global_job_client() else {
-        return Err(AutumnError::internal_server_error(std::io::Error::other(
-            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
-        )));
-    };
+    let client = require_job_client()?;
     client
         .enqueue_on_conn_due(name, payload, conn, Some(when))
         .await
@@ -2580,7 +2663,109 @@ pub async fn enqueue_in_tx<A: serde::Serialize>(
     enqueue_on_conn(name, args, conn).await
 }
 
+#[cfg(test)]
 impl JobClient {
+    /// A `JobClient` with no backend installed, for unit tests that only need
+    /// its clock/entropy seams. Callers set whichever backend field the case is
+    /// about, so a new field lands in one place rather than in every test.
+    fn bare_for_test(clock: Arc<dyn crate::time::ClockSource>) -> Self {
+        Self {
+            local_sender: None,
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 250,
+            per_job_settings: HashMap::new(),
+            interceptor: None,
+            entropy: Arc::new(crate::entropy::OsEntropy),
+            clock,
+            resilience_config: None,
+        }
+    }
+}
+
+impl JobClient {
+    /// Convert a relative delay into an absolute due instant, measured from
+    /// the clock the **serving backend** will later compare it against.
+    ///
+    /// See [`Self::due_origin`] for why that is not unconditionally this
+    /// client's injected clock.
+    fn delay_to_when(&self, delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
+        due_at_from(self.due_origin(), delay)
+    }
+
+    /// The instant a relative delay is measured from.
+    ///
+    /// A due instant is only meaningful against the clock that decides whether
+    /// it has arrived, and the backends do not share one:
+    ///
+    /// * **local** filters `due_at` against `self.clock.now()`, and
+    /// * **redis** scores its delayed set against `now_unix_ms(self.clock)`,
+    ///
+    /// so both must be stamped from the injected clock — that is what makes
+    /// `Sim::advance` bring a delayed job due, and it is the bug the RED test
+    /// `sim_delayed_enqueue` was written for.
+    ///
+    /// **Postgres does not.** Its claim query is `WHERE … run_at <= NOW()`,
+    /// evaluated by the database on the database's wall clock, and `run_at` is
+    /// a shared column every process claims against. Stamping it from a virtual
+    /// clock puts it years off the timeline it is compared to: a clock behind
+    /// the database makes the job claimable immediately, one ahead defers it
+    /// indefinitely. So the durable path keeps measuring from real time —
+    /// exactly as it did before the clock migration.
+    ///
+    /// Mirrors the backend precedence in `enqueue_with_outcome_due` /
+    /// `enqueue_durable_inner`: local, then redis, then Postgres.
+    ///
+    /// **Every** decision about a due instant must come from this one function
+    /// — both the stamping in [`Self::delay_to_when`] and the "is it actually in
+    /// the future" filters in `enqueue_with_outcome_due` /
+    /// `enqueue_on_conn_due`. A deadline is only in the future relative to the
+    /// clock that produced it; stamping from one origin and filtering against
+    /// another silently converts a delayed job into an immediate one.
+    ///
+    /// The residual app-vs-database clock skew on the Postgres path is the
+    /// ordinary NTP-scale condition this queue has always run under, unchanged
+    /// by the migration. Computing the deadline in the database itself
+    /// (`run_at = NOW() + $delay * INTERVAL '1 millisecond'`, as the backoff
+    /// path at the nack UPDATE already does) would remove even that, and is the
+    /// natural follow-up; it needs the relative/absolute distinction threaded
+    /// down to `pg_insert_job`, which is more surgery than this migration
+    /// should carry.
+    fn due_origin(&self) -> chrono::DateTime<chrono::Utc> {
+        due_origin_for(self.durable_is_pg(), self.clock.as_ref())
+    }
+
+    /// Whether a Postgres INSERT — rather than the local channel or the redis
+    /// queue — is what will serve an enqueue on this client.
+    ///
+    /// Mirrors the branch order in `enqueue_with_outcome_due` (local first) and
+    /// `enqueue_durable_inner` (redis before Postgres). Split out so the
+    /// decision and the clock read can each be tested on their own; reaching
+    /// the Postgres arm through this method needs a live pool.
+    const fn durable_is_pg(&self) -> bool {
+        if self.local_sender.is_some() {
+            return false;
+        }
+        #[cfg(feature = "redis")]
+        if self.redis.is_some() {
+            return false;
+        }
+        #[cfg(feature = "db")]
+        {
+            self.pg_pool.is_some()
+        }
+        #[cfg(not(feature = "db"))]
+        {
+            false
+        }
+    }
+
     /// Enqueue a job by name with a JSON payload.
     ///
     /// # Errors
@@ -2634,7 +2819,17 @@ impl JobClient {
         // Capture the reference instant once so every downstream decision
         // (filter, admin record status, local-backend sleep) uses a consistent
         // clock reading and near-due jobs cannot be misclassified.
-        let now = self.clock.now();
+        //
+        // This must be [`Self::due_origin`], not `self.clock.now()`: it is the
+        // same instant `delay_to_when` measured the deadline from, and a
+        // deadline is only "in the future" relative to the clock that stamped
+        // it. Reading the injected clock here while the Postgres path stamps
+        // from real time would make a `TestApp` pinned ahead of real time
+        // discard every durable deadline as already past and insert an
+        // immediately-runnable job. For the local and redis backends
+        // `due_origin` *is* `self.clock.now()`, so this is unchanged there —
+        // including the local-backend sleep computed from `now` below.
+        let now = self.due_origin();
         // Only treat a due time strictly in the future as "delayed"; a past or
         // absent due time enqueues for immediate execution exactly as before.
         let due_at = due_at.filter(|due| *due > now);
@@ -3013,7 +3208,12 @@ impl JobClient {
             // AfterCommitDue::After delay is measured from commit time.
             let due_at = match due {
                 AfterCommitDue::At(at) => at,
-                AfterCommitDue::After(d) => Some(delay_to_when(d)),
+                // This client's own clock, not the process-global one: an
+                // after-commit enqueue belongs to the app whose transaction just
+                // committed, and resolving the global handle again here would
+                // both take a second `RwLock` round-trip and read a different
+                // app's clock in a multi-app test process.
+                AfterCommitDue::After(d) => Some(client.delay_to_when(d)),
             };
             async move { client.enqueue_due(&name, payload, due_at).await }
         });
@@ -3229,7 +3429,8 @@ impl JobClient {
         due_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AutumnResult<()> {
         crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
-        let due_at = due_at.filter(|due| *due > self.clock.now());
+        // Same origin that stamped the deadline — see `enqueue_with_outcome_due`.
+        let due_at = due_at.filter(|due| *due > self.due_origin());
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
@@ -3439,9 +3640,27 @@ pub fn start_runtime(
 /// map is sufficient: a crashed process loses the queue itself along with any
 /// held keys, which means a dead worker can never deadlock a key beyond the
 /// process lifetime.
-#[derive(Default)]
 pub(crate) struct LocalJobCoordination {
     inner: std::sync::Mutex<LocalJobCoordinationInner>,
+    /// Injected clock backing unique-hold TTL expiry.
+    ///
+    /// Read inside the mutex critical section (so the `Arc` deref is free) and
+    /// only when a `unique_for` window is configured. Under a `#[sim_test]` this
+    /// makes a uniqueness window expire when `Sim::advance` crosses it rather
+    /// than when the real machine clock does.
+    clock: Arc<dyn crate::time::ClockSource>,
+}
+
+impl Default for LocalJobCoordination {
+    /// Coordination on the real system clock — the behaviour before the clock
+    /// became injectable. The runtime installs the app's clock via
+    /// [`with_clock`](LocalJobCoordination::with_clock).
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::default(),
+            clock: Arc::new(crate::time::SystemClock),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -3453,7 +3672,77 @@ struct LocalJobCoordinationInner {
 
 struct LocalUniqueHold {
     job_id: String,
-    expires_at: Option<std::time::Instant>,
+    expires_at: Option<crate::time::MonotonicInstant>,
+}
+
+#[cfg(test)]
+mod local_unique_hold_clock_tests {
+    use super::{JobUniquenessWindow, LocalJobCoordination};
+    use crate::time::TickingClock;
+    use chrono::{TimeZone, Utc};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// The `unique_for` window must expire on the clock the runtime was built
+    /// with, so a `#[sim_test]` can cross it with `Sim::advance` instead of
+    /// waiting out real time (issue #1797).
+    ///
+    /// This is the assertion that pins the TTL to the seam: before the
+    /// migration the hold's `expires_at` came from `std::time::Instant::now()`,
+    /// which no injected clock — and no paused tokio runtime — can move.
+    #[test]
+    fn unique_hold_ttl_expires_on_the_injected_clock() {
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let clock = TickingClock::starting_at(epoch);
+        let coordination = LocalJobCoordination::with_clock(Arc::new(clock.clone()));
+        let window = JobUniquenessWindow::TtlMs(300_000); // five minutes
+
+        assert!(
+            coordination.try_acquire_unique("probe", "k", "job-1", window),
+            "the first acquire takes the hold"
+        );
+        assert!(
+            !coordination.try_acquire_unique("probe", "k", "job-2", window),
+            "a second acquire inside the window must coalesce"
+        );
+
+        // Four virtual minutes: still inside the window, and — crucially — the
+        // machine clock has not moved at all.
+        clock.advance(Duration::from_secs(240));
+        assert!(
+            !coordination.try_acquire_unique("probe", "k", "job-3", window),
+            "the window must not expire early"
+        );
+
+        // Past five minutes of VIRTUAL time. Nothing here sleeps.
+        clock.advance(Duration::from_secs(120));
+        assert!(
+            coordination.try_acquire_unique("probe", "k", "job-4", window),
+            "the hold must expire once the injected clock crosses the TTL"
+        );
+    }
+
+    /// Two coordinations on identically-driven clocks must agree exactly — the
+    /// reproducibility half of the same property.
+    #[test]
+    fn unique_hold_expiry_is_reproducible_across_identical_clocks() {
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let window = JobUniquenessWindow::TtlMs(1_000);
+        let outcome = |steps: &[u64]| {
+            let clock = TickingClock::starting_at(epoch);
+            let coordination = LocalJobCoordination::with_clock(Arc::new(clock.clone()));
+            let mut seen = Vec::new();
+            seen.push(coordination.try_acquire_unique("p", "k", "a", window));
+            for step in steps {
+                clock.advance(Duration::from_millis(*step));
+                seen.push(coordination.try_acquire_unique("p", "k", "b", window));
+            }
+            seen
+        };
+        let steps = [200, 300, 600, 100];
+        assert_eq!(outcome(&steps), outcome(&steps));
+        assert_eq!(outcome(&steps), vec![true, false, false, true, false]);
+    }
 }
 
 fn local_unique_hold_key(name: &str, unique_key: &str) -> String {
@@ -3470,6 +3759,14 @@ enum LocalSlotDecision {
 }
 
 impl LocalJobCoordination {
+    /// Coordination reading TTL expiry from `clock` (the app's injected clock).
+    fn with_clock(clock: Arc<dyn crate::time::ClockSource>) -> Self {
+        Self {
+            inner: std::sync::Mutex::default(),
+            clock,
+        }
+    }
+
     /// Try to hold the unique key for `job_id`; `false` means an equivalent
     /// job already holds it (the enqueue should coalesce).
     fn try_acquire_unique(
@@ -3483,7 +3780,7 @@ impl LocalJobCoordination {
             return true;
         };
         let key = local_unique_hold_key(name, unique_key);
-        let now = std::time::Instant::now();
+        let now = self.clock.monotonic();
         if let Some(hold) = inner.unique_holds.get(&key) {
             let expired = hold.expires_at.is_some_and(|expires_at| expires_at <= now);
             if !expired {
@@ -3494,10 +3791,9 @@ impl LocalJobCoordination {
             // `unique_for` is app-supplied, and `Instant + Duration` panics
             // when the sum is not representable on the platform clock; clamp
             // so an absurd window means "holds effectively forever".
-            JobUniquenessWindow::TtlMs(ms) => Some(crate::time_math::saturating_deadline(
-                now,
-                std::time::Duration::from_millis(ms),
-            )),
+            JobUniquenessWindow::TtlMs(ms) => {
+                Some(now.saturating_add(std::time::Duration::from_millis(ms)))
+            }
             JobUniquenessWindow::Pending | JobUniquenessWindow::Running => None,
         };
         inner.unique_holds.insert(
@@ -3636,7 +3932,7 @@ pub(crate) fn start_local_runtime_inner(
     // `workers.max(1)` floor so zero worker loops run.
     let worker_count = if run_workers { workers.max(1) } else { 0 };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<QueuedJob>(1024);
-    let coordination = Arc::new(LocalJobCoordination::default());
+    let coordination = Arc::new(LocalJobCoordination::with_clock(state.clock_arc()));
 
     // Build the priority drain schedule from `[jobs] queues`, appending any
     // queue declared on a job but missing from config at lowest priority so it
@@ -4343,6 +4639,12 @@ fn finish_local_slot(
 #[derive(Clone)]
 struct RedisClient {
     connection: redis::aio::ConnectionManager,
+    /// The app's injected clock. Redis job records carry absolute
+    /// millisecond timestamps (`enqueued_at_ms`, due-at scores, visibility
+    /// deadlines), so they must be minted from the same clock the rest of the
+    /// runtime reads — never `SystemTime::now()` off-seam.
+    clock: Arc<dyn crate::time::ClockSource>,
+
     /// Base key prefix (e.g. `autumn:jobs`) used to derive per-queue list keys.
     key_prefix: String,
     /// ZSET keyed by due-time-ms used for delayed enqueues and retries. A
@@ -4353,13 +4655,13 @@ struct RedisClient {
     unique_prefix: String,
 }
 
+/// Current Unix time in milliseconds, read from the injected `clock`.
+///
+/// Redis job records are keyed and scored on absolute millisecond timestamps,
+/// so every producer of one goes through here rather than `SystemTime::now()`.
 #[cfg(feature = "redis")]
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
+fn now_unix_ms(clock: &dyn crate::time::ClockSource) -> u64 {
+    u64::try_from(crate::time::clock_unix_duration(clock).as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(feature = "redis")]
@@ -4524,7 +4826,7 @@ impl RedisClient {
             attempt: 1,
             max_attempts: default_max_attempts,
             initial_backoff_ms: default_initial_backoff_ms,
-            enqueued_at_ms: Some(now_unix_ms()),
+            enqueued_at_ms: Some(now_unix_ms(self.clock.as_ref())),
             started_at_ms: None,
             finished_at_ms: None,
             claimed_by: None,
@@ -4568,7 +4870,7 @@ impl RedisClient {
                         Some(JobUniquenessWindow::TtlMs(_))
                     ) =>
                 {
-                    let delay_ms = due_ms.saturating_sub(now_unix_ms());
+                    let delay_ms = due_ms.saturating_sub(now_unix_ms(self.clock.as_ref()));
                     delay_ms
                         .saturating_add(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
                         .max(base)
@@ -4625,6 +4927,14 @@ struct RedisJobAdminBackend {
     unique_prefix: String,
     history_limit: usize,
     registry: crate::actuator::JobRegistry,
+    /// The app's injected clock. Redis job records carry absolute
+    /// millisecond timestamps (`enqueued_at_ms`, due-at scores, visibility
+    /// deadlines), so they must be minted from the same clock the rest of the
+    /// runtime reads — never `SystemTime::now()` off-seam.
+    clock: Arc<dyn crate::time::ClockSource>,
+    /// The app's injected entropy source, used to mint the fresh job id an
+    /// admin "retry dead job" operation assigns.
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 #[cfg(feature = "redis")]
@@ -4644,6 +4954,8 @@ impl RedisJobAdminBackend {
         unique_prefix: String,
         history_limit: usize,
         registry: crate::actuator::JobRegistry,
+        clock: Arc<dyn crate::time::ClockSource>,
+        entropy: Arc<dyn crate::entropy::Entropy>,
     ) -> Self {
         Self {
             connection,
@@ -4659,13 +4971,15 @@ impl RedisJobAdminBackend {
             unique_prefix,
             history_limit: history_limit.max(1),
             registry,
+            clock,
+            entropy,
         }
     }
 
     async fn snapshot_redis(&self, query: &JobAdminQuery) -> AutumnResult<JobAdminSnapshot> {
         let mut connection = self.connection.clone();
         let per_page = query.per_page.clamp(1, 100);
-        let now_ms = now_unix_ms();
+        let now_ms = now_unix_ms(self.clock.as_ref());
         let completed_since = now_ms.saturating_sub(86_400_000);
         let failed_since = now_ms.saturating_sub(604_800_000);
 
@@ -4728,7 +5042,7 @@ impl RedisJobAdminBackend {
 
     async fn retry_failed_redis(&self, id: &str) -> AutumnResult<()> {
         let mut connection = self.connection.clone();
-        let new_id = uuid::Uuid::new_v4().to_string();
+        let new_id = self.entropy.uuid_v4().to_string();
         let dead_record_key = format!("{}{id}", self.dead_record_prefix);
         // Fetch the record's payload first (for a tracked-status reset on
         // success below) — the script below moves this same dead record.
@@ -4811,7 +5125,7 @@ return 1
             .arg(&self.key_prefix)
             .arg(&self.unique_prefix)
             .arg(new_id)
-            .arg(now_unix_ms())
+            .arg(now_unix_ms(self.clock.as_ref()))
             .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
             .query_async(&mut connection)
             .await
@@ -5338,7 +5652,7 @@ end
 return nil
 ";
 
-    let now_ms = now_unix_ms();
+    let now_ms = now_unix_ms(worker_config.clock.as_ref());
     let deadline_ms = now_ms.saturating_add(worker_config.visibility_timeout_ms);
     let blocked_due_ms = now_ms.saturating_add(REDIS_CONCURRENCY_REQUEUE_DELAY_MS);
     let mut cmd = redis::cmd("EVAL");
@@ -5472,7 +5786,7 @@ async fn record_enqueues_for_redis_ids(
 
     for body in bodies.into_iter().flatten() {
         if let Ok(mut record) = serde_json::from_str::<RedisJobRecord>(&body) {
-            record.enqueued_at_ms = Some(now_unix_ms());
+            record.enqueued_at_ms = Some(now_unix_ms(worker_config.clock.as_ref()));
             record.started_at_ms = None;
             record.finished_at_ms = None;
             clear_redis_claim(&mut record);
@@ -5539,7 +5853,7 @@ return promoted
         .arg(2)
         .arg(&worker_config.delayed_key)
         .arg(&worker_config.record_prefix)
-        .arg(now_unix_ms())
+        .arg(now_unix_ms(worker_config.clock.as_ref()))
         .arg(64_usize)
         .arg(&worker_config.key_prefix)
         .query_async(connection)
@@ -5586,7 +5900,7 @@ return #ids
         .arg(2)
         .arg(&worker_config.blocked_key)
         .arg(&worker_config.record_prefix)
-        .arg(now_unix_ms())
+        .arg(now_unix_ms(worker_config.clock.as_ref()))
         .arg(64_usize)
         .arg(&worker_config.key_prefix)
         .query_async(connection)
@@ -5700,7 +6014,7 @@ async fn update_redis_queue_depth_gauges(
     record_prefix: &str,
     state: &AppState,
 ) -> Result<(), redis::RedisError> {
-    let now = now_unix_ms();
+    let now = now_unix_ms(state.clock());
     let mut per_queue: HashMap<String, (u64, Option<u64>)> = HashMap::new();
     let mut per_name: HashMap<String, u64> = HashMap::new();
 
@@ -6037,7 +6351,7 @@ async fn ack_redis_success(
 ) -> Result<bool, redis::RedisError> {
     let mut completed = record.clone();
     clear_redis_claim(&mut completed);
-    completed.finished_at_ms = Some(now_unix_ms());
+    completed.finished_at_ms = Some(now_unix_ms(worker_config.clock.as_ref()));
     completed.last_error = None;
     let Ok(encoded) = encode_redis_record(&completed) else {
         tracing::warn!(job_id = %record.id, "failed to serialize redis completed record");
@@ -6261,7 +6575,7 @@ async fn recover_stale_redis_jobs(
     let stale_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
         .arg(&worker_config.processing_key)
         .arg("-inf")
-        .arg(now_unix_ms())
+        .arg(now_unix_ms(worker_config.clock.as_ref()))
         .arg("LIMIT")
         .arg(0)
         .arg(64)
@@ -6300,7 +6614,7 @@ async fn recover_stale_redis_jobs(
         };
         let Some(action) = recover_stale_redis_record(
             record.clone(),
-            now_unix_ms(),
+            now_unix_ms(worker_config.clock.as_ref()),
             worker_config.visibility_timeout_ms,
         ) else {
             continue;
@@ -6361,15 +6675,15 @@ fn spawn_redis_worker(
 
     tokio::spawn(async move {
         let mut retry_promotion_throttle = RedisMaintenanceThrottle::new(
-            std::time::Instant::now(),
+            tokio::time::Instant::now(),
             worker_config.retry_promotion_interval,
         );
         let mut stale_recovery_throttle = RedisMaintenanceThrottle::new(
-            std::time::Instant::now(),
+            tokio::time::Instant::now(),
             REDIS_STALE_MAINTENANCE_INTERVAL,
         );
         let mut blocked_promotion_throttle = RedisMaintenanceThrottle::new(
-            std::time::Instant::now(),
+            tokio::time::Instant::now(),
             REDIS_BLOCKED_PROMOTION_INTERVAL,
         );
         let idle_sleep = redis_worker_idle_sleep(worker_config.retry_promotion_interval);
@@ -6380,7 +6694,7 @@ fn spawn_redis_worker(
                 break;
             }
 
-            if retry_promotion_throttle.take_due(std::time::Instant::now()) {
+            if retry_promotion_throttle.take_due(tokio::time::Instant::now()) {
                 match promote_due_redis_retries(&mut connection, &worker_config, &state, &job_admin)
                     .await
                 {
@@ -6391,7 +6705,7 @@ fn spawn_redis_worker(
                 }
             }
 
-            if stale_recovery_throttle.take_due(std::time::Instant::now()) {
+            if stale_recovery_throttle.take_due(tokio::time::Instant::now()) {
                 match recover_stale_redis_jobs(&mut connection, &worker_config, &state, &job_admin)
                     .await
                 {
@@ -6407,7 +6721,7 @@ fn spawn_redis_worker(
                 }
             }
 
-            if blocked_promotion_throttle.take_due(std::time::Instant::now())
+            if blocked_promotion_throttle.take_due(tokio::time::Instant::now())
                 && let Err(error) =
                     promote_due_blocked_redis_jobs(&mut connection, &worker_config).await
             {
@@ -6513,7 +6827,11 @@ async fn settle_failed_redis_job(
     outcome: &str,
     job_admin: &JobAdminMemoryBackend,
 ) {
-    let action = prepare_redis_failure_action(record.clone(), error.clone(), now_unix_ms());
+    let action = prepare_redis_failure_action(
+        record.clone(),
+        error.clone(),
+        now_unix_ms(worker_config.clock.as_ref()),
+    );
     match action {
         RedisFailureAction::Retry(schedule) => {
             match schedule_redis_retry(connection, worker_config, record, &schedule).await {
@@ -6595,7 +6913,11 @@ async fn dead_letter_panicked_redis_job(
     error: String,
     job_admin: &JobAdminMemoryBackend,
 ) {
-    let dead = prepare_redis_panic_dead_letter(record.clone(), error.clone(), now_unix_ms());
+    let dead = prepare_redis_panic_dead_letter(
+        record.clone(),
+        error.clone(),
+        now_unix_ms(worker_config.clock.as_ref()),
+    );
     match dead_letter_redis_job(connection, worker_config, record, &dead).await {
         Ok(true) => {
             state
@@ -6893,6 +7215,8 @@ fn start_redis_runtime(
             unique_prefix.clone(),
             DEFAULT_JOB_ADMIN_HISTORY_LIMIT,
             state.job_registry.clone(),
+            state.clock_arc(),
+            state.entropy_arc(),
         ))));
     }
 
@@ -6926,6 +7250,7 @@ fn start_redis_runtime(
                 delayed_key: delayed_key.clone(),
                 record_prefix: record_prefix.clone(),
                 unique_prefix: unique_prefix.clone(),
+                clock: state.clock_arc(),
             }),
             #[cfg(feature = "db")]
             pg_pool: None,
@@ -6989,11 +7314,12 @@ fn start_redis_runtime(
                 dead_record_prefix: dead_record_prefix.clone(),
                 unique_prefix: unique_prefix.clone(),
                 concurrency_prefix: concurrency_prefix.clone(),
-                worker_id: format!("{}:{}", std::process::id(), uuid::Uuid::new_v4()),
+                worker_id: format!("{}:{}", std::process::id(), state.entropy().uuid_v4()),
                 visibility_timeout_ms: config.redis.visibility_timeout_ms,
                 default_attempts: config.max_attempts,
                 default_backoff: config.initial_backoff_ms,
                 retry_promotion_interval,
+                clock: state.clock_arc(),
             },
         )?;
     }
@@ -7773,11 +8099,21 @@ struct PgQueueDepthRow {
     name: String,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     count: i64,
-    /// `MIN(run_at)` of the group as epoch milliseconds, `NULL` for an empty
-    /// group (never returned by a `GROUP BY` with matching rows, but modelled
-    /// nullable for safety).
+    /// How long the group's oldest ready job has been waiting, in milliseconds,
+    /// **computed by the database**: `NOW() - MIN(run_at)`.
+    ///
+    /// An age rather than a timestamp on purpose. `run_at` is stamped on the
+    /// database clock and the readiness filter is the database's `NOW()`, so
+    /// subtracting an app-side instant from `MIN(run_at)` mixes two timelines —
+    /// with an injected clock pinned ahead of the database that reports years of
+    /// waiting age, and pinned behind it saturates to zero. Doing the
+    /// subtraction in SQL keeps both operands on the one clock; the caller then
+    /// rebases the age onto the registry's timeline.
+    ///
+    /// `NULL` for an empty group (never returned by a `GROUP BY` with matching
+    /// rows, but modelled nullable for safety).
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
-    oldest_run_at_ms: Option<i64>,
+    oldest_wait_ms: Option<i64>,
 }
 
 /// Survey ready (claimable) enqueued jobs grouped by queue and name and publish
@@ -7798,7 +8134,8 @@ async fn pg_update_queue_depth_gauges(pool: &PgPool, state: &AppState) {
     };
     let rows = diesel::sql_query(
         "SELECT queue, name, COUNT(*) AS count, \
-                CAST(EXTRACT(EPOCH FROM MIN(run_at)) * 1000 AS BIGINT) AS oldest_run_at_ms \
+                CAST(EXTRACT(EPOCH FROM (NOW() - MIN(run_at))) * 1000 AS BIGINT) \
+                    AS oldest_wait_ms \
          FROM autumn_jobs \
          WHERE status = 'enqueued' AND run_at <= NOW() \
          GROUP BY queue, name",
@@ -7807,12 +8144,28 @@ async fn pg_update_queue_depth_gauges(pool: &PgPool, state: &AppState) {
     .await;
     match rows {
         Ok(rows) => {
+            // Rebase the database-computed age onto the registry's timeline: the
+            // registry stores ready-at instants and freshens the age at read
+            // time against its own clock, so hand it an instant that means the
+            // same thing there. `survey_now - age` is the DB's "oldest waited
+            // this long" expressed on the injected clock — both subtractions
+            // stay within a single timeline, which is the whole point.
+            //
+            // The redis survey needs no such translation: its marks already come
+            // from `now_unix_ms(state.clock())`.
+            let survey_now =
+                u64::try_from(crate::time::clock_unix_duration(state.clock()).as_millis())
+                    .unwrap_or(u64::MAX);
             let gauges = aggregate_surveyed_job_gauges(rows.into_iter().map(|row| {
+                let oldest_ready_at = row
+                    .oldest_wait_ms
+                    .and_then(|ms| u64::try_from(ms).ok())
+                    .map(|wait| crate::actuator::ready_at_from_age(survey_now, wait));
                 (
                     row.queue,
                     row.name,
                     u64::try_from(row.count).unwrap_or(0),
-                    row.oldest_run_at_ms.and_then(|ms| u64::try_from(ms).ok()),
+                    oldest_ready_at,
                 )
             }));
             state.job_registry.set_queue_depth_gauges(&gauges.per_queue);
@@ -9023,7 +9376,7 @@ fn start_postgres_runtime(
         let schedule = schedule.clone();
         let slots = Arc::clone(&slots);
         tokio::spawn(async move {
-            let worker_id = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
+            let worker_id = format!("{}:{}", std::process::id(), state.entropy().uuid_v4());
             pg_worker_loop(
                 pool,
                 worker_id,
@@ -9441,6 +9794,165 @@ mod tests {
 
         let c = minted_ids(0x1234).await;
         assert_ne!(a, c, "a different seed ⇒ different job ids");
+    }
+
+    /// A relative delay is measured from the clock the **serving backend** will
+    /// compare it against — not unconditionally from the injected one.
+    ///
+    /// Local and redis filter due-at against `self.clock`, so they must read the
+    /// injected clock (this is what `sim_delayed_enqueue` proves end to end).
+    /// Postgres compares `run_at <= NOW()` in the database, so stamping that
+    /// column from a virtual clock would leave it years off the timeline it is
+    /// judged against — claimable immediately if the clock is behind, never if
+    /// it is ahead. Regression test for the P1 raised on #2192.
+    #[test]
+    fn due_origin_follows_the_backend_that_decides_dueness() {
+        use chrono::{TimeZone, Utc};
+
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+
+        // A local-backed client: the injected (2020) clock decides dueness, so
+        // the delay is measured from it.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<QueuedJob>(1);
+        let mut local =
+            JobClient::bare_for_test(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+        local.local_sender = Some(tx);
+        assert_eq!(
+            local.due_origin(),
+            epoch,
+            "a local-backed client measures a delay from its injected clock"
+        );
+
+        // With no backend installed at all there is nothing comparing against a
+        // database, so the injected clock still governs.
+        let bare =
+            JobClient::bare_for_test(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+        assert_eq!(
+            bare.due_origin(),
+            epoch,
+            "with no durable backend the injected clock governs"
+        );
+
+        // The Postgres arm, reachable here only because the decision is split
+        // out of the clock read — through `JobClient` it needs a live pool.
+        let clock = crate::time::FixedClock::at(epoch);
+        let before = chrono::Utc::now();
+        let pg_origin = due_origin_for(true, &clock);
+        let after = chrono::Utc::now();
+        assert!(
+            pg_origin >= before && pg_origin <= after,
+            "a Postgres-served delay must be measured from real time (the clock its \
+             `run_at <= NOW()` claim query uses), not from the injected {epoch}; got \
+             {pg_origin}"
+        );
+        assert_eq!(
+            due_origin_for(false, &clock),
+            epoch,
+            "every other backend compares against the injected clock, so it stamps from it"
+        );
+    }
+
+    /// The deadline and the "is it in the future?" filter must share an origin.
+    ///
+    /// `enqueue_with_outcome_due` / `enqueue_on_conn_due` drop a `due_at` that
+    /// is not strictly in the future. If the Postgres path stamps from real time
+    /// while that filter reads the injected clock, a `TestApp` pinned *ahead* of
+    /// real time discards every durable deadline as already past and inserts an
+    /// immediately-runnable job instead of a delayed one. Asserted on the pair
+    /// of functions both call sites now go through.
+    #[test]
+    fn a_stamped_deadline_survives_the_filter_that_judges_it() {
+        use chrono::{TimeZone, Utc};
+
+        // A clock pinned a decade ahead of real time — the case that breaks when
+        // the stamp and the filter disagree.
+        let ahead = Utc.with_ymd_and_hms(2036, 1, 1, 0, 0, 0).unwrap();
+        let clock = crate::time::FixedClock::at(ahead);
+        let delay = std::time::Duration::from_secs(60);
+
+        for durable_is_pg in [true, false] {
+            let stamped = due_at_from(due_origin_for(durable_is_pg, &clock), delay);
+            let filter_now = due_origin_for(durable_is_pg, &clock);
+            assert!(
+                stamped > filter_now,
+                "a {delay:?} deadline must still read as delayed when filtered \
+                 (durable_is_pg = {durable_is_pg}); stamped {stamped}, filtered against \
+                 {filter_now}"
+            );
+        }
+    }
+
+    /// A relative-delay enqueue must compute its due instant and submit it
+    /// through the **same** client handle.
+    ///
+    /// `enqueue_in` used to call the free `delay_to_when` (one global lookup,
+    /// to read the clock) and then `enqueue_at` (a second global lookup, to
+    /// submit). The global is a swappable `RwLock`, so a concurrent
+    /// `TestApp::build` landing between the two lookups stamped the due instant
+    /// from app A's virtual clock and handed it to app B — whose runtime filters
+    /// due-at against *its own* clock, leaving the job years off B's timeline
+    /// and never runnable. Same failure mode as the real-time bug this
+    /// migration fixed, reached from the other direction.
+    ///
+    /// The test swaps the global between the two points the old code looked it
+    /// up, then asserts the recorded due instant belongs to the clock of the
+    /// client that actually received the job.
+    #[tokio::test]
+    async fn relative_enqueue_reads_the_clock_of_the_client_it_submits_to() {
+        use chrono::{TimeZone, Utc};
+
+        fn client_at(epoch: chrono::DateTime<chrono::Utc>) -> JobClient {
+            JobClient {
+                local_sender: None,
+                local_coordination: None,
+                #[cfg(feature = "redis")]
+                redis: None,
+                #[cfg(feature = "db")]
+                pg_pool: None,
+                registry: crate::actuator::JobRegistry::new(),
+                job_admin: JobAdminMemoryBackend::new_for_test(32),
+                default_max_attempts: 3,
+                default_initial_backoff_ms: 250,
+                per_job_settings: HashMap::new(),
+                interceptor: None,
+                entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+                clock: std::sync::Arc::new(crate::time::FixedClock::at(epoch)),
+                resilience_config: None,
+            }
+        }
+
+        let epoch_a = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch_b = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        // Install A, take the handle the way `enqueue_in` now does, then swap
+        // the global to B — exactly the window the old two-lookup code left
+        // open between reading the clock and submitting.
+        init_global_job_client(client_at(epoch_a));
+        let held = require_job_client().expect("client A is installed");
+        init_global_job_client(client_at(epoch_b));
+
+        let when = held.delay_to_when(std::time::Duration::from_secs(60));
+        assert_eq!(
+            when,
+            epoch_a + chrono::Duration::seconds(60),
+            "the due instant must come from the clock of the handle we submit \
+             through (A), not from whichever client happens to be global now (B)"
+        );
+
+        // The swap really did land: a fresh resolution returns B, so the
+        // assertion above is about the handle we held, not a no-op.
+        assert_eq!(
+            require_job_client()
+                .expect("client B is installed")
+                .delay_to_when(std::time::Duration::from_secs(60)),
+            epoch_b + chrono::Duration::seconds(60),
+            "a fresh resolution sees B, confirming the global was swapped"
+        );
+
+        clear_global_job_client();
     }
 
     #[tokio::test]
@@ -10694,7 +11206,7 @@ mod tests {
     #[cfg(feature = "redis")]
     #[test]
     fn redis_maintenance_throttle_runs_immediately_then_waits_for_interval() {
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let mut throttle = RedisMaintenanceThrottle::new(start, Duration::from_secs(1));
 
         assert!(throttle.take_due(start));
@@ -10710,7 +11222,7 @@ mod tests {
         // sum is not representable. A pathological interval must clamp the
         // next-run deadline (making the maintenance pass effectively one-shot)
         // rather than crash the Redis worker task.
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         for interval in [Duration::MAX, Duration::from_secs(u64::MAX)] {
             let mut throttle = RedisMaintenanceThrottle::new(start, interval);
             assert!(throttle.take_due(start), "the first pass always runs");
@@ -10943,6 +11455,7 @@ mod tests {
             default_attempts: 3,
             default_backoff: 1,
             retry_promotion_interval: Duration::from_millis(1),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         }
     }
 
@@ -10993,6 +11506,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         producer
             .enqueue(
@@ -11038,6 +11552,8 @@ mod tests {
             worker_config.unique_prefix.clone(),
             128,
             crate::actuator::JobRegistry::new(),
+            std::sync::Arc::new(crate::time::SystemClock),
+            std::sync::Arc::new(crate::entropy::OsEntropy),
         )
     }
 
@@ -11257,8 +11773,12 @@ mod tests {
         let worker_config = redis_test_worker_config("autumn:test:admin", "worker-a", 30_000);
         let backend = redis_admin_test_backend(&client, &worker_config);
         let mut connection = new_redis_connection_manager(&client, "test redis setup").unwrap();
-        let records =
-            seed_redis_admin_storage(&mut connection, &worker_config, now_unix_ms()).await;
+        let records = seed_redis_admin_storage(
+            &mut connection,
+            &worker_config,
+            now_unix_ms(&crate::time::SystemClock),
+        )
+        .await;
 
         let snapshot = backend
             .snapshot(JobAdminQuery {
@@ -11313,6 +11833,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         // Low enqueued first, then critical.
@@ -11705,7 +12226,7 @@ mod tests {
             let base = redis_unique_lock_ttl_ms(window);
             match due_at_ms {
                 Some(due_ms) if !matches!(window, Some(JobUniquenessWindow::TtlMs(_))) => {
-                    let delay_ms = due_ms.saturating_sub(now_unix_ms());
+                    let delay_ms = due_ms.saturating_sub(now_unix_ms(&crate::time::SystemClock));
                     delay_ms
                         .saturating_add(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
                         .max(base)
@@ -11715,7 +12236,7 @@ mod tests {
         }
 
         let two_days_ms: u64 = 2 * 24 * 60 * 60 * 1_000;
-        let due_ms = now_unix_ms() + two_days_ms;
+        let due_ms = now_unix_ms(&crate::time::SystemClock) + two_days_ms;
 
         // Non-TTL window + long delay: lock must outlast the 24h backstop.
         let ttl_running = compute_lock_ttl(Some(JobUniquenessWindow::Running), Some(due_ms));
@@ -11931,6 +12452,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let constraints = ResolvedJobConstraints {
             unique_key: None,
@@ -12000,7 +12522,7 @@ mod tests {
             .unwrap();
         let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
 
-        let now = now_unix_ms();
+        let now = now_unix_ms(&crate::time::SystemClock);
         let record = RedisJobRecord {
             id: "job-failed-tracked".to_string(),
             name: "send_email".to_string(),
@@ -12074,6 +12596,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let constraints = ResolvedJobConstraints {
             unique_key: Some("dropped-pending-lock".to_string()),
@@ -12174,6 +12697,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         producer
             .enqueue(
@@ -12373,6 +12897,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         // max_attempts = 1 so stale recovery dead-letters instead of requeueing.
         assert_eq!(
@@ -12466,6 +12991,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let constraints = ResolvedJobConstraints {
             unique_key: None,
@@ -12537,10 +13063,11 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         // Enqueue due ~2s in the future.
-        let due_at_ms = now_unix_ms() + 2_000;
+        let due_at_ms = now_unix_ms(&crate::time::SystemClock) + 2_000;
         assert_eq!(
             producer
                 .enqueue(
@@ -16472,38 +16999,53 @@ mod tests {
         crate::circuit_breaker::global_registry().clear();
     }
 
-    // ── delay_to_when unit tests ──────────────────────────────────────────────
+    // ── due-time math unit tests ──────────────────────────────────────────────
+    //
+    // These target `due_at_from`, the single home of the overflow clamp that
+    // `JobClient::delay_to_when` reaches through. They pass an explicit `now`
+    // rather than reading a clock, so they assert exact equality instead of
+    // bracketing a real-time read.
 
     #[test]
-    fn delay_to_when_zero_returns_approximately_now() {
-        let before = chrono::Utc::now();
-        let result = delay_to_when(std::time::Duration::ZERO);
-        let after = chrono::Utc::now();
-        assert!(
-            result >= before && result <= after,
-            "zero delay should resolve to approximately now"
+    fn due_at_from_zero_delay_is_now() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            due_at_from(now, std::time::Duration::ZERO),
+            now,
+            "a zero delay must resolve to exactly the instant passed in"
         );
     }
 
     #[test]
-    fn delay_to_when_overflow_returns_max_utc() {
+    fn due_at_from_overflow_returns_max_utc() {
         // u64::MAX seconds overflows i64 nanoseconds in TimeDelta::from_std.
         let huge = std::time::Duration::from_secs(u64::MAX);
-        let result = delay_to_when(huge);
         assert_eq!(
-            result,
+            due_at_from(chrono::Utc::now(), huge),
             chrono::DateTime::<chrono::Utc>::MAX_UTC,
             "overflow duration must return MAX_UTC rather than panic"
         );
     }
 
     #[test]
-    fn delay_to_when_small_delay_is_in_the_future() {
-        let before = chrono::Utc::now();
-        let result = delay_to_when(std::time::Duration::from_secs(60));
-        assert!(
-            result > before,
-            "a positive delay must resolve to the future"
+    fn due_at_from_saturates_rather_than_wrapping_near_max() {
+        // The other overflow door: the delta converts fine, but adding it to a
+        // near-MAX `now` does not fit.
+        let near_max = chrono::DateTime::<chrono::Utc>::MAX_UTC - chrono::TimeDelta::seconds(1);
+        assert_eq!(
+            due_at_from(near_max, std::time::Duration::from_secs(3600)),
+            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            "adding past MAX must clamp, not wrap"
+        );
+    }
+
+    #[test]
+    fn due_at_from_small_delay_is_exactly_offset() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            due_at_from(now, std::time::Duration::from_secs(60)),
+            now + chrono::TimeDelta::seconds(60),
+            "a positive delay must land exactly `delay` after the given instant"
         );
     }
 

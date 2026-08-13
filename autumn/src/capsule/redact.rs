@@ -263,7 +263,8 @@ fn redact_headers(
 /// error page's rendering of the same case.
 const NON_UTF8_PLACEHOLDER: &str = "<non-utf8>";
 
-/// Re-serialize the request target with sensitive query parameters masked.
+/// Rewrite the request target with sensitive query parameters masked, leaving
+/// every other byte exactly as the client sent it.
 fn redact_uri(
     uri: &axum::http::Uri,
     filter: &ParameterFilter,
@@ -273,55 +274,66 @@ fn redact_uri(
     let Some(query) = uri.query() else {
         return uri.to_string();
     };
-    let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect();
-    if pairs.is_empty() {
-        return uri.to_string();
-    }
-
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    for (key, value) in pairs {
-        if key_is_sensitive(&key, filter) {
-            values.insert(value.as_bytes());
-            keys.insert(format!("query:{key}"));
-            serializer.append_pair(&key, FILTERED_PLACEHOLDER);
-        } else {
-            serializer.append_pair(&key, &value);
-        }
-    }
-    // The echo set holds *decoded* values, but an error that echoes the raw
-    // request target carries the percent-encoded form — `?token=a%2Fb`
-    // decodes to `a/b`, and `mask_echoes` cannot find `a/b` inside `a%2Fb`.
-    // Walk the raw query text and retain the on-the-wire value of every
-    // sensitive key too, so both spellings scrub.
-    retain_raw_sensitive_values(query, filter, values);
-    let redacted_query = serializer.finish();
-    let path = uri.path();
-    format!("{path}?{redacted_query}")
+    mask_raw_urlencoded(query, "query", filter, values, keys).map_or_else(
+        || uri.to_string(),
+        |masked| format!("{}?{masked}", uri.path()),
+    )
 }
 
-/// Retain the on-the-wire (percent-encoded) spelling of every sensitive value
-/// in a raw `key=value&…` string.
+/// The on-the-wire spelling a masked pair's value is replaced with — the
+/// percent-encoded [`FILTERED_PLACEHOLDER`], so the rewritten string is still
+/// a well-formed urlencoded pair list and decodes to `[FILTERED]`.
+const FILTERED_PLACEHOLDER_URLENCODED: &str = "%5BFILTERED%5D";
+
+/// Mask the sensitive pairs of a raw `key=value&…` string in place, leaving
+/// every byte of every other pair exactly as the client sent it.
 ///
-/// The decoded spelling goes into the echo set where the pairs are parsed;
-/// this walk covers the encoded spelling, which is what an error message that
-/// echoes the raw request target or body carries.
-fn retain_raw_sensitive_values(raw: &str, filter: &ParameterFilter, values: &mut RedactedValues) {
-    for raw_pair in raw.split('&') {
-        let (raw_key, raw_value) = raw_pair
-            .split_once('=')
-            .map_or((raw_pair, ""), |(key, value)| (key, value));
-        if raw_value.is_empty() {
-            continue;
-        }
-        let decoded_key: String = url::form_urlencoded::parse(raw_key.as_bytes())
-            .map(|(key, _)| key.into_owned())
-            .collect();
-        if key_is_sensitive(&decoded_key, filter) {
-            values.insert(raw_value.as_bytes());
-        }
-    }
+/// Returns `None` when no pair matched the filter: the caller keeps the
+/// original representation untouched, so a handler that inspects the raw
+/// string — or verifies a signature computed over it — sees the same bytes
+/// during replay that it saw in production. Decoding, and the spelling drift
+/// it brings (`%2f` → `%2F`, space → `+`, bare `flag` → `flag=`), happens
+/// only to *matched* pairs, which are being rewritten anyway.
+///
+/// A matched pair contributes **both** value spellings to the echo set: the
+/// decoded one (what a handler error usually quotes) and the on-the-wire one
+/// (what an error echoing the raw request target or body carries).
+fn mask_raw_urlencoded(
+    raw: &str,
+    context: &str,
+    filter: &ParameterFilter,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+) -> Option<String> {
+    let mut changed = false;
+    let masked: Vec<String> = raw
+        .split('&')
+        .map(|raw_pair| {
+            let Some((decoded_key, decoded_value)) =
+                url::form_urlencoded::parse(raw_pair.as_bytes()).next()
+            else {
+                // An empty segment (`a=1&&b=2`): sloppy, but the client sent
+                // it, so it stays.
+                return raw_pair.to_owned();
+            };
+            if !key_is_sensitive(&decoded_key, filter) {
+                return raw_pair.to_owned();
+            }
+            changed = true;
+            keys.insert(format!("{context}:{decoded_key}"));
+            if !decoded_value.is_empty() {
+                values.insert(decoded_value.as_bytes());
+            }
+            let (raw_key, raw_value) = raw_pair
+                .split_once('=')
+                .map_or((raw_pair, ""), |(key, value)| (key, value));
+            if !raw_value.is_empty() {
+                values.insert(raw_value.as_bytes());
+            }
+            format!("{raw_key}={FILTERED_PLACEHOLDER_URLENCODED}")
+        })
+        .collect();
+    changed.then(|| masked.join("&"))
 }
 
 /// Whether a form/query key names a sensitive value.
@@ -412,7 +424,18 @@ fn redact_body(
         let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return unparseable_body(bytes, UNPARSEABLE_JSON_NOTE, keys, notes);
         };
+        let keys_before = keys.len();
         let scrubbed = scrub_value(&parsed, filter, "body", values, keys);
+        if keys.len() == keys_before {
+            // Nothing was masked: keep the exact bytes the client sent.
+            // Re-serializing would drift whitespace, number spellings and key
+            // order, and a handler that verifies a signature over the raw
+            // body would reject the replay of a request it accepted in
+            // production. (serde_json just proved the bytes are UTF-8.)
+            return std::str::from_utf8(bytes).map_or(CapsuleBody::Absent, |text| {
+                CapsuleBody::Text(text.to_owned())
+            });
+        }
         return serde_json::to_string(&scrubbed).map_or(CapsuleBody::Absent, CapsuleBody::Text);
     }
 
@@ -420,28 +443,19 @@ fn redact_body(
         // Same conservatism, one step earlier: the urlencoded parser is lossy
         // and accepts anything, so a JSON document sent under a form content
         // type would come back as one giant key that matches no filter and is
-        // then re-serialized verbatim. `form_pairs` says whether this really
-        // is a form before any of it is copied.
-        let Some(pairs) = form_pairs(bytes) else {
+        // then copied verbatim. `form_text` says whether this really is a
+        // form before any of it is copied.
+        let Some(text) = form_text(bytes) else {
             return unparseable_body(bytes, UNPARSEABLE_FORM_NOTE, keys, notes);
         };
-        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-        for (key, value) in pairs {
-            if key_is_sensitive(&key, filter) {
-                values.insert(value.as_bytes());
-                keys.insert(format!("body:{key}"));
-                serializer.append_pair(&key, FILTERED_PLACEHOLDER);
-            } else {
-                serializer.append_pair(&key, &value);
-            }
-        }
-        // Same encoded-spelling retention as the query string: an error that
-        // echoes the raw form body carries `a%2Fb`, not the decoded `a/b` the
-        // loop above stored. `form_pairs` proved the body is UTF-8.
-        if let Ok(text) = std::str::from_utf8(bytes) {
-            retain_raw_sensitive_values(text, filter, values);
-        }
-        return CapsuleBody::Text(serializer.finish());
+        // The masking splices only the matched pairs, so an untouched form —
+        // or the untouched neighbours of a masked field — keeps the exact
+        // bytes the client sent, and a signature computed over the raw body
+        // still verifies during replay.
+        return CapsuleBody::Text(
+            mask_raw_urlencoded(text, "body", filter, values, keys)
+                .unwrap_or_else(|| text.to_owned()),
+        );
     }
 
     // A multipart body *has* key structure — a file upload's form fields are
@@ -482,14 +496,14 @@ fn unparseable_body(
     }
 }
 
-/// Decode a urlencoded form body, or `None` if it is not one.
+/// Validate that a body really is a urlencoded form, returning its text.
 ///
 /// `url::form_urlencoded::parse` never fails, so this validates the shape
 /// first: UTF-8, every `&`-separated segment a `key=value` pair, and every key
 /// made of characters a client would not have had to percent-encode. Rejecting
 /// costs a captured body; accepting a non-form costs an unredactable copy of
 /// it, so the doubt is resolved towards rejecting.
-fn form_pairs(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+fn form_text(bytes: &[u8]) -> Option<&str> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut pairs = 0usize;
     for segment in text.split('&') {
@@ -506,11 +520,7 @@ fn form_pairs(bytes: &[u8]) -> Option<Vec<(String, String)>> {
     if pairs == 0 {
         return None;
     }
-    Some(
-        url::form_urlencoded::parse(bytes)
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect(),
-    )
+    Some(text)
 }
 
 /// Whether a character disqualifies the string it appears in from being a
@@ -859,6 +869,88 @@ mod tests {
             format!("bad form field token={FILTERED_PLACEHOLDER}"),
             "an echoed raw form body must scrub"
         );
+    }
+
+    /// A signed webhook's handler verifies a signature over the exact bytes
+    /// the client sent. When nothing needs masking, the capsule must carry
+    /// those exact bytes — re-serializing would drift whitespace, number
+    /// spellings and key order, and the replay would flunk a signature check
+    /// the production request passed.
+    #[test]
+    fn an_unredacted_json_body_keeps_its_exact_bytes() {
+        let raw = br#"{ "b": 1.50,  "a": "x" }"#;
+        let (request, _values) = redact(
+            Request::post("/webhook").header(header::CONTENT_TYPE, "application/json"),
+            CapturedBody::Buffered(Bytes::from_static(raw)),
+            &filter_with(&[]),
+        );
+
+        assert_eq!(
+            request.body,
+            CapsuleBody::Text(String::from_utf8(raw.to_vec()).expect("utf8")),
+            "a JSON body with nothing to mask must be preserved byte for byte"
+        );
+    }
+
+    /// Decoding and re-encoding a query string canonicalizes spellings —
+    /// `%2f` → `%2F`, a bare `flag` → `flag=` — and routes that inspect the
+    /// raw query (or sign the request target) would diverge on replay. Only
+    /// matched pairs may be rewritten; everything else keeps its bytes.
+    #[test]
+    fn unredacted_query_pairs_keep_their_raw_spelling() {
+        // No sensitive pair at all: the whole target is untouched.
+        let (request, _values) = redact(
+            Request::get("/hook?path=a%2fb&flag&q=1+2"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert_eq!(
+            request.uri, "/hook?path=a%2fb&flag&q=1+2",
+            "an unredacted query must be preserved byte for byte"
+        );
+
+        // A sensitive pair elsewhere: its neighbours still keep their bytes.
+        let (request, values) = redact(
+            Request::get("/hook?path=a%2fb&token=s3cret&flag"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert_eq!(
+            request.uri, "/hook?path=a%2fb&token=%5BFILTERED%5D&flag",
+            "only the matched pair may be rewritten"
+        );
+        assert!(values.contains(b"s3cret"));
+    }
+
+    /// The form-body twin of the raw-spelling guarantee: an untouched form —
+    /// and the untouched neighbours of a masked field — keep the exact bytes
+    /// the client sent.
+    #[test]
+    fn unredacted_form_pairs_keep_their_raw_spelling() {
+        let (request, _values) = redact(
+            Request::post("/hook")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded"),
+            CapturedBody::Buffered(Bytes::from_static(b"path=a%2fb&q=1+2")),
+            &filter_with(&[]),
+        );
+        assert_eq!(
+            request.body,
+            CapsuleBody::Text("path=a%2fb&q=1+2".to_owned()),
+            "an unredacted form body must be preserved byte for byte"
+        );
+
+        let (request, values) = redact(
+            Request::post("/hook")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded"),
+            CapturedBody::Buffered(Bytes::from_static(b"path=a%2fb&token=s3cret")),
+            &filter_with(&[]),
+        );
+        assert_eq!(
+            request.body,
+            CapsuleBody::Text("path=a%2fb&token=%5BFILTERED%5D".to_owned()),
+            "only the matched form field may be rewritten"
+        );
+        assert!(values.contains(b"s3cret"));
     }
 
     #[test]

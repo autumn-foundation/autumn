@@ -193,7 +193,7 @@ async fn in_process_scheduler_coordinator_fires_a_task_on_sqlite() {
     let tick_key = scheduler::fixed_delay_tick_key(
         "sqlite_e2e_task",
         Duration::from_secs(60),
-        scheduler::now_unix_duration(),
+        autumn_web::time::clock_unix_duration(&autumn_web::time::SystemClock),
     );
     let lease = coordinator
         .try_acquire("sqlite_e2e_task", &tick_key, TaskCoordination::Fleet)

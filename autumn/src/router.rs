@@ -5117,7 +5117,7 @@ mod tests {
             db_capture_gap: None,
             profile: Some("test".to_owned()),
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: false,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),

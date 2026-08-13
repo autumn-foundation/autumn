@@ -1773,6 +1773,15 @@ impl TestApp {
         let probes = crate::probe::ProbeState::ready_for_test();
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
+        // Resolve the injected clock BEFORE the state literal so `started_at`
+        // is stamped on the same timeline the app will read time from. A sim
+        // installs a virtual clock here, and uptime has to start at that
+        // clock's origin rather than at real process time.
+        let clock: std::sync::Arc<dyn crate::time::ClockSource> = self
+            .clock
+            .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock));
+        let started_at = clock.monotonic();
+
         #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
         let mut state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
@@ -1815,13 +1824,19 @@ impl TestApp {
             db_capture_gap: None,
             profile: self.config.profile.clone(),
             role: self.config.role,
-            started_at: std::time::Instant::now(),
+            started_at,
             health_detailed: self.config.health.detailed,
             probes: probes.clone(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new(&self.config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
+            // Built from the resolved clock, not `JobRegistry::new()`: the queue
+            // gauges compare ready-at marks the job runtime stamps from this
+            // same clock. This literal bypasses `AppState::with_clock`, so
+            // leaving it on the default real clock is what made a sim's delayed
+            // job read as ready the instant it was enqueued.
+            job_registry: crate::actuator::JobRegistry::new()
+                .with_clock(std::sync::Arc::clone(&clock)),
             config_props: crate::actuator::ConfigProperties::default(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
@@ -1838,9 +1853,7 @@ impl TestApp {
                 .unwrap_or(self.config.security.forbidden_response),
             auth_session_key: self.config.auth.session_key.clone(),
             shared_cache: None,
-            clock: self
-                .clock
-                .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock)),
+            clock,
             entropy: self
                 .entropy
                 .unwrap_or_else(|| std::sync::Arc::new(crate::entropy::OsEntropy)),
