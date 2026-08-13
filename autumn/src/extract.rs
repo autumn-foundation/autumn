@@ -30,6 +30,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -637,7 +639,9 @@ impl<'a> MultipartField<'a> {
             .await
             .map_err(|err| multipart_error_to_error(&err))?
         {
-            read += chunk.len();
+            // Saturating: the very next check rejects anything over the cap,
+            // so a saturated total still fails closed instead of overflowing.
+            read = read.saturating_add(chunk.len());
             if read > self.max_file_size_bytes {
                 return Err(file_too_large_error(self.max_file_size_bytes));
             }
@@ -791,7 +795,7 @@ impl<'a> MultipartField<'a> {
         // Write any sniffed prefix bytes first so they are not lost, counting
         // them toward the per-file cap.
         if !self.prefix.is_empty() {
-            written += self.prefix.len();
+            written = written.saturating_add(self.prefix.len());
             if written > self.max_file_size_bytes {
                 drop(file);
                 let _ = tokio::fs::remove_file(path).await;
@@ -807,7 +811,9 @@ impl<'a> MultipartField<'a> {
             .await
             .map_err(|err| multipart_error_to_error(&err))?
         {
-            written += chunk.len();
+            // Saturating for the same reason as `bytes_limited`: a saturated
+            // running total is still over the cap, so the file is rejected.
+            written = written.saturating_add(chunk.len());
             if written > self.max_file_size_bytes {
                 drop(file);
                 let _ = tokio::fs::remove_file(path).await;

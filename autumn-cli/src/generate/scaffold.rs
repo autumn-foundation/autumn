@@ -57,6 +57,18 @@ pub struct ScaffoldOptions {
     /// (non-live, non-sharded) path — authorizes the mutating HTML handlers and
     /// scopes the index. `--api` scaffolds never generate a policy.
     pub no_policy: bool,
+    /// Bind this resource to a parent as its child (issue #1323) —
+    /// `--belongs-to Post`. Names the parent in `PascalCase` or `snake_case`;
+    /// the foreign key is this scaffold's own `references` column targeting the
+    /// parent's table (`post:references` -> `post_id`).
+    ///
+    /// `Some(parent)` adds a nested read route (`GET
+    /// /<parents>/{<fk>}/<children>`), a nested create route whose FK comes from
+    /// the path rather than the submitted body, a children list + inline create
+    /// form injected into the parent's generated `show` view, and back-links in
+    /// both directions. `None` (the default) keeps the flat, single-table
+    /// scaffold's output byte-for-byte unchanged.
+    pub belongs_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,6 +455,86 @@ fn plan_scaffold_with_options_impl(
             ));
         }
     }
+    // Gate (issue #1318): a `lock_version` column rewrites the HTML `update`
+    // handler's write into a `WHERE lock_version = $expected` guarded statement
+    // and adds a 409 re-render branch. That rewrite is wired for the standard
+    // raw-diesel write only. `--live`/`--sharded` write through the repository
+    // extractor and the attachment path writes after a multipart blob save;
+    // generating those would emit an edit form that *looks* concurrency-safe
+    // while the write still clobbers. Refuse the combination up front rather
+    // than ship silently lossy code (same posture as the `slug` gates above).
+    //
+    // `--api` is exempt outright — including `--api --live`, `--api --sharded`
+    // and the rest. Those variants only ever change the HTML surface, and an
+    // `--api` scaffold emits no routes file at all, so there is no form and no
+    // raw-diesel update to be inconsistent with. The model's `#[lock_version]`
+    // still lands, which is what makes the repository's own JSON update
+    // conflict-check. Refusing them would break combinations that generated
+    // fine before this feature existed.
+    // `for_revert` skips the whole gate: `autumn destroy scaffold` recomputes the
+    // plan it is about to revert, and a scaffold created before these refusals
+    // existed (`lock_version:i32 --live`, say) must still be removable. The
+    // refusal would fire during the recompute — before `Plan::revert` ever sees
+    // `--force` — and strand exactly the files the user asked to delete. Same
+    // posture as the shared-layout preflight below (issue #1834).
+    if !for_revert && !options.api && super::model::lock_version_field(&fields).is_some() {
+        // `--live-validation` is supported: it changes only how the form's
+        // controls are rendered (raw htmx inputs instead of `form_for`), while
+        // its `update` still writes through the same raw-diesel statement.
+        let unsupported = if options.live {
+            Some((
+                "--live",
+                "the SSE live scaffold writes through the repository extractor, not the \
+                 guarded `diesel::update(...).filter(lock_version.eq(...))` statement",
+                "Drop `--live`",
+            ))
+        } else if options.model.sharded {
+            Some((
+                "--sharded",
+                "the sharded scaffold writes through `Pg{Model}Repository::from_shard`, not \
+                 the guarded `diesel::update(...).filter(lock_version.eq(...))` statement",
+                "Drop `--sharded`",
+            ))
+        } else if has_attachment_fields(&fields) {
+            Some((
+                "an `attachment` field",
+                "the multipart update handler saves the blob before the row write, so a \
+                 rejected stale submit would leave an orphaned upload behind",
+                "Drop the attachment column",
+            ))
+        } else if fields.iter().any(|f| f.kind.is_slug()) {
+            // A slug scaffold keys its `update` off the slug, not the primary
+            // key (issue #1260), so the guarded statement would read
+            // `WHERE slug = $1 AND lock_version = $2`. That pair is not a stable
+            // row identity: the slug is editable and re-derivable, and every new
+            // row starts at version 0. Rename a row's slug, let a *different*
+            // row take the freed slug, and a stale submit against the old slug
+            // matches the new row at its default version — committing one
+            // author's edit over an unrelated record and reporting success.
+            // Keying the guard off the primary key instead is the real fix and
+            // needs the update handler to resolve the row first on every slug
+            // variant (including `--no-policy`, which loads nothing today);
+            // refuse the pair until that lands rather than ship the swap.
+            Some((
+                "a `slug` column",
+                "a slug scaffold keys its update off the (editable, reusable) slug rather \
+                 than the primary key, so `WHERE slug = ... AND lock_version = ...` does not \
+                 identify a stable row — a renamed slug reclaimed by a new row would let a \
+                 stale submit commit over that unrelated record",
+                "Drop the slug column (the scaffold keys off `id`)",
+            ))
+        } else {
+            None
+        };
+        if let Some((variant, why, remedy)) = unsupported {
+            return Err(GenerateError::Config(format!(
+                "a `lock_version` column is not yet supported together with {variant}: {why}. \
+                 {remedy} to get the conflict-aware edit form, or rename the `lock_version` \
+                 column if optimistic locking was not intended."
+            )));
+        }
+    }
+
     // Resolve shard key before planning the model (propagates to model render).
     let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;
     let model_options_with_key = ModelOptions {
@@ -456,14 +548,25 @@ fn plan_scaffold_with_options_impl(
         live: options.live,
         live_validation: options.live_validation,
         no_policy: options.no_policy,
+        belongs_to: options.belongs_to.clone(),
     };
-    let mut plan = plan_model_with_options(
-        project_root,
-        name,
-        field_tokens,
-        timestamp,
-        &options_with_key.model,
-    )?;
+    let mut plan = if for_revert {
+        super::model::plan_model_with_options_for_revert(
+            project_root,
+            name,
+            field_tokens,
+            timestamp,
+            &options_with_key.model,
+        )?
+    } else {
+        plan_model_with_options(
+            project_root,
+            name,
+            field_tokens,
+            timestamp,
+            &options_with_key.model,
+        )?
+    };
     let metadata = parse_model_metadata(&fields, &options_with_key.model)?;
     // A `--default field=value` column is dropped from `form_fields` (see
     // below) and therefore from the generated `New{Pascal}` insert struct
@@ -488,9 +591,26 @@ fn plan_scaffold_with_options_impl(
         .filter(|field| !metadata.defaults().contains_key(&field.name))
         .cloned()
         .collect::<Vec<_>>();
+    // The equivalent guard for the insert struct (issue #1318) lives in
+    // `plan_model_with_options`, which the scaffold delegates to above — so a
+    // lock-only scaffold is refused before it reaches here, and `generate model`
+    // gets the same refusal without the scaffold planner having to be involved.
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let plural = pluralize(&snake_name);
+
+    // ── Parent/child nesting (issue #1323) ─────────────────────────────────
+    // `--belongs-to Post` binds this resource to a parent: nested routes here,
+    // a children list + inline create form injected into the parent's own
+    // `show` view below. `None` for every flat scaffold, which keeps all of the
+    // emission below byte-for-byte what it was before this feature existed.
+    let nesting = super::nested::resolve(
+        project_root,
+        &plural,
+        &fields,
+        &options_with_key,
+        for_revert,
+    )?;
 
     // ── Record-level authorization (issue #1125) ───────────────────────────
     // A policy is generated by default for every non-`--api` scaffold unless
@@ -697,6 +817,62 @@ fn plan_scaffold_with_options_impl(
         name: snake_name.clone(),
     });
 
+    // …and the mirror: children nested INTO this resource. Destroying a parent
+    // out from under them deletes the module they still import
+    // (`crate::routes::<parent>::paths`, `schema::<parents>`) and leaves their
+    // nested routes mounted — an uncompilable project. The default destroy
+    // already stops, but only by accident: the injected section reads as
+    // "diverged from generated content", whose message says nothing about
+    // children and which `--force` waves straight through. Refuse explicitly
+    // instead, naming them, so `--force` cannot turn a deliberate override of
+    // one check into silent breakage of another.
+    if for_revert && !options_with_key.api {
+        let dependents = super::nested::children_nested_under(project_root, &plural);
+        if !dependents.is_empty() {
+            return Err(GenerateError::Config(format!(
+                "{} nested under {plural}, and src/routes/{plural}.rs renders their children \
+                 section. Destroying {plural} now would delete the module they import \
+                 (`crate::routes::{plural}::paths`, `schema::{plural}`) and leave their \
+                 nested routes mounted. Destroy {} first — that also removes the section from \
+                 src/routes/{plural}.rs — then destroy {plural}.",
+                if dependents.len() == 1 {
+                    format!("{} is", dependents[0])
+                } else {
+                    format!("{} are", dependents.join(", "))
+                },
+                dependents.join(", "),
+            )));
+        }
+    }
+
+    // Parents this resource is currently nested under, discovered from the
+    // `// autumn:nested:<plural>` markers already on disk (issue #1323). On the
+    // GENERATE path this is always empty — the marker is written by the `Modify`
+    // this same run is about to plan — so it costs one directory scan and
+    // changes nothing. On the DESTROY path it is the ONLY evidence available
+    // when `--belongs-to` was not repeated on the command line, and it drives
+    // both the parent-side cleanup and the `main.rs` unmounting below.
+    let nested_parents = if options_with_key.api {
+        Vec::new()
+    } else {
+        super::nested::parents_carrying_child(project_root, &plural)
+    };
+
+    // Nesting recovered from the markers rather than declared: say so, since the
+    // emitted module then carries nested routes the command line never asked for.
+    if let Some(n) = nesting.as_ref()
+        && n.inferred
+        && !for_revert
+    {
+        plan.warn(format!(
+            "src/routes/{parent}.rs still nests {plural} (a `--belongs-to {pascal}` \
+             scaffold), so the regenerated module keeps its nested routes. Pass \
+             `--belongs-to {pascal}` to make that explicit, or \
+             `autumn destroy scaffold {name} …` first to un-nest.",
+            parent = n.parent_plural,
+            pascal = n.parent_pascal,
+        ));
+    }
     // Route file under `src/routes/<plural>.rs`
     if !options_with_key.api {
         // The shared-layout preflight applies only to standard scaffolds, which
@@ -749,27 +925,57 @@ fn plan_scaffold_with_options_impl(
             }
         }
         let routes_dir = project_root.join("src").join("routes");
-        plan.create(
-            routes_dir.join(format!("{plural}.rs")),
-            render_routes_file(
-                project_root,
-                &pascal_name,
-                &snake_name,
-                &plural,
-                &form_fields,
-                &fields,
-                options_with_key.model.sharded,
-                options_with_key.model.soft_delete,
-                options_with_key.model.id_type,
-                options_with_key.live,
-                options_with_key.live_validation,
-                metadata.validations(),
-                &missing_reference_targets,
-                authorize_routes,
-                owner_column.as_ref().map(|o| o.name.as_str()),
-                &options_with_key.model.searchable,
-            ),
+        let own_routes_path = routes_dir.join(format!("{plural}.rs"));
+        // This resource may itself be a PARENT: its `show` can carry sections
+        // injected for children nested under it (issue #1323). The flat template
+        // below knows nothing about those, so a `--force` regeneration would
+        // overwrite them away — silently dropping the children list AND the only
+        // durable record of the relationship, after which a child regeneration
+        // would emit no nested handlers while `main.rs` still mounted them.
+        // Re-apply them onto the fresh render instead. Empty for the common
+        // case, and skipped on the revert path (where this Create is a Delete).
+        let previous_own_routes = if for_revert {
+            String::new()
+        } else {
+            read_or_empty(&own_routes_path)
+        };
+        let fresh_own_routes = render_routes_file(
+            project_root,
+            &pascal_name,
+            &snake_name,
+            &plural,
+            &form_fields,
+            &fields,
+            options_with_key.model.sharded,
+            options_with_key.model.soft_delete,
+            options_with_key.model.id_type,
+            options_with_key.live,
+            options_with_key.live_validation,
+            metadata.validations(),
+            &missing_reference_targets,
+            authorize_routes,
+            owner_column.as_ref().map(|o| o.name.as_str()),
+            &options_with_key.model.searchable,
+            nesting.as_ref(),
         );
+        let own_routes = super::nested::reapply_children(&previous_own_routes, &fresh_own_routes)
+            .map_err(|refused| {
+            GenerateError::Config(format!(
+                "{} nested under {plural}, but this run re-renders src/routes/{plural}.rs \
+                     into a shape their children section cannot be put back into (a \
+                     `--sharded` parent holds a `ShardedDb` the section cannot borrow; \
+                     `--live` and `--api` reshape the `show` view it renders in). Re-running \
+                     would silently drop the children list. Destroy {} first — that removes \
+                     the section — then regenerate {plural}. Nothing has been written.",
+                if refused.len() == 1 {
+                    format!("{} is", refused[0])
+                } else {
+                    format!("{} are", refused.join(", "))
+                },
+                refused.join(", "),
+            ))
+        })?;
+        plan.create(own_routes_path, own_routes);
         let route_mod_path = routes_dir.join("mod.rs");
         plan.modify(
             route_mod_path.clone(),
@@ -779,6 +985,35 @@ fn plan_scaffold_with_options_impl(
             path: route_mod_path,
             name: plural.clone(),
         });
+
+        // Issue #1323 AC4: the PARENT resource's generated `show` view gains a
+        // list of its children plus an inline create form. That is an in-place
+        // edit to a file this invocation does not own, so it is marker-delimited
+        // (idempotent on re-run) and paired with a `Revert` so `autumn destroy`
+        // takes exactly those lines back out (#1048).
+        if let Some(n) = nesting.as_ref()
+            && !for_revert
+        {
+            let parent_routes = routes_dir.join(format!("{}.rs", n.parent_plural));
+            if let Ok(parent_src) = std::fs::read_to_string(&parent_routes) {
+                plan.modify(
+                    parent_routes,
+                    super::nested::inject_into_parent_show(&parent_src, &plural),
+                );
+            }
+        }
+        // The destroy-side counterpart, driven by the MARKERS on disk rather
+        // than by `--belongs-to` being repeated on the destroy command line:
+        // the flag is something the author typed once, days ago, and forgetting
+        // it must not leave a `crate::routes::{plural}::children_section(…)`
+        // call dangling in a parent whose child module this destroy just
+        // deleted — an uncompilable project.
+        for parent_routes in &nested_parents {
+            plan.push_revert(Revert::NestedChildSection {
+                path: parent_routes.clone(),
+                child_plural: plural.clone(),
+            });
+        }
     }
 
     // Record-level authorization policy + scope (issue #1125). Emitted for every
@@ -860,6 +1095,16 @@ fn plan_scaffold_with_options_impl(
     if export_enabled {
         smoke_test.push_str(&render_csv_export_smoke_test(&plural, &fields));
     }
+    // Issue #1323 AC7: the nested write-path test. Appended here, alongside the
+    // CSV test, because `render_smoke_test` is shaped around the resource's own
+    // flat surface and this one needs the resolved parent binding.
+    if let Some(n) = nesting.as_ref() {
+        smoke_test.push_str(&render_nested_write_path_smoke_test(
+            &pascal_name,
+            &plural,
+            n,
+        ));
+    }
     plan.create(
         project_root.join("tests").join(format!("{snake_name}.rs")),
         smoke_test,
@@ -937,6 +1182,20 @@ fn plan_scaffold_with_options_impl(
         &validated_field_names,
         &sm_field_names,
         &rich_text_field_names,
+        // On the DESTROY path `--belongs-to` may not have been repeated on the
+        // command line, so `nesting` is `None` — but `main.rs` still mounts the
+        // two nested handlers this resource emitted, and a revert that removed
+        // the child's routes module while leaving those entries behind would
+        // leave the project uncompilable. The markers on disk are the same
+        // evidence the parent-side cleanup keys off.
+        //
+        // Gated to `for_revert` deliberately: on the GENERATE path the routes
+        // module is being rewritten right now, and what it emits is decided by
+        // `nesting` alone. Letting stale marker evidence mount handlers the
+        // fresh module does not emit is exactly the uncompilable state this
+        // predicate exists to avoid — `nesting` already folds in the marker
+        // inference for a regeneration that omitted the flag.
+        nesting.is_some() || (for_revert && !nested_parents.is_empty()),
     );
     let mut mods = vec!["models", "schema", "repositories"];
     if !options_with_key.api {
@@ -1835,6 +2094,8 @@ fn render_model_form(
     pascal_name: &str,
     fields: &[Field],
     validations: &BTreeMap<String, Vec<String>>,
+    // The parent foreign-key column under `--belongs-to` (issue #1323).
+    parent_fk: Option<&str>,
 ) -> ModelFormParts {
     use std::fmt::Write;
     let mut struct_fields = String::new();
@@ -1860,6 +2121,15 @@ fn render_model_form(
             for rule in rules {
                 let _ = writeln!(struct_fields, "    #[validate({rule})]");
             }
+        }
+        // Issue #1323: under `--belongs-to` the nested inline create form
+        // renders no control for the parent foreign key (the parent is the URL),
+        // so a nested submission carries no value for it. `#[serde(default)]`
+        // turns that absence into an empty string the nested handler
+        // immediately overwrites from the path, instead of a "missing field"
+        // 400. The flat form still submits a real value through its select.
+        if parent_fk == Some(name.as_str()) {
+            let _ = writeln!(struct_fields, "    #[serde(default)]");
         }
         if f.kind.is_attachment() {
             // Zero-JS multipart uploads (issue #1236): the attachment is NOT a
@@ -2133,6 +2403,11 @@ fn render_routes_file(
     authorize: bool,
     owner: Option<&str>,
     searchable: &[String],
+    // Issue #1323: `Some` only under `--belongs-to`, which adds the nested
+    // read/create routes and the shared `children_section` the parent's own
+    // `show` view renders. `None` keeps every emission below byte-identical to
+    // the pre-#1323 flat scaffold.
+    nesting: Option<&super::nested::Nesting>,
 ) -> String {
     let id_rust = id_type.rust_type();
     // Issue #1260: a `slug` field reroutes `show`/`edit`/`update`/`delete` (and
@@ -2212,6 +2487,16 @@ fn render_routes_file(
         .filter(|f| f.state_machine.is_some())
         .collect();
     let has_state_machine = !sm_fields.is_empty();
+    // Issue #1318: the optimistic-locking column, read from `all_fields` —
+    // `fields` is the FORM field list, and `lock_version` is deliberately absent
+    // from it (the version is carried in a hidden input, never as an editable
+    // control; see `plan_scaffold`'s `form_fields` filter). `None` for the
+    // overwhelming common case, which keeps every emission below byte-identical
+    // to the pre-#1318 output.
+    let lock_version: Option<&Field> = super::model::lock_version_field(all_fields);
+    // The Rust type of the version counter (`i32`/`i64`), used for the hidden
+    // field's parse target and the shared `form_for` helper's parameter.
+    let lock_version_ty: String = lock_version.map(Field::rust_type).unwrap_or_default();
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
@@ -2357,7 +2642,12 @@ fn render_routes_file(
                 .map(|d| (f.name.clone(), d))
         })
         .collect();
-    let model_form = render_model_form(pascal_name, fields, validations);
+    let model_form = render_model_form(
+        pascal_name,
+        fields,
+        validations,
+        nesting.map(|n| n.fk.as_str()),
+    );
     // Enum fields need their generated Rust type in scope here — `into_new`
     // parses into it and the `From<&Row>` seed matches against its variants
     // (see `render_model_form`).
@@ -2431,9 +2721,40 @@ fn render_routes_file(
             )
         }
     } else {
+        // Issue #1318: when the model declares `lock_version`, the write becomes
+        // a compare-and-swap — the expected version is part of the `WHERE`
+        // clause and the bump is part of the same `SET`, so the check and the
+        // increment are one atomic statement with no read-modify-write window.
+        // A concurrent writer that got there first leaves this `UPDATE` matching
+        // zero rows, which the `updated == 0` branch turns into a 409 re-render.
+        // Both fragments are empty without the column, so the emitted statement
+        // stays byte-identical for every other scaffold.
+        let lock_filter = lock_version.map_or_else(String::new, |_| {
+            format!(".filter({plural}::lock_version.eq(expected_lock_version))")
+        });
+        // A scaffold whose every other column is transition-only (issue #1326)
+        // has an empty `update_columns`, so the separator is conditional or the
+        // emitted tuple would start with a stray comma.
+        //
+        // The bump is a plain SQL `+ 1`, which DIVERGES from the repository
+        // path's `wrapping_add(1)` at the column's ceiling: Postgres raises
+        // `integer out of range` where the Rust path would wrap to the minimum.
+        // That is deliberate. Wrapping a lock version is not obviously the safer
+        // behaviour — a wrapped counter can collide with a stale client holding
+        // the same value from a previous cycle, which is the exact failure this
+        // guard exists to prevent — and emulating it would put a `CASE WHEN` in
+        // every scaffolded update forever. Reaching the ceiling organically
+        // takes 2^31 saves of one row; `lock_version:i64` is the answer for a
+        // row that churns that hard. The one *reachable* way to hit it, seeding
+        // a `--default` at the maximum, is refused by
+        // `validate_lock_version_field`.
+        let lock_bump = lock_version.map_or_else(String::new, |_| {
+            let sep = if update_columns.is_empty() { "" } else { ", " };
+            format!("{sep}{plural}::lock_version.eq({plural}::lock_version + 1)")
+        });
         format!(
-            "let updated = diesel::update({plural}::table.{find_expr})\n        \
-             .set(({update_columns}))\n        \
+            "let updated = diesel::update({plural}::table.{find_expr}{lock_filter})\n        \
+             .set(({update_columns}{lock_bump}))\n        \
              .execute(&mut *db)\n        .await?;"
         )
     };
@@ -2868,6 +3189,18 @@ fn render_routes_file(
     // once the changeset has been seeded from it.
     let edit_current_bind = if has_attachments {
         "// `current` is the name the shared edit body — and `update`, which\n             // re-renders that same body at 422 — reads the row through, so the\n             // stored-attachment block below can't drift between the two.\n             let current = row;\n    "
+    } else {
+        ""
+    };
+    // Issue #1318: the two bindings the shared edit body reads for optimistic
+    // locking. `edit_form` renders the row's live version and never shows the
+    // conflict banner — it is the *first* look at the record, so there is
+    // nothing to have lost a race to yet. `update`'s re-render branches bind the
+    // same two names to their own values (see `update_lock_version_preamble` and
+    // `update_zero_rows_block`), which is what lets one body serve all three
+    // sites without drifting.
+    let edit_lock_binds = if lock_version.is_some() {
+        "let lock_version_value = row.lock_version;\n    let lock_conflict = false;\n    "
     } else {
         ""
     };
@@ -3310,6 +3643,66 @@ mod attachment_read_back_tests {
     // carry zero per-column code. `--live-validation` keeps the per-field
     // emission path: its htmx inline-validation inputs (`text_input_htmx`)
     // have no `FieldControl` equivalent for `form_for` to dispatch to.
+    // Issue #1318 (AC3): the inline conflict banner. Rendered above the edit
+    // form by BOTH form-rendering paths, gated on the `lock_conflict` binding
+    // every splice site provides — so a stale submit lands the author back on
+    // their own edits with an explanation, never on a dead-end error page. The
+    // wording states what happened and what to do, because a bare "409
+    // Conflict" tells a non-technical author nothing.
+    let lock_conflict_banner = if lock_version.is_some() {
+        "@if lock_conflict {\n            \
+         p class=\"autumn-flash autumn-flash--error\" role=\"alert\" {\n                \
+         \"This record was changed by someone else since you opened it. \
+         Your changes are shown below — review them and save again to apply them.\"\n            \
+         }\n        \
+         }\n        "
+    } else {
+        ""
+    };
+    // The `--live-validation` form is raw markup rather than a `form_for` call,
+    // so its hidden version input is spliced straight into the `<form>` body.
+    let lock_version_hidden_input = if lock_version.is_some() {
+        "            input type=\"hidden\" name=\"lock_version\" value=(lock_version_value);\n"
+    } else {
+        ""
+    };
+    // The hidden field is read straight off the raw body rather than through
+    // `{Pascal}Form`: the version is not one of the model's editable columns, so
+    // it has no place on the form struct (which would render it as a visible
+    // control and let a submit set it like any other value). `serde_urlencoded`
+    // ignores the unknown pair when decoding the form, so the two coexist.
+    //
+    // A missing or unparsable value is a 400, not a silent `0`: `0` would be a
+    // *plausible* version that could match a freshly created row and wave a
+    // hand-crafted submit straight past the guard.
+    //
+    // It scans EVERY `lock_version` pair for the first that parses as an
+    // integer, rather than taking the first pair and parsing that. The CSRF and
+    // submit-token field names are app-configurable (`[security.csrf]` /
+    // `[security.submit_token] field_name`), so an app may legitimately name one
+    // of them `lock_version` — and those hidden inputs are prepended, so they
+    // land in the body FIRST. Stopping at the first pair would read a UUID,
+    // fail to parse it, and 400 every single update even though the real
+    // version was right there a few bytes later.
+    let lock_version_parser = lock_version.map_or_else(String::new, |_| {
+        format!(
+            "\n/// Read the hidden `lock_version` the edit form was rendered with\n\
+             /// (issue #1318).\n\
+             ///\n\
+             /// This is the version the author was looking at, NOT the version to\n\
+             /// write — the `UPDATE` uses it as a `WHERE` guard and increments the\n\
+             /// column itself, so a row that moved on in the meantime matches zero\n\
+             /// rows and the handler re-renders at 409.\n\
+             fn parse_lock_version(body: &Bytes) -> AutumnResult<{lock_version_ty}> {{\n    \
+             url::form_urlencoded::parse(body.as_ref())\n        \
+             .filter(|(key, _)| key == \"lock_version\")\n        \
+             .find_map(|(_, value)| value.parse::<{lock_version_ty}>().ok())\n        \
+             .ok_or_else(|| AutumnError::bad_request_msg(\n            \
+             \"missing or invalid lock_version: re-open the edit form and try again\",\n        \
+             ))\n\
+             }}\n"
+        )
+    });
     let (new_form_body, edit_form_body, form_for_helper) = if live_validation {
         // Issue #1124: `new_form`, `edit_form`, and both 422 re-render
         // branches render the same inputs from a `Changeset<{Pascal}Form>`
@@ -3357,10 +3750,11 @@ mod attachment_read_back_tests {
         let edit_form_layout = format!(
             "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
              h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
+             {lock_conflict_banner}\
              {edit_current_attachment_markup}\
              form action=(paths::update(*id)) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
-             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{changeset_inputs}            \
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{lock_version_hidden_input}{changeset_inputs}            \
              (autumn_web::a11y::Button::new(\"Save\").submit())\n        \
              }}\n        \
              form action=(paths::delete(*id)) method=\"post\" {{\n            \
@@ -3405,17 +3799,32 @@ mod attachment_read_back_tests {
         // no extra argument, keeping the pre-#1326 call byte-identical.
         let form_exclude_create = if has_state_machine { ", false" } else { "" };
         let form_exclude_edit = if has_state_machine { ", true" } else { "" };
+        // Issue #1318: the same shape for the optimistic-locking version — the
+        // edit call hands the helper the version to hide in the form, the create
+        // call `None` (no row, no version). Absent entirely without the column.
+        let form_lock_create = if lock_version.is_some() { ", None" } else { "" };
+        // Issue #1323: the FLAT create/edit forms keep the belongs_to select
+        // (#1146) — only the nested inline form drops it — so both pass `false`
+        // for the helper's `exclude_parent_fk` flag. Absent without
+        // `--belongs-to`, keeping the pre-#1323 call byte-identical.
+        let form_parent_fk = if nesting.is_some() { ", false" } else { "" };
+        let form_lock_edit = if lock_version.is_some() {
+            ", Some(lock_version_value)"
+        } else {
+            ""
+        };
         let new_form_layout = format!(
             "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
              h1 {{ \"New {pascal_name}\" }}\n        \
-             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_create}))\n    \
+             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_create}{form_lock_create}{form_parent_fk}))\n    \
              }})"
         );
         let edit_form_layout = format!(
             "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", {id_value_expr}), {cp_edit}{flash_arg}, html! {{\n        \
              h1 {{ \"Edit {pascal_name} #\" ({id_value_expr}) }}\n        \
+             {lock_conflict_banner}\
              {edit_current_attachment_markup}\
-             ({snake_name}_form_for(&changeset, paths::update({id_value_expr}), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}))\n        \
+             ({snake_name}_form_for(&changeset, paths::update({id_value_expr}), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}{form_lock_edit}{form_parent_fk}))\n        \
              form action=(paths::delete({id_value_expr})) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
@@ -3431,8 +3840,14 @@ mod attachment_read_back_tests {
         (
             new_form_body,
             edit_form_body,
-            render_form_for_helper(pascal_name, snake_name, fields, missing_reference_targets)
-                + &render_reference_option_loaders(&reference_fields, db_ty, &reference_displays),
+            render_form_for_helper(
+                pascal_name,
+                snake_name,
+                fields,
+                missing_reference_targets,
+                lock_version.map(|_| lock_version_ty.as_str()),
+                nesting.map(|n| n.fk.as_str()),
+            ) + &render_reference_option_loaders(&reference_fields, db_ty, &reference_displays),
         )
     };
     let form_model_impl = render_form_model_impl(pascal_name);
@@ -3517,6 +3932,67 @@ mod attachment_read_back_tests {
          }}\n"
     );
 
+    // What the `update` handler does when its `UPDATE` matched no rows.
+    //
+    // Without optimistic locking that can only mean the row is gone: 404, as
+    // before. With a `lock_version` guard (issue #1318) it is ambiguous — the
+    // row may be missing OR the version may have moved on under us — so the
+    // handler re-reads it to tell the two apart:
+    //
+    //   * still there  → someone else committed a newer version between the
+    //     edit-form load and this submit. Re-render the SAME edit body at 409
+    //     with the user's submitted values intact, an inline banner, and the
+    //     row's CURRENT version in the hidden field. Carrying the stale version
+    //     forward instead would make the form permanently unsavable — every
+    //     resubmit would lose the same race again.
+    //   * gone → the pre-#1318 404.
+    //
+    // `{blob_cleanup}` and the id expression differ per branch, so both are
+    // parameters; without a lock column the output is the pre-#1318 text
+    // verbatim.
+    // The re-read row is re-authorized before anything from it is used. The
+    // policy check at the top of `update` ran against the snapshot this request
+    // loaded; a record policy can depend on mutable row data, so the concurrent
+    // write that moved the version may also have moved the row out of this
+    // actor's reach. Only the version integer crosses over here (the re-render
+    // shows the author's own submitted values), but re-checking costs one call
+    // and removes the whole class rather than arguing about how sensitive a
+    // counter is. Empty without a policy.
+    let conflict_reauthz = if authorize {
+        format!(
+            "            autumn_web::authorization::authorize::<{pascal_name}>({create_update_state_expr}, &session, \"update\", &current).await?;\n"
+        )
+    } else {
+        String::new()
+    };
+    let update_zero_rows_block = |blob_cleanup: &str, id_expr: &str| -> String {
+        let not_found = format!(
+            "{blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
+             \"{pascal_name} with id {{}} not found\", {id_expr}\n        \
+             )));"
+        );
+        if lock_version.is_none() {
+            return not_found;
+        }
+        format!(
+            "{blob_cleanup}let current: Option<{pascal_name}> = {plural}::table\n            \
+             .{find_expr}\n            \
+             .select({pascal_name}::as_select())\n            \
+             .first(&mut *db)\n            \
+             .await\n            \
+             .optional()?;\n        \
+             if let Some(current) = current {{\n            \
+             // Lost the race: re-render this author's edits over the row as it\n            \
+             // now stands, so nothing they typed is thrown away.\n\
+             {conflict_reauthz}            \
+             let lock_version_value = current.lock_version;\n            \
+             let lock_conflict = true;\n            \
+             return Ok((autumn_web::reexports::http::StatusCode::CONFLICT, {edit_form_body}).into_response());\n        \
+             }}\n        \
+             {not_found}"
+        )
+    };
+
     // A slug field is always `unique` (issue #1260), so a slug scaffold
     // always takes THIS branch — the `has_attachments`/plain branches below
     // still hard-code the pre-#1260 `*id` literal, safe only because they're
@@ -3543,12 +4019,11 @@ mod attachment_read_back_tests {
              }}\n    \
              }};\n    \
              if updated == 0 {{\n        \
-             {blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
-             \"{pascal_name} with id {{}} not found\", {id_value_expr}\n        \
-             )));\n    \
+             {zero_rows}\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&paths::show({update_redirect_expr})).into_response())"
+             Ok(autumn_web::Redirect::to(&paths::show({update_redirect_expr})).into_response())",
+            zero_rows = update_zero_rows_block(blob_cleanup, &id_value_expr),
         )
     } else if has_attachments {
         // Issue #1872: no unique constraints, but the update write and the
@@ -3565,23 +4040,21 @@ mod attachment_read_back_tests {
              }}\n    \
              }};\n    \
              if updated == 0 {{\n        \
-             {blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
-             \"{pascal_name} with id {{}} not found\", *id\n        \
-             )));\n    \
+             {zero_rows}\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
+             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())",
+            zero_rows = update_zero_rows_block(blob_cleanup, "*id"),
         )
     } else {
         format!(
             "{update_stmt}\n    \
              if updated == 0 {{\n        \
-             return Err(AutumnError::not_found_msg(format!(\n            \
-             \"{pascal_name} with id {{}} not found\", *id\n        \
-             )));\n    \
+             {zero_rows}\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
+             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())",
+            zero_rows = update_zero_rows_block("", "*id"),
         )
     };
     // Issue #1125/#1830: load the target row and run the policy check *before*
@@ -3643,11 +4116,32 @@ mod attachment_read_back_tests {
     } else {
         String::new()
     };
+    // Issue #1318: read the version the edit form was rendered against out of
+    // its hidden field, and seed the two bindings the shared edit body renders
+    // from. Both are re-bound (shadowed) by the 409 branch in
+    // `update_zero_rows_block`; on the 422 branches they keep these values, so a
+    // validation failure hands the same version back and the author's next
+    // submit still races against the row they actually opened.
+    let update_lock_version_preamble = lock_version.map_or_else(String::new, |_| {
+        "let expected_lock_version = parse_lock_version(&body)?;\n    \
+         let lock_version_value = expected_lock_version;\n    \
+         let lock_conflict = false;\n    "
+            .to_owned()
+    });
+    let update_doc_locking = if lock_version.is_some() {
+        "/// Optimistic locking (issue #1318): the `UPDATE` is guarded by the\n\
+         /// `lock_version` the edit form was rendered against, so a submit that\n\
+         /// lost a race to a concurrent editor matches zero rows and re-renders\n\
+         /// the form at 409 instead of silently overwriting their work.\n"
+    } else {
+        ""
+    };
     let update_fn = format!(
         "/// `POST /{plural}/{{{id_url_segment}}}/update` — validate and apply form data to a row,\n\
          /// or re-render the edit form at 422 with inline errors and preserved input.\n\
          /// Uses column-by-column `diesel::update().set(...)` (same convention as\n\
          /// `examples/todo-app`) so we don't need `AsChangeset` on `New{pascal_name}`.\n\
+         {update_doc_locking}\
          #[secured]\n\
          #[post(\"/{plural}/{{{id_url_segment}}}/update\")]\n\
          pub async fn update(\n    \
@@ -3655,6 +4149,7 @@ mod attachment_read_back_tests {
          ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
          use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
          {authz_update_preamble}\
+         {update_lock_version_preamble}\
          {form_decode_block}\n    \
          {update_load_and_authorize_block}\
          let changeset = form.into_changeset();\n    \
@@ -4093,6 +4588,7 @@ mod attachment_read_back_tests {
             &reference_displays,
             false,
             route_key_field,
+            true,
         )
     };
     let index_label_loads = if live {
@@ -4123,6 +4619,7 @@ mod attachment_read_back_tests {
             &reference_displays,
             true,
             route_key_field,
+            true,
         )
     };
     // Issue #1312: the shared columns prelude the index AND the search-results
@@ -4347,6 +4844,7 @@ mod attachment_read_back_tests {
 /// unscoped `list`/`page`, so it cannot return another user's rows.
 #[secured]
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
@@ -4386,6 +4884,7 @@ pub async fn index(
 /// `{pascal_name}Scope` enforces for `#[repository(scope = ...)]` index routes.
 #[secured]
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     page_req: PageRequest,
     autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
@@ -4425,6 +4924,7 @@ pub async fn index(
 /// Out-of-range or missing values are clamped silently — list endpoints never
 /// return HTTP 400 for bad paging parameters.
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     page_req: PageRequest,
     db: ShardedDb,
@@ -4449,6 +4949,7 @@ pub async fn index(
 /// so this never 400s and can never inject SQL. `from_shard` keeps the query
 /// pinned to a single shard.
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
@@ -4475,6 +4976,7 @@ pub async fn index(
 /// Out-of-range or missing values are clamped silently — list endpoints never
 /// return HTTP 400 for bad paging parameters.
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
@@ -4497,6 +4999,7 @@ pub async fn index(
 /// malicious sort/filter keys are ignored against the model's column allowlist,
 /// so this never 400s and can never inject SQL.
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
@@ -4741,6 +5244,14 @@ pub async fn index(
         if live {
             names.push("events".to_owned());
         }
+        // Issue #1323: the nested list/create endpoints the children section
+        // links and posts to (`paths::nested_index(id)` /
+        // `paths::nested_create(id)`). Absent without `--belongs-to`, so a flat
+        // scaffold's `paths!` block stays byte-identical.
+        if nesting.is_some() {
+            names.push("nested_index".to_owned());
+            names.push("nested_create".to_owned());
+        }
         // One inline-validation endpoint per validated field (live-validation
         // only), each linked from the form's `.hx("post", paths::validate_{f}())`.
         if live_validation {
@@ -4797,6 +5308,31 @@ pub async fn index(
     } else {
         format!("{search_results_table}\n        {search_results_pager}")
     };
+    // Issue #1323: the `--belongs-to` nested surface — the shared
+    // `children_section` the parent's `show` view renders, the standalone page
+    // wrapper, and the two nested handlers. Empty for a flat scaffold.
+    let nested_section = nesting.map_or_else(String::new, |n| {
+        render_nested_section(
+            pascal_name,
+            snake_name,
+            plural,
+            n,
+            fields,
+            &reference_fields,
+            &reference_displays,
+            route_key_field,
+            soft_delete,
+            has_state_machine,
+            lock_version.is_some(),
+            !unique_fields.is_empty(),
+            authorize,
+            if owner_scoped_index { owner } else { None },
+            layout_fn,
+            &cp(&format!("/{}", n.parent_plural)),
+            flash_arg,
+        )
+    });
+
     let search_handler = if search_enabled && owner_scoped_standard {
         // Issue #1841: owner-scoped FTS handler for the standard Db path. The
         // SECURITY INVARIANT is that this branch calls ONLY the owner-filtered
@@ -5039,6 +5575,15 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
         // a `show` handler threading CSRF for the transition forms, and one
         // `POST /{plural}/{{id}}/transitions/{field}` handler per state-machine
         // field.
+        // Issue #1323 AC5: the child's detail page links back to the parent it
+        // belongs to, closing the loop the parent's children list opens. Empty
+        // without `--belongs-to`.
+        let show_parent_backlink = nesting.map_or_else(String::new, |n| {
+            format!(
+                "\n        \" \"\n        (autumn_web::a11y::Link::new(crate::routes::{}::paths::show(row.{}), \"Back to {}\"))",
+                n.parent_plural, n.fk, n.parent_pascal
+            )
+        });
         let show_section = if has_state_machine {
             // `show_view` only touches the DB when it must resolve reference
             // display labels (issue #1146); otherwise the connection is unused, so
@@ -5076,7 +5621,7 @@ async fn show_view(
         (autumn_web::widgets::property_list(&props))
 {show_transition_controls}        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
         " "
-        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit"))
+        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit")){show_parent_backlink}
     }}))
 }}"#
             );
@@ -5129,6 +5674,105 @@ pub async fn show(
             } else {
                 String::new()
             };
+            // Issue #1318: a state transition is a read-modify-write — it loads
+            // the row, asks `transition_{field}_to` whether the edge is legal
+            // from the state it just read, then writes. With a lock column in
+            // play that whole sequence becomes a compare-and-swap against the
+            // version it read, for two reasons:
+            //
+            //   * the GUARD stops two concurrent transitions out of the same
+            //     source state from both committing. Both would pass the
+            //     legality check against the stale row they each loaded, and an
+            //     `id`-only `WHERE` would let the second silently overwrite the
+            //     first's transition;
+            //   * the BUMP makes the transition visible to everyone else
+            //     guarding on the version — without it, an author holding an
+            //     edit form opened before the transition saves successfully and
+            //     is never told the record moved on, which is exactly the
+            //     "changed by someone else" case the 409 banner promises.
+            //
+            // Every fragment is empty without a lock column, including the tuple
+            // parentheses: the emitted `.set(...)` must stay the
+            // single-expression pre-#1318 form byte for byte.
+            let (transition_set_open, transition_lock_bump, transition_set_close) =
+                if lock_version.is_some() {
+                    (
+                        "(",
+                        format!(", {plural}::lock_version.eq({plural}::lock_version + 1)"),
+                        ")",
+                    )
+                } else {
+                    ("", String::new(), "")
+                };
+            let transition_update_bind = if lock_version.is_some() {
+                "let updated = "
+            } else {
+                ""
+            };
+            let transition_lock_filter = lock_version.map_or_else(String::new, |_| {
+                format!(".filter({plural}::lock_version.eq(row.lock_version))")
+            });
+            // Zero rows is ambiguous: the version moved between the load and
+            // the write, or the row was deleted outright. The block re-reads to
+            // tell them apart — 409 with the detail page re-rendered for a
+            // record someone else changed, 404 for one that is gone — rather
+            // than redirecting with a success flash for a transition that never
+            // happened, or offering a conflict page whose suggested reload
+            // cannot succeed. It renders the RE-READ row, not this request's
+            // snapshot: the reader is deciding again, and the legal edges may
+            // no longer be the ones they were shown.
+            // The re-read row must be re-authorized before it is rendered. The
+            // policy check earlier in this handler ran against `row`, the
+            // snapshot this request loaded; a record policy can depend on
+            // mutable row data (the generated owner policy does), so the very
+            // concurrent write that moved the version may also have moved the
+            // row out of this actor's reach. Rendering `current` unchecked would
+            // hand them its current properties and transition controls. Empty
+            // without a policy, where there is nothing to re-check.
+            let transition_conflict_reauthz = if authorize {
+                format!(
+                    "                autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"update\", &current).await?;\n"
+                )
+            } else {
+                String::new()
+            };
+            let transition_conflict_block = lock_version.map_or_else(String::new, |_| {
+                format!(
+                    "            if updated == 0 {{\n                \
+                     // Zero rows is ambiguous — the version moved on, or the row\n                \
+                     // is gone entirely. Re-read to tell them apart, exactly as the\n                \
+                     // `update` handler does: a 409 for a record someone else\n                \
+                     // changed, a 404 for one that no longer exists. Without this a\n                \
+                     // concurrent delete would render a conflict page for a row that\n                \
+                     // cannot be reloaded.\n                \
+                     let current: Option<{pascal_name}> = {plural}::table\n                    \
+                     .find(*id)\n                    \
+                     .select({pascal_name}::as_select())\n                    \
+                     .first(&mut *db)\n                    \
+                     .await\n                    \
+                     .optional()?;\n                \
+                     let Some(current) = current else {{\n                    \
+                     return Err(AutumnError::not_found_msg(format!(\n                        \
+                     \"{pascal_name} with id {{}} not found\", *id\n                    \
+                     )));\n                \
+                     }};\n\
+                     {transition_conflict_reauthz}                \
+                     flash.error(\"This {snake_name} was changed by someone else since this page was loaded. Reload and try again.\").await;\n                \
+                     // Render the row as it NOW stands, not the snapshot this\n                \
+                     // request loaded: the reader is deciding again, and the legal\n                \
+                     // transitions may well be different from the ones they saw.\n                \
+                     let view = show_view(\n                    \
+                     db,\n                    \
+                     &current,\n                    \
+                     flash_messages(&flash.consume().await),\n                    \
+                     csrf.as_ref(),\n                    \
+                     csrf_field.as_ref(){show_view_state_arg_call},\n                \
+                     )\n                \
+                     .await?;\n                \
+                     return Ok((autumn_web::reexports::http::StatusCode::CONFLICT, view).into_response());\n            \
+                     }}\n"
+                )
+            });
             let mut transition_handlers = String::new();
             for f in &sm_fields {
                 let field = &f.name;
@@ -5159,11 +5803,11 @@ pub async fn transition_{field}(
     let target = submitted.get("{field}").cloned().unwrap_or_default();
     match row.transition_{field}_to(&target) {{
         Ok(new_state) => {{
-            diesel::update({plural}::table.find(*id))
-                .set({plural}::{field}.eq(new_state))
+            {transition_update_bind}diesel::update({plural}::table.find(*id){transition_lock_filter})
+                .set({transition_set_open}{plural}::{field}.eq(new_state){transition_lock_bump}{transition_set_close})
                 .execute(&mut *db)
                 .await?;
-            flash.success("{pascal_name} {field} updated").await;
+{transition_conflict_block}            flash.success("{pascal_name} {field} updated").await;
             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())
         }}
         Err(err) => {{
@@ -5207,7 +5851,7 @@ pub async fn show({id_param_decl}, mut db: {db_ty}, flash: Flash{show_state_para
         (autumn_web::widgets::property_list(&props))
         (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
         " "
-        (autumn_web::a11y::Link::new(paths::edit({route_key_display_expr}), "Edit"))
+        (autumn_web::a11y::Link::new(paths::edit({route_key_display_expr}), "Edit")){show_parent_backlink}
     }}))
 }}
 "#
@@ -5277,7 +5921,7 @@ pub async fn edit_form(
         .await
         .map_err(AutumnError::not_found)?;
     {authz_edit_call}let changeset = Changeset::new({pascal_name}Form::from(&row));
-    {edit_current_bind}Ok({edit_form_body})
+    {edit_lock_binds}{edit_current_bind}Ok({edit_form_body})
 }}
 
 {update_fn}
@@ -5328,7 +5972,7 @@ pub async fn destroy(
 fn is_nullable_form_field(name: &str) -> bool {{
     {nullable_field_match}
 }}
-"#
+{lock_version_parser}"#
         )
     } + &if live {
         format!(
@@ -5348,7 +5992,381 @@ pub async fn events(
         + &preview_handlers
         + &paths_macro
         + &search_handler
+        + &nested_section
         + &attachment_read_back_unit_tests
+}
+
+/// Render the `--belongs-to` nested surface appended to the child's routes
+/// module (issue #1323): the shared `children_section` the parent's own `show`
+/// view renders, the full-page `nested_view` wrapper, and the two nested
+/// handlers (`GET`/`POST /<parents>/{<fk>}/<children>`).
+///
+/// Returns the empty string for every flat scaffold, so a resource generated
+/// without `--belongs-to` keeps byte-for-byte the output it had before this
+/// feature existed.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_lines,
+    reason = "one template — the whole point is a single place that prints one \
+              coherent block of generated code"
+)]
+fn render_nested_section(
+    pascal_name: &str,
+    snake_name: &str,
+    plural: &str,
+    nesting: &super::nested::Nesting,
+    // The FORM field list (the same one the flat index/forms render from).
+    fields: &[Field],
+    reference_fields: &[&Field],
+    reference_displays: &BTreeMap<String, ReferenceDisplay>,
+    route_key_field: Option<&str>,
+    soft_delete: bool,
+    has_state_machine: bool,
+    has_lock_version: bool,
+    has_unique: bool,
+    authorize: bool,
+    // The owner column the flat index scopes its list to (issue #1125/#1830), or
+    // `None` when this scaffold has none. `Some` makes the nested list carry the
+    // SAME owner scoping, so nesting can never widen what a resource discloses.
+    owner_scoped: Option<&str>,
+    layout_fn: &str,
+    cp_nested: &str,
+    flash_arg: &str,
+) -> String {
+    let fk = nesting.fk.as_str();
+    let parent_plural = nesting.parent_plural.as_str();
+    let parent_pascal = nesting.parent_pascal.as_str();
+    let parent_snake = nesting.parent_snake.as_str();
+    let route = nesting.route_path(plural);
+
+    // The parent foreign key is dropped from the child list's columns: in a
+    // list already scoped to one parent it is the same value on every row, so a
+    // column for it is pure noise (and, with #1146 display labels, an extra
+    // query per page for a value the page title already states).
+    let list_fields: Vec<Field> = fields.iter().filter(|f| f.name != fk).cloned().collect();
+
+    // Display-label maps for the remaining `references` columns, mirroring what
+    // the flat index loads. Written here rather than reusing
+    // `render_index_reference_label_loads` because this helper holds the
+    // connection as `&mut Db` (so a parent can render several children off one
+    // connection), which needs a reborrow at each call site.
+    let mut label_loads = String::new();
+    for f in reference_fields {
+        if f.name == fk || !reference_displays.contains_key(&f.name) {
+            continue;
+        }
+        let name = &f.name;
+        let _ = writeln!(
+            label_loads,
+            "    let {name}_labels: std::collections::HashMap<String, String> =\n        \
+             {name}_select_options(&mut *db).await?.into_iter().collect();"
+        );
+    }
+    let columns = render_columns_vec(
+        pascal_name,
+        &list_fields,
+        reference_displays,
+        true,
+        route_key_field,
+        false,
+    );
+
+    // Select options for the inline form's OTHER `references` columns. The
+    // parent FK gets an empty slice: `exclude_parent_fk` drops its control, so
+    // the options would never be rendered — loading them would be a wasted
+    // query on every parent show page.
+    let mut option_loads = String::new();
+    let mut option_args = String::new();
+    for f in reference_fields {
+        let name = &f.name;
+        if name == fk {
+            option_args.push_str(", &[]");
+            continue;
+        }
+        let _ = writeln!(
+            option_loads,
+            "    let {name}_options = {name}_select_options(&mut *db).await?;"
+        );
+        let _ = write!(option_args, ", &{name}_options");
+    }
+    // The nested form is a CREATE form, so it mirrors the flat create call's
+    // trailing flags: keep state-machine columns (the initial state), no lock
+    // version to guard against — plus `true` for the nested-only FK exclusion.
+    let form_exclude_state = if has_state_machine { ", false" } else { "" };
+    let form_lock = if has_lock_version { ", None" } else { "" };
+    // Soft-deleted children must not resurface in the parent's list; the flat
+    // index gets this for free through the repository's soft-delete support,
+    // but this parent-scoped query is hand-written.
+    let deleted_filter = if soft_delete {
+        format!("\n        .filter({plural}::deleted_at.is_null())")
+    } else {
+        String::new()
+    };
+
+    // SECURITY (issue #1125/#1830 posture parity): when the flat `GET /{plural}`
+    // index is owner-scoped, the nested list must be too. Otherwise
+    // `--belongs-to` would quietly open a SECOND, unscoped door onto the same
+    // rows — a child list scoped only by parent would disclose every user's
+    // children of that parent, including through the parent's public show page.
+    // The scoping lives in `children_section_with`, so BOTH entry points (the
+    // nested page and the parent's show view) inherit it.
+    //
+    // The `AppState`/`Session` pair is always in the helper's signature — the
+    // parent-side injection emits one fixed call shape — but is `_`-prefixed
+    // (and so warning-free) for a scaffold with no owner column.
+    let (state_param, session_param, owner_prelude, owner_filter) = owner_scoped.map_or_else(
+        || (
+            "_state: &autumn_web::AppState",
+            "_session: &autumn_web::session::Session",
+            String::new(),
+            String::new(),
+        ),
+        |owner_col| (
+            "state: &autumn_web::AppState",
+            "session: &autumn_web::session::Session",
+            "    let ctx = autumn_web::authorization::PolicyContext::from_request(state, session).await;\n    let owner_id = ctx.user_id_i64().unwrap_or(-1);\n"
+                .to_owned(),
+            format!("\n        .filter({plural}::{owner_col}.eq(owner_id))"),
+        ),
+    );
+    // The nested page is `#[secured]` exactly when the flat index is — i.e.
+    // whenever the list is owner-scoped and therefore only meaningful for a
+    // signed-in user.
+    let nested_index_secured = if owner_scoped.is_some() {
+        "#[secured]\n"
+    } else {
+        ""
+    };
+
+    // Authorization mirrors the flat `create` exactly: a nested create is still
+    // a create, so it runs the same context-only `authorize_create` check
+    // against the same policy (issue #1125). Without policy wiring both
+    // fragments are empty and the handler is just path/flash/csrf/db/body.
+    let authz_call = if authorize {
+        format!(
+            "    autumn_web::authorization::authorize_create::<{pascal_name}>(&state, &session).await?;\n"
+        )
+    } else {
+        String::new()
+    };
+    // The argument names `children_section` forwards to `children_section_with`
+    // — `_`-prefixed in lockstep with `{state_param}`/`{session_param}` so an
+    // unscoped scaffold stays warning-free.
+    let (state_arg, session_arg) = if owner_scoped.is_some() {
+        ("state", "session")
+    } else {
+        ("_state", "_session")
+    };
+
+    // A duplicate value on a `unique` column is a constraint violation, not a
+    // validation failure, so — exactly like the flat create (issue #1032) — it
+    // is classified into an inline field error and re-rendered at 422 rather
+    // than surfacing as a 500.
+    let insert_block = if has_unique {
+        format!(
+            "    let result: AutumnResult<()> = async {{\n        \
+             diesel::insert_into({plural}::table)\n            \
+             .values(&new)\n            \
+             .execute(&mut *db)\n            .await?;\n        \
+             Ok(())\n    \
+             }}.await;\n    \
+             if let Err(err) = result {{\n        \
+             if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n            \
+             let mut errors = std::collections::HashMap::new();\n            \
+             errors.insert(field.to_string(), vec![message.to_string()]);\n            \
+             let changeset = Changeset::from_errors(changeset.into_inner(), errors);\n            \
+             let view = nested_view(&mut db, *{fk}, &PageRequest::default(), &changeset, {flash_arg}, &state, &session, csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref()).await?;\n            \
+             return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, view).into_response());\n        \
+             }}\n        \
+             return Err(err);\n    \
+             }}\n"
+        )
+    } else {
+        format!(
+            "    diesel::insert_into({plural}::table)\n        \
+             .values(&new)\n        \
+             .execute(&mut *db)\n        .await?;\n"
+        )
+    };
+
+    format!(
+        r#"
+
+/// Render one {parent_snake}'s {plural} — the paginated child list plus the
+/// inline "add" form posting to `POST {route}` (issue #1323).
+///
+/// `pub` on purpose: the {parent_snake} resource's generated `show` view calls
+/// it, and so can any hand-written page that wants the same section. Takes the
+/// connection by `&mut` so one page can render several children off it.
+#[allow(clippy::too_many_arguments)]
+pub async fn children_section(
+    db: &mut Db,
+    {fk}: i64,
+    page_req: &PageRequest,
+    {state_param},
+    {session_param},
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+    submit_token: Option<&SubmitToken>,
+    submit_field: Option<&SubmitFormField>,
+) -> AutumnResult<Markup> {{
+    children_section_with(
+        db,
+        {fk},
+        page_req,
+        &Changeset::new({pascal_name}Form::default()),
+        {state_arg},
+        {session_arg},
+        csrf,
+        csrf_field,
+        submit_token,
+        submit_field,
+    )
+    .await
+}}
+
+/// The shared body behind [`children_section`], also used by `nested_create`'s
+/// 422 re-render — which hands it the *invalid* changeset so the inline form
+/// comes back with the submitted values and per-field errors intact (#1124).
+#[allow(clippy::too_many_arguments)]
+async fn children_section_with(
+    db: &mut Db,
+    {fk}: i64,
+    page_req: &PageRequest,
+    changeset: &Changeset<{pascal_name}Form>,
+    {state_param},
+    {session_param},
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+    submit_token: Option<&SubmitToken>,
+    submit_field: Option<&SubmitFormField>,
+) -> AutumnResult<Markup> {{
+{owner_prelude}    let total: i64 = {plural}::table
+        .filter({plural}::{fk}.eq({fk})){deleted_filter}{owner_filter}
+        .count()
+        .get_result(&mut **db)
+        .await?;
+    let items: Vec<{pascal_name}> = {plural}::table
+        .filter({plural}::{fk}.eq({fk})){deleted_filter}{owner_filter}
+        .select({pascal_name}::as_select())
+        .order({plural}::id.desc())
+        .limit(page_req.limit())
+        .offset(page_req.offset())
+        .load(&mut **db)
+        .await?;
+    let page_data: Page<{pascal_name}> = Page::new(items, total, page_req);
+{label_loads}{columns}{option_loads}    let nested_base = paths::nested_index({fk});
+    Ok(html! {{
+        section id="{parent_snake}-{plural}" aria-labelledby="{parent_snake}-{plural}-heading" {{
+            h2 id="{parent_snake}-{plural}-heading" {{ "{pascal_name}s" }}
+            (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&nested_base)))
+            (pagination_nav(&page_data, &PagerOptions::new(&nested_base)))
+            h3 {{ "Add {pascal_name}" }}
+            ({snake_name}_form_for(changeset, paths::nested_create({fk}), "Add {pascal_name}", csrf, csrf_field, submit_token, submit_field{option_args}{form_exclude_state}{form_lock}, true))
+        }}
+    }})
+}}
+
+/// Confirm the parent {parent_snake} exists, so a request naming one that does
+/// not answers **404** rather than a plausible-looking empty list — and so a
+/// nested create fails as a not-found instead of surfacing the foreign-key
+/// constraint violation as a 500.
+///
+/// Only the routes that take the id from an untrusted URL call this; the
+/// parent's own `show` view already loaded the row before it renders the
+/// section, so it pays nothing.
+async fn require_{parent_snake}(db: &mut Db, {fk}: i64) -> AutumnResult<()> {{
+    {parent_plural}::table
+        .find({fk})
+        .select({parent_plural}::id)
+        .first::<i64>(&mut **db)
+        .await
+        .map_err(AutumnError::not_found)?;
+    Ok(())
+}}
+
+/// The standalone page wrapper around [`children_section_with`] — shared by
+/// `nested_index` and `nested_create`'s 422 re-render so both render the same
+/// document.
+#[allow(clippy::too_many_arguments)]
+async fn nested_view(
+    db: &mut Db,
+    {fk}: i64,
+    page_req: &PageRequest,
+    changeset: &Changeset<{pascal_name}Form>,
+    flash: Markup,
+    state: &autumn_web::AppState,
+    session: &autumn_web::session::Session,
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+    submit_token: Option<&SubmitToken>,
+    submit_field: Option<&SubmitFormField>,
+) -> AutumnResult<Markup> {{
+    require_{parent_snake}(db, {fk}).await?;
+    let section = children_section_with(db, {fk}, page_req, changeset, state, session, csrf, csrf_field, submit_token, submit_field).await?;
+    Ok({layout_fn}(&format!("{pascal_name}s for {parent_pascal} #{{{fk}}}"), {cp_nested}flash, html! {{
+        h1 {{ "{pascal_name}s for {parent_pascal} #" ({fk}) }}
+        (section)
+        (autumn_web::a11y::Link::new(crate::routes::{parent_plural}::paths::show({fk}), "Back to {parent_pascal}"))
+    }}))
+}}
+
+/// `GET {route}` — one {parent_snake}'s {plural}, and only that {parent_snake}'s.
+///
+/// Paginated through the same `PageRequest` extractor the flat index uses:
+/// `?page=N&size=M`, clamped silently rather than 400ing.
+{nested_index_secured}#[get("{route}", name = "nested_index")]
+#[allow(clippy::too_many_arguments)]
+pub async fn nested_index(
+    {fk}: Path<i64>,
+    page_req: PageRequest,
+    mut db: Db,
+    flash: Flash,
+    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+    session: autumn_web::session::Session,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    submit_token: Option<SubmitToken>,
+    submit_field: Option<SubmitFormField>,
+) -> AutumnResult<Markup> {{
+    nested_view(&mut db, *{fk}, &page_req, &Changeset::new({pascal_name}Form::default()), {flash_arg}, &state, &session, csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref()).await
+}}
+
+/// `POST {route}` — create one {snake_name} under its parent {parent_snake}.
+#[secured]
+#[post("{route}", name = "nested_create")]
+pub async fn nested_create(
+    {fk}: Path<i64>,
+    flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    submit_token: Option<SubmitToken>,
+    submit_field: Option<SubmitFormField>,
+    mut db: Db,
+    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+    session: autumn_web::session::Session,
+    body: Bytes,
+) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{
+    use autumn_web::reexports::axum::response::IntoResponse as _;
+{authz_call}    let mut form = decode_form(body)?;
+    // SECURITY: the parent is the ROUTE, never the payload. The nested form
+    // renders no control for `{fk}` (see `exclude_parent_fk`), and this
+    // overwrite — before validation, before the insert — means a hand-crafted
+    // body carrying its own `{fk}` cannot re-parent the {snake_name}.
+    form.{fk} = {fk}.to_string();
+    let changeset = form.into_changeset();
+    if !changeset.is_valid() {{
+        let view = nested_view(&mut db, *{fk}, &PageRequest::default(), &changeset, {flash_arg}, &state, &session, csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref()).await?;
+        return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, view).into_response());
+    }}
+    let new = into_new(changeset.data())?;
+    require_{parent_snake}(&mut db, *{fk}).await?;
+{insert_block}    flash.success("{pascal_name} created").await;
+    Ok(autumn_web::Redirect::to(&crate::routes::{parent_plural}::paths::show(*{fk})).into_response())
+}}
+"#
+    )
 }
 
 /// The `UNIQUE_CONSTRAINTS` module-level const the generated `create`/
@@ -5504,6 +6522,13 @@ fn render_form_for_helper(
     snake_name: &str,
     fields: &[Field],
     missing_reference_targets: &BTreeSet<String>,
+    // The Rust type of the model's `lock_version` counter (issue #1318), or
+    // `None` when the model declares no optimistic-locking column.
+    lock_version_ty: Option<&str>,
+    // The parent foreign-key column under `--belongs-to` (issue #1323), or
+    // `None` for a flat scaffold. `Some` adds the `exclude_parent_fk` flag the
+    // nested inline create form passes to drop that control.
+    parent_fk: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
     let mut extra_params = String::new();
@@ -5776,8 +6801,44 @@ fn render_form_for_helper(
         for name in &sm_field_names {
             let _ = write!(excludes, "\n        form = form.exclude(\"{name}\");");
         }
-        format!("\n    if exclude_state_fields {{{excludes}\n    }}\n    ")
+        // Ends at a newline, not at the next line's indent: the template
+        // supplies that. (Before #1323 the trailing indent stacked with the
+        // template's, pushing the following comment out to 8 spaces.)
+        format!("\n    if exclude_state_fields {{{excludes}\n    }}\n")
     };
+    // Issue #1318: the optimistic-locking version travels as a hidden field
+    // INSIDE the form, so it must be injected here rather than around the
+    // helper's call — `form_for` renders the whole `<form>` element. The edit
+    // call passes `Some(version)` and the create call `None`: a row that does
+    // not exist yet has no version to guard against. A model with no
+    // `lock_version` column emits neither the parameter nor the block, keeping
+    // the pre-#1318 helper byte-identical.
+    let lock_version_block = lock_version_ty.map_or_else(String::new, |ty| {
+        let _ = write!(extra_params, ",\n    lock_version: Option<{ty}>");
+        // Prepended AFTER the submit token above, so the token stays the very
+        // first field in the URL-encoded body: `prepend` pushes onto a list
+        // rendered in call order, and `SubmitTokenLayer` only scans the body's
+        // first chunk (issue #1360).
+        "    if let Some(version) = lock_version {\n        \
+         form = form.prepend(html! { input type=\"hidden\" name=\"lock_version\" value=(version); });\n    \
+         }\n    "
+            .to_owned()
+    });
+    // Issue #1323: the nested inline create form must not offer the parent
+    // foreign key as an editable control — the parent is the URL, and the nested
+    // create handler sets the column from the path either way. The helper is
+    // shared by the flat create/edit forms (which keep the belongs_to select from
+    // #1146) and the nested form, so it takes a flag: the nested call passes
+    // `true`, every other call `false`. A scaffold with no `--belongs-to` emits
+    // neither the parameter nor the block.
+    //
+    // Placed AFTER the state-machine exclusion and BEFORE the submit-token
+    // prepend, so both exclusions read together and neither disturbs the
+    // token's position at the front of the form (issue #1360).
+    let parent_fk_block = parent_fk.map_or_else(String::new, |name| {
+        let _ = write!(extra_params, ",\n    exclude_parent_fk: bool");
+        format!("    if exclude_parent_fk {{\n        form = form.exclude(\"{name}\");\n    }}\n")
+    });
     format!(
         "/// Render the create/edit form in a single `form_for` call (issue #1135).\n\
          ///\n\
@@ -5786,6 +6847,7 @@ fn render_form_for_helper(
          /// column requires no edits here — any enum/decimal/attachment overrides\n\
          /// below are the only schema-specific lines, and regeneration maintains\n\
          /// them.\n\
+         #[allow(clippy::too_many_arguments)]\n\
          fn {snake_name}_form_for(\n    \
          changeset: &Changeset<{pascal_name}Form>,\n    \
          action: String,\n    \
@@ -5797,12 +6859,12 @@ fn render_form_for_helper(
          ) -> Markup {{\n\
          {preludes}    \
          let mut form = autumn_web::form::form_for(changeset, action, \"post\")\n        \
-         .submit_label(submit_label){builder_calls}{appends};\n{sm_exclude_block}    \
+         .submit_label(submit_label){builder_calls}{appends};\n{sm_exclude_block}{parent_fk_block}    \
          // Emit the one-time submit token at the FRONT of the form (issue #1360):\n    \
          // `SubmitTokenLayer` only scans the first chunk of the URL-encoded body,\n    \
          // so a large earlier textarea could otherwise push an appended token past\n    \
          // the scan cap and leave duplicate submits unguarded.\n    \
-         form = form.prepend(submit_token_input(submit_token, submit_field));\n    \
+         form = form.prepend(submit_token_input(submit_token, submit_field));\n{lock_version_block}    \
          if let Some(csrf) = csrf {{\n        \
          form = form.csrf(csrf.token());\n    \
          }}\n    \
@@ -6782,6 +7844,13 @@ fn render_columns_vec(
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
     use_label_maps: bool,
     route_key_field: Option<&str>,
+    // Whether the emitted columns advertise themselves as sortable. `true` for
+    // the flat index, whose handler extracts a `ListQuery` and actually honours
+    // `?sort=&dir=`. `false` for the nested child list (issue #1323), which runs
+    // a fixed `ORDER BY id DESC`: a sortable header there renders a link that
+    // reloads the identical list and stamps an `aria-sort` that never changes —
+    // an accessibility lie, not just a dead control.
+    sortable: bool,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 150 + 300);
@@ -6790,14 +7859,15 @@ fn render_columns_vec(
         "    let columns: Vec<autumn_web::widgets::Column<{pascal_name}>> = vec!["
     );
     // ID column — always sortable (the default order is `id DESC`).
+    let id_sortable = if sortable { ".sortable(\"id\")" } else { "" };
     let _ = writeln!(
         out,
-        "        autumn_web::widgets::Column::new(\"Id\", |row: &{pascal_name}| maud::html! {{ (row.id) }}).sortable(\"id\"),"
+        "        autumn_web::widgets::Column::new(\"Id\", |row: &{pascal_name}| maud::html! {{ (row.id) }}){id_sortable},"
     );
     // One column per field
     for f in fields {
         let header = title_case(&f.name);
-        let sortable_suffix = if kind_is_sortable(f.kind) {
+        let sortable_suffix = if sortable && kind_is_sortable(f.kind) {
             format!(".sortable(\"{}\")", f.name)
         } else {
             String::new()
@@ -7420,6 +8490,16 @@ fn render_smoke_test(
         base + &render_write_path_smoke_test(pascal_name, plural, bulk_delete)
     };
 
+    // Issue #1318 (AC6): a scaffold that opted into optimistic locking gets a
+    // dedicated stale-write test — the one behavior a reader would otherwise
+    // have to take on trust, and the one a later refactor is most likely to
+    // silently drop.
+    let base = if !api && super::model::lock_version_field(fields).is_some() {
+        base + &render_optimistic_lock_smoke_test(plural)
+    } else {
+        base
+    };
+
     // Issue #1236 (AC6): attachment scaffolds additionally get a multipart
     // write-path test that drives a zero-JS `multipart/form-data` create through
     // the real `Multipart` extractor, streams the uploaded file to a real
@@ -7647,6 +8727,173 @@ fn render_validation_rejection_smoke_test(
     )
 }
 
+/// Render the nested parent/child write-path test (issue #1323 AC7), appended to
+/// `tests/<snake>.rs` for a `--belongs-to` scaffold.
+///
+/// Pins the three claims the nesting makes, in one in-process `#[tokio::test]`:
+///
+/// * creating a child under a parent redirects (303 PRG) to that parent's show
+///   route — the same contract the generated `nested_create` handler has;
+/// * the child then appears in **that** parent's list;
+/// * and it does **not** appear under a different parent — the negative half,
+///   which is what makes the parent-scoping assertion have teeth.
+///
+/// Plus the security claim the nested create rests on: a body-supplied foreign
+/// key is ignored, because the handler overwrites it from the path before
+/// validating.
+///
+/// Like every other generated write-path test this drives a stand-in resource
+/// rather than the project's own handlers (a `tests/*.rs` integration binary
+/// cannot import a binary crate's modules) and needs no database, so it is a
+/// visible green rather than an `#[ignore]`d one.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a single verbatim test template plus its placeholder substitutions"
+)]
+fn render_nested_write_path_smoke_test(
+    pascal_name: &str,
+    plural: &str,
+    nesting: &super::nested::Nesting,
+) -> String {
+    const TEMPLATE: &str = r#"
+// ── nested parent/child write path (issue #1323) ──────────────────────────
+//
+// create child under parent -> child appears in THAT parent's list -> child
+// does NOT appear under a different parent. `TestApp::new()` disables CSRF, so
+// these same-origin form POSTs need no `_csrf` token (the real
+// form_for-rendered inline form injects one for the browser).
+#[tokio::test]
+async fn __PLURAL___nested_under_parent() {
+    use autumn_web::test::{TestApp, TestClient};
+
+    // A process-local stand-in for the persistence layer: `(id, parent_id, name)`
+    // rows shared across requests within this test. No database required.
+    static NESTED_STORE: std::sync::Mutex<Vec<(i64, i64, String)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    #[derive(serde::Deserialize, serde::Serialize, Default, validator::Validate, Clone)]
+    struct NestedForm {
+        #[validate(length(min = 1, message = "must not be blank"))]
+        name: String,
+        // Mirrors the generated `__PASCAL__Form`: the parent foreign key carries
+        // `#[serde(default)]` because the nested inline form renders no control
+        // for it, so a nested submission legitimately omits it.
+        #[serde(default)]
+        __FK__: String,
+    }
+
+    #[get("/__PARENT_PLURAL__/{__FK__}/__PLURAL__")]
+    async fn nested_index(__FK__: Path<i64>) -> Markup {
+        let store = NESTED_STORE.lock().unwrap();
+        html! {
+            h1 { "__PLURAL__ for __PARENT_PLURAL__ " (*__FK__) }
+            ul {
+                @for (_, parent, name) in store.iter() {
+                    @if *parent == *__FK__ { li { (name.as_str()) } }
+                }
+            }
+        }
+    }
+
+    #[post("/__PARENT_PLURAL__/{__FK__}/__PLURAL__")]
+    async fn nested_create(__FK__: Path<i64>, form: ChangesetForm<NestedForm>) -> impl IntoResponse {
+        match form.into_valid() {
+            Ok(mut valid) => {
+                // The parent is the ROUTE, never the payload -- exactly what the
+                // generated handler does before it validates and inserts.
+                valid.__FK__ = __FK__.to_string();
+                let parent: i64 = valid.__FK__.parse().unwrap_or_default();
+                let mut store = NESTED_STORE.lock().unwrap();
+                let id = store.iter().map(|(i, _, _)| *i).max().unwrap_or(0) + 1;
+                store.push((id, parent, valid.name));
+                Redirect::to(&format!("/__PARENT_PLURAL__/{}", *__FK__)).into_response()
+            }
+            Err(form) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                html! { (autumn_web::form::text_input(&form.changeset, "name", "name")) },
+            )
+                .into_response(),
+        }
+    }
+
+    let client: TestClient = TestApp::new()
+        .routes(routes![nested_index, nested_create])
+        .build();
+
+    // Create a child under parent 1: PRG redirects (303 See Other) to that
+    // parent's show page, not to the child's own index.
+    client
+        .post("/__PARENT_PLURAL__/1/__PLURAL__")
+        .form("name=under-parent-one")
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PARENT_PLURAL__/1");
+
+    // It shows up in THAT parent's list ...
+    client
+        .get("/__PARENT_PLURAL__/1/__PLURAL__")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("under-parent-one");
+
+    // ... and NOT under a different parent. This negative is the whole point of
+    // the nested read route: a list scoped to one parent must never leak
+    // another's rows.
+    let other_parent = client.get("/__PARENT_PLURAL__/2/__PLURAL__").send().await;
+    other_parent.assert_ok();
+    assert!(
+        !other_parent.text().contains("under-parent-one"),
+        "a child must not appear under a different parent:\n{}",
+        other_parent.text()
+    );
+
+    // A hand-crafted body carrying its own foreign key cannot re-parent the
+    // child: the path wins, because the handler overwrites the field before it
+    // validates.
+    client
+        .post("/__PARENT_PLURAL__/2/__PLURAL__")
+        .form("name=path-wins&__FK__=1")
+        .send()
+        .await
+        .assert_status(303);
+    let parent_one = client.get("/__PARENT_PLURAL__/1/__PLURAL__").send().await;
+    assert!(
+        !parent_one.text().contains("path-wins"),
+        "a submitted __FK__ must not override the parent in the URL:\n{}",
+        parent_one.text()
+    );
+    client
+        .get("/__PARENT_PLURAL__/2/__PLURAL__")
+        .send()
+        .await
+        .assert_body_contains("path-wins");
+
+    // An invalid submission re-renders at 422 with an inline error and persists
+    // nothing -- the parent's list is unchanged.
+    client
+        .post("/__PARENT_PLURAL__/1/__PLURAL__")
+        .form("name=")
+        .send()
+        .await
+        .assert_status(422)
+        .assert_body_contains("role=\"alert\"");
+    let after = client.get("/__PARENT_PLURAL__/1/__PLURAL__").send().await;
+    assert!(
+        after.text().matches("<li>").count() == 1,
+        "a rejected create must not persist a row:\n{}",
+        after.text()
+    );
+}
+"#;
+    TEMPLATE
+        .replace("__PARENT_PLURAL__", &nesting.parent_plural)
+        .replace("__PASCAL__", pascal_name)
+        .replace("__FK__", &nesting.fk)
+        .replace("__PLURAL__", plural)
+}
+
 /// Render the generated `tests/<snake>.rs` CSV-download test (issue #1315, AC6).
 ///
 /// Like [`render_write_path_smoke_test`] this drives a stand-in resource rather
@@ -7849,6 +9096,156 @@ fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
 /// `form_for`-rendered forms (PR #1587) auto-inject a hidden CSRF field for the
 /// browser; the in-process harness does not require it, and this comment
 /// records that so the absent token reads as intentional, not a gap.
+/// Render the optimistic-locking stale-write test (issue #1318, AC6).
+///
+/// Emitted only for a scaffold whose model declares `lock_version`, alongside
+/// [`render_write_path_smoke_test`] and in the same in-process style: a
+/// process-local store stands in for the persistence layer, so it runs with no
+/// database and is a visible green rather than an `#[ignore]`d one.
+///
+/// The stand-in `update` mirrors the generated handler's contract — a
+/// compare-and-swap on the submitted version, a 409 re-render carrying the
+/// author's own input plus the row's CURRENT version, and a version bump only on
+/// the winning write:
+///
+/// * a submit carrying a stale version responds 409, re-renders the author's
+///   input, and leaves the stored row EXACTLY as the other writer left it;
+/// * a submit carrying the current version redirects (303) and bumps the
+///   version, so the next stale submit is rejected against the new value.
+///
+/// The 409 body hands back the fresh version deliberately: re-rendering the
+/// stale one would make the form permanently unsavable, since every resubmit
+/// would lose the same race again.
+///
+/// SCOPE, stated plainly: like every #1127-style generated test this exercises
+/// the *request mechanism* against a stand-in, not the app's own handler (a
+/// `tests/*.rs` binary cannot import a binary crate's modules). It pins the
+/// contract a reader can then hold the handler to; it does NOT fail if the
+/// emitted `WHERE lock_version = ...` guard is removed. Two other tests cover
+/// that: `lock_version_update_guards_the_write_and_bumps_the_version` in the
+/// generator's own suite asserts the emitted statement, and
+/// `autumn-cli/tests/integration/generate_lock_version_postgres.rs` runs the
+/// generated migration and statement against real Postgres — including two
+/// concurrent transactions — to prove the semantics.
+fn render_optimistic_lock_smoke_test(plural: &str) -> String {
+    const TEMPLATE: &str = r#"
+
+// -- optimistic locking: stale write is rejected (issue #1318) --------------
+//
+// Two authors open the same row; the second one to save must not silently
+// clobber the first. Exercises the generated update handler's contract against
+// a stand-in resource: compare-and-swap on the submitted `lock_version`, a 409
+// re-render (never a redirect, never a dead-end error page) when it is stale,
+// and a version bump only on the write that wins.
+#[tokio::test]
+async fn __PLURAL___optimistic_lock_conflict() {
+    use autumn_web::test::{TestApp, TestClient};
+
+    // `(id, name, lock_version)` — the process-local stand-in for the row.
+    static ROW: std::sync::Mutex<(i64, String, i32)> =
+        std::sync::Mutex::new((1, String::new(), 0));
+
+    #[get("/__PLURAL__/{id}")]
+    async fn show(id: Path<i64>) -> Markup {
+        let _ = id;
+        let row = ROW.lock().unwrap();
+        html! { p { "name=" (row.1.as_str()) " lock_version=" (row.2) } }
+    }
+
+    #[post("/__PLURAL__/{id}/update")]
+    async fn update(id: Path<i64>, body: autumn_web::reexports::axum::body::Bytes) -> impl IntoResponse {
+        let expected: i32 = url::form_urlencoded::parse(body.as_ref())
+            .find(|(key, _)| key == "lock_version")
+            .and_then(|(_, value)| value.parse().ok())
+            .unwrap_or(-1);
+        let submitted: String = url::form_urlencoded::parse(body.as_ref())
+            .find(|(key, _)| key == "name")
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_default();
+
+        let mut row = ROW.lock().unwrap();
+        // Compare-and-swap, exactly like the generated
+        // `WHERE lock_version = $expected ... SET lock_version = lock_version + 1`.
+        if row.2 != expected {
+            // Stale: re-render the author's own input with the CURRENT version,
+            // so a second Save applies their edit on top of the newer row.
+            return (
+                StatusCode::CONFLICT,
+                html! {
+                    p role="alert" { "This record was changed by someone else since you opened it." }
+                    input type="hidden" name="lock_version" value=(row.2);
+                    input type="text" name="name" value=(submitted.as_str());
+                },
+            )
+                .into_response();
+        }
+        row.1 = submitted;
+        row.2 += 1;
+        Redirect::to(&format!("/__PLURAL__/{}", *id)).into_response()
+    }
+
+    let client: TestClient = TestApp::new().routes(routes![show, update]).build();
+
+    // Both authors opened the row at version 0. The first save wins: 303 to the
+    // show page, and the version is bumped to 1.
+    client
+        .post("/__PLURAL__/1/update")
+        .form("name=first-author&lock_version=0")
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PLURAL__/1");
+    client
+        .get("/__PLURAL__/1")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("name=first-author")
+        .assert_body_contains("lock_version=1");
+
+    // The second author still holds version 0. Their save is rejected with a
+    // 409 re-render that keeps what they typed and carries the row's CURRENT
+    // version, so the next Save can succeed instead of losing forever.
+    client
+        .post("/__PLURAL__/1/update")
+        .form("name=second-author&lock_version=0")
+        .send()
+        .await
+        .assert_status(409)
+        .assert_body_contains("changed by someone else")
+        .assert_body_contains("second-author")
+        .assert_body_contains("value=\"1\"");
+
+    // The stale submit changed nothing: the first author's value and the
+    // version they produced both stand.
+    client
+        .get("/__PLURAL__/1")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("name=first-author")
+        .assert_body_contains("lock_version=1");
+
+    // Re-submitting against the version the 409 handed back succeeds and bumps
+    // again — the conflict is recoverable, not a dead end.
+    client
+        .post("/__PLURAL__/1/update")
+        .form("name=second-author&lock_version=1")
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .get("/__PLURAL__/1")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("name=second-author")
+        .assert_body_contains("lock_version=2");
+}
+"#;
+    TEMPLATE.replace("__PLURAL__", plural)
+}
+
 #[allow(clippy::too_many_lines)] // the emitted test body is one raw-string template
 fn render_write_path_smoke_test(pascal_name: &str, plural: &str, bulk_delete: bool) -> String {
     const TEMPLATE: &str = r#"
@@ -9093,6 +10490,9 @@ fn main_route_entries(
     validated_field_names: &[String],
     sm_field_names: &[String],
     rich_text_field_names: &[String],
+    // Issue #1323: `true` under `--belongs-to`, mounting the two nested
+    // handlers the routes module emits alongside the flat seven.
+    nested: bool,
 ) -> Vec<String> {
     if api {
         let mut entries = vec![
@@ -9155,6 +10555,13 @@ fn main_route_entries(
         // set byte-identical.
         for field_name in rich_text_field_names {
             entries.push(format!("routes::{plural}::preview_{field_name}"));
+        }
+        // Issue #1323: the nested read/create pair. Gated with the handler
+        // emission in `render_routes_file` — mounting a route the module never
+        // emitted would fail the generated app to compile.
+        if nested {
+            entries.push(format!("routes::{plural}::nested_index"));
+            entries.push(format!("routes::{plural}::nested_create"));
         }
         entries.push(format!("repositories::{snake_name}::{snake_name}_api_list"));
         entries.push(format!("repositories::{snake_name}::{snake_name}_api_get"));
@@ -16602,5 +18009,1546 @@ exempt_paths = [
                 "the --live scaffold must carry no `{needle}` artifact: {routes}"
             );
         }
+    }
+
+    // ── optimistic locking on the edit form (issue #1318) ───────────────────
+    //
+    // A scaffold whose field set declares `lock_version` must carry the version
+    // through the edit form and guard the UPDATE with it, so two concurrent
+    // editors get a 409 re-render instead of silently clobbering each other.
+
+    /// A slug column token, held in a const so its `{from:title}` braces never
+    /// sit inside a macro invocation (clippy reads them as a format argument).
+    const SLUG_COL: &str = "slug:slug{from:title}";
+
+    /// The `Post` scaffold field list with a `lock_version` column.
+    fn lock_fields() -> Vec<String> {
+        vec!["title:String".into(), "lock_version:i32".into()]
+    }
+
+    fn lock_plan(options: &ScaffoldOptions) -> Result<Plan, GenerateError> {
+        let tmp = project_with_main(default_main());
+        // The TempDir must outlive the plan's file reads, which all happen
+        // during planning — `action_contents` reads from the in-memory plan.
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            options,
+        );
+        drop(tmp);
+        plan
+    }
+
+    /// The routes source of a default `Post` scaffold carrying `lock_version`.
+    fn lock_routes() -> String {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap();
+        action_contents(&plan, "src/routes/posts.rs")
+    }
+
+    #[test]
+    fn lock_version_edit_form_renders_hidden_version_input() {
+        // AC 1: the edit form carries the row's current `lock_version` as a
+        // hidden input so the submit says which version the user was editing.
+        let routes = lock_routes();
+        assert!(
+            routes.contains("name=\"lock_version\""),
+            "edit form must render a hidden lock_version input: {routes}"
+        );
+        let edit = handler_slice(&routes, "edit_form");
+        assert!(
+            edit.contains("row.lock_version"),
+            "edit_form must seed the hidden input from the loaded row: {edit}"
+        );
+        // The create form must NOT carry it: a new row has no version yet.
+        let new_form = handler_slice(&routes, "new_form");
+        assert!(
+            !new_form.contains("lock_version"),
+            "new_form must not carry a lock_version: {new_form}"
+        );
+    }
+
+    #[test]
+    fn lock_version_is_excluded_from_the_editable_form_struct() {
+        // The version is machinery, not content: it must not surface as a
+        // "Lock version" text box, and it must not be settable from user input
+        // through the ordinary column path.
+        let routes = lock_routes();
+        assert!(
+            !routes.contains("pub lock_version: i32,\n}"),
+            "lock_version must not be a PostForm column: {routes}"
+        );
+        assert!(
+            !routes.contains("posts::lock_version.eq(new.lock_version"),
+            "lock_version must not be set from the submitted form value: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_update_guards_the_write_and_bumps_the_version() {
+        // AC 2 + AC 4: the UPDATE carries a `WHERE lock_version = $expected`
+        // guard and increments the column in the same statement, so the check
+        // and the bump are atomic.
+        let routes = lock_routes();
+        let update = handler_slice(&routes, "update");
+        assert!(
+            update.contains("posts::lock_version.eq(expected_lock_version)"),
+            "the UPDATE must be guarded by the expected version: {update}"
+        );
+        assert!(
+            update.contains("posts::lock_version.eq(posts::lock_version + 1)"),
+            "a successful UPDATE must increment the version: {update}"
+        );
+        assert!(
+            routes.contains("fn parse_lock_version("),
+            "the routes file must parse the submitted version out of the body: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_parser_survives_a_colliding_security_field_name() {
+        // The CSRF and submit-token field names are app-configurable, so an app
+        // may legitimately name one of them `lock_version` — and those hidden
+        // inputs are prepended, landing in the body BEFORE the real version.
+        // Taking the first `lock_version` pair would read a UUID, fail to parse
+        // it, and 400 every update. The parser scans for the first pair that
+        // parses instead.
+        let routes = lock_routes();
+        assert!(
+            routes.contains(".filter(|(key, _)| key == \"lock_version\")")
+                && routes.contains(".find_map(|(_, value)| value.parse::<i32>().ok())"),
+            "the parser must scan every lock_version pair, not stop at the first: {routes}"
+        );
+        assert!(
+            !routes.contains(".find(|(key, _)| key == \"lock_version\")"),
+            "a first-match-wins parse is the collision bug: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_conflict_rerenders_the_edit_form_at_409() {
+        // AC 3: a stale submit is not a dead-end error page — it re-renders the
+        // edit form at 409 with the submitted values and an inline banner, and
+        // it is distinguished from a genuinely missing row (404).
+        let routes = lock_routes();
+        let update = handler_slice(&routes, "update");
+        assert!(
+            update.contains("StatusCode::CONFLICT"),
+            "a stale submit must respond 409: {update}"
+        );
+        assert!(
+            update.contains("lock_conflict"),
+            "the 409 branch must flag the shared edit body to show the banner: {update}"
+        );
+        assert!(
+            update.contains("not_found_msg"),
+            "a genuinely missing row must still be a 404, not a 409: {update}"
+        );
+        assert!(
+            routes.contains("changed by someone else"),
+            "the re-rendered form must carry an inline conflict banner: {routes}"
+        );
+        assert!(
+            routes.contains("role=\"alert\""),
+            "the banner must be announced to assistive tech: {routes}"
+        );
+    }
+
+    #[test]
+    fn a_re_read_row_is_re_authorized_before_it_is_used() {
+        // Both guarded writes re-read the row when they match zero. The policy
+        // check earlier in each handler ran against the snapshot that request
+        // loaded — and a record policy can depend on mutable row data (the
+        // generated owner policy does), so the very write that moved the version
+        // may also have moved the row out of this actor's reach. Rendering or
+        // reading the re-read row unchecked would leak it.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "user:references".into(),
+                "status:String:states(draft->published)".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let needle = "authorize::<Post>(&state, &session, \"update\", &current)";
+
+        // The transition path renders the whole row, so this is the sharp case.
+        let transition = handler_slice(&routes, "transition_status");
+        let conflict_at = transition
+            .find("if updated == 0")
+            .expect("transition conflict branch");
+        assert!(
+            transition[conflict_at..].contains(needle),
+            "the transition 409 must re-authorize before rendering: {transition}"
+        );
+        let reauthz_at = conflict_at + transition[conflict_at..].find(needle).unwrap();
+        let render_at = transition[conflict_at..]
+            .find("show_view(")
+            .map(|i| conflict_at + i)
+            .expect("show_view in the conflict branch");
+        assert!(
+            reauthz_at < render_at,
+            "the check must come BEFORE the render: {transition}"
+        );
+
+        // The update path only carries the version integer across, but re-checks
+        // for the same reason rather than arguing about how sensitive it is.
+        let update = handler_slice(&routes, "update");
+        let uconflict = update
+            .find("if updated == 0")
+            .expect("update conflict branch");
+        assert!(
+            update[uconflict..].contains(needle),
+            "the update 409 must re-authorize the re-read row: {update}"
+        );
+    }
+
+    #[test]
+    fn a_no_policy_scaffold_emits_no_conflict_reauthorization() {
+        // Nothing to re-check without a policy, and the emitted branch must not
+        // reference a `state`/`session` the handler never took.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            &ScaffoldOptions {
+                no_policy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            !routes.contains("authorize::<Post>"),
+            "a --no-policy scaffold must emit no authorize calls: {routes}"
+        );
+        assert!(
+            handler_slice(&routes, "update").contains("StatusCode::CONFLICT"),
+            "the 409 branch is still emitted: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_conflict_rerender_carries_the_fresh_version() {
+        // Re-rendering with the STALE version would make the form unsavable
+        // forever: the user would resubmit the same losing version and conflict
+        // again. The 409 body carries the row's current version so a second
+        // Save applies the user's values on top of the newer row.
+        let routes = lock_routes();
+        let update = handler_slice(&routes, "update");
+        assert!(
+            update.contains("let lock_version_value = current.lock_version;"),
+            "the 409 re-render must carry the freshly-read version: {update}"
+        );
+    }
+
+    #[test]
+    fn lock_version_scaffold_emits_a_stale_write_smoke_test() {
+        // AC 6: the generated suite proves the contract — a stale submit yields
+        // a 409 re-render and leaves the row untouched; a fresh submit succeeds
+        // and bumps the version.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap();
+        let test_file = action_contents(&plan, "tests/post.rs");
+        assert!(
+            test_file.contains("async fn posts_optimistic_lock_conflict()"),
+            "an optimistic-lock write-path test must be emitted: {test_file}"
+        );
+        assert!(
+            test_file.contains("assert_status(409)"),
+            "the stale submit must assert a 409: {test_file}"
+        );
+        assert!(
+            test_file.contains("assert_status(303)"),
+            "the fresh submit must still redirect: {test_file}"
+        );
+    }
+
+    #[test]
+    fn scaffold_without_lock_version_carries_no_locking_artifacts() {
+        // AC 5: zero behavior change for the overwhelming common case.
+        let routes = bulk_routes_default();
+        for needle in [
+            "lock_version",
+            "lock_conflict",
+            "CONFLICT",
+            "changed by someone else",
+        ] {
+            assert!(
+                !routes.contains(needle),
+                "a scaffold with no lock_version column must carry no `{needle}`: {routes}"
+            );
+        }
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let test_file = action_contents(&plan, "tests/post.rs");
+        assert!(
+            !test_file.contains("lock_version"),
+            "the generated test suite must carry no locking artifacts: {test_file}"
+        );
+    }
+
+    #[test]
+    fn lock_version_is_refused_on_variants_whose_update_path_is_not_wired() {
+        // `--live`/`--sharded` write through the repository extractor and the
+        // attachment path writes after a multipart save; neither routes through
+        // the guarded statement, so generating them would emit silently lossy
+        // code. Refuse up front instead (same posture as the `slug` gates).
+        for (label, options) in [
+            (
+                "--live",
+                ScaffoldOptions {
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--sharded",
+                ScaffoldOptions {
+                    model: ModelOptions {
+                        sharded: true,
+                        shard_key: Some("title".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let err = lock_plan(&options).expect_err("{label} + lock_version must be refused");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("lock_version"),
+                "the {label} refusal must name lock_version: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn api_scaffolds_are_exempt_from_every_variant_gate() {
+        // `--api` emits no routes file, so none of the HTML-surface variants
+        // can be inconsistent with a guarded update that does not exist. These
+        // combinations generated fine before #1318 and must keep doing so; the
+        // model attribute still lands, which is what conflict-checks the JSON
+        // update. (`--api` is NOT exempt from the empty-insert-struct guard —
+        // that one is about `New{Model}`, which every variant emits.)
+        for (label, cols, options) in [
+            (
+                "--api --live",
+                vec!["title:String".to_owned(), "lock_version:i32".to_owned()],
+                ScaffoldOptions {
+                    api: true,
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--api --sharded",
+                vec!["title:String".to_owned(), "lock_version:i32".to_owned()],
+                ScaffoldOptions {
+                    api: true,
+                    model: ModelOptions {
+                        sharded: true,
+                        shard_key: Some("title".to_owned()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "--api + attachment",
+                vec![
+                    "title:String".to_owned(),
+                    "cover:Attachment".to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+                ScaffoldOptions {
+                    api: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let tmp = project_with_main(default_main());
+            let plan =
+                plan_scaffold_with_options(tmp.path(), "Post", &cols, "20260427000000", &options);
+            assert!(
+                plan.is_ok(),
+                "{label} + lock_version must still generate: {:?}",
+                plan.err()
+            );
+        }
+    }
+
+    #[test]
+    fn destroying_a_legacy_lock_version_scaffold_is_never_blocked_by_the_new_gates() {
+        // A scaffold generated before these refusals existed must stay
+        // removable. `destroy` recomputes the plan it is about to revert, so a
+        // refusal here lands BEFORE `Plan::revert` sees `--force` — stranding
+        // exactly the files the user asked to delete, with no way out.
+        for (label, cols, options) in [
+            (
+                "--live",
+                lock_fields(),
+                ScaffoldOptions {
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--sharded",
+                lock_fields(),
+                ScaffoldOptions {
+                    model: ModelOptions {
+                        sharded: true,
+                        shard_key: Some("title".to_owned()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "slug",
+                vec![
+                    "title:String".to_owned(),
+                    SLUG_COL.to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+                ScaffoldOptions::default(),
+            ),
+            (
+                "attachment",
+                vec![
+                    "title:String".to_owned(),
+                    "cover:Attachment".to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+                ScaffoldOptions::default(),
+            ),
+        ] {
+            let tmp = project_with_main(default_main());
+            let plan = plan_scaffold_with_options_for_revert(
+                tmp.path(),
+                "Post",
+                &cols,
+                "20260427000000",
+                &options,
+            );
+            assert!(
+                plan.is_ok(),
+                "destroying a legacy {label} + lock_version scaffold must plan: {:?}",
+                plan.err()
+            );
+        }
+    }
+
+    #[test]
+    fn lock_version_is_refused_alongside_a_slug_column() {
+        // A slug scaffold keys `update` off the slug, not the primary key, so
+        // `WHERE slug = ... AND lock_version = ...` does not identify a stable
+        // row: rename a slug, let a new row (version 0) claim the freed value,
+        // and a stale submit would commit over that unrelated record while
+        // reporting success. Refuse the pair rather than ship the swap.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "slug:slug{from:title}".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lock_version") && msg.contains("slug"),
+            "the refusal must name both columns: {msg}"
+        );
+    }
+
+    #[test]
+    fn lock_version_scaffold_with_no_insertable_columns_is_refused() {
+        // Counting declared tokens would miss this: two columns are declared,
+        // but `--default` drops `title` from the insert struct and
+        // `#[lock_version]` drops the version, leaving `NewPost` empty — which
+        // does not implement `Insertable` and would not compile.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    defaults: vec!["title=x".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no insertable columns") && msg.contains("NewPost"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn lock_version_cannot_be_the_only_column() {
+        // The column is DB-managed, so it contributes no form field — a
+        // scaffold declaring only `lock_version` would emit an empty
+        // `NewPost`, which is not `Insertable` and does not compile.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no insertable columns") && msg.contains("NewPost"),
+            "the refusal must explain why one column is not enough: {msg}"
+        );
+    }
+
+    #[test]
+    fn state_transition_is_a_compare_and_swap_on_the_version() {
+        // A transition is a read-modify-write: it loads the row, checks the edge
+        // is legal from the state it read, then writes. Without a guard, two
+        // concurrent transitions out of the same source state both pass the
+        // check and both commit — the second silently overwriting the first.
+        // The bump alone does not prevent that; the WHERE does.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:String:states(draft->published)".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let transition = handler_slice(&routes, "transition_status");
+        assert!(
+            transition.contains(".filter(posts::lock_version.eq(row.lock_version))"),
+            "the transition write must be guarded by the version it read: {transition}"
+        );
+        assert!(
+            transition.contains("if updated == 0") && transition.contains("StatusCode::CONFLICT"),
+            "a lost transition race must 409, not report success: {transition}"
+        );
+        assert!(
+            transition.contains("changed by someone else"),
+            "the 409 must explain itself: {transition}"
+        );
+        // Zero rows is ambiguous: the version moved, or the row was deleted
+        // between the load and the write. The transition path re-reads to tell
+        // them apart, exactly as `update` does — otherwise a concurrent delete
+        // renders a conflict page for a row that can no longer be reloaded.
+        assert!(
+            transition.contains(".optional()?") && transition.contains("not_found_msg"),
+            "a concurrent delete must 404, not 409: {transition}"
+        );
+        // And the 409 shows the row as it now stands, not this request's stale
+        // snapshot — the legal transitions may have changed.
+        assert!(
+            transition.contains("&current,"),
+            "the 409 must render the re-read row: {transition}"
+        );
+    }
+
+    #[test]
+    fn state_transition_bumps_the_lock_version() {
+        // The bump is the other half: it makes the transition visible to anyone
+        // else guarding on the version, so an author whose edit form predates
+        // the transition is told the record moved on instead of saving over it.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:String:states(draft->published)".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let transition = handler_slice(&routes, "transition_status");
+        assert!(
+            transition.contains("posts::lock_version.eq(posts::lock_version + 1)"),
+            "the transition write must bump the version: {transition}"
+        );
+    }
+
+    #[test]
+    fn lock_version_hidden_input_is_prepended_after_the_submit_token() {
+        // `prepend` renders in call order, and `SubmitTokenLayer` only scans the
+        // body's first chunk (issue #1360) — so the token must still be the
+        // first field, with the version input behind it.
+        let routes = lock_routes();
+        let token_at = routes
+            .find("form = form.prepend(submit_token_input(")
+            .expect("submit token prepend");
+        let lock_at = routes
+            .find("input type=\"hidden\" name=\"lock_version\" value=(version);")
+            .expect("lock version prepend");
+        assert!(
+            token_at < lock_at,
+            "the submit token must be prepended before the lock version:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_is_refused_alongside_attachment_fields() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "cover:attachment".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("lock_version"), "got: {msg}");
+    }
+
+    // ── `--belongs-to` parent/child nesting (issue #1323) ──────────────────
+
+    /// A project whose `Post` parent has already been scaffolded, so
+    /// `src/routes/posts.rs` exists for the child's `--belongs-to` injection.
+    /// Returns the temp project plus the parent plan (already executed on disk).
+    fn project_with_scaffolded_parent() -> TempDir {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n\
+             [dependencies]\n\
+             autumn-web = \"0.6.0\"\n\
+             maud = { version = \"0.27\", features = [\"axum\"] }\n\
+             diesel_migrations = \"2\"\n\n\
+             [dev-dependencies]\n\
+             tokio = { version = \"1\", features = [\"rt\", \"macros\"] }\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        tmp
+    }
+
+    fn belongs_to_options() -> ScaffoldOptions {
+        ScaffoldOptions {
+            belongs_to: Some("Post".to_owned()),
+            ..ScaffoldOptions::default()
+        }
+    }
+
+    /// Plan a `Comment body:Text post:references --belongs-to Post` scaffold
+    /// against a project whose `Post` parent is already scaffolded.
+    fn nested_comment_plan(tmp: &TempDir) -> Plan {
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn belongs_to_emits_nested_read_and_create_routes() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains("#[get(\"/posts/{post_id}/comments\", name = \"nested_index\")]"),
+            "missing nested read route:\n{routes}"
+        );
+        assert!(
+            routes.contains("#[post(\"/posts/{post_id}/comments\", name = \"nested_create\")]"),
+            "missing nested create route:\n{routes}"
+        );
+        assert!(
+            routes.contains("pub async fn nested_index("),
+            "missing nested_index handler:\n{routes}"
+        );
+        assert!(
+            routes.contains("pub async fn nested_create("),
+            "missing nested_create handler:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_nested_list_filters_to_the_parent_and_paginates() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains(".filter(comments::post_id.eq(post_id))"),
+            "the child list must be scoped to the parent FK:\n{routes}"
+        );
+        // Paginated through the shipped `PageRequest`/`Page` primitives.
+        assert!(routes.contains("page_req: PageRequest"), "{routes}");
+        assert!(routes.contains(".limit(page_req.limit())"), "{routes}");
+        assert!(routes.contains(".offset(page_req.offset())"), "{routes}");
+        assert!(
+            routes.contains("let page_data: Page<Comment> = Page::new(items, total, page_req);"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_nested_create_takes_the_fk_from_the_path_not_the_body() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        let create = routes
+            .split("pub async fn nested_create(")
+            .nth(1)
+            .expect("nested_create handler");
+        let overwrite = create
+            .find("form.post_id = post_id.to_string();")
+            .expect("nested_create must overwrite the FK from the path");
+        let changeset = create
+            .find("form.into_changeset()")
+            .expect("nested_create must build a changeset");
+        assert!(
+            overwrite < changeset,
+            "the path FK must be applied BEFORE validation so a body-supplied \
+             post_id can never re-parent the child:\n{create}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_nested_create_is_secured_and_redirects_to_the_parent_show() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        let create = routes
+            .split("/// `POST /posts/{post_id}/comments`")
+            .nth(1)
+            .expect("nested_create doc comment");
+        assert!(
+            create.starts_with(" — create one comment under its parent post.\n#[secured]\n"),
+            "the nested mutation must carry #[secured] like the flat create:\n{create}"
+        );
+        assert!(
+            create.contains(
+                "Ok(autumn_web::Redirect::to(&crate::routes::posts::paths::show(*post_id)).into_response())"
+            ),
+            "PRG must redirect to the parent show:\n{create}"
+        );
+        assert!(
+            create.contains("UNPROCESSABLE_ENTITY"),
+            "an invalid submission must re-render at 422 with inline errors:\n{create}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_hides_the_parent_fk_from_the_nested_form() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains("exclude_parent_fk: bool"),
+            "the shared form helper must accept the nested-form exclusion flag:\n{routes}"
+        );
+        assert!(
+            routes.contains("form = form.exclude(\"post_id\");"),
+            "the nested form must drop the parent FK control:\n{routes}"
+        );
+        // The child's OWN create/edit forms keep the parent select (#1146).
+        assert!(
+            routes.contains("paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), &post_id_options, false)"),
+            "the flat create form must keep the parent select:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_child_show_links_back_to_its_parent() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains(
+                "(autumn_web::a11y::Link::new(crate::routes::posts::paths::show(row.post_id), \"Back to Post\"))"
+            ),
+            "the child show view must link back to its parent:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_child_rows_link_to_the_child_show_view() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        let section = routes
+            .split("async fn children_section_with(")
+            .nth(1)
+            .expect("children_section_with helper");
+        assert!(
+            section.contains("autumn_web::a11y::Link::new(paths::show(row.id), \"Show\")"),
+            "each child row must link to the child's own show view:\n{section}"
+        );
+        // The list reuses the shipped data_table widget.
+        assert!(
+            section.contains("autumn_web::widgets::data_table("),
+            "{section}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_patches_the_parent_show_view_with_children_and_inline_form() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let parent = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            parent.contains("crate::routes::comments::children_section("),
+            "the parent show must render its children section:\n{parent}"
+        );
+        assert!(
+            parent.contains("(__autumn_children_comments) // autumn:nested:comments"),
+            "the children section must be rendered inside the parent's markup:\n{parent}"
+        );
+        // Rendered above the "Back to list" furniture, i.e. inside the show body.
+        let render_at = parent
+            .find("(__autumn_children_comments) // autumn:nested:comments")
+            .unwrap();
+        let back_at = parent
+            .find("(autumn_web::a11y::Link::new(paths::index(), \"Back to list\"))")
+            .unwrap();
+        assert!(render_at < back_at, "{parent}");
+        // The extra extractors the inline form's CSRF/submit-token needs.
+        assert!(
+            parent.contains("__nested_csrf: Option<CsrfToken>"),
+            "the parent show needs CSRF extractors for the inline create form:\n{parent}"
+        );
+        assert!(
+            parent.contains("// autumn:nested-extractors"),
+            "the signature edit must be marked for destroy:\n{parent}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_parent_injection_is_idempotent() {
+        let tmp = project_with_scaffolded_parent();
+        let first = nested_comment_plan(&tmp);
+        first.execute(Flags::default()).unwrap();
+        let after_first = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        let second = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap();
+        second
+            .execute(Flags {
+                force: true,
+                ..Flags::default()
+            })
+            .unwrap();
+        let after_second = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert_eq!(
+            after_first, after_second,
+            "re-running the generator must not double-inject the parent-side section"
+        );
+        assert_eq!(
+            after_second.matches("// autumn:nested:comments").count(),
+            2,
+            "exactly one binding line + one render line:\n{after_second}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_destroy_restores_the_parent_routes_file() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project_with_scaffolded_parent();
+                let parent_path = tmp.path().join("src/routes/posts.rs");
+                let original = fs::read_to_string(&parent_path).unwrap();
+
+                let plan = nested_comment_plan(&tmp);
+                plan.execute(Flags::default()).unwrap();
+                assert_ne!(fs::read_to_string(&parent_path).unwrap(), original);
+
+                let revert = plan_scaffold_with_options_for_revert(
+                    tmp.path(),
+                    "Comment",
+                    &["body:Text".into(), "post:references".into()],
+                    "20260428000000",
+                    &belongs_to_options(),
+                )
+                .unwrap();
+                revert.revert(Flags::default()).unwrap();
+                assert_eq!(
+                    fs::read_to_string(&parent_path).unwrap(),
+                    original,
+                    "destroy must cleanly reverse the parent-side edits"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn belongs_to_registers_the_nested_routes_in_main() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let main = action_contents(&plan, "src/main.rs");
+        assert!(main.contains("routes::comments::nested_index"), "{main}");
+        assert!(main.contains("routes::comments::nested_create"), "{main}");
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(routes.contains("    nested_index,\n"), "{routes}");
+        assert!(routes.contains("    nested_create,\n"), "{routes}");
+    }
+
+    #[test]
+    fn belongs_to_generated_test_asserts_cross_parent_isolation() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let test = action_contents(&plan, "tests/comment.rs");
+        assert!(
+            test.contains("async fn comments_nested_under_parent()"),
+            "missing the generated nested write-path test:\n{test}"
+        );
+        assert!(
+            test.contains("a child must not appear under a different parent"),
+            "the test must assert the child is absent under a different parent:\n{test}"
+        );
+        // create child under parent → appears under that parent …
+        assert!(test.contains("/posts/1/comments"), "{test}");
+        // … and does NOT appear under a different parent.
+        assert!(test.contains("/posts/2/comments"), "{test}");
+    }
+
+    #[test]
+    fn belongs_to_marks_the_fk_form_field_serde_default() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains("    #[serde(default)]\n    pub post_id: String,"),
+            "the nested form omits the FK control, so its decode must tolerate \
+             an absent field:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_requires_a_matching_references_field() {
+        let tmp = project_with_scaffolded_parent();
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into()],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("post:references"), "got: {msg}");
+    }
+
+    #[test]
+    fn belongs_to_requires_the_parent_to_be_scaffolded_first() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("src/routes/posts.rs"), "got: {msg}");
+    }
+
+    #[test]
+    fn belongs_to_is_refused_for_unsupported_scaffold_variants() {
+        for (label, mutate) in [
+            (
+                "--api",
+                (|o: &mut ScaffoldOptions| o.api = true) as fn(&mut ScaffoldOptions),
+            ),
+            ("--live", |o: &mut ScaffoldOptions| o.live = true),
+            ("--live-validation", |o: &mut ScaffoldOptions| {
+                o.live_validation = true;
+            }),
+            ("--sharded", |o: &mut ScaffoldOptions| {
+                o.model.sharded = true;
+            }),
+        ] {
+            let tmp = project_with_scaffolded_parent();
+            let mut options = belongs_to_options();
+            mutate(&mut options);
+            let err = plan_scaffold_with_options(
+                tmp.path(),
+                "Comment",
+                &["body:Text".into(), "post:references".into()],
+                "20260428000000",
+                &options,
+            )
+            .unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("--belongs-to") && msg.contains(label),
+                "{label} must be refused with an actionable message; got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn belongs_to_composes_with_the_other_form_helper_flags() {
+        // The shared `{snake}_form_for` helper grows one extra parameter per
+        // opt-in feature, and every call site must pass them in DECLARATION
+        // order. `lock_version` (#1318) and `exclude_parent_fk` (#1323) are both
+        // trailing flags, so getting the order wrong compiles the generator but
+        // emits a child module that does not — exactly the break this pins.
+        let tmp = project_with_scaffolded_parent();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &[
+                "body:Text".into(),
+                "post:references".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        let decl = routes
+            .find("    lock_version: Option<i32>,\n    exclude_parent_fk: bool,")
+            .unwrap_or_else(|| {
+                panic!("helper params must be declared lock_version-then-exclude:\n{routes}")
+            });
+        assert!(decl > 0);
+        // The nested call passes them in the same order: no version, hide the FK.
+        assert!(
+            routes.contains("submit_field, &[], None, true)"),
+            "the nested form call must match the declaration order:\n{routes}"
+        );
+        // …and the flat create call: no version, keep the FK select.
+        assert!(
+            routes.contains("submit_field.as_ref(), &post_id_options, None, false)"),
+            "the flat create call must match the declaration order:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_scopes_the_nested_list_like_the_flat_index() {
+        // A child with an owner column gets an owner-scoped, `#[secured]` flat
+        // index. The nested list is a SECOND listing surface onto the same rows,
+        // so it must carry the same scoping — otherwise `--belongs-to` would
+        // quietly open an unauthenticated door onto other users' children.
+        let tmp = project_with_scaffolded_parent();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &[
+                "body:Text".into(),
+                "post:references".into(),
+                "user_id:i64".into(),
+            ],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains(".filter(comments::user_id.eq(owner_id))"),
+            "the nested list must be owner-scoped:\n{routes}"
+        );
+        assert!(
+            routes.contains(
+                "#[secured]\n#[get(\"/posts/{post_id}/comments\", name = \"nested_index\")]"
+            ),
+            "the nested page must be secured like the flat index:\n{routes}"
+        );
+        // A scaffold with NO owner column keeps the unscoped list and no
+        // `#[secured]` — matching its own flat index.
+        let plan = nested_comment_plan(&project_with_scaffolded_parent());
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(!routes.contains("owner_id"), "{routes}");
+        assert!(
+            routes.contains("\n#[get(\"/posts/{post_id}/comments\", name = \"nested_index\")]"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_refuses_a_sharded_parent() {
+        // The child's own `--sharded` is refused elsewhere; this is the other
+        // side of the relationship, which the child's flags cannot see. A
+        // sharded parent holds a `ShardedDb`, which will not coerce to the
+        // `&mut Db` the injected `children_section` call borrows.
+        let tmp = project_with_main(default_main());
+        let parent = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    sharded: true,
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        parent.execute(Flags::default()).unwrap();
+
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ShardedDb"), "got: {msg}");
+    }
+
+    #[test]
+    fn belongs_to_nested_list_headers_are_not_advertised_as_sortable() {
+        // The nested list runs a fixed `ORDER BY id DESC` and extracts no
+        // `ListQuery`, so a sortable header would render a link that reloads the
+        // identical list and an `aria-sort` that never changes.
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        let section = routes
+            .split("async fn children_section_with(")
+            .nth(1)
+            .expect("children_section_with helper");
+        let section = section.split("async fn nested_view(").next().unwrap();
+        assert!(
+            !section.contains(".sortable("),
+            "the nested columns must not advertise sorting the handler cannot do:\n{section}"
+        );
+        // The flat index still sorts.
+        assert!(routes.contains(".sortable(\"body\")"), "{routes}");
+    }
+
+    #[test]
+    fn belongs_to_nested_routes_404_on_a_parent_that_does_not_exist() {
+        // A path id is untrusted. Without a probe, `GET /posts/999/comments`
+        // renders a plausible-looking empty list + form, and submitting that
+        // form surfaces the foreign-key violation as a 500 instead of a 404.
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains("async fn require_post(db: &mut Db, post_id: i64)"),
+            "missing the parent-existence probe:\n{routes}"
+        );
+        assert!(
+            routes.contains(".map_err(AutumnError::not_found)?"),
+            "the probe must 404, not 500:\n{routes}"
+        );
+        // Both untrusted-path entry points run it: the page wrapper (which
+        // backs `nested_index` AND the 422 re-render) and the create's insert.
+        let view = routes
+            .split("async fn nested_view(")
+            .nth(1)
+            .expect("nested_view helper");
+        assert!(view.contains("require_post(db, post_id).await?;"), "{view}");
+        let create = routes
+            .split("pub async fn nested_create(")
+            .nth(1)
+            .expect("nested_create handler");
+        let probe = create
+            .find("require_post(&mut db, *post_id).await?;")
+            .expect("nested_create must probe the parent");
+        let insert = create
+            .find("diesel::insert_into(comments::table)")
+            .expect("nested_create must insert");
+        assert!(
+            probe < insert,
+            "the probe must run BEFORE the insert:\n{create}"
+        );
+    }
+
+    #[test]
+    fn destroy_unmounts_nested_routes_even_without_the_belongs_to_flag() {
+        // `--belongs-to` is something the author typed once, days ago. Omitting
+        // it on `destroy` must not leave `main.rs` mounting handlers whose
+        // module this destroy just deleted — an uncompilable project.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project_with_scaffolded_parent();
+                nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+                let main_path = tmp.path().join("src/main.rs");
+                assert!(
+                    fs::read_to_string(&main_path)
+                        .unwrap()
+                        .contains("routes::comments::nested_index")
+                );
+
+                // Recompute the plan WITHOUT `--belongs-to`, exactly as a
+                // forgetful `autumn destroy scaffold Comment …` would.
+                let revert = plan_scaffold_with_options_for_revert(
+                    tmp.path(),
+                    "Comment",
+                    &["body:Text".into(), "post:references".into()],
+                    "20260428000000",
+                    &ScaffoldOptions::default(),
+                )
+                .unwrap();
+                revert
+                    .revert(Flags {
+                        force: true,
+                        ..Flags::default()
+                    })
+                    .unwrap();
+
+                let main = fs::read_to_string(&main_path).unwrap();
+                assert!(!main.contains("nested_index"), "{main}");
+                assert!(!main.contains("nested_create"), "{main}");
+                let parent = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+                assert!(!parent.contains("children_section"), "{parent}");
+                assert!(!parent.contains("autumn:nested"), "{parent}");
+            },
+        );
+    }
+
+    #[test]
+    fn regenerating_without_the_flag_keeps_an_existing_nesting_intact() {
+        // `--belongs-to` is typed once. A later `generate … --force` (the
+        // ordinary "I changed a field" move) rarely repeats it — and the three
+        // artefacts must not disagree: the child module, the `main.rs` mounts,
+        // and the parent's `children_section` call.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+
+        let regen = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap();
+
+        let routes = action_contents(&regen, "src/routes/comments.rs");
+        assert!(
+            routes.contains("pub async fn nested_index("),
+            "the regenerated module must keep its nested handlers:\n{routes}"
+        );
+        let main = action_contents(&regen, "src/main.rs");
+        assert!(main.contains("routes::comments::nested_index"), "{main}");
+        assert!(main.contains("routes::comments::nested_create"), "{main}");
+        // The inference is surfaced, never silent.
+        assert!(
+            regen
+                .warnings
+                .iter()
+                .any(|w| w.contains("still nests comments") && w.contains("--belongs-to Post")),
+            "expected a warning naming the recovered parent; got: {:?}",
+            regen.warnings
+        );
+    }
+
+    #[test]
+    fn regenerating_after_dropping_the_foreign_key_is_refused_before_anything_is_written() {
+        // Nothing to nest on any more, so there is no relationship to recover —
+        // and the parent's `children_section` call would be left pointing at a
+        // helper the regenerated module no longer defines. A warning is not
+        // enough: the command would report success on an app that no longer
+        // compiles. Refuse instead, having written nothing.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+        let parent_before = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into()],
+            "20260428000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("already nested under posts"), "got: {msg}");
+        assert!(msg.contains("Nothing has been written"), "got: {msg}");
+        assert!(msg.contains("no longer compile"), "got: {msg}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap(),
+            parent_before,
+            "a refusal must not touch the parent"
+        );
+    }
+
+    #[test]
+    fn re_parenting_an_already_nested_resource_is_refused() {
+        // The nastiest shape: it COMPILES. `posts.rs` keeps calling
+        // `children_section(&mut db, row.id, …)`, but the regenerated helper now
+        // filters on `user_id` — so Post #3's page would list User #3's comments
+        // and its inline form would create rows owned by that user.
+        let tmp = project_with_scaffolded_parent();
+        // A second scaffolded parent to re-point at.
+        plan_scaffold(
+            tmp.path(),
+            "User",
+            &["name:String".into()],
+            "20260427000001",
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &[
+                "body:Text".into(),
+                "post:references".into(),
+                "user:references".into(),
+            ],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &[
+                "body:Text".into(),
+                "post:references".into(),
+                "user:references".into(),
+            ],
+            "20260428000000",
+            &ScaffoldOptions {
+                belongs_to: Some("User".to_owned()),
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("already nested under posts"), "got: {msg}");
+        assert!(
+            msg.contains("binds comments to users instead"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("quietly serves the wrong rows"),
+            "the message must name the failure mode — this shape COMPILES:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn regenerating_the_parent_keeps_the_children_section_it_carries() {
+        // `Post` is not a child, so its plan has no `Nesting` and the flat
+        // template it re-renders knows nothing about comments. Without the
+        // re-apply, a `--force` on the parent would silently drop the children
+        // list and the markers — after which a later child regeneration, having
+        // no markers to read, would emit no nested handlers while `main.rs`
+        // still mounted them.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+
+        let regen = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let parent = action_contents(&regen, "src/routes/posts.rs");
+        assert!(
+            parent.contains("// autumn:nested:comments"),
+            "the markers are the only durable record of the relationship:\n{parent}"
+        );
+        assert!(
+            parent.contains("crate::routes::comments::children_section("),
+            "{parent}"
+        );
+        assert!(parent.contains("(__autumn_children_comments)"), "{parent}");
+    }
+
+    #[test]
+    fn destroying_a_parent_that_still_has_nested_children_is_refused() {
+        // Deleting posts.rs and schema::posts out from under comments.rs — which
+        // imports both — leaves the project uncompilable with the nested routes
+        // still mounted. The plain divergence check stops the default destroy by
+        // accident, but says nothing about children and `--force` waves it
+        // through, so refuse explicitly.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+
+        let err = plan_scaffold_with_options_for_revert(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("comments is nested under posts"), "got: {msg}");
+        assert!(msg.contains("Destroy comments first"), "got: {msg}");
+        assert!(msg.contains("crate::routes::posts::paths"), "got: {msg}");
+
+        // …and the child's own destroy is unaffected: it is the operation the
+        // refusal points at, so it must not refuse itself.
+        plan_scaffold_with_options_for_revert(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &ScaffoldOptions::default(),
+        )
+        .expect("destroying the CHILD must still be allowed");
+    }
+
+    #[test]
+    fn regenerating_a_nested_parent_into_an_incompatible_variant_is_refused() {
+        // "The marker landed" is not the test: a `--sharded` parent's `show`
+        // takes the injection perfectly cleanly and then fails to compile,
+        // because `children_section` borrows `&mut Db` and the handler now holds
+        // a `ShardedDb`. The parent's own regeneration runs none of the
+        // preflights `resolve` does for a child, so it checks them here.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+        let before = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    sharded: true,
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("comments is nested under posts"), "got: {msg}");
+        assert!(msg.contains("Nothing has been written"), "got: {msg}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap(),
+            before,
+            "a refusal must not touch the parent"
+        );
+    }
+
+    #[test]
+    fn the_injected_show_carries_the_lint_allowance_its_extra_extractors_need() {
+        // A generated project's own CI runs `cargo clippy --all-targets -- -D
+        // warnings`. Every standard `show` already takes three parameters, so
+        // six extractors trip `too_many_arguments` (9/7) — `cargo check` passes,
+        // which is why this stayed invisible. The allowance is reversible: it
+        // carries the extractors marker and comes off with them.
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let parent = action_contents(&plan, "src/routes/posts.rs");
+        let allow = parent
+            .find("#[allow(clippy::too_many_arguments)] // autumn:nested-extractors")
+            .expect("the injected show needs a lint allowance");
+        let sig = parent.find("pub async fn show(").expect("show");
+        assert!(
+            allow < sig,
+            "the allowance must precede the signature:\n{parent}"
+        );
+
+        let reverted = super::super::nested::remove_nested_child_section(&parent, "comments");
+        assert!(
+            !reverted.contains("#[allow(clippy::too_many_arguments)] // autumn:nested"),
+            "the allowance must come off with the extractors:\n{reverted}"
+        );
+    }
+
+    #[test]
+    fn without_belongs_to_the_scaffold_output_is_unchanged() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(!routes.contains("nested_index"), "{routes}");
+        assert!(!routes.contains("children_section"), "{routes}");
+        assert!(!routes.contains("exclude_parent_fk"), "{routes}");
+        // The parent's routes file is not touched at all.
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| a.path().ends_with("routes/posts.rs")),
+            "a flat scaffold must never patch a sibling resource"
+        );
     }
 }

@@ -40,6 +40,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -109,7 +111,8 @@ impl Drop for ReportingPin {
 /// Pin `path` against pruning until the returned guard drops.
 pub(crate) fn pin_for_reporting(path: &Path) -> ReportingPin {
     if let Ok(mut pinned) = PINNED_FOR_REPORTING.lock() {
-        *pinned.entry(path.to_path_buf()).or_insert(0) += 1;
+        let count = pinned.entry(path.to_path_buf()).or_insert(0);
+        *count = count.saturating_add(1);
     }
     ReportingPin(path.to_path_buf())
 }
@@ -440,7 +443,7 @@ fn prune(dir: &Path, keep: usize, now: DateTime<Utc>) {
             continue;
         }
         if allowance > 0 && written_within_grace(&path, now) {
-            allowance -= 1;
+            allowance = allowance.saturating_sub(1);
             continue;
         }
         if let Err(error) = std::fs::remove_file(&path) {

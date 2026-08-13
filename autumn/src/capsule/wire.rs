@@ -40,6 +40,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 // `pub` throughout this file is crate-visible only: the enclosing `wire` module

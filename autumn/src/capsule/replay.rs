@@ -25,9 +25,9 @@
 //! without the `db` feature; [`DivergenceLog`] is a plain shared buffer the
 //! stub server writes into.
 
-// autumn-panic-gate: request-path module — production code path must be panic-free.
-// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
-// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+// Replay-time module (offline `autumn replay` runs, never the serving path);
+// kept panic-averse with the same deny set, but deliberately outside the
+// request-path panic-gate manifest — see CONTRIBUTING.md.
 #![cfg_attr(
     not(test),
     deny(

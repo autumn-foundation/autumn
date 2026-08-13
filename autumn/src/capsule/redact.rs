@@ -32,6 +32,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -499,7 +501,7 @@ fn form_pairs(bytes: &[u8]) -> Option<Vec<(String, String)>> {
         if key.is_empty() || key.contains(is_not_form_key_char) {
             return None;
         }
-        pairs += 1;
+        pairs = pairs.saturating_add(1);
     }
     if pairs == 0 {
         return None;

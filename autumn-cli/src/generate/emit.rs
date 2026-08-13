@@ -179,6 +179,16 @@ pub enum Revert {
     /// `src/schema.rs` (the link targets) are themselves removed. Destroying
     /// one of several models keeps the links, matching the surviving modules.
     SeedBinLinks { path: PathBuf, owner_dir: PathBuf },
+    /// Remove the children-list + inline-create-form lines `autumn generate
+    /// scaffold … --belongs-to` injected into the PARENT resource's generated
+    /// `show` handler in `path` (`src/routes/<parents>.rs`) for `child_plural`
+    /// (issue #1323).
+    ///
+    /// Every injected line carries a `// autumn:nested:<child_plural>` trailer,
+    /// so removal is exact even when the same parent has several nested
+    /// children; the extra CSRF/submit-token extractors spliced into the `show`
+    /// signature are shared by all of them and come off only with the last one.
+    NestedChildSection { path: PathBuf, child_plural: String },
 }
 
 impl Revert {
@@ -203,7 +213,8 @@ impl Revert {
             | Self::AuthWebauthnStub { path }
             | Self::SubmitTokenValidateExempt { path, .. }
             | Self::RememberMiddleware { path }
-            | Self::SeedBinLinks { path, .. } => path,
+            | Self::SeedBinLinks { path, .. }
+            | Self::NestedChildSection { path, .. } => path,
         }
     }
 
@@ -232,6 +243,7 @@ impl Revert {
             | Self::AuthOAuthProviderStubs { .. }
             | Self::AuthWebauthnStub { .. }
             | Self::SubmitTokenValidateExempt { .. }
+            | Self::NestedChildSection { .. }
             | Self::RememberMiddleware { .. } => None,
         }
     }
@@ -353,6 +365,9 @@ impl Revert {
                 plural, segment, ..
             } => super::scaffold::remove_submit_token_exempt_from_toml(content, plural, segment),
             Self::SeedBinLinks { .. } => super::schema_edit::unlink_models_from_seed_bin(content),
+            Self::NestedChildSection { child_plural, .. } => {
+                super::nested::remove_nested_child_section(content, child_plural)
+            }
         }
     }
 }

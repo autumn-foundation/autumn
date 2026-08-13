@@ -214,6 +214,95 @@ Composite foreign keys, cascade policy (`ON DELETE`/`ON UPDATE`), and runtime
 association traversal (`belongs_to`/`has_many`) are not in scope for this
 token — see issue #835 for the latter.
 
+#### Nested resources with `--belongs-to`
+
+`references` gives the child a foreign key and a parent dropdown on its *own*
+form. `--belongs-to` adds the half a flat scaffold has always left to you: the
+**parent's** show page listing its children with an inline "add" form, and the
+nested routes behind it.
+
+```bash
+autumn generate scaffold Post title:String
+autumn generate scaffold Comment body:Text post:references --belongs-to Post
+```
+
+On top of the usual flat CRUD you get:
+
+| Generated | What it does |
+| --- | --- |
+| `GET /posts/{post_id}/comments` | The child list for one parent, paginated by the same `PageRequest` extractor the flat index uses (`?page=N&size=M`). A `post_id` that doesn't exist answers **404**, not an empty list. |
+| `POST /posts/{post_id}/comments` | A `#[secured]` create whose foreign key comes from the **path**. Invalid input re-renders at 422 with inline errors and preserved values; success redirects (PRG) to the parent's show page. |
+| `pub async fn children_section(…)` in `src/routes/comments.rs` | The child list (a `data_table`, each row linking to the child's own show view) plus the inline create form. Public on purpose — call it from any hand-written page too. |
+| An edit to `src/routes/posts.rs` | The parent's generated `show` view now renders that section. |
+| A back-link on the child's show view | `Back to Post`, closing the loop. |
+| A test in `tests/comment.rs` | Create a child under a parent → it appears in *that* parent's list → it does **not** appear under a different parent. |
+
+If the child carries an owner column (`user_id`/`author_id`/`owner_id`), the
+nested list inherits the flat index's owner scoping: it is `#[secured]` and
+filtered to the signed-in user's own rows, so nesting can never open a second,
+wider door onto the same table. Widen it deliberately (drop the filter in
+`children_section_with`) if the children really are public.
+
+The nested create runs the same context-only `authorize_create::<Child>` the
+flat create runs — it does **not** authorize the *parent*. If attaching a child
+should depend on who owns the post, add that check to the generated handler; the
+policy has no parent-aware hook.
+
+The parent foreign key is deliberately **not** an editable control on the nested
+form: the parent is the URL. The handler overwrites the column from the path
+before it validates, so a hand-crafted body carrying its own `post_id` cannot
+re-parent a comment. (The child's own `/comments/new` form still shows the
+belongs_to dropdown — that is where choosing a parent belongs.)
+
+The child list is deliberately **not** sortable: unlike the flat index it runs a
+fixed `ORDER BY id DESC` and extracts no `ListQuery`, so advertising sortable
+headers would render links that reload the identical list. It is also a
+hand-written parent-scoped query rather than a repository call — the repository
+has no "children of X" method — so anything the repository layer applies for
+free on the flat index has to be spelled out in `children_section_with`
+(soft-delete and owner scoping already are).
+
+Because the markers record the relationship durably, `--belongs-to` is a
+**one-time** flag: re-running `generate … --force` without it keeps the nesting
+(and says so in a warning) rather than half-dismantling it, and `autumn destroy`
+finds the parent without it.
+
+Regenerating the **parent** is safe: `autumn generate scaffold Post … --force`
+re-applies every child section it was carrying onto the fresh render, so the
+children list and the markers survive. Destroying a parent that still has nested
+children is refused (destroy the children first — that removes the section from
+the parent as it goes).
+
+Changing or dropping the parent is refused, before anything is written. The
+parent's section hands `children_section` its own `row.id`, so re-pointing the
+child at a different parent would leave that call compiling but reading the
+wrong table's ids — a post's page listing whichever *user* shares its id.
+Un-nest first, then re-nest:
+
+```bash
+autumn destroy scaffold Comment body:Text post:references user:references --belongs-to Post
+autumn generate scaffold Comment body:Text post:references user:references --belongs-to User
+```
+
+The edits to the parent's routes file are marker-delimited
+(`// autumn:nested:comments`), so re-running the generator never double-injects
+and `autumn destroy scaffold Comment body:Text post:references --belongs-to Post`
+takes exactly those lines back out — including when one parent has several
+nested children, and including after `cargo fmt` has reflowed them. Destroy also
+finds the parent from the markers alone, so forgetting to repeat `--belongs-to`
+still leaves a compiling project.
+
+Refused at generation time, with an actionable message, when combined with
+`--api`, `--live`, `--live-validation`, `--sharded`, an `Attachment` column, a
+nullable parent reference (`post:references?`), or a self-referential parent —
+and when the **parent** isn't a shape the injection can patch: not scaffolded
+yet, `slug`-keyed (`slug:slug{from:title}`), carrying a `:states(…)` column, or
+with a hand-rewritten `show` view. In those cases scaffold the child without
+`--belongs-to` — the `references` column and its dropdown still work — and write
+the parent-scoped list by hand. Nesting is single-level: `/a/{id}/b` but
+never `/a/{id}/b/{id}/c`. Many-to-many joins, polymorphic associations, and
+counter-cache columns stay hand-written.
+
 ### Human-readable URLs with `slug:slug{from:...}`
 
 `slug:slug{from:title}` gives a model a clean, shareable URL
@@ -788,6 +877,108 @@ its own single-action form and so cannot carry a bulk form's checkbox
 selection (HTML forbids nesting forms). To confirm a batch, post the
 selection to an interstitial page that lists the affected rows and asks
 for a second, explicit submit.
+
+### Concurrent edits: `lock_version` (optimistic locking)
+
+Declare a column named `lock_version` and the scaffold wires the
+framework's [optimistic-concurrency
+primitive](./cloud-native.md#optimistic-concurrency-via-lock_version)
+through the HTML edit flow (issue #1318) — no extra flag, no extra code:
+
+`lock_version` is a **magic column name**, like `slug` and `deleted_at`.
+Declaring it changes what the column *is*, so the generator prints a
+warning saying so; rename the column if you wanted an ordinary integer
+counter you set yourself.
+
+```bash
+autumn generate scaffold Post title:String body:Text lock_version:i32
+```
+
+- The **model** gets `#[lock_version]`, so the column is DB-managed:
+  excluded from `NewPost`, carried on `UpdatePost` as the *expected*
+  version, and compared by `#[repository]`'s update (which is what makes
+  the JSON API path conflict-check too).
+- The **migration** declares it `NOT NULL DEFAULT 0` (`INTEGER` for
+  `i32`, `BIGINT` for `i64`), since the INSERT never names it. Pass
+  `--default lock_version=<n>` to seed from a different base (a seed at the
+  column's maximum is refused — the generated `UPDATE` increments in SQL, and
+  Postgres raises `integer out of range` rather than wrapping, so the first
+  save on every row would fail). A counter that reaches its ceiling
+  organically needs 2³¹ saves of one row; use `lock_version:i64` for anything
+  that churns that hard.
+  `autumn generate migration AddLockVersionToPosts lock_version:i32`
+  gets the same `DEFAULT 0`, so retrofitting an existing table also
+  backfills its rows in one statement.
+- The **edit form** carries the row's current version in a hidden
+  `lock_version` input. The new form does not — a row that does not exist
+  yet has no version to guard against — and the version never appears as
+  an editable control.
+- The **update handler** turns the write into a compare-and-swap:
+
+  ```rust,ignore
+  let updated = diesel::update(
+      posts::table.find(*id).filter(posts::lock_version.eq(expected_lock_version)),
+  )
+      .set((
+          posts::title.eq(new.title.clone()),
+          posts::lock_version.eq(posts::lock_version + 1),
+      ))
+      .execute(&mut *db)
+      .await?;
+  ```
+
+  The guard and the bump are one statement, so there is no
+  read-modify-write window between them.
+- A **stale submit** matches zero rows. The handler re-reads the row to
+  tell "someone else got there first" (409) from "the row is gone" (404).
+  On 409 it re-renders the *same* edit form with the author's own input
+  intact, an inline `role="alert"` banner, and — deliberately — the row's
+  **current** version in the hidden field, so a second Save applies their
+  edit on top of the newer row. Handing the stale version back would make
+  the form permanently unsavable.
+- The generated `tests/<snake>.rs` gains a
+  `<plural>_optimistic_lock_conflict` test covering exactly that
+  sequence: first write wins and bumps, stale write 409s and changes
+  nothing, retry against the returned version succeeds.
+
+- A `:states(...)` **transition** is guarded the same way. It is itself a
+  read-modify-write — load the row, check the edge is legal from the state
+  just read, write — so its `UPDATE` carries `WHERE lock_version =
+  <the version it read>` and 409s (re-rendering the detail page) when it
+  loses the race, instead of letting two concurrent transitions out of the
+  same state both commit. It bumps the version too, so an author holding an
+  edit form opened before the transition is told the record moved on.
+- `autumn db pull` reproduces the attribute when it finds a
+  `lock_version` column, so a pulled table round-trips to the same model.
+
+The column must be a non-nullable `i32` or `i64`; anything else is
+rejected at generation time rather than silently ignored.
+`--live-validation` is supported (it changes only how the controls are
+rendered; its `update` writes through the same guarded statement).
+
+**Also affects `--api`.** `#[lock_version]` puts a **required**
+`lock_version` on `UpdatePost`, so JSON `PUT`/`PATCH` clients must send
+the version they read — a deliberate contract change, and how the API
+path gets conflict-checking. Existing clients that omit it will fail
+deserialization.
+
+**Not covered by the guard.** The scaffolded **admin** update
+(`autumn generate admin`) and the **delete** actions bump or write
+without a `WHERE lock_version = …` guard — the admin handler
+deserializes `NewPost`, which excludes the column, so the expected
+version never reaches it, and locking across deletes is out of scope
+(issues #1021/#1312). Both remain last-write-wins.
+
+**Not yet wired (HTML scaffolds only):** `--live`, `--sharded`, a `slug`
+column, and scaffolds with an `Attachment` column write through paths that
+do not route via the guarded statement, so combining them with
+`lock_version` is refused up front instead of emitting an edit form that
+only looks concurrency-safe. `--api` is exempt from all of these — it emits
+no routes file, so there is no form to be inconsistent with, and
+`--api --live` and friends keep generating.
+(`slug` is refused because a slug scaffold keys its update off the
+editable, reusable slug rather than the primary key, so
+`WHERE slug = … AND lock_version = …` does not identify a stable row.)
 
 ### Export CSV from the list view
 

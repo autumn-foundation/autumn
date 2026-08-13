@@ -2771,6 +2771,20 @@ enum GenerateCommands {
         /// `--api` scaffolds, which never generate a policy.
         #[arg(long)]
         no_policy: bool,
+        /// Bind this resource to a parent as its child (issue #1323), e.g.
+        /// `--belongs-to Post` alongside a `post:references` column. Adds a
+        /// nested read route (`GET /posts/{post_id}/comments`), a nested create
+        /// route that takes the foreign key from the path instead of the
+        /// submitted body, a children list + inline "add" form on the parent's
+        /// generated show view, and back-links in both directions. The parent
+        /// must already be scaffolded, and must be an `id`-keyed resource whose
+        /// `show` view is the one the flat scaffold generated (not `slug`-keyed,
+        /// not carrying a `:states(...)` column, not hand-rewritten). Not
+        /// supported with `--api`, `--live`, `--live-validation`, `--sharded`,
+        /// an `Attachment` column, or a nullable/self-referential parent
+        /// reference.
+        #[arg(long, value_name = "PARENT")]
+        belongs_to: Option<String>,
         /// Make these text fields full-text searchable (issue #1319): comma-
         /// separated or repeatable, e.g. `--searchable title,body`. Adds
         /// `#[searchable]` to the model, `searchable` to the repository, a
@@ -3858,13 +3872,27 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 ..Default::default()
             };
             let timestamp = generate::timestamp_now();
-            let plan = generate::model::plan_model_with_options(
-                &std::env::current_dir().unwrap_or_default(),
-                &name,
-                &fields,
-                &timestamp,
-                &options,
-            );
+            // `destroy model` recomputes the plan it is about to revert, so it
+            // must not be blocked by generation-only semantic checks: a model
+            // created before those checks existed still has to be removable, and
+            // the refusal would land before `Plan::revert` ever sees `--force`.
+            let project_root = std::env::current_dir().unwrap_or_default();
+            let plan = match mode {
+                ApplyMode::Generate => generate::model::plan_model_with_options(
+                    &project_root,
+                    &name,
+                    &fields,
+                    &timestamp,
+                    &options,
+                ),
+                ApplyMode::Destroy => generate::model::plan_model_with_options_for_revert(
+                    &project_root,
+                    &name,
+                    &fields,
+                    &timestamp,
+                    &options,
+                ),
+            };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Migration {
@@ -4230,6 +4258,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             live,
             live_validation,
             no_policy,
+            belongs_to,
             searchable,
             dry_run,
             force,
@@ -4288,6 +4317,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 id.as_deref(),
                 live_validation,
                 no_policy,
+                belongs_to.as_deref(),
                 &searchable,
             ) {
                 Ok(result) => result,
@@ -6921,6 +6951,34 @@ mod tests {
             panic!("expected generate scaffold");
         };
         assert!(no_policy);
+    }
+
+    #[test]
+    fn parse_generate_scaffold_belongs_to_flag() {
+        // Default: flat scaffold, no parent.
+        let cli = Cli::try_parse_from(["autumn", "generate", "scaffold", "Comment", "body:Text"])
+            .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { belongs_to, .. }) = cli.command else {
+            panic!("expected generate scaffold");
+        };
+        assert_eq!(belongs_to, None, "flat scaffolds have no parent");
+
+        // `--belongs-to Post` binds the child to its parent resource.
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "scaffold",
+            "Comment",
+            "body:Text",
+            "post:references",
+            "--belongs-to",
+            "Post",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { belongs_to, .. }) = cli.command else {
+            panic!("expected generate scaffold");
+        };
+        assert_eq!(belongs_to.as_deref(), Some("Post"));
     }
 
     #[test]

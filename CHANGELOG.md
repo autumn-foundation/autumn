@@ -107,6 +107,184 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   successful requests are never captured. `ErrorEvent` gains a
   `capsule` field whose file is already on disk by the time a reporter runs.
   See `docs/guide/failure-capsules.md`.
+- **generate scaffold:** `--belongs-to <Parent>` scaffolds the parent-side half
+  of a parent → child relationship, which the flat scaffold has always omitted
+  (#1323). Autumn already shipped every piece — the `references:` column
+  (#1026), the belongs_to `<select>` (#1146), `PageRequest`/`Page`,
+  `data_table`, the Changeset re-render (#1124) — but nothing composed them into
+  the one view every CRUD app needs: a parent's show page that lists its
+  children and lets you add one inline. Our own `examples/reddit-clone` spends
+  ~165 hand-written lines on a richer version of exactly that shape.
+
+  ```bash
+  autumn generate scaffold Post title:String
+  autumn generate scaffold Comment body:Text post:references --belongs-to Post
+  ```
+
+  That second command now emits, on top of the usual flat CRUD:
+
+  - `GET /posts/{post_id}/comments` — the child list, scoped to one parent and
+    paginated through the existing `PageRequest` extractor. A parent id that
+    doesn't exist answers 404 rather than a plausible-looking empty list;
+  - `POST /posts/{post_id}/comments` — a `#[secured]` create whose foreign key
+    comes from the **path**, never the submitted body (the nested form renders
+    no control for it, and the handler overwrites the column before validating,
+    so a hand-crafted body cannot re-parent a child). Invalid input re-renders
+    at 422 with inline errors and preserved input; success redirects (PRG) to
+    the parent's show page;
+  - a `pub children_section(…)` helper in the child's routes module — the child
+    list (`data_table`, each row linking to the child's own show view) plus the
+    inline "add" form — which the **parent's generated `show` view** now renders,
+    and which any hand-written page can call too;
+  - a back-link from the child's show view to its parent;
+  - a generated write-path test that pins the whole point of the nesting: create
+    a child under a parent, see it in that parent's list, and see that it does
+    **not** appear under a different parent (plus that a body-supplied foreign
+    key is ignored).
+
+  The parent-side edit is marker-delimited, so re-running the generator never
+  double-injects and `autumn destroy scaffold … --belongs-to Post` takes exactly
+  those lines back out — including when one parent has several nested children. Because
+  the markers record the relationship durably, `--belongs-to` is a one-time
+  flag: a later `generate … --force` without it keeps the nesting (with a
+  warning) instead of half-dismantling it, and `destroy` finds the parent
+  without it. Re-pointing a nested child at a *different* parent, or dropping
+  its foreign key, is refused before anything is written — the parent's section
+  passes its own `row.id`, so the change would leave that call compiling while
+  reading another table's ids. Un-nest with `destroy` first.
+  Regenerating the PARENT re-applies the child sections it carried (and is
+  refused when the re-render would reshape `show` into something the section
+  cannot live in, such as a `--sharded` parent's `ShardedDb`), and destroying a
+  parent that still has nested children is refused with the order to follow.
+  The injected signature carries a reversible `#[allow(clippy::too_many_arguments)]`,
+  since a generated project's own CI runs `cargo clippy --all-targets -- -D warnings`
+  and nine parameters trips it — as the flat `index` and `<snake>_form_for`
+  helpers already did, which this also fixes.
+  When the child carries an owner column, the nested list inherits the flat
+  index's `#[secured]` + owner scoping, so nesting never opens a second, wider
+  door onto the same rows.
+
+  Not supported (refused at generation time with an actionable message) with
+  `--api`, `--live`, `--live-validation`, `--sharded`, an `Attachment` column, a
+  nullable or self-referential parent reference, or a parent that isn't
+  scaffolded, is `slug`-keyed, carries a `:states(…)` column, or has a
+  hand-rewritten `show` view. Single-level nesting only.
+
+- **release:** every release with a breaking change now ships a migration guide,
+  enforced by `scripts/check-migration-guides.sh` (#1588). Autumn ships every
+  2–4 weeks and, pre-1.0, most releases can break existing apps, but the only
+  automated check keyed off a `### Breaking` CHANGELOG heading this repo has
+  never written — so it never fired, and 0.6.0 shipped the `with_pool` →
+  `with_pool_untracked` rename with no guide entry at all. The new gate reads
+  `CHANGELOG.md` and fails when a section declares a breaking change without a
+  guide at `docs/migrations/<version>.md` (`next.md` for `## [Unreleased]`),
+  when a breaking entry does not *link* its guide (a bare path mention is not a
+  link), when an entry describes breaking something without the `**Breaking:**`
+  marker the coverage check reads (explicitly non-breaking wording passes
+  untouched), or when a guide is a stub — it must carry the `TEMPLATE.md`
+  sections including *How to verify*, each with content under it, record the
+  guide-only upgrade walk-through as `performed YYYY-MM-DD` rather than
+  `pending`, and be indexed in `docs/migrations/README.md`. A release-candidate
+  section (`## [0.7.0-rc.1]`) is gated against its release's guide. The gate
+  fails closed on anything it cannot read — an unparseable `## ` heading and an
+  unclosed code fence are hard errors, since either silently removes whole
+  sections from every check. Fenced code blocks — backtick or tilde, of any
+  fence length — are skipped wholesale in both the changelog and the guides
+  (CommonMark closing rules included), so a config sample cannot
+  turn a docs PR red and a guide cannot satisfy its own required headings from
+  inside an example; the rolling `next.md` draft is exempt from the placeholder
+  and empty-section checks, since the checklist recreates it from `TEMPLATE.md`
+  after every release. It runs as its own `ci.yml` job on every pull
+  request, so the guide is written by the author of the break while the change
+  is still in review, and again in the publish gate for tags pushed outside a
+  PR. Docs-only and free of any Rust build, it reports in seconds.
+  `--list` prints the per-section inventory for the release operator.
+  Guides are backfilled for `0.5.0` (new: the centralised
+  `[security.trusted_proxies]` boundary and the rate-limit key deprecations)
+  and `0.6.0` (the missing `with_pool` → `with_pool_untracked` section, scoped
+  honestly — the published 0.5.0 crates have no pool constructor, so the rename
+  is invisible to a crates.io upgrade and only bites `trunk-dev` trackers), and
+  the `0.4.0`/`0.5.0` changelog sections gained the `### Breaking Changes`
+  blocks they always deserved. `docs/release-checklist.md` gains a *Migration
+  Guide Gate* section requiring the `next.md` rename, the changelog link
+  repointing, and a **performed and recorded** guide-only upgrade of an
+  `autumn new` app from the previous release — no changelog, no source reading —
+  before `cargo publish`. `scripts/check-release-notes.sh` now shares the same
+  marker convention instead of its own dead heading-only heuristic.
+  The lint is textual and removes the *silent* failure mode rather than
+  replacing review: a break described without the word "breaking" and without
+  the marker still needs a reviewer to catch it. Entries that talk *about*
+  breaking changes rather than being one carry an explicit, greppable
+  `<!-- migration-guide-gate: reason -->` suppression — as this one does.
+  [no-plugin] <!-- migration-guide-gate: describes the gate itself -->
+- **generate scaffold / generate model:** a `lock_version` column now wires
+  optimistic locking end to end, so two people editing the same scaffolded
+  record can no longer silently clobber each other (#1318). Autumn already
+  shipped the hard half — `#[lock_version]` plus the `RepositoryError::Conflict`
+  the repository raises on a stale write (#575) — but the generator routed
+  around it: the update handler hand-wrote an unconditional
+  `diesel::update(table.find(id)).set(...)` and the edit form carried no
+  version, so on a `lock_version`-bearing model the last write always won.
+
+  Declaring the column (`autumn generate scaffold Post title:String
+  lock_version:i32`) is now the whole opt-in. The model gets `#[lock_version]`
+  and the migration `INTEGER NOT NULL DEFAULT 0` (the column is DB-managed, so
+  the INSERT never names it). The edit form carries the row's current version
+  in a hidden field — never as an editable control, and never on the *new*
+  form. The `update` handler turns the write into a compare-and-swap,
+  `WHERE lock_version = $expected` with `SET lock_version = lock_version + 1`
+  in the same statement, so there is no read-modify-write window.
+
+  A stale submit matches zero rows; the handler re-reads to distinguish "someone
+  else got there first" (409) from "the row is gone" (404). The 409 re-renders
+  the *same* edit form with the author's own input intact, an inline
+  `role="alert"` banner, and the row's **current** version in the hidden field —
+  so a second Save applies their edit on top of the newer row. Handing the stale
+  version back would leave the form permanently unsavable. A `:states(...)`
+  transition gets the same compare-and-swap: it is itself a read-modify-write
+  (load, check the edge is legal from the state just read, write), so two
+  concurrent transitions out of the same state would otherwise both commit. It
+  guards on the version it read, 409s on a lost race, and bumps — so an author
+  holding an older edit form also learns the record moved on.
+
+  Coverage: the generated `tests/<snake>.rs` gains a
+  `<plural>_optimistic_lock_conflict` test pinning the contract;
+  `autumn-cli/tests/integration/scaffold_lock_version.rs` drives the real CLI
+  and asserts the emitted model, migration, form and handler; and
+  `generate_lock_version_postgres.rs` runs the generated migration and statement
+  against real Postgres — including two concurrent transactions that both read
+  the same version, where exactly one write lands.
+
+  The retrofit path works too: `autumn generate migration AddLockVersionToPosts
+  lock_version:i32` emits `ADD COLUMN ... NOT NULL DEFAULT 0`, which backfills
+  existing rows in the same statement, and `autumn db pull` reproduces the
+  attribute so a pulled table round-trips to the same model.
+
+  Because the column name is load-bearing, `generate model`/`generate scaffold`
+  now print a warning saying what declaring it changed and how to opt out
+  (rename it). A `lock_version` that is not a non-nullable `i32`/`i64`, one
+  marked `unique` (it is DB-managed and defaults to 0, so a unique index would
+  reject the second row ever created), and and one that would leave a model with **no
+  insertable columns at all** (every column database-managed means an empty
+  `New{Model}`, whose Diesel `Insertable` derive does not compile) are all
+  rejected at generation time rather than silently mis-generated — on the
+  `generate model` path as well as `generate scaffold`, since the scaffold
+  delegates its model planning there. `autumn db pull` declines the attribute
+  in that same degenerate case (it mirrors a database it does not own, so it
+  warns and pulls an ordinary integer rather than emitting a project that will
+  not build). On HTML scaffolds,
+  `--live`, `--sharded`, a `slug` column, and scaffolds with an `Attachment`
+  column write through paths that do not route via the guarded statement, so
+  combining them with `lock_version` is refused up front instead of emitting an
+  edit form that only looks concurrency-safe (`--api` is exempt from those
+  gates: it emits no form, so `--api --live` and friends keep generating). (`slug` in particular keys the update off an
+  editable, reusable identifier, so `WHERE slug = ... AND lock_version = ...`
+  would not pin a stable row.) The scaffolded **admin** update and the delete
+  actions still bump-or-write without a guard and remain last-write-wins;
+  locking across deletes is out of scope (#1021/#1312).
+
+  A scaffold with no `lock_version` column is byte-identical to before, verified
+  by diffing pre- and post-change generator output across twelve variants.
 
 - **generate scaffold:** the generated list view ships a working **Export
   CSV** download (#1315). Autumn already had the hard half — `export_csv` +
@@ -1027,10 +1205,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extension only for routes that declared something, so routes without
   `seo(...)` pay nothing. As before, the attribute supplies *values*, not
   markup: handlers still decide where to emit them, normally via
-  `SeoMeta::render()` inside a layout. **Breaking for code that constructs
+  `SeoMeta::render()` inside a layout. **Breaking:** code that constructs
   `autumn_web::Route { .. }` or `autumn_web::static_gen::StaticRouteMeta { .. }`
-  literally** (plugins building a `Vec<Route>` by hand rather than through
-  `routes![]`): add `seo: autumn_web::seo::SeoRouteDefaults::EMPTY`.
+  literally (plugins building a `Vec<Route>` by hand rather than through
+  `routes![]`) must add `seo: autumn_web::seo::SeoRouteDefaults::EMPTY`. See the
+  [migration guide](docs/migrations/next.md).
   `SeoRouteDefaults` is itself `#[non_exhaustive]` and built by chaining its
   `const fn with_*` setters from `EMPTY`, so future SEO keys stay additive.
 - **cli:** `autumn console` (alias `autumn c`) — a one-command, pre-wired data
@@ -1427,6 +1606,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **generate model / generate scaffold:** `lock_version` is now a load-bearing
+  column name (#1318) — see the Added entry above for the full behaviour. What
+  *changes* for anyone who already declared a column with that name: it becomes
+  database-managed (dropped from `New{Model}`, so it can no longer be set on
+  create), it disappears from a scaffold's HTML form in favour of a hidden
+  field, the model gains a derived `etag()` method, and a scaffold that pairs it
+  with `--live`, `--sharded`, a `slug` column, or an `Attachment` column — or
+  that declares it as the only column, marks it `unique`, or types it as
+  anything but a non-nullable `i32`/`i64` — is now refused rather than
+  generated. Generation prints a warning naming the escape hatch (rename the
+  column) whenever the name is detected.
+
+  **Breaking:** on an `--api` scaffold over a `lock_version` model,
+  `#[lock_version]` puts a *required* `lock_version` on `Update{Model}`, so JSON
+  `PUT`/`PATCH` clients must now send the version they read. That is what gives
+  the JSON path conflict-checking, but existing clients that omit the field will
+  fail deserialization. See the
+  [migration guide](docs/migrations/next.md).
+
 - **generate:** finished the zero-JS file-upload slice (#1236) on the read-back
   side. A scaffold with an `Attachment` column now *shows* what it stored: the
   generated `show` and edit views resolve a signed, time-bounded URL through the
@@ -1721,7 +1919,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   earlier per-crate exclusion of victim crates. Under `--all-features`,
   autumn-cli's `sqlite` forwarded to `autumn-web/sqlite` and (via global cargo
   feature unification) flipped the shared autumn-web dependency to the SQLite
-  backend for the whole graph, breaking every Pg-assuming crate
+  backend for the whole graph, which failed to compile every Pg-assuming crate
   (`autumn-admin-plugin`, `autumn-media-plugin`, the example apps) with E0308.
   Excluding the two feature-owners resolves autumn-web to Postgres in the
   catch-all, so those crates compile again and their earlier `--exclude`s are
@@ -1782,6 +1980,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default-deny posture model and how to classify the three route kinds
   (`gated`, `public`, `framework`), completing the deferred items from #1604's
   first slice (#1850).
+
+### Security
+
+- **inbound_mail:** cap `multipart/*` nesting at 16 levels (`MAX_MIME_DEPTH`). A
+  deeply nested MIME body on an unauthenticated inbound-mail webhook could
+  previously recurse until the stack overflowed, aborting the process. Past the
+  cap the remaining subtree is kept verbatim as an opaque attachment — never
+  dropped (#1611).
+- **inbound_mail:** reject MIME boundaries RFC 2046 §5.1.1 does not permit —
+  empty, or longer than 70 characters. Such a `Content-Type` now takes the
+  existing single-part fallback instead of driving a boundary scan (#1611).
+
+### Fixed
+
+- **inbound_mail:** quoted MIME parameter values are no longer Latin-1 mangled
+  (`filename="café.pdf"` came back as `cafÃ©.pdf`); the parser scans `char`s
+  instead of casting bytes (#1611).
+- **jobs:** a large `jobs.tracking.ttl_secs` no longer panics the process — the
+  tracking stores clamp the TTL and every expiry stamp instead of hitting
+  `TimeDelta::seconds`' out-of-bounds panic and `DateTime + TimeDelta` overflow
+  (#1611).
+- **jobs:** retry on the in-process backend no longer underflows computing
+  exponential backoff for a zero attempt counter; the local backend now matches
+  the Redis/Postgres backends' saturating exponent (#1611).
+- **jobs:** pathological `#[job(unique_for = ...)]` windows and Redis maintenance
+  intervals clamp their deadlines instead of overflowing `Instant + Duration`
+  (#1611).
+
+### Changed
+
+- **panic gate:** the request-path panic gate (#1611) now also denies
+  `clippy::string_slice` and `clippy::arithmetic_side_effects` in every gated
+  module, and the manifest grows to 30 modules (adds `inbound_mail.rs`,
+  `nested_form.rs` — which carried the header but had drifted out of the
+  manifest — and the new crate-private `time_math` saturating-arithmetic
+  helpers). `scripts/check-panic-gate.sh` gains header anchoring, anti-spoof
+  checks for module-wide `allow`s, `reason =` hygiene on per-site allows,
+  reverse-manifest drift detection, a module-count floor, a CI
+  feature-reachability check (with a validated, self-expiring exemption list —
+  `middleware/trace_context.rs` is behind `telemetry-otlp`, which the lint runner
+  cannot enable without `protoc`, and the gate now says so on every run instead
+  of leaving it silently unenforced), and a `--self-test` mode that runs by
+  default;
+  `scripts/pre-push-check.sh` now runs the gate and the gated-features clippy
+  lane. CI lints the `inbound-mail`/`inbound-mailgun`/`inbound-ses`/`storage`
+  features and runs the inbound-mail test suites. [no-plugin]
+- **panic gate:** hardened `scripts/check-panic-gate.sh` against a set of
+  reviewer-confirmed bypasses that had passed both the script and `cargo clippy
+  -- -D warnings` while shipping a production panic (#1611). Header validation is
+  now structural (the block must open *exactly* `#![cfg_attr(not(test), deny(`
+  after comment/whitespace stripping), so a widened `all(not(test), any())`
+  predicate or a `not(test)` living only in a comment no longer passes. A new
+  tree-wide inner-suppression scan rejects any `#![allow(…)]`/`#![expect(…)]`
+  (including the `cfg_attr(…, allow(…))` form) that re-permits a gated lint or a
+  blanket group (`restriction`/`all`/`pedantic`/`nursery`) across **every** `*.rs`
+  under the scan roots — closing the unmarked-submodule hole — while exempting
+  `#[cfg(test)]` scopes; the scan roots now include the sibling framework crates
+  (`autumn-admin-plugin`, `autumn-media-plugin`, `autumn-storage-s3`,
+  `autumn-cache-redis`). Per-site allows must now carry a **non-empty** reason,
+  and the feature-reachability check only counts an *enforcing* CI clippy lane
+  (`-p autumn-web` + `-D warnings`, not commented out), so a stubbed lane can no
+  longer fake coverage. The `--self-test` suite grows to 34 cases, one per bypass.
+  CONTRIBUTING.md documents the enforced-subset scoping (the manifest is an
+  incremental subset of the request path, not the whole of it) and the
+  `macro_rules!` expansion blind spot the gate cannot see. [no-plugin]
+- **inbound_mail:** `compute_mailgun_signature` delegates to
+  `security::config::hmac_sha256_hex` (output byte-identical); removed a dead
+  re-parse in the SNS certificate DER reader (#1611). [no-plugin]
 
 ## [0.6.0] - 2026-07-18
 
@@ -3588,11 +3854,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     statement timeout, slow-query threshold, and shard-tagged route metric
     label are all carried from the `ShardedDb` context rather than reset to
     framework defaults.
-  - The previous `with_pool` constructor is **renamed** to
+  - **Breaking:** the previous `with_pool` constructor is **renamed** to
     `with_pool_untracked` to signal at the call site that request
     observability is bypassed. Uses of `with_pool` on generated repositories
     must be updated to `with_pool_untracked` (only the name changes; the
-    signature and semantics are identical).
+    signature and semantics are identical). See the
+    [migration guide](docs/migrations/0.6.0.md).
   - `ShardedDb` gains a `#[doc(hidden)]` `__autumn_repository_seed()` accessor
     exposing the `ShardRepositorySeed` carrier struct used by generated code.
 
@@ -4010,9 +4277,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `secrecy::SecretString` instead of a plain `String`, so the JWT signing
   secret is redacted from `Debug` output (and any logs that format the
   config) and zeroized on drop. Config-file deserialization is unchanged —
-  a plain TOML string still works. Breaking for code that read or set the
-  field directly: set it with `Some(value.into())` and read it via
-  `secrecy::ExposeSecret::expose_secret()` (supersedes #1304). [no-plugin]
+  a plain TOML string still works. **Breaking:** code that read or set the
+  field directly must set it with `Some(value.into())` and read it via
+  `secrecy::ExposeSecret::expose_secret()` (supersedes #1304). See the
+  [migration guide](docs/migrations/0.6.0.md). [no-plugin]
 - **deps(security):** dependency-vulnerability upgrades (supersedes PR #1557;
   `diesel-async` was already handled separately). `aws-sdk-s3` floored at
   1.122 (1.119.0 → 1.122.0, the last MSRV-1.88 release) with
@@ -4122,6 +4390,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trunk-dev-only).
 
 ## [0.5.0] - 2026-06-16
+
+### Breaking Changes
+
+> Backfilled by #1588. These entries were always in the release — they were
+> spelled out inside the feature bullets below rather than called out here,
+> which is exactly the archaeology this section exists to remove.
+
+- **security:** forwarded-header trust moved to a single `[security.trusted_proxies]`
+  policy and `prod` defaults to trusting **no** proxy until it is configured.
+  An app behind a load balancer or reverse proxy that relied on `X-Forwarded-For`
+  / `X-Forwarded-Host` being honoured implicitly must declare its proxy boundary
+  or it will rate-limit on (and log) the proxy's address. This is the fix for
+  #753, #785 and #791. See the [migration guide](docs/migrations/0.5.0.md).
+- **security:** `security.rate_limit.trusted_proxies` and
+  `security.rate_limit.trust_forwarded_headers` are deprecated in favour of the
+  top-level `[security.trusted_proxies]` block. They keep working (registered
+  for removal in `1.0.0`) with a startup warning, and `autumn doctor --strict`
+  fails when the old and new keys disagree. See the
+  [migration guide](docs/migrations/0.5.0.md).
 
 ### Added
 
@@ -4239,6 +4526,25 @@ To opt out of the generated `page` method: implement your own list handler using
 - **deps:** Bump actions/upload-artifact from 4 to 7 (#744)([b6b028c](https://github.com/madmax983/autumn/commit/b6b028cf71a7efee75d1437d2edc1b91f7b5313a))
 - Changelog and release notes([367bcd3](https://github.com/madmax983/autumn/commit/367bcd365df380f974f9cb6d943467e8d9c672a6))
 ## [0.4.0] - 2026-05-12
+
+### Breaking Changes
+
+> Backfilled by #1588 from `docs/migrations/0.4.0.md`, which shipped with the
+> release; the changelog section never named the breaks.
+
+- **security:** `prod` / `production` profiles refuse to bind without a stable
+  signing secret (`[security.signing_secret] secret`, or the
+  `AUTUMN_SECURITY__SIGNING_SECRET` override). See the
+  [migration guide](docs/migrations/0.4.0.md).
+- **storage:** the `storage-s3` feature was removed from `autumn-web` and moved
+  to the `autumn-storage-s3` crate. See the
+  [migration guide](docs/migrations/0.4.0.md).
+- **auth:** generated repository APIs require a `policy = ...` in production
+  unless `security.allow_unauthorized_repository_api` is set. See the
+  [migration guide](docs/migrations/0.4.0.md).
+- **mail:** `deliver_later` requires a durable `MailDeliveryQueue` in production
+  unless `mail.allow_in_process_deliver_later_in_production` is set. See the
+  [migration guide](docs/migrations/0.4.0.md).
 
 ### Added
 

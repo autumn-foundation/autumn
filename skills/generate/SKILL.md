@@ -73,6 +73,7 @@ accept aliases like `Integer` or `Boolean`.
 | `decimal` / `decimal{10,2}` **(trunk-dev)** | `NUMERIC(12,2)` default, or explicit precision/scale | `rust_decimal::Decimal` (dependency added automatically); use for money, never `f64` |
 | `:unique` modifier **(trunk-dev)** | `email:String:unique` → `CREATE UNIQUE INDEX` in the migration | Also generates a free `find_by_<field>` lookup and 23505 → 422 inline "already exists" form error. `--unique FIELD` is the flag equivalent |
 | `slug{from:col}` **(trunk-dev)** | `TEXT NOT NULL` + implicit `:unique`'s `CREATE UNIQUE INDEX` | `String`; free `find_by_slug`; `show`/`edit`/`update`/`delete` routes and generated links key off the slug, not `id` (`GET /posts/{slug}`); blank on create auto-derives via `autumn_web::slugify(&new.<col>)` with a deterministic `-2`/`-3` collision suffix. At most one per model; not yet supported with `--live`/`--live-validation`/`--sharded`/an `Attachment` field/a `:states(...)` field. Quote the token in bash/zsh (brace expansion) |
+| `lock_version` (magic column name) **(trunk-dev)** | `INTEGER`/`BIGINT NOT NULL DEFAULT 0` | Declaring a non-nullable `i32`/`i64` column literally named `lock_version` opts the model into optimistic locking (issue #1318): the model gets `#[lock_version]`, so the column is DB-managed (out of `New{Model}`, carried on `Update{Model}` as the *expected* version, conflict-checked by `#[repository]`, and JSON `PUT`/`PATCH` clients must now send it). A scaffold hides it in the edit form, turns `update` into `WHERE lock_version = $expected` + `SET lock_version = lock_version + 1`, and re-renders the form at **409** with the author's input and an inline banner when a concurrent editor got there first. On HTML scaffolds, not supported with `--live`/`--sharded`/a `slug` column/an `Attachment` field, and never as a model's only insertable column or marked `:unique` — all refused at generation time (`--api` is exempt from the variant gates: it emits no form). `--live-validation` is supported. Rename the column if you wanted a plain counter |
 
 **Foreign keys** (published 0.5.0 CLI only — no `references` token): scaffold
 an `i64` field and hand-edit the generated migration to add
@@ -212,7 +213,8 @@ owner-scopes the index; pass `--no-policy` to opt out (issue #1125).
 
 **Scaffold typed path module (trunk-dev)**: scaffolds reference a generated
 `autumn_web::paths![index, show, new, create, edit, update, delete]` module
-(`+events` under `--live`, `+validate_{field}` under `--live-validation`) for
+(`+events` under `--live`, `+validate_{field}` under `--live-validation`,
+`+nested_index, nested_create` under `--belongs-to`) for
 every href/action/redirect/SSE endpoint/`hx-post` target instead of literal URL
 strings (issue #1133).
 
@@ -516,6 +518,7 @@ Next steps:
 - `--live-validation` **(trunk-dev)**: For `scaffold` — per-field inline validation endpoints with `hx-post` inputs (implies `--live`)
 - `--unique FIELD` / `--index FIELD` / `--default field=variant` **(trunk-dev)**: Constraint/index/default markers (see field table)
 - `--no-policy` **(trunk-dev)**: For `scaffold` — skip the default-generated record-level `Policy`/`Scope`. Ignored under `--api` (issue #1125)
+- `--belongs-to <Parent>` **(trunk-dev)**: For `scaffold` — bind this resource to a parent as its child (issue #1323). Needs a matching `references` column (`--belongs-to Post` + `post:references`) and a parent that is **already scaffolded**. Emits `GET`/`POST /<parents>/{<fk>}/<children>` (the create takes the FK from the path, never the body), a `pub children_section(…)` helper, an injected children list + inline "add" form on the **parent's** generated `show` view, a back-link on the child's show view, and a cross-parent-isolation test. Marker-delimited, so re-runs are idempotent and `autumn destroy` reverses it. If the child has an owner column, the nested list inherits the flat index's `#[secured]` + owner scoping. Refused with `--api`/`--live`/`--live-validation`/`--sharded`, an `Attachment` column, a nullable or self-referential parent reference, or a parent that isn't scaffolded / is `slug`-keyed / carries a `:states(…)` column / has a hand-rewritten `show`. Single-level only
 - `--searchable <field,field>` **(trunk-dev)**: For `scaffold` — make the named text fields Postgres full-text searchable. Emits `#[searchable]` attrs, a `search_vector` generated column + GIN index migration, and a search box wired to `GET /<plural>/search`. Rejected for non-text/unknown fields, uuid-PK models, and owner-scoped models; gated off under `--live`/`--live-validation` (issue #1319)
 
 ## Wizard name constraints

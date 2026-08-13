@@ -644,12 +644,21 @@ pub fn add_columns_up_sql_for(
         // emitting DDL that breaks on SQLite. Postgres is unaffected (its
         // output stays byte-for-byte identical), and a NOT NULL column inside
         // CREATE TABLE (the `generate model` path) is likewise fine on SQLite.
-        if backend == DatabaseBackend::Sqlite && !f.nullable {
+        // Issue #1318: `lock_version` is the one column this path can default
+        // on its own. `#[lock_version]` makes it DB-managed — the generated
+        // `New{Model}` never names it — so a bare `NOT NULL` add would leave
+        // every subsequent INSERT failing, and the retrofit ("add optimistic
+        // locking to a resource I already shipped") is the *normal* way this
+        // column arrives. `DEFAULT 0` also backfills existing rows in one
+        // statement, which is why this add needs neither the blocking-safety
+        // banner nor the SQLite refusal below.
+        let lock_version_default = super::model::is_lock_version_column(f);
+        if backend == DatabaseBackend::Sqlite && !f.nullable && !lock_version_default {
             return Err(super::sqlite_add_not_null_without_default_error(
                 table, &f.name,
             ));
         }
-        if !f.nullable {
+        if !f.nullable && !lock_version_default {
             let _ = writeln!(
                 out,
                 "-- autumn-safety: potentially-blocking \
@@ -663,6 +672,9 @@ pub fn add_columns_up_sql_for(
             f.sql_column_type_for(backend),
             f.sql_nullability()
         );
+        if lock_version_default {
+            out.push_str(" DEFAULT 0");
+        }
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
         }
@@ -5570,6 +5582,65 @@ mod tests {
         assert!(
             drop_idx < drop_col,
             "DROP INDEX must precede DROP COLUMN:\n{down}"
+        );
+    }
+
+    /// Retrofitting optimistic locking onto a shipped resource (issue #1318) is
+    /// the normal way a `lock_version` column arrives, and it only works if the
+    /// `ALTER TABLE ... ADD COLUMN` carries `DEFAULT 0`: the column is
+    /// DB-managed, so the generated `New{Model}` never names it and a bare
+    /// `NOT NULL` add would leave every later INSERT failing. The default also
+    /// backfills the existing rows, so the add needs neither the blocking-safety
+    /// banner nor the `SQLite` refusal a plain NOT NULL add gets.
+    #[test]
+    fn add_lock_version_column_carries_a_default_on_both_backends() {
+        for (backend, sql_type) in [
+            (DatabaseBackend::Postgres, "INTEGER"),
+            (DatabaseBackend::Sqlite, "INTEGER"),
+        ] {
+            let f = fields(&["lock_version:i32"]);
+            let up = add_columns_up_sql_for(backend, "posts", &f, "").unwrap();
+            assert!(
+                up.contains(&format!(
+                    "ALTER TABLE posts ADD COLUMN lock_version {sql_type} NOT NULL DEFAULT 0;"
+                )),
+                "{backend:?} up:\n{up}"
+            );
+            assert!(
+                !up.contains("autumn-safety: potentially-blocking"),
+                "a defaulted add backfills in one statement, so it is not blocking:\n{up}"
+            );
+        }
+        // i64 keeps its own width.
+        let f = fields(&["lock_version:i64"]);
+        let up = add_columns_up_sql_for(DatabaseBackend::Postgres, "posts", &f, "").unwrap();
+        assert!(
+            up.contains("ADD COLUMN lock_version BIGINT NOT NULL DEFAULT 0;"),
+            "up:\n{up}"
+        );
+    }
+
+    /// The default is scoped to the real lock column: a nullable or
+    /// differently-typed `lock_version`, and any other NOT NULL column, keep the
+    /// pre-#1318 behaviour exactly.
+    #[test]
+    fn only_the_real_lock_version_column_gets_the_implicit_default() {
+        let f = fields(&["views:i32"]);
+        let up = add_columns_up_sql_for(DatabaseBackend::Postgres, "posts", &f, "").unwrap();
+        assert!(
+            up.contains("ADD COLUMN views INTEGER NOT NULL;"),
+            "an ordinary NOT NULL add keeps the pre-#1318 DDL:\n{up}"
+        );
+        assert!(
+            up.contains("autumn-safety: potentially-blocking"),
+            "up:\n{up}"
+        );
+
+        let f = fields(&["lock_version:Option<i32>"]);
+        let up = add_columns_up_sql_for(DatabaseBackend::Postgres, "posts", &f, "").unwrap();
+        assert!(
+            up.contains("ADD COLUMN lock_version INTEGER NULL;"),
+            "a nullable column is not a lock version:\n{up}"
         );
     }
 
