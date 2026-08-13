@@ -834,7 +834,13 @@ pub struct JobRegistry {
     ///
     /// Defaults to the real clock; [`AppState::with_clock`](crate::AppState)
     /// installs the app's.
-    clock: Arc<dyn crate::time::ClockSource>,
+    ///
+    /// **Shared, exactly like `queues`.** A clone of this registry keeps the
+    /// same marks, so it has to keep the same clock — a per-handle clock lets
+    /// one handle stamp a ready-at on a virtual timeline that another reads back
+    /// against `SystemClock`, and the two report different depths and ages for
+    /// one set of marks. Installing a clock therefore travels to every clone.
+    clock: Arc<RwLock<Arc<dyn crate::time::ClockSource>>>,
 }
 
 impl JobRegistry {
@@ -846,19 +852,36 @@ impl JobRegistry {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             queues: Arc::new(RwLock::new(QueueGaugeState::default())),
-            clock: Arc::new(crate::time::SystemClock),
+            clock: Arc::new(RwLock::new(
+                Arc::new(crate::time::SystemClock) as Arc<dyn crate::time::ClockSource>
+            )),
         }
     }
 
     /// Return this registry with its queue gauges reading `clock`.
     ///
-    /// The registry keeps sharing the same underlying counters — only the clock
-    /// handle is replaced — so an already-cloned registry elsewhere still sees
-    /// the same marks.
+    /// Builder form of [`Self::install_clock`], for wiring a registry at
+    /// construction. Like that method it reaches **every clone** of this
+    /// registry, since they all share one set of marks and must judge them on
+    /// one clock.
     #[must_use]
-    pub fn with_clock(mut self, clock: Arc<dyn crate::time::ClockSource>) -> Self {
-        self.clock = clock;
+    pub fn with_clock(self, clock: Arc<dyn crate::time::ClockSource>) -> Self {
+        self.install_clock(clock);
         self
+    }
+
+    /// Put this registry's queue gauges on `clock`.
+    ///
+    /// Writes through the shared clock cell, so a registry already cloned into
+    /// a running job client or another `AppState` moves onto the new timeline
+    /// too. That is the point: the clones share `queues`, and marks stamped by
+    /// one must be judged the same way by all of them.
+    pub(crate) fn install_clock(&self, clock: Arc<dyn crate::time::ClockSource>) {
+        let mut slot = self
+            .clock
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = clock;
     }
 
     /// The gauges' current instant in epoch milliseconds, on the injected
@@ -870,7 +893,15 @@ impl JobRegistry {
     /// Mixing in a mark stamped elsewhere — a database `run_at`, a real
     /// `SystemTime` reading — is what makes an age come back as years or zero.
     fn now_ms(&self) -> u64 {
-        u64::try_from(self.clock.now().timestamp_millis()).unwrap_or(0)
+        // Recover rather than drop the reading on a poisoned lock: the cell holds
+        // an immutable `Arc` handle, so a panic elsewhere leaves it perfectly
+        // readable, and falling back to real time here would reintroduce exactly
+        // the mixed timeline this field exists to prevent.
+        let clock = self
+            .clock
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        u64::try_from(clock.now().timestamp_millis()).unwrap_or(0)
     }
 
     /// Register a job name with initial counters.
@@ -4132,7 +4163,54 @@ mod tests {
         assert_eq!(drained.get("bulk").unwrap().depth, 0);
     }
 
+    /// Clones share marks, so they must share the clock that judges them.
+    ///
+    /// `queues` is behind an `Arc`, so every clone of a registry sees one set of
+    /// waiting marks. When the clock was a per-handle field, installing one on a
+    /// handle cloned *after* the fact left the older clone reading those same
+    /// marks against `SystemClock` — the two then reported different ready
+    /// depths, and years of waiting age, for identical state.
     #[test]
+    fn installing_a_clock_reaches_registry_clones() {
+        use chrono::{TimeZone, Utc};
+
+        // Clone first, install second — the order that used to diverge.
+        let registry = JobRegistry::new();
+        let earlier_clone = registry.clone();
+        registry.register_on_queue("probe", "default");
+
+        // Behind real time, like a sim epoch. That direction is what separates
+        // the two handles: a deadline one virtual minute past a 2020 epoch is
+        // still years behind a real-clock reading, so a stale clone calls it
+        // ready while the injected one correctly calls it scheduled. An epoch
+        // *ahead* of real time would have both answer "not yet" and prove
+        // nothing.
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let registry = registry.with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+
+        // A job due a minute after the injected epoch: scheduled, not ready.
+        let ready_at = u64::try_from(epoch.timestamp_millis()).unwrap() + 60_000;
+        registry.record_enqueue_scheduled("probe", ready_at);
+
+        let through_new = registry.queue_snapshot();
+        let through_old = earlier_clone.queue_snapshot();
+        assert_eq!(
+            through_new["default"].depth, 0,
+            "the handle that installed the clock sees a scheduled job"
+        );
+        assert_eq!(
+            through_old["default"].depth, through_new["default"].depth,
+            "a clone taken before the clock was installed must judge the shared \
+             marks identically; it read them against the real clock and saw a \
+             ready job that cannot run"
+        );
+        assert_eq!(
+            through_old["default"].oldest_waiting_age_ms,
+            through_new["default"].oldest_waiting_age_ms,
+            "and must report the same waiting age, not a decade of it"
+        );
+    }
+
     /// A surveyed age must survive the round trip onto the registry's clock,
     /// however far that clock sits from real time.
     ///
@@ -4142,6 +4220,7 @@ mod tests {
     /// raw database `MIN(run_at)` from the injected clock instead — what this
     /// branch briefly did — reports years of waiting age when the clock is
     /// pinned ahead of the database, or zero when it is behind.
+    #[test]
     fn a_surveyed_age_survives_the_rebase_onto_the_registry_clock() {
         use chrono::{TimeZone, Utc};
 

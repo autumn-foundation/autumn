@@ -528,7 +528,11 @@ impl AppState {
         // The job registry's queue gauges compare ready-at marks the job runtime
         // stamped from this same clock, so they have to move with it — otherwise
         // a delayed job under a sim reads as ready the moment it is enqueued.
-        self.job_registry = self.job_registry.clone().with_clock(Arc::clone(&clock));
+        // This writes through the registry's shared clock cell, so a registry
+        // already cloned into a running job client moves too; replacing only
+        // this handle's clock would leave the two judging one set of marks on
+        // two timelines.
+        self.job_registry.install_clock(Arc::clone(&clock));
         self.clock = clock;
         self
     }
