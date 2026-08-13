@@ -860,10 +860,10 @@ impl JobRegistry {
 
     /// Return this registry with its queue gauges reading `clock`.
     ///
-    /// Builder form of [`Self::install_clock`], for wiring a registry at
-    /// construction. Like that method it reaches **every clone** of this
-    /// registry, since they all share one set of marks and must judge them on
-    /// one clock.
+    /// Builder form, for wiring a registry at construction. It reaches **every
+    /// clone** of this registry, since they all share one set of marks and must
+    /// judge them on one clock — the clock lives in a shared cell beside the
+    /// marks, not on the handle.
     #[must_use]
     pub fn with_clock(self, clock: Arc<dyn crate::time::ClockSource>) -> Self {
         self.install_clock(clock);
