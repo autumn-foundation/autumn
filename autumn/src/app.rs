@@ -6168,14 +6168,20 @@ async fn run_cron_task_loop(
 /// `now` is passed in (rather than read here) so the caller supplies it from the
 /// app's injected clock and the rendered `next_run_at` follows virtual time
 /// under a `#[sim_test]`.
+///
+/// Goes through [`crate::job::due_at_from`] for the addition rather than `now +
+/// delay`. Once `now` comes from an injected clock it is no longer bounded by
+/// real time, and chrono's `Add` **panics** on overflow — a clock pinned near
+/// `DateTime::MAX_UTC` would kill this scheduler task before its first run, for
+/// a value that only ends up in a log line. `due_at_from` already owns that
+/// clamp for the job queue's deadlines; sharing it keeps the two from drifting
+/// apart, and makes an unrepresentable delay render as the far future rather
+/// than as `now` (which would read as "runs immediately").
 fn format_next_task_run_after(
     now: chrono::DateTime<chrono::Utc>,
     delay: std::time::Duration,
 ) -> String {
-    let Ok(delay) = chrono::TimeDelta::from_std(delay) else {
-        return now.to_rfc3339();
-    };
-    (now + delay).to_rfc3339()
+    crate::job::due_at_from(now, delay).to_rfc3339()
 }
 
 fn next_cron_occurrence_after<Tz: chrono::TimeZone>(
@@ -9529,6 +9535,41 @@ async fn canary_rollback_signal(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    /// A clock near the end of representable time must not kill the scheduler.
+    ///
+    /// `format_next_task_run_after` runs at the top of every fixed-delay loop.
+    /// While `now` came from real time its sum with an ordinary delay could not
+    /// overflow, but an injected clock is unbounded, and chrono's `Add` panics
+    /// rather than wrapping — so a `FixedClock` near `DateTime::MAX_UTC` would
+    /// take the task down before its first run, over a string for a log line.
+    #[test]
+    fn next_task_run_saturates_instead_of_panicking_at_the_end_of_time() {
+        let max = chrono::DateTime::<chrono::Utc>::MAX_UTC;
+
+        // An ordinary delay that would carry `now` past the representable end.
+        let rendered = super::format_next_task_run_after(max, std::time::Duration::from_secs(60));
+        assert_eq!(
+            rendered,
+            max.to_rfc3339(),
+            "a fixed delay past the end of time must clamp, not panic"
+        );
+
+        // A delay too large for `TimeDelta` at all renders as the far future,
+        // not as `now` — the latter would read as "this task runs immediately".
+        let absurd = super::format_next_task_run_after(
+            chrono::Utc::now(),
+            std::time::Duration::from_secs(u64::MAX),
+        );
+        assert_eq!(absurd, max.to_rfc3339());
+
+        // The ordinary case is unchanged.
+        let epoch = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        assert_eq!(
+            super::format_next_task_run_after(epoch, std::time::Duration::from_secs(60)),
+            (epoch + chrono::TimeDelta::seconds(60)).to_rfc3339()
+        );
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

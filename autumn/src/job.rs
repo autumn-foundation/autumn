@@ -2364,7 +2364,7 @@ fn due_origin_for(
 /// The single home of the overflow clamp: every enqueue-side due-time
 /// computation reaches it through [`JobClient::delay_to_when`], so a
 /// pathological delay can never panic on one path and clamp on another.
-fn due_at_from(
+pub(crate) fn due_at_from(
     now: chrono::DateTime<chrono::Utc>,
     delay: std::time::Duration,
 ) -> chrono::DateTime<chrono::Utc> {
