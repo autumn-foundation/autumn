@@ -623,7 +623,11 @@ pub fn is_session_housekeeping(sql: &str) -> bool {
 /// Whether one statement is a session setting replay reproduces on its own.
 ///
 /// Whitespace-tolerant on both sides of the setting name, so `SET  TIME ZONE`
-/// is classified identically by the recorder and the stub.
+/// is classified identically by the recorder and the stub. The name must end
+/// at a boundary: `SET autumn.capsule_request_mode = 'audit'` is an
+/// application's own GUC that merely shares a prefix with the marker, and
+/// classifying it as housekeeping would silently drop an application exchange
+/// from the tape.
 fn is_housekeeping_statement(statement: &str) -> bool {
     let statement = statement.trim().to_ascii_uppercase();
     let Some(setting) = strip_keyword(&statement, "SET") else {
@@ -637,7 +641,20 @@ fn is_housekeeping_statement(statement: &str) -> bool {
         MARKER_GUC_UPPER,
     ]
     .iter()
-    .any(|name| setting.starts_with(name))
+    .any(|name| {
+        setting
+            .strip_prefix(name)
+            .is_some_and(|rest| !rest.chars().next().is_some_and(is_setting_name_char))
+    })
+}
+
+/// Whether `c` could continue a `PostgreSQL` setting name.
+///
+/// GUC names are dotted identifiers (letters, digits, `_`, `$`, `.`), so any
+/// of these directly after a matched housekeeping name means the statement
+/// sets a *longer*, different setting.
+const fn is_setting_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.')
 }
 
 /// Split a SQL batch at top-level semicolons, ignoring semicolons inside
@@ -1106,6 +1123,29 @@ fn be_i32(bytes: &[u8]) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A custom GUC that merely *extends* a housekeeping name is application
+    /// SQL: dropping it from the tape would let replay fabricate a `SET` the
+    /// revised code never issued.
+    #[test]
+    fn a_custom_guc_sharing_a_housekeeping_prefix_is_not_housekeeping() {
+        assert!(
+            !is_session_housekeeping("SET autumn.capsule_request_mode = 'audit'"),
+            "a longer setting name sharing the marker's prefix is the app's own"
+        );
+        assert!(
+            !is_session_housekeeping("SET statement_timeout_policy = 'strict'"),
+            "a longer setting name sharing statement_timeout's prefix is the app's own"
+        );
+        // The real spellings still classify as housekeeping.
+        assert!(is_session_housekeeping("SET TIME ZONE 'UTC'"));
+        assert!(is_session_housekeeping("SET client_encoding TO 'UTF8'"));
+        assert!(is_session_housekeeping("SET statement_timeout = 5000"));
+        assert!(is_session_housekeeping(
+            "SET autumn.capsule_request = 'req-1'"
+        ));
+        assert!(is_session_housekeeping("SET autumn.capsule_request = ''"));
+    }
 
     // ---- fixture encoders -------------------------------------------------
 

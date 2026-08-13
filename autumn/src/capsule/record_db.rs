@@ -349,9 +349,45 @@ async fn establish_recording(url: &str) -> ConnectionResult<AsyncPgConnection> {
         ));
     }
 
-    let stream = connect_first_reachable(&endpoints)
+    // A multi-host URL is a failover list, and tokio-postgres's own connector
+    // walks it in order — so this one must too, or enabling capture would
+    // turn a healthy HA deployment away whenever its first host is down. Each
+    // endpoint gets the *complete* attempt (TCP, startup and authentication,
+    // the writability probe): a host that accepts TCP but cannot finish the
+    // handshake — a half-up standby, a mid-failover primary — rejects that
+    // endpoint, not the pool.
+    let mut failures: Vec<String> = Vec::new();
+    for (host, port) in &endpoints {
+        match establish_recording_at(&config, host, *port).await {
+            Ok(connection) => return Ok(connection),
+            Err(reason) => failures.push(format!("{host}:{port}: {reason}")),
+        }
+    }
+    Err(ConnectionError::BadConnection(format!(
+        "failed to establish a recorded connection to every configured host ({})",
+        failures.join("; ")
+    )))
+}
+
+/// One complete recorded-connection attempt against one endpoint.
+///
+/// Everything that can disqualify a host happens here, so the caller's
+/// failover loop only accepts an endpoint the ordinary connector would have
+/// accepted: the TCP connect, the `PostgreSQL` startup and authentication
+/// over the tee, the `target_session_attrs=read-write` probe when the URL
+/// demands a writable session, and diesel-async's adoption of the client.
+/// The probe is the same `SHOW transaction_read_only` tokio-postgres's own
+/// multi-host connector issues; it runs before the first checkout marker, so
+/// it lands in the connection memo's prologue — re-askable metadata the
+/// replay stub answers by key, never a tape entry a replay must consume.
+async fn establish_recording_at(
+    config: &tokio_postgres::Config,
+    host: &str,
+    port: u16,
+) -> Result<AsyncPgConnection, String> {
+    let stream = TcpStream::connect((host, port))
         .await
-        .map_err(ConnectionError::BadConnection)?;
+        .map_err(|error| error.to_string())?;
     // Match what tokio-postgres's own connector does: PostgreSQL is a
     // request/response protocol, so Nagle only adds latency.
     let _ = stream.set_nodelay(true);
@@ -359,7 +395,7 @@ async fn establish_recording(url: &str) -> ConnectionResult<AsyncPgConnection> {
     let (client, connection) = config
         .connect_raw(RecordingStream::new(stream), tokio_postgres::NoTls)
         .await
-        .map_err(|error| ConnectionError::BadConnection(error.to_string()))?;
+        .map_err(|error| error.to_string())?;
 
     tokio::spawn(async move {
         if let Err(error) = connection.await {
@@ -367,29 +403,31 @@ async fn establish_recording(url: &str) -> ConnectionResult<AsyncPgConnection> {
         }
     });
 
-    AsyncPgConnection::try_from(client).await
-}
-
-/// Connect to the first endpoint that accepts, in configured order.
-///
-/// A multi-host URL is a failover list, and tokio-postgres's own connector
-/// walks it in order — so this one must too, or enabling capture would turn a
-/// healthy HA deployment away whenever its first host is down. What this loop
-/// does *not* reproduce is `target_session_attrs`: it takes the first host
-/// that accepts a TCP connection, without probing whether that host is
-/// writable.
-async fn connect_first_reachable(endpoints: &[(String, u16)]) -> Result<TcpStream, String> {
-    let mut failures: Vec<String> = Vec::new();
-    for (host, port) in endpoints {
-        match TcpStream::connect((host.as_str(), *port)).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) => failures.push(format!("{host}:{port}: {error}")),
+    if matches!(
+        config.get_target_session_attrs(),
+        tokio_postgres::config::TargetSessionAttrs::ReadWrite
+    ) {
+        let rows = client
+            .simple_query("SHOW transaction_read_only")
+            .await
+            .map_err(|error| error.to_string())?;
+        let read_only = rows.iter().any(|message| {
+            matches!(
+                message,
+                tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0) == Some("on")
+            )
+        });
+        if read_only {
+            return Err(
+                "the session is read-only, and the URL asks for target_session_attrs=read-write"
+                    .to_owned(),
+            );
         }
     }
-    Err(format!(
-        "failed to connect to every configured host ({})",
-        failures.join("; ")
-    ))
+
+    AsyncPgConnection::try_from(client)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Every TCP host/port pair in a parsed connection string, in configured
@@ -1311,41 +1349,51 @@ mod tests {
         );
     }
 
-    /// An HA deployment's first host being down must not turn the recording
-    /// pool away when a later configured host is reachable — tokio-postgres's
-    /// own connector walks the list, so this one has to as well.
+    /// The failover loop must give every endpoint the *complete* connection
+    /// attempt: a host that accepts TCP but cannot finish the `PostgreSQL`
+    /// handshake (here, a listener that closes every accepted socket — a
+    /// half-up standby's shape) must reject that endpoint and move on, not
+    /// select the socket permanently and fail the pool.
     #[tokio::test]
-    async fn connect_falls_through_to_the_next_configured_host() {
+    async fn a_host_that_accepts_tcp_but_fails_the_handshake_is_not_selected() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
-        let reachable = listener.local_addr().expect("addr").port();
+        let half_up = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            // Accept and immediately drop: TCP succeeds, the startup message
+            // meets an EOF.
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
 
-        let endpoints = vec![
-            // Port 1 is never listening on loopback: connection refused.
-            ("127.0.0.1".to_owned(), 1),
-            ("127.0.0.1".to_owned(), reachable),
-        ];
-        let stream = connect_first_reachable(&endpoints)
-            .await
-            .expect("the second host is up, so the connect must succeed");
-        assert_eq!(
-            stream.peer_addr().expect("peer").port(),
-            reachable,
-            "the stream must be to the first *reachable* host in order"
+        let error = establish_recording(&format!(
+            "host=127.0.0.1,127.0.0.1 port={half_up},1 user=postgres dbname=postgres"
+        ))
+        .await
+        .err()
+        .expect("neither endpoint can finish a handshake");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("127.0.0.1:{half_up}")) && message.contains("127.0.0.1:1"),
+            "the error must show the loop moved past the TCP-accepting host \
+             and tried the whole failover list, got {message}"
         );
     }
 
     #[tokio::test]
     async fn exhausting_every_host_names_each_failed_attempt() {
-        let endpoints = vec![("127.0.0.1".to_owned(), 1), ("127.0.0.1".to_owned(), 2)];
-        let error = connect_first_reachable(&endpoints)
-            .await
-            .expect_err("nothing listens on ports 1 or 2");
+        let error =
+            establish_recording("host=127.0.0.1,127.0.0.1 port=1,2 user=postgres dbname=postgres")
+                .await
+                .err()
+                .expect("nothing listens on ports 1 or 2");
+        let message = error.to_string();
         assert!(
-            error.contains("127.0.0.1:1") && error.contains("127.0.0.1:2"),
+            message.contains("127.0.0.1:1") && message.contains("127.0.0.1:2"),
             "the error must name every attempted endpoint so an operator can \
-             see the whole failover list was tried, got {error}"
+             see the whole failover list was tried, got {message}"
         );
     }
 
