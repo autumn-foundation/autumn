@@ -513,6 +513,13 @@ This is the first slice. What it does not do, stated plainly:
 - **One request per capsule.** A failure that only appears under a particular
   interleaving of concurrent requests is not reproduced by replaying one of
   them.
+- **Work a handler `tokio::spawn`s is outside the request's clock.** A task
+  the handler spawns carries neither the capture scope nor the replay scope
+  (task-locals do not cross `spawn`), so its clock reads are not recorded and,
+  during replay, are served a stable non-consuming timestamp instead of the
+  recorded sequence — they can never shift the handler's own readings, but a
+  spawned task whose *result* depends on those reads may still diverge. Work
+  the handler awaits inline is fully covered.
 - **Same-commit replay is what is tested.** A capsule recorded by a different
   build of the framework warns; a capsule recorded by different *application*
   code will usually diverge, which is the honest outcome rather than a bug.

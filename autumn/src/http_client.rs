@@ -75,7 +75,7 @@ pub enum ClientError {
     #[error("outbound circuit breaker is open")]
     CircuitBreakerOpen,
     /// Outbound HTTP is blocked because this process is replaying a failure
-    /// capsule (see [`block_outbound_for_replay`]).
+    /// capsule (see the crate-internal `block_outbound_for_replay`).
     #[error(
         "outbound HTTP is not recorded in a failure capsule and is blocked during replay: {0} {1}"
     )]

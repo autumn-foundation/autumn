@@ -246,9 +246,7 @@ async fn capture_overhead_on_a_successful_query_request() {
     let on = Summary::of(db_on);
     report("one bound SELECT through the pool", &off, &on);
 
-    let written = std::fs::read_dir(dir.path())
-        .map(std::iter::Iterator::count)
-        .unwrap_or(0);
+    let written = std::fs::read_dir(dir.path()).map_or(0, std::iter::Iterator::count);
     assert_eq!(
         written, 0,
         "successful requests must leave no capsule behind — capture that writes on the \

@@ -2482,7 +2482,7 @@ impl AppBuilder {
     /// Declare a plugin-owned top-level config section so it coexists with
     /// `server.strict_config = true`.
     ///
-    /// Core's [`AutumnConfig`](crate::config::AutumnConfig) schema is closed: any
+    /// Core's [`AutumnConfig`] schema is closed: any
     /// top-level `[root]` table it does not know about is an unknown key. Under
     /// `strict_config`, an unknown root is a **hard** boot error. A plugin that
     /// reads its own top-level table — for example `autumn-media-plugin` reading

@@ -455,9 +455,15 @@ pub async fn execute(
 }
 
 /// Drive one rebuilt request through the router, capturing an escaping panic.
+///
+/// The call runs inside [`crate::capsule::clock::with_replay_request_scope`],
+/// which is what entitles it — and only it — to consume the capsule's
+/// recorded clock readings. Reads from anywhere else during the replay
+/// (boot, or tasks the handler spawns) are served non-consuming, mirroring
+/// the capture side, where only scope-carrying reads were recorded.
 async fn drive(router: axum::Router, request: Request<Body>) -> CapsuleOutcome {
-    let call = AssertUnwindSafe(router.oneshot(request));
-    match call.catch_unwind().await {
+    let call = crate::capsule::clock::with_replay_request_scope(router.oneshot(request));
+    match AssertUnwindSafe(call).catch_unwind().await {
         Ok(Ok(response)) => outcome_from_response(response).await,
         // `Router`'s error type is `Infallible`, but the service contract still
         // has an error arm; treat it as a zero-status failure rather than

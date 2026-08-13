@@ -274,10 +274,17 @@ fn redact_uri(
     let Some(query) = uri.query() else {
         return uri.to_string();
     };
-    mask_raw_urlencoded(query, "query", filter, values, keys).map_or_else(
-        || uri.to_string(),
-        |masked| format!("{}?{masked}", uri.path()),
-    )
+    let original = uri.to_string();
+    let Some(masked) = mask_raw_urlencoded(query, "query", filter, values, keys) else {
+        return original;
+    };
+    // Splice the masked query onto the original prefix rather than rebuilding
+    // from `uri.path()`: an absolute-form target
+    // (`https://api.example/items?...`) keeps its scheme and authority, so a
+    // proxy-style route that reads the full request target sees the same
+    // shape during replay.
+    let prefix = original.split_once('?').map_or("", |(prefix, _)| prefix);
+    format!("{prefix}?{masked}")
 }
 
 /// The on-the-wire spelling a masked pair's value is replaced with — the
@@ -920,6 +927,30 @@ mod tests {
             "only the matched pair may be rewritten"
         );
         assert!(values.contains(b"s3cret"));
+    }
+
+    /// An absolute-form request target (the shape a proxy-style route sees)
+    /// keeps its scheme and authority through masking: the rewritten query is
+    /// spliced onto the original prefix, never rebuilt from the path alone.
+    #[test]
+    fn an_absolute_form_target_keeps_its_scheme_and_authority() {
+        let (request, _values) = redact(
+            Request::get("https://api.example/items?token=s3cret&keep=a%2f"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert_eq!(
+            request.uri, "https://api.example/items?token=%5BFILTERED%5D&keep=a%2f",
+            "scheme and authority must survive query masking"
+        );
+
+        // And untouched absolute-form targets are preserved byte for byte.
+        let (request, _values) = redact(
+            Request::get("https://api.example/items?keep=a%2f"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert_eq!(request.uri, "https://api.example/items?keep=a%2f");
     }
 
     /// The form-body twin of the raw-spelling guarantee: an untouched form —
