@@ -538,6 +538,19 @@ This is the first slice. What it does not do, stated plainly:
 - **A handler that extracts a subsystem the replay does not boot** — a
   `Mailer`, a `BlobStore` — fails during replay and is reported as a mismatch
   rather than taking the replay process down.
+- **Randomness is not recorded.** A handler that draws from `Rng` /
+  `state.entropy()` — a fresh UUID, a token — draws *different* bytes during
+  replay; if those bytes reach a SQL bind, the replay reports a bind divergence
+  naming the statement. Recording the entropy seam is a follow-on slice, like
+  outbound HTTP; the divergence is the honest signal until then.
+- **Custom exception filters that rewrite failure identity can mis-verdict.**
+  The capsule records the outcome where the framework observes failures —
+  before the exception-filter chain runs — while replay observes the response
+  the full chain produced. The framework's own filters preserve identity, so
+  this only matters for a custom `exception_filter` that replaces the status
+  or message of a 500 (mismatch against unchanged code) or promotes a non-5xx
+  to a 5xx (no capsule at all — the same observation-scope trade-off
+  documented for error reporting).
 - **Only failures are captured.** There is no way to capsule a successful
   request, by design: the buffer for a request that succeeds is dropped at the
   response boundary.

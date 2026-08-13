@@ -248,6 +248,7 @@ pub struct CaptureScope {
     request: OnceLock<RawRequest>,
     body: Mutex<BodyTap>,
     clock: Mutex<Vec<DateTime<Utc>>>,
+    client_addr: OnceLock<Option<std::net::IpAddr>>,
     db: Mutex<DbBuffer>,
     notes: Mutex<Vec<String>>,
     truncated: AtomicBool,
@@ -265,6 +266,7 @@ impl CaptureScope {
             request: OnceLock::new(),
             body: Mutex::new(BodyTap::Absent),
             clock: Mutex::new(Vec::new()),
+            client_addr: OnceLock::new(),
             db: Mutex::new(DbBuffer::default()),
             notes: Mutex::new(Vec::new()),
             truncated: AtomicBool::new(false),
@@ -389,6 +391,18 @@ impl CaptureScope {
 
     /// Append a clock reading.
     ///
+    /// Record the client address the trusted-proxies resolver settled on.
+    /// Only the first call takes — one resolution per request.
+    pub fn set_client_addr(&self, addr: Option<std::net::IpAddr>) {
+        let _ = self.client_addr.set(addr);
+    }
+
+    /// The resolved client address, when the resolver ran under this scope.
+    #[must_use]
+    pub fn client_addr(&self) -> Option<std::net::IpAddr> {
+        self.client_addr.get().copied().flatten()
+    }
+
     /// Bounded: a pathological loop reading `now()` must not grow the buffer
     /// without limit, and a capsule that long is not replayable anyway.
     pub fn record_clock(&self, reading: DateTime<Utc>) {

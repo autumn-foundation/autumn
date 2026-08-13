@@ -599,8 +599,12 @@ enum Commands {
         #[arg(long, value_name = "BIN")]
         bin: Option<String>,
         /// Profile forwarded to the app binary via `AUTUMN_ENV`.
-        #[arg(long, default_value = "dev")]
-        profile: String,
+        ///
+        /// Defaults to the profile the capsule recorded, so profile-gated
+        /// routes and configuration match the failing run; falls back to
+        /// `dev` for capsules that recorded none.
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Run or list one-off operational tasks registered by the application.
     Task {
@@ -3131,7 +3135,12 @@ fn run_command(command: Commands) {
             package,
             bin,
             profile,
-        } => run_replay_command(&capsule, package.as_deref(), bin.as_deref(), &profile),
+        } => run_replay_command(
+            &capsule,
+            package.as_deref(),
+            bin.as_deref(),
+            profile.as_deref(),
+        ),
         Commands::Task {
             package,
             bin,
@@ -3546,7 +3555,12 @@ fn run_command(command: Commands) {
     }
 }
 
-fn run_replay_command(capsule: &str, package: Option<&str>, bin: Option<&str>, profile: &str) {
+fn run_replay_command(
+    capsule: &str,
+    package: Option<&str>,
+    bin: Option<&str>,
+    profile: Option<&str>,
+) {
     replay::run(&replay::ReplayOptions {
         capsule,
         package,

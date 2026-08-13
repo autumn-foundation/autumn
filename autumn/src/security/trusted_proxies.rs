@@ -565,6 +565,13 @@ where
             host: self.resolver.resolve_client_host(&req),
             scheme: self.resolver.resolve_client_scheme(&req),
         };
+        // A failure capsule records the *resolved* client address, so replay
+        // can re-anchor `ClientAddr` without re-running trust evaluation
+        // against a peer socket it does not have (issue #1598).
+        #[cfg(feature = "reporting")]
+        if let Some(scope) = crate::capsule::current_scope() {
+            scope.set_client_addr(identity.addr);
+        }
         req.extensions_mut().insert(identity);
 
         let mut inner = self.inner.clone();

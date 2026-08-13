@@ -153,6 +153,11 @@ pub struct CapsuleRequest {
     /// `header:authorization`, `query:token`, `body:user.password`.
     #[serde(default)]
     pub redacted_keys: Vec<String>,
+    /// The client address the trusted-proxies resolver settled on, when it
+    /// ran. Replay re-anchors `ClientAddr` on this so identity-reading
+    /// handlers reproduce without a real peer socket.
+    #[serde(default)]
+    pub client_addr: Option<std::net::IpAddr>,
 }
 
 /// A captured request body.
@@ -355,6 +360,7 @@ pub mod test_support {
             headers: Vec::new(),
             body: CapsuleBody::Absent,
             redacted_keys: Vec::new(),
+            client_addr: None,
         }
     }
 

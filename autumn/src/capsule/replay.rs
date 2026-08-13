@@ -550,6 +550,17 @@ fn rebuild_request(
         .method(method)
         .uri(uri)
         .version(parse_version(&recorded.http_version));
+    // Re-anchor client identity: the recorded *resolved* address becomes the
+    // replayed peer, so the trusted-proxies resolver — which runs during
+    // replay but has no real socket — settles on the same `ClientAddr` the
+    // production request had. (The resolved address is not a proxy, so the
+    // resolver returns the peer itself rather than re-walking forwarded
+    // headers against it.)
+    if let Some(addr) = recorded.client_addr {
+        builder = builder.extension(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+            addr, 0,
+        )));
+    }
     for (name, value) in &recorded.headers {
         let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
             warnings.push(format!("dropped unparseable recorded header name {name:?}"));
@@ -915,6 +926,7 @@ mod tests {
                 headers: Vec::new(),
                 body: CapsuleBody::Absent,
                 redacted_keys: Vec::new(),
+                client_addr: None,
             },
             outcome,
             clock: Vec::new(),
@@ -922,6 +934,29 @@ mod tests {
             truncated: false,
             notes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_recorded_client_addr_is_restored_as_the_replayed_peer() {
+        let mut recorded = crate::capsule::schema::test_support::request("GET", "/whoami");
+        recorded.client_addr = Some(std::net::IpAddr::from([203, 0, 113, 9]));
+        let mut warnings = Vec::new();
+        let request = rebuild_request(&recorded, &mut warnings).expect("request rebuilds");
+        let peer = request
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .expect("the recorded client address must anchor the replayed peer");
+        assert_eq!(peer.0.ip(), std::net::IpAddr::from([203, 0, 113, 9]));
+
+        let anonymous = crate::capsule::schema::test_support::request("GET", "/whoami");
+        let request = rebuild_request(&anonymous, &mut warnings).expect("request rebuilds");
+        assert!(
+            request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .is_none(),
+            "no recorded address, no synthetic peer"
+        );
     }
 
     #[test]

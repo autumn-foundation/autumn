@@ -14,7 +14,9 @@ pub struct ReplayOptions<'a> {
     pub capsule: &'a str,
     pub package: Option<&'a str>,
     pub bin: Option<&'a str>,
-    pub profile: &'a str,
+    /// Explicit `--profile`, or `None` to default to the capsule's recorded
+    /// profile (falling back to `dev`).
+    pub profile: Option<&'a str>,
 }
 
 /// Run `autumn replay`.
@@ -40,11 +42,14 @@ pub fn run(opts: &ReplayOptions<'_>) {
     crate::routes::compile_binary(opts.package, opts.bin);
     let binary = crate::routes::find_binary(opts.package, opts.bin);
 
+    let recorded_profile = recorded_profile(&capsule);
+    let profile = effective_profile(opts.profile, recorded_profile.as_deref());
+
     let mut command = Command::new(&binary);
     command
         .env(REPLAY_CAPSULE_ENV, &capsule)
-        .env("AUTUMN_ENV", opts.profile)
-        .env("AUTUMN_PROFILE", opts.profile)
+        .env("AUTUMN_ENV", &profile)
+        .env("AUTUMN_PROFILE", &profile)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -54,6 +59,42 @@ pub fn run(opts: &ReplayOptions<'_>) {
     });
 
     std::process::exit(exit_code(status));
+}
+
+/// The profile the capsule recorded (`app.profile`), when it recorded one.
+///
+/// Best-effort: an unreadable or malformed capsule returns `None` here and is
+/// then refused properly by the app binary, which owns capsule validation.
+fn recorded_profile(capsule: &Path) -> Option<String> {
+    let json = std::fs::read_to_string(capsule).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    value
+        .get("app")?
+        .get("profile")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The profile the replayed app boots with.
+///
+/// An explicit `--profile` wins (with a warning when it differs from the
+/// recording — profile-gated routes and configuration can then legitimately
+/// diverge); otherwise the capsule's recorded profile, so the replay boots the
+/// way the failing run did; `dev` only when the capsule recorded none.
+fn effective_profile(explicit: Option<&str>, recorded: Option<&str>) -> String {
+    match (explicit, recorded) {
+        (Some(explicit), Some(recorded)) if explicit != recorded => {
+            eprintln!(
+                "warning: replaying with --profile {explicit}, but the capsule was recorded \
+                 under the {recorded:?} profile — profile-gated routes and configuration may \
+                 differ from the failing run"
+            );
+            explicit.to_owned()
+        }
+        (Some(explicit), _) => explicit.to_owned(),
+        (None, Some(recorded)) => recorded.to_owned(),
+        (None, None) => "dev".to_owned(),
+    }
 }
 
 /// Resolve the capsule argument to an absolute path.
@@ -90,6 +131,32 @@ fn exit_code(status: ExitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_defaults_to_the_capsules_recorded_profile() {
+        assert_eq!(effective_profile(None, Some("prod")), "prod");
+        assert_eq!(effective_profile(None, None), "dev");
+        assert_eq!(effective_profile(Some("staging"), Some("prod")), "staging");
+        assert_eq!(effective_profile(Some("prod"), Some("prod")), "prod");
+    }
+
+    #[test]
+    fn recorded_profile_reads_app_profile_from_the_capsule_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("capsule.json");
+        std::fs::write(&path, r#"{"app":{"name":"shop","profile":"prod"}}"#).expect("write");
+        assert_eq!(recorded_profile(&path).as_deref(), Some("prod"));
+
+        std::fs::write(&path, r#"{"app":{"name":"shop"}}"#).expect("write");
+        assert_eq!(recorded_profile(&path), None);
+
+        std::fs::write(&path, "not json").expect("write");
+        assert_eq!(
+            recorded_profile(&path),
+            None,
+            "a malformed capsule is the app binary's refusal to make, not ours"
+        );
+    }
 
     #[test]
     fn resolve_capsule_path_rejects_a_missing_file() {

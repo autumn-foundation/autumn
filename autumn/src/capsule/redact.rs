@@ -169,6 +169,9 @@ pub fn redact_request(
         headers,
         body,
         redacted_keys: keys.into_iter().collect(),
+        // Filled in by persist from the capture scope; redaction only sees
+        // the request head.
+        client_addr: None,
     };
     (request, values, notes)
 }

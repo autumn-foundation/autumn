@@ -176,8 +176,9 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     if let Some(note) = scope.body_note() {
         scope.note(note);
     }
-    let (request, redacted, body_notes) =
+    let (mut request, redacted, body_notes) =
         crate::capsule::redact::redact_request(raw, &raw_body, scope.filter());
+    request.client_addr = scope.client_addr();
     for note in body_notes {
         scope.note(note);
     }
