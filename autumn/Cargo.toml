@@ -289,7 +289,14 @@ tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, optional = true }
 tokio-util = { workspace = true, features = ["io"] }
 toml.workspace = true
-tower.workspace = true
+# `util` is needed for `tower::util::option_layer`, which turns an
+# `Option<Layer>` into a `Layer` (`Either<L, Identity>`) so a conditionally
+# applied middleware can still join the statically-composed ingress layer
+# tuples in `router.rs` instead of costing its own `Router::layer` call — and
+# therefore its own `BoxCloneSyncService` nesting level (issue #2193). It pulls
+# in no crates the build does not already have: axum enables the same tower
+# feature.
+tower = { workspace = true, features = ["util"] }
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -403,6 +410,14 @@ harness = false
 
 [[bench]]
 name = "inspector"
+harness = false
+
+# Ingress-pipeline workload for profilers (issue #2193): drives real requests
+# through the production router so `valgrind --tool=callgrind|dhat` can attribute
+# the per-request framework overhead. Asserts nothing — see the file header for
+# the exact commands.
+[[bench]]
+name = "request_pipeline"
 harness = false
 
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for

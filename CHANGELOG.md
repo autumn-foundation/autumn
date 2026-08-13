@@ -1541,6 +1541,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Router: ~59% fewer heap allocations per request.** The framework's ingress
+  middleware stack is now assembled with a handful of *composed* `Router::layer`
+  calls instead of ~26 sequential ones (#2193). Every `Router::layer` call wraps
+  the whole downstream stack in another `tower::util::BoxCloneSyncService`
+  (axum's `Route::layer` ends in `Route::new`), and axum's `Route::call`
+  deep-clones that box on every invocation — so *N* stacked layers cost
+  `N(N+1)/2 + 2N` heap allocations per request, **quadratically**. Measured
+  against axum 0.8.9 with no-op layers: 38 allocations/request at N = 5, 263 at
+  N = 20, 1388 at N = 50; the same layers composed into a *single*
+  `Router::layer` call cost a flat 16 at any N.
+
+  Measured end-to-end on the real production router (`valgrind --tool=dhat`
+  against the new `request_pipeline` bench — three trivial handlers, no DB, no
+  business logic): **825.7 → 339.7 allocations per request**. The number of
+  times a request deep-clones the ingress stack fell from 29 to 16.
+
+  `MaintenanceLayer` and `LoadShedLayer` additionally held their path
+  allow-lists by value, so each per-request clone deep-copied two `String`s and
+  two `Vec<String>`s; both now share them behind an `Arc`. The `UploadConfig`
+  extension is installed with `axum::Extension` rather than
+  `axum::middleware::from_fn`, dropping a boxed future and a boxed `Next` per
+  request.
+
+  **No middleware changed position.** Layers are composed with `tower-layer`'s
+  tuple `Layer` impls, whose **first element is outermost** — the reverse of
+  consecutive `Router::layer` calls, where the **last** call is outermost.
+  `autumn/tests/integration/middleware_stack_order.rs` pins the ordering
+  invariants that were previously documented only in prose (metrics attribution,
+  panic-to-500 with `X-Request-Id`, trusted-proxy resolution before
+  `ClientAddr`, security headers on short-circuits, disabled layers being
+  inert); `autumn/tests/integration/middleware_stack_depth.rs` gates the depth;
+  and `autumn/benches/request_pipeline.rs` is the profiler workload.
+
 - **generate model / generate scaffold:** `lock_version` is now a load-bearing
   column name (#1318) — see the Added entry above for the full behaviour. What
   *changes* for anyone who already declared a column with that name: it becomes
