@@ -94,10 +94,11 @@ async fn db_fail_with_orphan(
     Err(AutumnError::internal_server_error_msg("exploded"))
 }
 
-/// Reads a row, then — as the job poller, the mailer and job tracking all do —
-/// takes a connection **straight from the pool**, with no `Db::checkout` and so
-/// no capsule marker, and runs a query on it. That query belongs to nobody and
-/// must not join this request's capsule.
+/// Reads a row, then takes a connection **straight from the pool** — as a
+/// policy or a notification store would — with no `Db::checkout`. The pool
+/// hooks run on this request task and see its capture scope, so the raw
+/// query is attributed to this request's capsule (unlike a scope-free
+/// background user's, which is cleared).
 #[get("/db-fail-with-raw-pool-user")]
 async fn db_fail_with_raw_pool_user(
     State(state): State<autumn_web::AppState>,
@@ -557,15 +558,16 @@ async fn marker_clears_previous_request_binding() {
 /// connection prologue that is then copied into *every* later capsule.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn raw_pool_users_are_never_recorded_into_a_capsule() {
+async fn request_task_raw_checkouts_join_the_capsule_but_background_ones_never_do() {
     let dir = tempfile::tempdir().expect("tempdir");
     // One slot: every checkout in this test is the same connection.
     let pool =
         autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
             .expect("recording pool builds");
 
-    // Before any request: the connection is born in a raw user's hands, so its
-    // statement would otherwise become part of the connection's prologue.
+    // Before any request: the connection is born in a raw user's hands with no
+    // capture scope, so its statement must stay out of the connection's
+    // prologue (and every later capsule).
     raw_pool_query(&pool, "prologue-poller")
         .await
         .expect("the raw query runs");
@@ -591,13 +593,22 @@ async fn raw_pool_users_are_never_recorded_into_a_capsule() {
         recorded.iter().any(|sql| sql.contains("SELECT $1::text")),
         "the request's own queries must still be recorded, got {recorded:?}"
     );
-    for stray in ["prologue-poller", "mid-request-poller"] {
-        assert!(
-            !recorded.iter().any(|sql| sql.contains(stray)),
-            "a raw pool user's query ({stray}) must never reach a capsule — not as an \
-             exchange and not as connection history: {recorded:?}"
-        );
-    }
+    // A raw `state.pool().get()` *on the request task* (a policy, a
+    // notification store, an app helper) carries the capture scope, and the
+    // pool hooks bind it — its SQL is part of what the request did, and a
+    // replay that re-issues it must find it on the tape.
+    assert!(
+        recorded
+            .iter()
+            .any(|sql| sql.contains("mid-request-poller")),
+        "a raw checkout on the request task must be attributed to the request's \
+         capsule: {recorded:?}"
+    );
+    assert!(
+        !recorded.iter().any(|sql| sql.contains("prologue-poller")),
+        "a scope-free raw pool user's query must never reach a capsule — not as an \
+         exchange and not as connection history: {recorded:?}"
+    );
 }
 
 /// deadpool's default recycling pings the connection with `SELECT $1` before

@@ -246,18 +246,22 @@ pub type CapturePoolProvider = Box<
 /// [`Db::checkout`](crate::db::Db::checkout) sends the attribution marker, but
 /// it is not the only way a connection leaves this pool: the job runtime, the
 /// mailer, job tracking and the app's own `state.pool().get()` all take
-/// connections straight from it. Nothing about those callers says "no capsule",
-/// so without help the recorder would keep the *previous* borrower's binding
-/// and file their statements into a stranger's capsule — or, on a connection
-/// they were the first to touch, write their SQL into the connection prologue
-/// that [`ConnectionRecorder::copy_memo`] then copies into every later capsule.
+/// connections straight from it. Without help the recorder would keep the
+/// *previous* borrower's binding and file their statements into a stranger's
+/// capsule — or, on a connection they were the first to touch, write their SQL
+/// into the connection prologue that [`ConnectionRecorder::copy_memo`] then
+/// copies into every later capsule.
 ///
 /// Both are closed here, at the boundary every borrower crosses: the
-/// `post_create` and `pre_recycle` hooks issue [`CLEAR_MARKER_SQL`] so the
-/// recorder unbinds (and ends its prologue) *before* the borrower's first
-/// statement. `deadpool` applies `pre_recycle` before the manager's recycle
-/// check and `post_create` before the object is handed out, so no user
-/// statement can precede it. The marker statement is housekeeping and is never
+/// `post_create` and `pre_recycle` hooks run on the checking-out task and set
+/// the binding from that task's own truth — the current capture scope's id
+/// when one is present (a direct `state.pool().get()` on a request task: a
+/// policy, a notification store, an app helper — their SQL belongs in the
+/// request's tape), and the clearing form otherwise, so unscoped background
+/// work can never be attributed to whoever held the connection last.
+/// `deadpool` applies `pre_recycle` before the manager's recycle check and
+/// `post_create` before the object is handed out, so no user statement can
+/// precede the binding. The marker statement is housekeeping and is never
 /// itself recorded. The cost is one extra round trip per checkout on a
 /// recording pool, which is capture's price for correct attribution — ordinary
 /// pools are untouched.
@@ -297,32 +301,49 @@ pub fn build_recording_pool(
         .max_size(max_size.max(1))
         .wait_timeout(Some(connect_timeout))
         .create_timeout(Some(connect_timeout))
-        .post_create(unbind_hook())
-        .pre_recycle(unbind_hook())
+        .post_create(attribution_hook())
+        .pre_recycle(attribution_hook())
         .runtime(deadpool::Runtime::Tokio1)
         .build()?)
 }
 
-/// A pool hook that unbinds the connection from any capsule before the next
-/// borrower touches it (see [`build_recording_pool`]).
+/// A pool hook that binds the connection to the checking-out task's capture
+/// scope — or unbinds it when there is none (see [`build_recording_pool`]).
+///
+/// Deadpool runs both hooks on the task that called `pool.get()`, so the
+/// capture scope task-local is visible here. That closes the *direct
+/// checkout* gap: a handler (or a policy, or a notification store) that takes
+/// a connection through the public `state.pool().get()` API never passes
+/// through `Db::checkout`'s marker, and without this binding its SQL would
+/// silently vanish from the capsule — leaving a "complete" tape that
+/// false-diverges the moment an unchanged replay issues the missing query. A
+/// scope-free checkout — the job poller, the mailer, a detached task — still
+/// clears the binding, so unattributed work can never land in whoever held
+/// the connection last (F2). `Db::checkout`'s own merged marker remains and
+/// simply re-asserts the same binding.
 ///
 /// A failure is reported to `deadpool`, which drops the connection and takes
-/// the next one: a connection that cannot be unbound must not be handed out,
-/// because everything it goes on to do would be filed under a stranger's
+/// the next one: a connection whose binding cannot be set must not be handed
+/// out, because everything it goes on to do would be filed under the wrong
 /// capsule.
-fn unbind_hook() -> Hook<AsyncDieselConnectionManager<AsyncPgConnection>> {
+fn attribution_hook() -> Hook<AsyncDieselConnectionManager<AsyncPgConnection>> {
     Hook::async_fn(|conn: &mut AsyncPgConnection, _metrics| {
         Box::pin(async move {
             use diesel_async::SimpleAsyncConnection as _;
 
-            conn.batch_execute(CLEAR_MARKER_SQL).await.map_err(|error| {
+            let marker = crate::capsule::current_scope()
+                .map(|scope| scope.id().to_owned())
+                .filter(|id| crate::capsule::is_valid_scope_id(id))
+                .and_then(|id| wire::marker_set_sql(&id))
+                .unwrap_or_else(|| CLEAR_MARKER_SQL.to_owned());
+            conn.batch_execute(&marker).await.map_err(|error| {
                 tracing::debug!(
                     %error,
-                    "a recorded connection could not be unbound from its capsule; it will be \
-                     discarded rather than handed out still attributed"
+                    "a recorded connection's capsule binding could not be set; it will be \
+                     discarded rather than handed out misattributed"
                 );
                 HookError::message(format!(
-                    "the failure-capsule recording pool could not clear a connection's capsule \
+                    "the failure-capsule recording pool could not set a connection's capsule \
                      binding: {error}"
                 ))
             })
