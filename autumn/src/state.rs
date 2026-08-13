@@ -9,12 +9,20 @@
 //! from the state. However, custom extractors can access the state via
 //! `crate::extract::State<AppState>`.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::Cache;
-use crate::time::{ClockSource, SystemClock};
+use crate::time::{ClockSource, MonotonicInstant, SystemClock};
 
 /// Newtype wrapper used to store the global cache in the extension map so that
 /// `set_cache` (called from startup hooks) is visible to all `AppState` clones.
@@ -88,8 +96,15 @@ pub struct AppState {
     /// without re-reading `AUTUMN_ROLE` by hand.
     pub(crate) role: crate::config::ProcessRole,
 
-    /// When the application started. Used for uptime calculation.
-    pub(crate) started_at: std::time::Instant,
+    /// When the application started, on the injected clock's monotonic
+    /// timeline. Used for uptime calculation.
+    ///
+    /// Read through [`crate::time::ClockSource::monotonic`] rather than a raw
+    /// [`std::time::Instant`] so uptime is virtual (and reproducible) under a
+    /// [`#[sim_test]`](crate::sim_test). Re-stamped by
+    /// [`with_clock`](Self::with_clock) so a clock installed after construction
+    /// owns the origin uptime is measured from.
+    pub(crate) started_at: MonotonicInstant,
 
     /// Whether the health endpoint should include detailed info.
     pub(crate) health_detailed: bool,
@@ -501,10 +516,84 @@ impl AppState {
     }
 
     /// Replace the clock (builder / test helper).
+    ///
+    /// Also re-stamps the app's start instant from the new clock, so
+    /// [`uptime`](Self::uptime) is measured on the timeline that is actually
+    /// installed. Without this, a state built with the default [`SystemClock`]
+    /// and then handed a virtual clock would compare a *virtual* `now` against a
+    /// *real* origin and report a nonsense uptime.
+    ///
+    /// A construction-time builder: it also gives the state a fresh job registry
+    /// on `clock`, so a state's clock and the queue gauges judged by it can
+    /// never belong to different timelines. A state cloned *before* this call
+    /// keeps its own clock and its own registry, equally consistent — the two
+    /// simply stop sharing queue gauges from here on.
+    ///
+    /// # Call this before starting a job runtime
+    ///
+    /// Once [`job::start_runtime`](mod@crate::job) has run, the runtime holds its
+    /// own clone of the registry and keeps recording into it, and **no**
+    /// behaviour here is correct:
+    ///
+    /// | if `with_clock` … | then |
+    /// |---|---|
+    /// | re-clocks this handle only | the runtime's clone judges shared marks on the old clock |
+    /// | re-clocks a shared cell | the runtime stamps with the old clock into gauges moved to the new one |
+    /// | takes a fresh registry (what it does) | the runtime keeps writing to the old one, and this state's gauges stay empty |
+    ///
+    /// The operation is simply not meaningful after initialization, so rather
+    /// than pick the least-bad wrong answer this asserts in debug builds and
+    /// logs at `error` in release. It is not silently tolerated.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
+        let already_initialized = self.job_registry.is_initialized();
+        debug_assert!(
+            !already_initialized,
+            "AppState::with_clock is a construction-time builder: by the time job \
+             names are registered a runtime holds its own clone of the registry, \
+             and re-clocking the state can no longer reach it. Install the clock \
+             before starting the job runtime."
+        );
+        if already_initialized {
+            tracing::error!(
+                "AppState::with_clock called after the job registry was populated; the \
+                 job runtime holds its own clone and keeps recording there, so this \
+                 state's actuator gauges will stay empty. Install the clock before \
+                 starting the job runtime."
+            );
+        }
+        self.started_at = clock.monotonic();
+        // A registry's queue gauges compare ready-at marks against a clock, and
+        // the marks come from the job runtime started off *this* state — so the
+        // registry has to be the one this state's clock governs, and only that
+        // one. Hence a fresh registry rather than re-clocking the existing one:
+        //
+        // * re-clocking only this handle leaves a clone's runtime stamping on
+        //   the old clock while the shared gauges judge on the new one, and
+        // * re-clocking through a shared cell inverts it — the *other* handle
+        //   then stamps with its own clock into gauges moved out from under it.
+        //
+        // Detaching gives every state one clock and one registry that agree,
+        // whichever order states are cloned and re-clocked in. Before a runtime
+        // starts — the only point at which this builder is meaningful, checked
+        // above — the registry is empty, so nothing is dropped.
+        self.job_registry = actuator::JobRegistry::new().with_clock(Arc::clone(&clock));
         self.clock = clock;
         self
+    }
+
+    /// Returns the current instant on the injected clock's monotonic timeline —
+    /// the deterministic replacement for [`std::time::Instant::now`] when
+    /// measuring how long something took.
+    ///
+    /// Framework internals and app code alike should bracket work with two of
+    /// these and take the difference via
+    /// [`MonotonicInstant::saturating_duration_since`]. Handlers can reach the
+    /// same value through the [`crate::time::Clock`] extractor's
+    /// [`monotonic`](crate::time::Clock::monotonic).
+    #[must_use]
+    pub fn monotonic(&self) -> MonotonicInstant {
+        self.clock.monotonic()
     }
 
     /// Clone the shared clock handle, e.g. to thread into a subsystem that needs
@@ -658,15 +747,20 @@ impl AppState {
     }
 
     /// Returns how long the application has been running.
+    ///
+    /// Measured on the injected clock's monotonic timeline, so it is immune to
+    /// wall-clock jumps in production and moves with
+    /// [`Sim::advance`](crate::sim::Sim::advance) under a
+    /// [`#[sim_test]`](crate::sim_test).
     #[must_use]
     pub fn uptime(&self) -> std::time::Duration {
-        self.started_at.elapsed()
+        self.monotonic().saturating_duration_since(self.started_at)
     }
 
     /// Format uptime as a human-readable string (e.g., "2h 15m").
     #[must_use]
     pub fn uptime_display(&self) -> String {
-        let secs = self.started_at.elapsed().as_secs();
+        let secs = self.uptime().as_secs();
         if secs < 60 {
             format!("{secs}s")
         } else if secs < 3600 {
@@ -756,7 +850,7 @@ impl AppState {
             shards: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: probe::ProbeState::ready_for_test(),
             metrics: middleware::MetricsCollector::new(),
@@ -793,6 +887,10 @@ impl AppState {
 
 #[cfg(feature = "db")]
 impl DbState for AppState {
+    fn clock(&self) -> Arc<dyn ClockSource> {
+        self.clock_arc()
+    }
+
     fn metrics(&self) -> Option<&crate::middleware::MetricsCollector> {
         Some(&self.metrics)
     }
@@ -999,6 +1097,74 @@ impl std::fmt::Debug for AppState {
 
 #[cfg(test)]
 mod tests {
+    /// Re-clocking a state that a runtime has already touched is refused loudly.
+    ///
+    /// By the time job names are registered, the runtime holds its own clone of
+    /// the registry and keeps recording there — so no behaviour `with_clock`
+    /// could pick is correct (see its docs for the three-way trade). It asserts
+    /// in debug rather than silently leaving this state's gauges empty.
+    #[test]
+    #[should_panic(expected = "construction-time builder")]
+    fn re_clocking_an_initialized_state_is_refused() {
+        use chrono::{TimeZone, Utc};
+
+        let state = AppState::detached();
+        // What `job::start_runtime` does: register the app's job names.
+        state.job_registry().register_on_queue("probe", "default");
+
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let _ = state.with_clock(Arc::new(crate::time::FixedClock::at(epoch)));
+    }
+
+    /// A state's clock and the gauges it judges must never come apart.
+    ///
+    /// The job runtime started off a state stamps ready-at marks with that
+    /// state's clock, and the state's registry judges them. Re-clocking a state
+    /// therefore has to move both together. Re-clocking only the handle leaves a
+    /// clone's runtime stamping on the old clock while shared gauges judge on
+    /// the new one; re-clocking through a shared cell inverts it, moving the
+    /// gauges out from under the other handle's runtime. `with_clock` detaches
+    /// instead, so each state keeps a matched pair.
+    #[test]
+    fn re_clocking_a_state_keeps_its_gauges_on_its_own_clock() {
+        use chrono::{TimeZone, Utc};
+
+        let real_state = AppState::detached();
+        let cloned_before = real_state.clone();
+
+        // Behind real time, like a sim epoch: the direction where a stale
+        // judgement calls a not-yet-due job ready.
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let virtual_state = real_state.with_clock(Arc::new(crate::time::FixedClock::at(epoch)));
+
+        // A job the virtual state's runtime would stamp: due a minute after its
+        // epoch, so not yet ready *on that state's clock*.
+        let ready_at = u64::try_from(epoch.timestamp_millis()).unwrap() + 60_000;
+        virtual_state
+            .job_registry()
+            .register_on_queue("probe", "default");
+        virtual_state
+            .job_registry()
+            .record_enqueue_scheduled("probe", ready_at);
+
+        let virtual_depth = virtual_state.job_registry().queue_snapshot()["default"].depth;
+        assert_eq!(
+            virtual_depth, 0,
+            "the state that stamped the mark must judge it as scheduled"
+        );
+
+        // The clone kept the real clock, so it must also have kept its own
+        // registry — otherwise its runtime would stamp real-time deadlines into
+        // gauges now judged against 2020, and every one of them would read as
+        // scheduled for years.
+        let clone_snapshot = cloned_before.job_registry().queue_snapshot();
+        assert!(
+            !clone_snapshot.contains_key("default"),
+            "a state cloned before the clock swap must not share gauges with a \
+             state on a different clock; it saw {clone_snapshot:?}"
+        );
+    }
+
     use super::*;
     #[cfg(feature = "db")]
     use crate::config;

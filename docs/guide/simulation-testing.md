@@ -298,10 +298,38 @@ immediate 0ms retry). See
 |---|---|
 | Wall-clock time (`Utc::now()` via the `Clock` extractor) | Virtual, driven by `Sim::advance` |
 | Async timers (`tokio::time::sleep`, job backoff, scheduler ticks) | Virtual, via a paused current-thread Tokio runtime |
+| Elapsed / monotonic time (`state.monotonic()`, the `Clock` extractor's `.monotonic()`) | Virtual, driven by `Sim::advance` — but a raw `std::time::Instant` is **not** (see below) |
 | Scheduling of autumn's own background work (jobs, scheduler, commit hooks) | Deterministic, drained by `Sim::run_to_idle` |
 | Framework-minted IDs (job IDs, request IDs, idempotency keys, sessions) | Seeded via the `Entropy` seam |
 | Database | **Boundary** — real in-process SQLite, fault-injected at the connection level via `Chaos`, not simulated at the SQL-dialect level |
 | Third-party network (SMTP, LLM calls, outbound HTTP) | **Boundary** — mocked/fault-injected via `Chaos`/`sim::llm`, not a full network simulator |
+
+### Keeping your own code deterministic
+
+Tokio's paused runtime virtualizes `tokio::time::Instant` — **not**
+`std::time::Instant`. So a handler or job that measures how long something took
+with `std::time::Instant::now()` reads the real machine clock even inside a
+`#[sim_test]`, and two runs of the same seed disagree. Read time through the
+seams instead:
+
+| Instead of | Use |
+|---|---|
+| `chrono::Utc::now()` | `state.clock().now()`, or the `Clock` extractor in a handler |
+| `std::time::Instant::now()` (measuring elapsed) | `clock.monotonic()` for the start (the extractor snapshots at request start) and `state.monotonic()` for the closing read, then `MonotonicInstant::saturating_duration_since` |
+| `std::time::Instant::now()` (a deadline whose counterparty is `tokio::time::sleep`) | `tokio::time::Instant::now()` — already virtual under the paused runtime |
+| `std::time::SystemTime::now()` | `autumn_web::time::clock_unix_secs(clock)` / `clock_unix_duration(clock)` |
+| `uuid::Uuid::new_v4()` | `state.entropy().uuid_v4()`, or the `Rng` extractor in a handler |
+
+If you write a custom `impl ClockSource` whose `now()` is virtual, you **must**
+also override `monotonic()`. The trait ships a default body that reads the real
+process-monotonic clock — that keeps every pre-existing implementation compiling
+and behaving exactly as before, but it means a virtual clock that forgets to
+override it silently reports real elapsed time.
+
+The framework holds itself to the same rule on the modules listed in
+`scripts/check-determinism-gate.sh`, where a clippy deny-lint enforces it; see
+CONTRIBUTING.md's "Determinism seam gate" for the enforced subset and the parts
+of the framework that are not on the seam yet.
 
 A sim-only green run proves your orchestration, timing, ordering, and identity
 logic — it is **not** a substitute for testcontainer integration tests against

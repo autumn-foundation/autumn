@@ -139,3 +139,16 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(loom_model
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
+# Determinism seam gate (issue #1797). `clippy.toml`'s `disallowed-methods`
+# array arms `clippy::disallowed_methods` — which is warn-by-default — in every
+# crate that sees the config, i.e. the whole workspace. Grandfather it here so
+# the ban is opt-IN: a module enters the gate by carrying the
+# `autumn-determinism-gate:` header, which re-denies the lint for that module's
+# production code path. Without this line the array would turn hundreds of
+# pre-existing, out-of-scope call sites into hard CI failures on day one.
+#
+# Crates that do NOT set `[lints] workspace = true` (every `examples/*`, the
+# runtime benchmark crates, `example-e2e`) carry the equivalent `#![allow(...)]`
+# at their own crate root instead; `scripts/check-determinism-gate.sh` verifies
+# that a gated module never sits under such an allow.
+disallowed_methods = "allow"

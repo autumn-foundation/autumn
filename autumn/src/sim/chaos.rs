@@ -410,6 +410,20 @@ impl ClockSource for SkewClock {
     fn now(&self) -> DateTime<Utc> {
         self.inner.now() + self.offset
     }
+
+    /// Forwarded to the wrapped clock **unskewed**.
+    ///
+    /// Clock skew is a *wall-clock* fault — it models a machine whose calendar
+    /// disagrees with reality — and a real monotonic clock is immune to exactly
+    /// that. Deriving the monotonic reading from the skewed wall instant would
+    /// let a future drifting/jittering skew corrupt every elapsed duration in
+    /// the sim (latencies, uptime, throttle windows), which is not the fault
+    /// being injected. Today's constant offset happens to cancel under
+    /// subtraction, so this forward is what keeps that an invariant rather than
+    /// a coincidence.
+    fn monotonic(&self) -> crate::time::MonotonicInstant {
+        self.inner.monotonic()
+    }
 }
 
 /// Draw the one-shot, deterministic clock-skew offset in `[0, dur]` from the

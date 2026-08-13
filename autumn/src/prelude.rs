@@ -329,7 +329,7 @@ pub use crate::state::AppState;
 ///
 /// Use in handlers instead of `chrono::Utc::now()` to make time-sensitive
 /// logic testable without sleeping. Override via `TestApp::with_clock`.
-pub use crate::time::Clock;
+pub use crate::time::{Clock, MonotonicInstant};
 
 // ── Feature flags ─────────────────────────────────────────────────
 /// The main feature-flag service, typically stored as an `AppState` extension.
@@ -423,7 +423,7 @@ mod tests {
             shards: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: false,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -454,7 +454,7 @@ mod tests {
             )),
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: false,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),

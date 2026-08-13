@@ -372,6 +372,174 @@ the headers to get green. Pin the toolchain action to the previous version
 (`dtolnay/rust-toolchain@<ver>`), land the PR, and file a burn-down issue for the
 new findings. Losing a lint is permanent; a pin is a week.
 
+## Determinism seam gate
+
+Autumn's simulation testing (`#[sim_test]`, [#1797][issue-1797]) rests on one
+promise: **a run is a pure function of its seed**. That holds only while the
+framework reads time and mints identifiers through its *injected* seams. A single
+`Instant::now()` on a code path a simulation touches makes the run depend on the
+machine it ran on, and the failure mode is silent — the test still passes, it
+just stops proving anything.
+
+The gate makes that a compile error instead of a code-review hope.
+
+### The seams, and what to reach for
+
+| Instead of | Use | Reachable from |
+|---|---|---|
+| `chrono::Utc::now()` | `state.clock().now()` | anything holding an `AppState`; the `Clock` extractor in a handler |
+| `std::time::Instant::now()` (measuring elapsed) | `clock.monotonic()` for the start reading and `state.monotonic()` for the closing one, then `MonotonicInstant::saturating_duration_since`. The `Clock` extractor **snapshots** at request start, so calling `Clock::monotonic` twice returns the same value | same |
+| `std::time::Instant::now()` (a deadline whose counterparty is `tokio::time::sleep`) | `tokio::time::Instant::now()` | anywhere — tokio's paused runtime already virtualizes it |
+| `std::time::SystemTime::now()` | `time::clock_unix_secs(clock)` / `time::clock_unix_duration(clock)` | same |
+| `uuid::Uuid::new_v4()` | `state.entropy().uuid_v4()`; the `Rng` extractor in a handler | same |
+
+Two notes on the monotonic seam, because they are the parts that surprise people:
+
+- **`tokio::time::pause()` does not virtualize `std::time::Instant`.** Only
+  `tokio::time::Instant` moves with the paused timer wheel. That is precisely why
+  a raw `Instant::now()` inside a `#[sim_test]` reads the real machine clock, and
+  why `MonotonicInstant` exists.
+- **`SystemClock` still reads a real `std::time::Instant`.** `MonotonicInstant`
+  is an offset from its source's own origin, so a *virtual* clock can produce one
+  at any point — but in production the origin is a process-global `Instant`, so an
+  NTP step can never make an elapsed duration negative. The seam does not trade
+  monotonicity for testability.
+
+When no clock is reachable at all — a constructor that runs before one is
+installed, a free function with no state argument — `time::monotonic_now()` is the
+sanctioned fallback. It is real time and never follows a simulation, so prefer
+threading a real handle whenever that is possible.
+
+### What the gate covers
+
+`clippy.toml`'s `disallowed-methods` array bans the four calls workspace-wide,
+and each gated module re-denies `clippy::disallowed_methods` for its production
+code path:
+
+```rust
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+```
+
+**The polarity is inverted from the panic gate, deliberately.** The panic-class
+lints are `restriction`-group and allow-by-default, so a module opts in simply by
+denying them. `clippy::disallowed_methods` is *warn*-by-default, so populating the
+config would arm it in all 24 workspace members at once — hundreds of
+pre-existing sites in crates that are not part of the determinism story (the
+`examples/*`, `autumn-cli`'s code generators). The workspace therefore
+**grandfathers** the lint — `[workspace.lints.clippy] disallowed_methods =
+"allow"` in the root `Cargo.toml`, plus a package-level `[lints.clippy]` table in
+each crate that does not opt into the workspace table — and a module opts *in* by
+carrying the header above.
+
+**Honest scoping — the manifest is the *enforced* subset.** The modules listed in
+`GATED_MODULES` in `scripts/check-determinism-gate.sh` are the ones enforced
+today, not a claim that the rest of the crate is on-seam. `autumn/src` still
+contains roughly 150 ungated production call sites. The highest-value next batch
+is the code whose elapsed-time reads gate *control flow* or are observable in a
+response: `idempotency.rs` (replay-window TTLs — note its `IdempotencyEntry`
+exposes `expires_at: Instant` as a **public** field, so migrating it is a
+breaking change and needs a migration-guide entry), `circuit_breaker.rs`
+(open/half-open transitions), and the per-request `middleware/access_log.rs`,
+`middleware/metrics.rs`, and `middleware/server_timing.rs` timers. Then
+`webhook_outbound.rs`, `notifications.rs`, `storage/local.rs`, and the rest. The
+manifest grows monotonically and never shrinks (`MODULE_COUNT_FLOOR`); do not
+read a module's absence from it as a promise that it is on-seam.
+
+Known-open gaps, named rather than hidden:
+
+- **`db::run_instrumented`** is a published `pub` function taking no state, so
+  threading a clock in would break the public API. Its `Instant::now()` carries a
+  per-site `#[allow]` with that reason; the instant never escapes (only
+  `elapsed_ms` does) and the framework has no caller of its own.
+- **`#[repository]`-generated writes.** The macro emits
+  `chrono::Utc::now()` for soft-delete and timestamp columns, and the generated
+  repository holds only a pool — no `AppState`, so no clock is reachable. The
+  expansion carries its own `#[allow(clippy::disallowed_methods, reason = "…")]`
+  so it never trips the lint in the *calling* crate, whose author did not write
+  it. That is a suppression, not a fix: a soft-deleted row's `deleted_at` is
+  still non-deterministic under simulation.
+- **`app.rs`'s TLS `now_unix`** reads real wall time on purpose. Certificate
+  validity is a fact about the real world; a simulation clock pinned to the sim
+  epoch must not be able to declare a live certificate expired.
+
+**Grandfathered crates.** "In-scope crates" is `autumn` (published as
+`autumn-web`) and nothing else today. Every other workspace member is
+grandfathered by a package-level `[lints.clippy] disallowed_methods = "allow"`
+(or by the workspace table, for members that opt into it), and several of them do
+carry production off-seam sites: `autumn-media-plugin` (room/session ids and
+timestamps), `autumn-admin-plugin`, `autumn-cache-redis`, and `autumn-cli`. That
+is a scoping decision, not an audit result — the sim drives an `autumn` app, so
+`autumn` is where determinism is load-bearing first. Gating a plugin crate means
+migrating its sites, adding the header, and adding it to `GATED_MODULES`.
+
+Exempt surfaces mirror the panic gate: `#[cfg(test)]` code (the
+`cfg_attr(not(test), …)` scope handles it automatically), benches, examples,
+`autumn-cli`, and application-author code.
+
+### What the script checks
+
+`scripts/check-determinism-gate.sh` is the gate on the gate, and it deliberately
+**never greps for the banned calls** — clippy does the detection, because clippy
+resolves `use chrono::Utc as U; U::now()` and proc-macro expansions that a grep
+cannot, and, decisively, clippy does *not* see string literals. A grep gate would
+flag the ~30 templated `Utc::now()` occurrences inside `autumn-cli`'s code
+generators and the `include_dir!`-embedded starter apps, which are generated-app
+*text*, not compiled code; "fixing" those would corrupt the apps the CLI emits.
+
+The script guards the things clippy cannot report on itself:
+
+- every manifest module exists, carries the `autumn-determinism-gate:` marker,
+  and the marker is **immediately followed** by the header;
+- **structural header shape**: after stripping comments and whitespace it must
+  open exactly `#![cfg_attr(not(test), deny(` and name every required lint, so a
+  widened predicate like `all(not(test), any())` — whose deny never compiles — or
+  a `not(test)` that lives only in a comment is rejected;
+- **anti-spoof, tree-wide**: no inner `#![allow(…)]` / `#![expect(…)]` /
+  `#![cfg_attr(…, allow(…))]` anywhere under `autumn/src` may re-permit the lint
+  or a blanket group containing it, outside a `#[cfg(test)]` scope;
+- **per-site allow hygiene**: an `#[allow(clippy::disallowed_methods)]` in a gated
+  module must carry a non-empty `reason = "…"` (an empty string fails);
+- **reverse manifest**: a marker-carrying file that is not listed is an error;
+- **config completeness**: `clippy.toml` still bans all four paths, each with a
+  non-empty reason, and still pins `msrv`. Emptying the array would otherwise
+  disarm every header at once while the whole tree stayed green;
+- **no crate-local `clippy.toml`**: clippy reads the nearest ancestor config and
+  stops, so a crate-local file *shadows* the root one entirely — silently
+  removing both the ban and the MSRV pin;
+- **workspace grandfather present**: without it the array arms every member, CI
+  fails on hundreds of out-of-scope sites, and the pressure is to "fix" that by
+  emptying the array;
+- **feature reachability**: a gated module behind a non-default feature must have
+  that feature enabled by an enforcing `ci.yml` clippy lane, or its deny block is
+  never compiled.
+
+Run it locally — it needs no toolchain and finishes in about a second:
+
+```bash
+./scripts/check-determinism-gate.sh              # self-test, then the real check
+./scripts/check-determinism-gate.sh --self-test  # synthetic fixtures only
+./scripts/check-determinism-gate.sh --check-only # real tree only
+```
+
+Like the panic gate, it self-tests first, so a refactor that quietly defangs the
+checker fails immediately rather than years later on a real regression.
+
+### Adding a module to the gate
+
+1. Migrate its production call sites onto the seams (table above).
+2. Add the header block verbatim, right after the module's `//!` docs.
+3. Add `<path>:<feature>` to `GATED_MODULES` and bump `MODULE_COUNT_FLOOR`.
+4. Run `./scripts/check-determinism-gate.sh` and
+   `cargo clippy -p autumn-web --all-targets -- -D warnings`.
+
+[issue-1797]: https://github.com/autumn-foundation/autumn/issues/1797
+
 ## Fuzzing
 
 Autumn coverage-guides a set of [cargo-fuzz][cargo-fuzz] (libFuzzer) harnesses
