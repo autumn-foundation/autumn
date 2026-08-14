@@ -1468,7 +1468,10 @@ mod tests {
             "an echoed raw body must be masked out of the outcome: {masked}"
         );
         // Ordinary prose sharing a word with a field name stays readable.
-        assert_eq!(mask_echoes("password rejected", &values), "password rejected");
+        assert_eq!(
+            mask_echoes("password rejected", &values),
+            "password rejected"
+        );
     }
 
     /// The truncated-tap shape: capture stopped mid-literal, so there is no
