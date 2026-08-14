@@ -60,7 +60,13 @@ Recommendations, in increasing strength:
 3. Bind the token to the session: sign `{uuid}:{session_id}` rather than the
    bare uuid, and verify against the current session id. This converts
    double-submit into a session-bound synchronizer-equivalent and defeats
-   planted-cookie attacks entirely.
+   planted-cookie attacks entirely. Design constraint: the session id rotates
+   at login/reset/OAuth completion, and `CsrfService` currently keeps an
+   existing valid cookie without re-minting — a naive binding would therefore
+   break every post-login form. The binding design must re-mint the CSRF
+   cookie whenever the session rotates (the session layer knows when it does),
+   or bind to a stable per-browser secret that survives rotation instead of
+   the raw session id.
 
 ### M2. Operator-unlock endpoint compares the admin secret non-constant-time
 
@@ -317,7 +323,11 @@ PR and verified against the code.)*
 - **Signing secrets**: 32-byte production minimum, template-value denylist,
   fail-fast boot validation, previous-key rotation grace.
 - **Reset/magic-link/confirm tokens**: 256-bit OS-random, digest-only at rest,
-  bounded TTLs, non-enumerating responses with 1s timing floors. Magic-link
+  bounded TTLs, non-enumerating responses — with 1s timing floors on the
+  *issuance* handlers (forgot-password, magic-link request, resend-
+  confirmation); the verification handlers have no floor, which is acceptable
+  because a submitted token's validity is already disclosed by the response
+  itself. Magic-link
   and confirm-email consume atomically (`UPDATE … RETURNING` on the digest);
   reset does not — see L11. Magic-link additionally uses the link-scanner-safe
   non-consuming GET → confirming POST pattern (confirm-email does not — see
