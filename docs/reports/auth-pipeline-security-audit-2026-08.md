@@ -120,6 +120,13 @@ password per attempt: after one successful password check, the
 TOTP/recovery guesses, so second-factor guessing through `/reauth` is
 password-free for the rest of that window.
 
+`two_factor_disable` (`POST /account/2fa/disable`) is a third instance:
+it accepts a current TOTP code *or* the password as re-authentication and has
+no throttle or attempt counter, so an attacker holding an authenticated
+session can machine-guess the 6-digit code until one matches and then turn the
+victim's second factor off. It does correctly consume a matched step via the
+replay guard, but that does not bound *guessing*.
+
 Fix: throttle `/login/verify` like the magic-link routes
 (`#[throttle(limit = 5, per = "1m", key = "ip")]`), add a small
 per-pending-session attempt counter (e.g. 5 tries, then clear
@@ -127,8 +134,8 @@ per-pending-session attempt counter (e.g. 5 tries, then clear
 recovery-code sweep when the submitted value does not look like a 6-digit
 code. Apply the same attempt bound to the `reauth` branch, clearing
 `reauth_pw_ok` after N failed second-factor guesses so the password gate
-re-engages. *(Credit: flagged by automated review on the audit PR and
-verified against the code.)*
+re-engages, and to `two_factor_disable`. *(Credit: flagged by automated review
+on the audit PR and verified against the code.)*
 
 ---
 
@@ -272,6 +279,20 @@ comment. Fix: add the same `{rem_table}` user-scoped delete to those five
 transactions (optionally sparing the current device's chain, mirroring the
 `token_digest.ne(current)` session carve-out). *(Credit: flagged by automated
 review on the audit PR and verified against the code.)*
+
+### L13a. `passkey_revoke` deletes a credential with no fresh-auth check
+
+`POST /passkeys/revoke` is only `#[secured]` — no `#[step_up]`, and no inline
+password/factor check — even though its sibling `passkey_register_begin`
+requires `#[step_up]` and `two_factor_disable` does an inline re-auth. So
+anyone with a live authenticated session (a briefly unattended browser, a
+stolen-but-not-yet-rotated session cookie) can delete every passkey without
+proving fresh possession of any credential, stripping the account's strongest
+factor. This is a credential-management gap distinct from the remember-chain
+omission (L13) on the same handler. Fix: add `#[step_up]` to `passkey_revoke`
+(matching `passkey_register_begin`), or an inline re-auth as
+`two_factor_disable` does. *(Credit: flagged by automated review on the audit
+PR and verified against the code.)*
 
 ### L14. Generated TOTP code comparison is not constant-time
 
