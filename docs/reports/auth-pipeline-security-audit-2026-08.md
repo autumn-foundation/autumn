@@ -203,9 +203,17 @@ requests for one address all observe `count == 0` and each sends:
   (there is none today), not just an atomic issuance claim — the claim only
   helps once a cooldown exists.
 
+A third case is the operator-unlock route `POST /auth/admin/unlock`: it has no
+`#[throttle]`, and (per M2) `AUTUMN_ADMIN_SECRET` has no minimum length, so a
+remote caller can make unlimited online guesses against the admin secret. Its
+docstring recommends a VPN/load-balancer allowlist, but that is an operator
+step, not a default — an unrestricted deployment is exposed. Throttle it and/or
+scope the "protect with network controls" advice as mandatory, not optional.
+
 Recommendation: `#[throttle]` **every** unauthenticated auth route
 (`login`, `signup`, `forgot_password`, `reset_password`, `magic_link_request`,
-`resend_confirmation`, and the `/login/magic/verify` + `/login/verify` POSTs);
+`resend_confirmation`, the `/login/magic/verify` + `/login/verify` POSTs, and
+`/auth/admin/unlock`);
 where feasible, reject cheaply (token/uniqueness lookup) *before* the bcrypt /
 HIBP work; and replace each count-then-issue email cooldown with an atomic
 per-account issuance claim (a unique partial index on "one live unconsumed
@@ -386,7 +394,16 @@ lock them out. Fix: bind the pending handoff to a password/credential version
 (and to non-deletion) and re-verify it in `login_verify`, or give the pending
 state a tracked/revocable row so credential-change revocation covers it too.
 Fixing M3 (bounding the guesses) reduces but does not eliminate this, since the
-promotion still skips the freshness re-check. *(Credit: flagged by automated
+promotion still skips the freshness re-check.
+
+Same-shaped omission for lockout specifically: `login_verify` reloads the user
+by `totp_pending_id` and promotes on a valid factor **without** re-checking
+`locked_at` — so a password submitted just before another request crossed the
+lockout threshold lets the attacker keep guessing (M3) and authenticate during
+the active cool-off. `magic_link_verify` already does exactly this guarded
+lock re-check (its #1777 defense-in-depth block); `login_verify` should mirror
+it (a guarded `UPDATE … WHERE locked_at IS NULL OR locked_at <= now - cooloff`,
+rejecting on zero rows) *before* promoting. *(Credit: flagged by automated
 review on the audit PR and verified against the code.)*
 
 ### L14. Generated TOTP code comparison is not constant-time
