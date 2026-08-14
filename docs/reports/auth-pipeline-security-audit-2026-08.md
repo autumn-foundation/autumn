@@ -22,7 +22,8 @@ TOCTOU).
 
 The pipeline is in very good shape. No critical or high-severity issues were
 found. The design repeatedly makes the hard-but-right choice: tokens hashed at
-rest everywhere, constant-time comparison at every secret check but one,
+rest everywhere, constant-time comparison at nearly every secret check (two
+exceptions — the admin secret in M2 and the TOTP code in L14),
 session-id rotation at every privilege boundary, atomic single-use token
 consumption, JWT algorithm pinning derived from trusted key material, TOTP
 step replay guards, and non-enumerating responses with timing equalization on
@@ -195,8 +196,12 @@ requests for one address all observe `count == 0` and each sends:
 - `magic_link_request` — counts recent unconsumed tokens, then inserts + mails.
 - `resend_confirmation` — counts by `confirm_token_expires_at`, then mails and
   *afterwards* updates the expiry (so all but the last link are invalidated).
-- `forgot_password` — re-mints and re-sends with only a 1s timing pad as
-  backpressure.
+- `forgot_password` — note this one is **not** a `count`-race: it does no
+  eligibility `COUNT` at all, and for every known address it *unconditionally*
+  overwrites the reset token and sends another email, with only a 1s timing pad
+  as backpressure. So its fix is a throttle + an actual per-email cooldown
+  (there is none today), not just an atomic issuance claim — the claim only
+  helps once a cooldown exists.
 
 Recommendation: `#[throttle]` **every** unauthenticated auth route
 (`login`, `signup`, `forgot_password`, `reset_password`, `magic_link_request`,
@@ -504,5 +509,8 @@ PR and verified against the code.)*
    remember-chain revocation in the TOTP/passkey/email-change transactions) —
    small, invariant-restoring changes to the generated handlers
 5. L1/L2 (route generated code through the ProxyResolver seams)
-6. L3 (throttle login/forgot-password)
+6. L3 (throttle the **whole** unauthenticated route class — `login`, `signup`,
+   `forgot_password`, `reset_password`, both magic-link POSTs,
+   `resend_confirmation`, `/login/verify` — plus reject-before-bcrypt/HIBP and
+   the atomic issuance claims; not just login + forgot-password)
 7. Remaining L-items opportunistically.
