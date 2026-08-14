@@ -168,19 +168,33 @@ record the proxy's IP. This fails safe (unspoofable) but shows users wrong
 "device" IPs and collapses lockout telemetry to one IP. Route it through the
 framework's `ClientAddr`/`ProxyResolver` seam instead.
 
-### L3. `/login` and `/forgot-password` have no request throttle
+### L3. `/login`, `/forgot-password`, and `/signup` have no request throttle
 
 The magic-link routes carry `#[throttle(limit = 5, per = "1m", key = "ip")]`
-plus a per-email re-mint cooldown; the password login and forgot-password
-routes have neither (and global rate limiting is off by default). Account
+plus a per-email re-mint cooldown; `login`, `forgot_password`, and `signup`
+have neither (and global rate limiting is off by default). Account
 lockout covers per-account brute force, but:
 - one IP can spray one password across many accounts without friction;
 - `/forgot-password` can be used to email-bomb a victim (each request re-mints
-  and re-sends; the 1s timing pad is the only backpressure).
+  and re-sends; the 1s timing pad is the only backpressure);
+- `/signup` runs the configured password policy (including the HIBP
+  k-anonymity lookup when breach-checking is enabled) **and** a cost-12 bcrypt
+  hash *before* the uniqueness-enforcing insert, so an attacker can submit a
+  policy-valid password with any address — even an already-registered one — and
+  burn a blocking bcrypt (plus an outbound HIBP request) on every call. That is
+  a direct CPU/-network amplification path on an unauthenticated route.
 
-Recommendation: mirror the magic-link posture — `#[throttle]` on both, and a
-per-email cooldown on forgot-password. The unthrottled TOTP verify endpoint
-is the sharper instance of this gap and is tracked separately as M3.
+Recommendation: `#[throttle]` all three, and a per-email cooldown on
+forgot-password. Caveat on "mirror the magic-link posture": the magic-link
+per-email cooldown is itself **not** race-safe — `magic_link_request` does a
+`SELECT count(...)` for a recent unconsumed token and *then* inserts, so
+concurrent requests for one address all observe `recent == 0` and each inserts
+a row and sends a mail (the per-IP `#[throttle]` bounds one IP but not
+distributed callers). Treat the cooldown as best-effort, not a guarantee, and
+close it with an atomic per-account issuance claim (a unique partial index on
+"live unconsumed token per user", or an `INSERT … ON CONFLICT DO NOTHING`
+gate). The unthrottled TOTP verify endpoint is the sharper instance of this
+family and is tracked separately as M3.
 
 ### L4. Small enumeration timing channel on login lockout bookkeeping
 
