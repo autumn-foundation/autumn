@@ -210,10 +210,16 @@ docstring recommends a VPN/load-balancer allowlist, but that is an operator
 step, not a default — an unrestricted deployment is exposed. Throttle it and/or
 scope the "protect with network controls" advice as mandatory, not optional.
 
-Recommendation: `#[throttle]` **every** unauthenticated auth route
-(`login`, `signup`, `forgot_password`, `reset_password`, `magic_link_request`,
-`resend_confirmation`, the `/login/magic/verify` + `/login/verify` POSTs, and
-`/auth/admin/unlock`);
+Recommendation: `#[throttle]` **every generated unauthenticated auth route,
+whether or not enumerated here** — the base set (`login`, `signup`,
+`forgot_password`, `reset_password`, `magic_link_request`,
+`resend_confirmation`, the `/login/magic/verify` + `/login/verify` POSTs,
+`/auth/admin/unlock`) **and the opt-in flows**: under `--oauth` the
+`oauth_redirect` + `oauth_callback` routes (each callback drives an outbound
+token exchange, so it is a network amplifier), and under `--passkeys` the
+`passkey_login_begin` / `passkey_login_finish` POSTs (each runs a WebAuthn
+ceremony, DB loads, and signature verification). Treat "throttle every public
+auth handler" as the invariant rather than a checklist to enumerate;
 where feasible, reject cheaply (token/uniqueness lookup) *before* the bcrypt /
 HIBP work; and replace each count-then-issue email cooldown with an atomic
 per-account issuance claim (a unique partial index on "one live unconsumed
@@ -396,15 +402,25 @@ state a tracked/revocable row so credential-change revocation covers it too.
 Fixing M3 (bounding the guesses) reduces but does not eliminate this, since the
 promotion still skips the freshness re-check.
 
-Same-shaped omission for lockout specifically: `login_verify` reloads the user
-by `totp_pending_id` and promotes on a valid factor **without** re-checking
-`locked_at` — so a password submitted just before another request crossed the
-lockout threshold lets the attacker keep guessing (M3) and authenticate during
-the active cool-off. `magic_link_verify` already does exactly this guarded
-lock re-check (its #1777 defense-in-depth block); `login_verify` should mirror
-it (a guarded `UPDATE … WHERE locked_at IS NULL OR locked_at <= now - cooloff`,
-rejecting on zero rows) *before* promoting. *(Credit: flagged by automated
-review on the audit PR and verified against the code.)*
+Same-shaped omission for lockout specifically, and it generalizes to **every
+login-completion handler**: only `login` (the password path) and
+`magic_link_verify` (its #1777 defense-in-depth block) perform the guarded
+`locked_at` re-check. The other completion paths do not:
+- `login_verify` reloads by `totp_pending_id` and promotes on a valid factor
+  without re-checking `locked_at`, so a password submitted just before another
+  request crossed the threshold lets the attacker keep guessing (M3) and
+  authenticate during the active cool-off.
+- `passkey_login_finish` (under `--passkeys`) selects only `email` and
+  `email_confirmed_at` before writing the session — it never reads `locked_at`
+  at all, so a locked account authenticates via passkey **unconditionally**,
+  fully bypassing lockout (a broader hole than the `login_verify` race).
+
+The rule: every path that creates an authenticated session must run the same
+guarded `UPDATE … WHERE locked_at IS NULL OR locked_at <= now - cooloff`
+(reject on zero rows) that `login`/`magic_link_verify` already do — this
+includes `login_verify`, `passkey_login_finish`, and any future
+login-completion handler. *(Credit: flagged by automated review on the audit
+PR and verified against the code.)*
 
 ### L14. Generated TOTP code comparison is not constant-time
 
@@ -526,8 +542,11 @@ PR and verified against the code.)*
    remember-chain revocation in the TOTP/passkey/email-change transactions) —
    small, invariant-restoring changes to the generated handlers
 5. L1/L2 (route generated code through the ProxyResolver seams)
-6. L3 (throttle the **whole** unauthenticated route class — `login`, `signup`,
-   `forgot_password`, `reset_password`, both magic-link POSTs,
-   `resend_confirmation`, `/login/verify` — plus reject-before-bcrypt/HIBP and
-   the atomic issuance claims; not just login + forgot-password)
+6. L3 (throttle the whole unauthenticated route class — see L3's authoritative
+   inventory, which covers the base routes plus `/auth/admin/unlock` and the
+   opt-in OAuth/passkey handlers — plus reject-before-bcrypt/HIBP and the
+   atomic issuance claims)
+7. The lockout-recheck rule from L13c: every login-completion handler
+   (`login_verify`, `passkey_login_finish`) must re-check `locked_at` before
+   creating a session, matching `login`/`magic_link_verify`
 7. Remaining L-items opportunistically.
