@@ -70,9 +70,11 @@ Generated `POST /auth/admin/unlock` (`generate/auth.rs`):
 if admin_secret.is_empty() || provided != admin_secret {
 ```
 
-This is the only secret comparison in the whole pipeline that uses `!=`
-instead of a constant-time compare — everywhere else uses `subtle` or the
-`constant_time_eq` helpers. `AUTUMN_ADMIN_SECRET` also has no minimum-length
+This is the only plain `!=` on a long-lived secret in the pipeline — token,
+state, nonce, and cookie comparisons all go through `subtle` or the
+`constant_time_eq` helpers. (The generated TOTP code compare is the other
+non-constant-time comparison, on a short-lived code — see L14.)
+`AUTUMN_ADMIN_SECRET` also has no minimum-length
 validation, unlike the signing secret (32-byte minimum + weak-value denylist).
 
 Recommendation: compare via `autumn_web::auth::constant_time_eq`, and consider
@@ -222,6 +224,48 @@ transactions (optionally sparing the current device's chain, mirroring the
 `token_digest.ne(current)` session carve-out). *(Credit: flagged by automated
 review on the audit PR and verified against the code.)*
 
+### L14. Generated TOTP code comparison is not constant-time
+
+`verify_totp_code` compares `expected == candidate` with a plain string
+equality. Practical exploitability is marginal — the code is 6 digits, rotates
+every 30 s, and a matched step is single-use via the `totp_last_used_step`
+replay guard — but it is inconsistent with the pipeline's own standard
+(constant-time comparison everywhere else, including for values with similar
+threat profiles). Fix: run the candidate through
+`autumn_web::auth::constant_time_eq` against each window's expected code.
+*(Credit: flagged by automated review on the audit PR and verified against the
+code.)*
+
+### L15. Lockout counter collapses concurrent failures right after cool-off
+
+In the generated `login` handler, once a lock's cool-off has expired the local
+state is reset (`current_attempts = 0`) and a failed attempt takes the reset
+branch, which unconditionally writes `failed_attempts = 1`. Every concurrent
+request that read the same expired-lock row takes that same branch and writes
+the same `1` — so a parallel burst of N wrong-password attempts fired at the
+cool-off boundary counts as a single failure instead of N. An attacker can
+thereby stretch each cool-off cycle to (burst size + threshold) attempts
+rather than threshold. The normal path's `failed_attempts + 1` DB-side
+increment *is* atomic; only the reset branch collapses. Fix: make the reset
+branch a guarded atomic transition too, e.g. `UPDATE … SET failed_attempts =
+failed_attempts + 1, locked_at = NULL WHERE id = … AND locked_at <= expiry`
+after first zeroing the counter in the unlock path, or fold reset-and-count
+into one conditional increment. *(Credit: flagged by automated review on the
+audit PR and verified against the code.)*
+
+### L16. Lockout telemetry digest falls back to a public hard-coded salt
+
+The `account_locked` telemetry event salts its `account_id_digest` with
+`SECRET_KEY_BASE` or `AUTUMN_ADMIN_SECRET` — env vars that Autumn's canonical
+config path (`AUTUMN_SECURITY__SIGNING_SECRET` / `autumn.toml`) never sets —
+and otherwise uses the hard-coded literal `"autumn-lockout-fallback-salt"`.
+With a public salt, sequential integer account ids, and only 8 digest bytes
+logged, anyone with log access can enumerate `sha256(salt:id)` and reverse the
+pseudonymization cheaply. Fix: salt from the app's resolved signing key
+(`ResolvedSigningKeys`), which production boot already guarantees exists, and
+drop the static fallback. *(Credit: flagged by automated review on the audit
+PR and verified against the code.)*
+
 ---
 
 ## Notable strengths (verified, not assumed)
@@ -256,10 +300,13 @@ review on the audit PR and verified against the code.)*
   chain, password change/reset revoke remember chains (the TOTP, passkey, and
   email-change flows do not — see L13), `reauth_pw_ok`
   cleared so an email-only login can't shortcut a password reauth.
-- **Lockout**: atomic counters, non-enumerating lock responses, cool-off with
-  clean re-entry, success-path guarded against concurrent locking, salted
-  digest + truncated IP prefix in telemetry.
-- **TOTP**: per-step replay guard (`totp_last_used_step` CAS).
+- **Lockout**: DB-side atomic increment on the normal failure path (the
+  post-cool-off reset branch is not — see L15), non-enumerating lock
+  responses, cool-off with clean re-entry, success-path guarded against
+  concurrent locking, truncated IP prefix in telemetry (the digest salt has a
+  weak fallback — see L16).
+- **TOTP**: per-step replay guard (`totp_last_used_step` CAS); code
+  comparison is not constant-time — see L14.
 - **API tokens**: SHA-256 digest-only at rest (appropriate for 244-bit random
   tokens), scoped default-deny, atomic CTE rotation, blank-seed-token guard,
   scopes carried in request extensions rather than the session (no cookie
