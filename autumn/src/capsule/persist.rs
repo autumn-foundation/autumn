@@ -156,13 +156,23 @@ pub fn persist(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<CapsuleR
     persist_pinned(scope, outcome).map(|(reference, _pin)| reference)
 }
 
+/// Serializes the prune-then-write retention transaction: during a failure
+/// burst, several blocking-pool persistence tasks would otherwise all prune
+/// against the same under-cap directory listing and then all write,
+/// overshooting `max_capsules` by the burst's width with nothing to clean it
+/// up until the next failure. The critical section is short (a directory scan
+/// and one file write), and blocking is fine — persistence already runs on
+/// the blocking pool.
+static RETENTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// [`persist`], holding the written file pinned against pruning.
 ///
 /// The pin is taken **before** the file becomes visible in the directory, so
 /// from the first instant a concurrent [`prune`] can observe the file it is
 /// already unprunable — the write-to-pin race a caller-side pin would leave
 /// open. Dropping the returned [`ReportingPin`] makes the file ordinary
-/// retention fodder again.
+/// retention fodder again. The whole prune-then-write pair runs under
+/// [`RETENTION`], so concurrent persists cannot overshoot the cap.
 #[must_use]
 pub(crate) fn persist_pinned(
     scope: &CaptureScope,
@@ -181,6 +191,7 @@ pub(crate) fn persist_pinned(
     };
 
     let path = dir.join(file_name(&capsule));
+    let _retention = RETENTION.lock();
     // Make room *first*, so the capsule about to be written is not a candidate
     // for the deletion that makes room for it, and a zero cap cannot mean
     // "record the failure, then immediately throw it away".

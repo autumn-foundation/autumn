@@ -69,7 +69,7 @@ pub use replay::{
     refusal_reason,
 };
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
-pub use replay_db::{StubServer, pool_from_capsule};
+pub use replay_db::{StubServer, pool_from_capsule, replica_pool_from_capsule};
 
 /// What a capsule says when the database backend has no wire capture at all.
 ///

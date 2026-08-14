@@ -5671,6 +5671,14 @@ impl AppBuilder {
     ///   for the same reason as the session store: the Redis backend spawns a
     ///   publisher and a listener against the application's live fan-out as
     ///   soon as the state is built.
+    /// * A config loader installed with
+    ///   [`with_config_loader`](Self::with_config_loader) is **dropped**:
+    ///   the documented implementations call AWS Secrets Manager, Vault,
+    ///   Consul, or an HTTP endpoint, and an offline replay must neither
+    ///   contact production infrastructure nor abort because it is
+    ///   unreachable. Configuration loads from local files and the
+    ///   environment; the secrets a loader fetches feed subsystems replay
+    ///   forces off or serves from the capsule.
     /// * The global request timeout is cleared. A replay's inputs all come from
     ///   the capsule, but the timeout layer runs on real tokio timers, so a
     ///   breakpoint held in a debugger would otherwise cancel the handler and
@@ -5761,8 +5769,18 @@ impl AppBuilder {
         // collector, and must not abort before its verdict because that
         // collector is unreachable from the machine doing the replaying.
         let _replay_ignores_custom_telemetry_provider = telemetry_provider;
+        // A custom config loader is a *live service call* — the documented
+        // implementations reach AWS Secrets Manager, Vault, Consul, or an
+        // HTTP endpoint — and an offline replay must neither contact
+        // production infrastructure nor abort because it is unreachable.
+        // Configuration comes from the local files and environment instead
+        // (the values replay actually consumes — routes, middleware, the
+        // filter list, the profile — live there; the secrets a loader
+        // fetches feed subsystems replay forces off or serves from the
+        // capsule).
+        let _replay_ignores_custom_config_loader = config_loader_factory;
         let (mut config, telemetry_guard) = load_config_and_telemetry(
-            config_loader_factory,
+            None,
             Some(Box::new(crate::telemetry::ReplayTelemetryProvider)),
             plugin_config_roots,
         )
@@ -6024,7 +6042,19 @@ fn replay_database_topology(
                 capsule_path,
             ))
         });
-    Some(crate::db::DatabaseTopology::primary_only(pool))
+    // Rebuild the topology with the shape the recording had: replica-recorded
+    // tapes get their own stub pool, so a write-then-read request claims each
+    // tape from the role it was recorded on instead of funnelling reads into
+    // the primary stub and diverging on both sides.
+    let replica =
+        crate::capsule::replica_pool_from_capsule(capsule, std::sync::Arc::clone(divergences))
+            .unwrap_or_else(|error| {
+                std::process::exit(crate::capsule::print_refusal(
+                    &format!("the capsule's replica tape could not be served: {error}"),
+                    capsule_path,
+                ))
+            });
+    Some(crate::db::DatabaseTopology::from_pools(pool, replica))
 }
 
 /// `SQLite` builds have no wire capture and no wire replay (F18), so a capsule
@@ -11179,6 +11209,24 @@ mod tests {
             !handler.contains("            session_store,"),
             "the replay handler must not forward the builder's session store; \
              a custom store outranks the forced memory backend"
+        );
+    }
+
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_never_invokes_a_custom_config_loader() {
+        let source = include_str!("app.rs");
+        let handler = replay_mode_source(source);
+
+        assert!(
+            handler.contains("_replay_ignores_custom_config_loader = config_loader_factory"),
+            "the replay handler must drop the builder's config loader — the documented \
+             implementations call live services (Secrets Manager, Vault, Consul, HTTP)"
+        );
+        assert!(
+            handler.contains("load_config_and_telemetry(\n            None,"),
+            "replay must load configuration through the default local path, never a \
+             custom loader"
         );
     }
 

@@ -163,6 +163,7 @@ fn request(method: &str, uri: &str) -> CapsuleRequest {
         route: None,
         http_version: "HTTP/1.1".to_owned(),
         headers: Vec::new(),
+        binary_headers: Vec::new(),
         body: CapsuleBody::Absent,
         redacted_keys: Vec::new(),
         client_addr: None,
@@ -231,6 +232,7 @@ fn widgets_rows(sql: &str, binds: Vec<BindValue>) -> Exchange {
 fn widgets_tape(sql: &str, param_oids: &[u32], binds: Vec<BindValue>) -> ConnectionTape {
     ConnectionTape {
         id: 7,
+        role: "primary".to_owned(),
         prologue: Vec::new(),
         statements: vec![widgets_statement(sql, param_oids)],
         catalog: Vec::new(),

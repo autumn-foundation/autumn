@@ -152,7 +152,7 @@ pub fn redact_request(
     let mut keys = BTreeSet::new();
     let mut notes = Vec::new();
 
-    let headers = redact_headers(&raw.headers, filter, &mut values, &mut keys);
+    let (headers, binary_headers) = redact_headers(&raw.headers, filter, &mut values, &mut keys);
     let uri = redact_uri(&raw.uri, filter, &mut values, &mut keys);
     let body = redact_body(
         &raw.headers,
@@ -169,6 +169,7 @@ pub fn redact_request(
         route: raw.route.clone(),
         http_version: format!("{:?}", raw.version),
         headers,
+        binary_headers,
         body,
         redacted_keys: keys.into_iter().collect(),
         // Filled in by persist from the capture scope; redaction only sees
@@ -237,31 +238,38 @@ fn header_is_sensitive(name: &str, filter: &ParameterFilter) -> bool {
     filter.matches_key(name) || ALWAYS_SENSITIVE_HEADERS.contains(&name)
 }
 
+/// Text headers plus base64-encoded non-UTF-8 headers, as redaction splits
+/// them.
+type RedactedHeaders = (Vec<(String, String)>, Vec<(String, String)>);
+
 /// Copy the headers in wire order, replacing sensitive values.
+///
+/// Returns the text headers and, separately, the non-sensitive headers whose
+/// values are valid HTTP bytes but not valid UTF-8 (`obs-text` metadata), as
+/// `(name, base64(value))` — substituting a placeholder for those would hand
+/// the replayed handler different bytes and manufacture a mismatch.
 fn redact_headers(
     headers: &axum::http::HeaderMap,
     filter: &ParameterFilter,
     values: &mut RedactedValues,
     keys: &mut BTreeSet<String>,
-) -> Vec<(String, String)> {
+) -> RedactedHeaders {
     let mut out = Vec::with_capacity(headers.len());
+    let mut binary = Vec::new();
     for (name, value) in headers {
         let name = name.as_str().to_owned();
         if header_is_sensitive(&name, filter) {
             values.insert(value.as_bytes());
             keys.insert(format!("header:{name}"));
             out.push((name, FILTERED_PLACEHOLDER.to_owned()));
+        } else if let Ok(text) = value.to_str() {
+            out.push((name, text.to_owned()));
         } else {
-            let value = value.to_str().unwrap_or(NON_UTF8_PLACEHOLDER).to_owned();
-            out.push((name, value));
+            binary.push((name, STANDARD.encode(value.as_bytes())));
         }
     }
-    out
+    (out, binary)
 }
-
-/// Placeholder for a header value that is not valid UTF-8, mirroring the dev
-/// error page's rendering of the same case.
-const NON_UTF8_PLACEHOLDER: &str = "<non-utf8>";
 
 /// Rewrite the request target with sensitive query parameters masked, leaving
 /// every other byte exactly as the client sent it.
@@ -955,6 +963,63 @@ mod tests {
             mask_echoes("bad form field token=a%2Fb%2Bc", &values),
             format!("bad form field token={FILTERED_PLACEHOLDER}"),
             "an echoed raw form body must scrub"
+        );
+    }
+
+    /// A non-sensitive header whose value is valid HTTP bytes but not valid
+    /// UTF-8 (`obs-text`) must keep its exact bytes — base64 in
+    /// `binary_headers` — because a placeholder would hand the replayed
+    /// handler different metadata than production saw. Sensitive headers stay
+    /// masked whatever their encoding.
+    #[test]
+    fn non_utf8_header_bytes_are_preserved_not_placeholdered() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-meta",
+            axum::http::HeaderValue::from_bytes(&[0x61, 0xFF, 0x62]).expect("obs-text is legal"),
+        );
+        headers.insert(
+            "authorization",
+            axum::http::HeaderValue::from_bytes(&[0x73, 0xFF]).expect("obs-text is legal"),
+        );
+        let raw = RawRequest {
+            method: "GET".to_owned(),
+            uri: "/meta".parse().expect("uri"),
+            version: axum::http::Version::HTTP_11,
+            headers,
+            route: None,
+        };
+        let (request, _values, _notes) =
+            redact_request(&raw, &CapturedBody::Absent, &filter_with(&[]));
+
+        assert!(
+            !request.headers.iter().any(|(name, _)| name == "x-meta"),
+            "a non-UTF-8 value does not belong in the text header list"
+        );
+        let encoded = request
+            .binary_headers
+            .iter()
+            .find(|(name, _)| name == "x-meta")
+            .map(|(_, value)| value.clone())
+            .expect("the non-UTF-8 header is preserved in binary_headers");
+        assert_eq!(
+            STANDARD.decode(encoded).expect("valid base64"),
+            vec![0x61, 0xFF, 0x62],
+            "the exact bytes must round-trip"
+        );
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value == FILTERED_PLACEHOLDER),
+            "a sensitive header is masked regardless of its encoding"
+        );
+        assert!(
+            !request
+                .binary_headers
+                .iter()
+                .any(|(name, _)| name == "authorization"),
+            "a sensitive header's bytes must never survive into binary_headers"
         );
     }
 

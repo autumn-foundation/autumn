@@ -221,7 +221,7 @@ async fn forced_500_on_a_db_reading_route_is_captured_and_replayed_identically()
 
     // ── Phase 1: capture ────────────────────────────────────────────────
     let recording_pool =
-        autumn_web::capsule::build_recording_pool(db.url(), 2, Duration::from_secs(10))
+        autumn_web::capsule::build_recording_pool(db.url(), 2, Duration::from_secs(10), "primary")
             .expect("recording pool builds");
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -334,7 +334,7 @@ async fn a_request_that_checks_out_twice_records_no_pool_traffic_and_replays() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let recording_pool =
-        autumn_web::capsule::build_recording_pool(db.url(), 1, Duration::from_secs(10))
+        autumn_web::capsule::build_recording_pool(db.url(), 1, Duration::from_secs(10), "primary")
             .expect("recording pool builds");
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -398,7 +398,7 @@ async fn a_panicking_db_reading_route_is_captured_and_replayed_identically() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let recording_pool =
-        autumn_web::capsule::build_recording_pool(db.url(), 2, Duration::from_secs(10))
+        autumn_web::capsule::build_recording_pool(db.url(), 2, Duration::from_secs(10), "primary")
             .expect("recording pool builds");
     let client = TestApp::new()
         .config(capture_config(dir.path()))

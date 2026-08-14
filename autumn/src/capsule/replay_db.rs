@@ -718,13 +718,61 @@ pub fn pool_from_capsule(
     capsule: &Capsule,
     divergences: Arc<DivergenceLog>,
 ) -> Result<Pool<AsyncPgConnection>, PoolError> {
-    let tapes: Arc<Vec<ConnectionTape>> = Arc::new(
-        capsule
-            .db
-            .as_ref()
-            .map(|db| db.connections.clone())
-            .unwrap_or_default(),
-    );
+    // Everything that is not explicitly a replica tape — including tapes from
+    // capsules that predate roles — is the primary's.
+    let tapes = capsule
+        .db
+        .as_ref()
+        .map(|db| {
+            db.connections
+                .iter()
+                .filter(|tape| tape.role != crate::capsule::schema::TAPE_ROLE_REPLICA)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    pool_from_tapes(tapes, divergences)
+}
+
+/// The replica-role sibling of [`pool_from_capsule`], or `None` when the
+/// capsule recorded no replica traffic.
+///
+/// Replay rebuilds the topology with the same shape the recording had: a
+/// write-then-read request claims each tape from the pool role it was
+/// recorded on, instead of funnelling reads into the primary stub and
+/// mismatching its tape while the replica's sits unconsumed.
+///
+/// # Errors
+///
+/// Returns [`PoolError::Build`] when the underlying deadpool builder rejects
+/// the configuration.
+pub fn replica_pool_from_capsule(
+    capsule: &Capsule,
+    divergences: Arc<DivergenceLog>,
+) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
+    let tapes: Vec<ConnectionTape> = capsule
+        .db
+        .as_ref()
+        .map(|db| {
+            db.connections
+                .iter()
+                .filter(|tape| tape.role == crate::capsule::schema::TAPE_ROLE_REPLICA)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if tapes.is_empty() {
+        return Ok(None);
+    }
+    pool_from_tapes(tapes, divergences).map(Some)
+}
+
+/// Shared constructor: a stub pool that serves `tapes` in first-use order.
+fn pool_from_tapes(
+    tapes: Vec<ConnectionTape>,
+    divergences: Arc<DivergenceLog>,
+) -> Result<Pool<AsyncPgConnection>, PoolError> {
+    let tapes: Arc<Vec<ConnectionTape>> = Arc::new(tapes);
     // One spare slot beyond the recording: see the note above on why replay
     // must never be able to block on its own pool.
     let max_size = tapes.len().saturating_add(1);
@@ -807,6 +855,60 @@ mod tests {
         }
     }
 
+    /// Tapes split by recorded role: the primary stub pool serves everything
+    /// that is not explicitly replica (pre-role capsules included), and a
+    /// replica pool exists exactly when replica tapes were recorded — so a
+    /// write-then-read request claims each tape from the pool it was recorded
+    /// on.
+    #[tokio::test]
+    async fn tapes_are_split_by_recorded_role() {
+        use crate::capsule::schema::{CapsuleOutcome, ConnectionTape, test_support};
+
+        let mut capsule = test_support::capsule(
+            test_support::request("GET", "/split"),
+            CapsuleOutcome::Status {
+                code: 500,
+                message: String::new(),
+                problem_type: None,
+            },
+        );
+        capsule.db = Some(crate::capsule::schema::CapsuleDb {
+            connections: vec![
+                ConnectionTape {
+                    id: 1,
+                    role: crate::capsule::schema::TAPE_ROLE_PRIMARY.to_owned(),
+                    ..ConnectionTape::default()
+                },
+                ConnectionTape {
+                    id: 2,
+                    role: crate::capsule::schema::TAPE_ROLE_REPLICA.to_owned(),
+                    ..ConnectionTape::default()
+                },
+            ],
+        });
+
+        let divergences = Arc::new(DivergenceLog::new());
+        let replica = replica_pool_from_capsule(&capsule, Arc::clone(&divergences))
+            .expect("replica pool builds");
+        assert!(
+            replica.is_some(),
+            "a capsule with replica-recorded tapes must get a replica stub pool"
+        );
+
+        capsule
+            .db
+            .as_mut()
+            .expect("db present")
+            .connections
+            .retain(|tape| tape.role != crate::capsule::schema::TAPE_ROLE_REPLICA);
+        let no_replica =
+            replica_pool_from_capsule(&capsule, divergences).expect("replica pool builds");
+        assert!(
+            no_replica.is_none(),
+            "no replica tapes — including a pre-role capsule — means no replica pool"
+        );
+    }
+
     #[test]
     fn framework_housekeeping_is_recognized() {
         assert!(is_housekeeping("SET TIME ZONE 'UTC'"));
@@ -848,6 +950,7 @@ mod tests {
     fn the_tape_is_consumed_in_order_and_then_exhausted() {
         let tape = ConnectionTape {
             id: 3,
+            role: crate::capsule::schema::TAPE_ROLE_PRIMARY.to_owned(),
             prologue: Vec::new(),
             statements: Vec::new(),
             catalog: Vec::new(),
@@ -873,6 +976,7 @@ mod tests {
     fn serving_an_exchange_advances_the_shared_consumption_cursor() {
         let tape = ConnectionTape {
             id: 5,
+            role: crate::capsule::schema::TAPE_ROLE_PRIMARY.to_owned(),
             prologue: Vec::new(),
             statements: Vec::new(),
             catalog: Vec::new(),
@@ -912,6 +1016,7 @@ mod tests {
     fn the_ordered_cursor_is_consulted_before_the_keyed_buckets() {
         let tape = ConnectionTape {
             id: 11,
+            role: crate::capsule::schema::TAPE_ROLE_PRIMARY.to_owned(),
             prologue: vec![exchange("BEGIN", Vec::new())],
             statements: Vec::new(),
             catalog: Vec::new(),
@@ -1020,6 +1125,7 @@ mod tests {
         capsule.db = Some(crate::capsule::schema::CapsuleDb {
             connections: vec![ConnectionTape {
                 id: 1,
+                role: crate::capsule::schema::TAPE_ROLE_PRIMARY.to_owned(),
                 ..ConnectionTape::default()
             }],
         });
@@ -1048,6 +1154,7 @@ mod tests {
     fn an_unrecorded_statement_names_itself() {
         let tape = ConnectionTape {
             id: 1,
+            role: crate::capsule::schema::TAPE_ROLE_PRIMARY.to_owned(),
             prologue: Vec::new(),
             statements: Vec::new(),
             catalog: Vec::new(),

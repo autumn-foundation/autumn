@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version};
+use base64::Engine as _;
 use futures::FutureExt as _;
 use serde::Serialize;
 use tower::ServiceExt as _;
@@ -551,7 +552,6 @@ fn rebuild_request(
         CapsuleBody::Absent => Body::empty(),
         CapsuleBody::Text(text) => Body::from(text.clone()),
         CapsuleBody::Base64(encoded) => {
-            use base64::Engine as _;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(encoded.as_bytes())
                 .map_err(|error| format!("the recorded body is not valid base64: {error}"))?;
@@ -607,6 +607,26 @@ fn rebuild_request(
         let Ok(value) = HeaderValue::from_str(value) else {
             warnings.push(format!(
                 "dropped unparseable recorded header value for {name}"
+            ));
+            continue;
+        };
+        builder = builder.header(name, value);
+    }
+    // Non-UTF-8 header values travel base64-encoded so the JSON stays
+    // diffable; restore the exact bytes — a placeholder here would hand the
+    // handler different metadata than production saw.
+    for (name, encoded) in &recorded.binary_headers {
+        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+            warnings.push(format!("dropped unparseable recorded header name {name:?}"));
+            continue;
+        };
+        let value = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()
+            .and_then(|bytes| HeaderValue::from_bytes(&bytes).ok());
+        let Some(value) = value else {
+            warnings.push(format!(
+                "dropped undecodable recorded binary header value for {name}"
             ));
             continue;
         };
@@ -962,6 +982,7 @@ mod tests {
                 route: None,
                 http_version: "HTTP/1.1".to_owned(),
                 headers: Vec::new(),
+                binary_headers: Vec::new(),
                 body: CapsuleBody::Absent,
                 redacted_keys: Vec::new(),
                 client_addr: None,
@@ -1224,6 +1245,7 @@ mod tests {
 
     fn tape(id: u64, sqls: &[&str]) -> ConnectionTape {
         ConnectionTape {
+            role: crate::capsule::schema::TAPE_ROLE_PRIMARY.to_owned(),
             id,
             prologue: Vec::new(),
             statements: Vec::new(),

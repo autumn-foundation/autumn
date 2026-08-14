@@ -283,6 +283,7 @@ pub fn build_recording_pool(
     url: &str,
     max_size: usize,
     connect_timeout: Duration,
+    role: &'static str,
 ) -> Result<Pool<AsyncPgConnection>, PoolError> {
     if let Some(reason) = capture_unavailable_reason(url) {
         return Err(PoolError::UnsupportedBackend(format!(
@@ -291,9 +292,9 @@ pub fn build_recording_pool(
     }
     let mut manager_config = ManagerConfig::<AsyncPgConnection>::default();
     manager_config.recycling_method = RecyclingMethod::Fast;
-    manager_config.custom_setup = Box::new(|url: &str| {
+    manager_config.custom_setup = Box::new(move |url: &str| {
         let url = url.to_owned();
-        async move { establish_recording(&url).await }.boxed()
+        async move { establish_recording(&url, role).await }.boxed()
     });
     let manager =
         AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, manager_config);
@@ -361,7 +362,7 @@ fn attribution_hook() -> Hook<AsyncDieselConnectionManager<AsyncPgConnection>> {
 /// diesel-async's notification stream and connection-error broadcast are not
 /// wired up on capture pools; `LISTEN`/`NOTIFY` is documented as unsupported
 /// there, and Autumn's own listener uses a dedicated connection.
-async fn establish_recording(url: &str) -> ConnectionResult<AsyncPgConnection> {
+async fn establish_recording(url: &str, role: &'static str) -> ConnectionResult<AsyncPgConnection> {
     let config = url
         .parse::<tokio_postgres::Config>()
         .map_err(|error| ConnectionError::InvalidConnectionUrl(error.to_string()))?;
@@ -381,7 +382,7 @@ async fn establish_recording(url: &str) -> ConnectionResult<AsyncPgConnection> {
     // endpoint, not the pool.
     let mut failures: Vec<String> = Vec::new();
     for (host, port) in &endpoints {
-        match establish_recording_at(&config, host, *port).await {
+        match establish_recording_at(&config, host, *port, role).await {
             Ok(connection) => return Ok(connection),
             Err(reason) => failures.push(format!("{host}:{port}: {reason}")),
         }
@@ -407,6 +408,7 @@ async fn establish_recording_at(
     config: &tokio_postgres::Config,
     host: &str,
     port: u16,
+    role: &'static str,
 ) -> Result<AsyncPgConnection, String> {
     let stream = TcpStream::connect((host, port))
         .await
@@ -416,7 +418,10 @@ async fn establish_recording_at(
     let _ = stream.set_nodelay(true);
 
     let (client, connection) = config
-        .connect_raw(RecordingStream::new(stream), tokio_postgres::NoTls)
+        .connect_raw(
+            RecordingStream::with_role(stream, role),
+            tokio_postgres::NoTls,
+        )
         .await
         .map_err(|error| error.to_string())?;
 
@@ -553,11 +558,23 @@ fn recording_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopology
     }
 
     let timeout = Duration::from_secs(config.connect_timeout_secs);
-    let primary = build_recording_pool(primary_url, config.effective_primary_pool_size(), timeout)?;
+    let primary = build_recording_pool(
+        primary_url,
+        config.effective_primary_pool_size(),
+        timeout,
+        crate::capsule::schema::TAPE_ROLE_PRIMARY,
+    )?;
     let replica = config
         .replica_url
         .as_deref()
-        .map(|url| build_recording_pool(url, config.effective_replica_pool_size(), timeout))
+        .map(|url| {
+            build_recording_pool(
+                url,
+                config.effective_replica_pool_size(),
+                timeout,
+                crate::capsule::schema::TAPE_ROLE_REPLICA,
+            )
+        })
         .transpose()?;
     Ok(Some(DatabaseTopology::from_pools(primary, replica)))
 }
@@ -581,12 +598,26 @@ pub struct RecordingStream<S> {
 }
 
 impl<S> RecordingStream<S> {
-    /// Wrap `inner`, assigning the connection a fresh recorder.
+    /// Wrap `inner`, assigning the connection a fresh recorder on the
+    /// primary role. Production connectors name their role explicitly via
+    /// [`Self::with_role`]; this shorthand serves the wire-level tests.
+    #[cfg(test)]
     #[must_use]
     pub fn new(inner: S) -> Self {
+        Self::with_role(inner, crate::capsule::schema::TAPE_ROLE_PRIMARY)
+    }
+
+    /// Wrap `inner`, tagging every tape this connection records with `role`
+    /// (`"primary"` or `"replica"`), so replay can rebuild one stub pool per
+    /// role and hand each tape back on the pool it was recorded on.
+    #[must_use]
+    pub fn with_role(inner: S, role: &'static str) -> Self {
         Self {
             inner,
-            recorder: ConnectionRecorder::new(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)),
+            recorder: ConnectionRecorder::new(
+                NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+                role,
+            ),
         }
     }
 }
@@ -817,6 +848,9 @@ impl ConnectionMemo {
 )]
 pub struct ConnectionRecorder {
     id: u64,
+    /// The pool role this connection belongs to, stamped onto every tape it
+    /// records so replay claims it from the matching stub pool.
+    role: &'static str,
     frontend: FrameSplitter,
     backend: FrameSplitter,
     /// Prepared-statement name → SQL, so a later `Bind` naming only the
@@ -852,9 +886,10 @@ pub struct ConnectionRecorder {
 }
 
 impl ConnectionRecorder {
-    fn new(id: u64) -> Self {
+    fn new(id: u64, role: &'static str) -> Self {
         Self {
             id,
+            role,
             frontend: FrameSplitter::new_frontend(),
             backend: FrameSplitter::new_backend(),
             statement_sql: HashMap::new(),
@@ -1114,6 +1149,7 @@ impl ConnectionRecorder {
         };
         let budget = scope.settings().max_capsule_bytes;
         let id = self.id;
+        let role = self.role;
         let cost = exchange_bytes(&exchange);
 
         let recorded = scope
@@ -1126,6 +1162,9 @@ impl ConnectionRecorder {
                     return true;
                 }
                 let tape = db.tape_mut(id);
+                if tape.role != role {
+                    role.clone_into(&mut tape.role);
+                }
                 let entries = tape_bucket(tape, bucket);
                 // The ordered `exchanges` bucket never deduplicates — a request
                 // may legitimately run the same statement twice — so the scan
@@ -1292,9 +1331,11 @@ impl ConnectionRecorder {
         if let Some(scope) = self.scope() {
             self.bound = None;
             let id = self.id;
+            let role = self.role.to_owned();
             scope.with_db(|db| {
                 *db.tape_mut(id) = ConnectionTape {
                     id,
+                    role,
                     ..ConnectionTape::default()
                 };
             });
@@ -1391,9 +1432,10 @@ mod tests {
             }
         });
 
-        let error = establish_recording(&format!(
-            "host=127.0.0.1,127.0.0.1 port={half_up},1 user=postgres dbname=postgres"
-        ))
+        let error = establish_recording(
+            &format!("host=127.0.0.1,127.0.0.1 port={half_up},1 user=postgres dbname=postgres"),
+            crate::capsule::schema::TAPE_ROLE_PRIMARY,
+        )
         .await
         .err()
         .expect("neither endpoint can finish a handshake");
@@ -1407,11 +1449,13 @@ mod tests {
 
     #[tokio::test]
     async fn exhausting_every_host_names_each_failed_attempt() {
-        let error =
-            establish_recording("host=127.0.0.1,127.0.0.1 port=1,2 user=postgres dbname=postgres")
-                .await
-                .err()
-                .expect("nothing listens on ports 1 or 2");
+        let error = establish_recording(
+            "host=127.0.0.1,127.0.0.1 port=1,2 user=postgres dbname=postgres",
+            crate::capsule::schema::TAPE_ROLE_PRIMARY,
+        )
+        .await
+        .err()
+        .expect("nothing listens on ports 1 or 2");
         let message = error.to_string();
         assert!(
             message.contains("127.0.0.1:1") && message.contains("127.0.0.1:2"),
@@ -1654,7 +1698,7 @@ mod tests {
             Arc::new(crate::log::filter::ParameterFilter::new(&[], &[])),
         ));
 
-        let mut recorder = ConnectionRecorder::new(7);
+        let mut recorder = ConnectionRecorder::new(7, crate::capsule::schema::TAPE_ROLE_PRIMARY);
         recorder.bound = Some(Arc::downgrade(&scope));
         // A memo far bigger than the whole budget.
         for index in 0..20 {

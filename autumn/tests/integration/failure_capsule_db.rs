@@ -265,9 +265,13 @@ fn frame_tags(response: &[u8]) -> Vec<u8> {
 #[ignore = "requires Docker (testcontainers)"]
 async fn capsule_records_db_query_results() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pool =
-        autumn_web::capsule::build_recording_pool(&db_url().await, 2, Duration::from_secs(10))
-            .expect("recording pool builds");
+    let pool = autumn_web::capsule::build_recording_pool(
+        &db_url().await,
+        2,
+        Duration::from_secs(10),
+        "primary",
+    )
+    .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -366,9 +370,13 @@ async fn capsule_records_db_query_results() {
 #[ignore = "requires Docker (testcontainers)"]
 async fn capsule_excludes_housekeeping_marker_exchange() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pool =
-        autumn_web::capsule::build_recording_pool(&db_url().await, 2, Duration::from_secs(10))
-            .expect("recording pool builds");
+    let pool = autumn_web::capsule::build_recording_pool(
+        &db_url().await,
+        2,
+        Duration::from_secs(10),
+        "primary",
+    )
+    .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -401,9 +409,13 @@ async fn second_request_on_a_pooled_connection_carries_statement_metadata() {
     let dir = tempfile::tempdir().expect("tempdir");
     // One slot: the second request is guaranteed the same, already-warm
     // connection.
-    let pool =
-        autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
-            .expect("recording pool builds");
+    let pool = autumn_web::capsule::build_recording_pool(
+        &db_url().await,
+        1,
+        Duration::from_secs(10),
+        "primary",
+    )
+    .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -461,9 +473,13 @@ async fn second_request_on_a_pooled_connection_carries_statement_metadata() {
 #[ignore = "requires Docker (testcontainers)"]
 async fn capsule_records_connection_prologue() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pool =
-        autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
-            .expect("recording pool builds");
+    let pool = autumn_web::capsule::build_recording_pool(
+        &db_url().await,
+        1,
+        Duration::from_secs(10),
+        "primary",
+    )
+    .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -502,9 +518,13 @@ async fn capsule_records_connection_prologue() {
 #[ignore = "requires Docker (testcontainers)"]
 async fn marker_clears_previous_request_binding() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pool =
-        autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
-            .expect("recording pool builds");
+    let pool = autumn_web::capsule::build_recording_pool(
+        &db_url().await,
+        1,
+        Duration::from_secs(10),
+        "primary",
+    )
+    .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -561,9 +581,13 @@ async fn marker_clears_previous_request_binding() {
 async fn request_task_raw_checkouts_join_the_capsule_but_background_ones_never_do() {
     let dir = tempfile::tempdir().expect("tempdir");
     // One slot: every checkout in this test is the same connection.
-    let pool =
-        autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
-            .expect("recording pool builds");
+    let pool = autumn_web::capsule::build_recording_pool(
+        &db_url().await,
+        1,
+        Duration::from_secs(10),
+        "primary",
+    )
+    .expect("recording pool builds");
 
     // Before any request: the connection is born in a raw user's hands with no
     // capture scope, so its statement must stay out of the connection's
@@ -621,9 +645,13 @@ async fn request_task_raw_checkouts_join_the_capsule_but_background_ones_never_d
 #[ignore = "requires Docker (testcontainers)"]
 async fn the_pools_liveness_ping_is_never_recorded() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pool =
-        autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
-            .expect("recording pool builds");
+    let pool = autumn_web::capsule::build_recording_pool(
+        &db_url().await,
+        1,
+        Duration::from_secs(10),
+        "primary",
+    )
+    .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(capture_config(dir.path()))
@@ -669,9 +697,13 @@ async fn exceeding_max_capsule_bytes_marks_truncated() {
     // than write a capsule that looks complete.
     config.failure_capture.max_capsule_bytes = 16;
 
-    let pool =
-        autumn_web::capsule::build_recording_pool(&db_url().await, 1, Duration::from_secs(10))
-            .expect("recording pool builds");
+    let pool = autumn_web::capsule::build_recording_pool(
+        &db_url().await,
+        1,
+        Duration::from_secs(10),
+        "primary",
+    )
+    .expect("recording pool builds");
 
     let client = TestApp::new()
         .config(config)

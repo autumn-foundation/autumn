@@ -155,6 +155,12 @@ pub struct CapsuleRequest {
     pub http_version: String,
     /// Request headers in wire order, sensitive values already masked.
     pub headers: Vec<(String, String)>,
+    /// Non-sensitive headers whose values are valid HTTP bytes but not valid
+    /// UTF-8 (`obs-text` metadata), as `(name, base64(value))`. Kept apart so
+    /// `headers` stays diffable text; replay restores both sets. Empty in
+    /// capsules written before this field existed.
+    #[serde(default)]
+    pub binary_headers: Vec<(String, String)>,
     /// The (redacted) request body.
     pub body: CapsuleBody,
     /// Sorted list of what redaction masked, prefixed by location — e.g.
@@ -239,6 +245,13 @@ pub struct CapsuleDb {
 pub struct ConnectionTape {
     /// Recorder-assigned connection identifier.
     pub id: u64,
+    /// Which pool role recorded this connection: `"primary"` or `"replica"`.
+    /// Replay rebuilds one stub pool per role so a write-then-read request
+    /// claims each tape from the pool it was recorded on. Capsules written
+    /// before this field existed deserialize as `"primary"`, matching what
+    /// they were.
+    #[serde(default = "default_tape_role")]
+    pub role: String,
     /// Exchanges from connection birth up to the first request binding.
     #[serde(default)]
     pub prologue: Vec<Exchange>,
@@ -252,6 +265,17 @@ pub struct ConnectionTape {
     #[serde(default)]
     pub exchanges: Vec<Exchange>,
 }
+
+/// The role a tape deserializes with when the capsule predates roles: every
+/// pre-role capsule was recorded on the primary.
+fn default_tape_role() -> String {
+    "primary".to_owned()
+}
+
+/// The `role` string replica-recorded tapes carry.
+pub const TAPE_ROLE_REPLICA: &str = "replica";
+/// The `role` string primary-recorded tapes carry.
+pub const TAPE_ROLE_PRIMARY: &str = "primary";
 
 /// Which Postgres protocol carried an exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +383,9 @@ pub mod test_support {
     pub const fn connection_tape(id: u64, exchanges: Vec<Exchange>) -> ConnectionTape {
         ConnectionTape {
             id,
+            // `String::new()` is const; an empty role reads as primary
+            // everywhere a role is consulted, matching pre-role capsules.
+            role: String::new(),
             prologue: Vec::new(),
             statements: Vec::new(),
             catalog: Vec::new(),
@@ -375,6 +402,7 @@ pub mod test_support {
             route: None,
             http_version: "HTTP/1.1".to_owned(),
             headers: Vec::new(),
+            binary_headers: Vec::new(),
             body: CapsuleBody::Absent,
             redacted_keys: Vec::new(),
             client_addr: None,

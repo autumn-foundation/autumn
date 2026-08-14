@@ -211,9 +211,13 @@ async fn capture_overhead_on_a_successful_query_request() {
     let mut on_config = base_config();
     on_config.failure_capture.enabled = true;
     on_config.failure_capture.dir = dir.path().to_string_lossy().into_owned();
-    let on_pool =
-        autumn_web::capsule::build_recording_pool(&url, POOL_SIZE, Duration::from_secs(10))
-            .expect("recording pool builds");
+    let on_pool = autumn_web::capsule::build_recording_pool(
+        &url,
+        POOL_SIZE,
+        Duration::from_secs(10),
+        "primary",
+    )
+    .expect("recording pool builds");
 
     // Both routes are measured, and the phases alternate rather than running
     // one after the other: a benchmark on shared hardware drifts, and a single
