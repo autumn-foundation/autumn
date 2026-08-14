@@ -137,8 +137,12 @@ backend already applies `SET EX max_age_secs` correctly.
 
 `ProxyResolver`: when forwarding trust is enabled but neither CIDR ranges nor
 `trusted_hops` are configured, every peer is trusted and the rightmost XFF
-entry wins — so a *direct* client can spoof its rate-limit/lockout identity by
-sending its own `X-Forwarded-For`. The dev default (loopback-only) and prod
+entry wins — so a *direct* client can spoof the identity seen by
+resolver-backed consumers (the global rate limiter's IP keying, `ClientAddr` /
+`ClientHost` / `ClientScheme` extractors, access logs) by sending its own
+`X-Forwarded-For`. Account lockout is unaffected: its counters are
+account-keyed and its IP telemetry reads unspoofable `ConnectInfo` (see L2).
+The dev default (loopback-only) and prod
 default (no trust) are both safe; this is purely the misconfiguration corner.
 A startup warning for "forwarding trusted but no boundary declared" would
 close the footgun.
@@ -201,6 +205,23 @@ variant (`confirm_email_change`) has the same GET-consumption shape and should
 move with it. *(Credit: flagged by automated review on the audit PR and
 verified against the code.)*
 
+### L13. TOTP/passkey/email-change credential flows do not revoke remember chains
+
+`change_password` and `reset_password` delete the user's remember-token rows
+inside their transactions ("the old password is compromised"), but the other
+credential-changing flows do not: `two_factor_confirm`, `two_factor_disable`,
+`passkey_register_finish`, `passkey_revoke`, and `confirm_email_change` all
+revoke tracked *session* rows (under `revoke_on_credential_change`) yet leave
+the remember-token table untouched. A stolen remember cookie therefore
+survives 2FA enrollment/disable and passkey add/remove and can re-establish a
+login afterwards — inconsistent with the `[auth.sessions]` documentation,
+which frames exactly these events as credential changes, and with
+`change_password`'s own "chains are ALWAYS revoked on a credential change"
+comment. Fix: add the same `{rem_table}` user-scoped delete to those five
+transactions (optionally sparing the current device's chain, mirroring the
+`token_digest.ne(current)` session carve-out). *(Credit: flagged by automated
+review on the audit PR and verified against the code.)*
+
 ---
 
 ## Notable strengths (verified, not assumed)
@@ -232,7 +253,8 @@ verified against the code.)*
   knowledge).
 - **Remember-me**: Jaspan series/token scheme, hash-at-rest, constant-time
   verify, CAS rotation with race re-evaluation, theft detection nukes the
-  chain, credential changes always revoke remember chains, `reauth_pw_ok`
+  chain, password change/reset revoke remember chains (the TOTP, passkey, and
+  email-change flows do not — see L13), `reauth_pw_ok`
   cleared so an email-only login can't shortcut a password reauth.
 - **Lockout**: atomic counters, non-enumerating lock responses, cool-off with
   clean re-entry, success-path guarded against concurrent locking, salted
@@ -263,8 +285,9 @@ verified against the code.)*
 
 1. M1 (CSRF cookie `Secure` + `__Host-`; session binding as follow-up)
 2. M2 (constant-time admin-secret compare) — one-line fix
-3. L11/L12 (atomic reset-token consumption; confirm-email GET→POST) — small,
-   invariant-restoring changes to the generated handlers
+3. L11/L12/L13 (atomic reset-token consumption; confirm-email GET→POST;
+   remember-chain revocation in the TOTP/passkey/email-change transactions) —
+   small, invariant-restoring changes to the generated handlers
 4. L1/L2 (route generated code through the ProxyResolver seams)
 5. L3 (throttle login/forgot-password)
 6. Remaining L-items opportunistically.
