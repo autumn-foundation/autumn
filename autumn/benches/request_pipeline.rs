@@ -10,6 +10,12 @@
 //! is measured is the tax every request pays *around* the handler, not
 //! application logic.
 //!
+//! What it does NOT cover: the layers `App::run` wraps around the finished
+//! router at the `axum::serve` boundary (`MethodOverrideLayer`,
+//! `TrustedProxiesLayer`) and `apply_startup_barrier`'s outermost quartet, none
+//! of which `try_build_router_inner` installs. A deployed request pays a little
+//! more than what is measured here.
+//!
 //! Like the other benches in this crate it is `harness = false` and asserts
 //! nothing: it is a workload to point a profiler at.
 //!
@@ -21,13 +27,17 @@
 //! valgrind --tool=callgrind --callgrind-out-file=callgrind.out "$BIN" --iterations 1000
 //! callgrind_annotate --threshold=80 callgrind.out | head -40
 //!
-//! # Allocation profile (valgrind's built-in dhat tool — no crate dependency)
-//! valgrind --tool=dhat --dhat-out-file=dhat.json "$BIN" --iterations 200
-//! # then read dhat.json's "pps" array, or load it into
-//! # file:///usr/libexec/valgrind/dh_view.html
+//! # Allocation profile (valgrind's built-in dhat tool — no crate dependency).
+//! # Take TWO runs and subtract: `--iterations 0` measures process startup plus
+//! # router construction plus the warm-up, so subtracting it leaves the MARGINAL
+//! # per-request cost rather than one amortised over the run length.
+//! valgrind --tool=dhat --dhat-out-file=dhat-base.json "$BIN" --iterations 0
+//! valgrind --tool=dhat --dhat-out-file=dhat-run.json  "$BIN" --iterations 200
+//! # allocations/request = (total_run - total_base) / (3 * 200)
+//! # ("total" is the block count DHAT prints as "Total: N bytes in M blocks".)
 //! ```
 //!
-//! `--iterations N` issues `3 * N` requests after a fixed warm-up.
+//! `--iterations N` issues `3 * N` requests after a fixed 50-request warm-up.
 
 use std::hint::black_box;
 

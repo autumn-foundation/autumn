@@ -3861,9 +3861,10 @@ fn apply_middleware(
     // `BoxCloneSyncService::new(..)`. So N sequential `.layer()` calls build N
     // *nested* boxes, and because `Route::call` runs `self.0.clone()` — a deep
     // clone of everything beneath it — a request descending N levels pays
-    // `N + (N-1) + … + 1` heap allocations. Measured against axum 0.8.9 that is
-    // `N(N+1)/2 + 2N` allocations per request (263 at N = 20), while the same
-    // layers composed into ONE `Router::layer` call cost a flat 16 for any N.
+    // `N + (N-1) + … + 1` heap allocations. Measured against axum 0.8.9 the fit
+    // is `13 + N(N+1)/2 + 2N` per request, 13 being the fixed baseline at N = 0
+    // (263 at N = 20, 1388 at N = 50), while the same layers composed into ONE
+    // `Router::layer` call cost a flat 16 for any N.
     // See issue #2193.
     //
     // So the layers below are composed into tuples and applied in three

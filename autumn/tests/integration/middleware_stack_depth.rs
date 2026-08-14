@@ -14,29 +14,48 @@
 //! boxes again, all the way to the leaf. A request descending *N* levels
 //! therefore triggers a full deep clone at each level: `N + (N-1) + … + 1`
 //! heap allocations. Measured against axum 0.8.9, per-request allocations for
-//! *N* stacked no-op layers come to `N(N+1)/2 + 2N` — 263 allocations at
-//! N = 20, 1388 at N = 50 — while the *same* layers composed into a single
-//! `Router::layer(ServiceBuilder…)` call cost a constant 16 regardless of N.
+//! *N* stacked no-op layers fit `13 + N(N+1)/2 + 2N` (13 being the fixed
+//! per-request baseline at N = 0): 263 allocations at N = 20, 1388 at N = 50 —
+//! while the *same* layers composed into a single `Router::layer` call cost a
+//! constant 16 regardless of N.
 //!
 //! # How the depth is observed
 //!
 //! Every one of those deep clones passes through *every* service below the
 //! level that initiated it. So a probe service installed at the innermost
-//! position — directly on the handler's `MethodRouter`, inside all global
-//! middleware — is cloned exactly once per traversal of the stack above it.
-//! Counting its clones over a single request yields the ingress depth as an
-//! exact integer: no timing, no allocator hooks, no sampling, and identical on
-//! every platform and in debug or release.
+//! position is cloned exactly once per traversal of the stack above it.
+//! Counting its clones over a single request yields an exact integer: no
+//! timing, no allocator hooks, no sampling, identical on every platform and in
+//! debug or release.
 //!
-//! # Why the budget is a ceiling, not an equality
+//! What that integer counts is **every service above the probe that clones on
+//! call**, which is the `Route` box levels *plus* each
+//! `axum::middleware::from_fn` (its generated `Service::call` starts with
+//! `self.inner.clone()`). Collapsing `Router::layer` calls removes box levels;
+//! it does not remove `from_fn` traversals. So the number moves with both, and
+//! a new `from_fn` inside an existing tuple raises it without adding a box.
+//!
+//! The probe is attached to a `MethodRouter` in a merged raw router, which
+//! `mount_raw_routers` mounts *after* `build_router_pre_state` has already
+//! applied the asset cache-control layer (and, under `i18n` locale prefixes,
+//! the locale-routing extension). A route declared with `#[get]` therefore sits
+//! one or two traversals deeper than the number measured here; the gate tracks
+//! relative change, not a route's absolute cost.
+//!
+//! # Why the assertion is a window
 //!
 //! The absolute figure moves with the enabled Cargo features: `cargo test
-//! -p autumn-web` builds the 8 default features while CI's `cargo test
-//! --workspace` unifies ~29 across the workspace, and some ingress layers are
-//! feature-gated (`oauth2`'s HTTP interceptor, `telemetry-otlp`'s trace
-//! context). The budget is therefore set with headroom above the widest
-//! configuration, and the test prints the observed number so a failure says
-//! what the depth actually is.
+//! -p autumn-web` builds the 8 default features and measures **16**, while
+//! CI's `cargo test --workspace` unifies ~29 across the workspace — `oauth2`
+//! (enabled by `examples/blog`) adds its HTTP-interceptor `from_fn` for **17**.
+//! The upper bound is set just above that: reverting even one collapsed run
+//! (e.g. the four-element outer group back to four chained `.layer()` calls)
+//! lands at 19-20 and fails.
+//!
+//! The lower bound matters too. Without it, a refactor that mounted merged raw
+//! routers *after* the middleware — which is exactly how `/mcp` is treated —
+//! would drop the probe out of the framework stack entirely, and a
+//! ceiling-only assertion would stay green while measuring nothing.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -102,21 +121,21 @@ async fn unused() -> &'static str {
     "unused"
 }
 
-/// Ceiling on how many times a single request may traverse (deep-clone) the
-/// framework's ingress stack.
+/// Accepted window for how many times a single request may traverse
+/// (deep-clone) the framework's ingress stack.
 ///
-/// Measured on the default feature set: **29 before #2193, 16 after**.
+/// Measured: **29 before #2193, 16 after** on the default feature set, 17 under
+/// CI's workspace-unified feature set (`oauth2` adds one `from_fn`).
 /// `apply_middleware` alone made 16 separate `Router::layer` calls, each adding
 /// one `BoxCloneSyncService` nesting level; composing each contiguous run into a
 /// single `Router::layer` call collapses those levels without changing the order
 /// any of them run in.
 ///
-/// The ceiling sits above the measured 16 rather than at it, because CI's
-/// `cargo test --workspace` unifies ~29 Cargo features where a plain
-/// `cargo test -p autumn-web` builds 8, and a couple of ingress layers are
-/// feature-gated. It is low enough that reverting the collapse fails it by a
-/// wide margin.
-const MAX_INGRESS_TRAVERSALS: usize = 20;
+/// Upper bound 18: one unit above the widest measured configuration, so
+/// reverting any collapsed run (which lands at 19+) fails. Lower bound 13:
+/// below it the probe is no longer inside the framework stack at all — see the
+/// module header.
+const INGRESS_TRAVERSAL_WINDOW: std::ops::RangeInclusive<usize> = 13..=18;
 
 /// Build the production router with a clone-counting probe at the innermost
 /// position, drive one request through it, and return the traversal count.
@@ -124,8 +143,12 @@ async fn ingress_traversals_per_request() -> usize {
     let clones = Arc::new(AtomicUsize::new(0));
 
     // `merge` mounts a raw `Router<AppState>`, and the probe is attached to the
-    // `MethodRouter` *before* the route is mounted — so it ends up inside every
-    // global layer `apply_middleware` and `build_router_pre_state` apply.
+    // `MethodRouter` *before* the route is mounted — so it sits inside every
+    // layer applied at or after `mount_raw_routers`, which is all of
+    // `apply_middleware` and the tail of `build_router_pre_state`. Layers
+    // applied EARLIER than that mount point (the asset cache-control `from_fn`,
+    // and the i18n locale-routing extension) are not counted; see the module
+    // header.
     let probed = axum::Router::<AppState>::new().route(
         "/probe",
         axum::routing::get(async || "probe").layer(CloneCountLayer {
@@ -146,19 +169,30 @@ async fn ingress_traversals_per_request() -> usize {
 #[tokio::test]
 async fn ingress_stack_depth_stays_within_budget() {
     let traversals = ingress_traversals_per_request().await;
-    println!("ingress traversals/request: {traversals} (budget {MAX_INGRESS_TRAVERSALS})");
+    println!("ingress traversals/request: {traversals} (window {INGRESS_TRAVERSAL_WINDOW:?})");
 
     assert!(
-        traversals <= MAX_INGRESS_TRAVERSALS,
+        traversals <= *INGRESS_TRAVERSAL_WINDOW.end(),
         "a single request deep-cloned the ingress stack {traversals} times \
-         (budget {MAX_INGRESS_TRAVERSALS}). Every `Router::layer` call boxes the \
-         whole downstream stack in a `BoxCloneSyncService`, and axum clones that \
-         box on each call — so the per-request cost is quadratic in the number of \
-         `.layer()` calls (issue #2193). Compose consecutive layers into one \
+         (max {}). Every `Router::layer` call boxes the whole downstream stack \
+         in a `BoxCloneSyncService`, and axum clones that box on each call — so \
+         the per-request cost is quadratic in the number of `.layer()` calls \
+         (issue #2193). Compose consecutive layers into one \
          `Router::layer((outermost, .., innermost))` call instead. NOTE: a \
          `tower-layer` tuple (like a `tower::ServiceBuilder` chain) puts its \
          FIRST element outermost, whereas repeated `Router::layer` calls put the \
-         LAST call outermost — so a run being collapsed must be reversed."
+         LAST call outermost — so a run being collapsed must be reversed.",
+        INGRESS_TRAVERSAL_WINDOW.end(),
+    );
+
+    assert!(
+        traversals >= *INGRESS_TRAVERSAL_WINDOW.start(),
+        "the probe saw only {traversals} traversals (min {}), which means it is \
+         no longer inside the framework's ingress stack — so this gate is \
+         measuring nothing. Check that `mount_raw_routers` still runs BEFORE \
+         `apply_middleware`; if merged routers moved after it (the way `/mcp` \
+         is mounted), this test needs a different probe, not a lower bound.",
+        INGRESS_TRAVERSAL_WINDOW.start(),
     );
 }
 
