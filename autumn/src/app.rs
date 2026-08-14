@@ -11198,8 +11198,8 @@ mod tests {
     #[cfg(feature = "reporting")]
     #[test]
     fn replay_never_uses_the_applications_custom_session_store() {
-        let source = include_str!("app.rs");
-        let handler = replay_mode_source(source);
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let handler = replay_mode_source(&source);
 
         assert!(
             handler.contains("session_store: None,"),
@@ -11215,8 +11215,11 @@ mod tests {
     #[cfg(feature = "reporting")]
     #[test]
     fn replay_never_invokes_a_custom_config_loader() {
-        let source = include_str!("app.rs");
-        let handler = replay_mode_source(source);
+        // Normalized like the other source assertions: a Windows checkout
+        // (`core.autocrlf`) hands `include_str!` CRLF line endings, and the
+        // `\n`-embedding pattern below would never match.
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let handler = replay_mode_source(&source);
 
         assert!(
             handler.contains("_replay_ignores_custom_config_loader = config_loader_factory"),
