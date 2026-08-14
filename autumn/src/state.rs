@@ -201,6 +201,24 @@ pub struct AppState {
 /// live app id.
 static NEXT_APP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Process-wide default config backing [`AppState::config_arc`]'s no-extension
+/// fallback, so that path clones a refcount instead of building a fresh
+/// `AutumnConfig` on every call.
+///
+/// Sharing one value across every config-less `AppState` is only sound because
+/// `AutumnConfig` and its whole section tree are plain data: no `Mutex`,
+/// `RwLock`, `Cell`, `OnceLock` or atomic anywhere in it, so there is no state
+/// one app could mutate and another observe. Introducing interior mutability
+/// into any config section invalidates that and this static must go back to a
+/// per-call `Arc::new`.
+static DEFAULT_CONFIG: std::sync::OnceLock<Arc<crate::config::AutumnConfig>> =
+    std::sync::OnceLock::new();
+
+/// Handle to the shared default config, built on first use.
+fn default_config() -> &'static Arc<crate::config::AutumnConfig> {
+    DEFAULT_CONFIG.get_or_init(|| Arc::new(crate::config::AutumnConfig::default()))
+}
+
 impl crate::authorization::ProvideAuthorizationState for AppState {
     fn policy_registry(&self) -> &crate::authorization::PolicyRegistry {
         &self.policy_registry
@@ -408,10 +426,14 @@ impl AppState {
     /// This hands back an owned, independently mutable snapshot, which costs a
     /// deep clone of every config section; on request paths use
     /// [`config_arc`](Self::config_arc) instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension map mutex is poisoned, inherited from
+    /// [`extension`](Self::extension).
     #[must_use]
     pub fn config(&self) -> crate::config::AutumnConfig {
-        self.extension::<crate::config::AutumnConfig>()
-            .map_or_else(crate::config::AutumnConfig::default, |arc| (*arc).clone())
+        (*self.config_arc()).clone()
     }
 
     /// Returns the resolved [`crate::config::AutumnConfig`] as a shared handle.
@@ -424,8 +446,9 @@ impl AppState {
     ///
     /// When no config extension has been installed (typically only in tests
     /// that don't wire the full startup pipeline) this yields a handle to a
-    /// default-valued config. That fallback is never written back into the
-    /// extension map, so a config installed afterwards is still observed.
+    /// shared default-valued config, so the fallback is free too. That fallback
+    /// is never written back into the extension map, so a config installed
+    /// afterwards is still observed.
     ///
     /// # Panics
     ///
@@ -433,7 +456,8 @@ impl AppState {
     /// [`extension`](Self::extension).
     #[must_use]
     pub fn config_arc(&self) -> Arc<crate::config::AutumnConfig> {
-        Arc::new(self.config())
+        self.extension::<crate::config::AutumnConfig>()
+            .unwrap_or_else(|| Arc::clone(default_config()))
     }
 
     /// Allocate the next process-unique app id.

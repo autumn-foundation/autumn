@@ -2755,8 +2755,13 @@ impl TestClient {
     /// (`dev.inspector_n_plus_one_threshold`), threaded into every
     /// [`RequestBuilder`] so the resulting [`TestResponse`] can default
     /// [`TestResponse::assert_no_n_plus_one`] to it.
+    ///
+    /// Reads through [`AppState::config_arc`]: this runs on every
+    /// `TestClient` request, so a [`AppState::config`] deep clone here would
+    /// tax the whole suite — and the committed `request_pipeline` benchmark
+    /// (issue #2198).
     fn n_plus_one_threshold(&self) -> usize {
-        self.state.config().dev.inspector_n_plus_one_threshold
+        self.state.config_arc().dev.inspector_n_plus_one_threshold
     }
 
     /// Start building a GET request.

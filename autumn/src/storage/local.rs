@@ -1208,7 +1208,7 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
                 return (StatusCode::FORBIDDEN, err.to_string()).into_response();
             }
 
-            let limit = state.config().security.upload.max_request_size_bytes;
+            let limit = state.config_arc().security.upload.max_request_size_bytes;
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             let stream = body.into_data_stream();
