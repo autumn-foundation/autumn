@@ -425,3 +425,129 @@ async fn upload_guards_are_installed_in_the_ingress_stack() {
         .assert_status(200)
         .assert_body_contains("128");
 }
+
+/// Counts handler invocations for [`csrf_is_validated_before_submit_token`].
+/// Process-global, but this route is mounted by that test alone.
+static SUBMIT_HANDLER_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[post("/create")]
+async fn counted_create() -> &'static str {
+    SUBMIT_HANDLER_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    "created"
+}
+
+/// INVARIANT: `SubmitTokenLayer` is INNER to `CsrfLayer`, so CSRF is validated
+/// first on the request path — and a replayed `_submit_token` is still
+/// short-circuited by the replay guard when the request carries a valid `_csrf`
+/// (issue #1360, AC #4).
+///
+/// This runs through the REAL assembled ingress stack (both layers enabled via
+/// `AutumnConfig`), which is what distinguishes it from the layer-level unit
+/// test `distinct_from_csrf_replayed_submit_token_short_circuits` in
+/// `src/security/submit_token.rs`: that router mounts the submit-token layer
+/// alone, so it cannot observe the relative order of the two.
+///
+/// The discriminating assertion is the last one. A replay of an
+/// already-consumed token that arrives WITHOUT a valid `_csrf` must be refused
+/// `403` — if the guard were outer to CSRF it would serve the stored `200`
+/// replay and CSRF would never run. The first two steps pin the direction that
+/// AC #4 names: a valid `_csrf` does not stop the replay guard from firing.
+///
+/// `router.rs`: "Inner to the CSRF layer so CSRF is validated first on the
+/// request path; a replayed `_submit_token` is still short-circuited even when
+/// the request carries a valid `_csrf`".
+#[tokio::test]
+async fn csrf_is_validated_before_submit_token() {
+    const CSRF_TOKEN: &str = "csrf-order-guard-token";
+    const SUBMIT_TOKEN: &str = "submit-order-guard-token";
+    // Private to `security::submit_token`; the header is the only observable
+    // that separates a replayed response from a freshly-handled one.
+    const REPLAYED: &str = "x-submit-token-replayed";
+
+    let mut config = AutumnConfig {
+        profile: Some("test".to_owned()),
+        ..AutumnConfig::default()
+    };
+    // CSRF is off by default; the submit-token guard is on by default and
+    // resolves to the per-process memory store outside production.
+    config.security.csrf.enabled = true;
+    assert!(
+        config.security.submit_token.enabled,
+        "this test needs the submit-token guard installed by the real router"
+    );
+
+    let client = TestApp::new()
+        .config(config)
+        .routes(routes![counted_create])
+        .build();
+
+    // Double-submit: matching cookie and form field, unsigned because no
+    // `security.signing_secret` is configured in this profile.
+    let submit = |body: String| {
+        client
+            .post("/create")
+            .header("cookie", &format!("autumn-csrf={CSRF_TOKEN}"))
+            .form(&body)
+    };
+    let valid_body = format!("_csrf={CSRF_TOKEN}&_submit_token={SUBMIT_TOKEN}&title=hello");
+
+    let first = submit(valid_body.clone()).send().await;
+    first.assert_status(200);
+    assert!(
+        first.header(REPLAYED).is_none(),
+        "the first submission must be handled, not replayed; headers = {:?}",
+        first.headers
+    );
+    assert_eq!(
+        SUBMIT_HANDLER_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the first submission must reach the handler exactly once"
+    );
+
+    // AC #4: the same token again, still carrying a VALID `_csrf`, is
+    // intercepted by the replay guard rather than refused by CSRF.
+    let second = submit(valid_body).send().await;
+    assert_ne!(
+        second.status.as_u16(),
+        403,
+        "a replay carrying a valid `_csrf` must not be refused by CSRF; \
+         body = {}",
+        second.text()
+    );
+    assert_eq!(
+        second.header(REPLAYED),
+        Some("true"),
+        "the replay guard must short-circuit the second submission; status = {}, \
+         headers = {:?}",
+        second.status,
+        second.headers
+    );
+    assert_eq!(
+        SUBMIT_HANDLER_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the handler must have run exactly once across both submissions"
+    );
+
+    // The ordering discriminator: same consumed token, no CSRF token at all.
+    // CSRF runs first, so this is a 403 — not the stored 200 replay.
+    let unauthenticated_replay = client
+        .post("/create")
+        .header("cookie", "unrelated=1")
+        .form(&format!("_submit_token={SUBMIT_TOKEN}&title=hello"))
+        .send()
+        .await;
+    assert_eq!(
+        unauthenticated_replay.status.as_u16(),
+        403,
+        "a replay with no valid `_csrf` must be refused by CSRF before the \
+         replay guard can serve the stored response; a 200 here means \
+         `SubmitTokenLayer` moved OUTSIDE `CsrfLayer`. headers = {:?}, body = {}",
+        unauthenticated_replay.headers,
+        unauthenticated_replay.text()
+    );
+    assert_eq!(
+        SUBMIT_HANDLER_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the CSRF-refused replay must not reach the handler either"
+    );
+}
