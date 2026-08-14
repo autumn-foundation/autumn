@@ -174,6 +174,7 @@ pub fn redact_request(
         redacted_keys: keys.into_iter().collect(),
         // Filled in by persist from the capture scope; redaction only sees
         // the request head.
+        peer_addr: None,
         client_addr: None,
         client_host: None,
         client_scheme: None,
@@ -254,6 +255,17 @@ fn redact_headers(
     values: &mut RedactedValues,
     keys: &mut BTreeSet<String>,
 ) -> RedactedHeaders {
+    // A name with *any* obs-text value moves wholesale into the binary list:
+    // splitting one name's values across the two lists would lose their
+    // relative order (replay appends text headers before binary ones), and
+    // `headers.get_all(name)` order is metadata code legitimately reads.
+    let mut binary_names: BTreeSet<String> = BTreeSet::new();
+    for (name, value) in headers {
+        if !header_is_sensitive(name.as_str(), filter) && value.to_str().is_err() {
+            binary_names.insert(name.as_str().to_owned());
+        }
+    }
+
     let mut out = Vec::with_capacity(headers.len());
     let mut binary = Vec::new();
     for (name, value) in headers {
@@ -262,10 +274,10 @@ fn redact_headers(
             values.insert(value.as_bytes());
             keys.insert(format!("header:{name}"));
             out.push((name, FILTERED_PLACEHOLDER.to_owned()));
-        } else if let Ok(text) = value.to_str() {
-            out.push((name, text.to_owned()));
-        } else {
+        } else if binary_names.contains(&name) {
             binary.push((name, STANDARD.encode(value.as_bytes())));
+        } else {
+            out.push((name, value.to_str().unwrap_or_default().to_owned()));
         }
     }
     (out, binary)
@@ -974,7 +986,14 @@ mod tests {
     #[test]
     fn non_utf8_header_bytes_are_preserved_not_placeholdered() {
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
+        // Mixed values under one name: a UTF-8 value first, then obs-text.
+        // The whole name must move to the binary list in original order, or
+        // `get_all("x-meta")` would observe a different sequence on replay.
+        headers.append(
+            "x-meta",
+            axum::http::HeaderValue::from_static("plain-text-first"),
+        );
+        headers.append(
             "x-meta",
             axum::http::HeaderValue::from_bytes(&[0x61, 0xFF, 0x62]).expect("obs-text is legal"),
         );
@@ -994,18 +1013,18 @@ mod tests {
 
         assert!(
             !request.headers.iter().any(|(name, _)| name == "x-meta"),
-            "a non-UTF-8 value does not belong in the text header list"
+            "a name with any non-UTF-8 value moves wholesale out of the text list"
         );
-        let encoded = request
+        let meta_values: Vec<Vec<u8>> = request
             .binary_headers
             .iter()
-            .find(|(name, _)| name == "x-meta")
-            .map(|(_, value)| value.clone())
-            .expect("the non-UTF-8 header is preserved in binary_headers");
+            .filter(|(name, _)| name == "x-meta")
+            .map(|(_, value)| STANDARD.decode(value).expect("valid base64"))
+            .collect();
         assert_eq!(
-            STANDARD.decode(encoded).expect("valid base64"),
-            vec![0x61, 0xFF, 0x62],
-            "the exact bytes must round-trip"
+            meta_values,
+            vec![b"plain-text-first".to_vec(), vec![0x61, 0xFF, 0x62]],
+            "all of the name's values live in binary_headers, exact bytes, original order"
         );
         assert!(
             request

@@ -234,6 +234,7 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     }
     let (mut request, redacted, body_notes) =
         crate::capsule::redact::redact_request(raw, &raw_body, scope.filter());
+    request.peer_addr = scope.peer_addr();
     if let Some(identity) = scope.client_identity() {
         request.client_addr = identity.addr;
         request.client_host.clone_from(&identity.host);

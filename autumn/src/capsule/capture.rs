@@ -247,6 +247,8 @@ pub struct CaptureScope {
     /// Monotonic readings, as offsets from the recording clock's origin.
     monotonic: Mutex<Vec<std::time::Duration>>,
     client_identity: OnceLock<CapturedClientIdentity>,
+    /// The raw peer socket (`ConnectInfo`), before trusted-proxy resolution.
+    peer_addr: OnceLock<std::net::SocketAddr>,
     db: Mutex<DbBuffer>,
     notes: Mutex<Vec<String>>,
     truncated: AtomicBool,
@@ -266,6 +268,7 @@ impl CaptureScope {
             clock: Mutex::new(Vec::new()),
             monotonic: Mutex::new(Vec::new()),
             client_identity: OnceLock::new(),
+            peer_addr: OnceLock::new(),
             db: Mutex::new(DbBuffer::default()),
             notes: Mutex::new(Vec::new()),
             truncated: AtomicBool::new(false),
@@ -400,6 +403,17 @@ impl CaptureScope {
     #[must_use]
     pub fn client_identity(&self) -> Option<&CapturedClientIdentity> {
         self.client_identity.get()
+    }
+
+    /// Record the raw peer socket the request arrived on.
+    pub fn set_peer_addr(&self, peer: std::net::SocketAddr) {
+        let _ = self.peer_addr.set(peer);
+    }
+
+    /// The raw peer socket, when the server had one to give.
+    #[must_use]
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer_addr.get().copied()
     }
 
     /// Bounded: a pathological loop reading `now()` must not grow the buffer
@@ -664,6 +678,16 @@ where
                 .get::<MatchedPath>()
                 .map(|matched| matched.as_str().to_owned());
             let scope = Arc::new(CaptureScope::new(id, settings, filter));
+            // The raw peer socket, before any trusted-proxy resolution: a
+            // replay restores it verbatim so middleware and handlers that
+            // inspect the peer directly (address *and* port) see what the
+            // failing request's server saw.
+            if let Some(peer) = req
+                .extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            {
+                scope.set_peer_addr(peer.0);
+            }
             scope.set_request(RawRequest {
                 method: req.method().as_str().to_owned(),
                 uri: req.uri().clone(),

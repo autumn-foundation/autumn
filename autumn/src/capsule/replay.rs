@@ -594,7 +594,13 @@ fn rebuild_request(
             scheme: recorded.client_scheme.clone(),
         });
     }
-    if let Some(addr) = recorded.client_addr {
+    // The raw peer socket outranks a synthesized one: middleware and
+    // handlers that inspect the peer directly (address *and* port) see what
+    // the recording server saw. Capsules that predate `peer_addr` fall back
+    // to anchoring the resolved client address with a zero port.
+    if let Some(peer) = recorded.peer_addr {
+        builder = builder.extension(axum::extract::ConnectInfo(peer));
+    } else if let Some(addr) = recorded.client_addr {
         builder = builder.extension(axum::extract::ConnectInfo(std::net::SocketAddr::new(
             addr, 0,
         )));
@@ -659,12 +665,10 @@ fn parse_version(text: &str) -> Version {
 /// replayed request carries the capsule's `[FILTERED]` literals, so a message
 /// that echoes request content echoes the same masked content.
 ///
-/// A recorded panic compares by payload when the replayed panic also escaped
-/// (substring either way, so a payload the recorder truncated still matches —
-/// but only when there is something to match: an *empty* recorded payload is a
-/// substring of everything, so it demands equality instead), and by status when
-/// a panic-catching middleware turned one side into a plain response — which is
-/// the ordinary case for an Autumn router.
+/// A recorded panic compares by whole payload when the replayed panic also
+/// escaped, and never across variants: a panic-catching middleware keeps the
+/// panic's identity (`CaughtPanic`), so a cross-variant pair means the
+/// failure *kind* changed.
 fn outcomes_match(expected: &CapsuleOutcome, actual: &CapsuleOutcome) -> bool {
     match (expected, actual) {
         (
@@ -703,19 +707,14 @@ fn outcomes_match(expected: &CapsuleOutcome, actual: &CapsuleOutcome) -> bool {
 }
 
 /// Whether two panic payloads describe the same panic.
-///
-/// Substring matching only applies when the recorded payload has something to
-/// match on. An empty recorded payload — a panic whose payload was neither a
-/// `&str` nor a `String`, or one the recorder could not format — is a substring
-/// of every string, so it would silently accept any panic at all; and the
-/// placeholder the formatter falls back to (`handler panicked`) says nothing
-/// about *which* panic, so it only matches itself.
 fn panic_payloads_match(expected: &str, actual: &str) -> bool {
-    const PLACEHOLDER: &str = "handler panicked";
-    if expected.is_empty() || expected == PLACEHOLDER || actual.is_empty() {
-        return expected == actual;
-    }
-    expected == actual || actual.contains(expected) || expected.contains(actual)
+    // Whole-payload equality, deliberately: persistence never truncates a
+    // panic payload (redaction only substitutes masked secrets, and the
+    // replayed handler panics with the same `[FILTERED]` literals its request
+    // carries), so a substring rule would let `database timeout while writing
+    // the audit log` pass for a recorded `database timeout` — a different
+    // panic wearing the old one's prefix.
+    expected == actual
 }
 
 /// The one-line explanation for a verdict whose status lined up but whose
@@ -985,6 +984,7 @@ mod tests {
                 binary_headers: Vec::new(),
                 body: CapsuleBody::Absent,
                 redacted_keys: Vec::new(),
+                peer_addr: None,
                 client_addr: None,
                 client_host: None,
                 client_scheme: None,
@@ -1054,7 +1054,10 @@ mod tests {
             &panic_outcome("boom"),
             &panic_outcome("boom")
         ));
-        assert!(outcomes_match(
+        // Both sides format a payload the same way (a `&str`/`String`
+        // downcast, no location suffix), so a superstring is a *different*
+        // panic, not a tolerance case.
+        assert!(!outcomes_match(
             &panic_outcome("boom"),
             &panic_outcome("boom at src/lib.rs:1")
         ));
@@ -1105,33 +1108,33 @@ mod tests {
         assert!(identity_mismatch_note(&recorded, &status(503)).is_none());
     }
 
-    /// An empty recorded payload is a substring of every string. Accepting it
-    /// as a match would make any panic at all reproduce a capsule whose panic
-    /// payload the recorder could not format.
+    /// Panic payloads compare by whole-payload equality: persistence never
+    /// truncates one, so a new panic that merely *contains* the recorded
+    /// message — `database timeout while writing the audit log` for a
+    /// recorded `database timeout` — is a different panic, not a
+    /// reproduction.
     #[test]
-    fn an_empty_or_placeholder_panic_payload_only_matches_itself() {
+    fn panic_payloads_compare_by_equality() {
         assert!(!outcomes_match(
             &panic_outcome(""),
             &panic_outcome("something else entirely")
         ));
         assert!(outcomes_match(&panic_outcome(""), &panic_outcome("")));
-        assert!(
-            !outcomes_match(
-                &panic_outcome("handler panicked"),
-                &panic_outcome("index out of bounds")
-            ),
-            "the formatter's placeholder for a non-string payload says nothing about \
-             which panic happened, so it cannot stand in for one"
-        );
+        assert!(!outcomes_match(
+            &panic_outcome("handler panicked"),
+            &panic_outcome("index out of bounds")
+        ));
         assert!(outcomes_match(
             &panic_outcome("handler panicked"),
             &panic_outcome("handler panicked")
         ));
-        // Truncation on either side still matches.
-        assert!(outcomes_match(
-            &panic_outcome("boom"),
-            &panic_outcome("boom at src/lib.rs:1")
-        ));
+        assert!(
+            !outcomes_match(
+                &panic_outcome("database timeout"),
+                &panic_outcome("database timeout while writing the audit log")
+            ),
+            "a superstring is a different panic wearing the old one's prefix"
+        );
     }
 
     /// Capsule text is production request data. Printing it to a terminal

@@ -157,8 +157,10 @@ pub struct CapsuleRequest {
     pub headers: Vec<(String, String)>,
     /// Non-sensitive headers whose values are valid HTTP bytes but not valid
     /// UTF-8 (`obs-text` metadata), as `(name, base64(value))`. Kept apart so
-    /// `headers` stays diffable text; replay restores both sets. Empty in
-    /// capsules written before this field existed.
+    /// `headers` stays diffable text; replay restores both sets. A name with
+    /// *any* obs-text value moves here wholesale — all its values, in
+    /// original order — so `get_all(name)` order survives the split. Empty
+    /// in capsules written before this field existed.
     #[serde(default)]
     pub binary_headers: Vec<(String, String)>,
     /// The (redacted) request body.
@@ -167,6 +169,12 @@ pub struct CapsuleRequest {
     /// `header:authorization`, `query:token`, `body:user.password`.
     #[serde(default)]
     pub redacted_keys: Vec<String>,
+    /// The raw peer socket the request arrived on (`ConnectInfo`), before
+    /// any trusted-proxy resolution — the proxy's own address and the real
+    /// source port. Replay restores it verbatim so code inspecting the peer
+    /// directly sees what the server saw.
+    #[serde(default)]
+    pub peer_addr: Option<std::net::SocketAddr>,
     /// The client address the trusted-proxies resolver settled on, when it
     /// ran. Replay re-anchors `ClientAddr` on this so identity-reading
     /// handlers reproduce without a real peer socket.
@@ -405,6 +413,7 @@ pub mod test_support {
             binary_headers: Vec::new(),
             body: CapsuleBody::Absent,
             redacted_keys: Vec::new(),
+            peer_addr: None,
             client_addr: None,
             client_host: None,
             client_scheme: None,

@@ -166,6 +166,7 @@ fn request(method: &str, uri: &str) -> CapsuleRequest {
         binary_headers: Vec::new(),
         body: CapsuleBody::Absent,
         redacted_keys: Vec::new(),
+        peer_addr: None,
         client_addr: None,
         client_host: None,
         client_scheme: None,
