@@ -26,8 +26,8 @@ rest everywhere, constant-time comparison at every secret check but one,
 session-id rotation at every privilege boundary, atomic single-use token
 consumption, JWT algorithm pinning derived from trusted key material, TOTP
 step replay guards, and non-enumerating responses with timing equalization on
-the email-based flows. The findings below are two medium-severity gaps and a
-set of low-severity hardening items.
+the email-based flows. The findings below are three medium-severity gaps and
+a set of low-severity hardening items.
 
 ---
 
@@ -82,6 +82,34 @@ running the value through the same `validate_signing_secret`-style checks at
 startup. (The endpoint is otherwise well-designed: non-enumerating response,
 empty-secret fail-closed, documented CSRF-exemption requirement.)
 
+### M3. The TOTP second-factor endpoint is brute-forceable (no throttle, no attempt limit)
+
+Generated `POST /login/verify` has neither a `#[throttle]` attribute nor any
+failed-attempt counter, and a failed guess returns "Invalid code." while
+leaving `totp_pending_id` in the session — so the pending login survives
+unlimited retries. An attacker who has the password (precisely the scenario
+2FA defends against) can therefore machine-guess the 6-digit code: ~10⁶
+values, with the ±1-step window accepting three codes per attempt, and no
+rate limit in the way. The account-lockout counters do not apply here (they
+are only touched in `login`).
+
+Each miss additionally loads **every** unused recovery code and runs a
+cost-12 bcrypt verify against each, so the same endpoint is a CPU
+amplification vector (~1 s of server CPU per guess with a default code set)
+— painful under load even when the guessing itself fails.
+
+The `reauth` TOTP branch shares the same shape (unlimited tries, full
+recovery-code bcrypt sweep per miss), though it at least demands the password
+on every attempt.
+
+Fix: throttle `/login/verify` like the magic-link routes
+(`#[throttle(limit = 5, per = "1m", key = "ip")]`), add a small
+per-pending-session attempt counter (e.g. 5 tries, then clear
+`totp_pending_id` and force re-login), and only fall through to the
+recovery-code sweep when the submitted value does not look like a 6-digit
+code. Apply the same attempt bound to the `reauth` branch. *(Credit: flagged
+by automated review on the audit PR and verified against the code.)*
+
 ---
 
 ## Low / hardening
@@ -115,7 +143,8 @@ lockout covers per-account brute force, but:
   and re-sends; the 1s timing pad is the only backpressure).
 
 Recommendation: mirror the magic-link posture — `#[throttle]` on both, and a
-per-email cooldown on forgot-password.
+per-email cooldown on forgot-password. The unthrottled TOTP verify endpoint
+is the sharper instance of this gap and is tracked separately as M3.
 
 ### L4. Small enumeration timing channel on login lockout bookkeeping
 
@@ -330,11 +359,13 @@ PR and verified against the code.)*
 
 ## Suggested fix order
 
-1. M1 (CSRF cookie `Secure` + `__Host-`; session binding as follow-up)
-2. M2 (constant-time admin-secret compare) — one-line fix
-3. L11/L12/L13 (atomic reset-token consumption; confirm-email GET→POST;
+1. M3 (throttle + attempt-bound the TOTP verify endpoint) — the one finding
+   that weakens a security guarantee outright
+2. M1 (CSRF cookie `Secure` + `__Host-`; session binding as follow-up)
+3. M2 (constant-time admin-secret compare) — one-line fix
+4. L11/L12/L13 (atomic reset-token consumption; confirm-email GET→POST;
    remember-chain revocation in the TOTP/passkey/email-change transactions) —
    small, invariant-restoring changes to the generated handlers
-4. L1/L2 (route generated code through the ProxyResolver seams)
-5. L3 (throttle login/forgot-password)
-6. Remaining L-items opportunistically.
+5. L1/L2 (route generated code through the ProxyResolver seams)
+6. L3 (throttle login/forgot-password)
+7. Remaining L-items opportunistically.
