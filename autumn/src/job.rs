@@ -7937,7 +7937,9 @@ fn pg_claim_sql() -> String {
     // `$2` is the worker's ordered queue list for this claim. Restricting to it
     // and ordering by `array_position` drains higher-priority queues first;
     // passing a per-iteration rotation of the list yields weighted draining.
-    // A single-queue (`['default']`) app orders only by `run_at` — today's behavior.
+    // Only reached when `queue_order` has 2+ entries — see
+    // `pg_claim_sql_single_queue` for the single-queue fast path, which is the
+    // common case (no `[jobs] queues` priority config).
     format!(
         "UPDATE autumn_jobs \
          SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
@@ -7961,6 +7963,50 @@ fn pg_claim_sql() -> String {
     )
 }
 
+/// Claim query for the single-queue case (`queue_order` has exactly one
+/// entry — no `[jobs] queues` priority config, the common case).
+///
+/// `pg_claim_sql`'s `ORDER BY array_position($2::text[], candidate.queue),
+/// candidate.run_at` cannot be served by `idx_autumn_jobs_queue_ready (queue,
+/// run_at)`: `array_position` is opaque to the planner at plan time (its
+/// value depends on the bound array parameter), so even though it is
+/// constant across every row that passes `queue = ANY($2)` when the array has
+/// one element, the planner cannot prove that and falls back to a full
+/// Bitmap-Heap-Scan-then-Sort of the *entire* ready backlog for the queue
+/// before `LIMIT 1` picks one row (measured: O(backlog) buffers, external
+/// merge sort spill past ~400k ready rows).
+///
+/// Dropping `array_position` from `ORDER BY` and using `queue = $2` (scalar)
+/// instead of `queue = ANY($2)` is exactly equivalent when there is only one
+/// queue to consider — `array_position` was constant for every candidate row
+/// anyway — but lets the planner recognize `(queue, run_at)` index order and
+/// do an `Index Scan` + `Limit 1`, touching O(1) buffers regardless of
+/// backlog size.
+#[cfg(feature = "db")]
+fn pg_claim_sql_single_queue() -> String {
+    format!(
+        "UPDATE autumn_jobs \
+         SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
+             pending_unique_key = CASE WHEN unique_window = 'pending' THEN unique_key ELSE NULL END, \
+             unique_key = CASE WHEN unique_window = 'pending' THEN NULL ELSE unique_key END \
+         WHERE id = ( \
+           SELECT candidate.id FROM autumn_jobs candidate \
+           WHERE candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
+             AND candidate.queue = $2 \
+             AND (candidate.concurrency_limit IS NULL OR ( \
+               SELECT COUNT(*) FROM autumn_jobs running \
+               WHERE running.status = 'running' \
+                 AND running.name = candidate.name \
+                 AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
+             ) < candidate.concurrency_limit) \
+           ORDER BY candidate.run_at ASC \
+           LIMIT 1 \
+           FOR UPDATE SKIP LOCKED \
+         ) \
+         RETURNING {PG_JOB_SELECT_COLS}"
+    )
+}
+
 #[cfg(feature = "db")]
 async fn pg_claim_next_job(
     pool: &PgPool,
@@ -7972,30 +8018,61 @@ async fn pg_claim_next_job(
     use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
 
     let mut conn = pool.get().await.ok()?;
-    let sql = pg_claim_sql();
-    let queue_order = queue_order.to_vec();
-    let claimed = if serialize_claims {
-        let worker_id = worker_id.to_owned();
-        conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(async move |conn| {
-            diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
-                .bind::<diesel::sql_types::BigInt, _>(PG_CLAIM_ADVISORY_LOCK_KEY)
-                .execute(conn)
-                .await?;
+    // See `pg_claim_sql_single_queue` for why the single-queue case (no
+    // `[jobs] queues` priority config — the common case) gets its own query
+    // text rather than reusing `pg_claim_sql` with a one-element array.
+    let claimed = if let [only_queue] = queue_order {
+        let sql = pg_claim_sql_single_queue();
+        let only_queue = only_queue.clone();
+        if serialize_claims {
+            let worker_id = worker_id.to_owned();
+            conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(async move |conn| {
+                diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
+                    .bind::<diesel::sql_types::BigInt, _>(PG_CLAIM_ADVISORY_LOCK_KEY)
+                    .execute(conn)
+                    .await?;
+                diesel::sql_query(sql)
+                    .bind::<diesel::sql_types::Text, _>(worker_id)
+                    .bind::<diesel::sql_types::Text, _>(only_queue)
+                    .get_result::<PgJobRow>(conn)
+                    .await
+                    .optional()
+            })
+            .await
+        } else {
+            diesel::sql_query(sql)
+                .bind::<diesel::sql_types::Text, _>(worker_id)
+                .bind::<diesel::sql_types::Text, _>(only_queue)
+                .get_result::<PgJobRow>(&mut *conn)
+                .await
+                .optional()
+        }
+    } else {
+        let sql = pg_claim_sql();
+        let queue_order = queue_order.to_vec();
+        if serialize_claims {
+            let worker_id = worker_id.to_owned();
+            conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(async move |conn| {
+                diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
+                    .bind::<diesel::sql_types::BigInt, _>(PG_CLAIM_ADVISORY_LOCK_KEY)
+                    .execute(conn)
+                    .await?;
+                diesel::sql_query(sql)
+                    .bind::<diesel::sql_types::Text, _>(worker_id)
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
+                    .get_result::<PgJobRow>(conn)
+                    .await
+                    .optional()
+            })
+            .await
+        } else {
             diesel::sql_query(sql)
                 .bind::<diesel::sql_types::Text, _>(worker_id)
                 .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
-                .get_result::<PgJobRow>(conn)
+                .get_result::<PgJobRow>(&mut *conn)
                 .await
                 .optional()
-        })
-        .await
-    } else {
-        diesel::sql_query(sql)
-            .bind::<diesel::sql_types::Text, _>(worker_id)
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
-            .get_result::<PgJobRow>(&mut *conn)
-            .await
-            .optional()
+        }
     };
     claimed.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "postgres job claim query failed");
