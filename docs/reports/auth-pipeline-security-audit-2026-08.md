@@ -48,9 +48,18 @@ overwritten over plaintext HTTP by an active network attacker.
 
 Because the scheme is double-submit (cookie value must equal the
 header/form/query value), a planted cookie plus a matching form value passes
-validation. HMAC signing raises the bar but does not close it: tokens are not
-bound to a session, so *any* legitimately-signed token (e.g. one the attacker
-minted by visiting the site) verifies for any victim it can be planted on.
+validation. Prerequisite: the forged request must be *same-site* — on an
+ordinary cross-site form POST, `SameSite=Lax` keeps the cookie at home and
+the check fails on the absent cookie alone. The planted-cookie bypass is
+therefore live for an attacker with a same-site vantage: a controlled or
+compromised sibling subdomain (which can also set parent-domain cookies), or
+an active network attacker injecting into any plaintext-HTTP page of the site
+(enabled by the missing `Secure`). HMAC signing raises the bar but does not
+close it for those attackers: tokens are not bound to a session, so *any*
+legitimately-signed token (e.g. one the attacker minted by visiting the site)
+verifies for any victim it can be planted on. Severity stays medium as a
+defense-in-depth failure — the CSRF layer exists precisely for the contexts
+where SameSite alone doesn't hold, and both gaps are cheap to fix.
 
 Recommendations, in increasing strength:
 1. Add `Secure` when the deployment is HTTPS (mirror `session.secure` /
