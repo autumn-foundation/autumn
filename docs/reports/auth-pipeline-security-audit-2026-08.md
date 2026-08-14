@@ -248,10 +248,16 @@ verified against the code.)*
 - **Headers**: CSP without `unsafe-eval`, `frame-ancestors 'none'`,
   `X-Frame-Options: DENY`, nosniff, HSTS prod default.
 - **Verifiability**: `autumn routes audit` emits a fail-closed security
-  manifest — every route must be provably `framework`/`gated`/`public` or the
-  build gate fails — with honest provenance tags (`provable` vs `declared` vs
-  `runtime-only`). Session cookie parsing is additionally fuzzed
-  (`fuzz/fuzz_targets/session.rs`).
+  manifest — every *dump-enumerated* route must be provably
+  `framework`/`gated`/`public` or the build gate fails — with honest
+  provenance tags (`provable` vs `declared` vs `runtime-only`). Coverage
+  caveat: the opt-in serve-path HTTP surfaces (MCP, inbound-mail, storage,
+  SEO) are injected only on the serve path, after the dump early-exit, so the
+  gate cannot classify or fail on them; the manifest discloses this honestly
+  in its `excluded` list (`serve_path_routers`, eventual provenance
+  `provable`) rather than silently omitting it, and closing that gap is the
+  natural next increment of the gate. Session cookie parsing is additionally
+  fuzzed (`fuzz/fuzz_targets/session.rs`).
 
 ## Suggested fix order
 
