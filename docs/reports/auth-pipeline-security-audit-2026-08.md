@@ -172,6 +172,35 @@ logs, browser history, and (partially) Referer. The default Referrer-Policy
 mitigates cross-origin leakage; still, consider dropping query-string
 acceptance or gating it behind config.
 
+### L11. Reset tokens are not atomically consumed
+
+Generated `reset_password` SELECTs the user by `reset_token_digest`, but the
+subsequent transaction UPDATEs the row by `find(user_id)` only — it never
+re-checks the digest. Two concurrent POSTs presenting the same valid token can
+both pass the SELECT and both commit, with the second password overwriting the
+first (each also rotating/revoking sessions). Exploitability is low — both
+requests must already hold the secret token — but it breaks the single-use
+invariant the magic-link and confirm-email flows enforce. Fix: add
+`.filter(reset_token_digest.eq(&token_digest))` to the in-transaction UPDATE
+(or consume via the same `UPDATE … RETURNING` pattern) and treat zero affected
+rows as an invalid link. *(Credit: flagged by automated review on the audit PR
+and verified against the code.)*
+
+### L12. `confirm_email` consumes its token — and grants a session — on a bare GET
+
+`GET /auth/confirm/{token}` atomically consumes the token (good) but does so
+directly on the GET, unlike magic-link's scanner-safe non-consuming GET →
+confirming POST. Consequences: (a) an email link-scanner or preview bot that
+follows the URL burns the single-use token before the human clicks, leaving
+them at the "invalid or expired" page and forcing a resend; (b) a
+session-granting, CSRF-exempt-by-method GET is login-CSRF-shaped — a victim
+who top-level-navigates an attacker's own confirm link is silently logged into
+the attacker's account. Recommendation: adopt the magic-link pattern (GET
+renders a confirm form, POST consumes), which fixes both. The email-change
+variant (`confirm_email_change`) has the same GET-consumption shape and should
+move with it. *(Credit: flagged by automated review on the audit PR and
+verified against the code.)*
+
 ---
 
 ## Notable strengths (verified, not assumed)
@@ -194,11 +223,13 @@ acceptance or gating it behind config.
 - **Signing secrets**: 32-byte production minimum, template-value denylist,
   fail-fast boot validation, previous-key rotation grace.
 - **Reset/magic-link/confirm tokens**: 256-bit OS-random, digest-only at rest,
-  bounded TTLs, atomic single-use consumption (`UPDATE ... WHERE consumed_at
-  IS NULL RETURNING`), non-enumerating responses with 1s timing floors,
-  link-scanner-safe GET-then-POST consumption, lockout re-checked *after*
-  token consumption to close the TOCTOU race, magic-link deliberately denied
-  step-up freshness (email possession ≠ password knowledge).
+  bounded TTLs, non-enumerating responses with 1s timing floors. Magic-link
+  and confirm-email consume atomically (`UPDATE … RETURNING` on the digest);
+  reset does not — see L11. Magic-link additionally uses the link-scanner-safe
+  non-consuming GET → confirming POST pattern (confirm-email does not — see
+  L12), re-checks lockout *after* token consumption to close the TOCTOU race,
+  and is deliberately denied step-up freshness (email possession ≠ password
+  knowledge).
 - **Remember-me**: Jaspan series/token scheme, hash-at-rest, constant-time
   verify, CAS rotation with race re-evaluation, theft detection nukes the
   chain, credential changes always revoke remember chains, `reauth_pw_ok`
@@ -226,6 +257,8 @@ acceptance or gating it behind config.
 
 1. M1 (CSRF cookie `Secure` + `__Host-`; session binding as follow-up)
 2. M2 (constant-time admin-secret compare) — one-line fix
-3. L1/L2 (route generated code through the ProxyResolver seams)
-4. L3 (throttle login/forgot-password)
-5. Remaining L-items opportunistically.
+3. L11/L12 (atomic reset-token consumption; confirm-email GET→POST) — small,
+   invariant-restoring changes to the generated handlers
+4. L1/L2 (route generated code through the ProxyResolver seams)
+5. L3 (throttle login/forgot-password)
+6. Remaining L-items opportunistically.
