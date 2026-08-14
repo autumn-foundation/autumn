@@ -127,6 +127,13 @@ session can machine-guess the 6-digit code until one matches and then turn the
 victim's second factor off. It does correctly consume a matched step via the
 replay guard, but that does not bound *guessing*.
 
+`two_factor_confirm` (`POST /account/2fa/confirm`) is a fourth: an
+authenticated session holding an abandoned `totp_pending_secret` can guess the
+current 6-digit value with no throttle or attempt counter (the pending secret
+survives every failed guess), then enable 2FA and receive the freshly minted
+recovery codes — effectively taking over the account's second factor from a
+merely-authenticated session.
+
 Fix: throttle `/login/verify` like the magic-link routes
 (`#[throttle(limit = 5, per = "1m", key = "ip")]`), add a small
 per-pending-session attempt counter (e.g. 5 tries, then clear
@@ -134,8 +141,10 @@ per-pending-session attempt counter (e.g. 5 tries, then clear
 recovery-code sweep when the submitted value does not look like a 6-digit
 code. Apply the same attempt bound to the `reauth` branch, clearing
 `reauth_pw_ok` after N failed second-factor guesses so the password gate
-re-engages, and to `two_factor_disable`. *(Credit: flagged by automated review
-on the audit PR and verified against the code.)*
+re-engages, and to `two_factor_disable` and `two_factor_confirm` (for the
+latter, drop `totp_pending_secret` after N failed guesses so enrollment must
+restart). *(Credit: flagged by automated review on the audit PR and verified
+against the code.)*
 
 ---
 
@@ -303,6 +312,21 @@ omission (L13) on the same handler. Fix: add `#[step_up]` to `passkey_revoke`
 (matching `passkey_register_begin`), or an inline re-auth as
 `two_factor_disable` does. *(Credit: flagged by automated review on the audit
 PR and verified against the code.)*
+
+### L13b. Scheduled account deletion doesn't revoke sessions or remember chains
+
+Generated `delete_account` (`POST /account/delete`, the 30-day-grace GDPR
+path) stamps `delete_scheduled_at` and calls `session.destroy()` — but nothing
+else. It does not delete the user's remember-token rows, clear the remember
+cookie, or revoke other tracked sessions. Because the account row survives the
+grace window, the global `remember_me` middleware silently re-authenticates
+the user from their remember cookie on the very next request, and any other
+logged-in devices stay live. So "delete my account" neither logs the user out
+everywhere nor stops a stolen remember cookie. (The immediate
+`account_destroy` path is fine — its row delete cascades to sessions.) Fix:
+in `delete_account`, delete the `{rem_table}` and `{sess_table}` rows for the
+user and emit the remember-clear cookie, exactly as `logout` does. *(Credit:
+flagged by automated review on the audit PR and verified against the code.)*
 
 ### L14. Generated TOTP code comparison is not constant-time
 
