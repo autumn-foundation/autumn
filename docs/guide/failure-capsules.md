@@ -42,7 +42,7 @@ error page use. It cannot mask what has no name attached.
 | Encrypted-column names | every column registered by `#[encrypted]` is added to the filter |
 | SQL bind parameters echoing a masked value | byte-equal binds become `"masked"`, and are excluded from replay's bind comparison |
 | The outcome message, panic payload and backtrace | any masked value quoted back inside them is substring-replaced |
-| Bodies that declare structure but do not parse as it | dropped entirely (`skipped`, with a note) — with no keys, there is nothing to match on |
+| Bodies that declare structure but do not parse as it | dropped entirely (`skipped`, with a note) — with no keys, there is nothing to match on. Their raw text and string-literal values still seed the echo set, so an outcome quoting the malformed body is scrubbed |
 
 | **Not** masked | Why |
 | --- | --- |

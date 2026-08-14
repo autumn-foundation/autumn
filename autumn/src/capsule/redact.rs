@@ -445,11 +445,11 @@ fn redact_body(
         // A body that claims to be JSON but is not one — malformed, or the
         // prefix the tap copied before the handler abandoned the read — has no
         // keys for the filter to match, so copying it verbatim would write
-        // `{"password":"secret",` straight into the capsule. Mask it instead:
-        // an unparsed body also contributes nothing to `values`, so nothing
-        // downstream could catch the echo either.
+        // `{"password":"secret",` straight into the capsule. Mask it instead,
+        // and seed the echo set from the raw text so an outcome that quotes
+        // the body (or a value inside it) is still scrubbed.
         let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-            return unparseable_body(bytes, UNPARSEABLE_JSON_NOTE, keys, notes);
+            return unparseable_body(bytes, UNPARSEABLE_JSON_NOTE, values, keys, notes);
         };
         let keys_before = keys.len();
         let scrubbed = scrub_value(&parsed, filter, "body", values, keys);
@@ -481,7 +481,7 @@ fn redact_body(
         // then copied verbatim. `form_text` says whether this really is a
         // form before any of it is copied.
         let Some(text) = form_text(bytes) else {
-            return unparseable_body(bytes, UNPARSEABLE_FORM_NOTE, keys, notes);
+            return unparseable_body(bytes, UNPARSEABLE_FORM_NOTE, values, keys, notes);
         };
         // The masking splices only the matched pairs, so an untouched form —
         // or the untouched neighbours of a masked field — keeps the exact
@@ -500,7 +500,7 @@ fn redact_body(
     // capsule records the length and says why, rather than becoming the one
     // place a submitted secret survives in the clear.
     if content_type.starts_with("multipart/") || content_type.contains("multipart/form-data") {
-        return unparseable_body(bytes, MULTIPART_BODY_NOTE, keys, notes);
+        return unparseable_body(bytes, MULTIPART_BODY_NOTE, values, keys, notes);
     }
 
     // Anything else has no key structure to match on, so it is copied
@@ -518,14 +518,26 @@ fn redact_body(
 /// the bytes were deliberately not carried, only their length — and replay
 /// already handles it by sending an empty body with a warning. The note says
 /// *why* this one was skipped.
+///
+/// Skipping removes the bytes from the *request* record, but a handler that
+/// read (part of) the body can still quote it into a 5xx message or a panic
+/// payload, and `scrub_outcome` can only mask what the echo set knows about —
+/// no key ever matched here, so nothing from this body joined it. Seed the
+/// set conservatively instead: the whole raw text, and every string literal
+/// in value position (see [`record_string_literal_values`]).
 fn unparseable_body(
     bytes: &[u8],
     note: &'static str,
+    values: &mut RedactedValues,
     keys: &mut BTreeSet<String>,
     notes: &mut Vec<String>,
 ) -> CapsuleBody {
     keys.insert(UNPARSEABLE_BODY_KEY.to_owned());
     notes.push(note.to_owned());
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        values.insert(text.as_bytes());
+        record_string_literal_values(text, values);
+    }
     CapsuleBody::Skipped {
         declared_len: Some(bytes.len()),
     }
@@ -634,6 +646,67 @@ fn record_masked_value(value: &serde_json::Value, values: &mut RedactedValues) {
             }
         }
         other => values.insert(other.to_string().as_bytes()),
+    }
+}
+
+/// Record the decoded form (and escaped spelling) of every string literal in
+/// *value* position of malformed JSON-like text.
+///
+/// Best-effort seeding for a body that declared a structure it does not have:
+/// the parser refused it, so the filter never saw its keys, but the secrets
+/// are still in there and a handler may echo one into the outcome. A literal
+/// followed by `:` is a key and is skipped — field names are ordinary words,
+/// and masking them would shred outcome prose like `password rejected` —
+/// while every other literal is treated as a value worth masking wherever it
+/// is echoed. Text ending *inside* a literal (the truncated-tap case, and the
+/// most likely place for a secret to sit) records the unterminated remainder.
+/// Escape handling mirrors [`retain_raw_json_string_spellings`].
+fn record_string_literal_values(text: &str, values: &mut RedactedValues) {
+    let mut rest = text;
+    while let Some(start) = rest.find('"') {
+        let Some(after_quote) = rest.get(start.saturating_add(1)..) else {
+            return;
+        };
+        // Find the closing quote, skipping escaped characters.
+        let mut end = None;
+        let mut escape = false;
+        for (index, c) in after_quote.char_indices() {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                end = Some(index);
+                break;
+            }
+        }
+        let Some(end) = end else {
+            if !after_quote.is_empty() {
+                values.insert(after_quote.as_bytes());
+            }
+            return;
+        };
+        let Some(inner) = after_quote.get(..end) else {
+            return;
+        };
+        let Some(after_literal) = after_quote.get(end.saturating_add(1)..) else {
+            return;
+        };
+        let is_key = after_literal.trim_start().starts_with(':');
+        if !is_key && !inner.is_empty() {
+            let literal = format!("\"{inner}\"");
+            if let Ok(decoded) = serde_json::from_str::<String>(&literal) {
+                values.insert(decoded.as_bytes());
+                if inner.contains('\\') {
+                    values.insert(inner.as_bytes());
+                }
+            } else {
+                // A literal serde cannot decode (a broken escape) is retained
+                // as spelled — that is the form an echo would carry.
+                values.insert(inner.as_bytes());
+            }
+        }
+        rest = after_literal;
     }
 }
 
@@ -1334,8 +1407,12 @@ mod tests {
             request.body
         );
         assert!(
-            values.is_empty(),
-            "an unparsed body yields no keys, so it contributes nothing to the echo set"
+            values.contains(b"hunter2secret"),
+            "a skipped body must still seed the echo set, so an outcome quoting it is scrubbed"
+        );
+        assert!(
+            !values.contains(b"password"),
+            "field names stay out of the echo set — masking them would shred outcome prose"
         );
         assert!(
             request
@@ -1363,6 +1440,52 @@ mod tests {
             request.body
         );
         assert_eq!(notes, vec![UNPARSEABLE_JSON_NOTE.to_owned()]);
+    }
+
+    /// A skipped body never reaches the capsule, but a handler that already
+    /// read it can quote it — whole, or one value at a time — into the 5xx
+    /// message or panic payload that *does*. The echo set has to know the
+    /// body's values even though no filter key ever matched.
+    #[test]
+    fn a_skipped_malformed_body_still_masks_echoed_values() {
+        let (request, values, _) = redact_with_notes(
+            Request::post("/users").header(header::CONTENT_TYPE, "application/json"),
+            CapturedBody::Buffered(Bytes::from_static(br#"{"password":"hunter2secret","#)),
+            &filter_with(&[]),
+        );
+        assert!(matches!(request.body, CapsuleBody::Skipped { .. }));
+
+        // A handler quoting the offending value...
+        let masked = mask_echoes("could not store credential hunter2secret", &values);
+        assert!(
+            !masked.contains("hunter2secret"),
+            "an echoed body value must be masked out of the outcome: {masked}"
+        );
+        // ...or the entire raw body it read.
+        let masked = mask_echoes(r#"bad payload: {"password":"hunter2secret","#, &values);
+        assert!(
+            !masked.contains("hunter2secret"),
+            "an echoed raw body must be masked out of the outcome: {masked}"
+        );
+        // Ordinary prose sharing a word with a field name stays readable.
+        assert_eq!(mask_echoes("password rejected", &values), "password rejected");
+    }
+
+    /// The truncated-tap shape: capture stopped mid-literal, so there is no
+    /// closing quote. The unterminated remainder is exactly where the secret
+    /// sits and must join the echo set.
+    #[test]
+    fn a_body_truncated_inside_a_literal_still_masks_the_remainder() {
+        let (_, values, _) = redact_with_notes(
+            Request::post("/users").header(header::CONTENT_TYPE, "application/json"),
+            CapturedBody::Buffered(Bytes::from_static(br#"{"token":"deep-secret-value"#)),
+            &filter_with(&[]),
+        );
+        let masked = mask_echoes("refused: deep-secret-value", &values);
+        assert!(
+            !masked.contains("deep-secret-value"),
+            "the unterminated literal's remainder must be masked: {masked}"
+        );
     }
 
     #[test]
