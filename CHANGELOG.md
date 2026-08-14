@@ -1554,8 +1554,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Measured end-to-end on the real production router (`valgrind --tool=dhat`
   against the new `request_pipeline` bench — three trivial handlers, no DB, no
-  business logic): **825.7 → 339.7 allocations per request**. The number of
-  times a request deep-clones the ingress stack fell from 29 to 16.
+  business logic, with a zero-iteration baseline subtracted so the figure is
+  marginal rather than amortised over router construction): **800.0 → 331.0
+  allocations per request**. The number of times a request deep-clones the
+  ingress stack fell from 29 to 16.
 
   `MaintenanceLayer` and `LoadShedLayer` additionally held their path
   allow-lists by value, so each per-request clone deep-copied two `String`s and

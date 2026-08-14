@@ -145,9 +145,12 @@ impl MaintenanceLayer {
         }
     }
 
-    /// Mutate the (build-time) path set in place, cloning it only if the `Arc`
-    /// has already been shared — the builder methods below are chained on a
-    /// freshly-constructed layer, so in practice this never copies.
+    /// Mutate the (build-time) path set, cloning it only when the `Arc` is
+    /// already shared. Router assembly chains the builders below on a
+    /// freshly-constructed layer, so that path never copies; the
+    /// clone-this-layer-then-override usage documented on the type copies once,
+    /// at build time. Either way no mutation is lost — `make_mut` forks and
+    /// mutates the copy `self` then owns.
     fn paths_mut(&mut self) -> &mut GatePaths {
         Arc::make_mut(&mut self.paths)
     }

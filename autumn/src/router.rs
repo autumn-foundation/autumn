@@ -884,7 +884,8 @@ fn build_router_pre_state(
         // same-origin browser client behind a TLS-terminating proxy. The
         // dispatch clone already carries its own copy of this layer.
         mcp_router = apply_trusted_proxies_middleware(mcp_router, config);
-        // The MCP route is merged after `apply_upload_middleware`, so axum's
+        // The MCP route is merged after the ingress upload guards
+        // (`build_upload_layers`), so axum's
         // built-in 2 MiB `DefaultBodyLimit` — not the app's configured limit —
         // would otherwise govern the `tools/call` envelope's `Bytes` body. Apply
         // the same cap a direct JSON endpoint gets so larger-but-valid tool
@@ -2818,37 +2819,21 @@ fn mount_raw_routers(
     router
 }
 
+/// Apply response compression, when enabled.
+///
+/// Unlike the other ingress middleware this keeps its own `Router::layer` call
+/// rather than joining a composed tuple: `CompressionLayer`'s service changes
+/// the response BODY type, which `Route::layer` absorbs via `IntoResponse` but
+/// `option_layer`'s `Either` cannot — both of its branches must share one
+/// `Response` type. Compression is off by default, so the extra nesting level
+/// is only paid by apps that turn it on.
 fn apply_compression_middleware<S>(
-    router: axum::Router<S>,
+    mut router: axum::Router<S>,
     config: &AutumnConfig,
 ) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    match build_compression_layer(config) {
-        Some(layer) => router.layer(layer),
-        None => router,
-    }
-}
-
-/// Build the response-compression layer, or `None` when compression is off.
-///
-/// Split out from [`apply_compression_middleware`] for symmetry with the other
-/// `build_*_layer` helpers and so the predicate can be constructed without a
-/// router. Compression deliberately keeps its own `Router::layer` call rather
-/// than joining the composed ingress tuple: `CompressionLayer`'s service changes
-/// the response BODY type, which `Route::layer` absorbs via `IntoResponse` but
-/// `option_layer`'s `Either` cannot (both of its branches must share one
-/// `Response` type). See the note at its application site in
-/// [`apply_middleware`].
-fn build_compression_layer(
-    config: &AutumnConfig,
-) -> Option<
-    // `Predicate` already requires `Clone + Send + Sync + 'static` as a
-    // supertrait, so naming it alone is enough. `use<>` opts out of Rust 2024's
-    // implicit capture of `config`'s lifetime — the predicate borrows nothing.
-    tower_http::compression::CompressionLayer<impl tower_http::compression::Predicate + use<>>,
-> {
     if config.compression.enabled {
         use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
         // Extend the default predicate (skips images, gRPC, SSE, small bodies) to also
@@ -2875,11 +2860,11 @@ fn build_compression_layer(
             // SFNT data that genuinely benefits from transfer compression.
             .and(NotForContentType::const_new("font/woff"))
             .and(NotForContentType::const_new("font/woff2"));
+        router =
+            router.layer(tower_http::compression::CompressionLayer::new().compress_when(predicate));
         tracing::info!("Response compression enabled (gzip/brotli)");
-        Some(tower_http::compression::CompressionLayer::new().compress_when(predicate))
-    } else {
-        None
     }
+    router
 }
 
 /// Kept as a router-level wrapper for this module's unit tests; the main
@@ -3102,9 +3087,11 @@ fn build_submit_token_layer(
 
 /// Build the CAPTCHA/bot-protection layer, or `None` when it is disabled.
 ///
-/// Split out of [`apply_bot_protection_middleware`] so the layer can join the
-/// composed ingress stack rather than costing its own nesting level
-/// (issue #2193).
+/// Called only by [`apply_middleware`], which places it in the composed ingress
+/// stack rather than spending its own `Router::layer` call — and therefore its
+/// own nesting level — on it (issue #2193). The former
+/// `apply_bot_protection_middleware` router wrapper was removed with its last
+/// caller.
 fn build_bot_protection_layer(
     config: &AutumnConfig,
 ) -> Option<crate::security::captcha::BotProtectionLayer> {
@@ -3277,9 +3264,10 @@ where
     S: Clone + Send + Sync + 'static,
 {
     let (body_limit, upload_config) = build_upload_layers(config);
-    // Applied inner-first: `DefaultBodyLimit` first, then the extension
-    // inserter, so the inserter ends up OUTER — the order this function has
-    // always produced.
+    // NOTE: this REPRODUCES the relative order `apply_middleware`'s `inner_stack`
+    // encodes (extension inserter OUTER to the body limit); it does not share it.
+    // Keep the two in sync. Applied inner-first here, because consecutive
+    // `Router::layer` calls put the LAST one outermost — the opposite of a tuple.
     router
         .layer(body_limit)
         .layer(axum::Extension(upload_config))
@@ -3608,6 +3596,10 @@ fn apply_request_timeout_middleware(
 
 /// Everything [`request_timeout_handler`] needs, resolved once at
 /// router-assembly time.
+///
+/// `Clone` is load-bearing: both call sites move this into an
+/// `axum::middleware::from_fn` closure, and `Router::layer` requires the layer
+/// (hence the closure, hence its captures) to be `Clone`.
 #[derive(Clone)]
 struct RequestTimeoutSettings {
     global: Option<Duration>,
@@ -3881,6 +3873,10 @@ fn apply_middleware(
     // type-checks, because every layer here is `Route -> Route` with
     // `Error = Infallible`; only the behavioural tests would catch it.
     //
+    // `tower-layer` implements `Layer` for tuples up to 16 elements; the largest
+    // group below has 13. Past 16, nest a sub-tuple as a single element —
+    // `(a, b, (c, d, e), f)` composes identically and still costs one box.
+    //
     // Conditional members use `tower::util::option_layer`, which maps `None` to
     // `tower::layer::util::Identity` — its `Service` is the inner service
     // itself, wrapped in an `Either` that forwards to it. A disabled layer
@@ -4087,6 +4083,7 @@ fn apply_middleware(
     // immediately outside the user layers — so `ResolvedClientIdentity` is
     // stamped before any user or framework middleware reads
     // ClientAddr / ClientHost / ClientScheme.
+    // Listed OUTERMOST FIRST — see the warning at the top of this function.
     let middle_stack = (
         RequestIdLayer::with_entropy(state.entropy_arc()),
         crate::middleware::LogContextLayer::new(log_context_filter),
@@ -4210,13 +4207,18 @@ fn apply_middleware(
     // outermost `SecurityHeadersLayer` and the `static_gate` layers are applied
     // by `build_router_pre_state` AFTER this function returns (and, crucially,
     // after the MCP dispatch clone is taken), so they are NOT in this list:
-    //   SecurityHeaders (framework outermost — applied in build_router_pre_state) ->
-    //   [static_gate layers — applied in build_router_pre_state, after the MCP
-    //   dispatch clone, outside session and the static cache] ->
-    //   TraceContext + AccessLog/ServerTiming fallbacks + StartupBarrier
-    //   (applied in apply_startup_barrier, outside everything below) ->
-    //   [event-bus context, oauth2 interceptor, inspector, dev live-reload —
-    //   applied in build_router_pre_state] ->
+    //   [MethodOverride, TrustedProxies, loopback ConnectInfo — wrapped around
+    //   the finished Router by `App::run` at the `axum::serve` boundary, so
+    //   they are outside even the startup barrier] ->
+    //   TraceContext -> ServerTiming-fallback -> AccessLog-fallback ->
+    //   StartupBarrier   (all four applied by `apply_startup_barrier`, which
+    //   every entry point calls LAST on the finished router — so this group is
+    //   the outermost thing inside the Router) ->
+    //   SecurityHeaders (framework outermost within build_router_pre_state) ->
+    //   [static_gate layers — applied just inside SecurityHeaders and after the
+    //   MCP dispatch clone, outside session and the static cache] ->
+    //   [event-bus context, oauth2 interceptor] -> Inspector (dev) ->
+    //   dev live-reload (dev)   (all applied in build_router_pre_state) ->
     //   Compression -> Metrics -> ExceptionFilter -> ErrorPageContext ->
     //   ReadYourWrites -> Session ->
     //   RequestId -> LogContext -> ServerTiming -> AccessLog-primary ->
@@ -4229,6 +4231,7 @@ fn apply_middleware(
     //   (In the SSG/ISG path the user layers and a second compression layer are
     //   applied outside the static-first middleware instead — see
     //   `try_build_router_with_static_inner`.)
+    // Listed OUTERMOST FIRST — see the warning at the top of this function.
     let outer_stack = (
         crate::middleware::MetricsLayer::new(state.metrics.clone()),
         ExceptionFilterLayer::new(all_filters),
@@ -4237,12 +4240,8 @@ fn apply_middleware(
     );
     let router = router.layer(outer_stack);
 
-    // Compression keeps its own `Router::layer` call: `CompressionLayer`'s
-    // service changes the response BODY type (`Response<CompressionBody<Body>>`),
-    // which `Route::layer` absorbs via `IntoResponse` but `option_layer`'s
-    // `Either` cannot — both of its branches must share one `Response` type.
-    // Since compression is off by default, this costs an extra nesting level
-    // only for apps that turn it on.
+    // Compression keeps its own `Router::layer` call — see
+    // `apply_compression_middleware` for why it cannot join the tuple above.
     let router = apply_compression_middleware(router, config);
 
     // NOTE: the `static_gate` layers and the framework's outermost

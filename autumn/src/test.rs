@@ -2163,17 +2163,22 @@ impl TestApp {
         // test router has the same nesting depth as the real one (issue #2193).
         // Tuple order is OUTERMOST FIRST: Server-Timing wraps the access log,
         // matching production order.
-        let router = router.layer((
-            tower::util::option_layer(
-                crate::config::server_timing_enabled(&self.config)
-                    .then(|| crate::middleware::ServerTimingLayer::fallback(true)),
-            ),
-            tower::util::option_layer(self.config.log.access_log.then(|| {
-                crate::middleware::AccessLogLayer::fallback(
-                    self.config.log.access_log_exclude.clone(),
-                )
-            })),
-        ));
+        let server_timing_fallback = crate::config::server_timing_enabled(&self.config)
+            .then(|| crate::middleware::ServerTimingLayer::fallback(true));
+        let access_log_fallback = self.config.log.access_log.then(|| {
+            crate::middleware::AccessLogLayer::fallback(self.config.log.access_log_exclude.clone())
+        });
+        // Guarded, because `Router::layer` re-boxes every route even when the
+        // tuple contributes no service: with both fallbacks off this would
+        // otherwise add a nesting level production does not have.
+        let router = if server_timing_fallback.is_some() || access_log_fallback.is_some() {
+            router.layer((
+                tower::util::option_layer(server_timing_fallback),
+                tower::util::option_layer(access_log_fallback),
+            ))
+        } else {
+            router
+        };
         TestClient {
             router,
             probes,
