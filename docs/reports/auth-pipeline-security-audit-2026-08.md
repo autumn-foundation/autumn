@@ -277,8 +277,18 @@ which frames exactly these events as credential changes, and with
 `change_password`'s own "chains are ALWAYS revoked on a credential change"
 comment. Fix: add the same `{rem_table}` user-scoped delete to those five
 transactions (optionally sparing the current device's chain, mirroring the
-`token_digest.ne(current)` session carve-out). *(Credit: flagged by automated
-review on the audit PR and verified against the code.)*
+`token_digest.ne(current)` session carve-out).
+
+A sixth path has the same gap even though it *is* a password reset: when the
+account has TOTP enabled, `reset_password` parks the new digest and returns
+*before* its own remember-chain delete, and the deferred commit that finishes
+the reset in `login_verify` updates the password and revokes sessions but
+**never** deletes the remember rows. So a TOTP-enabled account's password
+reset — the exact "old password compromised" case — leaves remember chains
+live, contradicting the direct-path guarantee. The same `{rem_table}` delete
+must be added to the deferred `login_verify` reset transaction too.
+*(Credit: flagged by automated review on the audit PR and verified against the
+code.)*
 
 ### L13a. `passkey_revoke` deletes a credential with no fresh-auth check
 
@@ -372,8 +382,9 @@ PR and verified against the code.)*
   knowledge).
 - **Remember-me**: Jaspan series/token scheme, hash-at-rest, constant-time
   verify, CAS rotation with race re-evaluation, theft detection nukes the
-  chain, password change/reset revoke remember chains (the TOTP, passkey, and
-  email-change flows do not — see L13), `reauth_pw_ok`
+  chain, the direct password change/reset paths revoke remember chains (but
+  the TOTP-deferred reset and the TOTP/passkey/email-change flows do not — see
+  L13), `reauth_pw_ok`
   cleared so an email-only login can't shortcut a password reauth.
 - **Lockout**: DB-side atomic increment on the normal failure path (the
   post-cool-off reset branch is not — see L15), non-enumerating lock
