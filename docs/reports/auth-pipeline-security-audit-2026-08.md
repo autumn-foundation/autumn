@@ -168,33 +168,45 @@ record the proxy's IP. This fails safe (unspoofable) but shows users wrong
 "device" IPs and collapses lockout telemetry to one IP. Route it through the
 framework's `ClientAddr`/`ProxyResolver` seam instead.
 
-### L3. `/login`, `/forgot-password`, and `/signup` have no request throttle
+### L3. Unauthenticated routes lack throttling and do expensive work before rejection
 
-The magic-link routes carry `#[throttle(limit = 5, per = "1m", key = "ip")]`
-plus a per-email re-mint cooldown; `login`, `forgot_password`, and `signup`
-have neither (and global rate limiting is off by default). Account
-lockout covers per-account brute force, but:
-- one IP can spray one password across many accounts without friction;
-- `/forgot-password` can be used to email-bomb a victim (each request re-mints
-  and re-sends; the 1s timing pad is the only backpressure);
-- `/signup` runs the configured password policy (including the HIBP
-  k-anonymity lookup when breach-checking is enabled) **and** a cost-12 bcrypt
-  hash *before* the uniqueness-enforcing insert, so an attacker can submit a
-  policy-valid password with any address — even an already-registered one — and
-  burn a blocking bcrypt (plus an outbound HIBP request) on every call. That is
-  a direct CPU/-network amplification path on an unauthenticated route.
+Only the magic-link routes carry `#[throttle(limit = 5, per = "1m", key =
+"ip")]`; the rest of the public auth surface has no per-route throttle, and the
+global limiter is off by default. Two anti-patterns recur across these routes,
+so the fix is a class of routes rather than a single endpoint:
 
-Recommendation: `#[throttle]` all three, and a per-email cooldown on
-forgot-password. Caveat on "mirror the magic-link posture": the magic-link
-per-email cooldown is itself **not** race-safe — `magic_link_request` does a
-`SELECT count(...)` for a recent unconsumed token and *then* inserts, so
-concurrent requests for one address all observe `recent == 0` and each inserts
-a row and sends a mail (the per-IP `#[throttle]` bounds one IP but not
-distributed callers). Treat the cooldown as best-effort, not a guarantee, and
-close it with an atomic per-account issuance claim (a unique partial index on
-"live unconsumed token per user", or an `INSERT … ON CONFLICT DO NOTHING`
-gate). The unthrottled TOTP verify endpoint is the sharper instance of this
-family and is tracked separately as M3.
+**(a) Expensive work before the cheap rejection.** Several handlers run a
+cost-12 bcrypt hash and/or the HIBP k-anonymity lookup (when
+`[auth.password].breach_check` is on) *before* the check that would reject the
+request, turning each into an unauthenticated CPU/network amplifier:
+- `login` — bcrypt on every attempt (a dummy hash even for unknown emails, by
+  design for timing); one IP can also spray one password across many accounts.
+- `signup` — full password policy (incl. HIBP) **and** bcrypt *before* the
+  uniqueness insert, so a policy-valid password with any address (even a
+  registered one) burns both per call.
+- `reset_password` — `validate_password` (incl. HIBP) runs *before* the reset
+  token is queried, so any bogus token plus an arbitrary password triggers the
+  outbound HIBP request.
+
+**(b) Count-then-issue email races (TOCTOU) + email-bomb.** The per-email
+"cooldown" routes check eligibility with a `SELECT count(...)` and *then*
+send/insert, sending the mail before recording the new token, so concurrent
+requests for one address all observe `count == 0` and each sends:
+- `magic_link_request` — counts recent unconsumed tokens, then inserts + mails.
+- `resend_confirmation` — counts by `confirm_token_expires_at`, then mails and
+  *afterwards* updates the expiry (so all but the last link are invalidated).
+- `forgot_password` — re-mints and re-sends with only a 1s timing pad as
+  backpressure.
+
+Recommendation: `#[throttle]` **every** unauthenticated auth route
+(`login`, `signup`, `forgot_password`, `reset_password`, `magic_link_request`,
+`resend_confirmation`, and the `/login/magic/verify` + `/login/verify` POSTs);
+where feasible, reject cheaply (token/uniqueness lookup) *before* the bcrypt /
+HIBP work; and replace each count-then-issue email cooldown with an atomic
+per-account issuance claim (a unique partial index on "one live unconsumed
+token per user", or `INSERT … ON CONFLICT DO NOTHING`) so the cooldown is a
+guarantee rather than best-effort. The unthrottled TOTP verify endpoint is the
+sharpest instance of anti-pattern (a) and is tracked separately as M3.
 
 ### L4. Small enumeration timing channel on login lockout bookkeeping
 
