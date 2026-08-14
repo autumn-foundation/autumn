@@ -139,6 +139,13 @@ pub struct AppInfo {
     /// Active profile (e.g. `prod`).
     #[serde(default)]
     pub profile: Option<String>,
+    /// Whether the recording binary was compiled with `debug_assertions` —
+    /// `false` means a release build. `autumn replay` uses this to compile the
+    /// replay binary the same way, so `cfg(debug_assertions)`-gated code and
+    /// release-only failures behave as they did in the failing run. Absent in
+    /// capsules recorded before this field existed.
+    #[serde(default)]
+    pub debug_assertions: Option<bool>,
 }
 
 /// The redacted request a capsule replays.

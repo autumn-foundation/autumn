@@ -605,6 +605,29 @@ enum Commands {
         /// `dev` for capsules that recorded none.
         #[arg(long)]
         profile: Option<String>,
+        /// Compile the replay binary with `cargo build --release`.
+        ///
+        /// Defaults to the build kind the capsule recorded, so
+        /// `cfg(debug_assertions)`-gated code and release-only behaviour
+        /// match the failing run; falls back to a debug build for capsules
+        /// that recorded none.
+        #[arg(long, conflicts_with = "debug")]
+        release: bool,
+        /// Compile the replay binary as a debug build, even when the capsule
+        /// was recorded by a release build.
+        #[arg(long)]
+        debug: bool,
+        /// Cargo features to compile the replay binary with (forwarded to
+        /// `cargo build --features`).
+        ///
+        /// The capsule does not record the recording binary's feature set;
+        /// pass the features the failing binary was built with when they
+        /// gate code the failure depends on.
+        #[arg(long, value_name = "FEATURES")]
+        features: Option<String>,
+        /// Compile without default features (forwarded to `cargo build`).
+        #[arg(long)]
+        no_default_features: bool,
     },
     /// Run or list one-off operational tasks registered by the application.
     Task {
@@ -3149,11 +3172,22 @@ fn run_command(command: Commands) {
             package,
             bin,
             profile,
+            release,
+            debug,
+            features,
+            no_default_features,
         } => run_replay_command(
             &capsule,
             package.as_deref(),
             bin.as_deref(),
             profile.as_deref(),
+            match (release, debug) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
+            features.as_deref(),
+            no_default_features,
         ),
         Commands::Task {
             package,
@@ -3574,12 +3608,18 @@ fn run_replay_command(
     package: Option<&str>,
     bin: Option<&str>,
     profile: Option<&str>,
+    build: Option<bool>,
+    features: Option<&str>,
+    no_default_features: bool,
 ) {
     replay::run(&replay::ReplayOptions {
         capsule,
         package,
         bin,
         profile,
+        build,
+        features,
+        no_default_features,
     });
 }
 

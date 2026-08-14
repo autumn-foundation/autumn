@@ -633,6 +633,19 @@ fn report_response(response: &Response, context: RequestContext, chain: &Arc<Rep
     );
 
     let capture = context.capture.map(|handle| {
+        // A body still streaming when the 5xx head resolved can run more
+        // handler code as it is polled — database queries, clock reads —
+        // after the snapshot below, so those effects would be missing from
+        // the tape while the capsule claims to be complete. A replay drains
+        // the body and would report divergences that never happened; mark
+        // the capsule truncated instead, so replay refuses it honestly.
+        if body_may_still_run(response.body()) {
+            handle.scope().note(
+                "the failing response returned a streaming body; effects produced while \
+                 the body streams are not recorded, so the capsule is marked truncated",
+            );
+            handle.scope().mark_truncated();
+        }
         // Close the scope here rather than leaving it to the capture layer's
         // registry guard: persistence starts as soon as this is dispatched, and
         // a connection recorder still appending effects would be racing the
@@ -661,6 +674,20 @@ fn report_response(response: &Response, context: RequestContext, chain: &Arc<Rep
         },
         capture,
     );
+}
+
+/// Whether a failing response's body may still run handler code after the
+/// response head resolved.
+///
+/// The capture scope closes when the response future resolves, so anything a
+/// lazily-produced body does while it is polled happens after the capsule
+/// snapshot. A body that has already ended can do nothing more; one whose
+/// exact size is known is sitting in memory (axum's `String`/JSON/bytes
+/// responses) and produces no effects when polled. Everything else — an SSE
+/// stream, `Body::from_stream` — is generator code that has not run yet.
+fn body_may_still_run(body: &axum::body::Body) -> bool {
+    use http_body::Body as _;
+    !body.is_end_stream() && body.size_hint().exact().is_none()
 }
 
 /// Convert a caught panic into a sanitized 500 response and report it.
@@ -753,6 +780,22 @@ mod tests {
     }
 
     #[test]
+    fn only_streaming_bodies_count_as_still_running() {
+        use axum::body::Body;
+
+        // In-memory bodies are finished work: nothing runs when they are
+        // polled, so the capsule they belong to is genuinely complete.
+        assert!(!body_may_still_run(&Body::empty()));
+        assert!(!body_may_still_run(&Body::from("boom details")));
+        // A streamed body is generator code that has not run yet — whatever
+        // it does happens after the capture scope closed.
+        let streaming = Body::from_stream(futures::stream::once(async {
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"chunk"))
+        }));
+        assert!(body_may_still_run(&streaming));
+    }
+
+    #[test]
     fn capture_context_can_cross_to_the_blocking_pool() {
         // `persist_capsule` hands the context to `spawn_blocking`, which needs
         // `Send + 'static`. A future field that is neither would only show up
@@ -797,6 +840,77 @@ mod tests {
             .await
             .expect("panic in call must be converted to a response, not propagated");
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A 5xx whose body is produced lazily can keep running handler code —
+    /// queries, clock reads — while the client drains it, after the capsule
+    /// snapshot. Such a capsule must say it is incomplete rather than send a
+    /// replay chasing divergences that never happened.
+    #[tokio::test]
+    async fn a_streaming_5xx_marks_its_capsule_truncated() {
+        use std::convert::Infallible;
+        use std::sync::Arc;
+
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        use crate::capsule::{CaptureHandle, CaptureLayer, CaptureSettings};
+        use crate::log::filter::ParameterFilter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seen: Arc<Mutex<Option<CaptureHandle>>> = Arc::new(Mutex::new(None));
+
+        let inner = {
+            let seen = Arc::clone(&seen);
+            tower::service_fn(move |req: Request<Body>| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    *seen.lock().expect("lock") = req.extensions().get::<CaptureHandle>().cloned();
+                    let stream = futures::stream::once(async {
+                        Ok::<_, Infallible>(bytes::Bytes::from_static(b"partial error page"))
+                    });
+                    let mut response = Response::new(Body::from_stream(stream));
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    Ok::<_, Infallible>(response)
+                }
+            })
+        };
+        // Same order as the router: capture outer, reporting inner, so the
+        // reporting layer finds the handle the capture layer inserted.
+        let reporting = ReportingLayer::new(Vec::new(), true, 1.0).layer(inner);
+        let service = CaptureLayer::new(
+            CaptureSettings {
+                dir: dir.path().to_string_lossy().into_owned(),
+                ..CaptureSettings::default()
+            },
+            Arc::new(ParameterFilter::new(&[], &[])),
+        )
+        .layer(reporting);
+
+        let response = service
+            .oneshot(Request::new(Body::empty()))
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let handle = seen
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("the capture layer inserts a handle");
+        assert!(
+            handle.scope().is_truncated(),
+            "a streaming 5xx body means the capsule cannot vouch for completeness"
+        );
+        assert!(
+            handle
+                .scope()
+                .notes()
+                .iter()
+                .any(|note| note.contains("streaming body")),
+            "the truncation must be explained in the notes: {:?}",
+            handle.scope().notes()
+        );
     }
 
     #[tokio::test]

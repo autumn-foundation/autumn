@@ -765,8 +765,8 @@ fn version_warnings(capsule: &Capsule, warnings: &mut Vec<String>) {
     }
     if capsule.truncated {
         warnings.push(
-            "the capsule is truncated: recording stopped at a size cap, so its tape is \
-             incomplete"
+            "the capsule is truncated: recording stopped before it was complete — its notes \
+             say why"
                 .to_owned(),
         );
     }
@@ -819,10 +819,10 @@ fn redaction_warning(capsule: &Capsule, actual: &CapsuleOutcome, warnings: &mut 
 pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
     if capsule.truncated {
         return Some(
-            "the capsule is truncated — recording hit a size cap partway through, so its \
-             database tape and clock readings are incomplete and a replay would report \
-             divergences that never happened. Raise `[failure_capture] max_capsule_bytes` and \
-             re-record."
+            "the capsule is truncated — recording stopped before it was complete (a size cap, \
+             an unrecordable connection, or a streaming response body), so a replay would \
+             report divergences that never happened. The capsule's notes say exactly why; for \
+             a size cap, raise `[failure_capture] max_capsule_bytes` and re-record."
                 .to_owned(),
         );
     }

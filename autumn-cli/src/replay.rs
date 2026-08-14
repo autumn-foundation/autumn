@@ -17,6 +17,16 @@ pub struct ReplayOptions<'a> {
     /// Explicit `--profile`, or `None` to default to the capsule's recorded
     /// profile (falling back to `dev`).
     pub profile: Option<&'a str>,
+    /// Explicit build kind: `Some(true)` for `--release`, `Some(false)` for
+    /// `--debug`, or `None` to default to the build kind the capsule recorded
+    /// (falling back to a debug build).
+    pub build: Option<bool>,
+    /// Cargo features forwarded to `cargo build --features`. The capsule does
+    /// not record the recording binary's feature set, so feature-gated code
+    /// the failure depends on needs these passed explicitly.
+    pub features: Option<&'a str>,
+    /// Forwarded to `cargo build --no-default-features`.
+    pub no_default_features: bool,
 }
 
 /// Run `autumn replay`.
@@ -38,12 +48,16 @@ pub fn run(opts: &ReplayOptions<'_>) {
         std::process::exit(EXIT_REFUSED);
     });
 
-    eprintln!("autumn replay {}\n", capsule.display());
-    crate::routes::compile_binary(opts.package, opts.bin);
-    let binary = crate::routes::find_binary(opts.package, opts.bin);
-
     let recorded_profile = recorded_profile(&capsule);
     let profile = effective_profile(opts.profile, recorded_profile.as_deref());
+    let release = effective_release(opts.build, recorded_debug_assertions(&capsule));
+
+    eprintln!("autumn replay {}\n", capsule.display());
+    compile_binary(opts, release);
+    let mut binary = crate::routes::find_binary(opts.package, opts.bin);
+    if release {
+        binary = release_path(binary);
+    }
 
     let mut command = Command::new(&binary);
     command
@@ -97,6 +111,89 @@ fn effective_profile(explicit: Option<&str>, recorded: Option<&str>) -> String {
     }
 }
 
+/// Whether the recording binary was compiled with `debug_assertions`
+/// (`app.debug_assertions`), when the capsule recorded it.
+///
+/// Best-effort, like [`recorded_profile`]: an unreadable or malformed capsule
+/// returns `None` here and is then refused properly by the app binary.
+fn recorded_debug_assertions(capsule: &Path) -> Option<bool> {
+    let json = std::fs::read_to_string(capsule).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    value.get("app")?.get("debug_assertions")?.as_bool()
+}
+
+/// Whether the replay binary is compiled `--release`.
+///
+/// An explicit `--release`/`--debug` wins (with a warning when it differs
+/// from the recording — `cfg(debug_assertions)`-gated code and release-only
+/// behaviour can then legitimately diverge); otherwise the capsule's recorded
+/// build kind, so a failure recorded by a release binary replays in one; a
+/// debug build only when the capsule recorded none.
+fn effective_release(explicit: Option<bool>, recorded_debug_assertions: Option<bool>) -> bool {
+    let recorded = recorded_debug_assertions.map(|debug| !debug);
+    match (explicit, recorded) {
+        (Some(explicit), Some(recorded)) if explicit != recorded => {
+            eprintln!(
+                "warning: replaying with a {} build, but the capsule was recorded by a {} \
+                 build — `cfg(debug_assertions)` code paths and release-only behaviour may \
+                 differ from the failing run",
+                build_kind(explicit),
+                build_kind(recorded)
+            );
+            explicit
+        }
+        (Some(explicit), _) => explicit,
+        (None, Some(recorded)) => recorded,
+        (None, None) => false,
+    }
+}
+
+/// Human name for a build kind, for the mismatch warning.
+const fn build_kind(release: bool) -> &'static str {
+    if release { "release" } else { "debug" }
+}
+
+/// Compile the app binary with the replay's build configuration.
+///
+/// A plain `cargo build` would produce a default-features debug binary no
+/// matter how the failing binary was built, and `cfg(debug_assertions)`- or
+/// feature-gated code would then diverge from the recording before the
+/// request is even replayed.
+fn compile_binary(opts: &ReplayOptions<'_>, release: bool) {
+    let mut cargo = Command::new("cargo");
+    cargo.arg("build");
+    if release {
+        cargo.arg("--release");
+    }
+    if let Some(features) = opts.features {
+        cargo.args(["--features", features]);
+    }
+    if opts.no_default_features {
+        cargo.arg("--no-default-features");
+    }
+    if let Some(pkg) = opts.package {
+        cargo.args(["-p", pkg]);
+    }
+    if let Some(bin) = opts.bin {
+        cargo.args(["--bin", bin]);
+    }
+
+    let status = cargo.status().expect("failed to run cargo build");
+    if !status.success() {
+        eprintln!("\u{2717} Compilation failed");
+        std::process::exit(1);
+    }
+}
+
+/// Swap a resolved `<target>/debug/<bin>` path to the release directory.
+fn release_path(path: PathBuf) -> PathBuf {
+    if let (Some(target_dir), Some(bin)) = (path.parent().and_then(Path::parent), path.file_name())
+    {
+        return target_dir.join("release").join(bin);
+    }
+    path
+}
+
 /// Resolve the capsule argument to an absolute path.
 ///
 /// Absolute because the child is free to resolve relative paths against its own
@@ -138,6 +235,46 @@ mod tests {
         assert_eq!(effective_profile(None, None), "dev");
         assert_eq!(effective_profile(Some("staging"), Some("prod")), "staging");
         assert_eq!(effective_profile(Some("prod"), Some("prod")), "prod");
+    }
+
+    #[test]
+    fn replay_defaults_to_the_capsules_recorded_build_kind() {
+        // Recorded debug_assertions = false means a release build was failing.
+        assert!(effective_release(None, Some(false)));
+        assert!(!effective_release(None, Some(true)));
+        // Old capsules recorded nothing: a debug build, as before.
+        assert!(!effective_release(None, None));
+        // An explicit flag always wins.
+        assert!(effective_release(Some(true), Some(true)));
+        assert!(!effective_release(Some(false), Some(false)));
+    }
+
+    #[test]
+    fn recorded_debug_assertions_reads_app_debug_assertions_from_the_capsule_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("capsule.json");
+        std::fs::write(
+            &path,
+            r#"{"app":{"name":"shop","profile":"prod","debug_assertions":false}}"#,
+        )
+        .expect("write");
+        assert_eq!(recorded_debug_assertions(&path), Some(false));
+
+        std::fs::write(&path, r#"{"app":{"name":"shop"}}"#).expect("write");
+        assert_eq!(
+            recorded_debug_assertions(&path),
+            None,
+            "capsules recorded before the field existed carry no build kind"
+        );
+    }
+
+    #[test]
+    fn release_path_swaps_only_the_profile_directory() {
+        let debug = PathBuf::from("/work/target/debug/app");
+        assert_eq!(
+            release_path(debug),
+            PathBuf::from("/work/target/release/app")
+        );
     }
 
     #[test]

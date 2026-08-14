@@ -279,6 +279,10 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
         app: AppInfo {
             name: settings.app_name.clone(),
             profile: settings.profile.clone(),
+            // The build that *recorded* is by definition the build that ran,
+            // so this is read here rather than configured: replay compiles
+            // the same way and `cfg(debug_assertions)` code paths line up.
+            debug_assertions: Some(cfg!(debug_assertions)),
         },
         request,
         outcome: scrub_outcome(outcome, &redacted),
@@ -427,6 +431,11 @@ fn retained_before_write(max_capsules: usize) -> usize {
 /// Delete the oldest capsules beyond `keep`, sparing pinned files always and
 /// files written within [`PRUNE_GRACE`] up to [`grace_allowance`].
 ///
+/// Only names produced by [`file_name`] are candidates at all
+/// ([`capsule_stamp`]): the capture directory is user configuration and may
+/// hold files this module did not write — an application's `state.json`
+/// sitting next to the capsules is not retention fodder.
+///
 /// File names begin with a sortable timestamp, so lexical order is
 /// chronological order and the same prefix gives each file's age without a
 /// `stat` — and, more importantly, without trusting an mtime that a copy or a
@@ -444,7 +453,7 @@ fn prune(dir: &Path, keep: usize, now: DateTime<Utc>) {
     let mut names: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter(|path| capsule_stamp(path).is_some())
         .collect();
     if names.len() <= keep {
         return;
@@ -475,22 +484,26 @@ fn prune(dir: &Path, keep: usize, now: DateTime<Utc>) {
 
 /// Whether a capsule file's name says it was written less than
 /// [`PRUNE_GRACE`] ago.
-///
-/// A name this writer did not produce has no readable timestamp; it is not a
-/// capsule anyone is about to follow a link to, so it is left prunable rather
-/// than pinned in the directory forever.
 fn written_within_grace(path: &Path, now: DateTime<Utc>) -> bool {
-    let Some(stamp) = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.split('-').next())
-    else {
-        return false;
-    };
-    let Ok(written) = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S%.f") else {
-        return false;
-    };
-    now.signed_duration_since(written.and_utc()) < PRUNE_GRACE
+    capsule_stamp(path)
+        .is_some_and(|written| now.signed_duration_since(written.and_utc()) < PRUNE_GRACE)
+}
+
+/// The timestamp a [`file_name`]-shaped name carries, or `None` for any other
+/// file.
+///
+/// This is what makes a file *this module's to delete*: the whole shape is
+/// checked — `<timestamp>-<6-digit sequence>-<id>.json` — not just a `.json`
+/// extension, because `[failure_capture] dir` points wherever the user says
+/// and pruning must never eat a file some other writer put there.
+fn capsule_stamp(path: &Path) -> Option<chrono::NaiveDateTime> {
+    let name = path.file_name()?.to_str()?.strip_suffix(".json")?;
+    let (stamp, rest) = name.split_once('-')?;
+    let (sequence, id) = rest.split_once('-')?;
+    if sequence.len() != 6 || !sequence.bytes().all(|b| b.is_ascii_digit()) || id.is_empty() {
+        return None;
+    }
+    chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S%.f").ok()
 }
 
 /// Read a capsule back from disk.
@@ -507,6 +520,40 @@ pub fn load_capsule(path: &Path) -> Result<Capsule, CapsuleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[failure_capture] dir` is user configuration: an application is free
+    /// to keep its own files next to the capsules, and retention must never
+    /// delete what it did not write — even at `keep = 0`, and even for names
+    /// that *almost* look like capsules.
+    #[test]
+    fn pruning_never_deletes_files_the_capsule_writer_did_not_create() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let foreign = [
+            "state.json",
+            "aaa.json",
+            // Timestamp but no sequence/id: not a name `file_name` produces.
+            "20200101T000000.000000-boom.json",
+            // Sequence of the wrong width.
+            "20200101T000000.000000-01-boom.json",
+            // No parseable timestamp in front.
+            "notastamp-000001-boom.json",
+        ];
+        for name in foreign {
+            std::fs::write(dir.path().join(name), b"{}").expect("write");
+        }
+        let capsule = dir.path().join("20200101T000000.000000-000001-aaa.json");
+        std::fs::write(&capsule, b"{}").expect("write");
+
+        prune(dir.path(), 0, Utc::now());
+
+        assert!(!capsule.exists(), "the real capsule is over the cap");
+        for name in foreign {
+            assert!(
+                dir.path().join(name).exists(),
+                "{name} was not written by capsule persistence and must survive"
+            );
+        }
+    }
 
     #[test]
     fn a_pinned_capsule_survives_pruning_past_the_grace_window() {

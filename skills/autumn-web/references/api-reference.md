@@ -1123,7 +1123,7 @@ enabled = true            # default: false — arms capture layer, recording poo
 dir = "tmp/autumn-capsules"
 max_body_bytes = 65536    # request-body copy cap (64 KiB)
 max_capsule_bytes = 1048576
-max_capsules = 50         # oldest-first prune, before each write
+max_capsules = 50         # oldest-first prune (capsule-named files only), before each write
 ```
 
 - `autumn replay <file>` exit codes: `0` reproduced (status + message +
@@ -1133,6 +1133,14 @@ max_capsules = 50         # oldest-first prune, before each write
   fail-closed outbound HTTP, no port bound, DB served from the capsule's tape
   by an in-process stub server. App-registered state initializers still run
   as written (documented boundary — point them at stubs when replaying).
+- `autumn replay` compiles the replay binary with the build kind the capsule
+  recorded (`app.debug_assertions`) so `cfg(debug_assertions)` code paths
+  match the failing run; override with `--release`/`--debug`, and pass
+  `--features`/`--no-default-features` when feature-gated code matters (the
+  feature set itself is not recorded).
+- A failing response with a *streaming* body (SSE, `Body::from_stream`) marks
+  its capsule truncated: effects produced while the body streams are not on
+  the tape.
 - `ErrorEvent::capsule: Option<CapsuleRef>` — the file is on disk (and pinned
   against pruning) before reporters run.
 - DB capture needs plaintext-TCP PostgreSQL: TLS-required URLs, Unix sockets,

@@ -162,7 +162,9 @@ max_capsules = 50                 # default: 50
   capsule `truncated`, and a truncated capsule is **refused** by replay rather
   than replayed misleadingly.
 - **`max_capsules`** is retention. It is clamped to at least 1: a zero would
-  otherwise mean "record the failure, then throw it away".
+  otherwise mean "record the failure, then throw it away". Pruning only ever
+  deletes files whose names match the capsule pattern — anything else you keep
+  in the directory is left alone.
 
 Every key has an environment override:
 
@@ -281,9 +283,14 @@ $ autumn replay tmp/autumn-capsules/20260812T101413.882104-000000-01JB2K7Q.json
 | --- | --- |
 | `-p`, `--package <PKG>` | Package to build and run, for workspaces |
 | `--bin <BIN>` | Binary target, for packages with several |
-| `--profile <PROFILE>` | Profile forwarded to the app as `AUTUMN_ENV`/`AUTUMN_PROFILE` (default `dev`) |
+| `--profile <PROFILE>` | Profile forwarded to the app as `AUTUMN_ENV`/`AUTUMN_PROFILE` (defaults to the profile the capsule recorded, else `dev`) |
+| `--release` / `--debug` | Cargo build kind for the replay binary (defaults to the build kind the capsule recorded, else a debug build) |
+| `--features <FEATURES>`, `--no-default-features` | Cargo features for the replay binary — the capsule cannot record the recording binary's feature set, so pass the failing build's features when they gate code the failure depends on |
 
-The CLI compiles your application and runs it with `AUTUMN_REPLAY_CAPSULE` set —
+The CLI compiles your application — with the same build kind the failing
+binary used, so `cfg(debug_assertions)`-gated code and release-only behaviour
+(overflow handling, optimizer-dependent timing) line up — and runs it with
+`AUTUMN_REPLAY_CAPSULE` set —
 your app, not the CLI, is the only thing that knows its routes, state and
 configuration. The app then boots into **replay mode**, which differs from a
 normal boot in exactly the ways that keep a replay offline and deterministic:
@@ -550,6 +557,10 @@ This is the first slice. What it does not do, stated plainly:
   the connection's tape is dropped and the capsule marked truncated.
 - **Shard pools are not recorded.** `[[database.shards]]` connections are built
   separately; a request that checks one out has its capsule noted and truncated.
+- **A failing response with a streaming body ends the recording at the response
+  head.** An SSE or `Body::from_stream` 5xx keeps running handler code while
+  the client reads it; those effects are not on the tape, so the capsule is
+  noted and marked truncated rather than presented as replayable.
 - **A handler that extracts a subsystem the replay does not boot** — a
   `Mailer`, a `BlobStore` — fails during replay and is reported as a mismatch
   rather than taking the replay process down.

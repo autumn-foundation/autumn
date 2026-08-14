@@ -703,8 +703,10 @@ where
                 .insert(CaptureHandle(Arc::clone(&scope)));
 
             // The scope ends when the response future resolves, so effects a
-            // streaming body produces afterwards are not captured — everything
-            // a failure needs happens during handler execution.
+            // streaming body produces afterwards are not captured. The
+            // reporting layer marks a failing response whose body is still
+            // streaming at that point as truncated (with a note), so such a
+            // capsule is refused by replay rather than presented as complete.
             CAPSULE_SCOPE.scope(scope, inner.call(req)).await
         })
     }
