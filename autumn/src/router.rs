@@ -260,7 +260,7 @@ pub struct RouterContext {
     pub error_page_renderer: Option<SharedRenderer>,
     /// Custom session store installed via
     /// [`AppBuilder::with_session_store`](crate::app::AppBuilder::with_session_store).
-    /// When `Some`, [`apply_session_layer`](crate::session::apply_session_layer)
+    /// When `Some`, [`build_session_layer`](crate::session::build_session_layer)
     /// uses it directly and skips the config-driven backend selection.
     pub session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
@@ -981,11 +981,24 @@ fn build_router_pre_state(
     // middleware), so this block is a no-op there.
     let router = if defer_security_headers {
         router
-    } else {
-        let router =
-            apply_layers_in_registration_order(router, static_gate_layers, "Pre-static gate");
+    } else if static_gate_layers.is_empty() {
         router.layer(crate::security::SecurityHeadersLayer::from_config(
             &config.security.headers,
+        ))
+    } else {
+        // ONE application for both: a `tower-layer` tuple puts its FIRST
+        // element OUTERMOST, so `SecurityHeadersLayer` stays outside the gates
+        // — the same order the two separate `.layer()` calls produced (the
+        // gates were applied first, then security headers wrapped them). A
+        // registered gate therefore costs the framework no extra nesting level
+        // at all.
+        tracing::debug!(
+            count = static_gate_layers.len(),
+            "Pre-static gate Tower layers applied"
+        );
+        router.layer((
+            crate::security::SecurityHeadersLayer::from_config(&config.security.headers),
+            ComposedRegisteredLayers::new(static_gate_layers),
         ))
     };
 
@@ -3806,6 +3819,169 @@ fn build_idempotency_layers(
     }))
 }
 
+/// A run of user-registered layers ([`AppBuilder::layer`](crate::app::AppBuilder::layer),
+/// [`AppBuilder::static_gate`](crate::app::AppBuilder::static_gate), plugin
+/// layers) composed into a SINGLE `tower::Layer`, so an arbitrary number of
+/// registrations costs one application instead of one per registration.
+///
+/// # Why this type exists
+///
+/// A `tower-layer` tuple needs every member's type at compile time; a `Vec` of
+/// registrations does not have that. Erasing each registration to
+/// [`ErasedAppLayer`](crate::app::ErasedAppLayer) at registration time makes
+/// them homogeneous, and this type folds the homogeneous run by hand. The
+/// result is one `Layer` that can sit inside `apply_middleware`'s single merged
+/// tuple, so operator layers no longer deepen the framework's per-request
+/// clone cascade (#2198) — the framework's overhead becomes a constant instead
+/// of a function of how many layers an operator or plugin attached.
+///
+/// The fold costs exactly one boxing adapter for the whole run (the
+/// `ErasedAppService::new` seed), regardless of how many layers it contains.
+/// That box does NOT clone on call — `BoxCloneSyncService::call` forwards to
+/// the inner service — so it adds no traversal to the cascade either; its
+/// runtime cost is one `Box::pin` per request.
+///
+/// # Why an EMPTY run is still composed in `apply_middleware`
+///
+/// It is not dead weight there: it is the type boundary that makes the single
+/// merged application compile in reasonable time. `tower::util::option_layer`
+/// yields `Either<L::Service, S>`, in which the inner service type `S` appears
+/// TWICE — so a chain of *n* conditional layers with no erasure between them
+/// expands to a type of size `O(2ⁿ)`, and rustc proves `Router::layer`'s
+/// `Send`/`Sync`/`Clone` obligations over that expansion. The ingress stack has
+/// twelve `option_layer`s. Split at this slot they are 5 above and 7 below
+/// (`2⁵ + 2⁷`); merged into one un-erased chain they are `2¹²`, which took
+/// rustc over twenty minutes to check `apply_middleware` alone. Dropping this
+/// boundary "to save a box when no layer is registered" brings that back.
+///
+/// `apply_layers_in_registration_order` (the SSG/ISG path) does the opposite
+/// and skips an empty run: there the run is applied on its own `Router::layer`
+/// call, so there is no long chain to break and the box would buy nothing.
+#[derive(Clone)]
+struct ComposedRegisteredLayers(Vec<crate::app::ErasedAppLayer>);
+
+impl ComposedRegisteredLayers {
+    /// Compose a run of registrations, preserving their registration order.
+    fn new(registrations: Vec<crate::app::CustomLayerRegistration>) -> Self {
+        Self(registrations.into_iter().map(|reg| reg.layer).collect())
+    }
+}
+
+impl<S> tower::Layer<S> for ComposedRegisteredLayers
+where
+    S: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Service = crate::app::ErasedAppService;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        // FOLD DIRECTION — the contract is "first registered ends up
+        // OUTERMOST on ingress", matching `tower::ServiceBuilder` and the
+        // behaviour of the pre-#2198 loop.
+        //
+        // Proof that `.rev()` is right here. `Layer::layer(inner)` returns a
+        // service that WRAPS `inner`, so each successive call in this fold
+        // produces something strictly more OUTER than what came before, and
+        // the LAST registration visited ends up outermost. Visiting the vec in
+        // reverse therefore visits `registrations[0]` last, putting the
+        // first-registered layer outermost. ∎
+        //
+        // This happens to be the same `.rev()` the old loop used, but for a
+        // different reason: there, `router = reg.apply(router)` made the LAST
+        // `Router::layer` CALL outermost. Both forms accumulate outward, so
+        // both reverse; a `tower-layer` TUPLE is the form that does not (its
+        // FIRST element is outermost). Getting this backwards still compiles —
+        // every layer here is `Request -> Response` with `Error = Infallible`
+        // — so only behavioural tests catch it.
+        let mut svc = crate::app::ErasedAppService::new(inner);
+        for registered in self.0.iter().rev() {
+            svc = registered.layer(svc);
+        }
+        svc
+    }
+}
+
+/// Re-normalize a group's response body back to `axum::body::Body`.
+///
+/// Every `Router::layer` call ends in `Route::new`, which maps the produced
+/// service's response through `IntoResponse::into_response` — so each of the
+/// separate `.layer()` calls this file used to make silently converted a
+/// group's exotic response body (e.g. `LogContextLayer`'s `LogContextBody`)
+/// back to `axum::body::Body` at the group boundary. Collapsing those calls
+/// into one merged tuple removes those implicit conversions, so a boundary
+/// between a body-rewrapping group and a member that demands
+/// `Response<axum::body::Body>` needs this explicit equivalent.
+///
+/// It costs nothing measurable: no box, no service clone on call, and the
+/// mapping is a fn pointer applied to the response future's output.
+///
+/// Deliberately a UNIT struct rather than a generic constructor returning
+/// `tower::util::MapResponseLayer<fn(Response<B>) -> Response>`: an inference
+/// variable for `B` sitting in the middle of the merged tuple makes rustc
+/// re-normalize the whole nested `Layer`/`Service` projection chain and pushes
+/// this function's type-check into the tens of minutes. With a unit struct,
+/// `B` is a projection out of the inner service and never an inference
+/// variable at the call site.
+#[derive(Clone, Copy)]
+struct NormalizeBodyLayer;
+
+impl<S> tower::Layer<S> for NormalizeBodyLayer {
+    type Service = NormalizeBody<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        NormalizeBody(inner)
+    }
+}
+
+/// Service half of [`NormalizeBodyLayer`].
+#[derive(Clone, Copy)]
+struct NormalizeBody<S>(S);
+
+/// Free function (not a closure) so it can be named as a `fn` pointer in
+/// `NormalizeBody::Future`, keeping the future un-boxed.
+fn into_response_result<B, E>(
+    result: Result<http::Response<B>, E>,
+) -> Result<axum::response::Response, E>
+where
+    http::Response<B>: axum::response::IntoResponse,
+{
+    result.map(axum::response::IntoResponse::into_response)
+}
+
+impl<S, B> tower::Service<axum::extract::Request> for NormalizeBody<S>
+where
+    S: tower::Service<axum::extract::Request, Response = http::Response<B>>,
+    http::Response<B>: axum::response::IntoResponse,
+{
+    type Response = axum::response::Response;
+    type Error = S::Error;
+    type Future = futures::future::Map<
+        S::Future,
+        fn(Result<http::Response<B>, S::Error>) -> Result<axum::response::Response, S::Error>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::extract::Request) -> Self::Future {
+        futures::FutureExt::map(
+            self.0.call(req),
+            into_response_result::<B, S::Error> as fn(_) -> _,
+        )
+    }
+}
+
 #[allow(
     clippy::cognitive_complexity,
     clippy::too_many_lines,
@@ -3859,19 +4035,21 @@ fn apply_middleware(
     // `Router::layer` call cost a flat 16 for any N.
     // See issue #2193.
     //
-    // So the layers below are composed into tuples and applied in three
-    // `Router::layer` calls instead of ~16. `tower-layer` implements `Layer` for
-    // tuples with the FIRST element outermost, so each tuple reads top-to-bottom
-    // in ingress order — the same direction as the layer-order comments in this
-    // file.
+    // So the layers below are composed into tuples and applied in ONE
+    // `Router::layer` call instead of ~16 (#2198 collapsed the last four:
+    // the inner group, the user layers, the middle group, and the session).
+    // `tower-layer` implements `Layer` for tuples with the FIRST element
+    // outermost, so each tuple reads top-to-bottom in ingress order — the same
+    // direction as the layer-order comments in this file.
     //
     // ⚠ THIS IS THE OPPOSITE of repeated `Router::layer` calls, where the LAST
     // call ends up outermost. When moving a layer between the two forms, the
     // order must be reversed. (The same applies to `tower::ServiceBuilder`:
-    // first-added is outermost — which is why `apply_layers_in_registration_order`
-    // below iterates in reverse.) Getting this backwards still compiles and still
-    // type-checks, because every layer here is `Route -> Route` with
-    // `Error = Infallible`; only the behavioural tests would catch it.
+    // first-added is outermost — which is why `ComposedRegisteredLayers`, which
+    // folds a run by hand rather than as a tuple, iterates in reverse.) Getting
+    // this backwards still compiles and still type-checks, because every layer
+    // here is `Request -> Response` with `Error = Infallible`; only the
+    // behavioural tests would catch it.
     //
     // `tower-layer` implements `Layer` for tuples up to 16 elements; the largest
     // group below has 13. Past 16, nest a sub-tuple as a single element —
@@ -3885,11 +4063,12 @@ fn apply_middleware(
 
     // Innermost group: everything from the handler out to (but not including)
     // the user-registered layers. Listed OUTERMOST FIRST.
-    // Built FIRST: this is the only builder that can fail the whole router
-    // build (the production memory-backend guard), and the others have side
-    // effects — `tracing::info!` lines, and a lazy Redis connection manager when
-    // the rate limiter is Redis-backed — that should not run on the way to a
-    // fail-fast `Err`.
+    // Built FIRST: this is the first of the two builders that can fail the whole
+    // router build (here, the production memory-backend guard for submit tokens;
+    // the other is `build_session_layer` further down, on the session backend
+    // plan), and the infallible builders have side effects — `tracing::info!`
+    // lines, and a lazy Redis connection manager when the rate limiter is
+    // Redis-backed — that should not run on the way to a fail-fast `Err`.
     let submit_token_layer = build_submit_token_layer(config, is_production)?;
     let (body_limit, upload_config) = build_upload_layers(config);
     let trusted_host_policy = TrustedHostPolicy::from_config(config);
@@ -3941,26 +4120,21 @@ fn apply_middleware(
         }),
         tower::util::option_layer(build_ingress_cors_layer(config)),
     );
-    router = router.layer(inner_stack);
 
-    // User-registered Tower layers (AppBuilder::layer). Applied after the group
-    // above, so they wrap all of it.  Iterate in reverse so the first registered
-    // layer ends up outermost among user layers — matching
-    // tower::ServiceBuilder ordering.
-    //
-    // These stay one `Router::layer` call each: the registrations are opaque
-    // `FnOnce(Router) -> Router` appliers carrying a `TypeId`/`type_name` that
-    // `AppBuilder::has_layer`/`get_layer_types` expose publicly, so they cannot
-    // be folded into the tuple above without changing that API.
+    // User-registered Tower layers (AppBuilder::layer) wrap the group above.
+    // They are erased at registration time and folded into
+    // `ComposedRegisteredLayers`, so however many an operator (or a plugin —
+    // `Plugin::build` receives the same `AppBuilder`) attaches, they occupy ONE
+    // slot in the single merged application below rather than one
+    // `Router::layer` call each. The `TypeId`/`type_name` that
+    // `AppBuilder::has_layer`/`get_layer_types` expose publicly ride along on
+    // the registration and are untouched by the erasure.
     //
     // When a static dist dir is active (SSG/ISG build), these layers are
     // NOT passed here — they are extracted by try_build_router_with_static_inner
     // and applied outside the static-first middleware instead, so they can
     // process pre-rendered responses without creating a session dependency.
     let custom_layer_count = custom_layers.len();
-    for registered in custom_layers.into_iter().rev() {
-        router = (registered.apply)(router);
-    }
     if custom_layer_count > 0 {
         tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");
     }
@@ -4094,19 +4268,19 @@ fn apply_middleware(
         tower::util::option_layer(tenancy_layer),
         build_trusted_proxies_layer(config),
     );
-    router = router.layer(middle_stack);
 
     // Pre-clone signing keys for the RYWW middleware (session mode needs to
     // sign/verify the `autumn.ryw` cookie; `signing_keys_opt` is consumed below).
     #[cfg(feature = "db")]
     let signing_keys_for_ryw = signing_keys_opt.clone();
 
-    // Session gets its own `Router::layer` call: each backend produces a
-    // differently-typed `SessionLayer<Store>`, so it cannot be a fixed member of
-    // a tuple without erasing the store type (which would cost a boxed future
-    // per store operation — a worse trade than the one nesting level it saves).
-    let router = crate::session::apply_session_layer(
-        router,
+    // The session used to need its own `Router::layer` call — each backend
+    // produces a differently-typed `SessionLayer<Store>`, which no fixed tuple
+    // member can be. `build_session_layer` monomorphizes it to
+    // `SessionLayer<ArcSessionStore>` so it joins the merged tuple below; see
+    // that function for the boxed-future-per-store-op cost that buys the
+    // nesting level back.
+    let session_layer = crate::session::build_session_layer(
         &config.session,
         config.profile.as_deref(),
         session_store,
@@ -4220,14 +4394,18 @@ fn apply_middleware(
     //   [event-bus context, oauth2 interceptor] -> Inspector (dev) ->
     //   dev live-reload (dev)   (all applied in build_router_pre_state) ->
     //   Compression -> Metrics -> ExceptionFilter -> ErrorPageContext ->
-    //   ReadYourWrites -> Session ->
+    //   ReadYourWrites -> Session -> NormalizeBody ->
     //   RequestId -> LogContext -> ServerTiming -> AccessLog-primary ->
     //   Reporting -> Timeout -> Tenancy -> TrustedProxies ->
-    //   [user layers, non-static build] ->
+    //   [user layers, non-static build — ONE slot however many are registered] ->
     //   UploadConfig -> BodyLimit -> WebhookReplayCleanup -> LoadShed ->
     //   Maintenance -> RateLimitPrincipal -> RateLimit ->
     //   MethodOverrideRejection -> BotProtection -> CSRF -> SubmitToken ->
     //   TrustedHost -> CORS -> [asset cache-control] -> handler
+    //   (Everything from `Metrics` through `CORS` is ONE `Router::layer` call —
+    //   the merged tuple below; `Compression` keeps its own. `NormalizeBody` is
+    //   a body-type adapter with no request-path behaviour, listed only so this
+    //   order reads against that tuple member-for-member.)
     //   (In the SSG/ISG path the user layers and a second compression layer are
     //   applied outside the static-first middleware instead — see
     //   `try_build_router_with_static_inner`.)
@@ -4238,7 +4416,35 @@ fn apply_middleware(
         crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev },
         ryw_layer,
     );
-    let router = router.layer(outer_stack);
+
+    // ── The single merged application ───────────────────────────────────────
+    //
+    // One `Router::layer` call for the whole ingress stack. A `tower-layer`
+    // tuple puts its FIRST element OUTERMOST, so this tuple reads in ingress
+    // order — outer group, then session, then the middle group, then the
+    // operator's own layers, then the inner group — which is exactly the order
+    // the four separate `.layer()` calls this replaces produced. (They ran
+    // inner-group-first precisely BECAUSE repeated calls accumulate outward:
+    // the last call was outermost. Collapsing a run therefore reverses it; see
+    // the warning at the top of this function.)
+    //
+    // Each `.layer()` call removed here is a whole `BoxCloneSyncService`
+    // nesting level that every request above it deep-clones on every call, so
+    // the four-to-one collapse is a quadratic-to-linear change, not a
+    // constant-factor one (#2193, #2198).
+    //
+    // `ComposedRegisteredLayers` occupies the user-layer slot UNCONDITIONALLY,
+    // even when no layer is registered — see its docs for why an empty run
+    // still earns its one boxing adapter (it is the compile-time boundary that
+    // keeps this single application's type from blowing up).
+    let router = router.layer((
+        outer_stack,
+        session_layer,
+        NormalizeBodyLayer,
+        middle_stack,
+        ComposedRegisteredLayers::new(custom_layers),
+        inner_stack,
+    ));
 
     // Compression keeps its own `Router::layer` call — see
     // `apply_compression_middleware` for why it cannot join the tuple above.
@@ -4252,22 +4458,28 @@ fn apply_middleware(
     Ok(router)
 }
 
-/// Apply a set of user-registered layer registrations so that the
-/// first-registered layer ends up outermost on ingress — matching
-/// [`tower::ServiceBuilder`] ordering. Returns the wrapped router.
+/// Apply a set of user-registered layer registrations in ONE `Router::layer`
+/// call, so that the first-registered layer ends up outermost on ingress —
+/// matching [`tower::ServiceBuilder`] ordering. Returns the wrapped router.
+///
+/// An empty run returns the router untouched: no application, and therefore no
+/// `BoxCloneSyncService` nesting level and no boxing adapter.
+///
+/// Used by the SSG/ISG path, which drains the custom layers and the static
+/// gates out of `apply_middleware` and applies them outside the static-first
+/// middleware instead. The fully-dynamic path composes both runs into larger
+/// merged applications (`apply_middleware` and `build_router_pre_state`).
 fn apply_layers_in_registration_order(
-    mut router: axum::Router<AppState>,
+    router: axum::Router<AppState>,
     layers: Vec<crate::app::CustomLayerRegistration>,
     what: &str,
 ) -> axum::Router<AppState> {
     let count = layers.len();
-    for registered in layers.into_iter().rev() {
-        router = (registered.apply)(router);
+    if count == 0 {
+        return router;
     }
-    if count > 0 {
-        tracing::debug!(count, "{what} Tower layers applied");
-    }
-    router
+    tracing::debug!(count, "{what} Tower layers applied");
+    router.layer(ComposedRegisteredLayers::new(layers))
 }
 
 async fn trusted_host_middleware(
@@ -4652,8 +4864,9 @@ pub fn try_build_router_with_static_inner(
 
     // Apply user layers OUTSIDE the static middleware so they wrap it and can
     // process both static and dynamic responses (e.g. compress the HTML on
-    // the way out). Iterate in reverse so the first registered layer ends up
-    // outermost — matching tower::ServiceBuilder ordering.
+    // the way out). The first registered layer ends up outermost — matching
+    // `tower::ServiceBuilder` ordering; the fold that gets it there lives in
+    // `apply_layers_in_registration_order` / `ComposedRegisteredLayers`.
     router = apply_layers_in_registration_order(
         router,
         custom_layers,
@@ -11266,7 +11479,7 @@ mod trusted_host_tests {
         crate::app::CustomLayerRegistration {
             type_id: std::any::TypeId::of::<()>(),
             type_name: "redirect_gate",
-            apply: Box::new(move |router| router.layer(gate)),
+            layer: tower::util::BoxCloneSyncServiceLayer::new(gate),
         }
     }
 

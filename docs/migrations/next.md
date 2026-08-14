@@ -16,20 +16,26 @@
 - **Expected upgrade effort:** none for application code, beyond two new
   deprecation warnings if you call `scheduler::now_unix_secs` /
   `now_unix_duration` (see *Deprecations* below). Small for **plugins
-  and libraries** that build `autumn_web::Route` values by hand, and for **JSON
-  API clients** of a scaffolded model that declares a `lock_version` column.
+  and libraries** that build `autumn_web::Route` values by hand, for **JSON
+  API clients** of a scaffolded model that declares a `lock_version` column,
+  and for the (rare) **layer author** who implemented
+  `tower::Layer<axum::routing::Route>` for a concrete type instead of
+  generically.
 - **MSRV delta:** `1.88.0` -> `1.88.0` (unchanged so far)
 - **Carried dependency majors:** none so far
 
 ## Summary
 
 Nothing in the unreleased line changes how an application written against
-0.6.x compiles or behaves. There are two breaks, both narrow. The first is at
+0.6.x compiles or behaves. There are three breaks, all narrow. The first is at
 the *route-construction* seam: `Route` and `StaticRouteMeta` gained a field, so
 code that builds those structs with a literal — which in practice means plugins
 assembling a `Vec<Route>` rather than using `routes![]` — has to name it. The
 second is on the wire, not in Rust: a model declaring a `lock_version` column
-now requires JSON `PUT`/`PATCH` clients to send that version.
+now requires JSON `PUT`/`PATCH` clients to send that version. The third is at
+the *layer-registration* seam: `AppBuilder::layer` accepts layers via a bound
+on Autumn's erased ingress service rather than `axum::routing::Route`, which
+only a layer implemented non-generically against `Route` itself can notice.
 
 ## Before you start
 
@@ -129,6 +135,47 @@ column) and echo it back on the next write.
 opt-in: rename it (e.g. to `revision`) and the behaviour goes away. `autumn
 generate` prints a warning naming this escape hatch whenever it detects the
 name.
+
+### App-wide layers are now erased
+
+**Why:** `AppBuilder::layer` / `static_gate` registrations (including plugin
+layers) are type-erased at registration time and composed into a single
+`Router::layer` application, so registering app-wide middleware no longer
+deepens the framework's per-request clone cascade (#2198).
+
+`IntoAppLayer`'s sealed blanket impl is therefore bound on
+`tower::Layer<autumn_web::app::ErasedAppService>` (the new public alias for
+the composed ingress service) instead of `tower::Layer<axum::routing::Route>`.
+
+This affects you only if you wrote a layer against **one concrete inner
+service type** rather than generically. Every layer that is generic over the
+service it wraps — the shape of every tower / tower-http layer, every layer in
+this repo and its plugins, and every example in the docs — satisfies both
+bounds and compiles unchanged.
+
+**Before (`0.6`):**
+
+```rust,ignore
+impl tower::Layer<axum::routing::Route> for MyLayer { /* … */ }
+```
+
+**After** — either make it generic (preferred):
+
+```rust,ignore
+impl<S> tower::Layer<S> for MyLayer { /* … */ }
+```
+
+or retarget the one concrete impl:
+
+```rust,ignore
+impl tower::Layer<autumn_web::app::ErasedAppService> for MyLayer { /* … */ }
+```
+
+**If you are automating the upgrade:**
+
+```bash
+rg -n 'Layer<axum::routing::Route>|Layer<Route>' src/
+```
 
 ## Deprecations (non-breaking)
 

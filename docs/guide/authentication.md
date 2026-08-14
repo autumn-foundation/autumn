@@ -239,6 +239,12 @@ if !validation.is_valid() {
 }
 ```
 
+`state.config()` hands back an owned, independently mutable snapshot, which
+costs a deep clone of every config section. On a path that runs per request
+rather than per boot, read through `state.config_arc()` instead — it clones the
+`Arc`, not the config behind it — and clone only the section you need:
+`state.config_arc().auth.password.clone()`.
+
 ```toml
 [auth.password]
 min_length    = 8       # counted in Unicode scalar values

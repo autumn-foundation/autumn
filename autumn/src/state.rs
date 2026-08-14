@@ -201,6 +201,24 @@ pub struct AppState {
 /// live app id.
 static NEXT_APP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Process-wide default config backing [`AppState::config_arc`]'s no-extension
+/// fallback, so that path clones a refcount instead of building a fresh
+/// `AutumnConfig` on every call.
+///
+/// Sharing one value across every config-less `AppState` is only sound because
+/// `AutumnConfig` and its whole section tree are plain data: no `Mutex`,
+/// `RwLock`, `Cell`, `OnceLock` or atomic anywhere in it, so there is no state
+/// one app could mutate and another observe. Introducing interior mutability
+/// into any config section invalidates that and this static must go back to a
+/// per-call `Arc::new`.
+static DEFAULT_CONFIG: std::sync::OnceLock<Arc<crate::config::AutumnConfig>> =
+    std::sync::OnceLock::new();
+
+/// Handle to the shared default config, built on first use.
+fn default_config() -> &'static Arc<crate::config::AutumnConfig> {
+    DEFAULT_CONFIG.get_or_init(|| Arc::new(crate::config::AutumnConfig::default()))
+}
+
 impl crate::authorization::ProvideAuthorizationState for AppState {
     fn policy_registry(&self) -> &crate::authorization::PolicyRegistry {
         &self.policy_registry
@@ -404,10 +422,42 @@ impl AppState {
     ///
     /// Falls back to a default config if no config has been installed
     /// (typically only in tests that don't wire the full startup pipeline).
+    ///
+    /// This hands back an owned, independently mutable snapshot, which costs a
+    /// deep clone of every config section; on request paths use
+    /// [`config_arc`](Self::config_arc) instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension map mutex is poisoned, inherited from
+    /// [`extension`](Self::extension).
     #[must_use]
     pub fn config(&self) -> crate::config::AutumnConfig {
+        (*self.config_arc()).clone()
+    }
+
+    /// Returns the resolved [`crate::config::AutumnConfig`] as a shared handle.
+    ///
+    /// The cheap accessor: it clones only the [`Arc`], never the
+    /// configuration behind it, so callers pay a refcount bump instead of a
+    /// deep copy of every config section. Prefer this over
+    /// [`config`](Self::config) on request paths, and reach for `config()`
+    /// only when an owned, independently mutable snapshot is genuinely needed.
+    ///
+    /// When no config extension has been installed (typically only in tests
+    /// that don't wire the full startup pipeline) this yields a handle to a
+    /// shared default-valued config, so the fallback is free too. That fallback
+    /// is never written back into the extension map, so a config installed
+    /// afterwards is still observed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension map mutex is poisoned, inherited from
+    /// [`extension`](Self::extension).
+    #[must_use]
+    pub fn config_arc(&self) -> Arc<crate::config::AutumnConfig> {
         self.extension::<crate::config::AutumnConfig>()
-            .map_or_else(crate::config::AutumnConfig::default, |arc| (*arc).clone())
+            .unwrap_or_else(|| Arc::clone(default_config()))
     }
 
     /// Allocate the next process-unique app id.
@@ -1402,5 +1452,100 @@ mod tests {
             .expect("runtime extension should be installed");
 
         assert_eq!(stored.as_str(), "haunted");
+    }
+
+    /// `config_arc` must hand back the very `Arc` the extension map holds, and
+    /// must keep reading through to that map rather than caching a handle:
+    /// `app::build` re-inserts a mutated config after `build_state` (static
+    /// routes excluded from locale prefixing), so a cached handle would serve
+    /// the pre-mutation config forever.
+    #[test]
+    fn config_arc_returns_the_installed_arc_without_deep_cloning() {
+        let state = AppState::for_test();
+        state.insert_extension(crate::config::AutumnConfig {
+            profile: Some("staging".to_owned()),
+            ..Default::default()
+        });
+
+        let installed = state
+            .extension::<crate::config::AutumnConfig>()
+            .expect("config extension should be installed");
+        let first = state.config_arc();
+        let second = state.config_arc();
+
+        assert!(
+            Arc::ptr_eq(&first, &installed),
+            "config_arc must return the extension map's Arc, not a fresh allocation"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two config_arc calls must share one allocation"
+        );
+
+        state.insert_extension(crate::config::AutumnConfig {
+            profile: Some("prod".to_owned()),
+            ..Default::default()
+        });
+        let after_reinsert = state.config_arc();
+
+        assert_eq!(
+            after_reinsert.profile.as_deref(),
+            Some("prod"),
+            "config_arc must observe a config re-inserted after construction"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &after_reinsert),
+            "a re-inserted config must replace the handle, not alias the old one"
+        );
+    }
+
+    #[test]
+    fn config_arc_falls_back_to_default_without_extension() {
+        let state = AppState::for_test();
+        let defaults = crate::config::AutumnConfig::default();
+
+        let fallback = state.config_arc();
+
+        assert_eq!(fallback.profile, defaults.profile);
+        assert_eq!(fallback.server.port, defaults.server.port);
+        assert_eq!(fallback.server.host, defaults.server.host);
+        // Reading config must not install one: a state that boots without a
+        // config and gets one later must see the later one, and the fallback
+        // must not become a phantom entry other `extension` callers observe.
+        assert!(
+            state.extension::<crate::config::AutumnConfig>().is_none(),
+            "the fallback default must not be written into the extension map"
+        );
+    }
+
+    /// `AutumnConfig` has no `PartialEq`, so `Debug` rendering stands in for
+    /// value equality.
+    #[test]
+    fn config_matches_config_arc_by_value() {
+        let absent = AppState::for_test();
+        assert_eq!(
+            format!("{:?}", absent.config()),
+            format!("{:?}", *absent.config_arc()),
+            "the two accessors must agree in the no-extension fallback case"
+        );
+
+        let present = AppState::for_test();
+        present.insert_extension(crate::config::AutumnConfig {
+            profile: Some("staging".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            format!("{:?}", present.config()),
+            format!("{:?}", *present.config_arc()),
+            "the two accessors must agree when a config is installed"
+        );
+    }
+
+    /// `config`'s signature is load-bearing beyond this crate: autumn-cli's
+    /// auth generator emits `state.config()` move-out patterns as strings that
+    /// CI never compiles, so a change here surfaces only in generated apps.
+    #[test]
+    fn config_signature_is_unchanged() {
+        let _: fn(&AppState) -> crate::config::AutumnConfig = AppState::config;
     }
 }
