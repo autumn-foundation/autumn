@@ -105,16 +105,21 @@ amplification vector (~1 s of server CPU per guess with a default code set)
 — painful under load even when the guessing itself fails.
 
 The `reauth` TOTP branch shares the same shape (unlimited tries, full
-recovery-code bcrypt sweep per miss), though it at least demands the password
-on every attempt.
+recovery-code bcrypt sweep per miss) — and it does **not** re-demand the
+password per attempt: after one successful password check, the
+`reauth_pw_ok` marker stays valid for 10 minutes and is left intact by failed
+TOTP/recovery guesses, so second-factor guessing through `/reauth` is
+password-free for the rest of that window.
 
 Fix: throttle `/login/verify` like the magic-link routes
 (`#[throttle(limit = 5, per = "1m", key = "ip")]`), add a small
 per-pending-session attempt counter (e.g. 5 tries, then clear
 `totp_pending_id` and force re-login), and only fall through to the
 recovery-code sweep when the submitted value does not look like a 6-digit
-code. Apply the same attempt bound to the `reauth` branch. *(Credit: flagged
-by automated review on the audit PR and verified against the code.)*
+code. Apply the same attempt bound to the `reauth` branch, clearing
+`reauth_pw_ok` after N failed second-factor guesses so the password gate
+re-engages. *(Credit: flagged by automated review on the audit PR and
+verified against the code.)*
 
 ---
 
@@ -273,7 +278,8 @@ code.)*
 
 ### L15. Lockout counter collapses concurrent failures right after cool-off
 
-In the generated `login` handler, once a lock's cool-off has expired the local
+In the generated `login` handler — and identically in `reauth`, which
+duplicates the lockout block — once a lock's cool-off has expired the local
 state is reset (`current_attempts = 0`) and a failed attempt takes the reset
 branch, which unconditionally writes `failed_attempts = 1`. Every concurrent
 request that read the same expired-lock row takes that same branch and writes
