@@ -138,20 +138,34 @@ On a request's **ingress** path (outermost → innermost), layers run in this
 order:
 
 ```
-  AccessLog (fallback)
-    └─ Metrics
-         └─ ExceptionFilter
-              └─ ErrorPageContext
-                   └─ Session
-                        └─ SecurityHeaders
-                             └─ RequestId
-                                  └─ LogContext
-                                       └─ AccessLog (primary)
-                                            └─ [your .layer() calls, first = outermost]
-                                                 └─ CSRF
-                                                      └─ CORS
-                                                           └─ route handler
+  TraceContext / ServerTiming + AccessLog fallbacks / StartupBarrier
+    └─ SecurityHeaders                     ← framework-outermost
+         └─ [your .static_gate() calls]
+              └─ Compression
+                   └─ Metrics
+                        └─ ExceptionFilter
+                             └─ ErrorPageContext
+                                  └─ Session
+                                       └─ RequestId
+                                            └─ LogContext
+                                                 └─ ServerTiming / AccessLog (primary)
+                                                      └─ Reporting (panic catch)
+                                                           └─ Timeout
+                                                                └─ TrustedProxies
+                                                                     └─ [your .layer() calls, first = outermost]
+                                                                          └─ BodyLimit
+                                                                               └─ Maintenance / LoadShed
+                                                                                    └─ RateLimit
+                                                                                         └─ CSRF
+                                                                                              └─ CORS
+                                                                                                   └─ route handler
 ```
+
+Config-gated layers (Compression, ServerTiming, AccessLog, Timeout, RateLimit,
+CSRF, CORS, LoadShed, …) are absent entirely when their feature is off. The
+canonical, exhaustive list — including the ones this diagram abbreviates — lives
+in a comment in `autumn/src/router.rs`'s `apply_middleware`; that comment is the
+source of truth if the two ever disagree.
 
 `LogContext` establishes the request-scoped log context (request id
 correlation for every log line); it sits inside `RequestId` so the id is

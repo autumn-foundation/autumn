@@ -718,9 +718,13 @@ fn build_router_pre_state(
     )?;
 
     if dev_reload_enabled {
-        router = router
-            .layer(axum::middleware::from_fn(dev::disable_static_cache))
-            .layer(axum::middleware::from_fn(dev::inject_live_reload));
+        // One `Router::layer` call, not two: tuple order is OUTERMOST FIRST, so
+        // `inject_live_reload` stays outer to `disable_static_cache` exactly as
+        // the two chained `.layer()` calls used to leave it (issue #2193).
+        router = router.layer((
+            axum::middleware::from_fn(dev::inject_live_reload),
+            axum::middleware::from_fn(dev::disable_static_cache),
+        ));
     }
 
     // Dev request inspector: mount UI and apply recording middleware.
@@ -756,18 +760,22 @@ fn build_router_pre_state(
     }
 
     #[cfg(feature = "oauth2")]
-    let router = router.layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        http_interceptor_middleware,
-    ));
+    let http_interceptor =
+        axum::middleware::from_fn_with_state(state.clone(), http_interceptor_middleware);
+    #[cfg(not(feature = "oauth2"))]
+    let http_interceptor = tower::layer::util::Identity::new();
 
     // Install the request's app as the ambient event-bus context so any code in
     // the request (handlers, services) that calls the free `events::publish`
     // dispatches against this app rather than the process-global bus — keeping
     // parallel in-process apps (notably tests) isolated.
-    let router = router.layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        event_app_context_middleware,
+    //
+    // One `Router::layer` call for both: tuple order is OUTERMOST FIRST, so the
+    // event-bus context stays outer to the oauth2 interceptor exactly as the two
+    // separate `.layer()` calls used to leave it (issue #2193).
+    let router = router.layer((
+        axum::middleware::from_fn_with_state(state.clone(), event_app_context_middleware),
+        http_interceptor,
     ));
 
     // Mount the MCP endpoint last so its dispatch target — a clone of the
@@ -876,7 +884,8 @@ fn build_router_pre_state(
         // same-origin browser client behind a TLS-terminating proxy. The
         // dispatch clone already carries its own copy of this layer.
         mcp_router = apply_trusted_proxies_middleware(mcp_router, config);
-        // The MCP route is merged after `apply_upload_middleware`, so axum's
+        // The MCP route is merged after the ingress upload guards
+        // (`build_upload_layers`), so axum's
         // built-in 2 MiB `DefaultBodyLimit` — not the app's configured limit —
         // would otherwise govern the `tools/call` envelope's `Bytes` body. Apply
         // the same cap a direct JSON endpoint gets so larger-but-valid tool
@@ -2810,6 +2819,14 @@ fn mount_raw_routers(
     router
 }
 
+/// Apply response compression, when enabled.
+///
+/// Unlike the other ingress middleware this keeps its own `Router::layer` call
+/// rather than joining a composed tuple: `CompressionLayer`'s service changes
+/// the response BODY type, which `Route::layer` absorbs via `IntoResponse` but
+/// `option_layer`'s `Either` cannot — both of its branches must share one
+/// `Response` type. Compression is off by default, so the extra nesting level
+/// is only paid by apps that turn it on.
 fn apply_compression_middleware<S>(
     mut router: axum::Router<S>,
     config: &AutumnConfig,
@@ -2850,31 +2867,62 @@ where
     router
 }
 
-fn apply_cors_middleware<S>(mut router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
+/// Kept as a router-level wrapper for this module's unit tests; the main
+/// ingress stack composes the layer directly (see `apply_middleware`).
+#[cfg(test)]
+fn apply_cors_middleware<S>(router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    // CORS middleware (only applied when allowed_origins is non-empty)
-    if !config.cors.allowed_origins.is_empty() {
-        let cors = build_cors_layer(&config.cors);
-        tracing::info!(
-            origins = ?config.cors.allowed_origins,
-            credentials = config.cors.allow_credentials,
-            "CORS enabled"
-        );
-        router = router.layer(cors);
+    match build_ingress_cors_layer(config) {
+        Some(layer) => router.layer(layer),
+        None => router,
     }
-    router
 }
 
+/// Build the ingress CORS layer, or `None` when no origins are configured.
+///
+/// Split out of [`apply_cors_middleware`] so the layer can join the composed
+/// ingress stack rather than costing its own nesting level (issue #2193).
+fn build_ingress_cors_layer(config: &AutumnConfig) -> Option<tower_http::cors::CorsLayer> {
+    // CORS middleware (only applied when allowed_origins is non-empty)
+    if config.cors.allowed_origins.is_empty() {
+        return None;
+    }
+    let cors = build_cors_layer(&config.cors);
+    tracing::info!(
+        origins = ?config.cors.allowed_origins,
+        credentials = config.cors.allow_credentials,
+        "CORS enabled"
+    );
+    Some(cors)
+}
+
+/// Kept as a router-level wrapper for this module's unit tests; the main
+/// ingress stack composes the layer directly (see `apply_middleware`).
+#[cfg(test)]
 fn apply_csrf_middleware<S>(
-    mut router: axum::Router<S>,
+    router: axum::Router<S>,
     config: &AutumnConfig,
     signing_keys: Option<std::sync::Arc<crate::security::config::ResolvedSigningKeys>>,
 ) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    match build_csrf_layer(config, signing_keys) {
+        Some(layer) => router.layer(layer),
+        None => router,
+    }
+}
+
+/// Build the CSRF layer, or `None` when CSRF is disabled.
+///
+/// Split out of [`apply_csrf_middleware`] so the layer can join the composed
+/// ingress stack rather than costing its own nesting level (issue #2193).
+fn build_csrf_layer(
+    config: &AutumnConfig,
+    signing_keys: Option<std::sync::Arc<crate::security::config::ResolvedSigningKeys>>,
+) -> Option<crate::security::CsrfLayer> {
     // CSRF middleware (only applied when enabled)
     if config.security.csrf.enabled {
         // The CSRF token scan reads only a bounded prefix of the body
@@ -2912,9 +2960,10 @@ where
             csrf_layer = csrf_layer.with_exempt_path(crate::mail::UNSUBSCRIBE_PATH);
         }
         tracing::info!("CSRF protection enabled");
-        router = router.layer(csrf_layer);
+        Some(csrf_layer)
+    } else {
+        None
     }
-    router
 }
 
 /// Apply the one-time submit-token guard (issue #1360).
@@ -2925,17 +2974,37 @@ where
 /// `_submit_token` is still short-circuited by this guard. The store backend
 /// mirrors [`build_idempotency_layers`]; the `redis` backend reuses the
 /// `[idempotency.redis]` connection settings.
+///
+/// Kept as a router-level wrapper for this module's unit tests; the main
+/// ingress stack composes the layer directly (see `apply_middleware`).
+#[cfg(test)]
 fn apply_submit_token_middleware<S>(
-    mut router: axum::Router<S>,
+    router: axum::Router<S>,
     config: &AutumnConfig,
     is_production: bool,
 ) -> Result<axum::Router<S>, RouterBuildError>
 where
     S: Clone + Send + Sync + 'static,
 {
+    Ok(match build_submit_token_layer(config, is_production)? {
+        Some(layer) => router.layer(layer),
+        None => router,
+    })
+}
+
+/// Build the one-time submit-token layer, or `None` when it is disabled.
+///
+/// Split out of [`apply_submit_token_middleware`] so the layer can join the
+/// composed ingress stack rather than costing its own nesting level
+/// (issue #2193). The production memory-backend guard still surfaces as an
+/// `Err`, before any layer is applied.
+fn build_submit_token_layer(
+    config: &AutumnConfig,
+    is_production: bool,
+) -> Result<Option<crate::security::SubmitTokenLayer>, RouterBuildError> {
     let cfg = &config.security.submit_token;
     if !cfg.enabled {
-        return Ok(router);
+        return Ok(None);
     }
 
     // Production guard for the resolved consumed-token backend. Submit tokens
@@ -3013,17 +3082,19 @@ where
         ttl_secs = cfg.ttl_secs,
         "One-time submit-token protection enabled"
     );
-    router = router.layer(layer);
-    Ok(router)
+    Ok(Some(layer))
 }
 
-fn apply_bot_protection_middleware<S>(
-    mut router: axum::Router<S>,
+/// Build the CAPTCHA/bot-protection layer, or `None` when it is disabled.
+///
+/// Called only by [`apply_middleware`], which places it in the composed ingress
+/// stack rather than spending its own `Router::layer` call — and therefore its
+/// own nesting level — on it (issue #2193). The former
+/// `apply_bot_protection_middleware` router wrapper was removed with its last
+/// caller.
+fn build_bot_protection_layer(
     config: &AutumnConfig,
-) -> axum::Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
+) -> Option<crate::security::captcha::BotProtectionLayer> {
     if config.bot_protection.enabled {
         // Use the dedicated captcha_exempt_paths list — NOT csrf.exempt_paths —
         // so that a route exempt from CSRF for non-cookie auth reasons does not
@@ -3047,9 +3118,10 @@ where
             dev_bypass = config.bot_protection.dev_bypass,
             "Bot protection (CAPTCHA) enabled"
         );
-        router = router.layer(layer);
+        Some(layer)
+    } else {
+        None
     }
-    router
 }
 
 async fn populate_rate_limit_principal(
@@ -3080,6 +3152,9 @@ async fn populate_rate_limit_principal(
     next.run(req).await
 }
 
+/// Kept as a router-level wrapper for the `/mcp` envelope; the main ingress
+/// stack composes the layer directly (see `apply_middleware`).
+#[cfg(feature = "mcp")]
 fn apply_trusted_proxies_middleware<S>(
     router: axum::Router<S>,
     config: &AutumnConfig,
@@ -3087,8 +3162,18 @@ fn apply_trusted_proxies_middleware<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
+    router.layer(build_trusted_proxies_layer(config))
+}
+
+/// Build the trusted-proxy resolution layer.
+///
+/// **Unconditional** — the `if` below gates only the log line; the layer itself
+/// is always installed, because `ResolvedClientIdentity` must be stamped for
+/// every request whether or not any proxy ranges are configured. Split out of
+/// [`apply_trusted_proxies_middleware`] so the layer can join the composed
+/// ingress stack rather than costing its own nesting level (issue #2193).
+fn build_trusted_proxies_layer(config: &AutumnConfig) -> crate::security::TrustedProxiesLayer {
     let tp = &config.security.trusted_proxies;
-    let layer = crate::security::TrustedProxiesLayer::from_config(tp);
     if tp.trust_forwarded_headers || !tp.ranges.is_empty() || tp.trusted_hops.is_some() {
         tracing::info!(
             ranges = ?tp.ranges,
@@ -3096,14 +3181,46 @@ where
             "Centralized trusted-proxy resolution enabled"
         );
     }
-    router.layer(layer)
+    crate::security::TrustedProxiesLayer::from_config(tp)
 }
 
+/// Kept as a router-level wrapper for the `/mcp` envelope and this module's
+/// unit tests; the main ingress stack composes the layer directly (see
+/// `apply_middleware`).
+#[cfg(any(test, feature = "mcp"))]
 fn apply_rate_limit_middleware(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
     state: &AppState,
 ) -> axum::Router<AppState> {
+    let (limiter, principal_keying) = build_rate_limit_layers(config, state);
+    if let Some(limiter) = limiter {
+        router = router.layer(limiter);
+    }
+    // Applied second, so it is OUTER to the limiter on ingress: the principal
+    // must be populated before `extract_key` runs.
+    if principal_keying {
+        router = router.layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            populate_rate_limit_principal,
+        ));
+    }
+    router
+}
+
+/// Build the rate-limit layer, plus a flag for whether the
+/// authenticated-principal keying shim is needed.
+///
+/// Returns `(None, false)` when rate limiting is disabled. Split out of
+/// [`apply_rate_limit_middleware`] so both layers can join the composed ingress
+/// stack rather than costing two more nesting levels (issue #2193). The shim is
+/// returned as a flag rather than a layer because it is an
+/// `axum::middleware::from_fn_with_state` closure whose type cannot be named
+/// across a function boundary; the caller constructs it in place.
+fn build_rate_limit_layers(
+    config: &AutumnConfig,
+    state: &AppState,
+) -> (Option<crate::security::RateLimitLayer>, bool) {
     if config.security.rate_limit.enabled {
         let tp = &config.security.trusted_proxies;
         let rl = &config.security.rate_limit;
@@ -3131,24 +3248,43 @@ fn apply_rate_limit_middleware(
             burst = config.security.rate_limit.burst,
             "Rate limiting enabled"
         );
-        router = router.layer(layer);
-
-        if config.security.rate_limit.key_strategy
-            == crate::security::KeyStrategy::AuthenticatedPrincipal
-        {
-            router = router.layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                populate_rate_limit_principal,
-            ));
-        }
+        let principal_keying = config.security.rate_limit.key_strategy
+            == crate::security::KeyStrategy::AuthenticatedPrincipal;
+        (Some(layer), principal_keying)
+    } else {
+        (None, false)
     }
-    router
 }
 
+/// Kept as a router-level wrapper for this module's unit tests; the main
+/// ingress stack composes the layer directly (see `apply_middleware`).
+#[cfg(test)]
 fn apply_upload_middleware<S>(router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    let (body_limit, upload_config) = build_upload_layers(config);
+    // NOTE: this REPRODUCES the relative order `apply_middleware`'s `inner_stack`
+    // encodes (extension inserter OUTER to the body limit); it does not share it.
+    // Keep the two in sync. Applied inner-first here, because consecutive
+    // `Router::layer` calls put the LAST one outermost — the opposite of a tuple.
+    router
+        .layer(body_limit)
+        .layer(axum::Extension(upload_config))
+}
+
+/// Resolve the two always-applied upload guards: the global body-size cap and
+/// the [`UploadConfig`](crate::security::config::UploadConfig) the `Multipart`
+/// extractor reads per-file limits from.
+///
+/// Split out of [`apply_upload_middleware`] so [`apply_middleware`] can place
+/// both in the composed ingress stack (issue #2193).
+fn build_upload_layers(
+    config: &AutumnConfig,
+) -> (
+    axum::extract::DefaultBodyLimit,
+    crate::security::config::UploadConfig,
+) {
     let upload_config = config.security.upload.clone();
     let max_request_size = upload_config.max_request_size_bytes;
     tracing::info!(
@@ -3157,22 +3293,17 @@ where
         allowed_mime_types = ?upload_config.allowed_mime_types,
         "Request body size limits enabled (applies to all content types)"
     );
-
-    // Apply a global body-size cap covering JSON, form, raw bytes, and multipart.
-    // The Multipart extractor further refines this per the UploadConfig extension.
-    let router = router.layer(axum::extract::DefaultBodyLimit::max(max_request_size));
-
-    // Insert UploadConfig into extensions so the Multipart extractor can read
-    // per-file limits and the allowed MIME-type list.
-    router.layer(axum::middleware::from_fn(
-        move |mut req: axum::extract::Request, next: axum::middleware::Next| {
-            let upload_config = upload_config.clone();
-            async move {
-                req.extensions_mut().insert(upload_config);
-                next.run(req).await
-            }
-        },
-    ))
+    // The global cap covers JSON, form, raw bytes, and multipart; the Multipart
+    // extractor further refines it per the UploadConfig extension. The config is
+    // handed back as a plain value: callers install it with `axum::Extension`,
+    // whose `AddExtension` service inserts it into request extensions directly —
+    // the same effect as the `axum::middleware::from_fn` that used to do it, but
+    // without that wrapper's per-request boxed future and boxed `Next`
+    // (issue #2193).
+    (
+        axum::extract::DefaultBodyLimit::max(max_request_size),
+        upload_config,
+    )
 }
 
 /// Exact-match health/probe paths that must always bypass admission-style
@@ -3214,8 +3345,11 @@ fn build_maintenance_layer(
 
 /// Build the admission-control ([`LoadShedLayer`](crate::middleware::LoadShedLayer))
 /// layer from config, or `None` when `server.max_concurrent_requests` is unset
-/// or `0` — the default, preserving today's unlimited behavior with zero
-/// overhead (the layer is simply never applied; see [`apply_middleware`]).
+/// or `0` — the default, preserving today's unlimited behavior with effectively
+/// zero overhead. In [`apply_middleware`] the `None` case goes through
+/// `tower::util::option_layer`, contributing an `Either` branch that forwards
+/// straight to the inner service: no allocation, no `Route` box, no nesting
+/// level. The `/mcp` envelope still installs nothing at all.
 ///
 /// Reuses the same probe/actuator bypass list as [`build_maintenance_layer`]
 /// so health/liveness/readiness probes are never shed under load (#1006).
@@ -3428,6 +3562,11 @@ fn expand_route_timeout_table_for_locale_prefix(
 /// never flows back through it; leave it off for the `/mcp` envelope, whose
 /// timeout is applied *inner* to its `CorsLayer` and whose 503 is therefore
 /// already CORS-readable.
+///
+/// Kept as a router-level wrapper for the `/mcp` envelope and this module's
+/// unit tests; the main ingress stack composes the layer directly (see
+/// `apply_middleware`).
+#[cfg(any(test, feature = "mcp"))]
 fn apply_request_timeout_middleware(
     router: axum::Router<AppState>,
     config: &AutumnConfig,
@@ -3435,6 +3574,57 @@ fn apply_request_timeout_middleware(
     route_timeouts: RouteTimeoutTable,
     mirror_cors: bool,
 ) -> axum::Router<AppState> {
+    let Some(s) = build_request_timeout_settings(config, metrics, route_timeouts, mirror_cors)
+    else {
+        return router;
+    };
+    // The closure is built here rather than in a shared helper because its type
+    // (and the opaque future it returns) cannot be named across a function
+    // boundary; `apply_middleware` builds an identical one for the main ingress
+    // stack. Keep the two in sync.
+    router.layer(axum::middleware::from_fn(move |req, next| {
+        request_timeout_handler(
+            req,
+            next,
+            s.global,
+            s.route_timeouts.clone(),
+            s.metrics.clone(),
+            s.cors.clone(),
+        )
+    }))
+}
+
+/// Everything [`request_timeout_handler`] needs, resolved once at
+/// router-assembly time.
+///
+/// `Clone` is load-bearing: both call sites move this into an
+/// `axum::middleware::from_fn` closure, and `Router::layer` requires the layer
+/// (hence the closure, hence its captures) to be `Clone`.
+#[derive(Clone)]
+struct RequestTimeoutSettings {
+    global: Option<Duration>,
+    route_timeouts: RouteTimeoutTable,
+    metrics: crate::middleware::MetricsCollector,
+    cors: Option<std::sync::Arc<crate::config::CorsConfig>>,
+}
+
+/// Resolve the request-timeout settings, or `None` when no global timeout is
+/// configured and no route declares an override.
+///
+/// In that case [`apply_request_timeout_middleware`] (the `/mcp` envelope)
+/// installs no layer at all, and [`apply_middleware`] contributes an
+/// `option_layer` `Either` branch that forwards straight to the inner service —
+/// no allocation, no `Route` box, no nesting level. Either way the documented
+/// zero-overhead default holds.
+///
+/// Split out of [`apply_request_timeout_middleware`] so [`apply_middleware`] can
+/// place the layer in the composed ingress stack (issue #2193).
+fn build_request_timeout_settings(
+    config: &AutumnConfig,
+    metrics: crate::middleware::MetricsCollector,
+    route_timeouts: RouteTimeoutTable,
+    mirror_cors: bool,
+) -> Option<RequestTimeoutSettings> {
     let global = config
         .server
         .timeouts
@@ -3446,7 +3636,7 @@ fn apply_request_timeout_middleware(
         .flat_map(std::collections::HashMap::values)
         .any(|t| matches!(t, crate::route::RouteTimeout::Override(_)));
     if global.is_none() && !has_override {
-        return router;
+        return None;
     }
     if let Some(duration) = global {
         tracing::info!(
@@ -3458,16 +3648,12 @@ fn apply_request_timeout_middleware(
     // any origin is configured (otherwise `CorsLayer` itself is absent).
     let cors = (mirror_cors && !config.cors.allowed_origins.is_empty())
         .then(|| std::sync::Arc::new(config.cors.clone()));
-    router.layer(axum::middleware::from_fn(move |req, next| {
-        request_timeout_handler(
-            req,
-            next,
-            global,
-            route_timeouts.clone(),
-            metrics.clone(),
-            cors.clone(),
-        )
-    }))
+    Some(RequestTimeoutSettings {
+        global,
+        route_timeouts,
+        metrics,
+        cors,
+    })
 }
 
 async fn request_timeout_handler(
@@ -3660,56 +3846,112 @@ fn apply_middleware(
             None
         };
 
-    router = apply_cors_middleware(router, config);
+    // ── How the ingress stack is assembled ──────────────────────────────────
+    //
+    // Each `Router::layer` call re-boxes the entire downstream stack: axum's
+    // `Route::layer` ends in `Route::new(..)`, which is
+    // `BoxCloneSyncService::new(..)`. So N sequential `.layer()` calls build N
+    // *nested* boxes, and because `Route::call` runs `self.0.clone()` — a deep
+    // clone of everything beneath it — a request descending N levels pays
+    // `N + (N-1) + … + 1` heap allocations. Measured against axum 0.8.9 the fit
+    // is `13 + N(N+1)/2 + 2N` per request, 13 being the fixed baseline at N = 0
+    // (263 at N = 20, 1388 at N = 50), while the same layers composed into ONE
+    // `Router::layer` call cost a flat 16 for any N.
+    // See issue #2193.
+    //
+    // So the layers below are composed into tuples and applied in three
+    // `Router::layer` calls instead of ~16. `tower-layer` implements `Layer` for
+    // tuples with the FIRST element outermost, so each tuple reads top-to-bottom
+    // in ingress order — the same direction as the layer-order comments in this
+    // file.
+    //
+    // ⚠ THIS IS THE OPPOSITE of repeated `Router::layer` calls, where the LAST
+    // call ends up outermost. When moving a layer between the two forms, the
+    // order must be reversed. (The same applies to `tower::ServiceBuilder`:
+    // first-added is outermost — which is why `apply_layers_in_registration_order`
+    // below iterates in reverse.) Getting this backwards still compiles and still
+    // type-checks, because every layer here is `Route -> Route` with
+    // `Error = Infallible`; only the behavioural tests would catch it.
+    //
+    // `tower-layer` implements `Layer` for tuples up to 16 elements; the largest
+    // group below has 13. Past 16, nest a sub-tuple as a single element —
+    // `(a, b, (c, d, e), f)` composes identically and still costs one box.
+    //
+    // Conditional members use `tower::util::option_layer`, which maps `None` to
+    // `tower::layer::util::Identity` — its `Service` is the inner service
+    // itself, wrapped in an `Either` that forwards to it. A disabled layer
+    // therefore costs one enum branch per call: no allocation, no `Route` box,
+    // no nesting level.
+
+    // Innermost group: everything from the handler out to (but not including)
+    // the user-registered layers. Listed OUTERMOST FIRST.
+    // Built FIRST: this is the only builder that can fail the whole router
+    // build (the production memory-backend guard), and the others have side
+    // effects — `tracing::info!` lines, and a lazy Redis connection manager when
+    // the rate limiter is Redis-backed — that should not run on the way to a
+    // fail-fast `Err`.
+    let submit_token_layer = build_submit_token_layer(config, is_production)?;
+    let (body_limit, upload_config) = build_upload_layers(config);
     let trusted_host_policy = TrustedHostPolicy::from_config(config);
-    router = router.layer(axum::middleware::from_fn(move |req, next| {
-        trusted_host_middleware(req, next, trusted_host_policy.clone())
-    }));
-    // Applied before (i.e. inner to) the CSRF layer so CSRF is validated first
-    // on the request path; a replayed `_submit_token` is still short-circuited
-    // even when the request carries a valid `_csrf` (issue #1360, AC #4).
-    router = apply_submit_token_middleware(router, config, is_production)?;
-    router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
-    router = apply_bot_protection_middleware(router, config);
-    // Method-override rejection filter. The outer `MethodOverrideLayer`
-    // (applied at the `axum::serve` boundary so it can rewrite the
-    // request method before route matching) stamps a
-    // [`MethodOverrideRejection`] extension when the override field
-    // value is invalid or the body was too large to scan; this inner
-    // middleware converts that extension into the corresponding
-    // `400`/`413` response. Running it here means the rejection flows
-    // through the rest of the response stack (security headers,
-    // request IDs, metrics, error-page filter) rather than bypassing
-    // them. Placed outside CSRF so a `BodyTooLarge` (empty body)
-    // doesn't get masked by a `403` from CSRF's missing-token branch,
-    // and a clear `400 invalid _method` outranks "missing CSRF".
-    router = router.layer(axum::middleware::from_fn(
-        crate::middleware::method_override_rejection_filter,
-    ));
-    router = apply_rate_limit_middleware(router, config, state);
+    let (rate_limit_layer, rate_limit_principal_keying) = build_rate_limit_layers(config, state);
+    let inner_stack = (
+        // Insert UploadConfig into extensions so the Multipart extractor can
+        // read per-file limits and the allowed MIME-type list.
+        axum::Extension(upload_config),
+        // Global body-size cap covering JSON, form, raw bytes, and multipart.
+        body_limit,
+        axum::middleware::from_fn(crate::webhook::webhook_replay_cleanup_middleware),
+        // Admission control / load shedding (#1006). Outer to MaintenanceLayer so
+        // the cheap in-flight-count check runs before maintenance mode's
+        // bypass-header/IP-allowlist evaluation. `None` (the default — no
+        // `server.max_concurrent_requests` configured) contributes an `Either`
+        // branch that forwards straight to the inner service: no allocation and
+        // no extra nesting level.
+        tower::util::option_layer(load_shed_layer),
+        // Maintenance mode (shared construction with the late-mounted `/mcp`
+        // envelope — see `build_maintenance_layer`).
+        build_maintenance_layer(config, state),
+        // Populates RateLimitPrincipal from the verified session identity, so it
+        // must run BEFORE (outside) the limiter that keys on it.
+        tower::util::option_layer(rate_limit_principal_keying.then(|| {
+            axum::middleware::from_fn_with_state(state.clone(), populate_rate_limit_principal)
+        })),
+        tower::util::option_layer(rate_limit_layer),
+        // Method-override rejection filter. The outer `MethodOverrideLayer`
+        // (applied at the `axum::serve` boundary so it can rewrite the
+        // request method before route matching) stamps a
+        // [`MethodOverrideRejection`] extension when the override field
+        // value is invalid or the body was too large to scan; this inner
+        // middleware converts that extension into the corresponding
+        // `400`/`413` response. Running it here means the rejection flows
+        // through the rest of the response stack (security headers,
+        // request IDs, metrics, error-page filter) rather than bypassing
+        // them. Placed outside CSRF so a `BodyTooLarge` (empty body)
+        // doesn't get masked by a `403` from CSRF's missing-token branch,
+        // and a clear `400 invalid _method` outranks "missing CSRF".
+        axum::middleware::from_fn(crate::middleware::method_override_rejection_filter),
+        tower::util::option_layer(build_bot_protection_layer(config)),
+        tower::util::option_layer(build_csrf_layer(config, signing_keys_opt.clone())),
+        // Inner to the CSRF layer so CSRF is validated first on the request
+        // path; a replayed `_submit_token` is still short-circuited even when
+        // the request carries a valid `_csrf` (issue #1360, AC #4).
+        tower::util::option_layer(submit_token_layer),
+        axum::middleware::from_fn(move |req, next| {
+            trusted_host_middleware(req, next, trusted_host_policy.clone())
+        }),
+        tower::util::option_layer(build_ingress_cors_layer(config)),
+    );
+    router = router.layer(inner_stack);
 
-    // Register MaintenanceLayer automatically (shared construction with the
-    // late-mounted `/mcp` envelope — see `build_maintenance_layer`).
-    router = router.layer(build_maintenance_layer(config, state));
-
-    // Admission control / load shedding (#1006). Outer to MaintenanceLayer so
-    // the cheap in-flight-count check runs before maintenance mode's
-    // bypass-header/IP-allowlist evaluation. `None` (the default — no
-    // `server.max_concurrent_requests` configured) applies no layer at all,
-    // so there is no overhead when the feature is unused.
-    if let Some(load_shed) = load_shed_layer {
-        router = router.layer(load_shed);
-    }
-
-    router = router.layer(axum::middleware::from_fn(
-        crate::webhook::webhook_replay_cleanup_middleware,
-    ));
-    router = apply_upload_middleware(router, config);
-
-    // User-registered Tower layers (AppBuilder::layer). Outermost — applied
-    // last so they wrap all framework middleware.  Iterate in reverse so the
-    // first registered layer ends up outermost among user layers — matching
+    // User-registered Tower layers (AppBuilder::layer). Applied after the group
+    // above, so they wrap all of it.  Iterate in reverse so the first registered
+    // layer ends up outermost among user layers — matching
     // tower::ServiceBuilder ordering.
+    //
+    // These stay one `Router::layer` call each: the registrations are opaque
+    // `FnOnce(Router) -> Router` appliers carrying a `TypeId`/`type_name` that
+    // `AppBuilder::has_layer`/`get_layer_types` expose publicly, so they cannot
+    // be folded into the tuple above without changing that API.
     //
     // When a static dist dir is active (SSG/ISG build), these layers are
     // NOT passed here — they are extracted by try_build_router_with_static_inner
@@ -3723,35 +3965,17 @@ fn apply_middleware(
         tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");
     }
 
-    // TrustedProxiesLayer is applied after user layers so it is outermost in the
-    // ingress request path, stamping ResolvedClientIdentity before any user or
-    // framework middleware reads ClientAddr / ClientHost / ClientScheme.
-    router = apply_trusted_proxies_middleware(router, config);
-
-    let mut router = router;
-
-    if config.tenancy.enabled {
-        router = router.layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::tenancy::tenancy_middleware,
-        ));
-        tracing::debug!("Multi-tenancy middleware enabled");
-    }
-
+    // ── Middle group: outer to the user layers, inner to the session ────────
+    //
     // Per-request timeout (inner to RequestId so the request ID set by that
     // layer is available when the timeout fires — see request_timeout_handler).
     //
-    // Full ingress layer order (outermost → innermost):
-    //   TraceContext → AccessLog-fallback (applied in apply_startup_barrier) →
-    //   StartupBarrier → Compression → Metrics → ExceptionFilter → ErrorPageContext →
-    //   Session → SecurityHeaders → RequestId → LogContext → AccessLog-primary →
-    //   Timeout → [user layers] → Tenancy → BodyLimit/UploadConfig →
-    //   MethodOverride → RateLimit → CSRF → CORS → handler
-    // `mirror_cors = true`: this layer is outside `CorsLayer` (CORS is applied
-    // earlier, hence inner), so its timeout 503 must carry CORS headers itself.
+    // `mirror_cors = true`: this layer is outside `CorsLayer` (CORS is in the
+    // inner group above, hence inner), so its timeout 503 must carry CORS
+    // headers itself.
     //
     // KNOWN LIMITATION (session store I/O is not bounded): `Session` sits outside
-    // this layer (see order above), so `store.load` runs before the timer starts
+    // this layer (see order below), so `store.load` runs before the timer starts
     // and `store.save`/`destroy` after it completes. A stalled session backend can
     // therefore tie up a worker despite `request_timeout_ms`. This placement is
     // deliberate: the timer is kept inner to `RequestId` so a timeout 503 (and its
@@ -3770,53 +3994,25 @@ fn apply_middleware(
     // `request_timeout_ms`. Moving the timer out there would again lose the
     // `X-Request-Id` correlation; bound this with a server/proxy read timeout
     // instead.
-    router = apply_request_timeout_middleware(
-        router,
-        config,
-        state.metrics.clone(),
-        route_timeouts,
-        true,
-    );
-
-    // Error-reporting + panic-catch layer. Placed inner to `RequestIdLayer`
-    // (so the request id is available when a handler panics) and outer to the
-    // timeout, user layers, and handler (so their panics are caught and turned
-    // into a clean 500 instead of aborting the worker task). The resulting 500
-    // still flows out through the exception-filter chain for HTML negotiation.
-    #[cfg(feature = "reporting")]
-    {
-        router = router.layer(crate::reporting::ReportingLayer::new(
-            state.error_reporters(),
-            config.reporting.enabled,
-            config.reporting.sample_rate,
-        ));
-    }
-
-    // Structured per-request access log (#999), primary emitter: one INFO
-    // event (target `autumn::access`) per served request at the response
-    // boundary. Inner to RequestId (so the request id is available) and to
-    // LogContext (so the event is emitted inside the request span); outer to
-    // the reporting and timeout layers so panics-turned-500s and timeout
-    // responses are logged with the status the client receives. Emitted
-    // responses are marked so the outermost fallback (apply_startup_barrier)
-    // does not double-log; that fallback covers requests that short-circuit
-    // before this layer runs.
-    if config.log.access_log {
-        router = router.layer(crate::middleware::AccessLogLayer::new(
-            config.log.access_log_exclude.clone(),
-        ));
-    }
-
-    // Server-Timing response header (#1348). Applied outer to AccessLogLayer
-    // (it is added after, so it wraps it) — its `total` metric is therefore
-    // the outermost wall-clock measure and is `>=` the access-log
-    // `duration_ms` by a few microseconds; both share the same
-    // `Instant`-based formula. Opt-in via
-    // `[observability] server_timing`; defaults on in dev, off in prod so
-    // timings never leak to anonymous prod clients without explicit opt-in.
-    if crate::config::server_timing_enabled(config) {
-        router = router.layer(crate::middleware::ServerTimingLayer::new(true));
-    }
+    // The closure is built here rather than in a shared helper because its type
+    // (and the opaque future it returns) cannot be named across a function
+    // boundary; `apply_request_timeout_middleware` builds an identical one for
+    // the `/mcp` envelope. Keep the two in sync.
+    let timeout_layer =
+        build_request_timeout_settings(config, state.metrics.clone(), route_timeouts, true).map(
+            |s| {
+                axum::middleware::from_fn(move |req, next| {
+                    request_timeout_handler(
+                        req,
+                        next,
+                        s.global,
+                        s.route_timeouts.clone(),
+                        s.metrics.clone(),
+                        s.cors.clone(),
+                    )
+                })
+            },
+        );
 
     // Request-scoped log context (#1169). Established for every request, inner
     // to `RequestIdLayer` (so the request id is available to seed it) and outer
@@ -3830,20 +4026,85 @@ fn apply_middleware(
         &log_context_filter_parameters,
         &config.log.unfilter_parameters,
     ));
-    let router = router.layer(crate::middleware::LogContextLayer::new(log_context_filter));
+
+    // Error-reporting + panic-catch layer. Placed inner to `RequestIdLayer`
+    // (so the request id is available when a handler panics) and outer to the
+    // timeout, user layers, and handler (so their panics are caught and turned
+    // into a clean 500 instead of aborting the worker task). The resulting 500
+    // still flows out through the exception-filter chain for HTML negotiation.
+    //
+    // NOTE: `config.reporting.enabled` is a CONSTRUCTOR ARGUMENT, not a gate —
+    // the layer is installed whenever the `reporting` feature is on, so the
+    // panic catch is never configured away.
+    #[cfg(feature = "reporting")]
+    let reporting_layer = crate::reporting::ReportingLayer::new(
+        state.error_reporters(),
+        config.reporting.enabled,
+        config.reporting.sample_rate,
+    );
+    #[cfg(not(feature = "reporting"))]
+    let reporting_layer = tower::layer::util::Identity::new();
+
+    // Structured per-request access log (#999), primary emitter: one INFO
+    // event (target `autumn::access`) per served request at the response
+    // boundary. Inner to RequestId (so the request id is available) and to
+    // LogContext (so the event is emitted inside the request span); outer to
+    // the reporting and timeout layers so panics-turned-500s and timeout
+    // responses are logged with the status the client receives. Emitted
+    // responses are marked so the outermost fallback (apply_startup_barrier)
+    // does not double-log; that fallback covers requests that short-circuit
+    // before this layer runs.
+    let access_log_layer = config
+        .log
+        .access_log
+        .then(|| crate::middleware::AccessLogLayer::new(config.log.access_log_exclude.clone()));
+
+    // Server-Timing response header (#1348). Outer to AccessLogLayer — its
+    // `total` metric is therefore the outermost wall-clock measure and is `>=`
+    // the access-log `duration_ms` by a few microseconds; both share the same
+    // `Instant`-based formula. Opt-in via `[observability] server_timing`;
+    // defaults on in dev, off in prod so timings never leak to anonymous prod
+    // clients without explicit opt-in.
+    let server_timing_layer = crate::config::server_timing_enabled(config)
+        .then(|| crate::middleware::ServerTimingLayer::new(true));
+
+    let tenancy_layer = config.tenancy.enabled.then(|| {
+        tracing::debug!("Multi-tenancy middleware enabled");
+        axum::middleware::from_fn_with_state(state.clone(), crate::tenancy::tenancy_middleware)
+    });
 
     // `security_headers` is applied LATER as the framework's outermost layer
-    // (after the gate, below) so that a gate short-circuit (redirect/401) still
-    // carries HSTS/CSP/nosniff — see the application point after the gate loop.
+    // (by `build_router_pre_state`, after the gate) so that a gate short-circuit
+    // (redirect/401) still carries HSTS/CSP/nosniff.
     // RequestId stays here (inner to session) so the request id seeds the
     // session, logs, and trace context.
-    let router = router.layer(RequestIdLayer::with_entropy(state.entropy_arc()));
+    //
+    // TrustedProxiesLayer is the innermost member of this group — i.e. it sits
+    // immediately outside the user layers — so `ResolvedClientIdentity` is
+    // stamped before any user or framework middleware reads
+    // ClientAddr / ClientHost / ClientScheme.
+    // Listed OUTERMOST FIRST — see the warning at the top of this function.
+    let middle_stack = (
+        RequestIdLayer::with_entropy(state.entropy_arc()),
+        crate::middleware::LogContextLayer::new(log_context_filter),
+        tower::util::option_layer(server_timing_layer),
+        tower::util::option_layer(access_log_layer),
+        reporting_layer,
+        tower::util::option_layer(timeout_layer),
+        tower::util::option_layer(tenancy_layer),
+        build_trusted_proxies_layer(config),
+    );
+    router = router.layer(middle_stack);
 
     // Pre-clone signing keys for the RYWW middleware (session mode needs to
     // sign/verify the `autumn.ryw` cookie; `signing_keys_opt` is consumed below).
     #[cfg(feature = "db")]
     let signing_keys_for_ryw = signing_keys_opt.clone();
 
+    // Session gets its own `Router::layer` call: each backend produces a
+    // differently-typed `SessionLayer<Store>`, so it cannot be a fixed member of
+    // a tuple without erasing the store type (which would cost a boxed future
+    // per store operation — a worse trade than the one nesting level it saves).
     let router = crate::session::apply_session_layer(
         router,
         &config.session,
@@ -3857,42 +4118,45 @@ fn apply_middleware(
     // Read-your-own-writes middleware: installed only when the mode is not
     // `off`. When active, it scopes a per-request task-local `RequestPin`
     // that generated repository read methods consult at acquire time.
-    // Inner to Session so the task-local wraps the handler; the `autumn.ryw`
-    // cookie is parsed from raw `Cookie` headers and does not require the
-    // Session extractor to have run first.
+    // Outer to Session, so the task-local also wraps the session store's own
+    // reads; the `autumn.ryw` cookie is parsed from raw `Cookie` headers and
+    // does not require the Session extractor to have run first.
     #[cfg(feature = "db")]
-    let router = if config.database.read_your_writes == crate::config::ReadYourWrites::Off {
-        router
-    } else {
-        let ryw_mode = config.database.read_your_writes;
-        let window_secs = config.database.pin_after_write_secs;
-        let keys = signing_keys_for_ryw;
-        if ryw_mode == crate::config::ReadYourWrites::Session && keys.is_none() {
-            tracing::warn!(
-                "read_your_writes = \"session\" requires a configured \
-                 security.signing_secret to sign the autumn.ryw cookie; \
-                 cross-request pinning is disabled until a secret is set"
-            );
-        }
-        let metrics = state.metrics().clone();
-        router.layer(axum::middleware::from_fn(move |req, next| {
-            crate::read_your_writes::middleware(
-                req,
-                next,
-                ryw_mode,
-                window_secs,
-                keys.clone(),
-                metrics.clone(),
-            )
-        }))
-    };
+    let ryw_layer = tower::util::option_layer(
+        (config.database.read_your_writes != crate::config::ReadYourWrites::Off).then(|| {
+            let ryw_mode = config.database.read_your_writes;
+            let window_secs = config.database.pin_after_write_secs;
+            let keys = signing_keys_for_ryw;
+            if ryw_mode == crate::config::ReadYourWrites::Session && keys.is_none() {
+                tracing::warn!(
+                    "read_your_writes = \"session\" requires a configured \
+                     security.signing_secret to sign the autumn.ryw cookie; \
+                     cross-request pinning is disabled until a secret is set"
+                );
+            }
+            let metrics = state.metrics().clone();
+            axum::middleware::from_fn(move |req, next| {
+                crate::read_your_writes::middleware(
+                    req,
+                    next,
+                    ryw_mode,
+                    window_secs,
+                    keys.clone(),
+                    metrics.clone(),
+                )
+            })
+        }),
+    );
+    #[cfg(not(feature = "db"))]
+    let ryw_layer = tower::layer::util::Identity::new();
 
-    // Error page filter: renders HTML error pages for browser requests.
-    // Always registered (uses default renderer if no custom one is provided).
     let is_dev = config
         .profile
         .as_deref()
         .map_or(cfg!(debug_assertions), |p| p == "dev");
+
+    // Error page filter: renders HTML error pages for browser requests.
+    // Always registered (uses default renderer if no custom one is provided).
 
     // When the `maud` feature is enabled, an ErrorPageFilter renders styled HTML
     // error pages for browser requests. Without `maud`, only the
@@ -3925,31 +4189,9 @@ fn apply_middleware(
         "Registered exception filters (including error page filter)"
     );
 
-    // Error page context layer must be inner to the exception filter so
-    // WantsHtml is set on the response before the filter inspects it.
-    // Full ingress layer order (outermost -> innermost). NOTE: the framework's
-    // outermost `SecurityHeadersLayer` and the `static_gate` layers are applied
-    // by `build_router_pre_state` AFTER this function returns (and, crucially,
-    // after the MCP dispatch clone is taken), so they are NOT in this list:
-    //   SecurityHeaders (framework outermost — applied in build_router_pre_state) ->
-    //   [static_gate layers — applied in build_router_pre_state, after the MCP
-    //   dispatch clone, outside session and the static cache] ->
-    //   TraceContext (applied outside the startup barrier so short-circuit
-    //   responses still carry traceparent) ->
-    //   Compression (outer to ExceptionFilter — see note below) ->
-    //   [user layers, when SSG/ISG dist dir active] ->
-    //   StaticFileMiddleware (when SSG/ISG enabled) ->
-    //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
-    //   RequestId -> LogContext -> AccessLog-primary ->
-    //   [user layers, non-static build] ->
-    //   Tenancy -> RateLimit -> CSRF -> CORS -> handler
-    //   (An AccessLog fallback sits outermost, applied in apply_startup_barrier.)
-    let router = router
-        .layer(crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev })
-        .layer(ExceptionFilterLayer::new(all_filters))
-        .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
-
-    // Response compression is applied outermost (outside ExceptionFilter) so that
+    // ── Outermost group: outer to the session ───────────────────────────────
+    //
+    // Response compression is outermost (outside ExceptionFilter) so that
     // exception filters which rebuild the response body (e.g. ProblemDetailsFilter
     // normalising AutumnErrors to JSON Problem Details) do so before the body is
     // encoded. If compression were inner to ExceptionFilter, the filter would
@@ -3957,6 +4199,49 @@ fn apply_middleware(
     // causing clients to receive uncompressed bytes labeled as gzip.
     // User-registered layers (EtagLayer etc.) remain inner to Compression, so
     // ETags are still computed on the uncompressed body before encoding occurs.
+    //
+    // The error page context layer must be inner to the exception filter so
+    // WantsHtml is set on the response before the filter inspects it.
+    //
+    // Full ingress layer order (outermost -> innermost). NOTE: the framework's
+    // outermost `SecurityHeadersLayer` and the `static_gate` layers are applied
+    // by `build_router_pre_state` AFTER this function returns (and, crucially,
+    // after the MCP dispatch clone is taken), so they are NOT in this list:
+    //   [MethodOverride, TrustedProxies, loopback ConnectInfo — wrapped around
+    //   the finished Router by `App::run` at the `axum::serve` boundary, so
+    //   they are outside even the startup barrier] ->
+    //   TraceContext -> ServerTiming-fallback -> AccessLog-fallback ->
+    //   StartupBarrier   (all four applied by `apply_startup_barrier`, which
+    //   every entry point calls LAST on the finished router — so this group is
+    //   the outermost thing inside the Router) ->
+    //   SecurityHeaders (framework outermost within build_router_pre_state) ->
+    //   [static_gate layers — applied just inside SecurityHeaders and after the
+    //   MCP dispatch clone, outside session and the static cache] ->
+    //   [event-bus context, oauth2 interceptor] -> Inspector (dev) ->
+    //   dev live-reload (dev)   (all applied in build_router_pre_state) ->
+    //   Compression -> Metrics -> ExceptionFilter -> ErrorPageContext ->
+    //   ReadYourWrites -> Session ->
+    //   RequestId -> LogContext -> ServerTiming -> AccessLog-primary ->
+    //   Reporting -> Timeout -> Tenancy -> TrustedProxies ->
+    //   [user layers, non-static build] ->
+    //   UploadConfig -> BodyLimit -> WebhookReplayCleanup -> LoadShed ->
+    //   Maintenance -> RateLimitPrincipal -> RateLimit ->
+    //   MethodOverrideRejection -> BotProtection -> CSRF -> SubmitToken ->
+    //   TrustedHost -> CORS -> [asset cache-control] -> handler
+    //   (In the SSG/ISG path the user layers and a second compression layer are
+    //   applied outside the static-first middleware instead — see
+    //   `try_build_router_with_static_inner`.)
+    // Listed OUTERMOST FIRST — see the warning at the top of this function.
+    let outer_stack = (
+        crate::middleware::MetricsLayer::new(state.metrics.clone()),
+        ExceptionFilterLayer::new(all_filters),
+        crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev },
+        ryw_layer,
+    );
+    let router = router.layer(outer_stack);
+
+    // Compression keeps its own `Router::layer` call — see
+    // `apply_compression_middleware` for why it cannot join the tuple above.
     let router = apply_compression_middleware(router, config);
 
     // NOTE: the `static_gate` layers and the framework's outermost
@@ -4459,10 +4744,40 @@ fn apply_startup_barrier(
     state: &AppState,
 ) -> axum::Router {
     let barrier_state = StartupBarrierState::from_config(config, state);
-    let router = router.layer(axum::middleware::from_fn_with_state(
-        barrier_state,
-        startup_barrier,
-    ));
+
+    // These four are the OUTERMOST layers on every production build path, so
+    // they are composed into a single tuple and applied with one
+    // `Router::layer` call — four separate calls would nest four
+    // `BoxCloneSyncService` levels around every route, and axum deep-clones
+    // that nest on each request (issue #2193).
+    //
+    // ⚠ Tuple order is OUTERMOST FIRST — the opposite of consecutive
+    // `Router::layer` calls, where the last call ends up outermost.
+    //
+    // W3C Trace Context propagation wraps the startup barrier (and the
+    // static-first middleware above it) so short-circuit responses —
+    // startup 503s and pre-built static file hits — still extract the
+    // incoming `traceparent` and inject the current context into the
+    // outgoing response. Applied here rather than inside `apply_middleware`
+    // because those outer wrappers can return without ever invoking the
+    // inner router. Outer to AccessLog so the access event is emitted while
+    // the trace context is current.
+    #[cfg(feature = "telemetry-otlp")]
+    let trace_context = crate::middleware::TraceContextLayer;
+    #[cfg(not(feature = "telemetry-otlp"))]
+    let trace_context = tower::layer::util::Identity::new();
+
+    // Server-Timing fallback (#1348), applied OUTSIDE the startup barrier, the
+    // static-first (SSG/ISR) middleware, the session layer, and the late MCP
+    // merge — exactly the short-circuit paths the primary ServerTimingLayer in
+    // `apply_middleware` never sees. Gated on the same `server_timing_enabled`
+    // resolver as the primary. It appends only for responses missing the
+    // `ServerTimingEmitted` marker, so requests that reach the primary carry a
+    // single `total`; short-circuits (startup 503, pre-built static hits) get a
+    // `total` here.
+    let server_timing_fallback = crate::config::server_timing_enabled(config)
+        .then(|| crate::middleware::ServerTimingLayer::fallback(true));
+
     // Access-log fallback (#999), applied OUTSIDE the startup barrier, the
     // static-first (SSG/ISR) middleware, the session layer, and the
     // exception-filter chain — every production build path funnels through
@@ -4473,37 +4788,16 @@ fn apply_startup_barrier(
     // an access line too. Those short-circuits never ran RequestIdLayer, so
     // the fallback reads `x-request-id` from the response when present and
     // logs without a request id otherwise.
-    let router = if config.log.access_log {
-        router.layer(crate::middleware::AccessLogLayer::fallback(
-            config.log.access_log_exclude.clone(),
-        ))
-    } else {
-        router
-    };
-    // Server-Timing fallback (#1348), applied OUTSIDE the startup barrier, the
-    // static-first (SSG/ISR) middleware, the session layer, and the late MCP
-    // merge — exactly the short-circuit paths the primary ServerTimingLayer in
-    // `apply_middleware` never sees. Gated on the same `server_timing_enabled`
-    // resolver as the primary. It appends only for responses missing the
-    // `ServerTimingEmitted` marker, so requests that reach the primary carry a
-    // single `total`; short-circuits (startup 503, pre-built static hits) get a
-    // `total` here.
-    let router = if crate::config::server_timing_enabled(config) {
-        router.layer(crate::middleware::ServerTimingLayer::fallback(true))
-    } else {
-        router
-    };
-    // W3C Trace Context propagation wraps the startup barrier (and the
-    // static-first middleware above it) so short-circuit responses —
-    // startup 503s and pre-built static file hits — still extract the
-    // incoming `traceparent` and inject the current context into the
-    // outgoing response. Applied here rather than inside `apply_middleware`
-    // because those outer wrappers can return without ever invoking the
-    // inner router. Outer to AccessLog so the access event is emitted while
-    // the trace context is current.
-    #[cfg(feature = "telemetry-otlp")]
-    let router = router.layer(crate::middleware::TraceContextLayer);
-    router
+    let access_log_fallback = config.log.access_log.then(|| {
+        crate::middleware::AccessLogLayer::fallback(config.log.access_log_exclude.clone())
+    });
+
+    router.layer((
+        trace_context,
+        tower::util::option_layer(server_timing_fallback),
+        tower::util::option_layer(access_log_fallback),
+        axum::middleware::from_fn_with_state(barrier_state, startup_barrier),
+    ))
 }
 
 async fn startup_barrier(

@@ -2148,29 +2148,34 @@ impl TestApp {
             },
         )
         .expect("failed to build test router");
-        // Mirror production's outermost access-log fallback (#999): in
-        // production it is applied in `apply_startup_barrier`, outside the
-        // session and exception-filter layers, and emits only for responses
-        // the primary in-stack layer never saw (e.g. session-store outage
-        // 503s), so tests observe the same access-log behavior an operator
-        // would.
-        let router = if self.config.log.access_log {
-            router.layer(crate::middleware::AccessLogLayer::fallback(
-                self.config.log.access_log_exclude.clone(),
+        // Mirror production's two outermost fallbacks, which `apply_startup_barrier`
+        // applies outside the session and exception-filter layers:
+        //
+        //  * access-log fallback (#999) — emits only for responses the primary
+        //    in-stack layer never saw (e.g. session-store outage 503s), so tests
+        //    observe the same access-log behavior an operator would;
+        //  * Server-Timing fallback (#1348) — appends a `total` only for responses
+        //    the primary never saw (short-circuits and the late-merged `/mcp`
+        //    envelope). Without it a `tools/call` would carry no outer `total` in
+        //    tests, unlike production.
+        //
+        // Composed into ONE `Router::layer` call, exactly as production does, so a
+        // test router has the same nesting depth as the real one (issue #2193).
+        // Tuple order is OUTERMOST FIRST: Server-Timing wraps the access log,
+        // matching production order.
+        let server_timing_fallback = crate::config::server_timing_enabled(&self.config)
+            .then(|| crate::middleware::ServerTimingLayer::fallback(true));
+        let access_log_fallback = self.config.log.access_log.then(|| {
+            crate::middleware::AccessLogLayer::fallback(self.config.log.access_log_exclude.clone())
+        });
+        // Guarded, because `Router::layer` re-boxes every route even when the
+        // tuple contributes no service: with both fallbacks off this would
+        // otherwise add a nesting level production does not have.
+        let router = if server_timing_fallback.is_some() || access_log_fallback.is_some() {
+            router.layer((
+                tower::util::option_layer(server_timing_fallback),
+                tower::util::option_layer(access_log_fallback),
             ))
-        } else {
-            router
-        };
-        // Mirror production's outermost Server-Timing fallback (#1348): in
-        // production it is applied in `apply_startup_barrier`, outside the
-        // primary `ServerTimingLayer` and the late `/mcp` merge, and appends a
-        // `total` only for responses the primary never saw — short-circuits and
-        // the late-merged `/mcp` envelope. Without mirroring it here a
-        // `tools/call` would carry no outer `total` in tests, unlike production,
-        // so tests would not observe the real `/mcp` timing an operator sees.
-        // Applied outer to the access-log fallback, matching production order.
-        let router = if crate::config::server_timing_enabled(&self.config) {
-            router.layer(crate::middleware::ServerTimingLayer::fallback(true))
         } else {
             router
         };
