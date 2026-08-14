@@ -350,6 +350,28 @@ in `delete_account`, delete the `{rem_table}` and `{sess_table}` rows for the
 user and emit the remember-clear cookie, exactly as `logout` does. *(Credit:
 flagged by automated review on the audit PR and verified against the code.)*
 
+### L13c. Pre-2FA pending handoffs survive credential changes and deletion
+
+A TOTP login parks `totp_pending_id` in the session and returns to
+`/login/verify` *before* `record_login_session`, so the pre-second-factor
+state has **no** tracked-session row. Every revocation this report recommends —
+`change_password`/`reset_password` deleting `{sess_table}` rows, the L13b
+deletion fix, `revoke_on_credential_change` — operates on tracked rows, so none
+of them can reach a pending handoff. Meanwhile `login_verify` promotes a
+pending handoff purely on `totp_pending_id` + a valid second factor; it never
+re-checks whether the password changed or the account entered
+`delete_scheduled_at` since the handoff was minted. Chained with M3's unbounded
+guessing, an attacker who already submitted the victim's *old* password can
+keep guessing the second factor **after** the victim changes their password or
+schedules deletion, then complete `login_verify`, mint a fresh tracked session,
+and even cancel the pending deletion — the credential change it was supposed to
+lock them out. Fix: bind the pending handoff to a password/credential version
+(and to non-deletion) and re-verify it in `login_verify`, or give the pending
+state a tracked/revocable row so credential-change revocation covers it too.
+Fixing M3 (bounding the guesses) reduces but does not eliminate this, since the
+promotion still skips the freshness re-check. *(Credit: flagged by automated
+review on the audit PR and verified against the code.)*
+
 ### L14. Generated TOTP code comparison is not constant-time
 
 `verify_totp_code` compares `expected == candidate` with a plain string
