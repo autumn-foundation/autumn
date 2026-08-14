@@ -380,7 +380,7 @@ pub struct AppBuilder {
     /// the default [`TracingOtlpTelemetryProvider`](crate::telemetry::TracingOtlpTelemetryProvider) runs.
     telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
     /// Custom session store (tier-1 subsystem replacement). When `Some`,
-    /// `apply_session_layer` skips the config-driven `memory`/`redis` selection
+    /// `build_session_layer` skips the config-driven `memory`/`redis` selection
     /// and uses this store directly.
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
     /// Custom channel backend (tier-1 subsystem replacement). When `Some`,
@@ -528,23 +528,37 @@ pub struct ScopedGroup {
     pub apply_layer: Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
 }
 
-/// A deferred router mutator that applies a user-registered
-/// [`tower::Layer`] to the app-wide router.
+/// The one service type every user-registered layer is composed against.
 ///
-/// Stored on [`AppBuilder`] by [`AppBuilder::layer`] and drained inside
-/// `apply_middleware` where the final layer stack is assembled.
-pub(crate) type CustomLayerApplier =
-    Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
+/// Erasing to a single concrete service type is what lets an arbitrary number
+/// of operator layers be folded into ONE `Router::layer` call: a `tower-layer`
+/// tuple needs its members' types known at compile time, and a `Vec` of
+/// registrations does not have that. See `router::ComposedRegisteredLayers`.
+pub(crate) type ErasedAppService = tower::util::BoxCloneSyncService<
+    axum::extract::Request,
+    axum::response::Response,
+    std::convert::Infallible,
+>;
 
-/// Metadata and deferred application closure for a user-registered layer.
+/// A user-registered layer with its type erased at registration time, so a
+/// heterogeneous `Vec` of them can be composed into a single application.
+pub(crate) type ErasedAppLayer = tower::util::BoxCloneSyncServiceLayer<
+    ErasedAppService,
+    axum::extract::Request,
+    axum::response::Response,
+    std::convert::Infallible,
+>;
+
+/// Metadata and the type-erased layer for a user-registered middleware.
 pub(crate) struct CustomLayerRegistration {
     /// Concrete type for the registered layer.
     pub(crate) type_id: TypeId,
     /// Concrete type name for generic layer families that need router-time
     /// classification without unstable specialization.
     pub(crate) type_name: &'static str,
-    /// Deferred router mutation that applies the layer.
-    pub(crate) apply: CustomLayerApplier,
+    /// The registered layer, erased so registrations of unrelated types can
+    /// share one `Vec` and one `Router::layer` application.
+    pub(crate) layer: ErasedAppLayer,
 }
 
 mod sealed {
@@ -564,20 +578,28 @@ mod sealed {
 /// candidate layer fails to meet axum's service bounds, instead of a
 /// 40-line associated-type wall. You cannot implement it manually, and
 /// you should not need to — just bring your own `tower::Layer`.
+///
+/// The layer is applied to Autumn's own erased ingress service rather than to
+/// `axum::routing::Route` directly, so registrations of unrelated types can be
+/// composed into a single `Router::layer` call (#2198). In practice this is
+/// invisible: a real-world layer is generic over its inner service and
+/// satisfies both.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a usable Autumn app-wide Tower layer",
-    label = "this type does not implement `tower::Layer<axum::routing::Route>` with the required service bounds",
-    note = "`AppBuilder::layer(..)` requires:\n    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,\n    L::Service: Service<axum::extract::Request, Response = axum::response::Response, Error = Infallible> + Clone + Send + Sync + 'static,\n    <L::Service as Service<axum::extract::Request>>::Future: Send + 'static\nSee docs/guide/middleware.md for common patterns and how to wrap raw-error layers (e.g. TimeoutLayer) with HandleErrorLayer."
+    label = "this type is not a `tower::Layer` over Autumn's ingress service with the required service bounds",
+    note = "`AppBuilder::layer(..)` requires a layer that is generic over the service it wraps (or written against Autumn's erased ingress service), producing:\n    L::Service: Service<axum::extract::Request, Response = axum::response::Response, Error = Infallible> + Clone + Send + Sync + 'static,\n    <L::Service as Service<axum::extract::Request>>::Future: Send + 'static\nand the layer itself must be Clone + Send + Sync + 'static.\nSee docs/guide/middleware.md for common patterns and how to wrap raw-error layers (e.g. TimeoutLayer) with HandleErrorLayer."
 )]
 pub trait IntoAppLayer: sealed::Sealed + Send + Sync + 'static {
-    /// Apply this layer to the given router. Not intended for direct use.
+    /// Erase this layer's type so it can be stored alongside registrations of
+    /// other types and composed into one application. Not intended for direct
+    /// use.
     #[doc(hidden)]
-    fn apply_to(self, router: axum::Router<AppState>) -> axum::Router<AppState>;
+    fn erase(self) -> ErasedAppLayer;
 }
 
 impl<L> sealed::Sealed for L
 where
-    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+    L: tower::Layer<ErasedAppService> + Clone + Send + Sync + 'static,
     L::Service: tower::Service<
             axum::extract::Request,
             Response = axum::response::Response,
@@ -592,7 +614,7 @@ where
 
 impl<L> IntoAppLayer for L
 where
-    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+    L: tower::Layer<ErasedAppService> + Clone + Send + Sync + 'static,
     L::Service: tower::Service<
             axum::extract::Request,
             Response = axum::response::Response,
@@ -603,8 +625,8 @@ where
         + 'static,
     <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
 {
-    fn apply_to(self, router: axum::Router<AppState>) -> axum::Router<AppState> {
-        router.layer(self)
+    fn erase(self) -> ErasedAppLayer {
+        tower::util::BoxCloneSyncServiceLayer::new(self)
     }
 }
 
@@ -1120,7 +1142,7 @@ impl AppBuilder {
         self.custom_layers.push(CustomLayerRegistration {
             type_id: TypeId::of::<L>(),
             type_name: std::any::type_name::<L>(),
-            apply: Box::new(move |router| layer.apply_to(router)),
+            layer: layer.erase(),
         });
         self
     }
@@ -1271,7 +1293,7 @@ impl AppBuilder {
         self.static_gate_layers.push(CustomLayerRegistration {
             type_id: TypeId::of::<L>(),
             type_name: std::any::type_name::<L>(),
-            apply: Box::new(move |router| layer.apply_to(router)),
+            layer: layer.erase(),
         });
         self
     }
@@ -6859,9 +6881,9 @@ fn log_startup_transparency(
 /// [`AppBuilder::with_session_store`] can override an otherwise-invalid
 /// `session.backend = "redis"`-without-`redis.url` config. But when no
 /// custom store is installed, the config-driven path will fail later in
-/// `apply_session_layer` — and by then, `setup_database` has already run
+/// `build_session_layer` — and by then, `setup_database` has already run
 /// migrations, leaving DB side effects from a doomed boot. This helper
-/// runs the same `backend_plan` check `apply_session_layer` does, but
+/// runs the same `backend_plan` check `build_session_layer` does, but
 /// before any side effects, and only when the override path is inactive.
 fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session_store: bool) {
     if has_custom_session_store {
@@ -7393,7 +7415,7 @@ fn install_i18n_bundle_layer(
     custom_layers.push(CustomLayerRegistration {
         type_id: TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
         type_name: std::any::type_name::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
-        apply: Box::new(move |router| router.layer(ext_layer)),
+        layer: tower::util::BoxCloneSyncServiceLayer::new(ext_layer),
     });
     custom_layers
 }
