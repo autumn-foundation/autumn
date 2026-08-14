@@ -533,8 +533,23 @@ pub struct ScopedGroup {
 /// Erasing to a single concrete service type is what lets an arbitrary number
 /// of operator layers be folded into ONE `Router::layer` call: a `tower-layer`
 /// tuple needs its members' types known at compile time, and a `Vec` of
-/// registrations does not have that. See `router::ComposedRegisteredLayers`.
-pub(crate) type ErasedAppService = tower::util::BoxCloneSyncService<
+/// registrations does not have that (#2198).
+///
+/// # When you need to name this type
+///
+/// Almost never. A layer that is generic over the service it wraps — the shape
+/// of every layer in tower, tower-http, and this repo — satisfies
+/// [`AppBuilder::layer`]'s bounds without mentioning it. The exception is a
+/// layer deliberately written against ONE concrete inner service type. Before
+/// #2198 that target was `axum::routing::Route`; it is now this alias:
+///
+/// ```rust,ignore
+/// impl tower::Layer<ErasedAppService> for MyRouteSpecificLayer { /* … */ }
+/// ```
+///
+/// Prefer the generic form (`impl<S> tower::Layer<S> for MyLayer`) unless the
+/// layer genuinely cannot be written that way.
+pub type ErasedAppService = tower::util::BoxCloneSyncService<
     axum::extract::Request,
     axum::response::Response,
     std::convert::Infallible,
@@ -587,7 +602,7 @@ mod sealed {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a usable Autumn app-wide Tower layer",
     label = "this type is not a `tower::Layer` over Autumn's ingress service with the required service bounds",
-    note = "`AppBuilder::layer(..)` requires a layer that is generic over the service it wraps (or written against Autumn's erased ingress service), producing:\n    L::Service: Service<axum::extract::Request, Response = axum::response::Response, Error = Infallible> + Clone + Send + Sync + 'static,\n    <L::Service as Service<axum::extract::Request>>::Future: Send + 'static\nand the layer itself must be Clone + Send + Sync + 'static.\nSee docs/guide/middleware.md for common patterns and how to wrap raw-error layers (e.g. TimeoutLayer) with HandleErrorLayer."
+    note = "`AppBuilder::layer(..)` requires a layer that is generic over the service it wraps (or written against `autumn_web::app::ErasedAppService`), producing:\n    L::Service: Service<axum::extract::Request, Response = axum::response::Response, Error = Infallible> + Clone + Send + Sync + 'static,\n    <L::Service as Service<axum::extract::Request>>::Future: Send + 'static\nand the layer itself must be Clone + Send + Sync + 'static.\nSee docs/guide/middleware.md for common patterns and how to wrap raw-error layers (e.g. TimeoutLayer) with HandleErrorLayer."
 )]
 pub trait IntoAppLayer: sealed::Sealed + Send + Sync + 'static {
     /// Erase this layer's type so it can be stored alongside registrations of

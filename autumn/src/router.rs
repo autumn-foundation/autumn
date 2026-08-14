@@ -4046,9 +4046,10 @@ fn apply_middleware(
     // call ends up outermost. When moving a layer between the two forms, the
     // order must be reversed. (The same applies to `tower::ServiceBuilder`:
     // first-added is outermost — which is why `ComposedRegisteredLayers`, which
-    // folds a run by hand rather than as a tuple, iterates in reverse.) Getting this backwards still compiles and still
-    // type-checks, because every layer here is `Route -> Route` with
-    // `Error = Infallible`; only the behavioural tests would catch it.
+    // folds a run by hand rather than as a tuple, iterates in reverse.) Getting
+    // this backwards still compiles and still type-checks, because every layer
+    // here is `Request -> Response` with `Error = Infallible`; only the
+    // behavioural tests would catch it.
     //
     // `tower-layer` implements `Layer` for tuples up to 16 elements; the largest
     // group below has 13. Past 16, nest a sub-tuple as a single element —
@@ -4062,11 +4063,12 @@ fn apply_middleware(
 
     // Innermost group: everything from the handler out to (but not including)
     // the user-registered layers. Listed OUTERMOST FIRST.
-    // Built FIRST: this is the only builder that can fail the whole router
-    // build (the production memory-backend guard), and the others have side
-    // effects — `tracing::info!` lines, and a lazy Redis connection manager when
-    // the rate limiter is Redis-backed — that should not run on the way to a
-    // fail-fast `Err`.
+    // Built FIRST: this is the first of the two builders that can fail the whole
+    // router build (here, the production memory-backend guard for submit tokens;
+    // the other is `build_session_layer` further down, on the session backend
+    // plan), and the infallible builders have side effects — `tracing::info!`
+    // lines, and a lazy Redis connection manager when the rate limiter is
+    // Redis-backed — that should not run on the way to a fail-fast `Err`.
     let submit_token_layer = build_submit_token_layer(config, is_production)?;
     let (body_limit, upload_config) = build_upload_layers(config);
     let trusted_host_policy = TrustedHostPolicy::from_config(config);
@@ -4392,14 +4394,18 @@ fn apply_middleware(
     //   [event-bus context, oauth2 interceptor] -> Inspector (dev) ->
     //   dev live-reload (dev)   (all applied in build_router_pre_state) ->
     //   Compression -> Metrics -> ExceptionFilter -> ErrorPageContext ->
-    //   ReadYourWrites -> Session ->
+    //   ReadYourWrites -> Session -> NormalizeBody ->
     //   RequestId -> LogContext -> ServerTiming -> AccessLog-primary ->
     //   Reporting -> Timeout -> Tenancy -> TrustedProxies ->
-    //   [user layers, non-static build] ->
+    //   [user layers, non-static build — ONE slot however many are registered] ->
     //   UploadConfig -> BodyLimit -> WebhookReplayCleanup -> LoadShed ->
     //   Maintenance -> RateLimitPrincipal -> RateLimit ->
     //   MethodOverrideRejection -> BotProtection -> CSRF -> SubmitToken ->
     //   TrustedHost -> CORS -> [asset cache-control] -> handler
+    //   (Everything from `Metrics` through `CORS` is ONE `Router::layer` call —
+    //   the merged tuple below; `Compression` keeps its own. `NormalizeBody` is
+    //   a body-type adapter with no request-path behaviour, listed only so this
+    //   order reads against that tuple member-for-member.)
     //   (In the SSG/ISG path the user layers and a second compression layer are
     //   applied outside the static-first middleware instead — see
     //   `try_build_router_with_static_inner`.)
@@ -4858,8 +4864,9 @@ pub fn try_build_router_with_static_inner(
 
     // Apply user layers OUTSIDE the static middleware so they wrap it and can
     // process both static and dynamic responses (e.g. compress the HTML on
-    // the way out). Iterate in reverse so the first registered layer ends up
-    // outermost — matching tower::ServiceBuilder ordering.
+    // the way out). The first registered layer ends up outermost — matching
+    // `tower::ServiceBuilder` ordering; the fold that gets it there lives in
+    // `apply_layers_in_registration_order` / `ComposedRegisteredLayers`.
     router = apply_layers_in_registration_order(
         router,
         custom_layers,

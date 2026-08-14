@@ -189,6 +189,14 @@ Multiple `.layer()` calls stack in registration order, mirroring
 [`tower::ServiceBuilder`]: the first `.layer(A)` call becomes the outermost
 user layer, so `A` sees the request first and the response last.
 
+Registrations are type-erased at `.layer(..)` time and composed into a single
+application, so the tenth layer you register costs the framework no more
+per-request work than the first — app-wide layers no longer deepen the stack
+that every request clones its way down. One consequence shows up in the bound:
+your layer is composed against Autumn's own erased ingress service rather than
+`axum::routing::Route`, which any layer written generically over the service it
+wraps — every standard tower layer — already satisfies.
+
 ---
 
 ## Wrap shared state in `Arc`
