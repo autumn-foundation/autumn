@@ -276,17 +276,25 @@ verified against the code.)*
 
 `change_password` and `reset_password` delete the user's remember-token rows
 inside their transactions ("the old password is compromised"), but the other
-credential-changing flows do not: `two_factor_confirm`, `two_factor_disable`,
-`passkey_register_finish`, `passkey_revoke`, and `confirm_email_change` all
-revoke tracked *session* rows (under `revoke_on_credential_change`) yet leave
-the remember-token table untouched. A stolen remember cookie therefore
-survives 2FA enrollment/disable and passkey add/remove and can re-establish a
-login afterwards — inconsistent with the `[auth.sessions]` documentation,
-which frames exactly these events as credential changes, and with
-`change_password`'s own "chains are ALWAYS revoked on a credential change"
-comment. Fix: add the same `{rem_table}` user-scoped delete to those five
-transactions (optionally sparing the current device's chain, mirroring the
-`token_digest.ne(current)` session carve-out).
+credential-changing flows do not. Two sub-cases:
+
+- `two_factor_confirm`, `two_factor_disable`, `passkey_register_finish`, and
+  `passkey_revoke` revoke tracked *session* rows (under
+  `revoke_on_credential_change`) yet leave the remember-token table untouched.
+  A stolen remember cookie therefore survives 2FA enrollment/disable and
+  passkey add/remove and can re-establish a login afterwards.
+- `confirm_email_change` is worse: it takes only `Db` and `Path`, never reads
+  `revoke_on_credential_change`, and its transaction touches **neither** the
+  session table nor the remember table. So an email-address change revokes
+  *nothing* — every existing session and every remember chain survives it.
+
+Both are inconsistent with the `[auth.sessions]` documentation, which frames
+exactly these events as credential changes, and with `change_password`'s own
+"chains are ALWAYS revoked on a credential change" comment. Fix: add the same
+`{rem_table}` user-scoped delete to the first four transactions (optionally
+sparing the current device's chain, mirroring the `token_digest.ne(current)`
+session carve-out); for `confirm_email_change`, add **both** the session and
+remember-chain revocation.
 
 A sixth path has the same gap even though it *is* a password reset: when the
 account has TOTP enabled, `reset_password` parks the new digest and returns
