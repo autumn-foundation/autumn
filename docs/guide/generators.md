@@ -1047,6 +1047,59 @@ pre-#1315 shape.
 > in the generated `to_csv_record` — the emitted impl carries a note at the
 > same spot.
 
+### Trash, Restore and Purge (`--soft-delete`)
+
+`--soft-delete` already turned the delete button into a `deleted_at`
+stamp and gave the repository `restore` / `purge` / `with_deleted` /
+`only_deleted` (see [soft delete](./soft-delete.md)). A standard HTML
+scaffold generated with the flag now also ships the recovery UI those
+methods were waiting for (issue #1332) — zero lines of user code:
+
+- A `#[secured] #[get("/<plural>/trash")]` page listing the deleted rows
+  through the repository's `page_only_deleted` (the paginated form of the
+  `only_deleted` scope). The list handler never writes a `deleted_at`
+  filter of its own, so "deleted" stays defined in exactly one place.
+- A **Trash** link next to "New …" in the index's page furniture.
+- Per row: a **Restore** submit posting to
+  `POST /<plural>/{id}/restore`, and a **Purge** control posting to
+  `POST /<plural>/{id}/purge` behind
+  [`confirm_action`](../reference/widgets.md)'s server-rendered dialog.
+  Both carry the CSRF hidden field.
+- A `Deleted` column showing each row's `deleted_at` stamp, so the page
+  answers "when did this go?" as well as "what went".
+- A generated `tests/<name>.rs` case walking the whole lifecycle: create
+  → delete (soft) → in Trash and out of the index → restore → back in the
+  index and out of Trash → purge → gone from both.
+
+Contract of the generated handlers:
+
+| Situation | Behaviour |
+| --------- | --------- |
+| Restore | Clears `deleted_at` via the repository's `restore`, flashes `<Model> restored`, and 303s back to the Trash page. The row reappears in the index, which filters `deleted_at IS NULL`. |
+| Purge | Hard-deletes via the repository's `purge` — the **only** hard delete in the generated app — then flashes and 303s back to Trash. |
+| A row that is not in the trash | Both handlers load their target with `deleted_at IS NOT NULL` first and answer **404** otherwise. So a crafted `POST /<plural>/{id}/purge` can never hard-delete a live row, and neither action ever reports success for a no-op. |
+| Record policy wiring on (an owner column, the default) | The loaded row is authorized with the same `"delete"` action `destroy` uses. Moving a row into or out of the trash is the same authority as deleting it, and `Policy::can` fails closed on action names it does not know — so a bespoke `"restore"` action would deny every request against a hand-written policy. |
+| Confirmation | A server-rendered `<dialog>`, not an inline `onclick` handler: the default CSP is `script-src 'self'` with no `'unsafe-inline'`, so an inline confirm is blocked by the browser and the form would submit with no prompt at all. The dialog is driven by the `autumn-widgets.js` the generated layout already loads, with a `<noscript>` fallback that keeps Purge reachable without JavaScript. |
+| Connection use | Each handler `drop`s its `Db` extractor after the guard load and before the repository call, so it holds **one** pooled connection at a time — no stall on `database.pool.max_size = 1`. |
+| Route vs `/<plural>/{id}` | The static `trash` segment outranks the `{id}` parameter in the router, the same way `/<plural>/new` already does. |
+| `--slug` route key | Restore and Purge key off the slug like the rest of the resource (`POST /<plural>/{slug}/restore`); the repository call still uses the loaded row's `id`. |
+
+Emitted **only** with `--soft-delete`, and only on the standard HTML
+path. Not emitted for `--live`/`--live-validation` (a restore goes
+through the repository's `restore`, not the broadcasting `save`, so the
+SSE list would never learn the row came back), `--sharded`
+(`page_only_deleted` refuses to fan out, so a trash page would silently
+show one shard's deletions), an **owner-scoped** index (there is no
+owner-filtered deleted-rows scope to read through, and re-deriving the
+owner filter by hand in a second list handler is how a list endpoint
+leaks another user's rows), or `--api` (no HTML at all). Every one of
+those variants — and every scaffold generated without `--soft-delete` —
+is byte-identical to its pre-#1332 shape.
+
+Bulk restore/purge, retention/auto-purge scheduling, and cascading
+restore across associations are deliberately out of scope; compose them
+with the bulk-actions widgets, `#[scheduled]`, and your own policy.
+
 Metadata flags let you keep common model and repository polish in the
 generation step:
 

@@ -32,6 +32,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generate scaffold:** `--soft-delete` now also generates the recover-from-
+  trash UI its data layer has been waiting for (#1332), finishing #689's AC6. A
+  standard HTML scaffold gains a `#[secured] GET /<plural>/trash` page that lists
+  deleted rows through the repository's generated `page_only_deleted` (the
+  paginated `only_deleted` scope — the list handler writes no `deleted_at`
+  filter of its own), a **Trash** link in the index's page furniture, a
+  `Deleted` column carrying each row's `deleted_at` stamp, and per row a
+  CSRF-protected **Restore** (`POST /<plural>/{id}/restore` → `restore(id)`) and
+  **Purge** (`POST /<plural>/{id}/purge` → `purge(id)`) control, the latter
+  behind `confirm_action`'s server-rendered dialog rather than an inline
+  `onclick` the default `script-src 'self'` CSP would block. Both write handlers
+  load their target with `deleted_at IS NOT NULL` first, so they 404 rather than
+  hard-deleting a live row, and record-authorize it with the same `"delete"`
+  action `destroy` uses. The generated `tests/<name>.rs` gains an in-process
+  lifecycle test (create → soft delete → present in Trash and absent from the
+  index → restore → back in the index → purge → gone from both). No new
+  `autumn-web` API: the scaffold consumes the existing macro methods and the
+  shipped CSRF/flash/widget helpers. Emitted **only** under `--soft-delete` and
+  only on the standard HTML path — `--live`/`--live-validation` (a restore does
+  not broadcast), `--sharded` (`page_only_deleted` cannot fan out), an
+  owner-scoped index (no owner-filtered deleted-rows scope to read through), and
+  `--api` stay byte-identical to their prior output, as does every scaffold
+  generated without the flag. See `docs/guide/generators.md`.
+
 - **counter caches:** `#[belongs_to(Post, counter_cache)]` keeps a
   `posts.comment_count` column current automatically (#1325). Creating a child
   increments the parent, destroying one decrements it, soft-deleting decrements
