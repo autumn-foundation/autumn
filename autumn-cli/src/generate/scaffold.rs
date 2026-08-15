@@ -1133,6 +1133,33 @@ fn plan_scaffold_with_options_impl(
         && !options_with_key.live_validation
         && !options_with_key.model.sharded
         && !owner_authorizes;
+    // A `--soft-delete` scaffold that lands on one of the gated-off variants
+    // gets the data layer and the delete tunnel but NO way to see or recover
+    // what it deleted — exactly the situation #1332 exists to remove. Say so at
+    // generation time, with the reason and the way out, rather than leaving the
+    // author to notice the missing Trash link and go read the guide. Only
+    // reached when the flag was actually passed, so an ordinary scaffold prints
+    // nothing.
+    if options_with_key.model.soft_delete && !trash_enabled {
+        let reason = if options_with_key.api {
+            "an --api scaffold renders no HTML views"
+        } else if options_with_key.live || options_with_key.live_validation {
+            "restoring a row goes through the repository's `restore`, not the \
+             broadcasting `save`, so a --live list would never learn the row came back"
+        } else if options_with_key.model.sharded {
+            "`page_only_deleted` cannot fan out across shards, so a trash page \
+             would silently show one shard's deletions"
+        } else {
+            "the index is owner-scoped and the repository has no owner-filtered \
+             deleted-rows scope; listing deleted rows without one would show every \
+             user's trash"
+        };
+        plan.warn(format!(
+            "--soft-delete: no Trash view generated for {plural} — {reason}. \
+             The repository still has restore/purge/only_deleted, so a hand-written \
+             trash route can use them; see docs/guide/generators.md."
+        ));
+    }
     // Smoke test under `tests/<snake>.rs`. Uses the same soft-delete-augmented
     // field list as the real migration (see `augment_fields_for_soft_delete`)
     // so the smoke test's throwaway table matches the real schema exactly.
@@ -2648,6 +2675,16 @@ fn render_routes_file(
     // routes module at all), or `main.rs` would mount routes this module never
     // emitted.
     let trash_enabled = soft_delete && !live && !live_validation && !sharded && !owner_scoped_index;
+    // Issue #1332: once a Trash page exists, "{pascal_name} deleted" is no longer
+    // what happened — the row moved somewhere the user can go and get it back,
+    // and the flash is the only place that says so. Every scaffold that emits no
+    // trash surface (including a `--soft-delete` one on a gated-off variant,
+    // where there is nowhere to point them) keeps the original wording.
+    let destroy_flash = if trash_enabled {
+        format!("{pascal_name} moved to Trash")
+    } else {
+        format!("{pascal_name} deleted")
+    };
     // The full extractor pair the authorize wiring needs on handlers that do not
     // already carry a `state:` wrapper. No trailing comma — each insertion site
     // supplies its own delimiter.
@@ -3571,10 +3608,18 @@ mod attachment_read_back_tests {
     // explicitly *submitted* slug of one of these isn't rejected here,
     // matching this AC's blank-only scope (out of scope: general
     // reserved-word validation on a hand-typed slug).
-    let reserved_segment_guard = if search_enabled {
-        "candidate != \"new\" && candidate != \"search\""
-    } else {
-        "candidate != \"new\""
+    // Issue #1332 adds `GET /{plural}/trash` to that set of static siblings, so
+    // a derived slug of "trash" must be treated as taken too — otherwise a post
+    // titled "Trash" would be permanently shadowed by the trash view.
+    let reserved_segment_guard = {
+        let mut guard = String::from("candidate != \"new\"");
+        if search_enabled {
+            guard.push_str(" && candidate != \"search\"");
+        }
+        if trash_enabled {
+            guard.push_str(" && candidate != \"trash\"");
+        }
+        guard
     };
     #[allow(clippy::option_if_let_else)] // nested map_or_else closures read worse here
     let slug_derive_block = if let Some(slug) = slug_field {
@@ -4738,10 +4783,14 @@ mod attachment_read_back_tests {
         // these handlers hold two connections at once — an unconditional stall
         // on a pool of one (same reasoning as `bulk_delete`).
         let cp_trash = cp(&format!("/{plural}/trash"));
+        // The soft-delete column's table header, title-cased the same way every
+        // other index column header is (`title_case`), so the trash table reads
+        // like the list it mirrors.
+        let deleted_at_header = title_case("deleted_at");
         format!(
             r#"
 
-/// `GET /{plural}/trash` — the recycle bin for soft-deleted {snake_name}s (issue #1332).
+/// `GET /{plural}/trash` — the Trash view for soft-deleted {snake_name}s (issue #1332).
 ///
 /// Lists the rows the delete button marked deleted, read through the
 /// repository's generated `page_only_deleted` — the paginated form of the
@@ -4766,32 +4815,46 @@ pub async fn trash(
     // all, which is worse than promising one. `confirm_action` renders a
     // `<dialog>` driven by the `autumn-widgets.js` the generated layout already
     // loads, plus a `<noscript>` fallback so the action stays reachable without
-    // JavaScript. Built once here and borrowed by the cell closure below.
+    // JavaScript.
     let purge_csrf = csrf.as_ref().map(|token| token.token()).unwrap_or_default();
-    let purge_confirm = autumn_web::widgets::ConfirmActionConfig::new()
-        .title("Permanently delete this {snake_name}?")
-        .message(maud::html! {{ p {{ "This cannot be undone. Restore it instead if you might need it later." }} }});
-    let purge_confirm = match csrf_field.as_ref() {{
-        Some(field) => purge_confirm.csrf_field(field.0.as_str()),
-        None => purge_confirm,
-    }};
-{trash_columns}    columns.push(autumn_web::widgets::Column::new("Deleted", |row: &{pascal_name}| maud::html! {{ (row.deleted_at.as_ref().map(ToString::to_string).unwrap_or_default()) }}));
-    columns.push(autumn_web::widgets::Column::new("Actions", |row: &{pascal_name}| maud::html! {{
-        form action=(paths::restore({route_key_display_expr})) method="post" {{
-            (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
-            button type="submit" {{ "Restore" }}
+{trash_columns}    // The `{deleted_at_header}` stamp goes BEFORE the trailing "Show" link column that
+    // `columns` ends with, so the data columns stay together and the two link
+    // columns stay at the end of the row.
+    columns.insert(
+        columns.len() - 1,
+        autumn_web::widgets::Column::new("{deleted_at_header}", |row: &{pascal_name}| maud::html! {{ (row.deleted_at.as_ref().map(ToString::to_string).unwrap_or_default()) }}),
+    );
+    columns.push(autumn_web::widgets::Column::new("Actions", |row: &{pascal_name}| {{
+        // Titled per row rather than once for the whole page: a page-sized
+        // trash renders one dialog per row, and identical titles would put a
+        // run of indistinguishable `<h2>`s in the heading outline — and leave
+        // the person confirming an irreversible delete with nothing on screen
+        // saying WHICH {snake_name} they are about to destroy.
+        let purge_title = format!("Permanently delete {snake_name} {{}}?", {route_key_display_expr});
+        let purge_confirm = autumn_web::widgets::ConfirmActionConfig::new()
+            .title(&purge_title)
+            .message(maud::html! {{ p {{ "This action cannot be undone. Restore it instead if you might need it later." }} }});
+        let purge_confirm = match csrf_field.as_ref() {{
+            Some(field) => purge_confirm.csrf_field(field.0.as_str()),
+            None => purge_confirm,
+        }};
+        maud::html! {{
+            form action=(paths::restore({route_key_display_expr})) method="post" {{
+                (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
+                (autumn_web::a11y::Button::new("Restore").submit())
+            }}
+            (autumn_web::widgets::confirm_action(
+                &format!("purge-{{}}", row.id),
+                "Purge",
+                &paths::purge({route_key_display_expr}),
+                autumn_web::reexports::http::Method::POST,
+                purge_csrf,
+                &purge_confirm,
+            ))
         }}
-        (autumn_web::widgets::confirm_action(
-            &format!("purge-{{}}", row.id),
-            "Purge",
-            &paths::purge({route_key_display_expr}),
-            autumn_web::reexports::http::Method::POST,
-            purge_csrf,
-            &purge_confirm,
-        ))
     }}));
     Ok({layout_fn}("{pascal_name} trash", {cp_trash}{flash_arg}, html! {{
-        h1 {{ "{pascal_name} trash" }}
+        h1 {{ "Deleted {pascal_name}s" }}
         (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
         (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("Trash is empty.").base_path(&paths::trash())))
         (pagination_nav(&page_data, &PagerOptions::new(&paths::trash())))
@@ -4813,7 +4876,9 @@ pub async fn restore(
 ) -> AutumnResult<autumn_web::Redirect> {{
 {trash_guard_load}{trash_authz_call}    drop(db);
     repo.restore(row.id).await?;
-    flash.success("{pascal_name} restored").await;
+    // The redirect lands back on the Trash page (the row is gone from it), so
+    // the flash has to say where the {snake_name} actually went.
+    flash.success("{pascal_name} restored — it is back in the list").await;
     Ok(autumn_web::Redirect::to(&paths::trash()))
 }}
 
@@ -4821,8 +4886,21 @@ pub async fn restore(
 ///
 /// The ONLY hard delete in this application: every other path marks
 /// `deleted_at`. Routed through the repository's generated `purge`, and reached
-/// only for a row that is already in the trash — so a {snake_name} can never be
-/// destroyed without having been soft-deleted (and confirmed) first.
+/// only for a row that was in the trash when this request loaded it — so a
+/// {snake_name} cannot be destroyed here without having been soft-deleted first.
+///
+/// SECURITY: this is irreversible and is authorized by exactly the same
+/// `"delete"` policy check as the recoverable `destroy`. If permanent deletion
+/// should be a higher bar in your app — admins only, or a re-authentication
+/// step — tighten it in `{pascal_name}Policy` or add `#[reauthenticate]` here;
+/// the generated policy authorizes any authenticated user by default.
+///
+/// The trash-membership check and the delete run on separate connections (the
+/// repository takes its own), so a `restore` that commits in between means this
+/// hard-deletes a row that just became live again. Nobody can reach the delete
+/// without the row having been trashed, but if losing that race is unacceptable,
+/// replace the `purge` call with a filtered `diesel::delete(… .filter(
+/// {plural}::deleted_at.is_not_null()))` on this handler's own connection.
 #[secured]
 #[post("/{plural}/{{{id_url_segment}}}/purge")]
 pub async fn purge(
@@ -6244,7 +6322,7 @@ pub async fn destroy(
             "{pascal_name} with id {{}} not found", {id_value_expr}
         )));
     }}
-    flash.success("{pascal_name} deleted").await;
+    flash.success("{destroy_flash}").await;
     Ok(autumn_web::Redirect::to(&paths::index()))
 }}
 
@@ -20246,23 +20324,26 @@ exempt_paths = [
         trash_routes(&trash_options(|_| {}))
     }
 
-    /// Every token that only the trash surface emits. Used by the gating tests
-    /// to prove a variant's output carries none of it.
-    const TRASH_TOKENS: &[&str] = &[
-        "pub async fn trash(",
-        "pub async fn restore(",
-        "pub async fn purge(",
-        "page_only_deleted",
-        "paths::trash()",
-        "repo.restore(",
-        "repo.purge(",
+    /// Every word the trash surface introduces. Deliberately whole WORDS
+    /// (`trash`, `restore`, `purge`, `only_deleted`) rather than the precise
+    /// call sites: a gated-off variant must carry no trace of the feature at
+    /// all, and matching on the narrow spellings would miss a stray link,
+    /// comment, or doc line that leaked through a gate.
+    const TRASH_WORDS: &[&str] = &[
+        "trash",
+        "Trash",
+        "restore",
+        "Restore",
+        "purge",
+        "Purge",
+        "only_deleted",
     ];
 
     fn assert_no_trash_surface(routes: &str, main: &str, label: &str) {
-        for token in TRASH_TOKENS {
+        for word in TRASH_WORDS {
             assert!(
-                !routes.contains(token),
-                "{label} must not emit `{token}`:\n{routes}"
+                !routes.contains(word),
+                "{label} must not emit `{word}` anywhere:\n{routes}"
             );
         }
         for entry in ["::trash", "::restore", "::purge"] {
@@ -20320,6 +20401,19 @@ exempt_paths = [
         assert!(
             trash.contains("csrf: Option<CsrfToken>"),
             "the trash handler must extract a CSRF token for its row forms:\n{trash}"
+        );
+        // Issue #1706: a submit control is emitted through the typed `a11y`
+        // primitive, whose constructor requires an accessible name.
+        assert!(
+            trash.contains("autumn_web::a11y::Button::new(\"Restore\").submit()"),
+            "Restore must render through the a11y Button primitive:\n{trash}"
+        );
+        // The confirm dialog is titled per row: one dialog per row means
+        // identical titles would stack indistinguishable headings in the outline
+        // and never tell the user WHICH row they are about to destroy.
+        assert!(
+            trash.contains("format!(\"Permanently delete post {}?\", row.id)"),
+            "the purge dialog must name the row it destroys:\n{trash}"
         );
         // Purge confirms through the framework's server-rendered dialog. An
         // inline `onclick` would be blocked by the default `script-src 'self'`
@@ -20499,6 +20593,90 @@ exempt_paths = [
                 label,
             );
         }
+    }
+
+    #[test]
+    fn soft_delete_slug_scaffold_reserves_the_trash_segment() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+            &trash_options(|_| {}),
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        // `GET /posts/trash` is a static sibling of `GET /posts/{slug}`, and the
+        // router always prefers the static one — so a post titled "Trash" whose
+        // slug derives to `trash` would be permanently unreachable at its own
+        // show page. The derived-slug collision probe must treat it as taken,
+        // exactly as it already does for `new` (and `search`).
+        assert!(
+            routes.contains("candidate != \"trash\""),
+            "a soft-delete slug scaffold must reserve the `trash` segment:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_without_trash_view_does_not_reserve_the_trash_segment() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            !routes.contains("candidate != \"trash\""),
+            "a scaffold with no trash route must not reserve the segment:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn soft_delete_destroy_flash_says_where_the_row_went() {
+        // With a Trash page in the app, "deleted" is no longer what happened.
+        assert!(
+            trash_routes_default().contains(r#"flash.success("Post moved to Trash")"#),
+            "a soft-delete scaffold with a trash view must say the row moved there"
+        );
+        // Without one there is nowhere to point the user, so the wording stays.
+        let plain = trash_routes(&trash_options(|o| o.model.sharded = true));
+        assert!(
+            plain.contains(r#"flash.success("Post deleted")"#),
+            "a scaffold with no trash view keeps the original delete wording"
+        );
+    }
+
+    #[test]
+    fn soft_delete_without_a_trash_view_warns_and_says_why() {
+        // Every gated-off variant explains itself at generation time rather than
+        // leaving the author to notice the missing Trash link.
+        let cases: [(&str, ScaffoldOptions, &[&str]); 4] = [
+            ("--api", trash_options(|o| o.api = true), &[]),
+            ("--live", trash_options(|o| o.live = true), &[]),
+            ("--sharded", trash_options(|o| o.model.sharded = true), &[]),
+            ("owner-scoped", trash_options(|_| {}), &["user:references"]),
+        ];
+        for (label, options, extra_fields) in cases {
+            let plan = trash_plan(&options, extra_fields);
+            assert!(
+                plan.warnings
+                    .iter()
+                    .any(|w| w.contains("no Trash view generated for posts")),
+                "{label} must warn that --soft-delete generated no trash view: {:?}",
+                plan.warnings
+            );
+        }
+        // A scaffold that DOES get the trash view says nothing about it.
+        let plan = trash_plan(&trash_options(|_| {}), &[]);
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("Trash")),
+            "a scaffold that gets the trash view must not warn: {:?}",
+            plan.warnings
+        );
     }
 
     #[test]

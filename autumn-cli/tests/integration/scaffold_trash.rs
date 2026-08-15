@@ -77,13 +77,18 @@ fn handler_slice<'a>(routes: &'a str, name: &str) -> &'a str {
     rest.split("pub async fn ").next().unwrap_or(rest)
 }
 
-/// Every token only the trash surface emits.
-const TRASH_TOKENS: &[&str] = &[
-    "pub async fn trash(",
-    "pub async fn restore(",
-    "pub async fn purge(",
-    "page_only_deleted",
-    "paths::trash()",
+/// Every word the trash surface introduces. Deliberately whole WORDS rather
+/// than the precise call sites: a gated-off variant must carry no trace of the
+/// feature at all, and matching the narrow spellings would miss a stray link,
+/// comment, or doc line that leaked through a gate.
+const TRASH_WORDS: &[&str] = &[
+    "trash",
+    "Trash",
+    "restore",
+    "Restore",
+    "purge",
+    "Purge",
+    "only_deleted",
 ];
 
 #[test]
@@ -206,23 +211,38 @@ fn soft_delete_scaffold_mounts_the_trash_surface_and_tests_the_lifecycle() {
     }
 }
 
-#[test]
-fn scaffold_without_soft_delete_emits_no_trash_surface() {
-    let (_tmp, project) = scaffold_project("trash-absent", &[], &[]);
-    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-    for token in TRASH_TOKENS {
-        assert!(
-            !routes.contains(token),
-            "a scaffold without --soft-delete must not emit `{token}`:\n{routes}"
-        );
+/// Assert a generated project carries no trace of the trash surface: not in the
+/// routes module (when it has one), not in the mounted route list, not in the
+/// generated test.
+fn assert_no_trash_surface(project: &Path, label: &str) {
+    let routes_path = project.join("src/routes/posts.rs");
+    if routes_path.exists() {
+        let routes = fs::read_to_string(&routes_path).unwrap();
+        for word in TRASH_WORDS {
+            assert!(
+                !routes.contains(word),
+                "{label} must not emit `{word}` anywhere:\n{routes}"
+            );
+        }
     }
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
     for entry in ["::trash", "::restore", "::purge"] {
         assert!(
             !main.contains(entry),
-            "a scaffold without --soft-delete must not mount `{entry}`:\n{main}"
+            "{label} must not mount `{entry}`:\n{main}"
         );
     }
+    let test_src = fs::read_to_string(project.join("tests/post.rs")).unwrap();
+    assert!(
+        !test_src.contains("trash"),
+        "{label} must generate no trash lifecycle test:\n{test_src}"
+    );
+}
+
+#[test]
+fn scaffold_without_soft_delete_emits_no_trash_surface() {
+    let (_tmp, project) = scaffold_project("trash-absent", &[], &[]);
+    assert_no_trash_surface(&project, "a scaffold without --soft-delete");
 }
 
 #[test]
@@ -239,27 +259,19 @@ fn gated_off_soft_delete_variants_emit_no_trash_surface() {
             &[][..],
             &["--soft-delete", "--sharded"][..],
         ),
+        // An owner-scoped index has no owner-filtered deleted-rows scope to list
+        // through; a trash page there would show every user's deleted rows.
         (
             "trash-owner",
             &["user:references"][..],
             &["--soft-delete"][..],
         ),
+        // `--api` emits no HTML routes module at all, so there is nothing to
+        // hang a trash view on — and nothing may be mounted for one.
+        ("trash-api", &[][..], &["--soft-delete", "--api"][..]),
     ] {
         let (_tmp, project) = scaffold_project(name, extra_fields, flags);
-        let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-        for token in TRASH_TOKENS {
-            assert!(
-                !routes.contains(token),
-                "{name} must not emit `{token}`:\n{routes}"
-            );
-        }
-        let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
-        for entry in ["::trash", "::restore", "::purge"] {
-            assert!(
-                !main.contains(entry),
-                "{name} must not mount `{entry}`:\n{main}"
-            );
-        }
+        assert_no_trash_surface(&project, name);
     }
 }
 

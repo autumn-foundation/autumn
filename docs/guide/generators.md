@@ -1063,10 +1063,14 @@ methods were waiting for (issue #1332) — zero lines of user code:
 - Per row: a **Restore** submit posting to
   `POST /<plural>/{id}/restore`, and a **Purge** control posting to
   `POST /<plural>/{id}/purge` behind
-  [`confirm_action`](../reference/widgets.md)'s server-rendered dialog.
-  Both carry the CSRF hidden field.
-- A `Deleted` column showing each row's `deleted_at` stamp, so the page
+  [`confirm_action`](../../autumn/src/widgets.rs)'s server-rendered dialog
+  (titled per row, so the person confirming an irreversible delete can see
+  which record it is). Both carry the CSRF hidden field.
+- A `Deleted At` column showing each row's `deleted_at` stamp, so the page
   answers "when did this go?" as well as "what went".
+- With a Trash page in the app, the delete button's flash becomes
+  `<Model> moved to Trash` rather than `<Model> deleted` — it is now the
+  only thing that tells the user the record is recoverable and where.
 - A generated `tests/<name>.rs` case walking the whole lifecycle: create
   → delete (soft) → in Trash and out of the index → restore → back in the
   index and out of Trash → purge → gone from both.
@@ -1082,7 +1086,9 @@ Contract of the generated handlers:
 | Confirmation | A server-rendered `<dialog>`, not an inline `onclick` handler: the default CSP is `script-src 'self'` with no `'unsafe-inline'`, so an inline confirm is blocked by the browser and the form would submit with no prompt at all. The dialog is driven by the `autumn-widgets.js` the generated layout already loads, with a `<noscript>` fallback that keeps Purge reachable without JavaScript. |
 | Connection use | Each handler `drop`s its `Db` extractor after the guard load and before the repository call, so it holds **one** pooled connection at a time — no stall on `database.pool.max_size = 1`. |
 | Route vs `/<plural>/{id}` | The static `trash` segment outranks the `{id}` parameter in the router, the same way `/<plural>/new` already does. |
-| `--slug` route key | Restore and Purge key off the slug like the rest of the resource (`POST /<plural>/{slug}/restore`); the repository call still uses the loaded row's `id`. |
+| `--slug` route key | Restore and Purge key off the slug like the rest of the resource (`POST /<plural>/{slug}/restore`); the repository call still uses the loaded row's `id`. A *derived* slug of `trash` is treated as taken (and suffixed `trash-2`) alongside `new` and `search`, so a record titled "Trash" is not shadowed by the trash view. |
+| Purge, concurrently restored | The membership check and the delete run on separate connections (the repository takes its own), so a `restore` committing in between means the purge hard-deletes a row that just came back. Nobody reaches the delete without the row having been trashed; if losing that race matters, the emitted handler carries a comment showing the filtered `diesel::delete` that closes it. |
+| Gated off | The generator says so, and why, on stderr at generation time — a `--soft-delete` scaffold that gets no Trash view never fails silently. |
 
 Emitted **only** with `--soft-delete`, and only on the standard HTML
 path. Not emitted for `--live`/`--live-validation` (a restore goes

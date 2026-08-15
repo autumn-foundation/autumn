@@ -41,8 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Deleted` column carrying each row's `deleted_at` stamp, and per row a
   CSRF-protected **Restore** (`POST /<plural>/{id}/restore` → `restore(id)`) and
   **Purge** (`POST /<plural>/{id}/purge` → `purge(id)`) control, the latter
-  behind `confirm_action`'s server-rendered dialog rather than an inline
-  `onclick` the default `script-src 'self'` CSP would block. Both write handlers
+  behind `confirm_action`'s server-rendered dialog (titled per row, so a
+  page-sized trash does not stack identical headings and the person confirming
+  an irreversible delete can see which record it is) rather than an inline
+  `onclick` the default `script-src 'self'` CSP would block. The delete button's
+  flash becomes `<Model> moved to Trash` — with somewhere to recover from, the
+  flash is the only thing that says so — and a derived slug of `trash` joins
+  `new`/`search` as a reserved segment. A `--soft-delete` scaffold on one of the
+  gated-off variants warns at generation time, naming the reason, instead of
+  silently shipping no recovery UI. Both write handlers
   load their target with `deleted_at IS NOT NULL` first, so they 404 rather than
   hard-deleting a live row, and record-authorize it with the same `"delete"`
   action `destroy` uses. The generated `tests/<name>.rs` gains an in-process
