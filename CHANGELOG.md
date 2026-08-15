@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **config reads on the request path:** generated auth handlers, the admin
+  plugin, the `saas` starter, and the `blog`/`saas`/`teams` examples now read
+  configuration through `AppState::config_arc()` instead of
+  `AppState::config()`. `config()` returns an owned `AutumnConfig`, so every
+  call deep-clones **every** config section — 64 allocations and 1,384 bytes
+  against a default config, and more as an app's config grows — even to read a
+  single `bool` or `usize`. On a handler that cost is paid per request, and a
+  handler reading two or three sections paid it two or three times over: a
+  downstream app profiling its request path measured whole-config clones at
+  ~30% of its per-request allocations and ~42% of its per-request bytes.
+  `config_arc()` hands back the shared `Arc<AutumnConfig>` the state already
+  holds, so the same read is a refcount bump and handlers borrow the section
+  they need off the handle (`&config.auth.password`).
+
+  Nothing about the framework's own ingress path changed — that was already
+  allocation-free as of #2199 — and no public signature moved: `config()`
+  remains the per-boot owned-snapshot accessor, and the one generated call site
+  that still uses it is the boot-time `remember_me_startup` hook, which needs an
+  owned `RememberConfig`. Apps calling `state.config()` in their own handlers
+  keep compiling; switching them to `state.config_arc()` is the fix, and
+  `docs/guide/authentication.md` now teaches that as the default. A new
+  generator test pins the emitted handlers to `config_arc()` so the deep clone
+  cannot reappear in scaffolded apps.
+
 - **jobs:** the Postgres job worker's claim query (`SELECT … FOR UPDATE SKIP
   LOCKED`) no longer scans and sorts the entire ready backlog for a queue
   before picking one row, for apps that don't configure `[jobs] queues`
@@ -130,6 +154,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   successful requests are never captured. `ErrorEvent` gains a
   `capsule` field whose file is already on disk by the time a reporter runs.
   See `docs/guide/failure-capsules.md`.
+- **counter caches:** `#[belongs_to(Post, counter_cache)]` keeps a
+  `posts.comment_count` column current automatically (#1325). Creating a child
+  increments the parent, destroying one decrements it, soft-deleting decrements
+  and `restore` puts it back, and reassigning the foreign key moves the count
+  from the old parent to the new one — every one of them **inside the same
+  transaction as the row mutation**, so the column and the row commit or roll
+  back together. The arithmetic is a single atomic `UPDATE posts SET
+  comment_count = comment_count + $1`, never a read-modify-write, so N
+  concurrent inserts yield exactly N. The column name defaults to
+  `{snake(child)}_count` and takes an override (`counter_cache =
+  "subscriber_count"`); a counter on a `has_many`, on a `through =` join table,
+  or two legs resolving onto one parent column are directed compile errors. Every
+  counter-cached repository also gains `recompute_counter_caches()` /
+  `recompute_counter_caches_for(parent_id)` — an idempotent rebuild from the
+  source of truth, which is both the backfill for a table adopting the column and
+  the repair for drift introduced by writes that bypassed the repository.
+  `autumn generate scaffold … --belongs-to Post --counter-cache` emits the
+  `BIGINT NOT NULL DEFAULT 0` column and its migration, opts the generated child
+  model in, and prints the two parent-side lines (`src/schema.rs`, the model
+  field) rather than editing files it does not own and cannot cleanly revert. Models with no counter cache are unaffected: the spec slice is empty
+  and the presence flag is a `const false`, so no statement is issued and the
+  transaction-free single-statement mutation paths keep their exact prior
+  codegen. See `docs/guide/counter-cache.md`.
+
 - **generate scaffold:** `--belongs-to <Parent>` scaffolds the parent-side half
   of a parent → child relationship, which the flat scaffold has always omitted
   (#1323). Autumn already shipped every piece — the `references:` column

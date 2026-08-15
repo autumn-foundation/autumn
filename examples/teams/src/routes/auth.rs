@@ -70,7 +70,7 @@ fn signup_page(min_len: usize, csrf_token: &str, error: Option<&str>) -> Markup 
 #[get("/signup")]
 pub async fn signup_form(State(state): State<AppState>, csrf: Option<CsrfToken>) -> Markup {
     signup_page(
-        state.config().auth.password.min_length,
+        state.config_arc().auth.password.min_length,
         csrf_value(&csrf),
         None,
     )
@@ -95,8 +95,10 @@ pub async fn signup(
             "Password must be at most 128 characters",
         ));
     }
-    let password_cfg = state.config().auth.password;
-    let policy = password_cfg.policy();
+    // `config_arc` shares the resolved config behind an `Arc`; `config()` would
+    // deep-clone every section just to read `[auth.password]` on a request path.
+    let config = state.config_arc();
+    let policy = config.auth.password.policy();
     let validation =
         autumn_web::auth::validate_password(&form.password, &policy, &[email.as_str()]).await;
     if !validation.is_valid() {
@@ -106,9 +108,12 @@ pub async fn signup(
         } else {
             messages.join("\n")
         };
-        return Ok(
-            signup_page(password_cfg.min_length, csrf_value(&csrf), Some(&message)).into_response(),
-        );
+        return Ok(signup_page(
+            config.auth.password.min_length,
+            csrf_value(&csrf),
+            Some(&message),
+        )
+        .into_response());
     }
 
     let password_hash = hash_password(&form.password).await?;

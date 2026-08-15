@@ -84,10 +84,33 @@ pub async fn create(
                     .get_result(conn)
                     .await?;
 
-                diesel::update(posts::table.find(post_id))
-                    .set(posts::comment_count.eq(posts::comment_count + 1))
-                    .execute(conn)
-                    .await?;
+                // Counter cache (#1325). This route inserts with raw Diesel
+                // (the comment id and the activity event have to land in one
+                // transaction), so it uses the documented escape hatch rather
+                // than going through `PgCommentRepository::save`. What used to
+                // be a hand-written `comment_count + 1` -- with no matching
+                // decrement anywhere -- is now the framework's atomic
+                // `UPDATE posts SET comment_count = comment_count + 1`,
+                // derived from `#[belongs_to(Post, counter_cache)]` on the
+                // model, running in this same transaction.
+                //
+                // The by-id form re-resolves the parent from the comment row
+                // through a sub-select. That costs one index hit on a row this
+                // transaction just wrote (and already holds the lock on), and it
+                // keeps the call site independent of which legs are
+                // counter-cached -- worth it here. Where the parent id is in
+                // hand and the lookup matters, `counter_cache_apply_delta` takes
+                // it directly.
+                //
+                // `Comment::counter_caches()` needs no trait import: `#[model]`
+                // emits it as an *inherent* associated function, which shadows
+                // the blanket `AutumnCounterCaches` impl.
+                autumn_web::repository::counter_cache_after_insert_by_id(
+                    conn,
+                    Comment::counter_caches(),
+                    comment_id,
+                )
+                .await?;
 
                 let event = comment_created_event(
                     comment_id,

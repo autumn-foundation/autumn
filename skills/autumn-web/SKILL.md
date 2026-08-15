@@ -480,6 +480,51 @@ the `reaction_controls` widget (see the widgets section), threading the CSRF
 token so the no-JS form POST works. See `docs/guide/votable.md` and `examples/reddit-clone`
 (`src/routes/votes.rs`).
 
+**Never hand-write `count + 1` on a parent.** `counter_cache` on a child's
+`#[belongs_to]` maintains a denormalised `{child}_count` column on the parent
+**(unreleased — trunk-dev, #1325)**:
+
+```rust
+#[autumn_web::model]
+#[belongs_to(Post, counter_cache)]              // -> posts.comment_count
+pub struct Comment {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+}
+```
+
+The child's repository then maintains it on `save`, `update`, `delete_by_id`,
+`restore`, `purge`, every bulk variant, and `dependent(...)` cascades — **inside
+the same transaction as the row mutation**, with a single atomic `UPDATE posts
+SET comment_count = comment_count + $1`. Never a read-modify-write, so N
+concurrent inserts yield exactly N. Soft-deleting decrements (the count reflects
+live rows) and `restore` puts it back; reassigning the foreign key moves the
+count from the old parent to the new one; a leg whose FK did not change issues
+no statement at all.
+
+The column defaults to `{snake(child)}_count` — **singular**, matching
+`#[votable(aggregate = count)]` — and is overridable with `counter_cache =
+"<column>"`. `counter_cache_tenant = "<column>"` confines every delta to the
+caller's tenant (both tables must carry that column); without it no tenant
+predicate is emitted. It is a **`belongs_to`** option only — on a `has_many`, on
+a `through =` join table, with a non-identifier column, with two legs resolving
+onto one parent column, or on a composite `#[id]`, it is a directed compile
+error.
+
+The column is the app's migration to write (`ALTER TABLE posts ADD COLUMN
+comment_count BIGINT NOT NULL DEFAULT 0` — `NOT NULL DEFAULT 0` is load-bearing,
+since `NULL + 1` is `NULL`), or `autumn generate scaffold … --belongs-to Post
+--counter-cache` emits it. Every counter-cached repository also gains
+`recompute_counter_caches()` / `recompute_counter_caches_for(parent_id)` — an
+idempotent rebuild from the source of truth, which is both the backfill for a
+table adopting the column and the repair for drift. Applications that insert
+with raw Diesel can opt in with
+`counter_cache_after_insert_by_id(conn, Comment::counter_caches(), id)`. Two
+paths are **not** yet maintained: a derived `delete_by_<field>` and
+`find_or_create_by_<field>` — `recompute` is the remedy. See
+`docs/guide/counter-cache.md`.
+
 Deleting a parent can cascade to its children in one transaction — declare
 `dependent(...)` on the parent's `#[repository]` instead of hand-writing the
 child cleanup **(unreleased — trunk-dev)**:
