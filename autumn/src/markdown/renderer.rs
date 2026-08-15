@@ -153,6 +153,11 @@ fn heading_text(events: &[Event<'_>], start: usize) -> String {
 /// `## Example` would take `example-1`, and a `#example-1` link already
 /// published against `## Example 1` would silently resolve to a different
 /// heading — worse for a docs site than a dead link.
+///
+/// A heading whose *own* slug already ends in `-N`, repeated, can only be
+/// disambiguated by suffixing the whole slug — `# x-1` twice yields `x-1` and
+/// `x-1-1`, as it does on GitHub. Reallocating the repeat from the `x` root
+/// would hand it `x-2`, which reads as belonging to a heading titled "x 2".
 struct AnchorAllocator {
     /// Slugs handed out so far.
     used: std::collections::HashSet<String>,
@@ -503,20 +508,33 @@ mod tests {
     }
 
     #[test]
-    fn suffixes_never_nest() {
-        // A base slug that is itself a suffixed form must not produce `x-1-1`.
+    fn every_heading_keeps_its_own_natural_slug() {
+        // With three `# x` competing for suffixes, the headings whose own text
+        // yields "x-1"/"x-2" must still get those exact ids — the repeats are
+        // pushed past them rather than squatting on them.
         let md = "# x\n# x\n# x\n# x-1\n# x-2\n# x\n";
         let result = render(md, RenderOptions::default());
         let ids: Vec<&str> = result.toc.iter().map(|t| t.id.as_str()).collect();
-        for id in &ids {
-            assert!(
-                !id.contains("-1-"),
-                "nested suffix in {id:?} (all: {ids:?})"
-            );
-        }
-        // Headings whose own text yields "x-1"/"x-2" keep those ids.
         assert_eq!(ids[3], "x-1");
         assert_eq!(ids[4], "x-2");
+        assert_eq!(ids[0], "x");
+        // Repeats of "x" skip the reserved x-1/x-2 entirely.
+        assert_eq!(ids[1], "x-3");
+        assert_eq!(ids[2], "x-4");
+        assert_eq!(ids[5], "x-5");
+    }
+
+    #[test]
+    fn repeat_of_a_numeric_looking_slug_nests_its_suffix() {
+        // A heading whose *own* slug already ends in `-N`, repeated, can only
+        // be disambiguated by suffixing the whole slug: `x-1` then `x-1-1`.
+        // This is what GitHub does too. Reallocating the second one from the
+        // "x" root would hand it `x-2`, which reads as belonging to a heading
+        // titled "x 2" — so nesting is the honest outcome, not a defect.
+        let md = "# x-1\n# x-1\n";
+        let result = render(md, RenderOptions::default());
+        let ids: Vec<&str> = result.toc.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["x-1", "x-1-1"]);
     }
 
     #[test]
