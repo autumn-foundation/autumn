@@ -5631,7 +5631,7 @@ mod tests {
             shards: None,
             #[cfg(all(feature = "db", feature = "reporting"))]
             db_capture_gap: None,
-            profile: Some("test".to_owned()),
+            profile: Some("test".into()),
             role: crate::config::ProcessRole::Combined,
             started_at: crate::time::monotonic_now(),
             health_detailed: false,
@@ -5651,7 +5651,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),

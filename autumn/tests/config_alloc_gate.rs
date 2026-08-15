@@ -163,13 +163,15 @@ async fn ping() -> &'static str {
 /// decorative.
 ///
 /// Numbers behind the constant, all from the debug profile with default
-/// features on the pre-fix tree: a request allocates exactly 320 blocks
-/// (identical across three runs — the whole path is deterministic, so there is
-/// no noise budget to reserve), of which one whole-config deep clone accounts
-/// for 65 (measured by the sibling tests above). Serving that read from a
-/// shared handle instead therefore lands a request near 255, and the ceiling
-/// sits between the two: it trips today and clears afterwards with roughly a
-/// tenth of the budget to spare.
+/// features, identical across three runs (the whole path is deterministic, so
+/// there is no noise budget to reserve): 320 blocks on the tree before #2198's
+/// `config_arc` work, 220 after it landed, and 172 after `AppState::profile`
+/// and `AppState::auth_session_key` moved from owned `String`/`Option<String>`
+/// to `Arc<str>` (`appstate_clone_allocates_nothing_for_profile_and_auth_session_key`
+/// above pins that clone at zero) — a 48-block drop, since `AppState` is
+/// cloned on every hop of the ingress tower stack and each of those two
+/// fields used to be deep-copied on every one of those clones. The ceiling
+/// sits above the current 172 with about a tenth of headroom to spare.
 ///
 /// A ceiling this close to the measured value is a deliberate trade: it can
 /// only stay honest while the number stays deterministic. If this ever fails
@@ -180,7 +182,7 @@ fn per_request_allocations_stay_under_the_ceiling() {
     use autumn_web::routes;
     use autumn_web::test::TestApp;
 
-    const CEILING: u64 = 288;
+    const CEILING: u64 = 190;
     const WARMUP: usize = 3;
     const MEASURED: u64 = 10;
 

@@ -93,7 +93,12 @@ pub struct AppState {
     pub(crate) db_capture_gap: Option<Arc<str>>,
 
     /// Active profile name (e.g., "dev", "prod", "staging").
-    pub(crate) profile: Option<String>,
+    ///
+    /// `Arc<str>` rather than `String`: `AppState` is cloned once per tower
+    /// ingress traversal (`Route::call` deep-clones the boxed service beneath
+    /// it, per #2193/#2198), so an owned `String` here would be deep-copied
+    /// on every one of those clones rather than once per request.
+    pub(crate) profile: Option<Arc<str>>,
 
     /// Resolved process role for this replica, after config parsing and the
     /// `AUTUMN_ROLE` env override. This is the same value the framework uses to
@@ -175,7 +180,10 @@ pub struct AppState {
     /// authenticated user id for the
     /// [`PolicyContext`](crate::authorization::PolicyContext).
     /// Mirrors `[auth] session_key` (default: `"user_id"`).
-    pub(crate) auth_session_key: String,
+    ///
+    /// `Arc<str>` for the same reason as [`Self::profile`]: shared across the
+    /// per-traversal clones instead of deep-copied by each one.
+    pub(crate) auth_session_key: Arc<str>,
 
     /// Shared application cache backend. `None` means no global cache has been
     /// registered; `#[cached]` will fall back to its per-function Moka store.
@@ -702,7 +710,7 @@ impl AppState {
     /// Sets the active profile.
     #[must_use]
     pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
-        self.profile = Some(profile.into());
+        self.profile = Some(Arc::from(profile.into()));
         self
     }
 
@@ -751,7 +759,7 @@ impl AppState {
     #[doc(hidden)]
     #[must_use]
     pub fn with_auth_session_key(mut self, value: impl Into<String>) -> Self {
-        self.auth_session_key = value.into();
+        self.auth_session_key = Arc::from(value.into());
         self
     }
 
@@ -927,7 +935,7 @@ impl AppState {
             shutdown: CancellationToken::new(),
             policy_registry: PolicyRegistry::default(),
             forbidden_response: ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: Arc::new(SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
