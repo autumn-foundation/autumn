@@ -42,7 +42,7 @@ error page use. It cannot mask what has no name attached.
 | Encrypted-column names | every column registered by `#[encrypted]` is added to the filter |
 | SQL bind parameters echoing a masked value | byte-equal binds become `"masked"`, and are excluded from replay's bind comparison |
 | The outcome message, panic payload and backtrace | any masked value quoted back inside them is substring-replaced. Values shorter than four characters (a CVV, a PIN) are masked only where they stand as a whole token, so a short secret is removed without shredding timestamps and identifiers |
-| Credentials *inside* a masked header | the token after a standard auth scheme (`Bearer …`) and each cookie value join the echo set on their own, because that is the form a handler extracts and may echo |
+| Credentials *inside* a masked header | the token after an auth scheme (`Bearer …`), what a `Basic` credential decodes to (the `user:password` pair and the password alone), and each cookie value join the echo set on their own, because that is the form a handler extracts and may echo. Usernames and cookie *names* do not — they are ordinary words that would shred unrelated prose |
 | Bodies that declare structure but do not parse as it | dropped entirely (`skipped`, with a note) — with no keys, there is nothing to match on. Their raw text and string-literal values still seed the echo set, so an outcome quoting the malformed body is scrubbed |
 
 | **Not** masked | Why |

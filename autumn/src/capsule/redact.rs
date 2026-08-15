@@ -378,6 +378,9 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
         let credential = credential.trim();
         if is_auth_scheme(scheme) && !credential.is_empty() {
             values.insert(credential.as_bytes());
+            if scheme.eq_ignore_ascii_case("basic") {
+                record_basic_credentials(credential, values);
+            }
         }
     }
 
@@ -402,6 +405,38 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
                 }
             }
         }
+    }
+}
+
+/// Retain what a `Basic` credential *decodes to*, not only its Base64 text.
+///
+/// `Basic` is the one scheme whose credential has a standardized interior
+/// (RFC 7617): a handler never works with `dXNlcjpzZWNyZXQ=` — it decodes,
+/// and holds `user:secret` or the password alone. Those are the forms that
+/// reappear in an error, a panic payload or a SQL bind, and neither is a
+/// substring of the Base64, so [`mask_echoes`] would not match either one.
+///
+/// The password is retained, and the decoded `user:password` pair as a whole.
+/// The *username* is not: it is the same hazard as a cookie name — `admin`
+/// or `service` is an ordinary word, and masking it everywhere would shred
+/// unrelated prose while protecting nothing that the pair and the password do
+/// not already cover.
+fn record_basic_credentials(credential: &str, values: &mut RedactedValues) {
+    // Not Base64, or not text once decoded: nothing here can be split into
+    // components, and the Base64 itself is already in the set.
+    let Ok(decoded) = STANDARD.decode(credential) else {
+        return;
+    };
+    let Ok(decoded) = String::from_utf8(decoded) else {
+        return;
+    };
+    // RFC 7617 splits on the *first* colon; a password may contain more.
+    let Some((_, password)) = decoded.split_once(':') else {
+        return;
+    };
+    values.insert(decoded.as_bytes());
+    if !password.is_empty() {
+        values.insert(password.as_bytes());
     }
 }
 
@@ -1100,6 +1135,43 @@ mod tests {
             mask_echoes("failed at / with status 0", &set_cookie),
             "failed at / with status 0",
             "attribute values must not rewrite unrelated outcome text"
+        );
+
+        // `Basic` is the one scheme whose credential has a standardized
+        // interior: a handler decodes it, so the Base64 text alone never
+        // matches what the handler actually held.
+        let (_request, basic) = redact(
+            // base64("alice:hunter2:pass") — a password containing a colon.
+            Request::get("/").header(header::AUTHORIZATION, "Basic YWxpY2U6aHVudGVyMjpwYXNz"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            basic.contains(b"YWxpY2U6aHVudGVyMjpwYXNz"),
+            "the Base64 credential is still retained"
+        );
+        assert!(
+            basic.contains(b"alice:hunter2:pass"),
+            "the decoded pair must be retained"
+        );
+        assert!(
+            basic.contains(b"hunter2:pass"),
+            "the password must be retained on its own, splitting on the first colon only"
+        );
+        assert!(
+            !basic.contains(b"alice"),
+            "the username is an ordinary word, like a cookie name"
+        );
+        // Anything that is not Base64 of `user:password` contributes nothing
+        // beyond the whole value — no panic, no half-parsed component.
+        let (_request, not_basic) = redact(
+            Request::get("/").header(header::AUTHORIZATION, "Basic not-base64!!"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            not_basic.contains(b"not-base64!!"),
+            "the token still counts"
         );
 
         // A scheme this code has never heard of is exactly where a credential

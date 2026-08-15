@@ -27,8 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state initializer that checks `state.pool()` or replica availability before
   querying took a branch production never took. Redaction reaches two things it
   used to miss: the credential *inside* a masked header (the token after
-  `Bearer`, each cookie value — the form a handler actually extracts and may
-  echo into an error message or a SQL bind, where the whole header value never
+  `Bearer`, what a `Basic` credential decodes to, each cookie value — the form
+  a handler actually extracts and may echo into an error message or a SQL bind,
+  where the whole header value never
   matched), and values shorter than four characters, which are now masked where
   they stand as a whole token, so a three-digit CVV quoted back by a failure no
   longer reaches disk while timestamps and identifiers stay readable. Finally,
