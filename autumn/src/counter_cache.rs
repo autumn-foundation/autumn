@@ -103,6 +103,15 @@ const IS_DISTINCT_FROM: &str = "IS DISTINCT FROM";
 #[cfg(feature = "sqlite")]
 const IS_DISTINCT_FROM: &str = "IS NOT";
 
+/// Its negation, for matching a tenant discriminator that may be NULL. Plain `=`
+/// would make two rows that are both untenanted fail to match, which for a
+/// counter cache means the maintenance silently does nothing — the one failure
+/// mode this module works hardest to avoid.
+#[cfg(not(feature = "sqlite"))]
+const IS_NOT_DISTINCT_FROM: &str = "IS NOT DISTINCT FROM";
+#[cfg(feature = "sqlite")]
+const IS_NOT_DISTINCT_FROM: &str = "IS";
+
 /// The alias the generated SQL gives the *child* table whenever it appears in a
 /// sub-select. Always aliasing keeps a **self-referential** counter cache
 /// (a `Comment` that `belongs_to` a parent `Comment` maintaining `reply_count`)
@@ -281,9 +290,11 @@ fn quoted<M: 'static>(spec: &CounterCacheSpec<M>) -> Quoted {
 /// decrement unscoped, so a cross-tenant foreign key would drive another
 /// tenant's counter down without ever driving it up.
 ///
-/// `AND <parent>.tenant IN (SELECT x.tenant FROM <child> x WHERE x.<pk> = N)`
-/// for the parent-keyed statements, which have no child row to join, empty
-/// otherwise.
+/// `AND EXISTS (SELECT 1 FROM <child> x WHERE x.<pk> = N AND <parent>.tenant IS
+/// NOT DISTINCT FROM x.tenant)` for the parent-keyed statements, which have no
+/// child row to join, empty otherwise. The `EXISTS` (rather than a scalar
+/// sub-select) keeps the statement a no-op when the child row is absent, which
+/// is what a missing child has always meant here.
 ///
 /// Deliberately a sub-select on the child row rather than a bound ambient
 /// tenant: the invariant being enforced is "the parent is in the same tenant as
@@ -296,7 +307,10 @@ fn tenant_predicate_joined<M: 'static>(spec: &CounterCacheSpec<M>) -> String {
     };
     let tenant_column = quote_ident(tenant_column);
     let parent_table = quote_ident(spec.parent_table);
-    format!(" AND {parent_table}.{tenant_column} = {CHILD_ALIAS}.{tenant_column}")
+    format!(
+        " AND {parent_table}.{tenant_column} {IS_NOT_DISTINCT_FROM} \
+         {CHILD_ALIAS}.{tenant_column}"
+    )
 }
 
 fn tenant_predicate<M: 'static>(spec: &CounterCacheSpec<M>, child_id: i64) -> String {
@@ -311,9 +325,11 @@ fn tenant_predicate<M: 'static>(spec: &CounterCacheSpec<M>, child_id: i64) -> St
         ..
     } = quoted(spec);
     format!(
-        " AND {parent_table}.{tenant_column} IN \
-         (SELECT {CHILD_ALIAS}_t.{tenant_column} FROM {child_table} AS {CHILD_ALIAS}_t \
-          WHERE {CHILD_ALIAS}_t.{child_pk} = {child_id})"
+        " AND EXISTS \
+         (SELECT 1 FROM {child_table} AS {CHILD_ALIAS}_t \
+          WHERE {CHILD_ALIAS}_t.{child_pk} = {child_id} \
+            AND {parent_table}.{tenant_column} {IS_NOT_DISTINCT_FROM} \
+                {CHILD_ALIAS}_t.{tenant_column})"
     )
 }
 
@@ -1392,6 +1408,35 @@ mod tests {
             sql.contains(&format!("\"posts\".\"comment_count\" {IS_DISTINCT_FROM}")),
             "a healthy parent must still be left unwritten: {sql}"
         );
+    }
+
+    #[test]
+    fn a_tenant_discriminator_is_matched_null_safely() {
+        // A nullable discriminator with NULL on both sides is the same tenant
+        // (namely none), but `=` yields NULL there, so the maintenance would
+        // silently do nothing — a counter that quietly stops moving is worse
+        // than one that errors.
+        let mut tenanted = spec(false);
+        tenanted.tenant_column = Some("tenant_id");
+
+        let joined = tenant_predicate_joined(&tenanted);
+        assert!(joined.contains(IS_NOT_DISTINCT_FROM), "{joined}");
+        assert!(
+            !joined.contains("\"tenant_id\" = "),
+            "plain equality is not NULL-safe: {joined}"
+        );
+
+        // The parent-keyed form still requires the child row to exist, so a
+        // missing child remains a no-op rather than matching every untenanted
+        // parent the way a scalar sub-select would.
+        let keyed = tenant_predicate(&tenanted, 7);
+        assert!(keyed.contains("EXISTS"), "{keyed}");
+        assert!(keyed.contains(IS_NOT_DISTINCT_FROM), "{keyed}");
+        assert!(keyed.contains("\"id\" = 7"), "{keyed}");
+
+        // Still nothing at all for an association that declares no tenant.
+        assert_eq!(tenant_predicate_joined(&spec(false)), "");
+        assert_eq!(tenant_predicate(&spec(false), 7), "");
     }
 
     #[test]

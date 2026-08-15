@@ -261,6 +261,14 @@ is raw SQL) but not readable from Rust.
   one, and it does not verify at compile time that the parent has it. A missing
   or mistyped column surfaces as a database error on the first mutation, not as
   silence.
+- **A row-suppressing `BEFORE` trigger will drift the counter.** The bulk
+  decrement is computed from the same filters the `DELETE`/`UPDATE` applies, so
+  a soft-deleted, cross-tenant or already-gone row is excluded from both. What
+  it cannot see is a hand-written `BEFORE DELETE` / `BEFORE UPDATE` trigger that
+  returns `NULL` for some rows: the statement succeeds, those children stay
+  live, and their parents end up undercounted. Nothing else in the framework
+  models a trigger that vetoes the mutation it was handed either — `recompute`
+  is the repair.
 - **Two opt-in query surfaces are not yet wired**, and will drift until
   `recompute` runs: a derived `fn delete_by_<field>(…)` declared on the
   repository trait, and `find_or_create_by_<field>(…)`. Both are explicit
