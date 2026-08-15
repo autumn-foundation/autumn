@@ -1,0 +1,6 @@
+ calls | total_buffers | buffers_per_call | temp_blks_read | temp_blks_written |                                                                  query_text                                                                  
+-------+---------------+------------------+----------------+-------------------+----------------------------------------------------------------------------------------------------------------------------------------------
+     1 |          6340 |          6340.00 |              0 |                 0 | DO $$ DECLARE recipients TEXT[]; hit_count INTEGER; BEGIN SELECT array_agg(subscriber) INTO recipients FROM batch_recipients; SELECT COUNT(*
+     1 |          6004 |          6004.00 |              0 |                 0 | SELECT COUNT(*) FROM ( SELECT subscriber FROM mail_unsubscribes WHERE list_id = $3 AND subscriber = ANY(recipients) ) suppressed
+(2 rows)
+

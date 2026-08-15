@@ -54,6 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   buffers, a 99.15% reduction. No index or migration changes — see
   `docs/reports/2026-08-14-ledger-job-claim-single-queue/`.
 
+- **mail:** list-mail sends (`Mailer::send` with `list_unsubscribe` set) now
+  resolve suppression for the whole recipient batch in one query instead of
+  one `SELECT` per recipient. The `SuppressionStore` trait gained a batched
+  `is_suppressed_many` method (default implementation loops over
+  `is_suppressed`, so existing custom stores keep working unchanged);
+  `DbSuppressionStore` overrides it with a single `WHERE list_id = $1 AND
+  subscriber = ANY($2)` query (chunked at 5,000 recipients). Measured
+  (`pg_stat_statements`, production-shaped `mail_unsubscribes` fixture):
+  statement count per send drops from N to 1 at every batch size tested
+  (200/2,000/20,000 recipients); total buffers 660→604 (200), 6,600→6,004
+  (2,000), and 66,000→8,070 (20,000, −87.8%). No index or migration changes
+  — see `docs/reports/2026-08-15-ledger-mail-suppression-batch/`.
+
 ### Added
 
 - **failure capsules:** a failing request can now be recorded and replayed

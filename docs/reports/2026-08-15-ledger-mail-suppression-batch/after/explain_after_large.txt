@@ -1,0 +1,24 @@
+=== AFTER: batched lookup, whole recipient batch in one statement ===
+                                                                                                                                                                                                         ...[array elided]...                                                                                                    
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- ...[array elided]... ---------------------------------------------------------------------------------------------------
+ Gather  (cost=1050.00..15767.03 rows=8137 width=22) (actual time=20.708..56.830 rows=6000 loops=1)
+   Output: subscriber
+   Workers Planned: 2
+   Workers Launched: 2
+   Buffers: shared hit=6624 read=1446
+   ->  Parallel Seq Scan on public.mail_unsubscribes  (cost=50.00..13953.33 rows=3390 width=22) (actual time=15.770..26.581 rows=2000 loops=3)
+         Output: subscriber
+         Filter: ((mail_unsubscribes.list_id = 'weekly_digest'::text) AND (mail_unsubscribes.subscriber = ANY ('{user1@example.com,user3@example.com,user4@example.com,user14@example.com,user16@example ...[array elided]... 97@example.com,active13998@example.com,active13999@example.com,active14000@example.com}'::text[])))
+         Rows Removed by Filter: 264667
+         Buffers: shared hit=6624 read=1446
+         Worker 0:  actual time=23.153..23.154 rows=0 loops=1
+           Buffers: shared hit=1831 read=500
+         Worker 1:  actual time=23.500..23.501 rows=0 loops=1
+           Buffers: shared hit=1743 read=444
+ Query Identifier: 5653161031852871432
+ Planning:
+   Buffers: shared hit=114 read=1
+ Planning Time: 6.023 ms
+ Execution Time: 57.227 ms
+(19 rows)
+
