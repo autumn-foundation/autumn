@@ -82,6 +82,16 @@ channels.redis
 channels.redis.key_prefix
 channels.redis.url
 channels.replay_buffer
+cluster
+cluster.advertise_addr
+cluster.bind_addr
+cluster.cluster_name
+cluster.enabled
+cluster.node_id
+cluster.push_interval_ms
+cluster.secret
+cluster.seed_peers
+cluster.suspicion_timeout_ms
 compression
 compression.enabled
 cors

@@ -1058,8 +1058,9 @@ pub struct AutumnConfig {
     /// # Field ordering (load-bearing — do not move below `database`)
     ///
     /// Declared here, before [`database`](Self::database), for the same reason
-    /// [`deploy`](Self::deploy) and [`failure_capture`](Self::failure_capture)
-    /// are: `DatabaseConfig`'s `deserialize_with` duration field aborts the
+    /// [`deploy`](Self::deploy) and `failure_capture` (a field only present
+    /// with the `reporting` feature, hence not linked) are: `DatabaseConfig`'s
+    /// `deserialize_with` duration field aborts the
     /// `SchemaDeserializer` traversal, so a section declared after it is
     /// recorded only as an opaque root leaf and strict unknown-key validation
     /// never descends into its children — a typo like
