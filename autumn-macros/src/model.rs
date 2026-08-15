@@ -923,9 +923,11 @@ fn resolve_associations(
 /// `counter_cache = "..."` override, else `{snake(ChildModel)}_count`.
 fn counter_cache_column(model_ident: &syn::Ident, assoc: &Association) -> Option<String> {
     let decl = assoc.counter_cache.as_ref()?;
-    Some(decl.column.clone().unwrap_or_else(|| {
-        format!("{}_count", pascal_to_snake(&model_ident.to_string()))
-    }))
+    Some(
+        decl.column
+            .clone()
+            .unwrap_or_else(|| format!("{}_count", pascal_to_snake(&model_ident.to_string()))),
+    )
 }
 
 /// Reject two counter-cached legs that resolve onto the **same**
@@ -8041,7 +8043,8 @@ mod tests {
     #[test]
     fn counter_cache_bare_flag_derives_the_column_from_the_child() {
         let model: syn::Ident = syn::parse_quote!(Comment);
-        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[belongs_to(Post, counter_cache)])];
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache)])];
         let assocs = resolve_associations(&model, &attrs).expect("parse ok");
         assert_eq!(assocs.len(), 1);
         assert!(assocs[0].counter_cache.is_some());
@@ -8055,9 +8058,8 @@ mod tests {
     #[test]
     fn counter_cache_accepts_an_explicit_column() {
         let model: syn::Ident = syn::parse_quote!(Subscription);
-        let attrs: Vec<syn::Attribute> = vec![
-            syn::parse_quote!(#[belongs_to(Subreddit, counter_cache = "subscriber_count")]),
-        ];
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Subreddit, counter_cache = "subscriber_count")])];
         let assocs = resolve_associations(&model, &attrs).expect("parse ok");
         assert_eq!(
             counter_cache_column(&model, &assocs[0]).as_deref(),
@@ -8097,7 +8099,8 @@ mod tests {
         // here, and guessing would break a tenant-scoped child hanging off a
         // global parent with a hard `column does not exist`.
         let model: syn::Ident = syn::parse_quote!(Comment);
-        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[belongs_to(Post, counter_cache)])];
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache)])];
         let assocs = resolve_associations(&model, &attrs).expect("parse ok");
         assert!(
             assocs[0]
@@ -8121,7 +8124,8 @@ mod tests {
     #[test]
     fn counter_cache_on_has_many_is_rejected() {
         let model: syn::Ident = syn::parse_quote!(Post);
-        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[has_many(Comment, counter_cache)])];
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Comment, counter_cache)])];
         let message = expect_assoc_error(&model, &attrs);
         assert!(
             message.contains("`#[belongs_to]` option")

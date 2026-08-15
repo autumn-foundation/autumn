@@ -1,0 +1,5 @@
+error: `counter_cache` is a `#[belongs_to]` option: the counter is maintained by the child's repository — the side that owns the foreign key and runs the insert/delete — so there is nothing on this side to hang the maintenance off. Move it to the child model's `#[belongs_to(...)]`, i.e. `#[belongs_to(Post, counter_cache)]` on `Comment`
+  --> tests/compile-fail/model_counter_cache_on_has_many.rs:33:21
+   |
+33 | #[has_many(Comment, counter_cache)]
+   |                     ^^^^^^^^^^^^^

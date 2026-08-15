@@ -1,0 +1,5 @@
+error: `comment_count; DROP TABLE posts` is not a valid column name for `counter_cache = ...`: the value is spliced verbatim into the generated `UPDATE <parent> SET <column> = <column> + $1` statement, so it must be a plain identifier — ASCII letters, digits and underscores only, and no leading digit
+  --> tests/compile-fail/model_counter_cache_bad_column.rs:30:20
+   |
+30 | #[belongs_to(Post, counter_cache = "comment_count; DROP TABLE posts")]
+   |                    ^^^^^^^^^^^^^

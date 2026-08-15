@@ -62,9 +62,10 @@ pub fn push_counter_cache_migration(
     parent_plural: &str,
 ) {
     let column = counter_column_for(child_snake);
-    let dir = project_root
-        .join("migrations")
-        .join(migration_dir_name(timestamp, &column, parent_plural));
+    let dir =
+        project_root
+            .join("migrations")
+            .join(migration_dir_name(timestamp, &column, parent_plural));
     plan.create(dir.join("up.sql"), up_sql(parent_plural, &column));
     plan.create(dir.join("down.sql"), down_sql(parent_plural, &column));
 
@@ -121,7 +122,9 @@ pub fn add_counter_cache_to_model_source(
     // Walk back over the attribute block above the struct to the line after the
     // last blank line, so the new attribute joins the existing attribute stack
     // rather than splitting it.
-    let insert_at = source[..struct_at].rfind("\n#[").map_or(struct_at, |i| i + 1);
+    let insert_at = source[..struct_at]
+        .rfind("\n#[")
+        .map_or(struct_at, |i| i + 1);
     let mut out = String::with_capacity(source.len() + 48);
     out.push_str(&source[..insert_at]);
     out.push_str(&format!("#[belongs_to({parent_pascal}, counter_cache)]\n"));
@@ -164,7 +167,9 @@ mod tests {
         let src = "#[autumn_web::model]\npub struct Comment {\n    pub id: i64,\n}\n";
         let out = add_counter_cache_to_model_source(src, "Comment", "Post");
         assert!(
-            out.contains("#[autumn_web::model]\n#[belongs_to(Post, counter_cache)]\npub struct Comment"),
+            out.contains(
+                "#[autumn_web::model]\n#[belongs_to(Post, counter_cache)]\npub struct Comment"
+            ),
             "{out}"
         );
     }
@@ -173,7 +178,10 @@ mod tests {
     fn an_existing_attribute_gains_the_key_and_is_idempotent() {
         let src = "#[autumn_web::model]\n#[belongs_to(Post)]\npub struct Comment {\n}\n";
         let once = add_counter_cache_to_model_source(src, "Comment", "Post");
-        assert!(once.contains("#[belongs_to(Post, counter_cache)]"), "{once}");
+        assert!(
+            once.contains("#[belongs_to(Post, counter_cache)]"),
+            "{once}"
+        );
         let twice = add_counter_cache_to_model_source(&once, "Comment", "Post");
         assert_eq!(once, twice, "re-running the scaffold must not stack keys");
     }

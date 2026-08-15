@@ -37,8 +37,8 @@
 use std::sync::Arc;
 
 use autumn_web::Patch;
-use autumn_web::tenancy::CURRENT_TENANT;
 use autumn_web::repository::AutumnCounterCaches as _;
+use autumn_web::tenancy::CURRENT_TENANT;
 use diesel::sql_types::BigInt;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -466,15 +466,13 @@ async fn seed_one_col(conn: &mut AsyncPgConnection, table: &str, column: &str, v
 /// The child's tenant column is what the counter predicate keys off, so a
 /// tenant-bearing parent has to be seeded with its tenant explicitly.
 async fn seed_tenant_post(conn: &mut AsyncPgConnection, tenant: &str, title: &str) -> i64 {
-    diesel::sql_query(
-        "INSERT INTO cc_tenant_posts (title, tenant_id) VALUES ($1, $2) RETURNING id",
-    )
-    .bind::<diesel::sql_types::Text, _>(title)
-    .bind::<diesel::sql_types::Text, _>(tenant)
-    .get_result::<IdRow>(conn)
-    .await
-    .expect("seed tenant post")
-    .id
+    diesel::sql_query("INSERT INTO cc_tenant_posts (title, tenant_id) VALUES ($1, $2) RETURNING id")
+        .bind::<diesel::sql_types::Text, _>(title)
+        .bind::<diesel::sql_types::Text, _>(tenant)
+        .get_result::<IdRow>(conn)
+        .await
+        .expect("seed tenant post")
+        .id
 }
 
 async fn seed_capped_parent(conn: &mut AsyncPgConnection) -> i64 {
@@ -1336,12 +1334,24 @@ async fn a_cross_tenant_foreign_key_moves_no_counter() {
         .await;
 
     assert_eq!(
-        counter(&mut conn, "cc_tenant_posts", "cc_tenant_comment_count", theirs).await,
+        counter(
+            &mut conn,
+            "cc_tenant_posts",
+            "cc_tenant_comment_count",
+            theirs
+        )
+        .await,
         0,
         "a cross-tenant foreign key must not move the other tenant's counter"
     );
     assert_eq!(
-        counter(&mut conn, "cc_tenant_posts", "cc_tenant_comment_count", mine).await,
+        counter(
+            &mut conn,
+            "cc_tenant_posts",
+            "cc_tenant_comment_count",
+            mine
+        )
+        .await,
         1,
         "the caller's own tenant still works"
     );

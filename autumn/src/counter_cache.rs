@@ -639,14 +639,8 @@ pub async fn counter_cache_before_restore_by_id<M: 'static>(
         // A model with no `deleted_at` has no restore path; guard anyway so a
         // mis-wired call cannot double-increment.
         if spec.child_soft_delete {
-            counter_cache_apply_delta_by_child_id(
-                conn,
-                spec,
-                child_id,
-                1,
-                ChildState::SoftDeleted,
-            )
-            .await?;
+            counter_cache_apply_delta_by_child_id(conn, spec, child_id, 1, ChildState::SoftDeleted)
+                .await?;
         }
     }
     Ok(())
@@ -722,10 +716,16 @@ pub async fn counter_cache_after_update<M: 'static>(
         let witness = (spec.pk_of)(record);
         let mut moves: HashMap<i64, Fold> = HashMap::new();
         if let Some(old_id) = old {
-            moves.entry(old_id).or_insert_with(|| Fold::new(witness)).delta -= 1;
+            moves
+                .entry(old_id)
+                .or_insert_with(|| Fold::new(witness))
+                .delta -= 1;
         }
         if let Some(new_id) = new {
-            moves.entry(new_id).or_insert_with(|| Fold::new(witness)).delta += 1;
+            moves
+                .entry(new_id)
+                .or_insert_with(|| Fold::new(witness))
+                .delta += 1;
         }
         apply_folded(conn, spec, moves).await?;
     }
@@ -826,10 +826,16 @@ pub async fn counter_cache_after_update_many<M: 'static>(
                 continue;
             }
             if let Some(old_id) = old {
-                deltas.entry(old_id).or_insert_with(|| Fold::new(child_id)).delta -= 1;
+                deltas
+                    .entry(old_id)
+                    .or_insert_with(|| Fold::new(child_id))
+                    .delta -= 1;
             }
             if let Some(new_id) = new {
-                deltas.entry(new_id).or_insert_with(|| Fold::new(child_id)).delta += 1;
+                deltas
+                    .entry(new_id)
+                    .or_insert_with(|| Fold::new(child_id))
+                    .delta += 1;
             }
         }
         apply_folded(conn, spec, deltas).await?;
@@ -891,10 +897,16 @@ pub async fn counter_cache_after_upsert_many<M: 'static>(
                         continue;
                     }
                     if let Some(old_id) = old {
-                        deltas.entry(old_id).or_insert_with(|| Fold::new(child_id)).delta -= 1;
+                        deltas
+                            .entry(old_id)
+                            .or_insert_with(|| Fold::new(child_id))
+                            .delta -= 1;
                     }
                     if let Some(new_id) = new {
-                        deltas.entry(new_id).or_insert_with(|| Fold::new(child_id)).delta += 1;
+                        deltas
+                            .entry(new_id)
+                            .or_insert_with(|| Fold::new(child_id))
+                            .delta += 1;
                     }
                 }
             }

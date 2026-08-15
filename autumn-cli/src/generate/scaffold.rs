@@ -18846,7 +18846,9 @@ exempt_paths = [
         let plan = nested_comment_plan(&tmp);
         let paths = scaffold_paths(&plan);
         assert!(
-            !paths.iter().any(|p| p.contains("add_comment_count_to_posts")),
+            !paths
+                .iter()
+                .any(|p| p.contains("add_comment_count_to_posts")),
             "the flag is opt-in: {paths:?}"
         );
     }
