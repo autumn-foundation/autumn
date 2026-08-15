@@ -86,6 +86,14 @@ const FOR_UPDATE: &str = " FOR UPDATE";
 #[cfg(feature = "sqlite")]
 const FOR_UPDATE: &str = "";
 
+/// NULL-safe inequality. Postgres spells it `IS DISTINCT FROM`; `SQLite` has
+/// spelled the same operator `IS NOT` since long before it gained the SQL
+/// standard alias, so the short form is the portable one there.
+#[cfg(not(feature = "sqlite"))]
+const IS_DISTINCT_FROM: &str = "IS DISTINCT FROM";
+#[cfg(feature = "sqlite")]
+const IS_DISTINCT_FROM: &str = "IS NOT";
+
 /// The alias the generated SQL gives the *child* table whenever it appears in a
 /// sub-select. Always aliasing keeps a **self-referential** counter cache
 /// (a `Comment` that `belongs_to` a parent `Comment` maintaining `reply_count`)
@@ -124,8 +132,24 @@ pub struct CounterCacheSpec<M: 'static> {
     pub fk_of: fn(&M) -> Option<i64>,
     /// Reads the child's own primary key off a record. Used by the bulk paths
     /// to match a post-update record back to the foreign keys captured for it
-    /// before the update.
+    /// before the update, and to scope the tenant predicate below.
     pub pk_of: fn(&M) -> i64,
+    /// The tenant-discriminator column, from
+    /// `#[belongs_to(…, counter_cache, counter_cache_tenant = "<column>")]`.
+    ///
+    /// A counter update is a write to a row the caller only had to name the id
+    /// of, so on a shared multi-tenant table it has to be confined to the
+    /// caller's own tenant — the same hazard `#[votable]`'s aggregate `UPDATE`
+    /// is scoped for. The predicate spells the invariant "the parent sits in the
+    /// same tenant as the child whose foreign key named it", so **both** tables
+    /// must carry a column of this name. That is why it is explicit: `#[model]`
+    /// on the child cannot see the parent's fields, and guessing would turn
+    /// every tenant-scoped child hanging off a global parent into a hard
+    /// `column does not exist`.
+    ///
+    /// `None` (the default) emits no predicate anywhere, so a single-tenant
+    /// app's SQL is byte-for-byte what it would be without this field.
+    pub tenant_column: Option<&'static str>,
 }
 
 // A manual `Clone`/`Copy` (rather than a derive) because the derive would add a
@@ -171,7 +195,7 @@ impl<T: Sized + 'static> AutumnCounterCaches for T {}
 /// Names reaching the `format!`ed SQL below are macro-emitted and already
 /// validated at macro time; this is the run-time backstop for that invariant.
 #[must_use]
-pub fn is_plain_identifier(s: &str) -> bool {
+pub(crate) fn is_plain_identifier(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with(|c: char| c.is_ascii_digit())
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -189,6 +213,49 @@ fn debug_assert_spec_idents<M: 'static>(spec: &CounterCacheSpec<M>) {
         "counter-cache spec carries a non-identifier name; it would be spliced \
          verbatim into SQL"
     );
+}
+
+/// `AND <parent>.<tenant> = __autumn_cc_child.<tenant>`, for the statements that
+/// already have the child row joined in a sub-select. Empty when the association
+/// declares no `counter_cache_tenant`.
+///
+/// The predicate must be applied to **every** delta path or it makes things
+/// worse rather than better: scoping only the increment would leave the matching
+/// decrement unscoped, so a cross-tenant foreign key would drive another
+/// tenant's counter down without ever driving it up.
+///
+/// `AND <parent>.tenant IN (SELECT x.tenant FROM <child> x WHERE x.<pk> = N)`
+/// for the parent-keyed statements, which have no child row to join, empty
+/// otherwise.
+///
+/// Deliberately a sub-select on the child row rather than a bound ambient
+/// tenant: the invariant being enforced is "the parent is in the same tenant as
+/// the child that names it", which is exactly what makes a cross-tenant foreign
+/// key move nothing. It needs no tenant plumbing through the generated code, and
+/// it is correct for `across_tenants()` callers too.
+fn tenant_predicate_joined<M: 'static>(spec: &CounterCacheSpec<M>) -> String {
+    let Some(tenant_column) = spec.tenant_column else {
+        return String::new();
+    };
+    let parent_table = spec.parent_table;
+    format!(" AND {parent_table}.{tenant_column} = {CHILD_ALIAS}.{tenant_column}")
+}
+
+fn tenant_predicate<M: 'static>(spec: &CounterCacheSpec<M>, child_id: i64) -> String {
+    let Some(tenant_column) = spec.tenant_column else {
+        return String::new();
+    };
+    let CounterCacheSpec {
+        child_table,
+        child_pk,
+        parent_table,
+        ..
+    } = spec;
+    format!(
+        " AND {parent_table}.{tenant_column} IN \
+         (SELECT {CHILD_ALIAS}_t.{tenant_column} FROM {child_table} AS {CHILD_ALIAS}_t \
+          WHERE {CHILD_ALIAS}_t.{child_pk} = {child_id})"
+    )
 }
 
 /// `AND __autumn_cc_child.deleted_at IS NULL` (or `IS NOT NULL`) for a
@@ -215,6 +282,7 @@ pub async fn counter_cache_apply_delta<M: 'static>(
     spec: &CounterCacheSpec<M>,
     parent_id: i64,
     delta: i64,
+    scope: TenantScope,
 ) -> AutumnResult<()> {
     debug_assert_spec_idents(spec);
     let CounterCacheSpec {
@@ -223,9 +291,13 @@ pub async fn counter_cache_apply_delta<M: 'static>(
         counter_column,
         ..
     } = spec;
+    let tenant = match scope {
+        TenantScope::SameTenantAsChild(child_id) => tenant_predicate(spec, child_id),
+        TenantScope::Unscoped => String::new(),
+    };
     let sql = format!(
         "UPDATE {parent_table} SET {counter_column} = {counter_column} + {PH1} \
-         WHERE {parent_pk} = {PH2}"
+         WHERE {parent_table}.{parent_pk} = {PH2}{tenant}"
     );
     diesel::sql_query(sql)
         .bind::<BigInt, _>(delta)
@@ -248,6 +320,7 @@ pub async fn counter_cache_apply_delta<M: 'static>(
 /// # Errors
 ///
 /// Propagates any database error from the `UPDATE`.
+#[doc(hidden)]
 pub async fn counter_cache_apply_delta_by_child_id<M: 'static>(
     conn: &mut RuntimeConnection,
     spec: &CounterCacheSpec<M>,
@@ -270,12 +343,17 @@ pub async fn counter_cache_apply_delta_by_child_id<M: 'static>(
         ChildState::Live => live_predicate(spec, true),
         ChildState::SoftDeleted => live_predicate(spec, false),
     };
+    // The parent is resolved by a sub-select on the child row, so the tenant
+    // check is a correlated comparison in the outer `WHERE` — it names the child
+    // alias, which is only in scope for a sub-select the outer statement
+    // correlates with, so the whole predicate moves into a second sub-select.
+    let tenant = tenant_predicate(spec, child_id);
     let sql = format!(
         "UPDATE {parent_table} SET {counter_column} = {counter_column} + {PH1} \
          WHERE {parent_table}.{parent_pk} IN \
            (SELECT {CHILD_ALIAS}.{fk_column} FROM {child_table} AS {CHILD_ALIAS} \
             WHERE {CHILD_ALIAS}.{child_pk} = {PH2} \
-              AND {CHILD_ALIAS}.{fk_column} IS NOT NULL{state_predicate}{FOR_UPDATE})"
+              AND {CHILD_ALIAS}.{fk_column} IS NOT NULL{state_predicate}{FOR_UPDATE}){tenant}"
     );
     diesel::sql_query(sql)
         .bind::<BigInt, _>(delta)
@@ -286,7 +364,19 @@ pub async fn counter_cache_apply_delta_by_child_id<M: 'static>(
     Ok(())
 }
 
+/// How a parent-keyed delta is confined to a tenant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantScope {
+    /// Require the parent to sit in the same tenant as this child row. Emits no
+    /// predicate for a child model without a tenant column.
+    SameTenantAsChild(i64),
+    /// No tenant predicate. Used only by paths that have no child row to scope
+    /// against (`recompute`, which sweeps the parent table wholesale).
+    Unscoped,
+}
+
 /// Which soft-delete state the child row must be in for a by-id delta to apply.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildState {
     /// No `deleted_at` predicate at all.
@@ -304,6 +394,7 @@ pub enum ChildState {
 /// # Errors
 ///
 /// Propagates any database error from the `UPDATE`s.
+#[doc(hidden)]
 pub async fn counter_cache_after_insert<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
@@ -311,7 +402,14 @@ pub async fn counter_cache_after_insert<M: 'static>(
 ) -> AutumnResult<()> {
     for spec in specs {
         if let Some(parent_id) = (spec.fk_of)(record) {
-            counter_cache_apply_delta(conn, spec, parent_id, 1).await?;
+            counter_cache_apply_delta(
+                conn,
+                spec,
+                parent_id,
+                1,
+                TenantScope::SameTenantAsChild((spec.pk_of)(record)),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -327,25 +425,68 @@ pub async fn counter_cache_after_insert<M: 'static>(
 /// # Errors
 ///
 /// Propagates any database error from the `UPDATE`s.
+#[doc(hidden)]
 pub async fn counter_cache_after_insert_many<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
     records: &[M],
 ) -> AutumnResult<()> {
     for spec in specs {
-        let mut deltas: HashMap<i64, i64> = HashMap::new();
+        let mut deltas: HashMap<i64, Fold> = HashMap::new();
         for record in records {
             if let Some(parent_id) = (spec.fk_of)(record) {
-                *deltas.entry(parent_id).or_insert(0) += 1;
+                deltas
+                    .entry(parent_id)
+                    .or_insert_with(|| Fold::new((spec.pk_of)(record)))
+                    .delta += 1;
             }
         }
-        // Deterministic order so concurrent batches touching the same parents
-        // take row locks in a consistent sequence and cannot deadlock.
-        let mut parents: Vec<(i64, i64)> = deltas.into_iter().collect();
-        parents.sort_unstable();
-        for (parent_id, delta) in parents {
-            counter_cache_apply_delta(conn, spec, parent_id, delta).await?;
-        }
+        apply_folded(conn, spec, deltas).await?;
+    }
+    Ok(())
+}
+
+/// One parent's accumulated delta plus a witness child id.
+///
+/// The tenant predicate needs *a* child row to scope against; any child that
+/// contributed to this parent's delta is a valid witness, since children of one
+/// parent necessarily share its tenant (that is the invariant being enforced).
+struct Fold {
+    delta: i64,
+    witness: i64,
+}
+
+impl Fold {
+    const fn new(witness: i64) -> Self {
+        Self { delta: 0, witness }
+    }
+}
+
+/// Apply a folded `parent -> delta` map in ascending parent id.
+///
+/// Ascending order is what stops two concurrent batches touching the same
+/// parents from taking their row locks in opposite orders and deadlocking.
+/// Zero deltas are dropped rather than issued as `+ 0`.
+async fn apply_folded<M: 'static>(
+    conn: &mut RuntimeConnection,
+    spec: &CounterCacheSpec<M>,
+    deltas: HashMap<i64, Fold>,
+) -> AutumnResult<()> {
+    let mut parents: Vec<(i64, i64, i64)> = deltas
+        .into_iter()
+        .filter(|(_, fold)| fold.delta != 0)
+        .map(|(parent_id, fold)| (parent_id, fold.delta, fold.witness))
+        .collect();
+    parents.sort_unstable();
+    for (parent_id, delta, witness) in parents {
+        counter_cache_apply_delta(
+            conn,
+            spec,
+            parent_id,
+            delta,
+            TenantScope::SameTenantAsChild(witness),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -412,6 +553,7 @@ pub async fn counter_cache_before_delete_by_id<M: 'static>(
 /// # Errors
 ///
 /// Propagates any database error from the `UPDATE`s.
+#[doc(hidden)]
 pub async fn counter_cache_before_delete_many<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
@@ -437,15 +579,20 @@ pub async fn counter_cache_before_delete_many<M: 'static>(
         } else {
             String::new()
         };
+        // Both sub-selects correlate on the parent, so the tenant check is a
+        // plain column comparison inside each — no extra round trip, and a
+        // cross-tenant child contributes to neither the count nor the row set.
+        let tenant = tenant_predicate_joined(spec);
         let sql = format!(
             "UPDATE {parent_table} SET {counter_column} = {counter_column} - \
              (SELECT COUNT(*) FROM {child_table} AS {CHILD_ALIAS} \
               WHERE {CHILD_ALIAS}.{fk_column} = {parent_table}.{parent_pk} \
-                AND {CHILD_ALIAS}.{child_pk} IN ({id_list}){live}) \
+                AND {CHILD_ALIAS}.{child_pk} IN ({id_list}){live}{tenant}) \
              WHERE {parent_table}.{parent_pk} IN \
                (SELECT {CHILD_ALIAS}.{fk_column} FROM {child_table} AS {CHILD_ALIAS} \
                 WHERE {CHILD_ALIAS}.{child_pk} IN ({id_list}) \
-                  AND {CHILD_ALIAS}.{fk_column} IS NOT NULL{live})"
+                  AND {CHILD_ALIAS}.{fk_column} IS NOT NULL{live} \
+                  AND {CHILD_ALIAS}.{fk_column} = {parent_table}.{parent_pk}{tenant})"
         );
         diesel::sql_query(sql)
             .execute(conn)
@@ -482,6 +629,7 @@ fn id_list(ids: &[i64]) -> String {
 /// # Errors
 ///
 /// Propagates any database error from the `UPDATE`s.
+#[doc(hidden)]
 pub async fn counter_cache_before_restore_by_id<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
@@ -513,6 +661,7 @@ pub async fn counter_cache_before_restore_by_id<M: 'static>(
 /// # Errors
 ///
 /// Propagates any database error from the `SELECT`s.
+#[doc(hidden)]
 pub async fn counter_cache_capture_fks<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
@@ -554,6 +703,7 @@ pub async fn counter_cache_capture_fks<M: 'static>(
 /// # Errors
 ///
 /// Propagates any database error from the `UPDATE`s.
+#[doc(hidden)]
 pub async fn counter_cache_after_update<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
@@ -566,22 +716,18 @@ pub async fn counter_cache_after_update<M: 'static>(
         if old == new {
             continue;
         }
-        // Apply in ascending parent id, not old-then-new. Two transactions
+        // Applied in ascending parent id, not old-then-new: two transactions
         // swapping children between parents A and B would otherwise take the two
-        // row locks in opposite orders and deadlock; a consistent global order
-        // makes that impossible. The two deltas are independent, so ordering
-        // them costs nothing.
-        let mut moves: Vec<(i64, i64)> = Vec::with_capacity(2);
+        // row locks in opposite orders and deadlock.
+        let witness = (spec.pk_of)(record);
+        let mut moves: HashMap<i64, Fold> = HashMap::new();
         if let Some(old_id) = old {
-            moves.push((old_id, -1));
+            moves.entry(old_id).or_insert_with(|| Fold::new(witness)).delta -= 1;
         }
         if let Some(new_id) = new {
-            moves.push((new_id, 1));
+            moves.entry(new_id).or_insert_with(|| Fold::new(witness)).delta += 1;
         }
-        moves.sort_unstable();
-        for (parent_id, delta) in moves {
-            counter_cache_apply_delta(conn, spec, parent_id, delta).await?;
-        }
+        apply_folded(conn, spec, moves).await?;
     }
     Ok(())
 }
@@ -595,6 +741,7 @@ pub async fn counter_cache_after_update<M: 'static>(
 /// # Errors
 ///
 /// Propagates any database error from the `SELECT`s.
+#[doc(hidden)]
 pub async fn counter_cache_capture_fks_many<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
@@ -646,6 +793,7 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
 /// # Errors
 ///
 /// Propagates any database error from the `UPDATE`s.
+#[doc(hidden)]
 pub async fn counter_cache_after_update_many<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
@@ -656,12 +804,35 @@ pub async fn counter_cache_after_update_many<M: 'static>(
         return Ok(());
     }
     let pk_of = specs[0].pk_of;
-    for record in records {
-        let child_id = pk_of(record);
-        let Ok(index) = before.binary_search_by_key(&child_id, |(id, _)| *id) else {
-            continue;
-        };
-        counter_cache_after_update(conn, specs, &before[index].1, record).await?;
+    for (index, spec) in specs.iter().enumerate() {
+        // Fold the WHOLE batch into one delta per parent before issuing any
+        // statement. Re-parenting 1000 children from one post to another is then
+        // two `UPDATE`s (`-1000`, `+1000`) rather than 2000, and — because the
+        // folded deltas are applied in ascending parent id — two concurrent
+        // batches swapping children between the same parents take their row
+        // locks in the same order and cannot deadlock.
+        let mut deltas: HashMap<i64, Fold> = HashMap::new();
+        for record in records {
+            let child_id = pk_of(record);
+            let Ok(found) = before.binary_search_by_key(&child_id, |(id, _)| *id) else {
+                // No captured "before" for this row: it appeared between the
+                // capture and the update. Guessing would be worse than leaving
+                // it to `recompute`.
+                continue;
+            };
+            let old = before[found].1.get(index).copied().flatten();
+            let new = (spec.fk_of)(record);
+            if old == new {
+                continue;
+            }
+            if let Some(old_id) = old {
+                deltas.entry(old_id).or_insert_with(|| Fold::new(child_id)).delta -= 1;
+            }
+            if let Some(new_id) = new {
+                deltas.entry(new_id).or_insert_with(|| Fold::new(child_id)).delta += 1;
+            }
+        }
+        apply_folded(conn, spec, deltas).await?;
     }
     Ok(())
 }
@@ -676,6 +847,7 @@ pub async fn counter_cache_after_update_many<M: 'static>(
 /// # Errors
 ///
 /// Propagates any database error from the `UPDATE`s.
+#[doc(hidden)]
 pub async fn counter_cache_after_upsert_many<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
@@ -695,26 +867,39 @@ pub async fn counter_cache_after_upsert_many<M: 'static>(
             )
         })
         .collect();
-    let mut inserted: Vec<&M> = Vec::new();
-    for record in upserted {
-        if let Some(old) = before.get(&pk_of(record)) {
-            counter_cache_after_update(conn, specs, old, record).await?;
-        } else {
-            inserted.push(record);
-        }
-    }
-    for spec in specs {
-        let mut deltas: HashMap<i64, i64> = HashMap::new();
-        for record in &inserted {
-            if let Some(parent_id) = (spec.fk_of)(record) {
-                *deltas.entry(parent_id).or_insert(0) += 1;
+    // One folded pass per leg over the whole chunk, inserts and updates together:
+    // a row absent from `before` is an insert (`+1`), a row present in it is an
+    // update (the before/after diff). Same folding and same ascending-parent-id
+    // ordering as the other bulk paths, for the same two reasons.
+    for (index, spec) in specs.iter().enumerate() {
+        let mut deltas: HashMap<i64, Fold> = HashMap::new();
+        for record in upserted {
+            let child_id = pk_of(record);
+            let new = (spec.fk_of)(record);
+            match before.get(&child_id) {
+                None => {
+                    if let Some(parent_id) = new {
+                        deltas
+                            .entry(parent_id)
+                            .or_insert_with(|| Fold::new(child_id))
+                            .delta += 1;
+                    }
+                }
+                Some(old_fks) => {
+                    let old = old_fks.get(index).copied().flatten();
+                    if old == new {
+                        continue;
+                    }
+                    if let Some(old_id) = old {
+                        deltas.entry(old_id).or_insert_with(|| Fold::new(child_id)).delta -= 1;
+                    }
+                    if let Some(new_id) = new {
+                        deltas.entry(new_id).or_insert_with(|| Fold::new(child_id)).delta += 1;
+                    }
+                }
             }
         }
-        let mut parents: Vec<(i64, i64)> = deltas.into_iter().collect();
-        parents.sort_unstable();
-        for (parent_id, delta) in parents {
-            counter_cache_apply_delta(conn, spec, parent_id, delta).await?;
-        }
+        apply_folded(conn, spec, deltas).await?;
     }
     Ok(())
 }
@@ -726,11 +911,13 @@ pub async fn counter_cache_after_upsert_many<M: 'static>(
 /// a `COUNT(*)`, never adjusted — so it is safe to run repeatedly, and it is the
 /// supported way to adopt a counter column on an existing table (AC6).
 ///
-/// Returns the number of parent rows updated, summed across every spec.
+/// Returns the number of parent rows **actually repaired**, summed across every
+/// spec — a sweep over a table with no drift returns 0 and writes nothing.
 ///
 /// # Errors
 ///
 /// Propagates any database error from the `UPDATE`s.
+#[doc(hidden)]
 pub async fn counter_cache_recompute<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
@@ -751,13 +938,20 @@ pub async fn counter_cache_recompute<M: 'static>(
         // The correlated sub-select aliases the child table so a self-referential
         // counter cache (child table == parent table) still binds the outer
         // `UPDATE` target on the right-hand side of the join predicate.
-        let mut sql = format!(
-            "UPDATE {parent_table} SET {counter_column} = \
-             (SELECT COUNT(*) FROM {child_table} AS {CHILD_ALIAS} \
+        let ground_truth = format!(
+            "(SELECT COUNT(*) FROM {child_table} AS {CHILD_ALIAS} \
               WHERE {CHILD_ALIAS}.{fk_column} = {parent_table}.{parent_pk}{live})"
         );
+        // `IS DISTINCT FROM` so a sweep over a healthy table writes nothing:
+        // under MVCC an unconditional assignment would rewrite every parent row
+        // (bloat proportional to the whole table, for no change), and it would
+        // make the returned count the row count rather than the repair count.
+        let mut sql = format!(
+            "UPDATE {parent_table} SET {counter_column} = {ground_truth} \
+             WHERE {parent_table}.{counter_column} {IS_DISTINCT_FROM} {ground_truth}"
+        );
         if parent_id.is_some() {
-            sql.push_str(&format!(" WHERE {parent_table}.{parent_pk} = {PH1}"));
+            sql.push_str(&format!(" AND {parent_table}.{parent_pk} = {PH1}"));
         }
         let query = diesel::sql_query(sql);
         let updated = if let Some(id) = parent_id {
@@ -818,6 +1012,7 @@ mod tests {
             counter_column: "comment_count",
             fk_of: |_| Some(1),
             pk_of: |_| 1,
+            tenant_column: None,
         }
     }
 

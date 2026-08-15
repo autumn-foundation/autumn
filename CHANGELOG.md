@@ -49,8 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source of truth, which is both the backfill for a table adopting the column and
   the repair for drift introduced by writes that bypassed the repository.
   `autumn generate scaffold … --belongs-to Post --counter-cache` emits the
-  `BIGINT NOT NULL DEFAULT 0` column, its migration, and the parent model/schema
-  entries. Models with no counter cache are unaffected: the spec slice is empty
+  `BIGINT NOT NULL DEFAULT 0` column and its migration, opts the generated child
+  model in, and prints the two parent-side lines (`src/schema.rs`, the model
+  field) rather than editing files it does not own and cannot cleanly revert. Models with no counter cache are unaffected: the spec slice is empty
   and the presence flag is a `const false`, so no statement is issued and the
   transaction-free single-statement mutation paths keep their exact prior
   codegen. See `docs/guide/counter-cache.md`.

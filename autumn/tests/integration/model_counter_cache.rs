@@ -37,6 +37,7 @@
 use std::sync::Arc;
 
 use autumn_web::Patch;
+use autumn_web::tenancy::CURRENT_TENANT;
 use autumn_web::repository::AutumnCounterCaches as _;
 use diesel::sql_types::BigInt;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -242,6 +243,64 @@ diesel::table! {
 #[autumn_web::repository(CcMessage, table = "cc_messages")]
 pub trait CcMessageRepository {}
 
+// ── Tenant isolation ────────────────────────────────────────────────────────
+
+diesel::table! {
+    cc_tenant_posts (id) {
+        id -> Int8,
+        title -> Text,
+        tenant_id -> Text,
+        cc_tenant_comment_count -> Int8,
+    }
+}
+
+#[autumn_web::model(table = "cc_tenant_posts")]
+pub struct CcTenantPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub tenant_id: String,
+    #[default]
+    pub cc_tenant_comment_count: i64,
+}
+
+#[autumn_web::repository(CcTenantPost, table = "cc_tenant_posts", tenant_scoped)]
+pub trait CcTenantPostRepository {}
+
+diesel::table! {
+    cc_tenant_comments (id) {
+        id -> Int8,
+        body -> Text,
+        post_id -> Int8,
+        tenant_id -> Text,
+    }
+}
+
+/// A counter update writes a parent row the caller only had to name the id of,
+/// so on a shared multi-tenant table it has to be confined to the caller's own
+/// tenant — the same hazard `#[votable]`'s aggregate `UPDATE` is scoped for.
+///
+/// `counter_cache_tenant` is explicit rather than inferred: `#[model]` on the
+/// child cannot see the parent's fields, so naming the column is the author
+/// asserting that **both** tables carry one by that name.
+#[autumn_web::model(table = "cc_tenant_comments")]
+#[belongs_to(
+    CcTenantPost,
+    fk = post_id,
+    counter_cache = "cc_tenant_comment_count",
+    counter_cache_tenant = "tenant_id"
+)]
+pub struct CcTenantComment {
+    #[id]
+    pub id: i64,
+    pub body: String,
+    pub post_id: i64,
+    pub tenant_id: String,
+}
+
+#[autumn_web::repository(CcTenantComment, table = "cc_tenant_comments", tenant_scoped)]
+pub trait CcTenantCommentRepository {}
+
 // ── Atomicity fixture: the counter column itself is `CHECK`ed ───────────────
 
 diesel::table! {
@@ -313,6 +372,16 @@ const DDL: &[&str] = &[
      (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL, \
       sender_id BIGINT NOT NULL REFERENCES cc_users(id), \
       room_id BIGINT NOT NULL REFERENCES cc_rooms(id))",
+    // Two tenants share one physical table — the shape the tenant predicate has
+    // to separate. No FK to `cc_tenant_posts`, deliberately: a `REFERENCES`
+    // constraint does not check `tenant_id`, which is exactly why the counter
+    // update needs its own predicate.
+    "CREATE TABLE IF NOT EXISTS cc_tenant_posts \
+     (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, tenant_id TEXT NOT NULL, \
+      cc_tenant_comment_count BIGINT NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS cc_tenant_comments \
+     (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL, post_id BIGINT NOT NULL, \
+      tenant_id TEXT NOT NULL)",
     // The `CHECK` is on the *counter* column, so the increment is what fails.
     "CREATE TABLE IF NOT EXISTS cc_capped_parents \
      (id BIGSERIAL PRIMARY KEY, label TEXT NOT NULL, \
@@ -391,6 +460,20 @@ async fn seed_one_col(conn: &mut AsyncPgConnection, table: &str, column: &str, v
     .get_result::<IdRow>(conn)
     .await
     .expect("seed row")
+    .id
+}
+
+/// The child's tenant column is what the counter predicate keys off, so a
+/// tenant-bearing parent has to be seeded with its tenant explicitly.
+async fn seed_tenant_post(conn: &mut AsyncPgConnection, tenant: &str, title: &str) -> i64 {
+    diesel::sql_query(
+        "INSERT INTO cc_tenant_posts (title, tenant_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind::<diesel::sql_types::Text, _>(title)
+    .bind::<diesel::sql_types::Text, _>(tenant)
+    .get_result::<IdRow>(conn)
+    .await
+    .expect("seed tenant post")
     .id
 }
 
@@ -493,6 +576,15 @@ fn counter_cache_specs_are_generated_from_the_conventions() {
     assert_eq!(specs[0].parent_table, "cc_users");
     assert_eq!(specs[1].counter_column, "cc_message_count");
     assert_eq!(specs[1].parent_table, "cc_rooms");
+
+    // `counter_cache_tenant` confines the parent UPDATE to the child's own
+    // tenant. An association without it emits no predicate at all, leaving a
+    // single-tenant app's SQL unchanged.
+    assert_eq!(
+        CcTenantComment::counter_caches()[0].tenant_column,
+        Some("tenant_id")
+    );
+    assert_eq!(CcComment::counter_caches()[0].tenant_column, None);
 
     // A model with no counter cache resolves to the empty blanket impl, so it
     // issues no extra statement on any mutation.
@@ -1082,7 +1174,7 @@ async fn recompute_repairs_drift_and_is_idempotent() {
         .recompute_counter_caches()
         .await
         .expect("recompute all parents");
-    assert!(touched >= 2, "every parent row is recomputed");
+    assert_eq!(touched, 2, "both drifted parents are repaired");
 
     assert_eq!(post_snapshot(&mut conn, a).await.persisted, 3);
     assert_eq!(post_snapshot(&mut conn, b).await.persisted, 1);
@@ -1092,10 +1184,16 @@ async fn recompute_repairs_drift_and_is_idempotent() {
         "observed counter drift across all parents is 0 after recompute"
     );
 
-    // Idempotent: a second run leaves the same values.
-    repo.recompute_counter_caches()
-        .await
-        .expect("recompute again");
+    // Idempotent: a second run finds nothing to repair and leaves the same
+    // values. The count is a *repair* count, so a healthy table returns 0 and
+    // writes no rows at all.
+    assert_eq!(
+        repo.recompute_counter_caches()
+            .await
+            .expect("recompute again"),
+        0,
+        "a second sweep must repair nothing"
+    );
     assert_eq!(post_snapshot(&mut conn, a).await.persisted, 3);
     assert_eq!(post_snapshot(&mut conn, b).await.persisted, 1);
     assert_eq!(total_post_drift(&mut conn).await, 0);
@@ -1194,6 +1292,55 @@ async fn the_parent_model_carries_the_maintained_count() {
     // N+1 — the count is already on each row `find_all` returns.
     let all = posts.find_all().await.expect("list");
     assert_eq!(all.iter().map(|p| p.cc_comment_count).sum::<i64>(), 2);
+}
+
+// ── Tenant isolation ────────────────────────────────────────────────────────
+
+/// A tenant-scoped child whose foreign key names **another tenant's** parent
+/// must not move that parent's counter.
+///
+/// The child row itself is already cross-tenant (nothing in the schema stops a
+/// caller supplying a foreign key it does not own — a `REFERENCES` constraint
+/// checks the id, not the tenant), so without a tenant predicate on the counter
+/// `UPDATE` the write lands on a row the caller has no access to.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_cross_tenant_foreign_key_moves_no_counter() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCcTenantCommentRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+
+    let mine = seed_tenant_post(&mut conn, "acme", "mine").await;
+    let theirs = seed_tenant_post(&mut conn, "globex", "theirs").await;
+
+    // Acting as tenant `acme`, aim the foreign key at `globex`'s post.
+    CURRENT_TENANT
+        .scope(Some("acme".to_owned()), async {
+            repo.save(&NewCcTenantComment {
+                body: "trespass".into(),
+                post_id: theirs,
+            })
+            .await
+            .expect("the insert itself is not what we are testing");
+            repo.save(&NewCcTenantComment {
+                body: "legitimate".into(),
+                post_id: mine,
+            })
+            .await
+            .expect("save");
+        })
+        .await;
+
+    assert_eq!(
+        counter(&mut conn, "cc_tenant_posts", "cc_tenant_comment_count", theirs).await,
+        0,
+        "a cross-tenant foreign key must not move the other tenant's counter"
+    );
+    assert_eq!(
+        counter(&mut conn, "cc_tenant_posts", "cc_tenant_comment_count", mine).await,
+        1,
+        "the caller's own tenant still works"
+    );
 }
 
 // ── The documented escape hatch for hand-written inserts ────────────────────

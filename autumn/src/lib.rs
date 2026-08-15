@@ -261,8 +261,11 @@ pub mod acme;
 #[cfg(feature = "db")]
 pub mod sharding;
 
+// Counter caches (#1325) are reached through `repository`, which re-exports the
+// public half — one path, matching the `AutumnDependents` precedent that lives
+// entirely inside that module.
 #[cfg(feature = "db")]
-pub mod counter_cache;
+pub(crate) mod counter_cache;
 
 #[cfg(feature = "db")]
 pub mod repository;

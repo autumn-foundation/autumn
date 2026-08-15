@@ -1324,7 +1324,47 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // Soft-delete filter fragment: appended to every finder when soft_delete is true.
+    // Cascade variants (#1325). `__autumn_apply_dependent_on_conn` removes or
+    // detaches THIS model's rows on behalf of a parent's `dependent(...)`
+    // cascade; those rows may themselves be counter-cached children of some
+    // other parent, whose counters have to move too — otherwise a
+    // `dependent = destroy` on `User` silently leaves every surviving post's
+    // `comment_count` inflated.
+    let cc_before_delete_cascade = quote! {
+        ::autumn_web::repository::counter_cache_before_delete_by_id(
+            conn, #cc_specs, __cid,
+        ).await?;
+    };
+    // Bulk `delete_all` / `nullify`: the rows are about to be removed or
+    // detached, so their ids have to be resolved BEFORE the statement runs.
+    // Skipped entirely (no query at all) for a model with no counter cache.
+    let cc_before_bulk_detach = quote! {
+        if #cc_has {
+            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+            struct __AutumnCcDetachId {
+                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                id: i64,
+            }
+            let __autumn_cc_detach_q = format!(
+                "SELECT id FROM \"{}\" WHERE \"{}\" = $1 ORDER BY id",
+                __table, __fk_column
+            );
+            let __autumn_cc_detach_ids: ::std::vec::Vec<i64> =
+                ::autumn_web::reexports::diesel::sql_query(__autumn_cc_detach_q)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                    .load::<__AutumnCcDetachId>(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?
+                    .into_iter()
+                    .map(|__r| __r.id)
+                    .collect();
+            ::autumn_web::repository::counter_cache_before_delete_many(
+                conn, #cc_specs, &__autumn_cc_detach_ids,
+            ).await?;
+        }
+    };
+
+    // Soft-delete filter fragment: appended to every finder when soft_delete is true.    // Soft-delete filter fragment: appended to every finder when soft_delete is true.
     let sd_filter = if config.soft_delete {
         quote! { .filter(#table_ident::deleted_at.is_null()) }
     } else {
@@ -1916,6 +1956,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::Nullify => {
+                        // #1325: the children survive but detach, so each one's
+                        // counter-cached parents lose it. Resolve the ids first
+                        // (the FK is about to be NULL, so they are unrecoverable
+                        // afterwards) and decrement before the UPDATE.
+                        #cc_before_bulk_detach
                         let __q = format!(
                             "UPDATE \"{}\" SET \"{}\" = NULL WHERE \"{}\" = $1",
                             __table, __fk_column, __fk_column
@@ -1928,6 +1973,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::DeleteAll => {
+                        // #1325: same as Nullify — the rows are about to go, so
+                        // their counter-cached parents are decremented first.
+                        #cc_before_bulk_detach
                         let __q = format!(
                             "DELETE FROM \"{}\" WHERE \"{}\" = $1",
                             __table, __fk_column
@@ -2098,6 +2146,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 // a hard delete never leaves an FK-dangling
                                 // grandchild and never FK-fails the child delete.
                                 #grandchild_mutating_cascade
+                                // #1325: this child's OWN counter caches move
+                                // as it is destroyed, in the cascade's
+                                // transaction. Without it a `dependent =
+                                // destroy` parent silently leaves every
+                                // surviving grandparent's count inflated.
+                                #cc_before_delete_cascade
                                 #destroy_mutation
                                 // #1800 case 1: record the row as gone ONLY when it
                                 // was physically deleted (a soft-deleted row stays
@@ -3248,57 +3302,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         quote! {}
-    };
-
-    // ── #1325 counter-cache repair ──────────────────────────────────────────
-    //
-    // Recompute the maintained column(s) from the source of truth. Idempotent by
-    // construction (the column is *assigned* a `COUNT(*)`, never adjusted), so
-    // it is both the backfill for a table adopting the column and the repair for
-    // drift introduced by writes that bypassed the repository.
-    //
-    // Always emitted: for a model with no counter cache the spec slice is empty,
-    // so the method is a zero-statement no-op returning 0 rather than a missing
-    // method the caller has to feature-detect.
-    let counter_cache_recompute_methods = quote! {
-        /// Recompute every counter cache this model maintains, for **all**
-        /// parent rows, from the source of truth (#1325).
-        ///
-        /// Idempotent: running it twice leaves the same values. Returns the
-        /// number of parent rows updated, summed across every counter-cached
-        /// association (0 when the model declares none).
-        ///
-        /// # Errors
-        ///
-        /// Propagates any database error from the recompute `UPDATE`s.
-        pub async fn recompute_counter_caches(&self) -> ::autumn_web::AutumnResult<usize> {
-            let mut conn = self.__autumn_acquire_conn().await?;
-            ::autumn_web::repository::counter_cache_recompute(
-                &mut conn,
-                #cc_specs,
-                ::core::option::Option::None,
-            )
-            .await
-        }
-
-        /// Recompute every counter cache this model maintains for a **single**
-        /// parent row (#1325), leaving every other parent untouched.
-        ///
-        /// # Errors
-        ///
-        /// Propagates any database error from the recompute `UPDATE`s.
-        pub async fn recompute_counter_caches_for(
-            &self,
-            parent_id: i64,
-        ) -> ::autumn_web::AutumnResult<usize> {
-            let mut conn = self.__autumn_acquire_conn().await?;
-            ::autumn_web::repository::counter_cache_recompute(
-                &mut conn,
-                #cc_specs,
-                ::core::option::Option::Some(parent_id),
-            )
-            .await
-        }
     };
 
     let with_pool_method = {
@@ -9750,6 +9753,62 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         quote! {}
+    };
+
+    // ── #1325 counter-cache repair ──────────────────────────────────────────
+    //
+    // Recompute the maintained column(s) from the source of truth. Idempotent by
+    // construction (the column is *assigned* a `COUNT(*)`, never adjusted), so
+    // it is both the backfill for a table adopting the column and the repair for
+    // drift introduced by writes that bypassed the repository.
+    //
+    // Always emitted: for a model with no counter cache the spec slice is empty,
+    // so the method is a zero-statement no-op returning 0 rather than a missing
+    // method the caller has to feature-detect.
+    let counter_cache_recompute_methods = quote! {
+        /// Recompute every counter cache this model maintains, for **all**
+        /// parent rows, from the source of truth (#1325).
+        ///
+        /// Idempotent: running it twice leaves the same values. Returns the
+        /// number of parent rows updated, summed across every counter-cached
+        /// association (0 when the model declares none).
+        ///
+        /// # Errors
+        ///
+        /// Propagates any database error from the recompute `UPDATE`s.
+        pub async fn recompute_counter_caches(&self) -> ::autumn_web::AutumnResult<usize> {
+            // A repair sweep is a write: reject it under `across_tenants()` on a
+            // sharded repository, where it would silently touch one arbitrary
+            // shard while promising every parent row (matching `restore`/`purge`).
+            #cross_shard_write_guard
+            let mut conn = self.__autumn_acquire_conn().await?;
+            ::autumn_web::repository::counter_cache_recompute(
+                &mut conn,
+                #cc_specs,
+                ::core::option::Option::None,
+            )
+            .await
+        }
+
+        /// Recompute every counter cache this model maintains for a **single**
+        /// parent row (#1325), leaving every other parent untouched.
+        ///
+        /// # Errors
+        ///
+        /// Propagates any database error from the recompute `UPDATE`s.
+        pub async fn recompute_counter_caches_for(
+            &self,
+            parent_id: i64,
+        ) -> ::autumn_web::AutumnResult<usize> {
+            #cross_shard_write_guard
+            let mut conn = self.__autumn_acquire_conn().await?;
+            ::autumn_web::repository::counter_cache_recompute(
+                &mut conn,
+                #cc_specs,
+                ::core::option::Option::Some(parent_id),
+            )
+            .await
+        }
     };
 
     // ── #1369: transactional dependent cascade for delete_by_id ──────
@@ -19924,6 +19983,25 @@ mod tests {
             update_many.contains("counter_cache_capture_fks_many")
                 && update_many.contains("counter_cache_after_update_many"),
             "update_many captures the batch's foreign keys and diffs each record: {update_many}"
+        );
+    }
+
+    #[test]
+    fn the_dependent_cascade_maintains_the_children_own_counters() {
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        // The cascade removes THIS model's rows on a parent's behalf; those rows
+        // may be counter-cached children of some other parent.
+        assert!(
+            generated.contains("counter_cache_before_delete_by_id"),
+            "the destroy cascade must move each child's own counters"
+        );
+        assert!(
+            generated.contains("counter_cache_before_delete_many"),
+            "delete_all / nullify resolve the ids first and decrement in bulk"
         );
     }
 

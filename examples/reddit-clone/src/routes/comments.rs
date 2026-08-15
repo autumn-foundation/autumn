@@ -93,6 +93,15 @@ pub async fn create(
                 // `UPDATE posts SET comment_count = comment_count + 1`,
                 // derived from `#[belongs_to(Post, counter_cache)]` on the
                 // model, running in this same transaction.
+                //
+                // The by-id form re-resolves the parent from the comment row
+                // through a sub-select. That costs one index hit on a row this
+                // transaction just wrote (and already holds the lock on), and it
+                // keeps the call site independent of which legs are
+                // counter-cached -- worth it here. Where the parent id is in
+                // hand and the lookup matters, `counter_cache_apply_delta` takes
+                // it directly.
+                //
                 // `Comment::counter_caches()` needs no trait import: `#[model]`
                 // emits it as an *inherent* associated function, which shadows
                 // the blanket `AutumnCounterCaches` impl.

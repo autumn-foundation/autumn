@@ -89,6 +89,7 @@ Adopting the column on a table that already has rows? Add it, then
 | `purge` | `-1`, and only if the row was still live (a purge after a soft delete does not double-decrement) |
 | `upsert_many` | insert → `+1`; update → the before/after diff |
 | a parent's `dependent = destroy` cascade | the child's own counters move as each child is destroyed |
+| a parent's `dependent = delete_all` / `nullify` cascade | **not** maintained — see [Limits](#limits) |
 
 A child whose foreign key is `NULL` moves nothing. A leg whose foreign key did
 not change issues no statement.
@@ -177,7 +178,12 @@ autumn_web::repository::counter_cache_after_insert_by_id(
 ```
 
 `counter_cache_before_delete_by_id` is the mirror for a hand-written delete (call
-it *before* the row goes away). Both take the spec slice explicitly: `#[model]`
+it *before* the row goes away). Both resolve the parent from the child row
+through a sub-select, so they work without the caller knowing which legs are
+counter-cached; where the parent id is already in hand and that lookup matters,
+`counter_cache_apply_delta(conn, spec, parent_id, delta, scope)` takes it
+directly (pass `TenantScope::SameTenantAsChild(child_id)`, or
+`TenantScope::Unscoped` when the association declares no tenant column). Both take the spec slice explicitly: `#[model]`
 emits `counter_caches()` as an **inherent** item shadowing an empty blanket impl,
 and an inherent shadow is not visible through a generic trait bound — so the
 helpers take the slice rather than recovering it from one.
@@ -193,9 +199,14 @@ adds, on top of the ordinary `--belongs-to` scaffold:
 
 - `counter_cache` on the generated child's `#[belongs_to(Post, …)]`;
 - a migration adding `comment_count BIGINT NOT NULL DEFAULT 0` to `posts`
-  (with a `DROP COLUMN` down);
-- the column in the parent's `src/schema.rs` block and a `#[default] pub
-  comment_count: i64` field on the parent model.
+  (with a `DROP COLUMN` down).
+
+The parent's `src/schema.rs` block and model struct still need the column, and
+the scaffold prints the two exact lines rather than editing them. That is
+deliberate: they are files this invocation does not own, and neither edit has a
+marker-delimited revert, so writing them would leave `autumn destroy scaffold`
+unable to take them back out. Until you add them the counter is maintained (it
+is raw SQL) but not readable from Rust.
 
 ## Limits
 
@@ -225,6 +236,40 @@ adds, on top of the ordinary `--belongs-to` scaffold:
   one, and it does not verify at compile time that the parent has it. A missing
   or mistyped column surfaces as a database error on the first mutation, not as
   silence.
+- **Two opt-in query surfaces are not yet wired**, and will drift until
+  `recompute` runs: a derived `fn delete_by_<field>(…)` declared on the
+  repository trait, and `find_or_create_by_<field>(…)`. Both are explicit
+  declarations rather than part of the default CRUD surface, so a repository
+  that does not declare them is unaffected. If you declare either on a
+  counter-cached model, schedule `recompute_counter_caches()` or move the call
+  through `save` / `delete_by_id`.
+
+## Tenant scoping
+
+A counter update writes a parent row the caller only had to name the **id** of.
+On a shared multi-tenant table that is a cross-tenant write waiting to happen: a
+child inserted with a foreign key pointing at another tenant's parent moves that
+parent's counter, because nothing in a plain `REFERENCES` constraint checks
+`tenant_id`.
+
+Name the column and the framework confines every delta to the caller's tenant:
+
+```rust,ignore
+#[belongs_to(Post, counter_cache, counter_cache_tenant = "tenant_id")]
+```
+
+Both tables must carry a column by that name — the predicate is
+`posts.tenant_id = comments.tenant_id`, i.e. "the parent sits in the same tenant
+as the child that named it". It is explicit rather than inferred because
+`#[model]` on the child cannot see the parent's fields, and guessing would turn
+every tenant-scoped child hanging off a *global* parent into a hard `column
+"tenant_id" does not exist`.
+
+Without the key, no predicate is emitted anywhere and the SQL is exactly what a
+single-tenant app would get. `recompute_counter_caches()` is deliberately
+unscoped: it is an operator-level repair that writes ground truth to every parent
+row (only the drifted ones, in fact), and it is rejected under `across_tenants()`
+on a sharded repository, where it could only reach one shard.
 
 ## See also
 
