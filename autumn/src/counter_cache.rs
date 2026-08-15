@@ -50,6 +50,7 @@
 //! spec cannot smuggle SQL through `format!`.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use diesel::sql_types::{BigInt, Nullable};
 use diesel_async::RunQueryDsl as _;
@@ -954,12 +955,20 @@ pub async fn counter_cache_after_upsert_many<M: Send + Sync + 'static>(
         return Ok(());
     }
     let pk_of = specs[0].pk_of;
+    // A soft-deleted existing row is counted by nobody, so it has no "old
+    // parent". Recording one would make the post-upsert side — which now checks
+    // `live_of` and yields `None` for a row that stays deleted — decrement a
+    // parent that had already dropped it.
     let before: HashMap<i64, Vec<Option<i64>>> = existing
         .iter()
         .map(|row| {
+            let live = specs.first().is_none_or(|spec| (spec.live_of)(row));
             (
                 pk_of(row),
-                specs.iter().map(|spec| (spec.fk_of)(row)).collect(),
+                specs
+                    .iter()
+                    .map(|spec| if live { (spec.fk_of)(row) } else { None })
+                    .collect(),
             )
         })
         .collect();
@@ -1052,7 +1061,7 @@ pub async fn counter_cache_recompute<M: 'static>(
              WHERE {parent_table}.{counter_column} {IS_DISTINCT_FROM} {ground_truth}"
         );
         if parent_id.is_some() {
-            sql.push_str(&format!(" AND {parent_table}.{parent_pk} = {PH1}"));
+            let _ = write!(sql, " AND {parent_table}.{parent_pk} = {PH1}");
         }
         let query = diesel::sql_query(sql);
         let updated = if let Some(id) = parent_id {

@@ -1268,9 +1268,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             conn, #cc_specs, &chunk_inserted,
         ).await?;
     };
-    let cc_before_delete_chunk = quote! {
-        ::autumn_web::repository::counter_cache_before_delete_many(conn, #cc_specs, chunk).await?;
-    };
     let cc_capture_many = quote! {
         let __autumn_cc_before_many =
             ::autumn_web::repository::counter_cache_capture_fks_many(conn, #cc_specs, ids).await?;
@@ -1399,6 +1396,43 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { .filter(#table_ident::deleted_at.is_null()) }
     } else {
         quote! {}
+    };
+
+    // The decrement has to see exactly the rows the delete will remove. On a
+    // tenant-scoped repository the delete carries a `tenant_id` filter the raw
+    // `chunk` does not, so an id belonging to another tenant would decrement a
+    // counter for a child that survives — and the transaction commits, so
+    // nothing rolls it back. Narrow the chunk to the deletable rows first.
+    let cc_delete_chunk_scope = if config.tenant_scoped {
+        quote! {
+            let __autumn_cc_scoped: ::std::vec::Vec<i64> = {
+                let __q = #table_ident::table
+                    .filter(#table_ident::id.eq_any(chunk))
+                    #sd_filter;
+                if let ::core::option::Option::Some(ref t) = tenant_id {
+                    __q.filter(#table_ident::tenant_id.eq(t))
+                        .select(#table_ident::id)
+                        .load::<i64>(conn)
+                        .await
+                } else {
+                    __q.select(#table_ident::id).load::<i64>(conn).await
+                }
+                .map_err(::autumn_web::AutumnError::from)?
+            };
+            let __autumn_cc_chunk: &[i64] = &__autumn_cc_scoped;
+        }
+    } else {
+        quote! {
+            let __autumn_cc_chunk: &[i64] = chunk;
+        }
+    };
+    let cc_before_delete_chunk = quote! {
+        if #cc_has {
+            #cc_delete_chunk_scope
+            ::autumn_web::repository::counter_cache_before_delete_many(
+                conn, #cc_specs, __autumn_cc_chunk,
+            ).await?;
+        }
     };
 
     // #1841 owner-scoping: when the repository declares `owner = <column>`, we

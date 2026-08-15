@@ -290,6 +290,14 @@ repairs every parent row — it is an operator-level repair, not a request-scope
 one — and it is rejected under `across_tenants()` on a sharded repository, where
 it could only reach one shard.
 
+One case the predicate does **not** cover: changing a child's tenant
+discriminator itself (only reachable through `across_tenants()`). The
+maintenance keys on the foreign key, so a row that moves tenant without changing
+parent stops or starts satisfying the predicate with no delta issued, and a
+simultaneous re-parent scopes the old parent's decrement by the child's *new*
+tenant. Moving rows between tenants is a data-migration-shaped operation —
+run `recompute_counter_caches()` afterwards.
+
 Bulk paths do **not** fold a tenant-scoped batch into one `UPDATE` per parent the
 way an unscoped one does: the predicate is anchored to a single child row, so
 collapsing a mixed-tenant batch behind one arbitrary witness would either sweep
