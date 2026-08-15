@@ -465,7 +465,7 @@ impl PeerTransport for TcpPeerTransport {
 /// under cancellation instead of degrading to the suspicion timeout.
 async fn retire_writers(shutdown: CancellationToken, writers: CancellationToken) {
     shutdown.cancelled().await;
-    let _ = WRITER_DRAIN_GRACE;
+    tokio::time::sleep(WRITER_DRAIN_GRACE).await;
     writers.cancel();
 }
 

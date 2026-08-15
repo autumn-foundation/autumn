@@ -420,6 +420,85 @@ async fn loopback_write_storm_is_bounded_by_the_push_cadence_floor() {
     b.token.cancel();
 }
 
+/// The metrics contract, which the guide publishes as a table an operator
+/// writes alerts against: every family is emitted from boot (including the
+/// zeroes), the members gauge really is the local view's size, and every
+/// `reason` label of the rejection family exists before anything is rejected —
+/// a `rate()` over a label that only appears once an attack starts is a
+/// `rate()` nobody wrote an alert for.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn metrics_source_emits_every_cluster_family() {
+    use crate::actuator::{MetricKind, MetricsSource as _};
+
+    let router = LoopbackRouter::new();
+    let clock = test_clock();
+    let a = start_node(&router, &clock, SECRET, "node-a", 1, Vec::new());
+    let b = start_node(&router, &clock, SECRET, "node-b", 2, vec![a.addr.clone()]);
+    settle(&clock, 6).await;
+
+    let source = super::ClusterMetricsSource {
+        handle: a.handle.clone(),
+    };
+    let families = source.collect();
+    let names: Vec<&str> = families.iter().map(|family| family.name.as_str()).collect();
+
+    assert_eq!(
+        names,
+        vec![
+            "autumn_cluster_members",
+            "autumn_cluster_pushes_sent_total",
+            "autumn_cluster_pushes_received_total",
+            "autumn_cluster_merges_applied_total",
+            "autumn_cluster_frames_dropped_total",
+            "autumn_cluster_frames_rejected_total",
+        ],
+        "the six documented families must all be emitted, under exactly the \
+         names docs/guide/clustering.md tells operators to alert on"
+    );
+
+    let members = families
+        .iter()
+        .find(|family| family.name == "autumn_cluster_members")
+        .expect("the members family is in the list asserted above");
+    let expected = f64::from(u32::try_from(a.handle.members().len()).unwrap_or(u32::MAX));
+    assert_eq!(members.kind, MetricKind::Gauge, "the view's size is a gauge");
+    assert_eq!(
+        members.samples.iter().map(|s| s.value).collect::<Vec<_>>(),
+        vec![expected],
+        "the members gauge must track the local view exactly; {} | {}",
+        view_of(&a),
+        view_of(&b)
+    );
+    assert!(
+        expected > 1.0,
+        "sanity: the gauge must be read against a converged two-member view, \
+         or a broken gauge reading 1 would pass; {}",
+        view_of(&a)
+    );
+
+    let rejected = families
+        .iter()
+        .find(|family| family.name == "autumn_cluster_frames_rejected_total")
+        .expect("the rejection family is in the list asserted above");
+    let labels: Vec<&str> = rejected
+        .samples
+        .iter()
+        .filter_map(|sample| sample.labels.first())
+        .map(|(_, reason)| reason.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        super::REJECT_REASONS
+            .iter()
+            .map(|reason| reason.label())
+            .collect::<Vec<_>>(),
+        "every reason label must be published from boot, zeroes included"
+    );
+
+    a.token.cancel();
+    b.token.cancel();
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn loopback_replayed_leave_is_refuted_by_live_node() {
     let router = LoopbackRouter::new();
