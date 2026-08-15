@@ -201,10 +201,13 @@ impl<T: Sized + 'static> AutumnCounterCaches for T {}
 /// Whether `s` is a plain SQL/Rust identifier: ASCII alphanumerics and
 /// underscores, not starting with a digit, non-empty.
 ///
+/// Module-private: the whole module is `pub(crate)`, so a `pub(crate)` here
+/// would be redundant.
+///
 /// Names reaching the `format!`ed SQL below are macro-emitted and already
 /// validated at macro time; this is the run-time backstop for that invariant.
 #[must_use]
-pub(crate) fn is_plain_identifier(s: &str) -> bool {
+fn is_plain_identifier(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with(|c: char| c.is_ascii_digit())
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -404,7 +407,7 @@ pub enum ChildState {
 ///
 /// Propagates any database error from the `UPDATE`s.
 #[doc(hidden)]
-pub async fn counter_cache_after_insert<M: 'static>(
+pub async fn counter_cache_after_insert<M: Send + Sync + 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
     record: &M,
@@ -435,7 +438,7 @@ pub async fn counter_cache_after_insert<M: 'static>(
 ///
 /// Propagates any database error from the `UPDATE`s.
 #[doc(hidden)]
-pub async fn counter_cache_after_insert_many<M: 'static>(
+pub async fn counter_cache_after_insert_many<M: Send + Sync + 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
     records: &[M],
@@ -783,7 +786,7 @@ pub async fn counter_cache_capture_fks<M: 'static>(
 ///
 /// Propagates any database error from the `UPDATE`s.
 #[doc(hidden)]
-pub async fn counter_cache_after_update<M: 'static>(
+pub async fn counter_cache_after_update<M: Send + Sync + 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
     before: &[Option<i64>],
@@ -881,7 +884,7 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
 ///
 /// Propagates any database error from the `UPDATE`s.
 #[doc(hidden)]
-pub async fn counter_cache_after_update_many<M: 'static>(
+pub async fn counter_cache_after_update_many<M: Send + Sync + 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
     before: &[(i64, Vec<Option<i64>>)],
@@ -941,7 +944,7 @@ pub async fn counter_cache_after_update_many<M: 'static>(
 ///
 /// Propagates any database error from the `UPDATE`s.
 #[doc(hidden)]
-pub async fn counter_cache_after_upsert_many<M: 'static>(
+pub async fn counter_cache_after_upsert_many<M: Send + Sync + 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
     existing: &[M],
