@@ -496,8 +496,25 @@ autumn dev
 ```
 
 That writes the `users` migration, the session and remember-token models, the
-handlers, and registers all of them in `src/main.rs`. Sign up, sign in, and the
-create/edit/delete views become reachable.
+handlers, and registers all of them in `src/main.rs`.
+
+Signing up is two steps, not one — the generated flow does not log you in:
+
+1. Sign up at <http://localhost:3000/signup>. The account is created
+   **unconfirmed**, and login rejects unconfirmed accounts.
+2. Open the confirmation link. On the `dev` profile Autumn defaults the mail
+   transport to `log` when `[mail]` is unset, so the confirmation email is
+   printed straight into your `autumn dev` output. Copy the
+   `/auth/confirm/{token}` URL out of the terminal and visit it.
+
+Then log in, and the create/edit/delete views are reachable.
+
+> **On any non-`dev` profile** that smart default does not apply: with `[mail]`
+> unset the transport is `Disabled`, and signup fails fast with a 500 rather
+> than creating an account nobody can confirm. Set `[mail] transport` (use
+> `"log"` locally, `"smtp"` in production) before running the flow there. Same
+> for forgot-password and change-email, which are also mail-gated. See the
+> [mail guide](mail.md).
 
 Read the generated `src/policies/post.rs` before you ship: with no owner column
 detected it authorizes *any* authenticated user and says so in `SECURITY TODO`

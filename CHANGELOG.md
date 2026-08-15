@@ -1749,11 +1749,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BIGSERIAL`/`i64` primary-key convention the generators and `#[repository]`
   assume, replacing `SERIAL`/`i32`.
 
-  Three sections the guide never had were added: `autumn generate scaffold` as
-  the five-command path to working CRUD (previously reachable only from the
-  generators guide), a testing section built on the `tests/integration_test.rs`
-  the scaffold already writes plus `autumn test`, and a prebuilt-binary install
-  path. In exchange, the ~100-line route-collision-diagnostics appendix and the
+  Three sections the guide never had were added. First, `autumn generate
+  scaffold`, previously reachable only from the generators guide — and
+  documented for what it actually produces: the read paths serve immediately,
+  while every write stays locked behind both `#[secured]` and the generated
+  policy until `autumn generate auth` is run, and the JSON write handlers are
+  generated but left unregistered. The guide explains that double gate rather
+  than treating it as a caveat, and walks the signup → email-confirmation →
+  login flow that unlocks the write views. Second, a testing section built on
+  the `tests/integration_test.rs` the scaffold already writes, plus `autumn
+  test`. Third, the prebuilt-binary install path. In exchange, the ~100-line
+  route-collision-diagnostics appendix and the
   `_method` override's same-origin bullet list were compressed to their
   first-hour essentials and now link onward, and the production checklist moved
   from the middle of the walkthrough to the end. The `#configuration`,
