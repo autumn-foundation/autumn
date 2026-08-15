@@ -81,18 +81,25 @@ fn next_migration_version(timestamp: &str) -> String {
     format!("{timestamp}1")
 }
 
-/// Push the counter-cache migration and the follow-up warning onto `plan`.
+/// Push the counter-cache migration's `up.sql`/`down.sql` onto `plan`.
 ///
 /// `plan` already carries the child's model/migration/schema actions; this adds
 /// the parent-side column. The child model's `#[belongs_to(..., counter_cache)]`
 /// attribute is added separately, by rewriting the model file the plan is about
 /// to create (see [`add_counter_cache_to_model_source`]).
+///
+/// Pushed on a **revert** plan too, and that is load-bearing: `Plan::revert`
+/// discovers the migration directories it may remove from the plan's `Create`
+/// actions under `migrations/`, so omitting these two would leave the
+/// `*_add_{column}_to_{parents}` directory behind after `autumn destroy
+/// scaffold`, where a later `migrate` run would then alter a parent table whose
+/// child scaffold no longer exists. Only the follow-up warning is
+/// generate-only — see [`push_counter_cache_warning`].
 pub fn push_counter_cache_migration(
     plan: &mut Plan,
     project_root: &Path,
     timestamp: &str,
     child_snake: &str,
-    parent_pascal: &str,
     parent_plural: &str,
 ) {
     let column = counter_column_for(child_snake);
@@ -102,7 +109,21 @@ pub fn push_counter_cache_migration(
             .join(migration_dir_name(timestamp, &column, parent_plural));
     plan.create(dir.join("up.sql"), up_sql(parent_plural, &column));
     plan.create(dir.join("down.sql"), down_sql(parent_plural, &column));
+}
 
+/// The two lines the author has to add by hand, surfaced as a plan warning.
+///
+/// The parent's `src/schema.rs` block and model struct need the column, but both
+/// are files this invocation does not own and neither has a marker-delimited
+/// revert — editing them would make `autumn destroy scaffold` unable to take
+/// them back out.
+pub fn push_counter_cache_warning(
+    plan: &mut Plan,
+    child_snake: &str,
+    parent_pascal: &str,
+    parent_plural: &str,
+) {
+    let column = counter_column_for(child_snake);
     plan.warn(format!(
         "--counter-cache: `{parent_plural}.{column}` is added by the generated \
          migration, but the parent's Rust side is a file this scaffold does not \

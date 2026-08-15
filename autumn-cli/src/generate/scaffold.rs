@@ -632,11 +632,19 @@ fn plan_scaffold_with_options_impl(
                     .to_owned(),
             ));
         };
+        // The migration actions go on the revert plan too — that is how
+        // `Plan::revert` finds the directory to remove. Only the follow-up
+        // warning is generate-only.
+        super::counter_cache::push_counter_cache_migration(
+            &mut plan,
+            project_root,
+            timestamp,
+            &snake_name,
+            &n.parent_plural,
+        );
         if !for_revert {
-            super::counter_cache::push_counter_cache_migration(
+            super::counter_cache::push_counter_cache_warning(
                 &mut plan,
-                project_root,
-                timestamp,
                 &snake_name,
                 &n.parent_pascal,
                 &n.parent_plural,
@@ -18851,6 +18859,32 @@ exempt_paths = [
                 .any(|p| p.contains("add_comment_count_to_posts")),
             "the flag is opt-in: {paths:?}"
         );
+    }
+
+    #[test]
+    fn the_counter_migration_is_on_the_revert_plan_too() {
+        // `Plan::revert` discovers removable migration directories from the
+        // plan's `Create` actions under `migrations/`, so a revert plan that
+        // omitted these would leave the counter migration on disk after
+        // `autumn destroy scaffold` — and a later `migrate` run would then add a
+        // column to a parent whose child scaffold is gone.
+        let tmp = project_with_scaffolded_parent();
+        let plan = plan_scaffold_with_options_for_revert(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &counter_cache_options(),
+        )
+        .unwrap();
+        let paths = scaffold_paths(&plan);
+        for side in ["up.sql", "down.sql"] {
+            let wanted = format!("migrations/202604280000001_add_comment_count_to_posts/{side}");
+            assert!(
+                paths.iter().any(|p| p == &wanted),
+                "the revert plan must carry {wanted}: {paths:?}"
+            );
+        }
     }
 
     #[test]

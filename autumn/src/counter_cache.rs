@@ -601,6 +601,22 @@ pub async fn counter_cache_before_delete_by_id<M: 'static>(
     Ok(())
 }
 
+/// Take the child row locks a bulk decrement needs, in ascending id order.
+///
+/// The returned rows are discarded — the statement exists for its locks (see
+/// [`counter_cache_before_delete_many`]'s lock-order note).
+fn child_lock_sql<M: 'static>(spec: &CounterCacheSpec<M>, id_list: &str) -> String {
+    let CounterCacheSpec {
+        child_table,
+        child_pk,
+        ..
+    } = spec;
+    format!(
+        "SELECT {child_pk} AS id FROM {child_table} \
+         WHERE {child_pk} IN ({id_list}) ORDER BY {child_pk}{FOR_UPDATE}"
+    )
+}
+
 /// [`counter_cache_before_delete_by_id`] over a batch of ids (`delete_many`).
 ///
 /// Issues **one** statement per spec regardless of batch size: each affected
@@ -609,9 +625,22 @@ pub async fn counter_cache_before_delete_by_id<M: 'static>(
 /// are deleted, and for a soft-deleting model it counts only rows that are still
 /// live so a repeated bulk delete moves nothing.
 ///
+/// # Lock order
+///
+/// The children are locked in ascending id order **before** any parent counter
+/// is touched. Every other path in this module reaches the parent through a
+/// child row it has already locked (`counter_cache_apply_delta_by_child_id`
+/// carries `FOR UPDATE` on its sub-select; the update paths lock the child while
+/// capturing its foreign keys), so the module's lock order is uniformly
+/// child-then-parent. Without this statement the bulk path would invert it —
+/// locking the parent for the decrement here and the child only later, when the
+/// `DELETE` itself runs — and a bulk delete racing an `update` that re-parents
+/// one of the same children would deadlock, which generated repository
+/// transactions do not retry.
+///
 /// # Errors
 ///
-/// Propagates any database error from the `UPDATE`s.
+/// Propagates any database error from the `SELECT` or the `UPDATE`s.
 #[doc(hidden)]
 pub async fn counter_cache_before_delete_many<M: 'static>(
     conn: &mut RuntimeConnection,
@@ -622,6 +651,15 @@ pub async fn counter_cache_before_delete_many<M: 'static>(
         return Ok(());
     }
     let id_list = id_list(child_ids);
+
+    // One statement, not one per spec: every spec here is a leg of the *same*
+    // child model, so they all name the same table and primary key.
+    debug_assert_spec_idents(&specs[0]);
+    diesel::sql_query(child_lock_sql(&specs[0], &id_list))
+        .load::<IdRow>(conn)
+        .await
+        .map_err(AutumnError::from)?;
+
     for spec in specs {
         debug_assert_spec_idents(spec);
         let CounterCacheSpec {
@@ -1088,7 +1126,7 @@ async fn recompute_batch<M: 'static>(
     let parent_table = spec.parent_table;
     let parent_pk = spec.parent_pk;
     let lock_sql = format!(
-        "SELECT {parent_pk} AS parent_id FROM {parent_table} \
+        "SELECT {parent_pk} AS id FROM {parent_table} \
          WHERE {parent_pk} IN ({id_list}) ORDER BY {parent_pk}{FOR_UPDATE}"
     );
     let update_sql = recompute_update_sql(spec, &id_list);
@@ -1096,7 +1134,7 @@ async fn recompute_batch<M: 'static>(
     scoped_immediate_transaction::<usize, AutumnError, _>(conn, move |conn| {
         async move {
             diesel::sql_query(lock_sql)
-                .load::<ParentIdRow>(&mut *conn)
+                .load::<IdRow>(&mut *conn)
                 .await
                 .map_err(AutumnError::from)?;
             diesel::sql_query(update_sql)
@@ -1148,25 +1186,22 @@ pub async fn counter_cache_recompute<M: 'static>(
         let parent_pk = spec.parent_pk;
         let mut cursor: Option<i64> = None;
         loop {
-            let mut page_sql = format!("SELECT {parent_pk} AS parent_id FROM {parent_table}");
+            let mut page_sql = format!("SELECT {parent_pk} AS id FROM {parent_table}");
             if cursor.is_some() {
                 let _ = write!(page_sql, " WHERE {parent_pk} > {PH1}");
             }
             let _ = write!(page_sql, " ORDER BY {parent_pk} LIMIT {RECOMPUTE_BATCH}");
             let query = diesel::sql_query(page_sql);
             let page = if let Some(after) = cursor {
-                query
-                    .bind::<BigInt, _>(after)
-                    .load::<ParentIdRow>(conn)
-                    .await
+                query.bind::<BigInt, _>(after).load::<IdRow>(conn).await
             } else {
-                query.load::<ParentIdRow>(conn).await
+                query.load::<IdRow>(conn).await
             }
             .map_err(AutumnError::from)?;
 
             let Some(last) = page.last() else { break };
-            cursor = Some(last.parent_id);
-            let ids: Vec<i64> = page.iter().map(|row| row.parent_id).collect();
+            cursor = Some(last.id);
+            let ids: Vec<i64> = page.iter().map(|row| row.id).collect();
             touched += recompute_batch(conn, spec, &ids).await?;
         }
     }
@@ -1181,10 +1216,15 @@ struct ChildFkRow {
     fk_value: Option<i64>,
 }
 
+/// A single `i64` primary key, aliased `id`.
+///
+/// Shared by the two statements whose result is incidental: the recompute
+/// sweep's page of parent ids, and the bulk-delete child lock (whose rows are
+/// discarded — the point is the lock it takes).
 #[derive(diesel::QueryableByName)]
-struct ParentIdRow {
+struct IdRow {
     #[diesel(sql_type = BigInt)]
-    parent_id: i64,
+    id: i64,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -1252,6 +1292,21 @@ mod tests {
         assert_eq!(
             live_predicate(&spec(true), false),
             format!(" AND {CHILD_ALIAS}.deleted_at IS NOT NULL")
+        );
+    }
+
+    #[test]
+    fn a_bulk_decrement_locks_its_children_in_ascending_id_order() {
+        // Deterministic order, and children before parents — the same direction
+        // the single-row and update paths take. Inverting it here would let a
+        // bulk delete deadlock against an `update` that re-parents one of the
+        // same children.
+        let sql = child_lock_sql(&spec(false), "3,1,2");
+        assert!(sql.starts_with("SELECT id AS id FROM comments"), "{sql}");
+        assert!(sql.contains("WHERE id IN (3,1,2)"), "{sql}");
+        assert!(
+            sql.contains(&format!("ORDER BY id{FOR_UPDATE}")),
+            "the lock must be taken in a deterministic order: {sql}"
         );
     }
 
