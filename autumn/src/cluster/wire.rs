@@ -403,8 +403,10 @@ impl FrameVerifier {
 
         // Accepted: adopt the incarnation (resetting the sequence watermark
         // when it rose) and remember the sequence at it.
-        self.watermarks
-            .insert(envelope.sender.clone(), (envelope.incarnation, envelope.seq));
+        self.watermarks.insert(
+            envelope.sender.clone(),
+            (envelope.incarnation, envelope.seq),
+        );
         Ok((envelope, message))
     }
 

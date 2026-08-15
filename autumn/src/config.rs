@@ -2034,6 +2034,55 @@ pub(crate) const MIN_CLUSTER_PUSH_INTERVAL_MS: u64 = 10;
 /// The suspicion timeout must be at least this many push intervals.
 pub(crate) const MIN_CLUSTER_SUSPICION_MULTIPLE: u64 = 3;
 
+/// Longest `node_id` / `cluster_name` accepted, in bytes.
+///
+/// Both travel in every frame and are covered by the MAC, so the bound keeps
+/// the fixed overhead of a state push small and predictable.
+pub(crate) const MAX_CLUSTER_IDENT_LEN: usize = 64;
+
+/// Separator between node id and incarnation in a counter cell key
+/// (`"{node_id}#{incarnation}"`). Reserved: an id containing it would make
+/// cell keys ambiguous, so validation refuses one.
+pub(crate) const CLUSTER_CELL_KEY_SEPARATOR: char = '#';
+
+/// Validate one identity string (`cluster.node_id`, `cluster.cluster_name`).
+///
+/// `field` is the dotted config path, used verbatim in the message so an
+/// operator can fix the offending key without reading the source.
+fn validate_cluster_ident(field: &str, value: &str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{field} must not be empty: it identifies this node (or its cluster) in every frame"
+        )));
+    }
+    let len = value.len();
+    if len > MAX_CLUSTER_IDENT_LEN {
+        return Err(ConfigError::Validation(format!(
+            "{field} must be at most {MAX_CLUSTER_IDENT_LEN} bytes, got {len} ({value:?}); it \
+             travels in every cluster frame and is covered by the MAC"
+        )));
+    }
+    if value.contains(CLUSTER_CELL_KEY_SEPARATOR) {
+        return Err(ConfigError::Validation(format!(
+            "{field} must not contain {CLUSTER_CELL_KEY_SEPARATOR:?} ({value:?}): it separates \
+             the node id from the incarnation in counter cell keys, and an id containing it \
+             would make two different cells collide"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse a cluster address, rejecting anything that is not a `host:port` pair
+/// with an IP literal (hostnames are never resolved).
+fn parse_cluster_addr(field: &str, value: &str) -> Result<std::net::SocketAddr, ConfigError> {
+    value.parse::<std::net::SocketAddr>().map_err(|error| {
+        ConfigError::Validation(format!(
+            "{field} must be a socket address of the form host:port with an IP literal \
+             (hostnames are not resolved), got {value:?}: {error}"
+        ))
+    })
+}
+
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -2054,22 +2103,106 @@ impl ClusterConfig {
     /// Fail fast on a `[cluster]` section that would boot an insecure or
     /// flapping cluster.
     ///
-    /// When `enabled`:
-    /// - `secret` must be present and at least
-    ///   [`MIN_CLUSTER_SECRET_LEN`] bytes;
-    /// - `push_interval_ms` must be at least
-    ///   [`MIN_CLUSTER_PUSH_INTERVAL_MS`];
-    /// - `suspicion_timeout_ms` must be at least
-    ///   [`MIN_CLUSTER_SUSPICION_MULTIPLE`] × `push_interval_ms`;
+    /// Checked when `enabled` — these are about a node that will really bind
+    /// and gossip:
+    /// - `secret` must be present and at least 16 bytes. There is no lenient
+    ///   unauthenticated mode.
+    /// - The address peers are told to dial (`advertise_addr`, or `bind_addr`
+    ///   when it is unset) must not be a wildcard: nobody can dial `0.0.0.0`.
+    ///
+    /// Checked always, enabled or not — a section that is wrong is wrong
+    /// before the switch is flipped:
+    /// - `push_interval_ms` must be at least 10ms.
+    /// - `suspicion_timeout_ms` must be at least 3 × `push_interval_ms`: the
+    ///   anti-flap hysteresis, below which one delayed push evicts a healthy
+    ///   peer.
     /// - `bind_addr`, `advertise_addr` and every `seed_peers` entry must parse
-    ///   as a socket address.
+    ///   as a [`std::net::SocketAddr`] (IP literal — hostnames are not
+    ///   resolved).
+    /// - `cluster_name`, and `node_id` when set, must be non-empty, at most 64
+    ///   bytes, and free of the `#` counter cell-key separator.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::Validation`] describing the first violated rule.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // RED-PHASE STUB: the green phase implements the rules above. Kept
-        // total (and wired into `AutumnConfig::validate`) so the seam exists.
+        // Operational rules: only meaningful for a node that will actually
+        // bind and gossip.
+        if self.enabled {
+            self.validate_secret()?;
+        }
+
+        if self.push_interval_ms < MIN_CLUSTER_PUSH_INTERVAL_MS {
+            return Err(ConfigError::Validation(format!(
+                "cluster.push_interval_ms must be at least {MIN_CLUSTER_PUSH_INTERVAL_MS}ms, \
+                 got {}",
+                self.push_interval_ms
+            )));
+        }
+        // Saturating: a push interval near u64::MAX would overflow the
+        // multiply, and an overflow must not turn into an accidental pass.
+        let min_suspicion = self
+            .push_interval_ms
+            .saturating_mul(MIN_CLUSTER_SUSPICION_MULTIPLE);
+        if self.suspicion_timeout_ms < min_suspicion {
+            return Err(ConfigError::Validation(format!(
+                "cluster.suspicion_timeout_ms ({}) must be at least \
+                 {MIN_CLUSTER_SUSPICION_MULTIPLE}x cluster.push_interval_ms ({}), i.e. at least \
+                 {min_suspicion}ms: below that ratio one delayed push evicts a healthy peer and \
+                 the view flaps",
+                self.suspicion_timeout_ms, self.push_interval_ms
+            )));
+        }
+
+        validate_cluster_ident("cluster.cluster_name", &self.cluster_name)?;
+        if let Some(node_id) = self.node_id.as_deref() {
+            validate_cluster_ident("cluster.node_id", node_id)?;
+        }
+
+        let bind_addr = parse_cluster_addr("cluster.bind_addr", &self.bind_addr)?;
+        let advertise_addr = match self.advertise_addr.as_deref() {
+            Some(addr) => parse_cluster_addr("cluster.advertise_addr", addr)?,
+            None => bind_addr,
+        };
+        for (index, peer) in self.seed_peers.iter().enumerate() {
+            parse_cluster_addr(&format!("cluster.seed_peers[{index}]"), peer)?;
+        }
+
+        // A wildcard bind is legal, advertising one is not: peers copy the
+        // advertised address out of the pushed state and dial it verbatim.
+        if self.enabled && advertise_addr.ip().is_unspecified() {
+            let source = if self.advertise_addr.is_some() {
+                "cluster.advertise_addr"
+            } else {
+                "cluster.bind_addr"
+            };
+            return Err(ConfigError::Validation(format!(
+                "{source} advertises {advertise_addr}, which no peer can dial: binding a \
+                 wildcard address is fine, but it requires an explicit, non-wildcard \
+                 cluster.advertise_addr (see docs/guide/clustering.md)"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// The shared HMAC key: required, and long enough to be a key.
+    fn validate_secret(&self) -> Result<(), ConfigError> {
+        let Some(secret) = self.secret.as_ref() else {
+            return Err(ConfigError::Validation(
+                "cluster.secret is required when cluster.enabled = true: the cluster transport \
+                 is authenticated (HMAC-SHA256) and has no unauthenticated mode — set it with \
+                 AUTUMN_CLUSTER__SECRET"
+                    .to_owned(),
+            ));
+        };
+        let len = secrecy::ExposeSecret::expose_secret(secret).len();
+        if len < MIN_CLUSTER_SECRET_LEN {
+            return Err(ConfigError::Validation(format!(
+                "cluster.secret must be at least {MIN_CLUSTER_SECRET_LEN} bytes, got {len}: a \
+                 short shared key is a guessable one, and every member signs every frame with it"
+            )));
+        }
         Ok(())
     }
 }

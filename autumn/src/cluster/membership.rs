@@ -32,8 +32,6 @@
 //! sees **any** record about itself at an incarnation `>=` its own — `Left` or
 //! a stale `Alive` — adopts `observed + 1`, marks itself `Alive`, and pushes
 //! immediately. See [`ClusterState::refute`].
-//!
-//! RED PHASE (TDD): bodies are inert stubs — see the module docs on [`super`].
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
@@ -86,6 +84,19 @@ pub enum MemberStatus {
     Left,
 }
 
+impl MemberStatus {
+    /// This status's rank *within one incarnation*: `Left` outranks `Alive`.
+    ///
+    /// Merge rule 2 in one function — a leave is never undone by an in-flight
+    /// older push carrying the same incarnation.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Alive => 0,
+            Self::Left => 1,
+        }
+    }
+}
+
 /// One member's replicated record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberRecord {
@@ -118,11 +129,24 @@ impl MemberRecord {
         }
     }
 
+    /// The three merge rules expressed as one comparable key:
+    /// `(incarnation, status rank, addr)`.
+    ///
+    /// Records are ordered *totally* by this key, so the merge below is a
+    /// maximum — which is what makes it commutative, associative and
+    /// idempotent for free rather than by inspection of three separate cases.
+    const fn merge_key(&self) -> (Incarnation, u8, &str) {
+        (self.incarnation, self.status.rank(), self.addr.as_str())
+    }
+
     /// Merge `other` into `self` by the three-rule order in the module docs.
     pub fn merge(&mut self, other: &Self) {
-        // RED-PHASE STUB: must implement (incarnation, Left > Alive, greater
-        // addr) — the ordering that makes this type a join-semilattice.
-        let _ = other;
+        if other.merge_key() > self.merge_key() {
+            // The winning record wins whole: its address travels with its
+            // incarnation, so a member that moved address is not left half
+            // merged.
+            self.clone_from(other);
+        }
     }
 }
 
@@ -143,9 +167,20 @@ impl ClusterState {
     /// Commutative, associative and idempotent — the property the counter's
     /// cross-node consistency reduces to.
     pub fn merge(&mut self, other: &Self) {
-        // RED-PHASE STUB: must merge member records by their semilattice order
-        // and counter cells by per-cell max.
-        let _ = other;
+        for (id, theirs) in &other.members {
+            if let Some(ours) = self.members.get_mut(id) {
+                ours.merge(theirs);
+            } else {
+                // A member we have never heard of: learning it *is* discovery.
+                // Tombstones (`Left`) are learned too, so a leave keeps
+                // propagating through a node that never met the departed peer.
+                self.members.insert(id.clone(), theirs.clone());
+            }
+        }
+        for (name, theirs) in &other.counters {
+            // Per-cell max, delegated: the counter owns its own join.
+            self.counters.entry(name.clone()).or_default().merge(theirs);
+        }
     }
 
     /// Reconcile this document's record for `me` against `own`, the node's own
@@ -161,9 +196,78 @@ impl ClusterState {
     /// simply echoes our own record back at us, which must **not** bump (an
     /// unconditional bump would ratchet forever).
     pub fn refute(&mut self, me: &str, own: &MemberRecord) -> Option<Incarnation> {
-        // RED-PHASE STUB: must implement the generalized rule above.
-        let _ = (me, own);
-        None
+        let observed = self.members.get_mut(me)?;
+
+        if observed == own {
+            // Our own record, echoed back by a peer. Bumping here would ratchet
+            // the incarnation on every single push round.
+            return None;
+        }
+        if observed.incarnation < own.incarnation {
+            // Already loses merge rule 1 against the record we publish; the
+            // document heals itself on the next push without a bump.
+            return None;
+        }
+
+        // Rule 1 outranks rule 2, so `observed + 1` buries a `Left` (or a stale
+        // `Alive` from an earlier boot) everywhere it has spread. Saturating
+        // because the panic gate forbids the wrapping alternative; a node that
+        // reaches `u64::MAX` here stops bumping rather than wrapping to zero and
+        // losing every argument.
+        let bumped = observed.incarnation.saturating_add(1);
+        observed.incarnation = bumped;
+        observed.status = MemberStatus::Alive;
+        // We are authoritative about our own address, whatever the document
+        // claimed.
+        observed.addr.clone_from(&own.addr);
+        Some(bumped)
+    }
+
+    /// Drop `Left` tombstones that have outlived their window, forgetting the
+    /// pruned members in `overlay` too. Returns how many records were dropped.
+    ///
+    /// A tombstone exists so a leave *propagates*; once every peer has had
+    /// [`TOMBSTONE_TIMEOUT_MULTIPLE`] suspicion timeouts to hear it, keeping it
+    /// only grows the document. Pruning is deliberately **local** and driven by
+    /// the caller's clock reading: it removes no information any peer still
+    /// needs, and a straggling push that re-teaches the tombstone simply
+    /// re-inserts a record that is still `Left` and still out of the view.
+    ///
+    /// A tombstone for a member this node has never accepted a frame from has
+    /// no receipt to measure the window against and is therefore kept.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no production caller yet: the periodic call lands with the \
+                      push loop in node.rs — DELETE this attribute when it does \
+                      (the expectation then goes unfulfilled and fails the build). \
+                      The behaviour itself is pinned by this module's unit tests."
+        )
+    )]
+    pub fn prune_tombstones(
+        &mut self,
+        overlay: &mut LivenessOverlay,
+        now: MonotonicInstant,
+    ) -> usize {
+        let window = overlay.tombstone_timeout();
+        let expired: Vec<NodeId> = self
+            .members
+            .iter()
+            .filter_map(|(id, record)| {
+                let lapsed = record.status == MemberStatus::Left
+                    && overlay
+                        .last_receipt(id)
+                        .is_some_and(|seen| now.saturating_duration_since(seen) > window);
+                lapsed.then(|| id.clone())
+            })
+            .collect();
+
+        for id in &expired {
+            self.members.remove(id);
+            overlay.forget(id);
+        }
+        expired.len()
     }
 }
 
@@ -237,17 +341,47 @@ impl LivenessOverlay {
         self.last_seen.remove(node);
     }
 
+    /// When a frame from `node` was last accepted, if ever.
+    fn last_receipt(&self, node: &str) -> Option<MonotonicInstant> {
+        self.last_seen.get(node).copied()
+    }
+
+    /// How long a `Left` tombstone is kept before
+    /// [`ClusterState::prune_tombstones`] drops it:
+    /// [`TOMBSTONE_TIMEOUT_MULTIPLE`] suspicion timeouts.
+    fn tombstone_timeout(&self) -> Duration {
+        self.suspicion_timeout
+            .saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE)
+    }
+
     /// Classify `node` as of `now`. Pure: no clock read, no mutation.
     pub fn liveness(&self, node: &str, now: MonotonicInstant) -> Liveness {
-        // RED-PHASE STUB: must implement the Alive/Suspect/Down table above.
-        let _ = (node, now);
-        Liveness::Alive
+        // Never heard from — `Down`, not `Alive`. Optimism here would put a peer
+        // that has never once answered into the view.
+        let Some(last) = self.last_receipt(node) else {
+            return Liveness::Down;
+        };
+
+        let silence = now.saturating_duration_since(last);
+        // `saturating_mul` rather than `2 *`: the panic gate forbids arithmetic
+        // that can overflow, and a configured push interval near `Duration::MAX`
+        // must clamp rather than wrap the threshold down to something tiny.
+        if silence > self.suspicion_timeout {
+            Liveness::Down
+        } else if silence > self.push_interval.saturating_mul(2) {
+            Liveness::Suspect
+        } else {
+            Liveness::Alive
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ClusterState, Liveness, LivenessOverlay, MemberRecord, MemberStatus};
+    use super::{
+        ClusterState, Liveness, LivenessOverlay, MemberRecord, MemberStatus,
+        TOMBSTONE_TIMEOUT_MULTIPLE,
+    };
     use crate::time::MonotonicInstant;
     use std::time::Duration;
 
@@ -446,6 +580,56 @@ mod tests {
             overlay.liveness("node-b", at(4_100)),
             Liveness::Down,
             "…including the Down threshold"
+        );
+    }
+
+    /// Coverage added in the green phase: the guide says tombstones are "pruned
+    /// locally after ten suspicion timeouts", and no red test pinned it.
+    #[test]
+    fn left_tombstones_prune_after_ten_suspicion_timeouts() {
+        let window = SUSPICION.saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE);
+        let window_ms = u64::try_from(window.as_millis()).expect("the window fits in a u64 of ms");
+
+        let mut overlay = LivenessOverlay::new(PUSH, SUSPICION);
+        overlay.record_receipt("node-a", at(0));
+        overlay.record_receipt("node-b", at(0));
+
+        let mut state = ClusterState::default();
+        state.members.insert(
+            "node-a".to_owned(),
+            MemberRecord::alive("127.0.0.1:7001", 4),
+        );
+        state
+            .members
+            .insert("node-b".to_owned(), MemberRecord::left("127.0.0.1:7002", 9));
+
+        assert_eq!(
+            state.prune_tombstones(&mut overlay, at(window_ms)),
+            0,
+            "a tombstone must survive its whole window — pruning it early would \
+             let a straggling push resurrect the departed member; observed {state:?}"
+        );
+
+        assert_eq!(
+            state.prune_tombstones(&mut overlay, at(window_ms.saturating_add(1))),
+            1,
+            "past ten suspicion timeouts the tombstone must be pruned; observed {state:?}"
+        );
+        assert!(
+            !state.members.contains_key("node-b"),
+            "the pruned tombstone must leave the document; observed {state:?}"
+        );
+        assert_eq!(
+            overlay.liveness("node-b", at(window_ms)),
+            Liveness::Down,
+            "pruning must forget the overlay row too, so a pruned member reads \
+             as never-seen rather than as a stale receipt"
+        );
+        assert!(
+            state.members.contains_key("node-a"),
+            "an Alive member must never be pruned, however long it has been \
+             silent — silence is the overlay's business, not the document's; \
+             observed {state:?}"
         );
     }
 }
