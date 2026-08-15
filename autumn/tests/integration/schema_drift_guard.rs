@@ -354,7 +354,8 @@ fn cluster_child_keys_are_strictly_validated() {
 
     // End-to-end: the strict validator flags an unknown child key under [cluster].
     let schema = AutumnConfig::get_schema_keys();
-    let errors = AutumnConfig::validate_toml("[cluster]\nseed_peer = [\"127.0.0.1:7946\"]\n", &schema);
+    let errors =
+        AutumnConfig::validate_toml("[cluster]\nseed_peer = [\"127.0.0.1:7946\"]\n", &schema);
     assert!(
         errors.iter().any(|(path, _)| path == "cluster.seed_peer"),
         "a bogus [cluster] child key must be rejected by strict validation, got: {errors:?}"

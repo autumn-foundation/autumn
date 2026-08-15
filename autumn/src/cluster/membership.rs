@@ -59,6 +59,9 @@
         clippy::arithmetic_side_effects,
     )
 )]
+// `pub` throughout this file is crate-visible only: the enclosing `cluster`
+// submodule is itself `pub(crate)`, so nothing here escapes the crate
+// (clippy::redundant_pub_crate).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -70,13 +73,13 @@ use super::{Incarnation, NodeId};
 use crate::time::MonotonicInstant;
 
 /// How many suspicion timeouts a `Left` tombstone is kept before pruning.
-pub(crate) const TOMBSTONE_TIMEOUT_MULTIPLE: u32 = 10;
+pub const TOMBSTONE_TIMEOUT_MULTIPLE: u32 = 10;
 
 /// Replicated member status. Deliberately only two values: liveness is local
 /// (see [`LivenessOverlay`]) and is never gossiped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum MemberStatus {
+pub enum MemberStatus {
     /// The member is a participating peer.
     Alive,
     /// The member announced a clean departure at this incarnation.
@@ -85,20 +88,20 @@ pub(crate) enum MemberStatus {
 
 /// One member's replicated record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct MemberRecord {
+pub struct MemberRecord {
     /// The address peers dial to reach this member.
     #[serde(default)]
-    pub(crate) addr: String,
+    pub addr: String,
     /// The member's boot generation; higher always wins.
     #[serde(default)]
-    pub(crate) incarnation: Incarnation,
+    pub incarnation: Incarnation,
     /// Replicated status at that incarnation.
-    pub(crate) status: MemberStatus,
+    pub status: MemberStatus,
 }
 
 impl MemberRecord {
     /// An `Alive` record for `addr` at `incarnation`.
-    pub(crate) fn alive(addr: impl Into<String>, incarnation: Incarnation) -> Self {
+    pub fn alive(addr: impl Into<String>, incarnation: Incarnation) -> Self {
         Self {
             addr: addr.into(),
             incarnation,
@@ -107,7 +110,7 @@ impl MemberRecord {
     }
 
     /// A `Left` record for `addr` at `incarnation`.
-    pub(crate) fn left(addr: impl Into<String>, incarnation: Incarnation) -> Self {
+    pub fn left(addr: impl Into<String>, incarnation: Incarnation) -> Self {
         Self {
             addr: addr.into(),
             incarnation,
@@ -116,7 +119,7 @@ impl MemberRecord {
     }
 
     /// Merge `other` into `self` by the three-rule order in the module docs.
-    pub(crate) fn merge(&mut self, other: &Self) {
+    pub fn merge(&mut self, other: &Self) {
         // RED-PHASE STUB: must implement (incarnation, Left > Alive, greater
         // addr) — the ordering that makes this type a join-semilattice.
         let _ = other;
@@ -125,13 +128,13 @@ impl MemberRecord {
 
 /// The single replicated document.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ClusterState {
+pub struct ClusterState {
     /// `node id -> member record`. `BTreeMap` keeps the serialized form stable.
     #[serde(default)]
-    pub(crate) members: BTreeMap<NodeId, MemberRecord>,
+    pub members: BTreeMap<NodeId, MemberRecord>,
     /// `counter name -> per-cell tallies`.
     #[serde(default)]
-    pub(crate) counters: BTreeMap<String, CounterShards>,
+    pub counters: BTreeMap<String, CounterShards>,
 }
 
 impl ClusterState {
@@ -139,7 +142,7 @@ impl ClusterState {
     ///
     /// Commutative, associative and idempotent — the property the counter's
     /// cross-node consistency reduces to.
-    pub(crate) fn merge(&mut self, other: &Self) {
+    pub fn merge(&mut self, other: &Self) {
         // RED-PHASE STUB: must merge member records by their semilattice order
         // and counter cells by per-cell max.
         let _ = other;
@@ -157,7 +160,7 @@ impl ClusterState {
     /// Returns `None` when nothing needs refuting — including when the document
     /// simply echoes our own record back at us, which must **not** bump (an
     /// unconditional bump would ratchet forever).
-    pub(crate) fn refute(&mut self, me: &str, own: &MemberRecord) -> Option<Incarnation> {
+    pub fn refute(&mut self, me: &str, own: &MemberRecord) -> Option<Incarnation> {
         // RED-PHASE STUB: must implement the generalized rule above.
         let _ = (me, own);
         None
@@ -166,7 +169,7 @@ impl ClusterState {
 
 /// Locally-observed liveness of a peer. Never serialized, never gossiped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Liveness {
+pub enum Liveness {
     /// A frame arrived recently. In the view.
     Alive,
     /// Silence past two push intervals — a warning, not an eviction. Still in
@@ -178,7 +181,7 @@ pub(crate) enum Liveness {
 
 impl Liveness {
     /// Whether a member in this state appears in [`members`](super::ClusterHandle::members).
-    pub(crate) const fn in_view(self) -> bool {
+    pub const fn in_view(self) -> bool {
         matches!(self, Self::Alive | Self::Suspect)
     }
 }
@@ -198,7 +201,7 @@ impl Liveness {
 ///
 /// A peer that has never been heard from is `Down`.
 #[derive(Debug)]
-pub(crate) struct LivenessOverlay {
+pub struct LivenessOverlay {
     push_interval: Duration,
     suspicion_timeout: Duration,
     last_seen: BTreeMap<NodeId, MonotonicInstant>,
@@ -206,7 +209,7 @@ pub(crate) struct LivenessOverlay {
 
 impl LivenessOverlay {
     /// A fresh overlay with no observations.
-    pub(crate) const fn new(push_interval: Duration, suspicion_timeout: Duration) -> Self {
+    pub const fn new(push_interval: Duration, suspicion_timeout: Duration) -> Self {
         Self {
             push_interval,
             suspicion_timeout,
@@ -215,27 +218,27 @@ impl LivenessOverlay {
     }
 
     /// The push interval this overlay measures `Suspect` against.
-    pub(crate) const fn push_interval(&self) -> Duration {
+    pub const fn push_interval(&self) -> Duration {
         self.push_interval
     }
 
     /// The suspicion timeout this overlay measures `Down` against.
-    pub(crate) const fn suspicion_timeout(&self) -> Duration {
+    pub const fn suspicion_timeout(&self) -> Duration {
         self.suspicion_timeout
     }
 
     /// Record that a frame from `node` was accepted at `at`.
-    pub(crate) fn record_receipt(&mut self, node: &str, at: MonotonicInstant) {
+    pub fn record_receipt(&mut self, node: &str, at: MonotonicInstant) {
         self.last_seen.insert(node.to_owned(), at);
     }
 
     /// Drop every observation of `node` (it left cleanly, or was pruned).
-    pub(crate) fn forget(&mut self, node: &str) {
+    pub fn forget(&mut self, node: &str) {
         self.last_seen.remove(node);
     }
 
     /// Classify `node` as of `now`. Pure: no clock read, no mutation.
-    pub(crate) fn liveness(&self, node: &str, now: MonotonicInstant) -> Liveness {
+    pub fn liveness(&self, node: &str, now: MonotonicInstant) -> Liveness {
         // RED-PHASE STUB: must implement the Alive/Suspect/Down table above.
         let _ = (node, now);
         Liveness::Alive

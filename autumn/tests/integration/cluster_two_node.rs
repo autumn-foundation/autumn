@@ -156,9 +156,7 @@ async fn tcp_two_nodes_converge_and_counter_replicates() {
     // Seed B from A's OBSERVED bound address — no hardcoded ports anywhere.
     let seed = handle_a.local_addr().to_string();
     let config_b = cluster_config(vec![seed.clone()]);
-    let app_b = TestApp::new()
-        .config(app_config(config_b.clone()))
-        .build();
+    let app_b = TestApp::new().config(app_config(config_b.clone())).build();
     install_from_config(app_b.state(), &config_b, &shutdown).expect("node B must install");
     let handle_b = app_b
         .state()
@@ -215,9 +213,7 @@ async fn tcp_survivor_converges_after_peer_cancelled() {
     let shutdown_b = CancellationToken::new();
 
     let config_a = cluster_config(Vec::new());
-    let app_a = TestApp::new()
-        .config(app_config(config_a.clone()))
-        .build();
+    let app_a = TestApp::new().config(app_config(config_a.clone())).build();
     install_from_config(app_a.state(), &config_a, &shutdown_a).expect("node A must install");
     let handle_a = app_a
         .state()
@@ -225,9 +221,7 @@ async fn tcp_survivor_converges_after_peer_cancelled() {
         .expect("node A must expose a ClusterHandle");
 
     let config_b = cluster_config(vec![handle_a.local_addr().to_string()]);
-    let app_b = TestApp::new()
-        .config(app_config(config_b.clone()))
-        .build();
+    let app_b = TestApp::new().config(app_config(config_b.clone())).build();
     install_from_config(app_b.state(), &config_b, &shutdown_b).expect("node B must install");
     let handle_b = app_b
         .state()
@@ -290,9 +284,7 @@ async fn full_app_two_nodes_health_and_counter_via_http() {
     let http_shutdown = CancellationToken::new();
 
     let config_a = cluster_config(Vec::new());
-    let app_a = TestApp::new()
-        .config(app_config(config_a.clone()))
-        .build();
+    let app_a = TestApp::new().config(app_config(config_a.clone())).build();
     let state_a = app_a.state().clone();
     install_from_config(&state_a, &config_a, &cluster_a_shutdown).expect("node A must install");
     let handle_a = state_a
@@ -300,9 +292,7 @@ async fn full_app_two_nodes_health_and_counter_via_http() {
         .expect("node A must expose a ClusterHandle");
 
     let config_b = cluster_config(vec![handle_a.local_addr().to_string()]);
-    let app_b = TestApp::new()
-        .config(app_config(config_b.clone()))
-        .build();
+    let app_b = TestApp::new().config(app_config(config_b.clone())).build();
     let state_b = app_b.state().clone();
     install_from_config(&state_b, &config_b, &cluster_b_shutdown).expect("node B must install");
     let handle_b = state_b

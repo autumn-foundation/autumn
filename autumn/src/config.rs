@@ -4081,7 +4081,11 @@ impl AutumnConfig {
             "AUTUMN_CLUSTER__CLUSTER_NAME",
             &mut self.cluster.cluster_name,
         );
-        parse_env_string(env, "AUTUMN_CLUSTER__BIND_ADDR", &mut self.cluster.bind_addr);
+        parse_env_string(
+            env,
+            "AUTUMN_CLUSTER__BIND_ADDR",
+            &mut self.cluster.bind_addr,
+        );
         parse_env_option_string(
             env,
             "AUTUMN_CLUSTER__ADVERTISE_ADDR",
@@ -10824,10 +10828,7 @@ path = "/healthz"
             .with("AUTUMN_CLUSTER__CLUSTER_NAME", "orchard")
             .with("AUTUMN_CLUSTER__BIND_ADDR", "0.0.0.0:7946")
             .with("AUTUMN_CLUSTER__ADVERTISE_ADDR", "10.0.0.4:7946")
-            .with(
-                "AUTUMN_CLUSTER__SEED_PEERS",
-                "10.0.0.5:7946, 10.0.0.6:7946",
-            )
+            .with("AUTUMN_CLUSTER__SEED_PEERS", "10.0.0.5:7946, 10.0.0.6:7946")
             .with("AUTUMN_CLUSTER__NODE_ID", "node-a")
             .with("AUTUMN_CLUSTER__PUSH_INTERVAL_MS", "250")
             .with("AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS", "1500");
@@ -10845,7 +10846,10 @@ path = "/healthz"
         );
         assert_eq!(config.cluster.cluster_name, "orchard");
         assert_eq!(config.cluster.bind_addr, "0.0.0.0:7946");
-        assert_eq!(config.cluster.advertise_addr.as_deref(), Some("10.0.0.4:7946"));
+        assert_eq!(
+            config.cluster.advertise_addr.as_deref(),
+            Some("10.0.0.4:7946")
+        );
         assert_eq!(
             config.cluster.seed_peers,
             vec!["10.0.0.5:7946".to_owned(), "10.0.0.6:7946".to_owned()],

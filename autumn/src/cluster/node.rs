@@ -47,6 +47,9 @@
         clippy::arithmetic_side_effects,
     )
 )]
+// `pub` throughout this file is crate-visible only: the enclosing `cluster`
+// submodule is itself `pub(crate)`, so nothing here escapes the crate
+// (clippy::redundant_pub_crate).
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -64,32 +67,32 @@ use crate::{AutumnResult, cluster::NodeId};
 /// Upper bound on the best-effort `Leave` broadcast during shutdown. Sized to
 /// sit comfortably inside the app's drain budget: a clean departure must never
 /// extend shutdown.
-pub(crate) const LEAVE_BUDGET: Duration = Duration::from_millis(250);
+pub const LEAVE_BUDGET: Duration = Duration::from_millis(250);
 
 /// Everything a node needs that does not come from the app.
 ///
 /// Built from [`ClusterConfig`](crate::config::ClusterConfig) by
 /// [`install_from_config`](super::install_from_config), or by hand in tests.
 #[derive(Debug, Clone)]
-pub(crate) struct ClusterRuntimeConfig {
+pub struct ClusterRuntimeConfig {
     /// Cluster name; part of every MAC, so two clusters cannot cross-talk.
-    pub(crate) cluster_name: String,
+    pub cluster_name: String,
     /// Shared HMAC secret.
-    pub(crate) secret: Vec<u8>,
+    pub secret: Vec<u8>,
     /// Explicit node id override; entropy-derived when absent.
-    pub(crate) node_id: Option<String>,
+    pub node_id: Option<String>,
     /// Address advertised to peers; the bound address when absent.
-    pub(crate) advertise_addr: Option<String>,
+    pub advertise_addr: Option<String>,
     /// Addresses to dial on startup.
-    pub(crate) seed_peers: Vec<String>,
+    pub seed_peers: Vec<String>,
     /// Base interval between state pushes.
-    pub(crate) push_interval: Duration,
+    pub push_interval: Duration,
     /// How long without a push before a peer becomes `Suspect`.
-    pub(crate) suspicion_timeout: Duration,
+    pub suspicion_timeout: Duration,
 }
 
 /// Constructor for a running cluster node.
-pub(crate) struct ClusterNode;
+pub struct ClusterNode;
 
 impl ClusterNode {
     /// Start a node on `transport` and return its handle.
@@ -98,7 +101,7 @@ impl ClusterNode {
     ///
     /// Returns an error when the node cannot be constructed on the given
     /// transport.
-    pub(crate) fn start(
+    pub fn start(
         config: ClusterRuntimeConfig,
         entropy: Arc<dyn Entropy>,
         clock: Arc<dyn ClockSource>,
@@ -161,9 +164,12 @@ impl ClusterNode {
 ///
 /// Never hostname-derived: hostnames collide across containers and are not a
 /// uniqueness guarantee.
-pub(crate) fn resolve_node_id(configured: Option<&str>, entropy: &dyn Entropy) -> NodeId {
-    match configured.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(id) => id.to_owned(),
-        None => format!("node-{}", entropy.uuid_v4().simple()),
-    }
+pub fn resolve_node_id(configured: Option<&str>, entropy: &dyn Entropy) -> NodeId {
+    configured
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(
+            || format!("node-{}", entropy.uuid_v4().simple()),
+            ToOwned::to_owned,
+        )
 }

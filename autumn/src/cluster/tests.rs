@@ -385,7 +385,10 @@ async fn loopback_replayed_leave_is_refuted_by_live_node() {
     );
 
     let delivered = router.deliver(&a.addr, &b.addr, frame);
-    assert!(delivered, "the forged frame must reach node B to prove anything");
+    assert!(
+        delivered,
+        "the forged frame must reach node B to prove anything"
+    );
 
     settle(&clock, 6).await;
 

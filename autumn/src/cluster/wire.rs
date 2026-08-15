@@ -59,6 +59,9 @@
         clippy::arithmetic_side_effects,
     )
 )]
+// `pub` throughout this file is crate-visible only: the enclosing `cluster`
+// submodule is itself `pub(crate)`, so nothing here escapes the crate
+// (clippy::redundant_pub_crate).
 
 use std::collections::BTreeMap;
 
@@ -68,22 +71,22 @@ use super::membership::ClusterState;
 use super::{Incarnation, NodeId};
 
 /// Envelope version. Any other value is dropped.
-pub(crate) const WIRE_VERSION: u8 = 1;
+pub const WIRE_VERSION: u8 = 1;
 
 /// Signing-key identifier. Reserved for rotation; always `0` in this slice.
-pub(crate) const CURRENT_KEY_ID: u8 = 0;
+pub const CURRENT_KEY_ID: u8 = 0;
 
 /// Hard cap on a single frame's JSON body, checked before allocation.
-pub(crate) const MAX_FRAME_BYTES: usize = 65_536;
+pub const MAX_FRAME_BYTES: usize = 65_536;
 
 /// Width of the big-endian length prefix.
-pub(crate) const LENGTH_PREFIX_BYTES: usize = 4;
+pub const LENGTH_PREFIX_BYTES: usize = 4;
 
 /// The messages a node can send. Internally tagged, so an unknown future
 /// variant is a clean drop rather than a parse failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ClusterMessage {
+pub enum ClusterMessage {
     /// The whole replicated document. This IS the heartbeat.
     StatePush {
         /// The sender's document at the moment it pushed.
@@ -99,30 +102,30 @@ pub(crate) enum ClusterMessage {
 
 /// The authenticated wrapper every frame carries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Envelope {
+pub struct Envelope {
     /// Envelope version ([`WIRE_VERSION`]).
-    pub(crate) v: u8,
+    pub v: u8,
     /// Signing-key id ([`CURRENT_KEY_ID`]). Outside the signing input.
     #[serde(default)]
-    pub(crate) key_id: u8,
+    pub key_id: u8,
     /// Sender's cluster name — a frame from another cluster is refused even
     /// under the same secret.
-    pub(crate) cluster: String,
+    pub cluster: String,
     /// Authenticated sender id. The source address is never an identity.
-    pub(crate) sender: NodeId,
+    pub sender: NodeId,
     /// The sender's incarnation when the frame was produced.
-    pub(crate) incarnation: Incarnation,
+    pub incarnation: Incarnation,
     /// Per-sender counter, reset to `0` when the incarnation increases.
-    pub(crate) seq: u64,
+    pub seq: u64,
     /// The inner message as a JSON string. Opaque until the MAC verifies.
-    pub(crate) payload: String,
+    pub payload: String,
     /// Lowercase hex HMAC-SHA256, 64 characters.
-    pub(crate) mac: String,
+    pub mac: String,
 }
 
 /// Why a frame was refused. Labels match the guide's receive-path table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum RejectReason {
+pub enum RejectReason {
     /// Step 1: `N == 0` or `N > MAX_FRAME_BYTES`. **Closes the connection.**
     Oversize,
     /// Step 2: the envelope is not well-formed JSON, or is missing a field.
@@ -145,7 +148,7 @@ pub(crate) enum RejectReason {
 
 impl RejectReason {
     /// Stable label used in metrics and logs.
-    pub(crate) const fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Oversize => "oversize",
             Self::Malformed => "malformed",
@@ -165,7 +168,7 @@ impl RejectReason {
     /// Only step 1 does: after a bad length prefix there is no way to know
     /// where the next frame starts. Everything else drops the frame and reads
     /// on.
-    pub(crate) const fn closes_connection(self) -> bool {
+    pub const fn closes_connection(self) -> bool {
         matches!(self, Self::Oversize)
     }
 }
@@ -174,7 +177,7 @@ impl RejectReason {
 /// field value can be shifted into another field.
 ///
 /// `L(x) = 8-byte big-endian byte length of x, followed by x`.
-pub(crate) fn signing_input(
+pub fn signing_input(
     v: u8,
     cluster: &str,
     sender: &str,
@@ -192,7 +195,7 @@ pub(crate) fn signing_input(
 ///
 /// Returns `None` when the message cannot be serialized — a caller must drop
 /// the send, never panic.
-pub(crate) fn sign_envelope(
+pub fn sign_envelope(
     secret: &[u8],
     cluster: &str,
     sender: &str,
@@ -208,7 +211,7 @@ pub(crate) fn sign_envelope(
 /// Length-prefix a serialized envelope. `None` when it does not fit
 /// [`MAX_FRAME_BYTES`] or cannot be serialized — the sender applies the same
 /// cap rather than emitting something the peer must reject.
-pub(crate) fn encode_frame(envelope: &Envelope) -> Option<Vec<u8>> {
+pub fn encode_frame(envelope: &Envelope) -> Option<Vec<u8>> {
     // RED-PHASE STUB.
     let _ = envelope;
     None
@@ -216,7 +219,7 @@ pub(crate) fn encode_frame(envelope: &Envelope) -> Option<Vec<u8>> {
 
 /// Read a length prefix, refusing `0` and anything over [`MAX_FRAME_BYTES`]
 /// **before** a buffer of that size is reserved.
-pub(crate) const fn frame_len(prefix: [u8; LENGTH_PREFIX_BYTES]) -> Option<usize> {
+pub const fn frame_len(prefix: [u8; LENGTH_PREFIX_BYTES]) -> Option<usize> {
     // RED-PHASE STUB: must accept a legal length and refuse 0 / oversized.
     let _ = prefix;
     None
@@ -224,7 +227,7 @@ pub(crate) const fn frame_len(prefix: [u8; LENGTH_PREFIX_BYTES]) -> Option<usize
 
 /// Parse a complete frame (prefix + body) into an envelope. Total: any
 /// malformed input yields `None`.
-pub(crate) fn decode_frame(frame: &[u8]) -> Option<Envelope> {
+pub fn decode_frame(frame: &[u8]) -> Option<Envelope> {
     // RED-PHASE STUB.
     let _ = frame;
     None
@@ -234,7 +237,7 @@ pub(crate) fn decode_frame(frame: &[u8]) -> Option<Envelope> {
 ///
 /// Owned by the receive loop; never shared, so a plain `&mut self` suffices.
 #[derive(Debug)]
-pub(crate) struct FrameVerifier {
+pub struct FrameVerifier {
     cluster: String,
     local_id: NodeId,
     secret: Vec<u8>,
@@ -247,11 +250,7 @@ pub(crate) struct FrameVerifier {
 
 impl FrameVerifier {
     /// A verifier for `cluster`, refusing frames whose sender is `local_id`.
-    pub(crate) fn new(
-        cluster: impl Into<String>,
-        local_id: impl Into<String>,
-        secret: Vec<u8>,
-    ) -> Self {
+    pub fn new(cluster: impl Into<String>, local_id: impl Into<String>, secret: Vec<u8>) -> Self {
         Self {
             cluster: cluster.into(),
             local_id: local_id.into(),
@@ -267,37 +266,34 @@ impl FrameVerifier {
     /// length cap, envelope parse, header checks, MAC, self-origin, replay
     /// watermark, payload parse. The payload is only parsed once the MAC has
     /// verified.
-    pub(crate) fn accept(
-        &mut self,
-        frame: &[u8],
-    ) -> Result<(Envelope, ClusterMessage), RejectReason> {
+    pub fn accept(&mut self, frame: &[u8]) -> Result<(Envelope, ClusterMessage), RejectReason> {
         // RED-PHASE STUB: refuses everything and counts nothing.
         let _ = frame;
         Err(RejectReason::Malformed)
     }
 
     /// The number of frames this verifier has refused, for any reason.
-    pub(crate) const fn rejected_total(&self) -> u64 {
+    pub const fn rejected_total(&self) -> u64 {
         self.rejected
     }
 
     /// The cluster name this verifier accepts.
-    pub(crate) fn cluster(&self) -> &str {
+    pub fn cluster(&self) -> &str {
         &self.cluster
     }
 
     /// The local node id whose frames are dropped as self-origin.
-    pub(crate) fn local_id(&self) -> &str {
+    pub fn local_id(&self) -> &str {
         &self.local_id
     }
 
     /// The secret this verifier checks MACs against.
-    pub(crate) fn secret(&self) -> &[u8] {
+    pub fn secret(&self) -> &[u8] {
         &self.secret
     }
 
     /// The `(incarnation, seq)` watermark recorded for `sender`.
-    pub(crate) fn watermark(&self, sender: &str) -> Option<(Incarnation, u64)> {
+    pub fn watermark(&self, sender: &str) -> Option<(Incarnation, u64)> {
         self.watermarks.get(sender).copied()
     }
 }
@@ -413,7 +409,11 @@ mod tests {
             Some(RejectReason::Mac),
             "a frame signed with another secret must not verify"
         );
-        assert_eq!(verifier.rejected_total(), 1, "the rejection must be counted");
+        assert_eq!(
+            verifier.rejected_total(),
+            1,
+            "the rejection must be counted"
+        );
     }
 
     #[test]
@@ -434,7 +434,11 @@ mod tests {
             Some(RejectReason::Cluster),
             "a frame naming a different cluster must be refused even under the same secret"
         );
-        assert_eq!(verifier.rejected_total(), 1, "the rejection must be counted");
+        assert_eq!(
+            verifier.rejected_total(),
+            1,
+            "the rejection must be counted"
+        );
     }
 
     #[test]
@@ -495,7 +499,11 @@ mod tests {
             Some(RejectReason::SelfOrigin),
             "a frame whose authenticated sender is this node must be dropped"
         );
-        assert_eq!(verifier.rejected_total(), 1, "the rejection must be counted");
+        assert_eq!(
+            verifier.rejected_total(),
+            1,
+            "the rejection must be counted"
+        );
     }
 
     #[test]

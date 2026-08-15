@@ -44,6 +44,9 @@
         clippy::arithmetic_side_effects,
     )
 )]
+// `pub` throughout this file is crate-visible only: the enclosing `cluster`
+// submodule is itself `pub(crate)`, so nothing here escapes the crate
+// (clippy::redundant_pub_crate).
 
 use std::net::SocketAddr;
 use std::sync::{Mutex, PoisonError};
@@ -54,17 +57,17 @@ use crate::AutumnResult;
 
 /// A peer's dial address, as a string so the transport can stay address-family
 /// agnostic and a loopback router can key on it directly.
-pub(crate) type PeerAddr = String;
+pub type PeerAddr = String;
 
 /// The receive side handed to a node's receive loop.
-pub(crate) type IncomingFrames = mpsc::Receiver<(PeerAddr, Vec<u8>)>;
+pub type IncomingFrames = mpsc::Receiver<(PeerAddr, Vec<u8>)>;
 
 /// Per-peer send-queue depth. Full means drop: the next state push carries the
 /// same (merged) document anyway.
-pub(crate) const PEER_QUEUE_CAPACITY: usize = 64;
+pub const PEER_QUEUE_CAPACITY: usize = 64;
 
 /// How a node talks to its peers.
-pub(crate) trait PeerTransport: Send + Sync + 'static {
+pub trait PeerTransport: Send + Sync + 'static {
     /// Queue `frame` for `to`. Never blocks and never fails loudly — a full
     /// queue drops, because anti-entropy re-sends the whole document anyway.
     fn send(&self, to: &str, frame: Vec<u8>);
@@ -77,7 +80,7 @@ pub(crate) trait PeerTransport: Send + Sync + 'static {
 }
 
 /// The production transport: a single TCP listener plus per-peer writers.
-pub(crate) struct TcpPeerTransport {
+pub struct TcpPeerTransport {
     local_addr: SocketAddr,
     /// The bound listener, taken by the accept loop when it starts.
     listener: Mutex<Option<std::net::TcpListener>>,
@@ -104,7 +107,7 @@ impl TcpPeerTransport {
     ///
     /// Returns a boot error when the address cannot be bound — a node that
     /// cannot be reached must not pretend to have joined.
-    pub(crate) fn bind(addr: &str) -> AutumnResult<Self> {
+    pub fn bind(addr: &str) -> AutumnResult<Self> {
         let listener =
             std::net::TcpListener::bind(addr).map_err(|err| super::bind_error(addr, &err))?;
         let local_addr = listener
@@ -124,7 +127,7 @@ impl TcpPeerTransport {
     }
 
     /// Take the bound listener, for the accept loop.
-    pub(crate) fn take_listener(&self) -> Option<std::net::TcpListener> {
+    pub fn take_listener(&self) -> Option<std::net::TcpListener> {
         self.listener
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -132,7 +135,7 @@ impl TcpPeerTransport {
     }
 
     /// A sender the accept loop can clone into each per-connection reader.
-    pub(crate) fn inbound_sender(&self) -> mpsc::Sender<(PeerAddr, Vec<u8>)> {
+    pub fn inbound_sender(&self) -> mpsc::Sender<(PeerAddr, Vec<u8>)> {
         self.inbound_tx.clone()
     }
 }
@@ -159,11 +162,11 @@ impl PeerTransport for TcpPeerTransport {
 // ── In-process loopback transport (tests only) ───────────────────────────────
 
 #[cfg(test)]
-pub(crate) use loopback::{LoopbackRouter, LoopbackTransport};
+pub use loopback::{LoopbackRouter, LoopbackTransport};
 
 #[cfg(test)]
 mod loopback {
-    use super::{IncomingFrames, PeerAddr, PeerTransport, PEER_QUEUE_CAPACITY};
+    use super::{IncomingFrames, PEER_QUEUE_CAPACITY, PeerAddr, PeerTransport};
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex, PoisonError};
@@ -182,12 +185,12 @@ mod loopback {
 
     /// An in-process message router: whole nodes, no sockets, no wall clock.
     #[derive(Clone, Default)]
-    pub(crate) struct LoopbackRouter {
+    pub struct LoopbackRouter {
         inner: Arc<Mutex<RouterInner>>,
     }
 
     impl LoopbackRouter {
-        pub(crate) fn new() -> Self {
+        pub fn new() -> Self {
             Self::default()
         }
 
@@ -196,7 +199,7 @@ mod loopback {
         }
 
         /// Register a new endpoint and hand back its transport.
-        pub(crate) fn endpoint(&self) -> Arc<LoopbackTransport> {
+        pub fn endpoint(&self) -> Arc<LoopbackTransport> {
             let (tx, rx) = mpsc::channel(PEER_QUEUE_CAPACITY);
             let addr = {
                 let mut guard = self.lock();
@@ -218,19 +221,19 @@ mod loopback {
         /// Returns `false` when the destination is unknown or its queue is
         /// full — both are "the packet was lost", which the protocol must
         /// tolerate. Also the injection point for replay tests.
-        pub(crate) fn deliver(&self, from: &str, to: &str, frame: Vec<u8>) -> bool {
+        pub fn deliver(&self, from: &str, to: &str, frame: Vec<u8>) -> bool {
             let sender = self.lock().peers.get(to).cloned();
             sender.is_some_and(|tx| tx.try_send((from.to_owned(), frame)).is_ok())
         }
 
         /// Remove an endpoint: a hard kill with no clean departure.
-        pub(crate) fn disconnect(&self, addr: &str) {
+        pub fn disconnect(&self, addr: &str) {
             self.lock().peers.remove(addr);
         }
     }
 
     /// One endpoint on a [`LoopbackRouter`].
-    pub(crate) struct LoopbackTransport {
+    pub struct LoopbackTransport {
         router: LoopbackRouter,
         addr: SocketAddr,
         incoming: Mutex<Option<IncomingFrames>>,

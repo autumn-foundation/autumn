@@ -51,6 +51,9 @@
         clippy::arithmetic_side_effects,
     )
 )]
+// `pub` throughout this file is crate-visible only: the enclosing `cluster`
+// submodule is itself `pub(crate)`, so nothing here escapes the crate
+// (clippy::redundant_pub_crate).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -64,16 +67,16 @@ use super::{ClusterInner, Incarnation};
 ///
 /// Config validation forbids `#` in `node_id` and `cluster_name`, which is what
 /// keeps this encoding unambiguous.
-pub(crate) const CELL_SEPARATOR: char = '#';
+pub const CELL_SEPARATOR: char = '#';
 
 /// The wire key for one node's one boot: `"{node_id}#{incarnation}"`.
-pub(crate) fn cell_key(node_id: &str, incarnation: Incarnation) -> String {
+pub fn cell_key(node_id: &str, incarnation: Incarnation) -> String {
     format!("{node_id}{CELL_SEPARATOR}{incarnation}")
 }
 
 /// Per-`(node, boot)` cells of one named grow-only counter.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CounterShards {
+pub struct CounterShards {
     /// `"node#incarnation" -> that boot's tally`. `BTreeMap` so the serialized
     /// form is byte-stable for a given document (deterministic tests, stable
     /// MACs).
@@ -86,30 +89,30 @@ impl CounterShards {
     ///
     /// Only ever called with the *local* node's current cell key: a node that
     /// writes another cell breaks the semilattice.
-    pub(crate) fn increment_cell(&mut self, cell: &str, by: u64) {
+    pub fn increment_cell(&mut self, cell: &str, by: u64) {
         // RED-PHASE STUB: must saturate into `self.cells[cell]`.
         let _ = (cell, by);
     }
 
     /// Merge `other` into `self` by taking the per-cell maximum.
-    pub(crate) fn merge(&mut self, other: &Self) {
+    pub fn merge(&mut self, other: &Self) {
         // RED-PHASE STUB: must be commutative, associative and idempotent.
         let _ = other;
     }
 
     /// This counter's value: the saturating sum of every cell.
-    pub(crate) fn value(&self) -> u64 {
+    pub fn value(&self) -> u64 {
         // RED-PHASE STUB.
         0
     }
 
     /// The tally recorded for one specific cell.
-    pub(crate) fn cell_value(&self, cell: &str) -> u64 {
+    pub fn cell_value(&self, cell: &str) -> u64 {
         self.cells.get(cell).copied().unwrap_or(0)
     }
 
     /// How many distinct cells this counter holds (one per node per boot).
-    pub(crate) fn cell_count(&self) -> usize {
+    pub fn cell_count(&self) -> usize {
         self.cells.len()
     }
 }
@@ -136,6 +139,10 @@ impl std::fmt::Debug for ClusterCounter {
 }
 
 impl ClusterCounter {
+    /// `pub(crate)` rather than `pub` (the exception to this file's `pub`
+    /// convention): `ClusterCounter` IS publicly re-exported, so a `pub`
+    /// constructor taking the crate-private `ClusterInner` would leak a
+    /// private type into the public API.
     pub(crate) const fn new(inner: Arc<ClusterInner>, name: String) -> Self {
         Self { inner, name }
     }

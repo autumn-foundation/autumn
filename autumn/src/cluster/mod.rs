@@ -4,7 +4,7 @@
 //! address, discover each other over an authenticated TCP gossip transport and
 //! converge on a **single replicated document** — a join-semilattice carrying
 //! both the member table and the cluster-wide counters. There is no Redis, no
-//! Postgres, no etcd and no ZooKeeper in the picture: the control plane is the
+//! Postgres, no etcd and no `ZooKeeper` in the picture: the control plane is the
 //! binary.
 //!
 //! # What ships in this slice
@@ -17,7 +17,7 @@
 //!   **eventually consistent** by construction.
 //! - **Exactly one distributed primitive.** A cluster-wide grow-only counter
 //!   ([`ClusterCounter`]), convergent (CRDT) because each node writes only its
-//!   own shard and merge is per-shard max.
+//!   own `(node, boot)` cell and merge is per-cell max.
 //!
 //! The transport is **authenticated (HMAC-SHA256) but not encrypted**, and the
 //! counter's lifetime is the cluster's process lifetime — see
@@ -101,9 +101,10 @@ pub(crate) type Incarnation = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ClusterMemberStatus {
-    /// A state push from this member arrived within the suspicion timeout.
+    /// A frame from this member arrived within the last two push intervals.
     Alive,
-    /// No push within the suspicion timeout; not yet evicted from the view.
+    /// Silence past two push intervals — a warning, not an eviction: the member
+    /// stays in the view until the suspicion timeout elapses.
     Suspect,
 }
 
