@@ -37,8 +37,8 @@ pub use crate::counter_cache::{
     counter_cache_after_update_many, counter_cache_after_upsert_many, counter_cache_apply_delta,
     counter_cache_apply_delta_by_child_id, counter_cache_before_delete_by_id,
     counter_cache_before_delete_many, counter_cache_before_detach_many,
-    counter_cache_before_restore_by_id,
-    counter_cache_capture_fks, counter_cache_capture_fks_many, counter_cache_recompute,
+    counter_cache_before_restore_by_id, counter_cache_capture_fks, counter_cache_capture_fks_many,
+    counter_cache_recompute,
 };
 
 /// Backend-portable `FOR UPDATE` seam for generated `#[repository]` CRUD.

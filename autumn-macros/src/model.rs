@@ -1168,6 +1168,10 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
 /// dependent-cascade specs. `fk_of` is emitted as a plain `fn` item per leg,
 /// which doubles as the type guard: a foreign-key field that is not `i64` /
 /// `Option<i64>` fails to coerce to `fn(&Model) -> Option<i64>`.
+// One resolution + validation arm per spec field (column, tenant column, the
+// foreign key's existence and nullability, the primary key's arity), so it grows
+// past the line lint as counter-cache options are added.
+#[allow(clippy::too_many_lines)]
 fn emit_counter_caches_impl(
     model_ident: &syn::Ident,
     table_name: &str,
@@ -1261,10 +1265,10 @@ fn emit_counter_caches_impl(
         // would break every tenant-scoped child hanging off a global parent with
         // a hard `column does not exist`, and this macro cannot see the parent's
         // fields to check.
-        let tenant_column = match decl.tenant_column.as_deref() {
-            Some(tenant) => quote! { ::core::option::Option::Some(#tenant) },
-            None => quote! { ::core::option::Option::None },
-        };
+        let tenant_column = decl.tenant_column.as_deref().map_or_else(
+            || quote! { ::core::option::Option::None },
+            |tenant| quote! { ::core::option::Option::Some(#tenant) },
+        );
         let parent_table = infer_table_name(&assoc.target);
         let fk = &assoc.fk;
         let fk_ident = format_ident!("{fk}");
