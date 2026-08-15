@@ -158,6 +158,9 @@ max_capsules = 50                 # default: 50
 - **`max_body_bytes`** caps how much request body is copied. A body that
   *declares* more than this is never copied at all (the handler still receives
   it in full); one that grows past it mid-stream has its partial copy dropped.
+  A capsule whose body went uncopied is **refused** by replay rather than
+  replayed with an empty one: the handler would be judged on input the failing
+  request never had, and the resulting `mismatch` reads as "the bug is gone".
 - **`max_capsule_bytes`** caps recorded database traffic. Blowing it marks the
   capsule `truncated`, and a truncated capsule is **refused** by replay rather
   than replayed misleadingly.
@@ -302,6 +305,14 @@ normal boot in exactly the ways that keep a replay offline and deterministic:
 - sessions are forced to in-memory storage, and no migrations, storage
   preflight, cache backend, job runtime, scheduler, mailer or fail-fast
   configuration gate runs;
+- **every config-driven store the request path can reach is forced local** —
+  rate limiting, idempotency keys, submit tokens, webhook replay protection,
+  the response cache and the job queue. A replayed request *writes* to these
+  (it decrements a bucket, takes a key and its in-flight lock, consumes a
+  token, inserts a replay key), so pointing them at the recording deployment's
+  Redis would make diagnosing a failure change production state — and an
+  unreachable backend would manufacture a `429` or `503` the recorded run never
+  produced;
 - only **sync** event listeners are registered (a durable one needs the job
   runtime);
 - outbound HTTP and channel delivery are refused, so replaying a capsule cannot
@@ -339,7 +350,7 @@ A verdict is machine-readable JSON on **stdout** and a human summary on
 | `reproduced` | Same outcome — status code, message and Problem Details type — and the database traffic matched the tape. The bug is still there. | `0` |
 | `mismatch` | The tape lined up but the outcome differs, in the code, the message or the problem type. Usually what you want after a fix. | `1` |
 | `diverged` | The code asked the database something the recording never asked, so the run was not a fair comparison. A divergence outranks a matching status. | `1` |
-| `refused` | Nothing was replayed — a truncated capsule, an unknown `format_version`, an unreadable file, or a `PostgreSQL` tape handed to a `sqlite` build. | `2` |
+| `refused` | Nothing was replayed — a truncated capsule, a capsule whose request body was never recorded (over `max_body_bytes`, or an unparseable structured body), an unknown `format_version`, an unreadable file, or a `PostgreSQL` tape handed to a `sqlite` build. | `2` |
 
 A `diverged` verdict is not a failure of the tool. It is the tool telling you
 that a status matching by luck, while the queries differ, is not a

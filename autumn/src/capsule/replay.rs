@@ -826,6 +826,24 @@ pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
                 .to_owned(),
         );
     }
+    if let CapsuleBody::Skipped { declared_len } = &capsule.request.body {
+        // Replaying with an empty body would drive the handler with input the
+        // failing request never had. The handler then rejects it, the verdict
+        // reads `mismatch` — which the guide tells operators means "the bug is
+        // gone" — and a live bug is quietly marked fixed. Missing input is a
+        // refusal, not a verdict.
+        let size = declared_len.map_or_else(
+            || "its size was never declared".to_owned(),
+            |len| format!("it declared {len} byte(s)"),
+        );
+        return Some(format!(
+            "the capsule's request body was not recorded ({size}) — it was over \
+             `[failure_capture] max_body_bytes`, or it declared a structure redaction could not \
+             parse and mask. Replaying would send an empty body, so a handler that reads the \
+             body would be judged on input the failing request never had. The capsule's notes \
+             say which case this was; raise `max_body_bytes` and re-record if it was the cap."
+        ));
+    }
     None
 }
 
@@ -1162,6 +1180,39 @@ mod tests {
         capsule.truncated = true;
         let reason = refusal_reason(&capsule).expect("truncated capsules are refused");
         assert!(reason.contains("truncated"));
+    }
+
+    /// A body the capture never recorded is missing *input*, not a difference
+    /// in behaviour. Replaying it empty and reporting `mismatch` would read as
+    /// "the bug is gone" when nothing of the kind was established.
+    #[test]
+    fn a_capsule_whose_body_was_never_recorded_is_refused() {
+        let mut capsule = fixture(status(500));
+        assert!(refusal_reason(&capsule).is_none());
+
+        capsule.request.body = CapsuleBody::Skipped {
+            declared_len: Some(2_000_000),
+        };
+        let reason =
+            refusal_reason(&capsule).expect("a capsule with an unrecorded body is refused");
+        assert!(
+            reason.contains("2000000"),
+            "the refusal must say how big the body was: {reason}"
+        );
+        assert!(
+            reason.contains("max_body_bytes"),
+            "the refusal must point at the knob that caused it: {reason}"
+        );
+
+        // A skipped body with no declared length is refused just the same.
+        capsule.request.body = CapsuleBody::Skipped { declared_len: None };
+        assert!(refusal_reason(&capsule).is_some());
+
+        // A body that was recorded, or genuinely absent, still replays.
+        capsule.request.body = CapsuleBody::Text("{}".to_owned());
+        assert!(refusal_reason(&capsule).is_none());
+        capsule.request.body = CapsuleBody::Absent;
+        assert!(refusal_reason(&capsule).is_none());
     }
 
     #[test]

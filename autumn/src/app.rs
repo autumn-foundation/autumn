@@ -6038,7 +6038,7 @@ fn normalize_replay_capsule(value: &str) -> Option<String> {
 /// other setting stays the application's own, because status codes, CSRF,
 /// locale routing and error rendering all depend on them.
 #[cfg(feature = "reporting")]
-const fn force_offline_replay_config(config: &mut AutumnConfig) {
+fn force_offline_replay_config(config: &mut AutumnConfig) {
     // Capturing the replay would write a capsule of a capsule, and arming
     // capture would point the connection-checkout marker at the stub pool.
     config.failure_capture.enabled = false;
@@ -6050,6 +6050,29 @@ const fn force_offline_replay_config(config: &mut AutumnConfig) {
     // a publisher and a listener task against the application's live fan-out
     // the moment the state is built.
     config.channels.backend = crate::config::ChannelBackend::InProcess;
+    // Every other config-driven store the request path can reach. These are
+    // not merely *dialled* during a replay — they are **written**: a rate-limit
+    // bucket is decremented, an idempotency key and its in-flight lock are
+    // taken, a submit token is consumed, a webhook replay key is inserted and
+    // deleted. Doing that against the recording deployment's Redis would make
+    // diagnosing a failure change production state, and an unreachable backend
+    // would manufacture a verdict (a 429 or a 503) that the recorded run never
+    // produced. A replay is a read of the past; it writes nothing anywhere.
+    config.security.rate_limit.backend = crate::security::config::RateLimitBackend::Memory;
+    config.idempotency.backend = crate::config::IdempotencyBackend::Memory;
+    config.idempotency.allow_memory_in_production = true;
+    // Submit tokens inherit the idempotency backend when unset, so the
+    // in-memory store is pinned explicitly rather than left to that inheritance.
+    config.security.submit_token.backend = Some(crate::config::IdempotencyBackend::Memory);
+    config.security.webhooks.replay.backend = crate::webhook::WebhookReplayBackend::Memory;
+    config.security.webhooks.replay.allow_memory_in_production = true;
+    // A `#[cached]` handler would otherwise read — and populate — the
+    // application's shared cache.
+    config.cache.backend = crate::config::CacheBackend::Memory;
+    // A handler that enqueues a job would otherwise put it on the real queue,
+    // where a live worker would run it. The replay never starts a job runtime,
+    // so the enqueue lands in a process-local queue nothing drains.
+    "local".clone_into(&mut config.jobs.backend);
     // No wall-clock deadline. Everything a replay consumes comes from the
     // capsule — including the clock the handler reads — but the request-timeout
     // layer runs on real tokio timers, so the one thing still measured in real
@@ -11179,8 +11202,11 @@ mod tests {
         let forcer_start = source
             .find("fn force_offline_replay_config(")
             .expect("the offline-knob helper exists");
+        // Wide enough for the whole helper: it forces every config-driven
+        // store the request path can reach, so the window has to outgrow the
+        // list rather than the list being trimmed to the window.
         let forcer = source
-            .get(forcer_start..forcer_start.saturating_add(3_000))
+            .get(forcer_start..forcer_start.saturating_add(6_000))
             .unwrap_or_default();
         assert!(
             forcer.contains("config.channels.backend = crate::config::ChannelBackend::InProcess;"),
@@ -11202,6 +11228,14 @@ mod tests {
         config.session.backend = crate::session::SessionBackend::Redis;
         config.channels.backend = crate::config::ChannelBackend::Redis;
         config.server.timeouts.request_timeout_ms = Some(30_000);
+        // Every remaining config-driven store the request path can reach, set
+        // the way a production recording would have had them.
+        config.security.rate_limit.backend = crate::security::config::RateLimitBackend::Redis;
+        config.idempotency.backend = crate::config::IdempotencyBackend::Redis;
+        config.security.submit_token.backend = Some(crate::config::IdempotencyBackend::Redis);
+        config.security.webhooks.replay.backend = crate::webhook::WebhookReplayBackend::Redis;
+        config.cache.backend = crate::config::CacheBackend::Redis;
+        config.jobs.backend = "redis".to_owned();
 
         force_offline_replay_config(&mut config);
 
@@ -11223,6 +11257,41 @@ mod tests {
             config.server.timeouts.request_timeout_ms, None,
             "a deterministic offline replay has no wall-clock deadline — and a \
              breakpoint held in a debugger must not cancel the handler"
+        );
+        // The middleware stores. Each of these is *written* by a replayed
+        // request, so leaving any of them pointed at the recording
+        // deployment's Redis would make diagnosing a failure mutate live state.
+        assert_eq!(
+            config.security.rate_limit.backend,
+            crate::security::config::RateLimitBackend::Memory,
+            "a replay must not consume the deployment's shared rate-limit budget"
+        );
+        assert_eq!(
+            config.idempotency.backend,
+            crate::config::IdempotencyBackend::Memory,
+            "a replay must not take an idempotency key or its in-flight lock"
+        );
+        assert!(config.idempotency.allow_memory_in_production);
+        assert_eq!(
+            config.security.submit_token.backend,
+            Some(crate::config::IdempotencyBackend::Memory),
+            "submit tokens inherit the idempotency backend when unset, so a replay \
+             must pin them explicitly rather than rely on that inheritance"
+        );
+        assert_eq!(
+            config.security.webhooks.replay.backend,
+            crate::webhook::WebhookReplayBackend::Memory,
+            "a replay must not insert or delete webhook replay-protection keys"
+        );
+        assert!(config.security.webhooks.replay.allow_memory_in_production);
+        assert_eq!(
+            config.cache.backend,
+            crate::config::CacheBackend::Memory,
+            "a `#[cached]` handler must not read or populate the shared cache"
+        );
+        assert_eq!(
+            config.jobs.backend, "local",
+            "a job enqueued during a replay must not reach a queue a live worker drains"
         );
     }
 

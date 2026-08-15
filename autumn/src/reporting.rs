@@ -720,73 +720,138 @@ fn materialize_body(response: &mut Response) -> bool {
     }
 
     let mut body = std::mem::replace(response.body_mut(), Body::empty());
-    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut frames: std::collections::VecDeque<http_body::Frame<Bytes>> =
+        std::collections::VecDeque::new();
     let mut collected = 0usize;
+    // Trailers are frames too, and a body carrying them cannot be handed on as
+    // a plain buffer without losing them.
+    let mut data_only = true;
     let waker = std::task::Waker::noop();
     let mut cx = Context::from_waker(waker);
 
     for _ in 0..PROBE_FRAMES {
         match Pin::new(&mut body).poll_frame(&mut cx) {
-            // The body is done — either cleanly, or with an error that ends it
-            // for the client just the same. Whichever it is, it happened
-            // without waiting, so the frames already pulled are the whole of
-            // what the client will receive.
-            Poll::Ready(None | Some(Err(_))) => {
-                *response.body_mut() = Body::from(concat_chunks(chunks));
+            // Ended without ever waiting: everything it had is in `frames`.
+            Poll::Ready(None) => {
+                *response.body_mut() = rebuild_probed_body(frames, None, None, data_only);
                 return true;
             }
-            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                Ok(data) => {
+            // An error ends the body, but it is part of what the client must
+            // observe — collapsing it into a clean EOF would report a
+            // successful response the handler never produced. Keep it, and do
+            // not call the capsule complete: the body did not finish.
+            Poll::Ready(Some(Err(error))) => {
+                *response.body_mut() = rebuild_probed_body(frames, Some(error), None, data_only);
+                return false;
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
                     collected = collected.saturating_add(data.len());
-                    chunks.push(data);
-                    if collected > PROBE_BYTES {
-                        break;
-                    }
+                } else {
+                    data_only = false;
                 }
-                // Trailers: rebuilding would drop them, so stop here and let
-                // the body deliver the rest of itself.
-                Err(_) => break,
-            },
+                frames.push_back(frame);
+                if collected > PROBE_BYTES {
+                    break;
+                }
+            }
             Poll::Pending => break,
         }
     }
 
-    *response.body_mut() = prepend_chunks(chunks, body);
+    *response.body_mut() = rebuild_probed_body(frames, None, Some(body), data_only);
     false
 }
 
-/// Join probed frames into one buffer.
-fn concat_chunks(chunks: Vec<bytes::Bytes>) -> bytes::Bytes {
-    use bytes::Bytes;
+/// Rebuild a response body out of what the probe pulled and whatever is left.
+///
+/// The probe must be invisible to the client: every frame it took goes back,
+/// in order, ahead of the error that ended the body or the body itself.
+fn rebuild_probed_body(
+    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+    error: Option<axum::Error>,
+    rest: Option<axum::body::Body>,
+    data_only: bool,
+) -> axum::body::Body {
+    use axum::body::Body;
 
-    match <[Bytes; 1]>::try_from(chunks) {
-        // The overwhelmingly common shape: one frame, handed on without a copy.
-        Ok([single]) => single,
-        Err(chunks) => {
-            let total = chunks.iter().map(Bytes::len).sum();
-            let mut joined = Vec::with_capacity(total);
-            for chunk in chunks {
-                joined.extend_from_slice(&chunk);
-            }
-            Bytes::from(joined)
-        }
+    if frames.is_empty() && error.is_none() {
+        // Nothing was taken — a body that answered `Pending` on the first poll
+        // (every stream, in practice) goes back untouched.
+        return rest.unwrap_or_else(Body::empty);
     }
+    if data_only && error.is_none() && rest.is_none() {
+        // The whole body, and all of it data: hand it on as a plain sized body
+        // so the response keeps an exact length.
+        return Body::from(concat_frames(frames));
+    }
+    Body::new(ProbedBody {
+        frames,
+        error,
+        rest,
+    })
 }
 
-/// Put probed frames back in front of the body they came from.
-fn prepend_chunks(chunks: Vec<bytes::Bytes>, body: axum::body::Body) -> axum::body::Body {
-    use axum::body::Body;
-    use futures::StreamExt as _;
+/// Join the data frames the probe pulled into one buffer.
+fn concat_frames(
+    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+) -> bytes::Bytes {
+    use bytes::Bytes;
 
-    if chunks.is_empty() {
-        // Nothing was taken (a body that answered `Pending` on the first
-        // poll — every stream, in practice), so it goes back untouched.
-        return body;
+    let mut chunks = frames
+        .into_iter()
+        .filter_map(|frame| frame.into_data().ok());
+    let Some(first) = chunks.next() else {
+        return Bytes::new();
+    };
+    let Some(second) = chunks.next() else {
+        // The overwhelmingly common shape: one frame, handed on without a copy.
+        return first;
+    };
+    let mut joined = Vec::with_capacity(first.len().saturating_add(second.len()));
+    joined.extend_from_slice(&first);
+    joined.extend_from_slice(&second);
+    for chunk in chunks {
+        joined.extend_from_slice(&chunk);
     }
-    Body::from_stream(
-        futures::stream::iter(chunks.into_iter().map(Ok::<_, axum::Error>))
-            .chain(body.into_data_stream()),
-    )
+    Bytes::from(joined)
+}
+
+/// The body the probe hands back: the frames it pulled, then the error that
+/// ended the body or the remainder of the body itself.
+struct ProbedBody {
+    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+    error: Option<axum::Error>,
+    rest: Option<axum::body::Body>,
+}
+
+impl http_body::Body for ProbedBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(frame) = self.frames.pop_front() {
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        if let Some(error) = self.error.take() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        self.rest
+            .as_mut()
+            .map_or_else(|| Poll::Ready(None), |rest| Pin::new(rest).poll_frame(cx))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.frames.is_empty()
+            && self.error.is_none()
+            && self
+                .rest
+                .as_ref()
+                .is_none_or(http_body::Body::is_end_stream)
+    }
 }
 
 /// Convert a caught panic into a sanitized 500 response and report it.
@@ -957,6 +1022,107 @@ mod tests {
                 .to_bytes(),
             "late",
             "a probed body must still deliver everything it produces"
+        );
+    }
+
+    /// The probe must be invisible to the client. A trailer frame it pulls has
+    /// to go back into the response: enabling failure capture must not strip
+    /// integrity or diagnostic metadata off a 5xx.
+    #[tokio::test]
+    async fn a_probed_trailer_frame_is_put_back() {
+        use axum::body::Body;
+        use http_body_util::BodyExt as _;
+
+        struct DataThenTrailers(u8);
+        impl http_body::Body for DataThenTrailers {
+            type Data = bytes::Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                self.0 = self.0.saturating_add(1);
+                match self.0 {
+                    1 => Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+                        b"body",
+                    ))))),
+                    2 => {
+                        let mut trailers = axum::http::HeaderMap::new();
+                        trailers.insert("x-checksum", axum::http::HeaderValue::from_static("42"));
+                        Poll::Ready(Some(Ok(http_body::Frame::trailers(trailers))))
+                    }
+                    _ => Poll::Ready(None),
+                }
+            }
+
+            fn size_hint(&self) -> http_body::SizeHint {
+                http_body::SizeHint::with_exact(4)
+            }
+        }
+
+        let mut response = Response::new(Body::new(DataThenTrailers(0)));
+        assert!(
+            materialize_body(&mut response),
+            "the body finished without waiting, so the capsule is complete"
+        );
+        let collected = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect the rebuilt body");
+        let trailers = collected
+            .trailers()
+            .cloned()
+            .expect("the trailer frame must survive the probe");
+        assert_eq!(trailers.get("x-checksum").expect("checksum"), "42");
+        assert_eq!(collected.to_bytes(), "body");
+    }
+
+    /// A body that fails mid-stream must still fail for the client: turning the
+    /// error into a clean EOF would report a whole response the handler never
+    /// sent, and the capsule cannot claim to be complete either.
+    #[tokio::test]
+    async fn a_probed_body_error_is_preserved_and_marks_the_capsule_incomplete() {
+        use axum::body::Body;
+        use http_body_util::BodyExt as _;
+
+        struct DataThenError(bool);
+        impl http_body::Body for DataThenError {
+            type Data = bytes::Bytes;
+            type Error = std::io::Error;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                if self.0 {
+                    self.0 = false;
+                    return Poll::Ready(Some(Ok(http_body::Frame::data(
+                        bytes::Bytes::from_static(b"partial"),
+                    ))));
+                }
+                Poll::Ready(Some(Err(std::io::Error::other("upstream went away"))))
+            }
+
+            fn size_hint(&self) -> http_body::SizeHint {
+                http_body::SizeHint::with_exact(7)
+            }
+        }
+
+        let mut response = Response::new(Body::new(DataThenError(true)));
+        assert!(
+            !materialize_body(&mut response),
+            "a body that failed did not finish, so the capsule must not claim to be complete"
+        );
+        let error = response
+            .into_body()
+            .collect()
+            .await
+            .expect_err("the body error must reach the client, not be collapsed into EOF");
+        assert!(
+            error.to_string().contains("upstream went away"),
+            "the original error must survive the probe: {error}"
         );
     }
 
