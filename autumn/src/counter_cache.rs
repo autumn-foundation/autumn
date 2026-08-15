@@ -48,6 +48,13 @@
 //! validated at macro time to be a plain identifier. [`is_plain_identifier`]
 //! re-checks that at run time under `debug_assertions` so a hand-constructed
 //! spec cannot smuggle SQL through `format!`.
+//!
+//! On top of that, every interpolated identifier is [quoted](quote_ident) — the
+//! same convention the `dependent(restrict)` codegen already follows. That is
+//! what lets a counter column be named after a SQL keyword
+//! (`counter_cache = "order"`) without turning every generated statement into a
+//! syntax error, and it is safe precisely because the validation above rules out
+//! the `"` that would otherwise escape the quotes.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -229,6 +236,42 @@ fn debug_assert_spec_idents<M: 'static>(spec: &CounterCacheSpec<M>) {
     );
 }
 
+/// Wrap `ident` in the SQL identifier quotes both backends accept.
+///
+/// Quoting is what keeps a counter column named after a SQL keyword
+/// (`counter_cache = "order"`) from turning every generated statement into a
+/// syntax error, and it matches how the `dependent(restrict)` codegen already
+/// interpolates table and column names. Safe to apply unconditionally: the names
+/// are validated plain identifiers, so none of them contains the `"` that would
+/// otherwise let a hand-built spec escape the quotes.
+fn quote_ident(ident: &str) -> String {
+    format!("\"{ident}\"")
+}
+
+/// Every identifier a spec splices into SQL, quoted.
+///
+/// Field names match [`CounterCacheSpec`]'s so the statement builders below can
+/// destructure this in place of the spec and leave their SQL untouched.
+struct Quoted {
+    child_table: String,
+    child_pk: String,
+    fk_column: String,
+    parent_table: String,
+    parent_pk: String,
+    counter_column: String,
+}
+
+fn quoted<M: 'static>(spec: &CounterCacheSpec<M>) -> Quoted {
+    Quoted {
+        child_table: quote_ident(spec.child_table),
+        child_pk: quote_ident(spec.child_pk),
+        fk_column: quote_ident(spec.fk_column),
+        parent_table: quote_ident(spec.parent_table),
+        parent_pk: quote_ident(spec.parent_pk),
+        counter_column: quote_ident(spec.counter_column),
+    }
+}
+
 /// `AND <parent>.<tenant> = __autumn_cc_child.<tenant>`, for the statements that
 /// already have the child row joined in a sub-select. Empty when the association
 /// declares no `counter_cache_tenant`.
@@ -251,7 +294,8 @@ fn tenant_predicate_joined<M: 'static>(spec: &CounterCacheSpec<M>) -> String {
     let Some(tenant_column) = spec.tenant_column else {
         return String::new();
     };
-    let parent_table = spec.parent_table;
+    let tenant_column = quote_ident(tenant_column);
+    let parent_table = quote_ident(spec.parent_table);
     format!(" AND {parent_table}.{tenant_column} = {CHILD_ALIAS}.{tenant_column}")
 }
 
@@ -259,12 +303,13 @@ fn tenant_predicate<M: 'static>(spec: &CounterCacheSpec<M>, child_id: i64) -> St
     let Some(tenant_column) = spec.tenant_column else {
         return String::new();
     };
-    let CounterCacheSpec {
+    let tenant_column = quote_ident(tenant_column);
+    let Quoted {
         child_table,
         child_pk,
         parent_table,
         ..
-    } = spec;
+    } = quoted(spec);
     format!(
         " AND {parent_table}.{tenant_column} IN \
          (SELECT {CHILD_ALIAS}_t.{tenant_column} FROM {child_table} AS {CHILD_ALIAS}_t \
@@ -279,7 +324,8 @@ fn live_predicate<M: 'static>(spec: &CounterCacheSpec<M>, want_live: bool) -> St
         return String::new();
     }
     let op = if want_live { "IS NULL" } else { "IS NOT NULL" };
-    format!(" AND {CHILD_ALIAS}.{DELETED_AT} {op}")
+    let deleted_at = quote_ident(DELETED_AT);
+    format!(" AND {CHILD_ALIAS}.{deleted_at} {op}")
 }
 
 /// Apply `delta` to one parent's counter with a single atomic statement.
@@ -299,12 +345,12 @@ pub async fn counter_cache_apply_delta<M: 'static>(
     scope: TenantScope,
 ) -> AutumnResult<()> {
     debug_assert_spec_idents(spec);
-    let CounterCacheSpec {
+    let Quoted {
         parent_table,
         parent_pk,
         counter_column,
         ..
-    } = spec;
+    } = quoted(spec);
     let tenant = match scope {
         TenantScope::SameTenantAsChild(child_id) => tenant_predicate(spec, child_id),
         TenantScope::Unscoped => String::new(),
@@ -343,7 +389,7 @@ pub async fn counter_cache_apply_delta_by_child_id<M: 'static>(
     child_state: ChildState,
 ) -> AutumnResult<()> {
     debug_assert_spec_idents(spec);
-    let CounterCacheSpec {
+    let Quoted {
         child_table,
         child_pk,
         fk_column,
@@ -351,7 +397,7 @@ pub async fn counter_cache_apply_delta_by_child_id<M: 'static>(
         parent_pk,
         counter_column,
         ..
-    } = spec;
+    } = quoted(spec);
     let state_predicate = match child_state {
         ChildState::Any => String::new(),
         ChildState::Live => live_predicate(spec, true),
@@ -405,6 +451,11 @@ pub enum ChildState {
 
 /// Increment every counter-cached parent of a freshly inserted child record.
 ///
+/// A record that arrives already soft-deleted moves nothing: the counter is
+/// defined as live rows only, and every other path agrees on that, so counting a
+/// born-deleted row would inflate the counter until the next repair. An ordinary
+/// insert is live, so this changes nothing for it.
+///
 /// # Errors
 ///
 /// Propagates any database error from the `UPDATE`s.
@@ -415,6 +466,9 @@ pub async fn counter_cache_after_insert<M: Send + Sync + 'static>(
     record: &M,
 ) -> AutumnResult<()> {
     for spec in specs {
+        if !(spec.live_of)(record) {
+            continue;
+        }
         if let Some(parent_id) = (spec.fk_of)(record) {
             counter_cache_apply_delta(
                 conn,
@@ -448,6 +502,9 @@ pub async fn counter_cache_after_insert_many<M: Send + Sync + 'static>(
     for spec in specs {
         let mut contributions: Vec<(i64, i64, i64)> = Vec::new();
         for record in records {
+            if !(spec.live_of)(record) {
+                continue;
+            }
             if let Some(parent_id) = (spec.fk_of)(record) {
                 contributions.push((parent_id, 1, (spec.pk_of)(record)));
             }
@@ -561,6 +618,12 @@ async fn apply_folded<M: 'static>(
 /// counter_cache_after_insert_by_id(conn, Comment::counter_caches(), id).await?;
 /// ```
 ///
+/// For a soft-deleting child the increment is conditional on the row being live,
+/// mirroring the delete side. Raw SQL can insert a row with `deleted_at` already
+/// set, and every other path — delete, update, recompute — defines the counter as
+/// live rows only, so incrementing for a born-deleted row would inflate the
+/// counter until the next repair.
+///
 /// # Errors
 ///
 /// Propagates any database error from the `UPDATE`s.
@@ -570,7 +633,12 @@ pub async fn counter_cache_after_insert_by_id<M: 'static>(
     child_id: i64,
 ) -> AutumnResult<()> {
     for spec in specs {
-        counter_cache_apply_delta_by_child_id(conn, spec, child_id, 1, ChildState::Any).await?;
+        let state = if spec.child_soft_delete {
+            ChildState::Live
+        } else {
+            ChildState::Any
+        };
+        counter_cache_apply_delta_by_child_id(conn, spec, child_id, 1, state).await?;
     }
     Ok(())
 }
@@ -606,11 +674,11 @@ pub async fn counter_cache_before_delete_by_id<M: 'static>(
 /// The returned rows are discarded — the statement exists for its locks (see
 /// [`counter_cache_before_delete_many`]'s lock-order note).
 fn child_lock_sql<M: 'static>(spec: &CounterCacheSpec<M>, id_list: &str) -> String {
-    let CounterCacheSpec {
+    let Quoted {
         child_table,
         child_pk,
         ..
-    } = spec;
+    } = quoted(spec);
     format!(
         "SELECT {child_pk} AS id FROM {child_table} \
          WHERE {child_pk} IN ({id_list}) ORDER BY {child_pk}{FOR_UPDATE}"
@@ -662,7 +730,7 @@ pub async fn counter_cache_before_delete_many<M: 'static>(
 
     for spec in specs {
         debug_assert_spec_idents(spec);
-        let CounterCacheSpec {
+        let Quoted {
             child_table,
             child_pk,
             fk_column,
@@ -670,7 +738,7 @@ pub async fn counter_cache_before_delete_many<M: 'static>(
             parent_pk,
             counter_column,
             ..
-        } = spec;
+        } = quoted(spec);
         let live = if spec.child_soft_delete {
             live_predicate(spec, true)
         } else {
@@ -791,12 +859,12 @@ pub async fn counter_cache_capture_fks<M: 'static>(
     let mut out = Vec::with_capacity(specs.len());
     for spec in specs {
         debug_assert_spec_idents(spec);
-        let CounterCacheSpec {
+        let Quoted {
             child_table,
             child_pk,
             fk_column,
             ..
-        } = spec;
+        } = quoted(spec);
         // A soft-deleted child is counted by nobody, so it has no "old parent"
         // to move away from — reporting one would make a later re-parent
         // decrement a counter that had already dropped this row.
@@ -883,12 +951,12 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
     let mut by_child: HashMap<i64, Vec<Option<i64>>> = HashMap::new();
     for (index, spec) in specs.iter().enumerate() {
         debug_assert_spec_idents(spec);
-        let CounterCacheSpec {
+        let Quoted {
             child_table,
             child_pk,
             fk_column,
             ..
-        } = spec;
+        } = quoted(spec);
         let live = live_predicate(spec, true);
         let sql = format!(
             "SELECT {CHILD_ALIAS}.{child_pk} AS child_id, \
@@ -1061,14 +1129,14 @@ const RECOMPUTE_BATCH: i64 = 1_000;
 
 /// The `UPDATE` that rebuilds `ids`' counters from the source of truth.
 fn recompute_update_sql<M: 'static>(spec: &CounterCacheSpec<M>, ids: &str) -> String {
-    let CounterCacheSpec {
+    let Quoted {
         child_table,
         fk_column,
         parent_table,
         parent_pk,
         counter_column,
         ..
-    } = spec;
+    } = quoted(spec);
     let live = live_predicate(spec, true);
     // The ground truth has to agree with what the deltas maintain: an ordinary
     // delta skips a cross-tenant child, so a recompute that counted it would
@@ -1123,8 +1191,8 @@ async fn recompute_batch<M: 'static>(
         return Ok(0);
     }
     let id_list = id_list(ids);
-    let parent_table = spec.parent_table;
-    let parent_pk = spec.parent_pk;
+    let parent_table = quote_ident(spec.parent_table);
+    let parent_pk = quote_ident(spec.parent_pk);
     let lock_sql = format!(
         "SELECT {parent_pk} AS id FROM {parent_table} \
          WHERE {parent_pk} IN ({id_list}) ORDER BY {parent_pk}{FOR_UPDATE}"
@@ -1182,8 +1250,8 @@ pub async fn counter_cache_recompute<M: 'static>(
         // is held while enumerating. A parent inserted after its page was read
         // is simply not in this sweep, which is harmless: it starts at the
         // column default and its children are counted by the delta paths.
-        let parent_table = spec.parent_table;
-        let parent_pk = spec.parent_pk;
+        let parent_table = quote_ident(spec.parent_table);
+        let parent_pk = quote_ident(spec.parent_pk);
         let mut cursor: Option<i64> = None;
         loop {
             let mut page_sql = format!("SELECT {parent_pk} AS id FROM {parent_table}");
@@ -1287,11 +1355,11 @@ mod tests {
         assert_eq!(live_predicate(&spec(false), true), "");
         assert_eq!(
             live_predicate(&spec(true), true),
-            format!(" AND {CHILD_ALIAS}.deleted_at IS NULL")
+            format!(" AND {CHILD_ALIAS}.\"deleted_at\" IS NULL")
         );
         assert_eq!(
             live_predicate(&spec(true), false),
-            format!(" AND {CHILD_ALIAS}.deleted_at IS NOT NULL")
+            format!(" AND {CHILD_ALIAS}.\"deleted_at\" IS NOT NULL")
         );
     }
 
@@ -1302,10 +1370,13 @@ mod tests {
         // bulk delete deadlock against an `update` that re-parents one of the
         // same children.
         let sql = child_lock_sql(&spec(false), "3,1,2");
-        assert!(sql.starts_with("SELECT id AS id FROM comments"), "{sql}");
-        assert!(sql.contains("WHERE id IN (3,1,2)"), "{sql}");
         assert!(
-            sql.contains(&format!("ORDER BY id{FOR_UPDATE}")),
+            sql.starts_with("SELECT \"id\" AS id FROM \"comments\""),
+            "{sql}"
+        );
+        assert!(sql.contains("WHERE \"id\" IN (3,1,2)"), "{sql}");
+        assert!(
+            sql.contains(&format!("ORDER BY \"id\"{FOR_UPDATE}")),
             "the lock must be taken in a deterministic order: {sql}"
         );
     }
@@ -1316,10 +1387,31 @@ mod tests {
         // `SELECT` that precedes it meaningful: a sweep-wide `UPDATE` would
         // touch parents this transaction never locked.
         let sql = recompute_update_sql(&spec(false), "1,2,3");
-        assert!(sql.contains("posts.id IN (1,2,3)"), "{sql}");
+        assert!(sql.contains("\"posts\".\"id\" IN (1,2,3)"), "{sql}");
         assert!(
-            sql.contains(&format!("posts.comment_count {IS_DISTINCT_FROM}")),
+            sql.contains(&format!("\"posts\".\"comment_count\" {IS_DISTINCT_FROM}")),
             "a healthy parent must still be left unwritten: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_counter_column_named_after_a_sql_keyword_still_produces_valid_sql() {
+        // `counter_cache = "order"` is a legal identifier and a legal column
+        // name, but `SET order = order + $1` is a syntax error on both backends.
+        // Quoting every interpolated identifier is what keeps the choice of
+        // column name from being able to break the generated statements.
+        let mut keyword = spec(false);
+        keyword.counter_column = "order";
+        keyword.parent_table = "group";
+        let sql = recompute_update_sql(&keyword, "1");
+        assert!(
+            sql.starts_with("UPDATE \"group\" SET \"order\" = "),
+            "{sql}"
+        );
+        assert!(sql.contains("\"group\".\"order\" "), "{sql}");
+        assert!(
+            !sql.contains(" order "),
+            "no bare keyword may survive: {sql}"
         );
     }
 
