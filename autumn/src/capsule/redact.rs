@@ -489,7 +489,7 @@ fn record_auth_params(credential: &str, values: &mut RedactedValues) {
         if !is_auth_scheme(name.trim()) {
             continue;
         }
-        let value = value.trim().trim_matches('"');
+        let value = unquote_auth_param(value.trim());
         if !value.is_empty() {
             values.insert_whole_token_only(value.as_bytes());
         }
@@ -510,18 +510,18 @@ fn is_token68(credential: &str) -> bool {
         })
 }
 
-/// Split an auth-param list on the commas that actually delimit it, and
-/// resolve quoted-pairs while doing so.
+/// Split an auth-param list on the commas that actually delimit it.
 ///
-/// A `quoted-string` may contain both — `Digest response="abc,def"` is one
-/// param, and `response="abc\"def"` holds a literal quote. Splitting on every
-/// comma cuts that value in half and retains a fragment the handler never
-/// holds, which is the same as retaining nothing. Unescaping matters for the
-/// same reason: the handler works with `abc"def`, not with the backslash.
+/// A `quoted-string` may contain the delimiter — `Digest response="abc,def"`
+/// is one param — so splitting on every comma cuts the value in half and
+/// retains a fragment the handler never holds, which is the same as retaining
+/// nothing.
 ///
-/// Returns owned strings because the unescaped value is not a slice of the
-/// input, and because the panic gate denies the index arithmetic a
-/// borrowing split would need.
+/// Escapes are *tracked* but not resolved: a `\"` must not be mistaken for the
+/// end of the quoted string, yet the backslashes have to survive into
+/// [`unquote_auth_param`], which is the only place that can tell a syntactic
+/// boundary quote from a literal one. Returns owned strings because the panic
+/// gate denies the index arithmetic a borrowing split would need.
 fn split_auth_params(credential: &str) -> Vec<String> {
     let mut params = Vec::new();
     let mut current = String::new();
@@ -532,6 +532,7 @@ fn split_auth_params(credential: &str) -> Vec<String> {
             current.push(character);
             escaped = false;
         } else if character == '\\' && quoted {
+            current.push(character);
             escaped = true;
         } else if character == '"' {
             quoted = !quoted;
@@ -544,6 +545,39 @@ fn split_auth_params(credential: &str) -> Vec<String> {
     }
     params.push(current);
     params
+}
+
+/// Strip an auth-param value's *syntactic* quotes and resolve its
+/// quoted-pairs, in that order.
+///
+/// Order is the whole point. Unescaping first and trimming quotes afterwards
+/// turns `response="\"hunter2\""` — whose value is literally `"hunter2"` — into
+/// `hunter2`, because the trim cannot tell the delimiters it should remove
+/// from the literal quotes it must keep. Walking from the opening delimiter
+/// and stopping at the first *unescaped* quote answers that question exactly,
+/// and a bind byte-equal to what the handler extracted then matches.
+///
+/// An unquoted value (`qop=auth`) is a token and is returned as it stands.
+fn unquote_auth_param(value: &str) -> String {
+    let mut characters = value.chars();
+    if characters.next() != Some('"') {
+        return value.to_owned();
+    }
+    let mut unquoted = String::new();
+    let mut escaped = false;
+    for character in characters {
+        if escaped {
+            unquoted.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            break;
+        } else {
+            unquoted.push(character);
+        }
+    }
+    unquoted
 }
 
 /// Retain what a `Basic` credential *decodes to*, not only its Base64 text.
@@ -1431,6 +1465,19 @@ mod tests {
         assert!(
             values.contains(b"auth"),
             "an unquoted param after a quoted one is still found"
+        );
+
+        // A value whose own first and last characters are escaped quotes. The
+        // handler extracts `"hunter2"`, quotes included, so that is what a
+        // bind will carry.
+        let (_request, bounded) = redact(
+            Request::get("/").header(header::AUTHORIZATION, r#"Digest response="\"hunter2\"""#),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            bounded.contains(br#""hunter2""#),
+            "literal quotes at the value's boundary are part of the value"
         );
     }
 
