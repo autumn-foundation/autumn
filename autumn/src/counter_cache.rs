@@ -481,22 +481,16 @@ pub async fn counter_cache_after_insert<M: Send + Sync + 'static>(
     specs: &[CounterCacheSpec<M>],
     record: &M,
 ) -> AutumnResult<()> {
-    for spec in specs {
+    let mut contributions: Vec<Contribution> = Vec::with_capacity(specs.len());
+    for (index, spec) in specs.iter().enumerate() {
         if !(spec.live_of)(record) {
             continue;
         }
         if let Some(parent_id) = (spec.fk_of)(record) {
-            counter_cache_apply_delta(
-                conn,
-                spec,
-                parent_id,
-                1,
-                TenantScope::SameTenantAsChild((spec.pk_of)(record)),
-            )
-            .await?;
+            contributions.push((index, parent_id, 1, (spec.pk_of)(record)));
         }
     }
-    Ok(())
+    apply_ordered(conn, specs, contributions).await
 }
 
 /// [`counter_cache_after_insert`] over a batch of records (`save_many`).
@@ -515,105 +509,56 @@ pub async fn counter_cache_after_insert_many<M: Send + Sync + 'static>(
     specs: &[CounterCacheSpec<M>],
     records: &[M],
 ) -> AutumnResult<()> {
-    for spec in specs {
-        let mut contributions: Vec<(i64, i64, i64)> = Vec::new();
+    let mut contributions: Vec<Contribution> = Vec::new();
+    for (index, spec) in specs.iter().enumerate() {
         for record in records {
             if !(spec.live_of)(record) {
                 continue;
             }
             if let Some(parent_id) = (spec.fk_of)(record) {
-                contributions.push((parent_id, 1, (spec.pk_of)(record)));
+                contributions.push((index, parent_id, 1, (spec.pk_of)(record)));
             }
         }
-        fold_or_apply_each(conn, spec, contributions).await?;
     }
-    Ok(())
+    apply_ordered(conn, specs, contributions).await
 }
 
-/// Apply per-parent deltas, folding only when it is safe to do so.
+/// One parent row a mutation will move: `(spec index, parent id, delta,
+/// witness child id)`.
+type Contribution = (usize, i64, i64, i64);
+
+/// Apply every contribution in the lock order all counter-cached mutations
+/// agree on: `(parent_table, parent_id)`.
 ///
-/// Folding a batch into one `UPDATE` per parent is a pure optimization. It is
-/// only sound when the association has no tenant column: the tenant predicate is
-/// scoped to a single witness child, so a mixed-tenant batch folded behind one
-/// arbitrary witness would either sweep cross-tenant children into the increment
-/// or drop legitimate ones. With a tenant column each contribution is therefore
-/// applied under its own witness.
-async fn fold_or_apply_each<M: 'static>(
+/// Ordering by parent id alone is not enough once a mutation moves more than one
+/// leg. Two child models that declare their legs in opposite orders — one
+/// `belongs_to(User)` then `belongs_to(Post)`, the other the reverse — would
+/// take the same two row locks in opposite orders and deadlock, and generated
+/// repository transactions are single-attempt, so one request fails outright.
+/// Keying on the parent *table* as well makes the order a property of the schema
+/// rather than of any one model's declaration order, so every writer in the
+/// process agrees on it — including two legs that point at the same table, which
+/// a per-spec ordering cannot reconcile.
+///
+/// Folding several children of one parent into a single `+ n` is a pure
+/// optimization: re-parenting 1000 children becomes two statements rather than
+/// 2000. It is only sound when the association has no tenant column, since the
+/// tenant predicate is scoped to a single witness child and a mixed-tenant batch
+/// folded behind one arbitrary witness would either sweep cross-tenant children
+/// into the increment or drop legitimate ones. Tenant-scoped specs therefore
+/// keep one statement per contribution — in the same global order.
+async fn apply_ordered<M: 'static>(
     conn: &mut RuntimeConnection,
-    spec: &CounterCacheSpec<M>,
-    contributions: Vec<(i64, i64, i64)>,
+    specs: &[CounterCacheSpec<M>],
+    contributions: Vec<Contribution>,
 ) -> AutumnResult<()> {
-    if spec.tenant_column.is_some() {
-        // Sorted by parent id for the same lock-ordering reason folding is.
-        let mut each = contributions;
-        each.sort_unstable();
-        for (parent_id, delta, witness) in each {
-            if delta == 0 {
-                continue;
-            }
-            counter_cache_apply_delta(
-                conn,
-                spec,
-                parent_id,
-                delta,
-                TenantScope::SameTenantAsChild(witness),
-            )
-            .await?;
-        }
+    if contributions.is_empty() {
         return Ok(());
     }
-    let mut folded: HashMap<i64, Fold> = HashMap::new();
-    for (parent_id, delta, witness) in contributions {
-        folded
-            .entry(parent_id)
-            .or_insert_with(|| Fold::new(witness))
-            .delta += delta;
-    }
-    apply_folded(conn, spec, folded).await
-}
-
-/// One parent's accumulated delta plus a witness child id.
-///
-/// The tenant predicate needs *a* child row to scope against; any child that
-/// contributed to this parent's delta is a valid witness, since children of one
-/// parent necessarily share its tenant (that is the invariant being enforced).
-struct Fold {
-    delta: i64,
-    witness: i64,
-}
-
-impl Fold {
-    const fn new(witness: i64) -> Self {
-        Self { delta: 0, witness }
-    }
-}
-
-/// Apply a folded `parent -> delta` map in ascending parent id.
-///
-/// Ascending order is what stops two concurrent batches touching the same
-/// parents from taking their row locks in opposite orders and deadlocking.
-/// Zero deltas are dropped rather than issued as `+ 0`.
-///
-/// **Only used when the association declares no tenant column.** The tenant
-/// predicate is scoped to one witness child, so folding a mixed-tenant batch
-/// behind a single arbitrary witness would either sweep cross-tenant children
-/// into the increment or drop legitimate ones. Where a tenant column exists the
-/// callers apply per child instead — see [`fold_or_apply_each`].
-async fn apply_folded<M: 'static>(
-    conn: &mut RuntimeConnection,
-    spec: &CounterCacheSpec<M>,
-    deltas: HashMap<i64, Fold>,
-) -> AutumnResult<()> {
-    let mut parents: Vec<(i64, i64, i64)> = deltas
-        .into_iter()
-        .filter(|(_, fold)| fold.delta != 0)
-        .map(|(parent_id, fold)| (parent_id, fold.delta, fold.witness))
-        .collect();
-    parents.sort_unstable();
-    for (parent_id, delta, witness) in parents {
+    for (spec_index, parent_id, delta, witness) in fold_and_order(specs, contributions) {
         counter_cache_apply_delta(
             conn,
-            spec,
+            &specs[spec_index],
             parent_id,
             delta,
             TenantScope::SameTenantAsChild(witness),
@@ -621,6 +566,49 @@ async fn apply_folded<M: 'static>(
         .await?;
     }
     Ok(())
+}
+
+/// The pure half of [`apply_ordered`]: fold, drop the no-ops, and put what is
+/// left in the global lock order. Split out so the ordering is unit-testable
+/// without a database.
+fn fold_and_order<M: 'static>(
+    specs: &[CounterCacheSpec<M>],
+    contributions: Vec<Contribution>,
+) -> Vec<Contribution> {
+    let mut folded: Vec<Contribution> = Vec::with_capacity(contributions.len());
+    // `(spec, parent)` -> where that parent's running total lives in `folded`.
+    let mut seen: HashMap<(usize, i64), usize> = HashMap::new();
+    for (spec_index, parent_id, delta, witness) in contributions {
+        if specs[spec_index].tenant_column.is_some() {
+            folded.push((spec_index, parent_id, delta, witness));
+            continue;
+        }
+        if let Some(&at) = seen.get(&(spec_index, parent_id)) {
+            folded[at].2 += delta;
+        } else {
+            seen.insert((spec_index, parent_id), folded.len());
+            folded.push((spec_index, parent_id, delta, witness));
+        }
+    }
+    // Zero deltas are dropped rather than issued as `+ 0`.
+    folded.retain(|&(_, _, delta, _)| delta != 0);
+    folded
+        .sort_by_key(|&(spec_index, parent_id, _, _)| (specs[spec_index].parent_table, parent_id));
+    folded
+}
+
+/// Spec indices in the same global order, for the paths that resolve the parent
+/// inside the statement and so cannot key on its id.
+///
+/// This removes every cross-table cycle, which is the half these paths can
+/// reach: a by-id call touches one parent per leg, so two legs onto *different*
+/// tables are ordered here, and two legs onto the *same* table are the residual
+/// (`recompute` is the repair, and a deadlock there surfaces as an error rather
+/// than as drift). `counter_column` breaks ties so the order is total.
+fn specs_in_lock_order<M: 'static>(specs: &[CounterCacheSpec<M>]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..specs.len()).collect();
+    order.sort_by_key(|&i| (specs[i].parent_table, specs[i].counter_column));
+    order
 }
 
 /// Increment every counter-cached parent of the child row `child_id`.
@@ -648,7 +636,8 @@ pub async fn counter_cache_after_insert_by_id<M: 'static>(
     specs: &[CounterCacheSpec<M>],
     child_id: i64,
 ) -> AutumnResult<()> {
-    for spec in specs {
+    for index in specs_in_lock_order(specs) {
+        let spec = &specs[index];
         let state = if spec.child_soft_delete {
             ChildState::Live
         } else {
@@ -674,7 +663,8 @@ pub async fn counter_cache_before_delete_by_id<M: 'static>(
     specs: &[CounterCacheSpec<M>],
     child_id: i64,
 ) -> AutumnResult<()> {
-    for spec in specs {
+    for index in specs_in_lock_order(specs) {
+        let spec = &specs[index];
         let state = if spec.child_soft_delete {
             ChildState::Live
         } else {
@@ -744,7 +734,8 @@ pub async fn counter_cache_before_delete_many<M: 'static>(
         .await
         .map_err(AutumnError::from)?;
 
-    for spec in specs {
+    for index in specs_in_lock_order(specs) {
+        let spec = &specs[index];
         debug_assert_spec_idents(spec);
         let Quoted {
             child_table,
@@ -843,7 +834,8 @@ pub async fn counter_cache_before_restore_by_id<M: 'static>(
     specs: &[CounterCacheSpec<M>],
     child_id: i64,
 ) -> AutumnResult<()> {
-    for spec in specs {
+    for index in specs_in_lock_order(specs) {
+        let spec = &specs[index];
         // A model with no `deleted_at` has no restore path; guard anyway so a
         // mis-wired call cannot double-increment.
         if spec.child_soft_delete {
@@ -916,6 +908,7 @@ pub async fn counter_cache_after_update<M: Send + Sync + 'static>(
     before: &[Option<i64>],
     record: &M,
 ) -> AutumnResult<()> {
+    let mut moves: Vec<Contribution> = Vec::with_capacity(specs.len() * 2);
     for (index, spec) in specs.iter().enumerate() {
         let old = before.get(index).copied().flatten();
         // A soft-deleted child is counted by nobody, so neither its old nor its
@@ -929,20 +922,19 @@ pub async fn counter_cache_after_update<M: Send + Sync + 'static>(
         if old == new {
             continue;
         }
-        // Applied in ascending parent id, not old-then-new: two transactions
-        // swapping children between parents A and B would otherwise take the two
-        // row locks in opposite orders and deadlock.
+        // Collected rather than applied here, and not old-then-new: every delta
+        // this mutation makes goes out in one global lock order (see
+        // `apply_ordered`), so two transactions swapping children between the
+        // same parents cannot take the two row locks in opposite orders.
         let witness = (spec.pk_of)(record);
-        let mut moves: Vec<(i64, i64, i64)> = Vec::with_capacity(2);
         if let Some(old_id) = old {
-            moves.push((old_id, -1, witness));
+            moves.push((index, old_id, -1, witness));
         }
         if let Some(new_id) = new {
-            moves.push((new_id, 1, witness));
+            moves.push((index, new_id, 1, witness));
         }
-        fold_or_apply_each(conn, spec, moves).await?;
     }
-    Ok(())
+    apply_ordered(conn, specs, moves).await
 }
 
 /// [`counter_cache_capture_fks`] over a batch of child ids (`update_many`).
@@ -1018,14 +1010,14 @@ pub async fn counter_cache_after_update_many<M: Send + Sync + 'static>(
         return Ok(());
     }
     let pk_of = specs[0].pk_of;
+    let mut contributions: Vec<Contribution> = Vec::new();
     for (index, spec) in specs.iter().enumerate() {
-        // Fold the WHOLE batch into one delta per parent before issuing any
-        // statement. Re-parenting 1000 children from one post to another is then
-        // two `UPDATE`s (`-1000`, `+1000`) rather than 2000, and — because the
-        // folded deltas are applied in ascending parent id — two concurrent
+        // Every leg's deltas are collected before any statement runs, then
+        // folded and applied in one global lock order (see `apply_ordered`).
+        // Re-parenting 1000 children from one post to another is then two
+        // `UPDATE`s (`-1000`, `+1000`) rather than 2000, and two concurrent
         // batches swapping children between the same parents take their row
         // locks in the same order and cannot deadlock.
-        let mut contributions: Vec<(i64, i64, i64)> = Vec::new();
         for record in records {
             let child_id = pk_of(record);
             let Ok(found) = before.binary_search_by_key(&child_id, |(id, _)| *id) else {
@@ -1046,15 +1038,14 @@ pub async fn counter_cache_after_update_many<M: Send + Sync + 'static>(
                 continue;
             }
             if let Some(old_id) = old {
-                contributions.push((old_id, -1, child_id));
+                contributions.push((index, old_id, -1, child_id));
             }
             if let Some(new_id) = new {
-                contributions.push((new_id, 1, child_id));
+                contributions.push((index, new_id, 1, child_id));
             }
         }
-        fold_or_apply_each(conn, spec, contributions).await?;
     }
-    Ok(())
+    apply_ordered(conn, specs, contributions).await
 }
 
 /// Move the counters for an `upsert_many` chunk (#1325).
@@ -1095,12 +1086,12 @@ pub async fn counter_cache_after_upsert_many<M: Send + Sync + 'static>(
             )
         })
         .collect();
-    // One folded pass per leg over the whole chunk, inserts and updates together:
-    // a row absent from `before` is an insert (`+1`), a row present in it is an
-    // update (the before/after diff). Same folding and same ascending-parent-id
-    // ordering as the other bulk paths, for the same two reasons.
+    // One pass per leg over the whole chunk, inserts and updates together: a row
+    // absent from `before` is an insert (`+1`), a row present in it is an update
+    // (the before/after diff). Folded and ordered by `apply_ordered` like every
+    // other bulk path, for the same two reasons.
+    let mut contributions: Vec<Contribution> = Vec::new();
     for (index, spec) in specs.iter().enumerate() {
-        let mut contributions: Vec<(i64, i64, i64)> = Vec::new();
         for record in upserted {
             let child_id = pk_of(record);
             let new = if (spec.live_of)(record) {
@@ -1111,7 +1102,7 @@ pub async fn counter_cache_after_upsert_many<M: Send + Sync + 'static>(
             match before.get(&child_id) {
                 None => {
                     if let Some(parent_id) = new {
-                        contributions.push((parent_id, 1, child_id));
+                        contributions.push((index, parent_id, 1, child_id));
                     }
                 }
                 Some(old_fks) => {
@@ -1120,17 +1111,16 @@ pub async fn counter_cache_after_upsert_many<M: Send + Sync + 'static>(
                         continue;
                     }
                     if let Some(old_id) = old {
-                        contributions.push((old_id, -1, child_id));
+                        contributions.push((index, old_id, -1, child_id));
                     }
                     if let Some(new_id) = new {
-                        contributions.push((new_id, 1, child_id));
+                        contributions.push((index, new_id, 1, child_id));
                     }
                 }
             }
         }
-        fold_or_apply_each(conn, spec, contributions).await?;
     }
-    Ok(())
+    apply_ordered(conn, specs, contributions).await
 }
 
 /// How many parent rows one recompute transaction locks and repairs at a time.
@@ -1255,7 +1245,8 @@ pub async fn counter_cache_recompute<M: 'static>(
     parent_id: Option<i64>,
 ) -> AutumnResult<usize> {
     let mut touched = 0usize;
-    for spec in specs {
+    for index in specs_in_lock_order(specs) {
+        let spec = &specs[index];
         debug_assert_spec_idents(spec);
         if let Some(id) = parent_id {
             touched += recompute_batch(conn, spec, &[id]).await?;
@@ -1408,6 +1399,68 @@ mod tests {
             sql.contains(&format!("\"posts\".\"comment_count\" {IS_DISTINCT_FROM}")),
             "a healthy parent must still be left unwritten: {sql}"
         );
+    }
+
+    /// Two legs whose parents sit in tables named in the *opposite* order to
+    /// their declaration — the shape a second child model would produce if it
+    /// declared the same two parents the other way round.
+    fn two_legs() -> Vec<CounterCacheSpec<Dummy>> {
+        let mut users = spec(false);
+        users.parent_table = "users";
+        users.counter_column = "sent_count";
+        let mut posts = spec(false);
+        posts.parent_table = "posts";
+        posts.counter_column = "comment_count";
+        // Declared users-first; `posts` sorts first.
+        vec![users, posts]
+    }
+
+    #[test]
+    fn deltas_go_out_in_a_globally_stable_lock_order() {
+        // The order has to come from the schema, not from either model's
+        // declaration order: two child models declaring the same two parents in
+        // opposite orders would otherwise take the two row locks in opposite
+        // orders and deadlock, and the generated transactions do not retry.
+        let specs = two_legs();
+        let ordered = fold_and_order(&specs, vec![(0, 5, 1, 100), (1, 9, 1, 100), (1, 2, 1, 100)]);
+        let keys: Vec<(&str, i64)> = ordered
+            .iter()
+            .map(|&(i, parent_id, _, _)| (specs[i].parent_table, parent_id))
+            .collect();
+        assert_eq!(keys, vec![("posts", 2), ("posts", 9), ("users", 5)]);
+
+        // …and the same for the paths that resolve the parent inside the
+        // statement, which can only order by table.
+        assert_eq!(specs_in_lock_order(&specs), vec![1, 0]);
+    }
+
+    #[test]
+    fn contributions_to_one_parent_fold_into_a_single_statement() {
+        let specs = two_legs();
+        // Re-parenting away from and back to the same parent nets out; the two
+        // remaining moves stay one statement each.
+        let ordered = fold_and_order(
+            &specs,
+            vec![
+                (1, 2, -1, 10),
+                (1, 2, 1, 11),
+                (1, 7, 1, 12),
+                (1, 7, 1, 13),
+                (0, 4, -1, 14),
+            ],
+        );
+        assert_eq!(ordered, vec![(1, 7, 2, 12), (0, 4, -1, 14)]);
+    }
+
+    #[test]
+    fn a_tenant_scoped_leg_keeps_one_statement_per_child() {
+        // Folding behind a single arbitrary witness would either sweep
+        // cross-tenant children into the delta or drop legitimate ones, so a
+        // tenant-scoped spec stays unfolded — still in the global order.
+        let mut specs = two_legs();
+        specs[1].tenant_column = Some("tenant_id");
+        let ordered = fold_and_order(&specs, vec![(1, 3, 1, 20), (1, 3, 1, 21)]);
+        assert_eq!(ordered, vec![(1, 3, 1, 20), (1, 3, 1, 21)]);
     }
 
     #[test]
