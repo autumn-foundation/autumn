@@ -1310,7 +1310,28 @@ fn plan_scaffold_with_options_impl(
         mods.push("policies");
     }
     let updated = update_main_rs(&main_existing, &mods, &route_entries);
-    // Fold the policy/scope builder registration into the same `updated` content
+    // `update_main_rs` only ADDS entries, so a re-run that stops emitting a
+    // handler leaves the old entry behind pointing at a function the fresh
+    // routes module no longer defines — and the project stops compiling. That
+    // bites hardest on the trash surface: `--soft-delete` is exactly the kind of
+    // flag someone forgets to repeat on a `--force` regeneration, and forgetting
+    // it strands THREE entries at once. So when this render emits no trash
+    // surface, prune any that a previous run mounted. Harmless when there are
+    // none (`remove_routes_entries` returns the input untouched), and never
+    // reached when the surface IS emitted, where the entries are re-added above.
+    let updated = if trash_enabled {
+        updated
+    } else {
+        super::schema_edit::remove_routes_entries(
+            &updated,
+            &[
+                format!("routes::{plural}::trash"),
+                format!("routes::{plural}::restore"),
+                format!("routes::{plural}::purge"),
+            ],
+        )
+    };
+    // Fold the policy/scope registration into the same `updated` content
     // (issue #1125) so main.rs gets a single `Modify` action.
     let updated = if policy_on {
         super::schema_edit::add_policy_registration_to_app(
@@ -20693,6 +20714,56 @@ exempt_paths = [
             "the matrix must include combinations that DO emit the trash surface, \
              otherwise it only proves the feature is always off"
         );
+    }
+
+    #[test]
+    fn regenerating_without_soft_delete_unmounts_the_trash_routes() {
+        let tmp = project_with_main(default_main());
+        // First run: the trash surface is mounted.
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &bulk_fields(),
+            "20260427000000",
+            &trash_options(|_| {}),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(main.contains("routes::posts::trash"), "{main}");
+
+        // Second run WITHOUT the flag — the shape people land on when they
+        // re-scaffold and forget to repeat it. `update_main_rs` only adds, so
+        // without the prune the three entries would survive pointing at
+        // handlers the fresh routes module no longer defines, and the generated
+        // project would stop compiling.
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &bulk_fields(),
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags {
+            force: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        for entry in [
+            "routes::posts::trash",
+            "routes::posts::restore",
+            "routes::posts::purge",
+        ] {
+            assert!(
+                !main.contains(entry),
+                "regenerating without --soft-delete must unmount `{entry}`:\n{main}"
+            );
+        }
+        // The routes that ARE still emitted stay mounted.
+        assert!(main.contains("routes::posts::destroy"), "{main}");
     }
 
     #[test]
