@@ -36,6 +36,7 @@
 
 use std::sync::Arc;
 
+use autumn_web::Patch;
 use autumn_web::repository::AutumnCounterCaches as _;
 use diesel::sql_types::BigInt;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -833,7 +834,7 @@ async fn reassigning_the_parent_moves_the_count() {
     repo.update(
         comment.id,
         &UpdateCcComment {
-            post_id: Some(new),
+            post_id: Patch::Set(new),
             ..Default::default()
         },
     )
@@ -865,7 +866,7 @@ async fn an_update_that_keeps_the_parent_moves_nothing() {
     repo.update(
         comment.id,
         &UpdateCcComment {
-            body: Some("after".into()),
+            body: Patch::Set("after".into()),
             ..Default::default()
         },
     )
@@ -901,7 +902,7 @@ async fn only_the_changed_leg_moves() {
     repo.update(
         msg.id,
         &UpdateCcMessage {
-            room_id: Some(new_room),
+            room_id: Patch::Set(new_room),
             ..Default::default()
         },
     )
@@ -949,7 +950,7 @@ async fn update_many_moves_every_reassigned_child() {
     repo.update_many(
         &ids,
         &UpdateCcComment {
-            post_id: Some(new),
+            post_id: Patch::Set(new),
             ..Default::default()
         },
     )

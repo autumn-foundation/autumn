@@ -81,6 +81,7 @@ pub struct ScaffoldConfigEntry {
     #[serde(default)]
     pub belongs_to: Option<String>,
     /// Maintain a `{child}_count` column on the parent (issue #1325).
+    #[serde(default)]
     pub counter_cache: Option<bool>,
     /// Text field names to make full-text searchable (issue #1319): emits
     /// `#[searchable]` on the model, `searchable` on the repository, the
@@ -678,6 +679,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap()
@@ -712,6 +714,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap();
@@ -737,6 +740,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap();
@@ -762,6 +766,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap();
@@ -789,6 +794,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap();
@@ -814,6 +820,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap();
@@ -840,6 +847,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap();
@@ -869,6 +877,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap();
@@ -933,6 +942,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap();
@@ -982,6 +992,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap();
@@ -1023,6 +1034,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap();
@@ -1087,6 +1099,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap();
@@ -1130,6 +1143,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap();
@@ -1169,6 +1183,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             &[],
         )
         .unwrap_err();

@@ -7907,6 +7907,15 @@ mod tests {
     // non-identifier column name (it is spliced into `format!`ed SQL), and two
     // legs resolving onto one parent column (both would move it).
 
+    /// `resolve_associations`' `Ok` type is not `Debug`, so unwrap the error by
+    /// matching rather than through `expect_err`.
+    fn expect_assoc_error(model: &syn::Ident, attrs: &[syn::Attribute]) -> String {
+        match resolve_associations(model, attrs) {
+            Ok(_) => panic!("expected the association to be rejected"),
+            Err(err) => err.to_string(),
+        }
+    }
+
     #[test]
     fn counter_cache_bare_flag_derives_the_column_from_the_child() {
         let model: syn::Ident = syn::parse_quote!(Comment);
@@ -7947,10 +7956,10 @@ mod tests {
     fn counter_cache_on_has_many_is_rejected() {
         let model: syn::Ident = syn::parse_quote!(Post);
         let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[has_many(Comment, counter_cache)])];
-        let err = resolve_associations(&model, &attrs).expect_err("has_many must be rejected");
-        let message = err.to_string();
+        let message = expect_assoc_error(&model, &attrs);
         assert!(
-            message.contains("`belongs_to`"),
+            message.contains("`#[belongs_to]` option")
+                && message.contains("Move it to the child model's"),
             "the error must name the leg to move it to: {message}"
         );
     }
@@ -7969,8 +7978,8 @@ mod tests {
         let attrs: Vec<syn::Attribute> = vec![
             syn::parse_quote!(#[belongs_to(Post, counter_cache = "comment_count; DROP TABLE posts")]),
         ];
-        let err = resolve_associations(&model, &attrs).expect_err("must reject");
-        assert!(err.to_string().contains("plain identifier"), "{err}");
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(message.contains("plain identifier"), "{message}");
     }
 
     #[test]
@@ -7982,8 +7991,8 @@ mod tests {
             syn::parse_quote!(#[belongs_to(User, fk = sender_id, name = sender, counter_cache)]),
             syn::parse_quote!(#[belongs_to(User, fk = recipient_id, name = recipient, counter_cache)]),
         ];
-        let err = resolve_associations(&model, &attrs).expect_err("must reject");
-        assert!(err.to_string().contains("users.message_count"), "{err}");
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(message.contains("users.message_count"), "{message}");
     }
 
     #[test]

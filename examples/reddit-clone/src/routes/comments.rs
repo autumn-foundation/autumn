@@ -14,8 +14,6 @@ use scoped_futures::ScopedFutureExt;
 use crate::live_events::{
     comment_created_event, publish_stored_live_event_best_effort, store_activity_event_for_state,
 };
-use autumn_web::repository::AutumnCounterCaches as _;
-
 use crate::models::Comment;
 use crate::schema::{comments, posts, subreddits, users};
 
@@ -95,6 +93,9 @@ pub async fn create(
                 // `UPDATE posts SET comment_count = comment_count + 1`,
                 // derived from `#[belongs_to(Post, counter_cache)]` on the
                 // model, running in this same transaction.
+                // `Comment::counter_caches()` needs no trait import: `#[model]`
+                // emits it as an *inherent* associated function, which shadows
+                // the blanket `AutumnCounterCaches` impl.
                 autumn_web::repository::counter_cache_after_insert_by_id(
                     conn,
                     Comment::counter_caches(),

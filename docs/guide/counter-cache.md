@@ -106,6 +106,22 @@ creation rolls back with it. The framework's test suite pins this with a parent
 whose counter column carries `CHECK (count <= 2)` — the third insert fails on the
 *counter*, and the child row is not persisted.
 
+### Locking and races
+
+Reading a child's current parent and writing its new one is a read-then-write, so
+the read takes a row lock on the **child** (`SELECT … FOR UPDATE` on Postgres;
+`SQLite` needs none — generated write paths open with `BEGIN IMMEDIATE`, which
+excludes every other writer). It is the same row the surrounding mutation locks,
+so no new lock-ordering edge appears. When a foreign key moves, the two parent
+deltas are applied in **ascending parent id**, not old-then-new, so two
+transactions swapping children between the same pair of parents cannot deadlock.
+
+One narrow window is left open by design: `delete_by_id` resolves the parent from
+the child row in the decrementing statement and removes the row in the next one.
+A concurrent transaction that re-parents that child between the two would leave
+the counter one off. It is a genuinely rare interleaving (deleting and
+re-parenting the same row concurrently), and `recompute` is the repair.
+
 ### Atomic, not read-modify-write
 
 The increment is one statement: `SET comment_count = comment_count + $1`. The
@@ -197,6 +213,18 @@ adds, on top of the ordinary `--belongs-to` scaffold:
   like the rest of autumn's repository layer.
 - **Same database.** The parent `UPDATE` runs on the child's connection, so a
   sharded setup must keep parent and child on the same shard.
+- **Tenancy follows the foreign key.** The parent `UPDATE` is by primary key with
+  no tenant predicate: it moves the counter on exactly the row the child's own
+  foreign key names. On a `tenant_scoped` repository that means a child written
+  with a foreign key pointing at another tenant's parent will move that parent's
+  counter — but that child row is itself already cross-tenant, which is the
+  problem to fix. Validate the foreign key (a `before_create` hook, or a
+  composite `(id, tenant_id)` foreign key in the schema) if a caller can supply
+  it directly.
+- **The column is yours.** The attribute maintains a column; it does not create
+  one, and it does not verify at compile time that the parent has it. A missing
+  or mistyped column surfaces as a database error on the first mutation, not as
+  silence.
 
 ## See also
 

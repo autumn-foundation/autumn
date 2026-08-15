@@ -69,6 +69,23 @@ const PH1: &str = "?";
 #[cfg(feature = "sqlite")]
 const PH2: &str = "?";
 
+/// Row lock appended to the sub-selects that read a child row's foreign key.
+///
+/// Without it there is a window between "read the child's current parent" and
+/// "write the child's new parent" in which a concurrent writer can re-parent the
+/// row, so the counter would be moved off the wrong parent. Taking the lock on
+/// the child row closes it: the concurrent writer blocks until this transaction
+/// commits. The lock is on the same row the surrounding mutation locks anyway,
+/// so it introduces no new lock-ordering edge.
+///
+/// `SQLite` has no `SELECT … FOR UPDATE` and needs none: generated write paths
+/// begin with `BEGIN IMMEDIATE`, which excludes every other writer for the
+/// duration — the same reason `maybe_for_update!` is the identity there.
+#[cfg(not(feature = "sqlite"))]
+const FOR_UPDATE: &str = " FOR UPDATE";
+#[cfg(feature = "sqlite")]
+const FOR_UPDATE: &str = "";
+
 /// The alias the generated SQL gives the *child* table whenever it appears in a
 /// sub-select. Always aliasing keeps a **self-referential** counter cache
 /// (a `Comment` that `belongs_to` a parent `Comment` maintaining `reply_count`)
@@ -258,7 +275,7 @@ pub async fn counter_cache_apply_delta_by_child_id<M: 'static>(
          WHERE {parent_table}.{parent_pk} IN \
            (SELECT {CHILD_ALIAS}.{fk_column} FROM {child_table} AS {CHILD_ALIAS} \
             WHERE {CHILD_ALIAS}.{child_pk} = {PH2} \
-              AND {CHILD_ALIAS}.{fk_column} IS NOT NULL{state_predicate})"
+              AND {CHILD_ALIAS}.{fk_column} IS NOT NULL{state_predicate}{FOR_UPDATE})"
     );
     diesel::sql_query(sql)
         .bind::<BigInt, _>(delta)
@@ -515,7 +532,8 @@ pub async fn counter_cache_capture_fks<M: 'static>(
         } = spec;
         let sql = format!(
             "SELECT {CHILD_ALIAS}.{fk_column} AS fk_value \
-             FROM {child_table} AS {CHILD_ALIAS} WHERE {CHILD_ALIAS}.{child_pk} = {PH1}"
+             FROM {child_table} AS {CHILD_ALIAS} \
+             WHERE {CHILD_ALIAS}.{child_pk} = {PH1}{FOR_UPDATE}"
         );
         let row: Option<FkRow> = diesel::sql_query(sql)
             .bind::<BigInt, _>(child_id)
@@ -548,11 +566,21 @@ pub async fn counter_cache_after_update<M: 'static>(
         if old == new {
             continue;
         }
+        // Apply in ascending parent id, not old-then-new. Two transactions
+        // swapping children between parents A and B would otherwise take the two
+        // row locks in opposite orders and deadlock; a consistent global order
+        // makes that impossible. The two deltas are independent, so ordering
+        // them costs nothing.
+        let mut moves: Vec<(i64, i64)> = Vec::with_capacity(2);
         if let Some(old_id) = old {
-            counter_cache_apply_delta(conn, spec, old_id, -1).await?;
+            moves.push((old_id, -1));
         }
         if let Some(new_id) = new {
-            counter_cache_apply_delta(conn, spec, new_id, 1).await?;
+            moves.push((new_id, 1));
+        }
+        moves.sort_unstable();
+        for (parent_id, delta) in moves {
+            counter_cache_apply_delta(conn, spec, parent_id, delta).await?;
         }
     }
     Ok(())
@@ -589,7 +617,8 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
             "SELECT {CHILD_ALIAS}.{child_pk} AS child_id, \
              {CHILD_ALIAS}.{fk_column} AS fk_value \
              FROM {child_table} AS {CHILD_ALIAS} \
-             WHERE {CHILD_ALIAS}.{child_pk} IN ({id_list})"
+             WHERE {CHILD_ALIAS}.{child_pk} IN ({id_list}) \
+             ORDER BY {CHILD_ALIAS}.{child_pk}{FOR_UPDATE}"
         );
         let rows: Vec<ChildFkRow> = diesel::sql_query(sql)
             .load::<ChildFkRow>(conn)

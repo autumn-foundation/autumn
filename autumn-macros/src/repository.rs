@@ -8821,10 +8821,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 for chunk in new.chunks(chunk_size) {
                     let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
-                            let chunk_inserted = (#insert_expr_conn)
+                            let results = (#insert_expr_conn)
                                 .map_err(::autumn_web::AutumnError::from)?;
-                            let results = chunk_inserted;
                             #vh_skip_batch
+                            // #1325: renamed rather than referenced directly so
+                            // the shared `#cc_after_insert_chunk` fragment sees
+                            // the binding it expects on every insert path.
                             let chunk_inserted = results;
                             #cc_after_insert_chunk
                             Ok(chunk_inserted)
@@ -8867,6 +8869,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                         let model = (#row_insert_expr_conn)
                                             .map_err(::autumn_web::AutumnError::from)?;
                                         #vh_skip_row
+                                        // See the batch path above: renamed for
+                                        // the shared `#cc_after_insert` fragment.
                                         let record = model;
                                         #cc_after_insert
                                         Ok(record)
