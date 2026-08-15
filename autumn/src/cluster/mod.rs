@@ -569,9 +569,11 @@ pub fn install_from_config(
         Arc::new(transport),
     )?;
 
-    // Registration failure means the name is already taken — a second cluster
-    // node in one process. Warn rather than fail the boot: the first node's
-    // component is the accurate one, and the extension below still resolves.
+    // Registration only fails when the name is already taken on THIS state,
+    // i.e. the installer was called twice for one app. Warn rather than fail
+    // the boot: the already-registered component still reports a live node, and
+    // the extension below still resolves. (Two nodes in one *process* — which
+    // the two-node tests do — have one `AppState` each and never collide.)
     if let Err(error) = state.health_indicator_registry().register(
         MEMBERSHIP_COMPONENT,
         crate::actuator::IndicatorGroup::HealthOnly,
