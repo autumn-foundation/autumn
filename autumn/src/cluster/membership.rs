@@ -25,10 +25,10 @@
 //!
 //! # Refutation
 //!
-//! Incarnations are seeded at boot from Unix seconds through the injected clock,
-//! so a restart normally comes back strictly higher with no persistence
-//! anywhere. Refutation covers the residual cases (a same-second restart, a
-//! backwards clock step) and keeps a live node from being buried: a node that
+//! Incarnations are seeded at boot from Unix **milliseconds** through the
+//! injected clock, so a restart normally comes back strictly higher with no
+//! persistence anywhere. Refutation covers the residual case (a clock that
+//! stepped backwards) and keeps a live node from being buried: a node that
 //! sees **any** record about itself at an incarnation `>=` its own — `Left` or
 //! a stale `Alive` — adopts `observed + 1`, marks itself `Alive`, and pushes
 //! immediately. See [`ClusterState::refute`].
@@ -235,16 +235,6 @@ impl ClusterState {
     ///
     /// A tombstone for a member this node has never accepted a frame from has
     /// no receipt to measure the window against and is therefore kept.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no production caller yet: the periodic call lands with the \
-                      push loop in node.rs — DELETE this attribute when it does \
-                      (the expectation then goes unfulfilled and fails the build). \
-                      The behaviour itself is pinned by this module's unit tests."
-        )
-    )]
     pub fn prune_tombstones(
         &mut self,
         overlay: &mut LivenessOverlay,
@@ -350,7 +340,7 @@ impl LivenessOverlay {
     /// [`ClusterState::prune_tombstones`] drops it:
     /// [`TOMBSTONE_TIMEOUT_MULTIPLE`] suspicion timeouts.
     const fn tombstone_timeout(&self) -> Duration {
-        self.suspicion_timeout
+        self.suspicion_timeout()
             .saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE)
     }
 

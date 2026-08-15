@@ -28,12 +28,6 @@
 //! `[cluster]` here means *app nodes clustering with each other*. It is
 //! unrelated to [`crate::sharding`]'s Redis-Cluster-style **database** shard
 //! vocabulary.
-//!
-//! # Status of this file
-//!
-//! RED PHASE (TDD): the type surface below is final-shaped but the bodies are
-//! inert. Every entry point compiles, runs, and returns an empty/zero answer so
-//! the red tests fail by *assertion*, never by panic.
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
@@ -143,6 +137,10 @@ pub(crate) struct ClusterMetrics {
     pub(crate) pushes_sent: AtomicU64,
     /// State pushes accepted from peers.
     pub(crate) pushes_received: AtomicU64,
+    /// Frames the transport could not queue (a peer's bounded writer queue was
+    /// full, or that peer has no writer). Never an error: anti-entropy re-sends
+    /// the whole document on the next interval.
+    pub(crate) frames_dropped: AtomicU64,
 }
 
 /// Everything one cluster node owns, shared between the node's loops and every
@@ -156,7 +154,6 @@ pub(crate) struct ClusterInner {
     pub(crate) secret: Vec<u8>,
     pub(crate) seed_peers: Vec<String>,
     pub(crate) push_interval: Duration,
-    pub(crate) suspicion_timeout: Duration,
     /// This process's incarnation; bumped when refuting a stale `Left`.
     pub(crate) incarnation: AtomicU64,
     /// The single replicated document (members + counters).
@@ -234,9 +231,50 @@ impl ClusterHandle {
     /// push intervals, they are not instantaneously identical.
     #[must_use]
     pub fn members(&self) -> Vec<ClusterMemberInfo> {
-        // RED-PHASE STUB: the real view folds the replicated member table
-        // through the local liveness overlay.
-        Vec::new()
+        // Read the clock before taking either lock: a clock source may lock
+        // internals of its own, and a view is cheap enough not to hold three
+        // locks at once.
+        let now = self.inner.clock.monotonic();
+        let incarnation = self.inner.incarnation.load(Ordering::Relaxed);
+
+        let state = self.inner.lock_state();
+        let overlay = self.inner.lock_overlay();
+
+        let mut view = Vec::with_capacity(state.members.len().saturating_add(1));
+        // This node is always in its own view. A one-member view is healthy, and
+        // a node has no silence to measure against itself.
+        view.push(ClusterMemberInfo {
+            id: self.inner.node_id.clone(),
+            addr: self.inner.advertise_addr.clone(),
+            status: ClusterMemberStatus::Alive,
+            incarnation,
+        });
+
+        for (id, record) in &state.members {
+            // Replicated `Left` is a tombstone, not a member; the local overlay
+            // then removes whoever has gone silent past the suspicion timeout.
+            // The view is exactly that intersection.
+            if id == &self.inner.node_id || record.status != membership::MemberStatus::Alive {
+                continue;
+            }
+            let liveness = overlay.liveness(id, now);
+            if !liveness.in_view() {
+                continue;
+            }
+            view.push(ClusterMemberInfo {
+                id: id.clone(),
+                addr: record.addr.clone(),
+                status: if liveness == membership::Liveness::Suspect {
+                    ClusterMemberStatus::Suspect
+                } else {
+                    ClusterMemberStatus::Alive
+                },
+                incarnation: record.incarnation,
+            });
+        }
+        drop(overlay);
+        drop(state);
+        view
     }
 
     /// Handle onto the cluster-wide grow-only counter called `name`.
@@ -306,6 +344,34 @@ pub fn install_from_config(
     // the cluster metrics source here.
     state.insert_extension(handle);
     Ok(())
+}
+
+/// The lowest percentage of a base interval a jittered draw can return.
+const JITTER_FLOOR_PERCENT: u64 = 80;
+
+/// Width of the jitter window in percentage points: `80..=120`, i.e. ±20%.
+const JITTER_SPAN_PERCENT: u64 = 41;
+
+/// `base` ± 20%, drawn from the injected [`Entropy`](crate::entropy::Entropy).
+///
+/// *Separation*, in the flocking sense: two identically configured nodes must
+/// not fly in lockstep and collide on the wire. The same draw shapes the
+/// transport's reconnect backoff, so two nodes that lost each other do not
+/// resynchronize into a dial storm.
+///
+/// Never returns zero — a zero-length sleep would spin the loop that awaits it.
+pub(crate) fn jittered(base: Duration, entropy: &dyn crate::entropy::Entropy) -> Duration {
+    let base_ms = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
+    let draw = entropy
+        .next_u64()
+        .checked_rem(JITTER_SPAN_PERCENT)
+        .unwrap_or(0);
+    let percent = JITTER_FLOOR_PERCENT.saturating_add(draw);
+    let millis = base_ms
+        .saturating_mul(percent)
+        .checked_div(100)
+        .unwrap_or(base_ms);
+    Duration::from_millis(millis.max(1))
 }
 
 /// Build the boot error used when the cluster listener cannot be bound.
