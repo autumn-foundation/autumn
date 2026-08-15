@@ -445,6 +445,14 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
     // matches a standalone `/` or `0`, so `failed at /` and `status 0` would
     // be rewritten in the outcome, and a SQL bind equal to either would be
     // blanked and dropped from replay's comparison.
+    //
+    // Cookie values are whole-token-only for the same reason auth-param
+    // values are: a cookie jar mixes a session token with `theme=dark`, and
+    // only the *name* separates them — which is the ranking this code declines
+    // to make. Substring-masking `dark` would turn a later `darkness check
+    // failed` into `[FILTERED]ness check failed`, and replay, which scrubs
+    // with the same set but produces the static message, would call that a
+    // mismatch.
     if is_cookie && trimmed.contains('=') {
         let pairs: Vec<&str> = if name == "set-cookie" {
             trimmed.split(';').take(1).collect()
@@ -455,7 +463,7 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
             if let Some((_, cookie_value)) = pair.split_once('=') {
                 let cookie_value = cookie_value.trim().trim_matches('"');
                 if !cookie_value.is_empty() {
-                    values.insert(cookie_value.as_bytes());
+                    values.insert_whole_token_only(cookie_value.as_bytes());
                 }
             }
         }
@@ -1297,6 +1305,19 @@ mod tests {
         assert!(
             !values.contains(b"session"),
             "cookie names are ordinary words and must stay out of the echo set"
+        );
+        // A cookie jar mixes a session token with ordinary preferences, and
+        // only the name separates them — so values are whole-token-only, like
+        // auth-params.
+        assert_eq!(
+            mask_echoes("darkness check failed", &values),
+            "darkness check failed",
+            "a `theme=dark` cookie must not shred words that merely contain it"
+        );
+        assert_eq!(
+            mask_echoes("theme dark rejected", &values),
+            format!("theme {FILTERED_PLACEHOLDER} rejected"),
+            "it is still masked where it stands as a whole token"
         );
         // `Set-Cookie` attributes are not secrets, and retaining them is worse
         // than useless: whole-token masking matches a standalone `/` or `0`.
