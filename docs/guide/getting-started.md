@@ -436,8 +436,8 @@ autumn_web::app()
 
 Before writing CRUD by hand, know that you usually do not have to.
 `autumn generate scaffold` emits the model, the migration, the `schema.rs`
-entry, a `#[repository]`, HTML routes and views, a JSON API, and a smoke test —
-then registers everything in `src/main.rs`:
+entry, a `#[repository]`, HTML routes and views, a policy stub, a JSON API, and
+a smoke test — then wires the routes into `src/main.rs` for you:
 
 ```bash
 autumn new my-app
@@ -450,7 +450,48 @@ autumn dev
 ```
 
 Visit <http://localhost:3000/posts> for the generated index page, or
-<http://localhost:3000/api/posts> for the JSON endpoint.
+<http://localhost:3000/api/posts> for the JSON read endpoint.
+
+### The writes are locked, on purpose
+
+Those five commands do **not** hand you an open CRUD app, and it is worth
+understanding why before you go looking for the bug:
+
+- The read paths — `GET /posts`, `GET /posts/{id}`, the CSV export, and the
+  JSON `GET /api/posts` — work immediately.
+- The write paths — `new_form`, `create`, `edit_form`, `update`, `destroy`,
+  `bulk_delete` — are emitted with `#[secured]`. A fresh `autumn new` app has
+  no login flow, so with no authenticated session those routes answer
+  `401 Unauthorized`.
+- The JSON *write* handlers are generated but deliberately **not** registered
+  in `routes![]`. Mount them once you have written a real repository policy.
+
+That is the scaffold being secure by default rather than open by default: it
+would rather hand you a locked door than an unauthenticated `DELETE` endpoint
+you forgot about. `autumn routes audit` enforces the same posture in CI.
+
+To get writes working, generate the missing half — a full signup, login,
+logout, account, and password-reset flow, named after the model it creates:
+
+```bash
+autumn generate auth User
+autumn migrate
+autumn dev
+```
+
+That writes the `users` migration, the session and remember-token models, the
+handlers, and registers all of them in `src/main.rs`. Sign up, sign in, and the
+create/edit/delete views become reachable. The
+generated `src/policies/post.rs` authorizes any authenticated user and marks
+itself with `SECURITY TODO` comments; replace those with a real per-record
+ownership rule before production. See [authentication](authentication.md) and
+[authorization](authorization.md).
+
+If you only want to click around a demo, removing the `#[secured]` attributes
+from `src/routes/posts.rs` opens the write routes — it is your code to edit.
+Do that knowingly, and not on anything reachable from the internet.
+
+### More of the DSL
 
 The field DSL carries validation and relationships too — `title:String{min=3,max=120}`
 emits both a server-side `#[validate(length(...))]` rule and the matching HTML5
