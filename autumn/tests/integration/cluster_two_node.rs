@@ -296,6 +296,96 @@ async fn tcp_survivor_converges_after_peer_cancelled() {
     drop(handle_b);
 }
 
+/// The clean-leave FAST path over real sockets: cancellation must converge the
+/// survivor long before the suspicion timeout could have.
+///
+/// The bug this pins is a shutdown-ordering one, invisible to every other test
+/// here because they all give the suspicion timeout room to finish the job:
+/// when the per-peer writer tasks are cancelled by the same token that triggers
+/// the departure, the writers are gone before the `Leave` they exist to carry
+/// is queued, and the clean path silently degrades into the timeout. So the
+/// suspicion timeout is set to **six seconds** and convergence is required
+/// inside a fraction of it — the assertion is the *margin*, not the outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn tcp_clean_leave_converges_before_the_suspicion_timeout() {
+    /// Long enough that reaching it would take the test far past its poll
+    /// budget, so a convergence observed below can only have come from a
+    /// delivered `Leave`.
+    const SUSPICION: Duration = Duration::from_millis(6_000);
+    /// A generous fraction of that: a leave crosses loopback in microseconds.
+    const LEAVE_BUDGET: Duration = Duration::from_millis(2_000);
+
+    let shutdown_a = CancellationToken::new();
+    let shutdown_b = CancellationToken::new();
+
+    let config_a = ClusterConfig {
+        suspicion_timeout_ms: 6_000,
+        ..cluster_config(Vec::new())
+    };
+    let app_a = TestApp::new().config(app_config(config_a.clone())).build();
+    install_from_config(app_a.state(), &config_a, &shutdown_a).expect("node A must install");
+    let handle_a = app_a
+        .state()
+        .extension::<ClusterHandle>()
+        .expect("node A must expose a ClusterHandle");
+
+    let config_b = ClusterConfig {
+        suspicion_timeout_ms: 6_000,
+        ..cluster_config(vec![handle_a.local_addr().to_string()])
+    };
+    let app_b = TestApp::new().config(app_config(config_b.clone())).build();
+    install_from_config(app_b.state(), &config_b, &shutdown_b).expect("node B must install");
+    let handle_b = app_b
+        .state()
+        .extension::<ClusterHandle>()
+        .expect("node B must expose a ClusterHandle");
+
+    let (a, b) = (handle_a.clone(), handle_b.clone());
+    poll_until(CONVERGE_TIMEOUT, || {
+        let (a, b) = (a.clone(), b.clone());
+        async move { a.members().len() == 2 && b.members().len() == 2 }
+    })
+    .await;
+    assert_eq!(
+        handle_a.members().len(),
+        2,
+        "the pair must be converged before the leave, or this test proves nothing; {}",
+        describe("A", &handle_a)
+    );
+
+    let departed_at = tokio::time::Instant::now();
+    shutdown_b.cancel();
+
+    let a = handle_a.clone();
+    poll_until(LEAVE_BUDGET, || {
+        let a = a.clone();
+        async move { a.members().len() == 1 }
+    })
+    .await;
+    let converged_after = departed_at.elapsed();
+
+    assert_eq!(
+        member_ids(&handle_a).len(),
+        1,
+        "a clean cancellation must deliver B's leave and converge A within \
+         {}ms — the suspicion timeout is {}ms away, so falling back to it means \
+         the leave never reached the wire; {}",
+        LEAVE_BUDGET.as_millis(),
+        SUSPICION.as_millis(),
+        describe("A", &handle_a)
+    );
+    assert!(
+        converged_after < SUSPICION,
+        "convergence took {}ms, at or past the {}ms suspicion timeout: that is \
+         the slow path, not the leave",
+        converged_after.as_millis(),
+        SUSPICION.as_millis()
+    );
+
+    shutdown_a.cancel();
+    drop(handle_b);
+}
+
 // ── L3: the full-app vertical ────────────────────────────────────────────────
 
 /// The whole stack, end to end: two in-process apps built from `[cluster]`

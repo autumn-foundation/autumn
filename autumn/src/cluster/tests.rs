@@ -106,6 +106,15 @@ fn member_ids(handle: &ClusterHandle) -> Vec<String> {
     ids
 }
 
+/// State pushes this node has handed to the transport since it started.
+fn pushes_sent(node: &TestNode) -> u64 {
+    node.handle
+        .inner
+        .metrics
+        .pushes_sent
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A one-line description of a node's view, for failure messages.
 fn view_of(node: &TestNode) -> String {
     format!(
@@ -352,6 +361,63 @@ async fn loopback_kill_without_leave_converges_after_suspicion_timeout() {
     );
 
     a.token.cancel();
+}
+
+/// A write storm must not turn the push loop into request-rate gossip.
+///
+/// Every increment leaves a notify permit behind, so an unthrottled loop
+/// clones, signs and sends the whole document once per write. This pins the
+/// cadence floor: the first nudge after a quiet gap still pushes promptly, and
+/// the rest of the storm collapses into it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn loopback_write_storm_is_bounded_by_the_push_cadence_floor() {
+    let router = LoopbackRouter::new();
+    let clock = test_clock();
+
+    let a = start_node(&router, &clock, SECRET, "node-a", 1, Vec::new());
+    let b = start_node(&router, &clock, SECRET, "node-b", 2, vec![a.addr.clone()]);
+    settle(&clock, 6).await;
+
+    // Past the floor (a quarter of PUSH) but well short of a whole interval,
+    // so the next push can only come from a nudge.
+    advance_time(&clock, PUSH.checked_div(2).unwrap_or(PUSH)).await;
+
+    let before = pushes_sent(&a);
+    // `yield_now` rather than a sleep: the loop gets to run between writes (so
+    // the permits really are consumed one at a time) while the clock stands
+    // still, which is exactly the "increments faster than the interval" shape.
+    for _ in 0..50 {
+        a.handle.counter(COUNTER).increment();
+        tokio::task::yield_now().await;
+    }
+    let storm_pushes = pushes_sent(&a).saturating_sub(before);
+
+    assert!(
+        storm_pushes >= 1,
+        "the first nudge after a quiet gap must still push promptly — a floor \
+         that swallows it would make every write wait out the interval; {}",
+        view_of(&a)
+    );
+    assert!(
+        storm_pushes <= 4,
+        "50 increments inside one floor window must collapse into a handful of \
+         pushes, not 50: observed {storm_pushes} pushes; {}",
+        view_of(&a)
+    );
+
+    // …and the storm is still delivered: bounding the cadence must not lose a
+    // single increment.
+    settle(&clock, 4).await;
+    assert_eq!(
+        b.handle.counter(COUNTER).get(),
+        50,
+        "every increment in the storm must reach B once the pushes resume; {} | {}",
+        view_of(&a),
+        view_of(&b)
+    );
+
+    a.token.cancel();
+    b.token.cancel();
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

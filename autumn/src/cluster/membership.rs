@@ -223,6 +223,28 @@ impl ClusterState {
         Some(bumped)
     }
 
+    /// Stamp the local observation time of every `Left` record, and clear the
+    /// stamp of every member that is `Alive` again.
+    ///
+    /// A tombstone's age is **not** the silence since the departed peer's last
+    /// frame: pruning forgets that receipt, so a lagging peer that re-teaches
+    /// the tombstone would re-insert a record whose age was then measured
+    /// against the *sender's* receipts and never expired again — an unbounded
+    /// document under repeated departures. The stamp is instead set when this
+    /// node first observes the departure and left alone while the record stays
+    /// `Left`, so a reintroduced tombstone expires one window after it was
+    /// re-learned rather than never.
+    pub fn observe_tombstones(&self, overlay: &mut LivenessOverlay, now: MonotonicInstant) {
+        for (id, record) in &self.members {
+            match record.status {
+                MemberStatus::Left => overlay.mark_tombstoned(id, now),
+                // A member that came back (refutation, or a higher-incarnation
+                // record) must not inherit the age of its previous departure.
+                MemberStatus::Alive => overlay.clear_tombstone(id),
+            }
+        }
+    }
+
     /// Drop `Left` tombstones that have outlived their window, forgetting the
     /// pruned members in `overlay` too. Returns how many records were dropped.
     ///
@@ -231,10 +253,12 @@ impl ClusterState {
     /// only grows the document. Pruning is deliberately **local** and driven by
     /// the caller's clock reading: it removes no information any peer still
     /// needs, and a straggling push that re-teaches the tombstone simply
-    /// re-inserts a record that is still `Left` and still out of the view.
+    /// re-inserts a record that is still `Left`, still out of the view, and
+    /// stamped afresh by [`observe_tombstones`](Self::observe_tombstones) so it
+    /// expires again.
     ///
-    /// A tombstone for a member this node has never accepted a frame from has
-    /// no receipt to measure the window against and is therefore kept.
+    /// A `Left` record nobody has stamped yet is kept — it is younger than one
+    /// observation, not older than the window.
     pub fn prune_tombstones(
         &mut self,
         overlay: &mut LivenessOverlay,
@@ -247,7 +271,7 @@ impl ClusterState {
             .filter_map(|(id, record)| {
                 let lapsed = record.status == MemberStatus::Left
                     && overlay
-                        .last_receipt(id)
+                        .tombstoned_at(id)
                         .is_some_and(|seen| now.saturating_duration_since(seen) > window);
                 lapsed.then(|| id.clone())
             })
@@ -299,6 +323,10 @@ pub struct LivenessOverlay {
     push_interval: Duration,
     suspicion_timeout: Duration,
     last_seen: BTreeMap<NodeId, MonotonicInstant>,
+    /// `node -> when this node first observed that member's departure`. Kept
+    /// apart from `last_seen` on purpose: see
+    /// [`ClusterState::observe_tombstones`].
+    tombstoned_at: BTreeMap<NodeId, MonotonicInstant>,
 }
 
 impl LivenessOverlay {
@@ -308,6 +336,7 @@ impl LivenessOverlay {
             push_interval,
             suspicion_timeout,
             last_seen: BTreeMap::new(),
+            tombstoned_at: BTreeMap::new(),
         }
     }
 
@@ -324,6 +353,24 @@ impl LivenessOverlay {
     /// Drop every observation of `node` (it left cleanly, or was pruned).
     pub fn forget(&mut self, node: &str) {
         self.last_seen.remove(node);
+        self.tombstoned_at.remove(node);
+    }
+
+    /// Stamp `node`'s departure at `at`, unless it is already stamped: a
+    /// tombstone ages from the FIRST observation, so a peer re-teaching it on
+    /// every push cannot keep it young forever.
+    fn mark_tombstoned(&mut self, node: &str, at: MonotonicInstant) {
+        self.tombstoned_at.entry(node.to_owned()).or_insert(at);
+    }
+
+    /// Forget `node`'s departure stamp (it is `Alive` again).
+    fn clear_tombstone(&mut self, node: &str) {
+        self.tombstoned_at.remove(node);
+    }
+
+    /// When this node first observed `node`'s departure, if it has.
+    fn tombstoned_at(&self, node: &str) -> Option<MonotonicInstant> {
+        self.tombstoned_at.get(node).copied()
     }
 
     /// When a frame from `node` was last accepted, if ever.
@@ -587,6 +634,8 @@ mod tests {
         state
             .members
             .insert("node-b".to_owned(), MemberRecord::left("127.0.0.1:7002", 9));
+        // The window runs from the moment this node OBSERVED the departure.
+        state.observe_tombstones(&mut overlay, at(0));
 
         assert_eq!(
             state.prune_tombstones(&mut overlay, at(window_ms)),
@@ -615,6 +664,66 @@ mod tests {
             "an Alive member must never be pruned, however long it has been \
              silent — silence is the overlay's business, not the document's; \
              observed {state:?}"
+        );
+    }
+
+    /// A tombstone re-taught by a lagging peer AFTER it was pruned must age
+    /// from that re-observation and expire again.
+    ///
+    /// The bug this pins: measuring a tombstone's age against the departed
+    /// member's last *receipt* means a pruned-then-reintroduced record has no
+    /// receipt of its own (pruning forgot it) and can never expire, so repeated
+    /// departures grow the document toward the 64 KiB frame cap.
+    #[test]
+    fn reintroduced_tombstone_expires_again() {
+        let window = SUSPICION.saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE);
+        let window_ms = u64::try_from(window.as_millis()).expect("the window fits in a u64 of ms");
+
+        let mut overlay = LivenessOverlay::new(PUSH, SUSPICION);
+        let mut state = ClusterState::default();
+        state
+            .members
+            .insert("node-b".to_owned(), MemberRecord::left("127.0.0.1:7002", 9));
+        state.observe_tombstones(&mut overlay, at(0));
+        assert_eq!(
+            state.prune_tombstones(&mut overlay, at(window_ms.saturating_add(1))),
+            1,
+            "sanity: the first tombstone must prune, or this test proves nothing"
+        );
+
+        // A lagging peer pushes the same departure again, long after the
+        // pruning — exactly what `merge` does with a record we no longer hold.
+        let reintroduced = at(window_ms.saturating_mul(2));
+        let mut lagging = ClusterState::default();
+        lagging
+            .members
+            .insert("node-b".to_owned(), MemberRecord::left("127.0.0.1:7002", 9));
+        state.merge(&lagging);
+        state.observe_tombstones(&mut overlay, reintroduced);
+        // The sender of that push is a DIFFERENT node, so attributing the age
+        // to receipts would restart the clock on every one of its pushes.
+        overlay.record_receipt("node-c", reintroduced);
+
+        assert_eq!(
+            state.prune_tombstones(&mut overlay, reintroduced.saturating_add(window)),
+            0,
+            "a freshly re-learned tombstone must survive a full window; observed {state:?}"
+        );
+        assert_eq!(
+            state.prune_tombstones(
+                &mut overlay,
+                reintroduced
+                    .saturating_add(window)
+                    .saturating_add(Duration::from_millis(1)),
+            ),
+            1,
+            "a REINTRODUCED tombstone must expire one window after it was \
+             re-observed — otherwise repeated departures grow the document \
+             without bound; observed {state:?}"
+        );
+        assert!(
+            !state.members.contains_key("node-b"),
+            "the re-expired tombstone must leave the document; observed {state:?}"
         );
     }
 }

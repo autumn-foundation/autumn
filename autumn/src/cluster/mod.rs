@@ -161,6 +161,17 @@ pub(crate) struct ClusterMetrics {
     /// full, or that peer has no writer). Never an error: anti-entropy re-sends
     /// the whole document on the next interval.
     pub(crate) frames_dropped: AtomicU64,
+    /// Inbound frames the transport's *framing* layer refused (a zero or
+    /// oversize length prefix), mirrored from
+    /// [`PeerTransport::framing_rejections`](transport::PeerTransport::framing_rejections).
+    ///
+    /// Kept apart from `rejected_by_reason` because the two are written
+    /// differently — this one mirrors a monotonic counter the transport owns,
+    /// that one is incremented here — and summed into the `oversize` series by
+    /// [`rejections_by_reason`](Self::rejections_by_reason), so one series
+    /// covers both the connection-fatal TCP rejections and the whole-buffer
+    /// ones the verifier sees.
+    pub(crate) framing_rejected: AtomicU64,
 }
 
 impl ClusterMetrics {
@@ -180,24 +191,34 @@ impl ClusterMetrics {
     }
 
     /// Every `(reason label, count)` pair, including the zeroes.
+    ///
+    /// The `oversize` pair carries the transport's framing rejections too: a
+    /// bad length prefix closes the connection before the verifier ever sees
+    /// the bytes, and an operator alerting on the series does not care which
+    /// layer refused them.
     pub(crate) fn rejections_by_reason(&self) -> Vec<(&'static str, u64)> {
+        let framing = self.framing_rejected.load(Ordering::Relaxed);
         REJECT_REASONS
             .iter()
             .enumerate()
             .filter_map(|(index, reason)| {
-                self.rejected_by_reason
-                    .get(index)
-                    .map(|counter| (reason.label(), counter.load(Ordering::Relaxed)))
+                self.rejected_by_reason.get(index).map(|counter| {
+                    let mut count = counter.load(Ordering::Relaxed);
+                    if *reason == wire::RejectReason::Oversize {
+                        count = count.saturating_add(framing);
+                    }
+                    (reason.label(), count)
+                })
             })
             .collect()
     }
 
-    /// Total frames refused, for any reason.
+    /// Total frames refused, for any reason and at either layer.
     #[cfg(test)]
     pub(crate) fn rejected_total(&self) -> u64 {
-        self.rejected_by_reason
-            .iter()
-            .map(|counter| counter.load(Ordering::Relaxed))
+        self.rejections_by_reason()
+            .into_iter()
+            .map(|(_, count)| count)
             .fold(0, u64::saturating_add)
     }
 }
@@ -371,6 +392,10 @@ impl ClusterHandle {
         self.inner.metrics.rejected_total()
     }
 }
+
+/// How many suspicion timeouts an inbound connection may stay silent before the
+/// transport closes it. Well past the point where its peer is out of the view.
+const INBOUND_IDLE_SUSPICION_MULTIPLE: u32 = 4;
 
 /// Registration name of the cluster health component and of the cluster
 /// metrics source. `curl /actuator/health | jq '.components["cluster:membership"]'`.
@@ -546,7 +571,17 @@ pub fn install_from_config(
     };
     let secret = secret.expose_secret().as_bytes().to_vec();
 
-    let transport = transport::TcpPeerTransport::bind(&config.bind_addr)?;
+    let suspicion_timeout = Duration::from_millis(config.suspicion_timeout_ms);
+    // A peer silent for longer than its suspicion timeout is already out of the
+    // view, so closing its idle socket costs nothing a live peer would miss —
+    // while an unauthenticated socket that never completes a frame stops being
+    // free to hold. The floor keeps a fast cluster from recycling connections.
+    let transport = transport::TcpPeerTransport::bind(&config.bind_addr)?
+        .with_inbound_idle_timeout(
+            suspicion_timeout
+                .saturating_mul(INBOUND_IDLE_SUSPICION_MULTIPLE)
+                .max(transport::DEFAULT_INBOUND_IDLE_TIMEOUT),
+        );
 
     let runtime = node::ClusterRuntimeConfig {
         cluster_name: config.cluster_name.clone(),
@@ -555,7 +590,7 @@ pub fn install_from_config(
         advertise_addr: config.advertise_addr.clone(),
         seed_peers: config.seed_peers.clone(),
         push_interval: Duration::from_millis(config.push_interval_ms),
-        suspicion_timeout: Duration::from_millis(config.suspicion_timeout_ms),
+        suspicion_timeout,
     };
 
     // A short secret is refused inside `ClusterNode::start`, before any frame is

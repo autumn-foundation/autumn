@@ -55,9 +55,9 @@
 // submodule is itself `pub(crate)`, so nothing here escapes the crate
 // (clippy::redundant_pub_crate).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -91,6 +91,34 @@ pub const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
 /// Pause after an `accept()` error before listening again, so a transient
 /// resource exhaustion (EMFILE) cannot spin the accept loop hot.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Cap on inbound connections held open at once.
+///
+/// Anyone who can reach the port can open a socket; nobody can *say* anything
+/// without the secret. The cap is what keeps the first fact from costing file
+/// descriptors without bound: past it, a new connection is accepted and closed
+/// immediately rather than parked. Sized far above any real two-node
+/// deployment (one peer needs one), so it can only ever bite an abuser.
+pub const MAX_INBOUND_CONNECTIONS: usize = 128;
+
+/// Default deadline for an inbound connection to deliver a *complete frame*.
+///
+/// A connection that has said nothing for this long is closed, so a socket
+/// opened and then left silent costs one descriptor for a bounded time rather
+/// than forever. [`TcpPeerTransport::with_inbound_idle_timeout`] raises it for
+/// a cluster whose push interval is slower than this.
+pub const DEFAULT_INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long per-peer writers outlive the app's shutdown token.
+///
+/// The departure `Leave` is queued *by* the cancellation arm of the node's push
+/// loop, so writers cancelled by the same token would routinely be gone before
+/// the frame they exist to carry was written — the clean-leave path would then
+/// silently degrade into the suspicion timeout. Writers instead run on a token
+/// this transport owns and retires one [`LEAVE_BUDGET`](super::node::LEAVE_BUDGET)
+/// after shutdown begins, which is the same budget the departure flush is
+/// bounded by.
+const WRITER_DRAIN_GRACE: Duration = super::node::LEAVE_BUDGET;
 
 /// How a node talks to its peers.
 pub trait PeerTransport: Send + Sync + 'static {
@@ -129,6 +157,29 @@ pub trait PeerTransport: Send + Sync + 'static {
     fn dropped_frames(&self) -> u64 {
         0
     }
+
+    /// Inbound frames refused by the *framing* layer — a length prefix of zero
+    /// or over the cap — which never reach
+    /// [`FrameVerifier`](super::wire::FrameVerifier) because the connection is
+    /// closed on the spot.
+    ///
+    /// Mirrored into `autumn_cluster_frames_rejected_total{reason="oversize"}`,
+    /// so the series counts the real TCP rejections it documents and not only
+    /// the ones a whole-buffer transport can hand to the verifier. Monotonic.
+    fn framing_rejections(&self) -> u64 {
+        0
+    }
+
+    /// Retire the per-peer state of every address **not** in `live`.
+    ///
+    /// Called with each push round's target set. A node id that returns at a
+    /// new address leaves its old address behind in the document only until the
+    /// record merges; without this the writer task and queue for the dead
+    /// address would live as long as the process, so address churn would
+    /// accumulate tasks. A no-op for a transport that keeps no per-peer state.
+    fn retain_peers(&self, live: &BTreeSet<String>) {
+        let _ = live;
+    }
 }
 
 /// The background I/O context, captured when [`PeerTransport::start`] runs.
@@ -138,8 +189,41 @@ pub trait PeerTransport: Send + Sync + 'static {
 /// [`tokio::runtime::Handle`] cannot panic, whereas `tokio::spawn` would.
 struct TransportIo {
     runtime: tokio::runtime::Handle,
-    shutdown: CancellationToken,
+    /// The token every **writer** runs on. Owned by this transport rather than
+    /// derived from the app's shutdown token, and retired one
+    /// [`WRITER_DRAIN_GRACE`] after that token fires — see its docs.
+    writers: CancellationToken,
     entropy: Arc<dyn Entropy>,
+}
+
+/// What one inbound connection is allowed to cost, and where it reports.
+#[derive(Clone)]
+struct InboundLimits {
+    /// Deadline for a connection to deliver one complete frame.
+    idle_timeout: Duration,
+    /// Inbound connections currently held open, capped at
+    /// [`MAX_INBOUND_CONNECTIONS`].
+    live: Arc<AtomicUsize>,
+    /// Framing-layer rejections, surfaced by
+    /// [`PeerTransport::framing_rejections`].
+    framing_rejections: Arc<AtomicU64>,
+}
+
+/// One accepted connection's slot in the [`MAX_INBOUND_CONNECTIONS`] budget,
+/// released on drop so an early return, an error, or a cancellation all give it
+/// back on the same path.
+struct InboundSlot(Arc<AtomicUsize>);
+
+impl Drop for InboundSlot {
+    fn drop(&mut self) {
+        // `fetch_update` rather than `fetch_sub`: a counter that underflowed
+        // would wrap to `usize::MAX` and permanently close the port.
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                Some(live.saturating_sub(1))
+            });
+    }
 }
 
 /// The production transport: a single TCP listener plus per-peer writers.
@@ -155,6 +239,7 @@ pub struct TcpPeerTransport {
     peers: Mutex<BTreeMap<PeerAddr, mpsc::Sender<Vec<u8>>>>,
     io: Mutex<Option<TransportIo>>,
     dropped: AtomicU64,
+    limits: InboundLimits,
 }
 
 impl std::fmt::Debug for TcpPeerTransport {
@@ -194,7 +279,25 @@ impl TcpPeerTransport {
             peers: Mutex::new(BTreeMap::new()),
             io: Mutex::new(None),
             dropped: AtomicU64::new(0),
+            limits: InboundLimits {
+                idle_timeout: DEFAULT_INBOUND_IDLE_TIMEOUT,
+                live: Arc::new(AtomicUsize::new(0)),
+                framing_rejections: Arc::new(AtomicU64::new(0)),
+            },
         })
+    }
+
+    /// Set how long an inbound connection may go without delivering a complete
+    /// frame before it is closed.
+    ///
+    /// The installer derives it from the cluster's own timings, so the deadline
+    /// can never fire on a peer that is still pushing: a peer silent for longer
+    /// than the suspicion timeout is already out of the view, and re-dialling
+    /// costs it one push.
+    #[must_use]
+    pub fn with_inbound_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.limits.idle_timeout = idle_timeout;
+        self
     }
 
     /// Take the bound listener, for the accept loop.
@@ -226,10 +329,19 @@ impl TcpPeerTransport {
         self.lock_io().as_ref().map(|io| {
             (
                 io.runtime.clone(),
-                io.shutdown.child_token(),
+                io.writers.child_token(),
                 Arc::clone(&io.entropy),
             )
         })
+    }
+
+    /// How many peers currently have a writer task and queue.
+    ///
+    /// Test observability only: production reads nothing here, and the number
+    /// is exactly what [`PeerTransport::retain_peers`] exists to bound.
+    #[cfg(test)]
+    fn writer_count(&self) -> usize {
+        self.lock_peers().len()
     }
 
     /// The queue for `to`, spawning that peer's writer task on first use.
@@ -296,6 +408,7 @@ impl PeerTransport for TcpPeerTransport {
             );
             return;
         };
+        let writers = CancellationToken::new();
         {
             let mut io = self.lock_io();
             if io.is_some() {
@@ -305,10 +418,11 @@ impl PeerTransport for TcpPeerTransport {
             }
             *io = Some(TransportIo {
                 runtime: runtime.clone(),
-                shutdown: shutdown.clone(),
+                writers: writers.clone(),
                 entropy: Arc::clone(entropy),
             });
         }
+        runtime.spawn(retire_writers(shutdown.clone(), writers));
         let Some(listener) = self.take_listener() else {
             return;
         };
@@ -316,6 +430,7 @@ impl PeerTransport for TcpPeerTransport {
             listener,
             self.inbound_sender(),
             shutdown.child_token(),
+            self.limits.clone(),
         ));
     }
 
@@ -329,6 +444,29 @@ impl PeerTransport for TcpPeerTransport {
     fn dropped_frames(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
+
+    fn framing_rejections(&self) -> u64 {
+        self.limits.framing_rejections.load(Ordering::Relaxed)
+    }
+
+    fn retain_peers(&self, live: &BTreeSet<String>) {
+        // Dropping the queue's sender is the retirement: the writer's `recv`
+        // then yields `None` once it has drained whatever was queued, so a
+        // frame already handed over is still transmitted.
+        self.lock_peers().retain(|addr, _| live.contains(addr));
+    }
+}
+
+/// Retire the per-peer writers a bounded grace after shutdown begins.
+///
+/// Not a loop and not detached: it awaits the app's token, waits out
+/// [`WRITER_DRAIN_GRACE`], and ends. That gap is the whole point — see
+/// [`WRITER_DRAIN_GRACE`] — and it is what makes the clean-leave path work
+/// under cancellation instead of degrading to the suspicion timeout.
+async fn retire_writers(shutdown: CancellationToken, writers: CancellationToken) {
+    shutdown.cancelled().await;
+    let _ = WRITER_DRAIN_GRACE;
+    writers.cancel();
 }
 
 /// Accept inbound connections until cancelled.
@@ -340,6 +478,7 @@ async fn accept_loop(
     listener: std::net::TcpListener,
     inbound: mpsc::Sender<(PeerAddr, Vec<u8>)>,
     shutdown: CancellationToken,
+    limits: InboundLimits,
 ) {
     let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
         tracing::warn!("cluster: could not adopt the bound listener; no peer can connect");
@@ -352,11 +491,25 @@ async fn accept_loop(
         };
         match accepted {
             Ok((stream, peer)) => {
+                let Some(slot) = claim_inbound_slot(&limits.live) else {
+                    // Accepted and closed at once rather than parked: the
+                    // socket has already cost a descriptor, and refusing it
+                    // here is what keeps the cost bounded.
+                    drop(stream);
+                    tracing::warn!(
+                        peer = %peer,
+                        cap = MAX_INBOUND_CONNECTIONS,
+                        "cluster: inbound connection cap reached; closing the new connection"
+                    );
+                    continue;
+                };
                 let reader = connection_reader(
                     stream,
                     peer.to_string(),
                     inbound.clone(),
                     shutdown.child_token(),
+                    limits.clone(),
+                    slot,
                 );
                 tokio::spawn(reader);
             }
@@ -371,27 +524,61 @@ async fn accept_loop(
     }
 }
 
+/// Take one inbound connection's slot in the [`MAX_INBOUND_CONNECTIONS`]
+/// budget, or `None` when the budget is spent.
+fn claim_inbound_slot(live: &Arc<AtomicUsize>) -> Option<InboundSlot> {
+    live.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+        (live < MAX_INBOUND_CONNECTIONS).then(|| live.saturating_add(1))
+    })
+    .ok()
+    .map(|_| InboundSlot(Arc::clone(live)))
+}
+
 /// Read length-prefixed frames off one inbound connection and hand them up.
 ///
 /// Framing is the only thing decided here; authentication is the node's
 /// business ([`super::wire::FrameVerifier`]), and the source address is
 /// forwarded for diagnostics only — it is never an identity.
+///
+/// Every read is bounded by [`InboundLimits::idle_timeout`]. Nothing on this
+/// path knows the secret yet, so an unauthenticated socket that never completes
+/// a frame must not be able to hold a descriptor open indefinitely — the
+/// deadline is the difference between "somebody can make me hold a socket" and
+/// "somebody can make me hold every socket".
 async fn connection_reader(
     mut stream: tokio::net::TcpStream,
     peer: PeerAddr,
     inbound: mpsc::Sender<(PeerAddr, Vec<u8>)>,
     shutdown: CancellationToken,
+    limits: InboundLimits,
+    slot: InboundSlot,
 ) {
+    // Held for the whole connection: dropping it gives the budget back on every
+    // exit path below, including cancellation.
+    let _slot = slot;
     loop {
         let mut prefix = [0u8; LENGTH_PREFIX_BYTES];
         let read = tokio::select! {
-            result = stream.read_exact(&mut prefix) => result,
+            result = tokio::time::timeout(
+                limits.idle_timeout,
+                stream.read_exact(&mut prefix),
+            ) => result,
             () = shutdown.cancelled() => return,
         };
-        if read.is_err() {
+        match read {
+            Ok(Ok(_)) => {}
             // EOF or a reset: the peer re-dials, and a closed connection carries
             // no liveness meaning at all.
-            return;
+            Ok(Err(_)) => return,
+            Err(_elapsed) => {
+                tracing::debug!(
+                    peer = %peer,
+                    idle_ms = limits.idle_timeout.as_millis(),
+                    "cluster: inbound connection delivered no frame within its idle \
+                     deadline; closing it"
+                );
+                return;
+            }
         }
 
         // Receive-path step 1, and the one place a rejection closes the
@@ -399,6 +586,10 @@ async fn connection_reader(
         // the next frame starts, so the stream is unusable. The cap is checked
         // on the declared `u32`, before a buffer of that size is reserved.
         let Some(declared) = frame_len(prefix) else {
+            // Counted here, not by the verifier: this frame never reaches it,
+            // and an `oversize` series that stays at zero for exactly the
+            // traffic it documents is worse than no series at all.
+            limits.framing_rejections.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 peer = %peer,
                 reason = RejectReason::Oversize.label(),
@@ -409,10 +600,15 @@ async fn connection_reader(
 
         let mut body = vec![0u8; declared];
         let read = tokio::select! {
-            result = stream.read_exact(&mut body) => result,
+            result = tokio::time::timeout(
+                limits.idle_timeout,
+                stream.read_exact(&mut body),
+            ) => result,
             () = shutdown.cancelled() => return,
         };
-        if read.is_err() {
+        // A prefix followed by a stalled body is the same posture as a silent
+        // socket: bounded, then closed.
+        if !matches!(read, Ok(Ok(_))) {
             return;
         }
 
@@ -481,6 +677,121 @@ async fn peer_writer(
             // be gone, and there is nothing worth retrying this frame for.
             connection = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tcp_tests {
+    use super::{PeerTransport as _, TcpPeerTransport};
+    use crate::entropy::SeededEntropy;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_util::sync::CancellationToken;
+
+    /// Short enough to keep the test quick, long enough that a local connect
+    /// and write can never lose the race to it.
+    const IDLE: Duration = Duration::from_millis(200);
+
+    fn started(idle: Duration) -> (Arc<TcpPeerTransport>, CancellationToken) {
+        let transport = Arc::new(
+            TcpPeerTransport::bind("127.0.0.1:0")
+                .expect("binding an ephemeral loopback port must succeed")
+                .with_inbound_idle_timeout(idle),
+        );
+        let token = CancellationToken::new();
+        let entropy: Arc<dyn crate::entropy::Entropy> = Arc::new(SeededEntropy::new(7));
+        transport.start(&token, &entropy);
+        (transport, token)
+    }
+
+    /// An inbound connection that never says anything must not be able to hold
+    /// a descriptor open: nothing on the read path knows the secret yet, so
+    /// "connected" has to cost strictly less than "authenticated".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn silent_inbound_connection_is_closed_at_the_idle_deadline() {
+        let (transport, token) = started(IDLE);
+        let mut client = tokio::net::TcpStream::connect(transport.local_addr())
+            .await
+            .expect("the cluster listener must accept a connection");
+
+        // Say nothing at all, then read: the server closing is EOF here.
+        let mut sink = [0_u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.read(&mut sink)).await;
+
+        assert!(
+            matches!(closed, Ok(Ok(0))),
+            "a connection that delivers no frame within its idle deadline must be \
+             closed by the node, not parked forever; observed {closed:?}"
+        );
+        token.cancel();
+    }
+
+    /// The connection-fatal framing rejection must be *counted*, or
+    /// `frames_rejected_total{reason="oversize"}` reads zero for exactly the
+    /// traffic it documents.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversize_length_prefix_is_counted_and_closes_the_connection() {
+        let (transport, token) = started(Duration::from_secs(30));
+        let mut client = tokio::net::TcpStream::connect(transport.local_addr())
+            .await
+            .expect("the cluster listener must accept a connection");
+
+        assert_eq!(
+            transport.framing_rejections(),
+            0,
+            "sanity: nothing has been rejected yet"
+        );
+        client
+            .write_all(&u32::MAX.to_be_bytes())
+            .await
+            .expect("writing a hostile length prefix must reach the node");
+
+        let mut sink = [0_u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.read(&mut sink)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0))),
+            "a 4 GiB length prefix desynchronizes the framing, so the connection \
+             must close; observed {closed:?}"
+        );
+        assert_eq!(
+            transport.framing_rejections(),
+            1,
+            "the oversize rejection must be counted even though the frame never \
+             reaches the verifier"
+        );
+        token.cancel();
+    }
+
+    /// A node id that comes back at a new address must not leave the old
+    /// address's writer task and queue alive for the life of the process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writers_retire_when_an_address_leaves_the_target_set() {
+        let (transport, token) = started(IDLE);
+
+        // Two addresses nobody is listening on: a writer is created by the
+        // send, and whether the dial succeeds is beside the point.
+        transport.send("127.0.0.1:9", vec![1, 2, 3]);
+        transport.send("127.0.0.1:10", vec![4, 5, 6]);
+        assert_eq!(
+            transport.writer_count(),
+            2,
+            "each addressed peer must get its own writer queue"
+        );
+
+        // The membership view now knows only one of them.
+        let live: BTreeSet<String> = ["127.0.0.1:10".to_owned()].into_iter().collect();
+        transport.retain_peers(&live);
+
+        assert_eq!(
+            transport.writer_count(),
+            1,
+            "an address that has left the target set must not keep a writer \
+             queue alive — repeated address churn would otherwise accumulate \
+             one task per address, forever"
+        );
+        token.cancel();
     }
 }
 
