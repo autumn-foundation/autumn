@@ -7,6 +7,10 @@ use crate::markdown::types::{RenderOptions, RenderedMarkdown, TocItem};
 /// Render Markdown body text to HTML, injecting stable `id` attributes on
 /// every heading and returning an ordered table of contents.
 ///
+/// Anchors are unique within a document: a repeated heading keeps the plain
+/// slug on its first occurrence and gets a `-1`, `-2`, … suffix on later ones,
+/// so the HTML stays valid and every TOC entry links to its own heading.
+///
 /// Fenced code blocks preserve their language hint as a `language-{lang}`
 /// CSS class. Raw HTML in the source is escaped rather than emitted — this
 /// function rewrites pulldown-cmark's `Html`/`InlineHtml` events to text before
@@ -54,6 +58,7 @@ pub fn render(body: &str, options: RenderOptions) -> RenderedMarkdown {
 
     let mut toc: Vec<TocItem> = Vec::new();
     let mut output: Vec<Event<'_>> = Vec::with_capacity(raw.len());
+    let mut anchors = AnchorAllocator::default();
 
     let mut i = 0;
     while i < raw.len() {
@@ -73,7 +78,7 @@ pub fn render(body: &str, options: RenderOptions) -> RenderedMarkdown {
                     }
                     j += 1;
                 }
-                let id = heading_id(&text);
+                let id = anchors.allocate(&heading_id(&text));
                 // Only inject an id and add a TOC entry when the heading has
                 // at least one alphanumeric character.  An empty id (e.g. a
                 // punctuation-only heading like `# !!!`) would produce invalid
@@ -120,6 +125,52 @@ pub fn render(body: &str, options: RenderOptions) -> RenderedMarkdown {
     RenderedMarkdown { html, toc }
 }
 
+/// Hands out document-unique heading anchors.
+///
+/// A document may legitimately repeat a heading ("Example", "Usage", "Notes"),
+/// but [`heading_id`] is a pure function of the heading text, so every
+/// repetition slugifies to the same string. Emitting that string twice
+/// produces duplicate `id` attributes — invalid HTML — and makes every TOC
+/// link for the repeated heading jump to the first occurrence.
+///
+/// The first use of a slug is handed back unchanged, so anchors already
+/// published in URLs keep resolving; later collisions get a `-1`, `-2`, …
+/// suffix (the convention GitHub, mdBook, and Hugo all use). The suffix search
+/// skips candidates already claimed by an unrelated heading, so a document
+/// containing `## Example`, `## Example 1`, `## Example` yields `example`,
+/// `example-1`, `example-2` rather than colliding on `example-1`.
+#[derive(Default)]
+struct AnchorAllocator {
+    used: std::collections::HashSet<String>,
+    /// Highest suffix tried per base slug, so a heading repeated `n` times
+    /// costs O(n) probes in total rather than O(n²).
+    next_suffix: std::collections::HashMap<String, usize>,
+}
+
+impl AnchorAllocator {
+    /// Reserve and return a unique anchor derived from `base`.
+    ///
+    /// An empty `base` (a heading with no alphanumeric characters) is returned
+    /// as-is and never reserved — the caller emits no `id` at all for it, so
+    /// such headings must not consume or collide in the anchor namespace.
+    fn allocate(&mut self, base: &str) -> String {
+        if base.is_empty() {
+            return String::new();
+        }
+        if self.used.insert(base.to_owned()) {
+            return base.to_owned();
+        }
+        let counter = self.next_suffix.entry(base.to_owned()).or_insert(0);
+        loop {
+            *counter += 1;
+            let candidate = format!("{base}-{counter}");
+            if self.used.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
+    }
+}
+
 const fn heading_level_to_u8(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
@@ -137,6 +188,15 @@ const fn heading_level_to_u8(level: HeadingLevel) -> u8 {
 /// remaining parts, filters empty parts, and joins with `-`.  Non-ASCII
 /// scripts (e.g. German umlauts, CJK characters) are preserved so that
 /// anchors remain meaningful for non-English content.
+///
+/// This is a pure function of the heading text, so two headings that read the
+/// same produce the same ID. [`render`] deduplicates within a document by
+/// suffixing later collisions; call this directly only when you need the raw
+/// slug for one piece of text.
+///
+/// Text with no alphanumeric characters (e.g. `"!!!"`) yields an empty string.
+/// [`render`] emits no `id` attribute at all in that case rather than an
+/// invalid `id=""`.
 ///
 /// # Examples
 ///
@@ -332,6 +392,90 @@ mod tests {
         assert!(result.toc.is_empty());
         // The heading tag itself must still be present.
         assert!(result.html.contains("<h1>"));
+    }
+
+    #[test]
+    fn duplicate_headings_get_unique_ids() {
+        // Real docs repeat headings ("Example", "Usage", "Notes"). Emitting the
+        // same `id` twice is invalid HTML and makes both TOC links jump to the
+        // first occurrence.
+        let md = "## Example\n\nFirst.\n\n## Example\n\nSecond.\n";
+        let result = render(md, RenderOptions::default());
+        assert_eq!(result.toc.len(), 2);
+        assert_eq!(result.toc[0].id, "example");
+        assert_eq!(result.toc[1].id, "example-1");
+        assert!(result.html.contains(r#"<h2 id="example">"#));
+        assert!(result.html.contains(r#"<h2 id="example-1">"#));
+    }
+
+    #[test]
+    fn first_occurrence_keeps_unsuffixed_id() {
+        // Heading IDs are URL-visible. Deduplication must only ever *add* a
+        // suffix to later duplicates so existing deep links keep resolving.
+        let md = "# Intro\n\n## Setup\n\n## Setup\n";
+        let result = render(md, RenderOptions::default());
+        assert_eq!(result.toc[0].id, "intro");
+        assert_eq!(result.toc[1].id, "setup");
+        assert_eq!(result.toc[2].id, "setup-1");
+    }
+
+    #[test]
+    fn three_duplicate_headings_count_up() {
+        let md = "## Notes\n## Notes\n## Notes\n";
+        let result = render(md, RenderOptions::default());
+        let ids: Vec<&str> = result.toc.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["notes", "notes-1", "notes-2"]);
+    }
+
+    #[test]
+    fn dedup_suffix_skips_ids_already_taken_by_another_heading() {
+        // "Example 1" naturally slugifies to "example-1", which is also the
+        // suffix a second "Example" would want. The dedup counter must skip
+        // past ids that are already in use rather than collide again.
+        let md = "## Example\n\n## Example 1\n\n## Example\n";
+        let result = render(md, RenderOptions::default());
+        let ids: Vec<&str> = result.toc.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["example", "example-1", "example-2"]);
+        // Every emitted id must be distinct.
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "ids must be unique: {ids:?}");
+    }
+
+    #[test]
+    fn dedup_is_case_insensitive_via_slug() {
+        // "Setup" and "SETUP" slugify to the same id, so the second must be
+        // suffixed.
+        let md = "## Setup\n\n## SETUP\n";
+        let result = render(md, RenderOptions::default());
+        assert_eq!(result.toc[0].id, "setup");
+        assert_eq!(result.toc[1].id, "setup-1");
+    }
+
+    #[test]
+    fn duplicate_punctuation_only_headings_stay_id_free() {
+        // Empty slugs are not ids at all, so they must not participate in
+        // dedup (no `id="-1"` nonsense) and must stay out of the TOC.
+        let result = render("# !!!\n\n# ???\n", RenderOptions::default());
+        assert!(!result.html.contains("id="));
+        assert!(result.toc.is_empty());
+    }
+
+    #[test]
+    fn toc_ids_match_emitted_heading_ids() {
+        // The TOC is only useful if every entry's id actually exists in the
+        // rendered HTML.
+        let md = "# Guide\n## Example\n### Example\n## Example\n";
+        let result = render(md, RenderOptions::default());
+        for item in &result.toc {
+            assert!(
+                result.html.contains(&format!(r#" id="{}">"#, item.id)),
+                "TOC id {:?} has no matching heading in HTML:\n{}",
+                item.id,
+                result.html
+            );
+        }
     }
 
     #[test]

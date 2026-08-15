@@ -54,6 +54,11 @@
 //! }
 //! ```
 //!
+//! Heading anchors are unique per document: a heading repeated within a page
+//! keeps the plain slug on its first occurrence (`#example`) and later ones are
+//! suffixed (`#example-1`), so every entry in [`RenderedMarkdown::toc`] links to
+//! its own heading.
+//!
 //! ### 3. Wire up static pre-rendering
 //!
 //! ```rust,ignore
