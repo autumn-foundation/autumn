@@ -381,13 +381,20 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
         }
     }
 
-    // `Cookie: a=1; b=2` and `Set-Cookie: name=value; Path=/; HttpOnly`. Every
-    // value is a candidate secret; the attributes that follow a `Set-Cookie`
-    // value are not, but retaining `/` or `HttpOnly` is harmless because the
-    // echo floor and boundary rule in `mask_echoes` refuse to match them
-    // inside prose.
+    // `Cookie: a=1; b=2` carries one pair per cookie, all of them candidate
+    // secrets. `Set-Cookie: session=abc; Path=/; Max-Age=0` carries *one*
+    // cookie followed by attributes — and those attribute values are not
+    // secrets. Retaining them was actively harmful: whole-token masking
+    // matches a standalone `/` or `0`, so `failed at /` and `status 0` would
+    // be rewritten in the outcome, and a SQL bind equal to either would be
+    // blanked and dropped from replay's comparison.
     if is_cookie && trimmed.contains('=') {
-        for pair in trimmed.split(';') {
+        let pairs: Vec<&str> = if name == "set-cookie" {
+            trimmed.split(';').take(1).collect()
+        } else {
+            trimmed.split(';').collect()
+        };
+        for pair in pairs {
             if let Some((_, cookie_value)) = pair.split_once('=') {
                 let cookie_value = cookie_value.trim().trim_matches('"');
                 if !cookie_value.is_empty() {
@@ -1076,6 +1083,25 @@ mod tests {
             !values.contains(b"session"),
             "cookie names are ordinary words and must stay out of the echo set"
         );
+        // `Set-Cookie` attributes are not secrets, and retaining them is worse
+        // than useless: whole-token masking matches a standalone `/` or `0`.
+        let (_request, set_cookie) = redact(
+            Request::get("/").header("set-cookie", "session=abc-secret; Path=/; Max-Age=0"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            set_cookie.contains(b"abc-secret"),
+            "the cookie value counts"
+        );
+        assert!(!set_cookie.contains(b"/"), "`Path=/` is an attribute");
+        assert!(!set_cookie.contains(b"0"), "`Max-Age=0` is an attribute");
+        assert_eq!(
+            mask_echoes("failed at / with status 0", &set_cookie),
+            "failed at / with status 0",
+            "attribute values must not rewrite unrelated outcome text"
+        );
+
         // A scheme this code has never heard of is exactly where a credential
         // would otherwise go unmasked.
         assert!(is_auth_scheme("Negotiate") && is_auth_scheme("AWS4-HMAC-SHA256"));

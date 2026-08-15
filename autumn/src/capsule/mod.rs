@@ -108,47 +108,32 @@ pub fn settings_from_config(config: &crate::config::AutumnConfig) -> CaptureSett
         max_capsules: config.failure_capture.max_capsules,
         app_name: Some(config.telemetry.service_name.clone()),
         profile: config.profile.clone(),
-        db_roles: configured_db_roles(config),
+        db_roles: Vec::new(),
     }
 }
 
-/// The database roles the application has configured, recorded on every
-/// capsule so replay can rebuild the same shape even when the request issued
-/// no wire traffic (see [`Capsule::db_roles`](crate::capsule::Capsule)).
+/// The database roles the application actually built, for
+/// [`Capsule::db_roles`](crate::capsule::Capsule).
 ///
-/// Read through `effective_primary_url`, which is what `create_topology`
-/// itself uses: an application on the legacy `database.url` field leaves
-/// `primary_url` unset but still gets a primary pool, and recording no role
-/// for it would put replay back in the branch this field exists to fix.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
-fn configured_db_roles(config: &crate::config::AutumnConfig) -> Vec<String> {
+/// Taken from the pools on the live state rather than inferred from the
+/// configured URLs, because the two can disagree: a custom
+/// `DatabasePoolProvider` may return no pool despite a `primary_url`, build one
+/// without any URL, or — as the managed-Postgres provider does — ignore a
+/// configured replica entirely. Recording a role the application does not have
+/// would make replay rebuild a shape production never ran, which is the same
+/// false mismatch this field exists to prevent, only pointed the other way.
+///
+/// No roles are recorded where replay could not rebuild them: wire capture and
+/// wire replay are both PostgreSQL-only, so a `sqlite` build (and a build
+/// without `db` at all) records none — the caller decides by not calling this.
+#[must_use]
+pub fn observed_db_roles(has_primary: bool, has_replica: bool) -> Vec<String> {
     let mut roles = Vec::new();
-    if config
-        .database
-        .effective_primary_url()
-        .is_some_and(|url| !url.trim().is_empty())
-    {
+    if has_primary {
         roles.push(crate::capsule::schema::TAPE_ROLE_PRIMARY.to_owned());
     }
-    if config
-        .database
-        .replica_url
-        .as_deref()
-        .is_some_and(|url| !url.trim().is_empty())
-    {
+    if has_replica {
         roles.push(crate::capsule::schema::TAPE_ROLE_REPLICA.to_owned());
     }
     roles
-}
-
-/// No roles are recorded where replay could not rebuild them.
-///
-/// Without the `db` feature there is no database to have a shape. On a
-/// `sqlite` build there is one, but wire capture and wire replay are both
-/// PostgreSQL-only: the sqlite replay path has no stub pool to construct, so
-/// recording a role it will then drop would make the capsule claim a shape
-/// its own replay cannot honour.
-#[cfg(any(not(feature = "db"), feature = "sqlite"))]
-const fn configured_db_roles(_config: &crate::config::AutumnConfig) -> Vec<String> {
-    Vec::new()
 }
