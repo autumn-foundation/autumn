@@ -18779,7 +18779,7 @@ exempt_paths = [
         let plan = counter_cached_comment_plan(&tmp);
         let up = action_contents(
             &plan,
-            "migrations/20260428000001_add_comment_count_to_posts/up.sql",
+            "migrations/202604280000001_add_comment_count_to_posts/up.sql",
         );
         assert!(
             up.contains("ALTER TABLE posts ADD COLUMN comment_count BIGINT NOT NULL DEFAULT 0;"),
@@ -18788,7 +18788,7 @@ exempt_paths = [
         );
         let down = action_contents(
             &plan,
-            "migrations/20260428000001_add_comment_count_to_posts/down.sql",
+            "migrations/202604280000001_add_comment_count_to_posts/down.sql",
         );
         assert!(
             down.contains("ALTER TABLE posts DROP COLUMN comment_count;"),

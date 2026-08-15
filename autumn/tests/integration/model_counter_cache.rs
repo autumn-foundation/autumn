@@ -549,7 +549,9 @@ fn counter_cache_specs_are_generated_from_the_conventions() {
         !specs[0].child_soft_delete,
         "a child with no deleted_at column must not emit a live-row predicate"
     );
-    assert!(CcComment::HAS_COUNTER_CACHES);
+    // `const` blocks, because the flag exists precisely so the maintenance
+    // folds away at compile time for a model that declares no counter cache.
+    const { assert!(CcComment::HAS_COUNTER_CACHES) };
 
     // Explicit override, nullable foreign key.
     let specs = CcMember::counter_caches();
@@ -587,7 +589,7 @@ fn counter_cache_specs_are_generated_from_the_conventions() {
     // A model with no counter cache resolves to the empty blanket impl, so it
     // issues no extra statement on any mutation.
     assert!(CcPost::counter_caches().is_empty());
-    assert!(!CcPost::HAS_COUNTER_CACHES);
+    const { assert!(!CcPost::HAS_COUNTER_CACHES) };
 }
 
 /// The recompute/backfill surface exists on the generated repository.
@@ -1254,6 +1256,67 @@ async fn recompute_ignores_soft_deleted_children() {
         1,
         "the soft-deleted revision must not be counted"
     );
+}
+
+/// A repair sweep run against live traffic must not *introduce* the drift it
+/// exists to remove.
+///
+/// Before the sweep locked each batch of parents ahead of counting them, this
+/// lost increments on Postgres: a child's transaction takes the parent's row
+/// lock for its `SET c = c + 1` and has not yet committed, so the sweep's
+/// `UPDATE` queues behind that lock, then resumes and writes a `COUNT(*)` from a
+/// snapshot taken before the child existed — silently overwriting the increment
+/// that committed in between.
+///
+/// The assertion can only fail if that race is present: with the lock in place
+/// both orderings converge, so this is a regression test rather than a flaky
+/// stress test.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_repair_sweep_cannot_overwrite_a_concurrent_increment() {
+    const N: usize = 40;
+    const SWEEPS: usize = 25;
+
+    let (pool, _container) = setup_pool().await;
+    let repo = Arc::new(PgCcCommentRepository::with_pool_untracked(pool.clone()));
+    let mut conn = pool.get().await.expect("conn");
+    let post = seed_post(&mut conn, "repaired under load").await;
+
+    let mut handles = Vec::with_capacity(N + 1);
+    for i in 0..N {
+        let repo = Arc::clone(&repo);
+        handles.push(tokio::spawn(async move {
+            repo.save(&NewCcComment {
+                body: format!("c{i}"),
+                post_id: post,
+            })
+            .await
+            .expect("concurrent save");
+        }));
+    }
+    // Sweep repeatedly *while* the inserts are in flight, so a sweep lands in
+    // the window between a child's INSERT and the counter UPDATE that follows it
+    // in the same transaction.
+    let sweeper = Arc::clone(&repo);
+    handles.push(tokio::spawn(async move {
+        for _ in 0..SWEEPS {
+            sweeper
+                .recompute_counter_caches()
+                .await
+                .expect("recompute under load");
+        }
+    }));
+    for h in handles {
+        h.await.expect("join");
+    }
+
+    let snap = post_snapshot(&mut conn, post).await;
+    assert_eq!(
+        snap.persisted,
+        i64::try_from(N).expect("N fits in i64"),
+        "a repair sweep must never overwrite a committed increment"
+    );
+    assert_eq!(snap.persisted, snap.ground_truth);
 }
 
 // ── AC8: the in-process test client can assert the maintained value ─────────

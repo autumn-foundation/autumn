@@ -54,8 +54,9 @@ use std::fmt::Write as _;
 
 use diesel::sql_types::{BigInt, Nullable};
 use diesel_async::RunQueryDsl as _;
+use scoped_futures::ScopedFutureExt as _;
 
-use crate::db::RuntimeConnection;
+use crate::db::{RuntimeConnection, scoped_immediate_transaction};
 use crate::{AutumnError, AutumnResult};
 
 // Backend-forked placeholders: Postgres numbers its binds, `SQLite` does not.
@@ -1010,6 +1011,104 @@ pub async fn counter_cache_after_upsert_many<M: Send + Sync + 'static>(
     Ok(())
 }
 
+/// How many parent rows one recompute transaction locks and repairs at a time.
+///
+/// A full sweep has to take a row lock on every parent it rebuilds (see
+/// [`recompute_batch`]), and locks are held until commit. Rebuilding the whole
+/// table in one transaction would therefore block every concurrent write to that
+/// table for the duration of the sweep, so the sweep is cut into batches: each
+/// one is its own short transaction, and per-parent correctness does not depend
+/// on the batches being atomic with each other.
+const RECOMPUTE_BATCH: i64 = 1_000;
+
+/// The `UPDATE` that rebuilds `ids`' counters from the source of truth.
+fn recompute_update_sql<M: 'static>(spec: &CounterCacheSpec<M>, ids: &str) -> String {
+    let CounterCacheSpec {
+        child_table,
+        fk_column,
+        parent_table,
+        parent_pk,
+        counter_column,
+        ..
+    } = spec;
+    let live = live_predicate(spec, true);
+    // The ground truth has to agree with what the deltas maintain: an ordinary
+    // delta skips a cross-tenant child, so a recompute that counted it would
+    // undo the isolation on the very next sweep.
+    let tenant = tenant_predicate_joined(spec);
+    // The correlated sub-select aliases the child table so a self-referential
+    // counter cache (child table == parent table) still binds the outer `UPDATE`
+    // target on the right-hand side of the join predicate.
+    let ground_truth = format!(
+        "(SELECT COUNT(*) FROM {child_table} AS {CHILD_ALIAS} \
+          WHERE {CHILD_ALIAS}.{fk_column} = {parent_table}.{parent_pk}{live}{tenant})"
+    );
+    // `IS DISTINCT FROM` so a sweep over a healthy table writes nothing: under
+    // MVCC an unconditional assignment would rewrite every parent row (bloat
+    // proportional to the whole table, for no change), and it would make the
+    // returned count the row count rather than the repair count.
+    format!(
+        "UPDATE {parent_table} SET {counter_column} = {ground_truth} \
+         WHERE {parent_table}.{parent_pk} IN ({ids}) \
+           AND {parent_table}.{counter_column} {IS_DISTINCT_FROM} {ground_truth}"
+    )
+}
+
+/// Repair one batch of parents: lock them, then rebuild them, in one transaction.
+///
+/// The lock is what makes a repair safe to run against live traffic. Without it,
+/// on Postgres, a repair racing an in-flight child insert **introduces** the
+/// drift it exists to remove: the child's transaction has already taken the
+/// parent's row lock for its `SET c = c + 1` but has not committed, so the
+/// repair's `UPDATE` blocks on that lock, and when it resumes it writes a
+/// `COUNT(*)` taken from a snapshot that predates — and therefore cannot see —
+/// the child that just committed. The committed `+1` is silently overwritten.
+///
+/// Taking the lock in a *separate, earlier statement* removes both halves of
+/// that race. Either the repair wins the lock, in which case the child's
+/// increment is applied after the repair commits and is relative, so it lands on
+/// top of the rebuilt value; or the child wins, in which case the locking
+/// `SELECT` waits for it to commit and the `UPDATE` that follows takes a fresh
+/// snapshot that does see it. Ids are locked in ascending order, matching the
+/// order the delta paths apply in, so the two cannot deadlock against each
+/// other.
+///
+/// On `SQLite` the enclosing `BEGIN IMMEDIATE` already excludes every other
+/// writer, and `FOR UPDATE` degrades to the empty string; the locking `SELECT`
+/// is then a cheap indexed read that keeps this one code path.
+async fn recompute_batch<M: 'static>(
+    conn: &mut RuntimeConnection,
+    spec: &CounterCacheSpec<M>,
+    ids: &[i64],
+) -> AutumnResult<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let id_list = id_list(ids);
+    let parent_table = spec.parent_table;
+    let parent_pk = spec.parent_pk;
+    let lock_sql = format!(
+        "SELECT {parent_pk} AS parent_id FROM {parent_table} \
+         WHERE {parent_pk} IN ({id_list}) ORDER BY {parent_pk}{FOR_UPDATE}"
+    );
+    let update_sql = recompute_update_sql(spec, &id_list);
+
+    scoped_immediate_transaction::<usize, AutumnError, _>(conn, move |conn| {
+        async move {
+            diesel::sql_query(lock_sql)
+                .load::<ParentIdRow>(&mut *conn)
+                .await
+                .map_err(AutumnError::from)?;
+            diesel::sql_query(update_sql)
+                .execute(&mut *conn)
+                .await
+                .map_err(AutumnError::from)
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 /// Recompute counters from the source of truth.
 ///
 /// With `parent_id = None` every parent row is rebuilt; with `Some(id)` only
@@ -1017,12 +1116,16 @@ pub async fn counter_cache_after_upsert_many<M: Send + Sync + 'static>(
 /// a `COUNT(*)`, never adjusted — so it is safe to run repeatedly, and it is the
 /// supported way to adopt a counter column on an existing table (AC6).
 ///
+/// Safe to run against live traffic: each batch locks the parents it is about to
+/// rebuild before counting, so it can neither read a half-applied write nor
+/// clobber one (see [`recompute_batch`]).
+///
 /// Returns the number of parent rows **actually repaired**, summed across every
 /// spec — a sweep over a table with no drift returns 0 and writes nothing.
 ///
 /// # Errors
 ///
-/// Propagates any database error from the `UPDATE`s.
+/// Propagates any database error from the `SELECT`s or `UPDATE`s.
 #[doc(hidden)]
 pub async fn counter_cache_recompute<M: 'static>(
     conn: &mut RuntimeConnection,
@@ -1032,45 +1135,40 @@ pub async fn counter_cache_recompute<M: 'static>(
     let mut touched = 0usize;
     for spec in specs {
         debug_assert_spec_idents(spec);
-        let CounterCacheSpec {
-            child_table,
-            fk_column,
-            parent_table,
-            parent_pk,
-            counter_column,
-            ..
-        } = spec;
-        let live = live_predicate(spec, true);
-        // The ground truth has to agree with what the deltas maintain: an
-        // ordinary delta skips a cross-tenant child, so a recompute that counted
-        // it would undo the isolation on the very next sweep.
-        let tenant = tenant_predicate_joined(spec);
-        // The correlated sub-select aliases the child table so a self-referential
-        // counter cache (child table == parent table) still binds the outer
-        // `UPDATE` target on the right-hand side of the join predicate.
-        let ground_truth = format!(
-            "(SELECT COUNT(*) FROM {child_table} AS {CHILD_ALIAS} \
-              WHERE {CHILD_ALIAS}.{fk_column} = {parent_table}.{parent_pk}{live}{tenant})"
-        );
-        // `IS DISTINCT FROM` so a sweep over a healthy table writes nothing:
-        // under MVCC an unconditional assignment would rewrite every parent row
-        // (bloat proportional to the whole table, for no change), and it would
-        // make the returned count the row count rather than the repair count.
-        let mut sql = format!(
-            "UPDATE {parent_table} SET {counter_column} = {ground_truth} \
-             WHERE {parent_table}.{counter_column} {IS_DISTINCT_FROM} {ground_truth}"
-        );
-        if parent_id.is_some() {
-            let _ = write!(sql, " AND {parent_table}.{parent_pk} = {PH1}");
+        if let Some(id) = parent_id {
+            touched += recompute_batch(conn, spec, &[id]).await?;
+            continue;
         }
-        let query = diesel::sql_query(sql);
-        let updated = if let Some(id) = parent_id {
-            query.bind::<BigInt, _>(id).execute(conn).await
-        } else {
-            query.execute(conn).await
+
+        // Page over the parent ids *outside* the repair transactions, so no lock
+        // is held while enumerating. A parent inserted after its page was read
+        // is simply not in this sweep, which is harmless: it starts at the
+        // column default and its children are counted by the delta paths.
+        let parent_table = spec.parent_table;
+        let parent_pk = spec.parent_pk;
+        let mut cursor: Option<i64> = None;
+        loop {
+            let mut page_sql = format!("SELECT {parent_pk} AS parent_id FROM {parent_table}");
+            if cursor.is_some() {
+                let _ = write!(page_sql, " WHERE {parent_pk} > {PH1}");
+            }
+            let _ = write!(page_sql, " ORDER BY {parent_pk} LIMIT {RECOMPUTE_BATCH}");
+            let query = diesel::sql_query(page_sql);
+            let page = if let Some(after) = cursor {
+                query
+                    .bind::<BigInt, _>(after)
+                    .load::<ParentIdRow>(conn)
+                    .await
+            } else {
+                query.load::<ParentIdRow>(conn).await
+            }
+            .map_err(AutumnError::from)?;
+
+            let Some(last) = page.last() else { break };
+            cursor = Some(last.parent_id);
+            let ids: Vec<i64> = page.iter().map(|row| row.parent_id).collect();
+            touched += recompute_batch(conn, spec, &ids).await?;
         }
-        .map_err(AutumnError::from)?;
-        touched += updated;
     }
     Ok(touched)
 }
@@ -1081,6 +1179,12 @@ struct ChildFkRow {
     child_id: i64,
     #[diesel(sql_type = Nullable<BigInt>)]
     fk_value: Option<i64>,
+}
+
+#[derive(diesel::QueryableByName)]
+struct ParentIdRow {
+    #[diesel(sql_type = BigInt)]
+    parent_id: i64,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -1152,8 +1256,23 @@ mod tests {
     }
 
     #[test]
+    fn a_recompute_batch_is_scoped_to_the_ids_it_locked() {
+        // Restricting the `UPDATE` to the batch is what makes the locking
+        // `SELECT` that precedes it meaningful: a sweep-wide `UPDATE` would
+        // touch parents this transaction never locked.
+        let sql = recompute_update_sql(&spec(false), "1,2,3");
+        assert!(sql.contains("posts.id IN (1,2,3)"), "{sql}");
+        assert!(
+            sql.contains(&format!("posts.comment_count {IS_DISTINCT_FROM}")),
+            "a healthy parent must still be left unwritten: {sql}"
+        );
+    }
+
+    #[test]
     fn a_model_without_an_inherent_shadow_resolves_to_the_empty_blanket() {
-        assert!(!Dummy::HAS_COUNTER_CACHES);
+        // A `const` block, because the whole point of the flag is that it folds
+        // at compile time — `assert!` on a constant is a clippy error.
+        const { assert!(!Dummy::HAS_COUNTER_CACHES) };
         assert!(Dummy::counter_caches().is_empty());
     }
 }

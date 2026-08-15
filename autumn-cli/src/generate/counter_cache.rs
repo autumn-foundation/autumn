@@ -41,15 +41,13 @@ pub fn down_sql(parent_plural: &str, column: &str) -> String {
 }
 
 /// The migration directory name, e.g.
-/// `20260427000001_add_comment_count_to_posts`.
+/// `202604270000001_add_comment_count_to_posts`.
 ///
-/// Diesel takes the numeric prefix as the migration **version**, and the
-/// scaffold has already claimed `{timestamp}` for its own
-/// `{timestamp}_create_{table}`. Two directories sharing a version cannot both
-/// be recorded in `__diesel_schema_migrations`, so one of the two schema changes
-/// would silently never apply. This one therefore runs at `timestamp + 1`, which
-/// also gives it the right ordering: the parent column is added after the child
-/// table exists.
+/// Diesel takes the prefix as the migration **version**, and the scaffold has
+/// already claimed `{timestamp}` for its own `{timestamp}_create_{table}`. Two
+/// directories sharing a version cannot both be recorded in
+/// `__diesel_schema_migrations`, so one of the two schema changes would silently
+/// never apply.
 #[must_use]
 pub fn migration_dir_name(timestamp: &str, column: &str, parent_plural: &str) -> String {
     format!(
@@ -58,15 +56,29 @@ pub fn migration_dir_name(timestamp: &str, column: &str, parent_plural: &str) ->
     )
 }
 
-/// `timestamp + 1`, preserving width (`20260427000000` -> `20260427000001`).
+/// The version to run this migration at: `{timestamp}` with a `1` appended.
 ///
-/// Falls back to appending `1` for a non-numeric timestamp, which still yields a
-/// distinct version rather than a silent collision.
+/// The obvious choice — `timestamp + 1` — is wrong in a way that only shows up
+/// later: it *reserves* the version a scaffold run one second afterwards would
+/// naturally take, so that run's `{timestamp}_create_{table}` collides with this
+/// directory and one of the two never applies. The bug lands in a different
+/// invocation than the one that caused it.
+///
+/// Appending a digit instead never consumes a wall-clock version. Diesel's
+/// `MigrationVersion` is `Ord` over the raw string, so lexicographic ordering is
+/// what matters, and a suffixed version sorts exactly where it should:
+///
+/// * after its own scaffold (`20260427000000` is a prefix of
+///   `202604270000001`, and a prefix sorts first), so the parent column is added
+///   after the child table exists; and
+/// * before the next second's scaffold — `{timestamp}` and `{timestamp + 1}`
+///   first differ at some index inside the timestamp, where the later one is
+///   greater, and the appended digit sits beyond that index.
+///
+/// It also needs no knowledge of the timestamp's format, so a non-numeric one
+/// (tests, a stubbed clock) is handled by the same single code path.
 fn next_migration_version(timestamp: &str) -> String {
-    timestamp.parse::<u64>().map_or_else(
-        |_| format!("{timestamp}1"),
-        |n| format!("{:0width$}", n + 1, width = timestamp.len()),
-    )
+    format!("{timestamp}1")
 }
 
 /// Push the counter-cache migration and the follow-up warning onto `plan`.
@@ -149,7 +161,9 @@ pub fn add_counter_cache_to_model_source(
         .map_or(struct_at, |i| i + 1);
     let mut out = String::with_capacity(source.len() + 48);
     out.push_str(&source[..insert_at]);
-    out.push_str(&format!("#[belongs_to({parent_pascal}, counter_cache)]\n"));
+    out.push_str("#[belongs_to(");
+    out.push_str(parent_pascal);
+    out.push_str(", counter_cache)]\n");
     out.push_str(&source[insert_at..]);
     out
 }
@@ -180,24 +194,40 @@ mod tests {
     fn the_migration_dir_names_both_sides() {
         assert_eq!(
             migration_dir_name("20260427000000", "comment_count", "posts"),
-            "20260427000001_add_comment_count_to_posts"
+            "202604270000001_add_comment_count_to_posts"
         );
     }
 
     #[test]
     fn the_counter_migration_gets_its_own_diesel_version() {
-        // Diesel keys `__diesel_schema_migrations` on the numeric prefix, so
-        // sharing the scaffold's `{timestamp}_create_{table}` version would mean
-        // one of the two schema changes never applies.
+        // Diesel keys `__diesel_schema_migrations` on the prefix, so sharing the
+        // scaffold's `{timestamp}_create_{table}` version would mean one of the
+        // two schema changes never applies.
         let scaffold_version = "20260427000000";
         let dir = migration_dir_name(scaffold_version, "comment_count", "posts");
         let version = dir.split('_').next().expect("a version prefix");
         assert_ne!(version, scaffold_version);
-        assert_eq!(version.len(), scaffold_version.len(), "width is preserved");
         assert!(
             version > scaffold_version,
             "the parent column is added after the child table exists"
         );
+    }
+
+    #[test]
+    fn the_counter_version_does_not_claim_a_later_scaffolds_timestamp() {
+        // `timestamp + 1` would reserve the version a scaffold run one second
+        // later takes for its own create-table migration, breaking *that* run.
+        let this_second = "20260427000000";
+        let next_second = "20260427000001";
+        let ours = next_migration_version(this_second);
+        assert_ne!(ours, next_second);
+        assert!(ours.as_str() > this_second, "sorts after its own scaffold");
+        assert!(
+            ours.as_str() < next_second,
+            "and before the next second's scaffold"
+        );
+        // Including across a carry in the timestamp's minute field.
+        assert!(next_migration_version("20260427005959").as_str() < "20260427010000");
     }
 
     #[test]

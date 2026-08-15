@@ -32,7 +32,7 @@ use thiserror::Error;
 // code, generated repositories and application escape hatches all name them
 // through `autumn_web::repository::…`, next to `AutumnDependents`.
 pub use crate::counter_cache::{
-    AutumnCounterCaches, ChildState, CounterCacheSpec, counter_cache_after_insert,
+    AutumnCounterCaches, ChildState, CounterCacheSpec, TenantScope, counter_cache_after_insert,
     counter_cache_after_insert_by_id, counter_cache_after_insert_many, counter_cache_after_update,
     counter_cache_after_update_many, counter_cache_after_upsert_many, counter_cache_apply_delta,
     counter_cache_apply_delta_by_child_id, counter_cache_before_delete_by_id,

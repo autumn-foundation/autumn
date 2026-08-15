@@ -161,6 +161,16 @@ drift, and it is the supported adoption path:
 2. add `counter_cache` to the child's `#[belongs_to]`;
 3. deploy, then call `recompute_counter_caches()` once.
 
+You do not have to take the application down to do it. Safety against live
+traffic is not free, though: a repair that simply counted would *introduce*
+drift, because a child insert that has already taken the parent's row lock but
+has not committed is invisible to the repair's snapshot, so the repair would
+overwrite that increment the moment it commits. Each batch therefore locks the
+parents it is about to rebuild in a separate, earlier statement, which forces
+the repair and the increment into a definite order either way round. The sweep
+runs in batches of 1,000 parents, one short transaction each, so it never holds
+locks over the whole table.
+
 Counters are deliberately **not** clamped at zero. A negative count is a visible
 signal that something wrote around the framework; `GREATEST(0, …)` would hide it.
 `recompute` is the fix.
