@@ -55,11 +55,20 @@ already defaults to `{name}_count` and because `posts.comment_count` /
 `subreddits.subscriber_count` are the columns this project's own examples have
 shipped since their first migration. Name it explicitly when your column differs.
 
-Two conventions are assumed, and both match what `belongs_to` already assumes for
-eager loading:
+Two conventions are assumed about the **parent**, and both match what
+`belongs_to` already assumes for eager loading:
 
 - the **parent table** is derived from the target type (`Post` → `posts`);
 - the **parent primary key** is `id`.
+
+Neither is checked at compile time — `#[model]` on the child cannot see the
+parent's fields, so a parent that overrides its table (`#[model(table =
+"person")]`) or keys on something other than `id` produces SQL that fails at
+runtime (`relation "people" does not exist`) rather than a compile error. The
+same is true of a typo in `counter_cache = "…"`. Those are the parent-side
+conventions to check when adopting the attribute; the child side (its table, its
+primary key, its foreign key) is all resolved from the model the attribute sits
+on and cannot drift.
 
 ## The required migration
 
@@ -220,6 +229,12 @@ is raw SQL) but not readable from Rust.
 - **One column per (parent table, column).** Two counter-cached legs resolving
   onto the same parent column are a compile error — they would both move it and
   double-count. Two legs to *different* parent tables may share a column name.
+  The check keys on the *convention-derived* parent table, so two legs to two
+  type names that a `table = "…"` override collapses onto one physical table are
+  not caught.
+- **A single primary key.** The maintenance addresses the child by one id, so a
+  composite `#[id]` is a compile error rather than a decrement keyed on the first
+  component.
 - **`i64` keys.** The whole surface is typed on `i64` primary and foreign keys,
   like the rest of autumn's repository layer.
 - **Same database.** The parent `UPDATE` runs on the child's connection, so a

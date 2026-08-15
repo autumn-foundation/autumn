@@ -772,9 +772,11 @@ fn parse_assoc_attr(
             ),
         ));
     }
-    if counter_cache.is_some() && explicit_through.is_some() {
-        return Err(syn::Error::new_spanned(
-            &target,
+    if let Some(decl) = counter_cache.as_ref()
+        && explicit_through.is_some()
+    {
+        return Err(syn::Error::new(
+            decl.span,
             "`counter_cache` is not supported on a `through = <join_table>` \
              (many-to-many) association: its foreign key names a column on the \
              join table, not on this model, so the generated increment would \
@@ -1180,12 +1182,42 @@ fn emit_counter_caches_impl(
         return Ok(TokenStream::new());
     }
 
+    // A composite key cannot back a counter cache: the maintenance addresses the
+    // child by ONE value, so with two `#[id]` fields the decrement would key on
+    // whichever rows share the first component and move every one of their
+    // parents. Reject rather than silently corrupt (the same call `#[votable]`
+    // makes for the same reason).
+    let id_fields: Vec<&syn::Ident> = all_fields
+        .iter()
+        .filter(|f| has_attr(f, "id"))
+        .filter_map(|f| f.ident.as_ref())
+        .collect();
+    if id_fields.len() > 1 {
+        let listed = id_fields
+            .iter()
+            .map(|i| format!("`{i}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let span = cached[0]
+            .counter_cache
+            .as_ref()
+            .map_or_else(proc_macro2::Span::call_site, |d| d.span);
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "`counter_cache` requires a single primary key: model \
+                 `{model_ident}` declares a composite key ({listed}), and the \
+                 counter maintenance identifies its child row by one id — the \
+                 decrement would key on every row sharing the first component"
+            ),
+        ));
+    }
     let Some(pk_ident) = pk_ident else {
         return Err(syn::Error::new_spanned(
             model_ident,
-            "`counter_cache` requires the child model to declare an `#[id]` \
-             primary-key field: the maintenance resolves the parent from the \
-             child row by primary key",
+            "`counter_cache` requires the child model to have a primary-key \
+             field: the maintenance resolves the parent from the child row by \
+             primary key. Mark one with `#[id]`",
         ));
     };
     let pk_column = pk_ident.to_string();
@@ -5114,9 +5146,21 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let cc_has_deleted_at = all_fields
             .iter()
             .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
+        // Same fallback every other primary-key consumer in this macro uses
+        // (`id_field_names`, the factory PK, `#[votable]`): an explicit `#[id]`,
+        // else the first integer field. Hard-requiring `#[id]` would reject
+        // models the rest of `#[model]` accepts — and, because the error
+        // short-circuits the whole macro, would bury it under a cascade of
+        // "cannot find type" errors from the paired `#[repository]`.
         let cc_pk_ident = all_fields
             .iter()
             .find(|f| has_attr(f, "id"))
+            .or_else(|| {
+                all_fields.iter().find(|f| match &f.ty {
+                    syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                    _ => false,
+                })
+            })
             .and_then(|f| f.ident.as_ref());
         match emit_counter_caches_impl(
             name,

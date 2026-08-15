@@ -1319,12 +1319,16 @@ async fn a_cross_tenant_foreign_key_moves_no_counter() {
             repo.save(&NewCcTenantComment {
                 body: "trespass".into(),
                 post_id: theirs,
+                // Overwritten by the tenant-scoped insert; the struct still
+                // declares the column.
+                tenant_id: "acme".into(),
             })
             .await
             .expect("the insert itself is not what we are testing");
             repo.save(&NewCcTenantComment {
                 body: "legitimate".into(),
                 post_id: mine,
+                tenant_id: "acme".into(),
             })
             .await
             .expect("save");
