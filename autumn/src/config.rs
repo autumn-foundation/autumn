@@ -162,6 +162,15 @@
 //! | `AUTUMN_FAILURE_CAPTURE__MAX_BODY_BYTES` | `failure_capture.max_body_bytes` | `usize` |
 //! | `AUTUMN_FAILURE_CAPTURE__MAX_CAPSULE_BYTES` | `failure_capture.max_capsule_bytes` | `usize` |
 //! | `AUTUMN_FAILURE_CAPTURE__MAX_CAPSULES` | `failure_capture.max_capsules` | `usize` |
+//! | `AUTUMN_CLUSTER__ENABLED` | `cluster.enabled` | `bool` |
+//! | `AUTUMN_CLUSTER__SECRET` | `cluster.secret` | `SecretString` |
+//! | `AUTUMN_CLUSTER__CLUSTER_NAME` | `cluster.cluster_name` | `String` |
+//! | `AUTUMN_CLUSTER__BIND_ADDR` | `cluster.bind_addr` | `String` |
+//! | `AUTUMN_CLUSTER__ADVERTISE_ADDR` | `cluster.advertise_addr` | `String` |
+//! | `AUTUMN_CLUSTER__SEED_PEERS` | `cluster.seed_peers` | comma-separated addresses |
+//! | `AUTUMN_CLUSTER__NODE_ID` | `cluster.node_id` | `String` |
+//! | `AUTUMN_CLUSTER__PUSH_INTERVAL_MS` | `cluster.push_interval_ms` | `u64` |
+//! | `AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS` | `cluster.suspicion_timeout_ms` | `u64` |
 
 use std::path::{Path, PathBuf};
 
@@ -1041,6 +1050,25 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub failure_capture: FailureCaptureConfig,
 
+    /// Embedded self-clustering control plane (`[cluster]` section, issue
+    /// #1762).
+    ///
+    /// Off by default. See [`ClusterConfig`] and `docs/guide/clustering.md`.
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// Declared here, before [`database`](Self::database), for the same reason
+    /// [`deploy`](Self::deploy) and [`failure_capture`](Self::failure_capture)
+    /// are: `DatabaseConfig`'s `deserialize_with` duration field aborts the
+    /// `SchemaDeserializer` traversal, so a section declared after it is
+    /// recorded only as an opaque root leaf and strict unknown-key validation
+    /// never descends into its children — a typo like
+    /// `[cluster] seed_peer = […]` would then be silently accepted. The
+    /// regression guard `cluster_child_keys_are_strictly_validated` fails if
+    /// this ordering breaks.
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+
     /// Database connection settings (URL, pool size, timeouts).
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -1905,6 +1933,145 @@ const fn default_channel_replay_buffer() -> usize {
 
 fn default_channels_redis_prefix() -> String {
     "autumn:channels".to_owned()
+}
+
+// ── Cluster configuration ────────────────────────────────────────────────────
+
+/// Embedded self-clustering control plane (`[cluster]` section, issue #1762).
+///
+/// Off by default. When enabled, the node binds a small authenticated gossip
+/// listener, discovers the peers named in `seed_peers`, and exposes a
+/// cluster-wide counter through
+/// [`ClusterHandle`](crate::cluster::ClusterHandle). No external coordination
+/// service is involved — see `docs/guide/clustering.md`.
+///
+/// The transport is **authenticated (HMAC-SHA256), not encrypted**: run it on a
+/// trusted network.
+///
+/// Unrelated to [`crate::sharding`]'s database-"cluster" vocabulary.
+///
+/// # Examples
+///
+/// ```toml
+/// [cluster]
+/// enabled = true
+/// secret = "a-shared-secret-at-least-16-bytes"
+/// bind_addr = "0.0.0.0:7946"
+/// advertise_addr = "10.0.0.4:7946"
+/// seed_peers = ["10.0.0.5:7946"]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClusterConfig {
+    /// Master switch. When `false` (the default) nothing is bound, nothing is
+    /// spawned, and `state.extension::<ClusterHandle>()` is `None`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Shared secret every member signs its frames with (minimum 16 bytes).
+    ///
+    /// Stored as a [`secrecy::SecretString`] so the raw value is redacted from
+    /// `Debug` output and zeroized on drop. Call
+    /// [`secrecy::ExposeSecret::expose_secret`] at the point of use.
+    #[serde(default)]
+    pub secret: Option<secrecy::SecretString>,
+
+    /// Cluster name. Signed into every frame, so two clusters that share a
+    /// secret still refuse each other's traffic.
+    #[serde(default = "default_cluster_name")]
+    pub cluster_name: String,
+
+    /// Address the cluster listener binds. Port `0` takes an OS-assigned
+    /// ephemeral port, readable back through `ClusterHandle::local_addr`.
+    #[serde(default = "default_cluster_bind_addr")]
+    pub bind_addr: String,
+
+    /// Address advertised to peers when it differs from `bind_addr` (NAT,
+    /// container port mapping). Defaults to the bound address.
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
+
+    /// Peer addresses to dial on startup. One reachable seed is enough.
+    #[serde(default)]
+    pub seed_peers: Vec<String>,
+
+    /// Explicit node id. Entropy-derived when absent (never hostname-derived).
+    #[serde(default)]
+    pub node_id: Option<String>,
+
+    /// Base interval between state pushes, in milliseconds. The push is also
+    /// the heartbeat, so this is the failure-detector's sampling rate.
+    #[serde(default = "default_cluster_push_interval_ms")]
+    pub push_interval_ms: u64,
+
+    /// How long without a push before a peer is suspected, in milliseconds.
+    /// Must be at least three push intervals (anti-flap hysteresis).
+    #[serde(default = "default_cluster_suspicion_timeout_ms")]
+    pub suspicion_timeout_ms: u64,
+}
+
+fn default_cluster_name() -> String {
+    "autumn".to_owned()
+}
+
+fn default_cluster_bind_addr() -> String {
+    "127.0.0.1:0".to_owned()
+}
+
+const fn default_cluster_push_interval_ms() -> u64 {
+    500
+}
+
+const fn default_cluster_suspicion_timeout_ms() -> u64 {
+    2_500
+}
+
+/// Shortest secret accepted when `[cluster] enabled = true`.
+pub(crate) const MIN_CLUSTER_SECRET_LEN: usize = 16;
+
+/// Shortest push interval accepted, in milliseconds.
+pub(crate) const MIN_CLUSTER_PUSH_INTERVAL_MS: u64 = 10;
+
+/// The suspicion timeout must be at least this many push intervals.
+pub(crate) const MIN_CLUSTER_SUSPICION_MULTIPLE: u64 = 3;
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secret: None,
+            cluster_name: default_cluster_name(),
+            bind_addr: default_cluster_bind_addr(),
+            advertise_addr: None,
+            seed_peers: Vec::new(),
+            node_id: None,
+            push_interval_ms: default_cluster_push_interval_ms(),
+            suspicion_timeout_ms: default_cluster_suspicion_timeout_ms(),
+        }
+    }
+}
+
+impl ClusterConfig {
+    /// Fail fast on a `[cluster]` section that would boot an insecure or
+    /// flapping cluster.
+    ///
+    /// When `enabled`:
+    /// - `secret` must be present and at least
+    ///   [`MIN_CLUSTER_SECRET_LEN`] bytes;
+    /// - `push_interval_ms` must be at least
+    ///   [`MIN_CLUSTER_PUSH_INTERVAL_MS`];
+    /// - `suspicion_timeout_ms` must be at least
+    ///   [`MIN_CLUSTER_SUSPICION_MULTIPLE`] × `push_interval_ms`;
+    /// - `bind_addr`, `advertise_addr` and every `seed_peers` entry must parse
+    ///   as a socket address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] describing the first violated rule.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // RED-PHASE STUB: the green phase implements the rules above. Kept
+        // total (and wired into `AutumnConfig::validate`) so the seam exists.
+        Ok(())
+    }
 }
 
 // ── Cache configuration ──────────────────────────────────────────────────────
@@ -3772,6 +3939,9 @@ impl AutumnConfig {
         #[cfg(feature = "mail")]
         self.mail.validate(self.profile.as_deref())?;
         self.time_zone.validate()?;
+        // Fail fast on an insecure or flapping [cluster] section: a node that
+        // would boot without a shared secret must not boot at all.
+        self.cluster.validate()?;
         // Session backend validation deliberately lives in
         // `crate::session::build_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
@@ -3847,6 +4017,17 @@ impl AutumnConfig {
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` -> `security.webhooks.replay.redis.url` (`String`)
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__KEY_PREFIX` -> `security.webhooks.replay.redis.key_prefix` (`String`)
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__ALLOW_MEMORY_IN_PRODUCTION` -> `security.webhooks.replay.allow_memory_in_production` (`bool`)
+    ///
+    /// # Cluster
+    /// - `AUTUMN_CLUSTER__ENABLED` → `cluster.enabled` (`bool`)
+    /// - `AUTUMN_CLUSTER__SECRET` → `cluster.secret` (`SecretString`)
+    /// - `AUTUMN_CLUSTER__CLUSTER_NAME` → `cluster.cluster_name` (`String`)
+    /// - `AUTUMN_CLUSTER__BIND_ADDR` → `cluster.bind_addr` (`String`)
+    /// - `AUTUMN_CLUSTER__ADVERTISE_ADDR` → `cluster.advertise_addr` (`String`)
+    /// - `AUTUMN_CLUSTER__SEED_PEERS` → `cluster.seed_peers` (comma-separated addresses)
+    /// - `AUTUMN_CLUSTER__NODE_ID` → `cluster.node_id` (`String`)
+    /// - `AUTUMN_CLUSTER__PUSH_INTERVAL_MS` → `cluster.push_interval_ms` (`u64`)
+    /// - `AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS` → `cluster.suspicion_timeout_ms` (`u64`)
     pub fn apply_env_overrides(&mut self) {
         self.apply_env_overrides_with_env(&OsEnv);
     }
@@ -3889,6 +4070,39 @@ impl AutumnConfig {
         self.apply_time_zone_env_overrides_with_env(env);
         self.apply_alerts_env_overrides_with_env(env);
         self.apply_tenancy_env_overrides_with_env(env);
+        self.apply_cluster_env_overrides_with_env(env);
+    }
+
+    fn apply_cluster_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_CLUSTER__ENABLED", &mut self.cluster.enabled);
+        parse_env_option_secret(env, "AUTUMN_CLUSTER__SECRET", &mut self.cluster.secret);
+        parse_env_string(
+            env,
+            "AUTUMN_CLUSTER__CLUSTER_NAME",
+            &mut self.cluster.cluster_name,
+        );
+        parse_env_string(env, "AUTUMN_CLUSTER__BIND_ADDR", &mut self.cluster.bind_addr);
+        parse_env_option_string(
+            env,
+            "AUTUMN_CLUSTER__ADVERTISE_ADDR",
+            &mut self.cluster.advertise_addr,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_CLUSTER__SEED_PEERS",
+            &mut self.cluster.seed_peers,
+        );
+        parse_env_option_string(env, "AUTUMN_CLUSTER__NODE_ID", &mut self.cluster.node_id);
+        parse_env(
+            env,
+            "AUTUMN_CLUSTER__PUSH_INTERVAL_MS",
+            &mut self.cluster.push_interval_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS",
+            &mut self.cluster.suspicion_timeout_ms,
+        );
     }
 
     fn apply_tenancy_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -10484,6 +10698,162 @@ path = "/healthz"
             "a bogus [failure_capture] child key must be rejected by strict validation, \
              got: {errors:?}"
         );
+    }
+
+    // ── [cluster] (issue #1762) ──────────────────────────────────────────
+
+    /// A cluster with no shared secret is an unauthenticated cluster: anyone
+    /// who can reach the port can inject state. Boot must fail, not warn.
+    #[test]
+    fn cluster_enabled_requires_secret() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = None;
+
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "[cluster] enabled = true with no secret must fail validation, got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("secret"),
+            "the error must name the missing key so an operator can fix it; got {message:?}"
+        );
+
+        // Disabled clusters need nothing: the default config must still boot.
+        assert!(
+            AutumnConfig::default().cluster.validate().is_ok(),
+            "a disabled [cluster] section must validate with no secret at all"
+        );
+    }
+
+    #[test]
+    fn cluster_rejects_short_secret() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from("too-short".to_owned()));
+
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "a secret shorter than {MIN_CLUSTER_SECRET_LEN} bytes must be refused, got {result:?}"
+        );
+
+        // …and a long-enough secret must be accepted, or the rule is vacuous.
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+        assert!(
+            config.cluster.validate().is_ok(),
+            "a secret of at least {MIN_CLUSTER_SECRET_LEN} bytes must be accepted"
+        );
+    }
+
+    /// Anti-flap hysteresis: a suspicion timeout under three push intervals
+    /// turns one lost packet into a membership change.
+    #[test]
+    fn cluster_rejects_suspicion_below_3x_push_interval() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+        config.cluster.push_interval_ms = 500;
+        config.cluster.suspicion_timeout_ms = 1_000;
+
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "suspicion_timeout_ms must be at least {MIN_CLUSTER_SUSPICION_MULTIPLE}x \
+             push_interval_ms, got {result:?}"
+        );
+
+        config.cluster.suspicion_timeout_ms = 1_500;
+        assert!(
+            config.cluster.validate().is_ok(),
+            "exactly {MIN_CLUSTER_SUSPICION_MULTIPLE}x the push interval must be accepted"
+        );
+
+        // A push interval below the floor is refused too.
+        config.cluster.push_interval_ms = 1;
+        config.cluster.suspicion_timeout_ms = 3;
+        assert!(
+            config.cluster.validate().is_err(),
+            "push_interval_ms below {MIN_CLUSTER_PUSH_INTERVAL_MS}ms must be refused"
+        );
+    }
+
+    /// Counter cells are keyed `"{node_id}#{incarnation}"`, so a `#` in a node
+    /// id (or a cluster name, which is signed alongside it) makes the key
+    /// ambiguous. Validation refuses it rather than shipping a counter whose
+    /// cells can collide.
+    #[test]
+    fn cluster_rejects_node_id_with_cell_separator() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+
+        config.cluster.node_id = Some("node#1".to_owned());
+        assert!(
+            config.cluster.validate().is_err(),
+            "a node_id containing '#' must be refused: it is the counter cell-key separator"
+        );
+
+        config.cluster.node_id = Some("node-1".to_owned());
+        config.cluster.cluster_name = "orch#ard".to_owned();
+        assert!(
+            config.cluster.validate().is_err(),
+            "a cluster_name containing '#' must be refused for the same reason"
+        );
+
+        config.cluster.cluster_name = "orchard".to_owned();
+        assert!(
+            config.cluster.validate().is_ok(),
+            "…and separator-free names must be accepted, or the rule is vacuous"
+        );
+    }
+
+    #[test]
+    fn cluster_env_overrides_apply() {
+        let env = MockEnv::new()
+            .with("AUTUMN_CLUSTER__ENABLED", "true")
+            .with("AUTUMN_CLUSTER__SECRET", "a-shared-cluster-secret-value")
+            .with("AUTUMN_CLUSTER__CLUSTER_NAME", "orchard")
+            .with("AUTUMN_CLUSTER__BIND_ADDR", "0.0.0.0:7946")
+            .with("AUTUMN_CLUSTER__ADVERTISE_ADDR", "10.0.0.4:7946")
+            .with(
+                "AUTUMN_CLUSTER__SEED_PEERS",
+                "10.0.0.5:7946, 10.0.0.6:7946",
+            )
+            .with("AUTUMN_CLUSTER__NODE_ID", "node-a")
+            .with("AUTUMN_CLUSTER__PUSH_INTERVAL_MS", "250")
+            .with("AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS", "1500");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.cluster.enabled);
+        assert_eq!(
+            config
+                .cluster
+                .secret
+                .as_ref()
+                .map(|s| secrecy::ExposeSecret::expose_secret(s).to_owned()),
+            Some("a-shared-cluster-secret-value".to_owned())
+        );
+        assert_eq!(config.cluster.cluster_name, "orchard");
+        assert_eq!(config.cluster.bind_addr, "0.0.0.0:7946");
+        assert_eq!(config.cluster.advertise_addr.as_deref(), Some("10.0.0.4:7946"));
+        assert_eq!(
+            config.cluster.seed_peers,
+            vec!["10.0.0.5:7946".to_owned(), "10.0.0.6:7946".to_owned()],
+            "AUTUMN_CLUSTER__SEED_PEERS must split on commas and trim"
+        );
+        assert_eq!(config.cluster.node_id.as_deref(), Some("node-a"));
+        assert_eq!(config.cluster.push_interval_ms, 250);
+        assert_eq!(config.cluster.suspicion_timeout_ms, 1_500);
     }
 
     #[test]

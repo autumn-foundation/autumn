@@ -113,6 +113,7 @@ pub mod canary;
 #[cfg(feature = "reporting")]
 pub mod capsule;
 pub mod circuit_breaker;
+pub mod cluster;
 pub mod config;
 pub mod consent;
 pub mod credentials;

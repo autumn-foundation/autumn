@@ -321,6 +321,46 @@ fn deploy_child_keys_are_strictly_validated() {
     );
 }
 
+/// Regression guard for the `[cluster]` field ordering (issue #1762).
+///
+/// Same landmine as `deploy_child_keys_are_strictly_validated`: the strict
+/// unknown-key validator only descends into a config.rs-internal section
+/// declared *before* `database`, because `DatabaseConfig`'s `deserialize_with`
+/// duration field aborts the `SchemaDeserializer` walk. `[cluster]` carries a
+/// shared secret and a bind address — a silently-accepted typo there is a node
+/// that never joins, or joins something it should not. If someone moves
+/// `cluster` below `database`, its child keys vanish from the schema and this
+/// fails.
+#[test]
+fn cluster_child_keys_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "cluster.enabled",
+        "cluster.secret",
+        "cluster.cluster_name",
+        "cluster.bind_addr",
+        "cluster.advertise_addr",
+        "cluster.seed_peers",
+        "cluster.node_id",
+        "cluster.push_interval_ms",
+        "cluster.suspicion_timeout_ms",
+    ] {
+        assert!(
+            leaves.contains(key),
+            "{key} must be a schema leaf so strict validation descends into [cluster]; \
+             if this fails, `cluster` was likely moved below `database` in AutumnConfig"
+        );
+    }
+
+    // End-to-end: the strict validator flags an unknown child key under [cluster].
+    let schema = AutumnConfig::get_schema_keys();
+    let errors = AutumnConfig::validate_toml("[cluster]\nseed_peer = [\"127.0.0.1:7946\"]\n", &schema);
+    assert!(
+        errors.iter().any(|(path, _)| path == "cluster.seed_peer"),
+        "a bogus [cluster] child key must be rejected by strict validation, got: {errors:?}"
+    );
+}
+
 /// #1890: config.rs-internal sections declared AFTER `database` used to vanish
 /// from the derived schema because the `statement_timeout` duration field
 /// aborted the `SchemaDeserializer` walk. The tolerant `deserialize_any` probe
