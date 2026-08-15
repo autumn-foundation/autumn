@@ -349,7 +349,7 @@ impl LivenessOverlay {
     /// How long a `Left` tombstone is kept before
     /// [`ClusterState::prune_tombstones`] drops it:
     /// [`TOMBSTONE_TIMEOUT_MULTIPLE`] suspicion timeouts.
-    fn tombstone_timeout(&self) -> Duration {
+    const fn tombstone_timeout(&self) -> Duration {
         self.suspicion_timeout
             .saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE)
     }
