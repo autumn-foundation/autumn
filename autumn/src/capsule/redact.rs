@@ -421,23 +421,31 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
 /// or `service` is an ordinary word, and masking it everywhere would shred
 /// unrelated prose while protecting nothing that the pair and the password do
 /// not already cover.
+///
+/// Everything here works on **bytes**, deliberately. RFC 7617 leaves the
+/// charset open and the historical default is not UTF-8, so a username
+/// carrying a legacy-encoded byte would take an ASCII password down with it if
+/// the pair had to parse as text first. A handler splits the decoded bytes and
+/// holds that password regardless; the echo set is byte-keyed, so a bind equal
+/// to it is masked either way, and only free-form text masking — which needs
+/// valid UTF-8 to search — quietly skips what it cannot represent.
 fn record_basic_credentials(credential: &str, values: &mut RedactedValues) {
-    // Not Base64, or not text once decoded: nothing here can be split into
-    // components, and the Base64 itself is already in the set.
+    // Not Base64: nothing to split, and the Base64 itself is already in the
+    // set.
     let Ok(decoded) = STANDARD.decode(credential) else {
         return;
     };
-    let Ok(decoded) = String::from_utf8(decoded) else {
-        return;
-    };
     // RFC 7617 splits on the *first* colon; a password may contain more.
-    let Some((_, password)) = decoded.split_once(':') else {
+    let Some(colon) = decoded.iter().position(|byte| *byte == b':') else {
         return;
     };
-    values.insert(decoded.as_bytes());
+    let Some(password) = decoded.get(colon.saturating_add(1)..) else {
+        return;
+    };
     if !password.is_empty() {
-        values.insert(password.as_bytes());
+        values.insert(password);
     }
+    values.insert(&decoded);
 }
 
 /// Whether `word` is a syntactically valid authorization scheme — an RFC 7235
@@ -1162,6 +1170,22 @@ mod tests {
             !basic.contains(b"alice"),
             "the username is an ordinary word, like a cookie name"
         );
+        // RFC 7617 leaves the charset open, so a legacy-encoded username must
+        // not take an ASCII password down with it. base64(b"\xffuser:hunter2").
+        let (_request, latin1) = redact(
+            Request::get("/").header(header::AUTHORIZATION, "Basic /3VzZXI6aHVudGVyMg=="),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            latin1.contains(b"hunter2"),
+            "a valid password must survive a username that is not UTF-8"
+        );
+        assert!(
+            latin1.contains(b"\xffuser:hunter2".as_slice()),
+            "the decoded pair is retained as bytes, not as text"
+        );
+
         // Anything that is not Base64 of `user:password` contributes nothing
         // beyond the whole value — no panic, no half-parsed component.
         let (_request, not_basic) = redact(
