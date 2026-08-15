@@ -35,7 +35,16 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bumped whenever the schema changes in a way a previous reader cannot
 /// tolerate. Replay refuses any capsule whose `format_version` differs.
-pub const CAPSULE_FORMAT_VERSION: u32 = 1;
+///
+/// A *semantic* field counts as such a change even though `serde` would
+/// happily ignore it. [`Capsule::db_roles`] is the case that made this
+/// concrete: a v1 reader skips the unknown field, rebuilds no database
+/// topology for a capsule whose `db` is `null`, and a handler that checks
+/// pool availability before querying takes a branch the recording never took
+/// — a `mismatch` the guide tells operators to read as "the bug is gone".
+/// Tolerating the document silently is precisely what the version gate exists
+/// to prevent, so adding the field bumps the version.
+pub const CAPSULE_FORMAT_VERSION: u32 = 2;
 
 /// Errors surfaced when reading a capsule back from disk.
 #[derive(Debug)]
