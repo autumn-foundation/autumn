@@ -346,6 +346,46 @@ introspected — a non-empty opaque table emits a `tracing::warn!`
 ("check skipped") rather than a false pass. See
 `docs/guide/getting-started.md` "Route collision diagnostics".
 
+### Markdown-backed pages + SSG (feature `markdown`)
+
+`MarkdownRegistry` parses `.md` files with `+++` TOML frontmatter (`title`
+required; `description`/`order` default to `""`/`0`) and pairs with
+`#[static_get]` so one handler serves live requests in dev and pre-renders in
+`autumn build`. Build it once in a `OnceLock` from `from_embedded(&[MarkdownSource
+{ slug, content: include_str!(...) }])` or `from_dir(path)` (non-recursive);
+pages sort by `(order, slug)`.
+
+```rust
+async fn doc_params(_router: axum::Router) -> Vec<StaticParams> {
+    docs().static_params()            // one entry per page, keyed "slug"
+}
+
+#[static_get("/docs/{slug}", params = doc_params)]
+async fn show(Path(slug): Path<String>) -> AutumnResult<Markup> {
+    let page = docs().get(&slug).ok_or_else(AutumnError::not_found)?;
+    let out = render(&page.body, RenderOptions::default());
+    Ok(layout(&page.frontmatter.title, html! { (PreEscaped(&out.html)) }))
+}
+```
+
+`static_params()` keys every entry `"slug"`. If the route names its parameter
+anything else — `#[static_get("/docs/{page}", …)]` — use
+`static_params_for("page")` (unreleased — trunk-dev, issue #743); a mismatched
+key leaves `{page}` unsubstituted and the SSG build panics on the invalid URI.
+
+`render` returns `{ html, toc }` and injects heading anchors. Anchors are
+document-unique: each heading keeps the slug its own text produces, and only
+*repeats* are suffixed `-1`, `-2`, … A suffix never takes a slug another heading
+owns by name, so `## Example` / `## Example` / `## Example 1` yields `example`,
+`example-2`, `example-1` — deep links stay put. Headings with no alphanumeric
+characters get no `id` at all.
+
+`render` is for **trusted, build-time content only** — it applies no URL-scheme
+allowlist. For anything a request body carried in, use `render_user_content`
+(see [rich text](../../docs/guide/rich-text.md)). The framework ships no docs
+theme; compose `out.html`/`out.toc` into your own Maud layout. Worked example:
+`examples/wiki` (`src/routes/docs.rs` + `content/*.md`).
+
 ## Models and repositories
 
 Autumn uses Diesel + diesel-async for Postgres. Primary keys are `i64` /
