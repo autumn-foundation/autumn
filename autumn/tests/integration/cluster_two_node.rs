@@ -76,6 +76,15 @@ fn cluster_config(seed_peers: Vec<String>) -> ClusterConfig {
 fn app_config(cluster: ClusterConfig) -> AutumnConfig {
     AutumnConfig {
         cluster,
+        // `/actuator/health` renders a component's `details` map only when
+        // `health.detailed` is on — the `dev` profile turns it on, the bare
+        // `AutumnConfig::default()` these tests build does not. Without this
+        // the membership component still appears (status `UP`) but with no
+        // details at all, and every assertion below would be reading `null`.
+        health: autumn_web::config::HealthConfig {
+            detailed: true,
+            ..autumn_web::config::HealthConfig::default()
+        },
         ..AutumnConfig::default()
     }
 }
@@ -124,6 +133,23 @@ async fn http_get(addr: SocketAddr, path: &str) -> String {
         return String::new();
     }
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The cluster membership facts a `/actuator/health` body reports, as
+/// `(details.member_count, details.members.len())`.
+///
+/// Both halves are asserted together on purpose: the guide defines
+/// `member_count` as the number and `members` as the array of
+/// `{id, addr, status, incarnation}` rows, and a count that disagrees with the
+/// array it summarises is exactly the bug this pair catches. `(0, 0)` when the
+/// component is absent, so a missing indicator fails as a mismatch rather than
+/// as a panic.
+fn membership(health: &serde_json::Value) -> (u64, usize) {
+    let details = &health["components"]["cluster:membership"]["details"];
+    (
+        details["member_count"].as_u64().unwrap_or(0),
+        details["members"].as_array().map_or(0, Vec::len),
+    )
 }
 
 /// The JSON body of an HTTP/1.1 response, or `Null` when there isn't one.
@@ -279,14 +305,14 @@ async fn tcp_survivor_converges_after_peer_cancelled() {
 /// the survivor).
 #[tokio::test(flavor = "multi_thread")]
 async fn full_app_two_nodes_health_and_counter_via_http() {
-    let cluster_a_shutdown = CancellationToken::new();
-    let cluster_b_shutdown = CancellationToken::new();
+    let shutdown_cluster_a = CancellationToken::new();
+    let shutdown_cluster_b = CancellationToken::new();
     let http_shutdown = CancellationToken::new();
 
     let config_a = cluster_config(Vec::new());
     let app_a = TestApp::new().config(app_config(config_a.clone())).build();
     let state_a = app_a.state().clone();
-    install_from_config(&state_a, &config_a, &cluster_a_shutdown).expect("node A must install");
+    install_from_config(&state_a, &config_a, &shutdown_cluster_a).expect("node A must install");
     let handle_a = state_a
         .extension::<ClusterHandle>()
         .expect("node A must expose a ClusterHandle");
@@ -294,7 +320,7 @@ async fn full_app_two_nodes_health_and_counter_via_http() {
     let config_b = cluster_config(vec![handle_a.local_addr().to_string()]);
     let app_b = TestApp::new().config(app_config(config_b.clone())).build();
     let state_b = app_b.state().clone();
-    install_from_config(&state_b, &config_b, &cluster_b_shutdown).expect("node B must install");
+    install_from_config(&state_b, &config_b, &shutdown_cluster_b).expect("node B must install");
     let handle_b = state_b
         .extension::<ClusterHandle>()
         .expect("node B must expose a ClusterHandle");
@@ -306,20 +332,23 @@ async fn full_app_two_nodes_health_and_counter_via_http() {
     poll_until(CONVERGE_TIMEOUT, || async move {
         let a = json_body(&http_get(http_a, "/actuator/health").await);
         let b = json_body(&http_get(http_b, "/actuator/health").await);
-        a["components"]["cluster:membership"]["details"]["members"] == 2
-            && b["components"]["cluster:membership"]["details"]["members"] == 2
+        membership(&a) == (2, 2) && membership(&b) == (2, 2)
     })
     .await;
 
     let health_a = json_body(&http_get(http_a, "/actuator/health").await);
     let health_b = json_body(&http_get(http_b, "/actuator/health").await);
     assert_eq!(
-        health_a["components"]["cluster:membership"]["details"]["members"], 2,
-        "/actuator/health on node A must report a two-member cluster; got {health_a}"
+        membership(&health_a),
+        (2, 2),
+        "/actuator/health on node A must report a two-member cluster, count and rows \
+         agreeing; got {health_a}"
     );
     assert_eq!(
-        health_b["components"]["cluster:membership"]["details"]["members"], 2,
-        "/actuator/health on node B must report a two-member cluster; got {health_b}"
+        membership(&health_b),
+        (2, 2),
+        "/actuator/health on node B must report a two-member cluster, count and rows \
+         agreeing; got {health_b}"
     );
     assert_eq!(
         health_a["components"]["cluster:membership"]["status"], "UP",
@@ -343,17 +372,16 @@ async fn full_app_two_nodes_health_and_counter_via_http() {
     );
 
     // AC5: A departs; B stays UP and converges to one member.
-    cluster_a_shutdown.cancel();
+    shutdown_cluster_a.cancel();
     poll_until(CONVERGE_TIMEOUT, || async move {
-        json_body(&http_get(http_b, "/actuator/health").await)["components"]
-            ["cluster:membership"]["details"]["members"]
-            == 1
+        membership(&json_body(&http_get(http_b, "/actuator/health").await)) == (1, 1)
     })
     .await;
 
     let survivor = json_body(&http_get(http_b, "/actuator/health").await);
     assert_eq!(
-        survivor["components"]["cluster:membership"]["details"]["members"], 1,
+        membership(&survivor),
+        (1, 1),
         "node B must converge to a one-member view after A leaves; got {survivor}"
     );
     assert_eq!(
@@ -368,7 +396,7 @@ async fn full_app_two_nodes_health_and_counter_via_http() {
         describe("B", &handle_b)
     );
 
-    cluster_b_shutdown.cancel();
+    shutdown_cluster_b.cancel();
     http_shutdown.cancel();
 }
 

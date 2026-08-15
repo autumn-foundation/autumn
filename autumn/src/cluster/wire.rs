@@ -273,13 +273,6 @@ pub const fn frame_len(prefix: [u8; LENGTH_PREFIX_BYTES]) -> Option<usize> {
     }
 }
 
-/// Parse a complete frame (prefix + body) into an envelope. Total: any
-/// malformed input yields `None`.
-pub fn decode_frame(frame: &[u8]) -> Option<Envelope> {
-    let body = frame_body(frame).ok()?;
-    serde_json::from_slice(body).ok()
-}
-
 /// Take exactly the body a frame declares.
 ///
 /// [`RejectReason::Oversize`] is the one connection-fatal verdict (step 1: a
@@ -415,22 +408,12 @@ impl FrameVerifier {
         self.rejected
     }
 
-    /// The cluster name this verifier accepts.
-    pub fn cluster(&self) -> &str {
-        &self.cluster
-    }
-
-    /// The local node id whose frames are dropped as self-origin.
-    pub fn local_id(&self) -> &str {
-        &self.local_id
-    }
-
-    /// The secret this verifier checks MACs against.
-    pub fn secret(&self) -> &[u8] {
-        &self.secret
-    }
-
     /// The `(incarnation, seq)` watermark recorded for `sender`.
+    ///
+    /// Test-only: the watermark is replay-protection bookkeeping, and exposing
+    /// it to production code would invite somebody to make a decision on it
+    /// outside [`Self::accept`], which is the one place that may.
+    #[cfg(test)]
     pub fn watermark(&self, sender: &str) -> Option<(Incarnation, u64)> {
         self.watermarks.get(sender).copied()
     }
@@ -688,12 +671,16 @@ mod tests {
         let mut truncated = 64u32.to_be_bytes().to_vec();
         truncated.extend_from_slice(b"only-a-few-bytes");
 
-        for bad in [
-            b"".as_slice(),
-            b"\x00".as_slice(),
-            &truncated,
-            b"not-a-frame-at-all".as_slice(),
-        ] {
+        // A LEGAL length prefix over a body that is not an envelope — the
+        // "malformed body" case this test is about. The bytes must be framed:
+        // fed raw, `not-` reads as a declared length of 1,852,797,997, which is
+        // over the cap and therefore the connection-fatal `Oversize` verdict
+        // that `frame_len_refuses_zero_and_oversize` pins, not a malformed body
+        // at all (issue #1762 red-phase input bug).
+        let mut junk = 18u32.to_be_bytes().to_vec();
+        junk.extend_from_slice(b"not-a-frame-at-all");
+
+        for bad in [b"".as_slice(), b"\x00".as_slice(), &truncated, &junk] {
             let result = verifier.accept(bad);
             assert!(
                 result.is_err(),

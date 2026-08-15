@@ -124,13 +124,33 @@ pub struct ClusterMemberInfo {
     pub incarnation: u64,
 }
 
+/// Every [`wire::RejectReason`], in the order their per-reason counters are
+/// stored in [`ClusterMetrics::rejected_by_reason`].
+///
+/// Exhaustive on purpose: the `reason` label on
+/// `autumn_cluster_frames_rejected_total` is what turns "somebody is talking to
+/// my port with the wrong secret" into an alert, so every series is published
+/// from boot — a `rate()` over a label that only appears once the attack starts
+/// is a `rate()` nobody wrote an alert for.
+pub(crate) const REJECT_REASONS: [wire::RejectReason; 9] = [
+    wire::RejectReason::Oversize,
+    wire::RejectReason::Malformed,
+    wire::RejectReason::Version,
+    wire::RejectReason::KeyId,
+    wire::RejectReason::Cluster,
+    wire::RejectReason::Mac,
+    wire::RejectReason::SelfOrigin,
+    wire::RejectReason::Replay,
+    wire::RejectReason::Payload,
+];
+
 /// Counters that make cluster behaviour observable from `/actuator/metrics`
 /// and from tests, without asserting on message counts.
 #[derive(Debug, Default)]
 pub(crate) struct ClusterMetrics {
-    /// Frames refused by the verifier for any reason (bad MAC, wrong cluster,
-    /// replay, oversized, malformed, self-origin).
-    pub(crate) frames_rejected: AtomicU64,
+    /// Frames refused by the verifier, one counter per
+    /// [`REJECT_REASONS`] entry and in that order.
+    rejected_by_reason: [AtomicU64; REJECT_REASONS.len()],
     /// Remote documents successfully merged into the local one.
     pub(crate) merges_applied: AtomicU64,
     /// State pushes handed to the transport.
@@ -141,6 +161,45 @@ pub(crate) struct ClusterMetrics {
     /// full, or that peer has no writer). Never an error: anti-entropy re-sends
     /// the whole document on the next interval.
     pub(crate) frames_dropped: AtomicU64,
+}
+
+impl ClusterMetrics {
+    /// Count one refused frame under its reason.
+    ///
+    /// A reason with no slot is impossible ([`REJECT_REASONS`] is exhaustive)
+    /// and is dropped rather than panicked on: the receive loop must survive
+    /// anything, including a future variant somebody forgot to add here.
+    pub(crate) fn record_rejection(&self, reason: wire::RejectReason) {
+        if let Some(counter) = REJECT_REASONS
+            .iter()
+            .position(|candidate| *candidate == reason)
+            .and_then(|index| self.rejected_by_reason.get(index))
+        {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Every `(reason label, count)` pair, including the zeroes.
+    pub(crate) fn rejections_by_reason(&self) -> Vec<(&'static str, u64)> {
+        REJECT_REASONS
+            .iter()
+            .enumerate()
+            .filter_map(|(index, reason)| {
+                self.rejected_by_reason
+                    .get(index)
+                    .map(|counter| (reason.label(), counter.load(Ordering::Relaxed)))
+            })
+            .collect()
+    }
+
+    /// Total frames refused, for any reason.
+    #[cfg(test)]
+    pub(crate) fn rejected_total(&self) -> u64 {
+        self.rejected_by_reason
+            .iter()
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .fold(0, u64::saturating_add)
+    }
 }
 
 /// Everything one cluster node owns, shared between the node's loops and every
@@ -215,6 +274,15 @@ impl ClusterHandle {
         &self.inner.node_id
     }
 
+    /// The cluster this node belongs to (`[cluster] cluster_name`).
+    ///
+    /// Signed into every frame, so two clusters that share a secret still
+    /// refuse each other's traffic.
+    #[must_use]
+    pub fn cluster_name(&self) -> &str {
+        &self.inner.cluster_name
+    }
+
     /// The address this node's cluster listener is actually bound to.
     ///
     /// With the default `bind_addr = "127.0.0.1:0"` this is the OS-assigned
@@ -284,26 +352,180 @@ impl ClusterHandle {
     }
 
     /// This node's current incarnation.
+    ///
+    /// Test-only: the number is an implementation detail of refutation, and the
+    /// operator-facing view of it is the `incarnation` field of each row in the
+    /// `cluster:membership` health component.
+    #[cfg(test)]
     pub(crate) fn incarnation(&self) -> u64 {
         self.inner.incarnation.load(Ordering::Relaxed)
     }
 
     /// Total frames refused by this node's verifier, for any reason.
+    ///
+    /// Test-only: production reads the same counters *with their `reason`
+    /// label* through `autumn_cluster_frames_rejected_total`, which is the
+    /// series an operator can actually act on.
+    #[cfg(test)]
     pub(crate) fn frames_rejected_total(&self) -> u64 {
-        self.inner.metrics.frames_rejected.load(Ordering::Relaxed)
+        self.inner.metrics.rejected_total()
+    }
+}
+
+/// Registration name of the cluster health component and of the cluster
+/// metrics source. `curl /actuator/health | jq '.components["cluster:membership"]'`.
+pub(crate) const MEMBERSHIP_COMPONENT: &str = "cluster:membership";
+
+/// The `cluster:membership` health component.
+///
+/// Registered in [`IndicatorGroup::HealthOnly`](crate::actuator::IndicatorGroup)
+/// and **always `UP`**: it reports the local view, it never grades it. A
+/// one-member view is a healthy view — a node that reported `DOWN` because its
+/// peer went away would hand an orchestrator a reason to restart the last
+/// survivor, which is the one action guaranteed to make the outage total.
+struct ClusterHealthIndicator {
+    handle: ClusterHandle,
+}
+
+impl ClusterHealthIndicator {
+    /// The details map, exactly as documented in `docs/guide/clustering.md`.
+    fn snapshot(&self) -> crate::actuator::HealthCheckOutput {
+        let members = self.handle.members();
+        let rows: Vec<serde_json::Value> = members
+            .iter()
+            .map(|member| {
+                serde_json::json!({
+                    "id": member.id,
+                    "addr": member.addr,
+                    "status": member.status.to_string(),
+                    "incarnation": member.incarnation,
+                })
+            })
+            .collect();
+
+        let details = std::collections::HashMap::from([
+            (
+                "node_id".to_owned(),
+                serde_json::json!(self.handle.node_id()),
+            ),
+            (
+                "cluster".to_owned(),
+                serde_json::json!(self.handle.cluster_name()),
+            ),
+            (
+                "local_addr".to_owned(),
+                serde_json::json!(self.handle.local_addr().to_string()),
+            ),
+            ("member_count".to_owned(), serde_json::json!(members.len())),
+            ("members".to_owned(), serde_json::Value::Array(rows)),
+        ]);
+        crate::actuator::HealthCheckOutput::up().with_details(details)
+    }
+}
+
+impl crate::actuator::HealthIndicator for ClusterHealthIndicator {
+    fn check(&self) -> futures::future::BoxFuture<'_, crate::actuator::HealthCheckOutput> {
+        // Reading the view is two uncontended mutex acquisitions and a clone;
+        // there is nothing to await, so the check can never trip the registry's
+        // per-indicator timeout.
+        Box::pin(std::future::ready(self.snapshot()))
+    }
+
+    fn group(&self) -> crate::actuator::IndicatorGroup {
+        crate::actuator::IndicatorGroup::HealthOnly
+    }
+}
+
+/// The `autumn_cluster_*` families on `/actuator/metrics` and
+/// `/actuator/prometheus`, per the table in `docs/guide/clustering.md`.
+struct ClusterMetricsSource {
+    handle: ClusterHandle,
+}
+
+impl crate::actuator::MetricsSource for ClusterMetricsSource {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "Prometheus values are f64 by definition; these counters would \
+                  have to pass 2^53 frames to lose a unit"
+    )]
+    fn collect(&self) -> Vec<crate::actuator::MetricFamily> {
+        use crate::actuator::{MetricFamily, MetricKind, MetricSample};
+
+        let metrics = &self.handle.inner.metrics;
+        let unlabelled = |value: u64| {
+            vec![MetricSample {
+                labels: Vec::new(),
+                value: value as f64,
+            }]
+        };
+
+        vec![
+            MetricFamily {
+                name: "autumn_cluster_members".to_owned(),
+                help: "Members in this node's local cluster view.".to_owned(),
+                kind: MetricKind::Gauge,
+                samples: unlabelled(self.handle.members().len() as u64),
+            },
+            MetricFamily {
+                name: "autumn_cluster_pushes_sent_total".to_owned(),
+                help: "State pushes handed to the cluster transport.".to_owned(),
+                kind: MetricKind::Counter,
+                samples: unlabelled(metrics.pushes_sent.load(Ordering::Relaxed)),
+            },
+            MetricFamily {
+                name: "autumn_cluster_pushes_received_total".to_owned(),
+                help: "State pushes accepted from peers after verification.".to_owned(),
+                kind: MetricKind::Counter,
+                samples: unlabelled(metrics.pushes_received.load(Ordering::Relaxed)),
+            },
+            MetricFamily {
+                name: "autumn_cluster_merges_applied_total".to_owned(),
+                help: "Merges that changed this node's replicated document.".to_owned(),
+                kind: MetricKind::Counter,
+                samples: unlabelled(metrics.merges_applied.load(Ordering::Relaxed)),
+            },
+            MetricFamily {
+                name: "autumn_cluster_frames_dropped_total".to_owned(),
+                help: "Frames the transport could not queue for a peer.".to_owned(),
+                kind: MetricKind::Counter,
+                samples: unlabelled(metrics.frames_dropped.load(Ordering::Relaxed)),
+            },
+            MetricFamily {
+                name: "autumn_cluster_frames_rejected_total".to_owned(),
+                help: "Inbound frames refused by the verifier, by reason.".to_owned(),
+                kind: MetricKind::Counter,
+                samples: metrics
+                    .rejections_by_reason()
+                    .into_iter()
+                    .map(|(reason, count)| MetricSample {
+                        labels: vec![("reason".to_owned(), reason.to_owned())],
+                        value: count as f64,
+                    })
+                    .collect(),
+            },
+        ]
     }
 }
 
 /// Install the cluster control plane from `[cluster]` configuration.
 ///
 /// Mirrors [`crate::alerts::install_from_config`]: a no-op when the section is
-/// disabled, a hard boot error when it is enabled but cannot bind, and on
-/// success a [`ClusterHandle`] inserted as an [`AppState`] extension.
+/// disabled, a hard boot error when it is enabled but cannot start, and on
+/// success a [`ClusterHandle`] inserted as an [`AppState`] extension, plus the
+/// `cluster:membership` health component and the `autumn_cluster_*` metric
+/// families.
 ///
 /// # Errors
 ///
-/// Returns an error when the cluster listener cannot bind `bind_addr`. A node
-/// that cannot join must not boot pretending it did.
+/// Returns an error when the section is enabled but
+///
+/// - the shared secret is absent or shorter than 16 bytes. This installer is
+///   public and reachable with a hand-built [`ClusterConfig`] that never went
+///   through [`ClusterConfig::validate`], so a missing secret must fail closed
+///   here too: falling back to an empty HMAC key would authenticate every peer
+///   on the port;
+/// - the cluster listener cannot bind `bind_addr`, or the node cannot start. A
+///   node that cannot join must not boot pretending it did.
 pub fn install_from_config(
     state: &AppState,
     config: &ClusterConfig,
@@ -313,11 +535,16 @@ pub fn install_from_config(
         return Ok(());
     }
 
-    let secret = config
-        .secret
-        .as_ref()
-        .map(|s| s.expose_secret().as_bytes().to_vec())
-        .unwrap_or_default();
+    // Deliberately not `unwrap_or_default()`: an absent secret is a
+    // configuration error, never an empty key.
+    let Some(secret) = config.secret.as_ref() else {
+        return Err(AutumnError::internal_server_error_msg(
+            "cluster.secret is required when cluster.enabled = true: the cluster transport is \
+             authenticated (HMAC-SHA256) and has no unauthenticated mode — set it with \
+             AUTUMN_CLUSTER__SECRET",
+        ));
+    };
+    let secret = secret.expose_secret().as_bytes().to_vec();
 
     let transport = transport::TcpPeerTransport::bind(&config.bind_addr)?;
 
@@ -331,6 +558,9 @@ pub fn install_from_config(
         suspicion_timeout: Duration::from_millis(config.suspicion_timeout_ms),
     };
 
+    // A short secret is refused inside `ClusterNode::start`, before any frame is
+    // signed — same rule as `ClusterConfig::validate`, enforced at the seam that
+    // actually holds the key.
     let handle = node::ClusterNode::start(
         runtime,
         state.entropy_arc(),
@@ -339,9 +569,27 @@ pub fn install_from_config(
         Arc::new(transport),
     )?;
 
-    // RED-PHASE STUB: the green phase also registers the `cluster:membership`
-    // health indicator (HealthOnly — a one-member view is UP, never DOWN) and
-    // the cluster metrics source here.
+    // Registration failure means the name is already taken — a second cluster
+    // node in one process. Warn rather than fail the boot: the first node's
+    // component is the accurate one, and the extension below still resolves.
+    if let Err(error) = state.health_indicator_registry().register(
+        MEMBERSHIP_COMPONENT,
+        crate::actuator::IndicatorGroup::HealthOnly,
+        Arc::new(ClusterHealthIndicator {
+            handle: handle.clone(),
+        }),
+    ) {
+        tracing::warn!("cluster: {error}");
+    }
+    if let Err(error) = state.metrics_source_registry().register(
+        MEMBERSHIP_COMPONENT,
+        Arc::new(ClusterMetricsSource {
+            handle: handle.clone(),
+        }),
+    ) {
+        tracing::warn!("cluster: {error}");
+    }
+
     state.insert_extension(handle);
     Ok(())
 }

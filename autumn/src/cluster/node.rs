@@ -466,20 +466,20 @@ async fn receive_loop(
         match verifier.accept(&frame) {
             Ok((envelope, message)) => apply(&inner, &envelope, &from, &message),
             Err(reason) => {
+                // Counted per reason: `frames_rejected_total{reason="mac"}`
+                // climbing is somebody talking to the port with the wrong
+                // secret, which is a different alert from a replay or a
+                // truncated frame.
+                inner.metrics.record_rejection(reason);
                 tracing::debug!(
                     peer = %from,
                     reason = reason.label(),
                     closes_connection = reason.closes_connection(),
+                    rejected_total = verifier.rejected_total(),
                     "cluster: inbound frame rejected"
                 );
             }
         }
-        // The verifier owns the count so that no early return in the receive
-        // path can forget to increment it; this only mirrors it out.
-        inner
-            .metrics
-            .frames_rejected
-            .store(verifier.rejected_total(), Ordering::Relaxed);
     }
 }
 

@@ -3881,6 +3881,24 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
+        // Embedded cluster control plane (issue #1762). Mirrors the
+        // `crate::alerts::install_from_config` precedent — a no-op when
+        // `[cluster]` is disabled — but installed here rather than next to
+        // alerts because it owns a listener and two loops, and therefore needs
+        // `server_shutdown` to exist so its departure notice rides the same
+        // graceful-drain token as everything else. A cluster that cannot bind
+        // or start is a hard boot failure: a node that silently never joins
+        // would serve its own private view of a counter it claims is
+        // cluster-wide.
+        if let Err(error) =
+            crate::cluster::install_from_config(&state, &config.cluster, &server_shutdown)
+        {
+            tracing::error!(error = %error, "cluster installation failed");
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+
         #[cfg(feature = "db")]
         {
             #[cfg(feature = "ws")]

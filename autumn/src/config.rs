@@ -2083,6 +2083,27 @@ fn parse_cluster_addr(field: &str, value: &str) -> Result<std::net::SocketAddr, 
     })
 }
 
+/// Reject port `0` on an address somebody has to *dial*.
+///
+/// Port `0` is only meaningful on `bind_addr`, where it means "let the OS pick"
+/// and the node then advertises the port it actually got. Everywhere else it is
+/// undialable: a peer would connect to port 0 and fail forever, and the mistake
+/// looks exactly like a network problem from the other side.
+fn reject_ephemeral_cluster_port(
+    field: &str,
+    value: &str,
+    addr: std::net::SocketAddr,
+) -> Result<(), ConfigError> {
+    if addr.port() == 0 {
+        return Err(ConfigError::Validation(format!(
+            "{field} is {value:?}, which no peer can dial: port 0 means \"any free port\" and is \
+             only meaningful on cluster.bind_addr, where the node advertises the port it was \
+             actually given (see docs/guide/clustering.md)"
+        )));
+    }
+    Ok(())
+}
+
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -2159,13 +2180,21 @@ impl ClusterConfig {
             validate_cluster_ident("cluster.node_id", node_id)?;
         }
 
+        // `bind_addr` may keep port 0 — that is the documented "ephemeral bind"
+        // spelling, read back through `ClusterHandle::local_addr`.
         let bind_addr = parse_cluster_addr("cluster.bind_addr", &self.bind_addr)?;
         let advertise_addr = match self.advertise_addr.as_deref() {
-            Some(addr) => parse_cluster_addr("cluster.advertise_addr", addr)?,
+            Some(addr) => {
+                let parsed = parse_cluster_addr("cluster.advertise_addr", addr)?;
+                reject_ephemeral_cluster_port("cluster.advertise_addr", addr, parsed)?;
+                parsed
+            }
             None => bind_addr,
         };
         for (index, peer) in self.seed_peers.iter().enumerate() {
-            parse_cluster_addr(&format!("cluster.seed_peers[{index}]"), peer)?;
+            let field = format!("cluster.seed_peers[{index}]");
+            let parsed = parse_cluster_addr(&field, peer)?;
+            reject_ephemeral_cluster_port(&field, peer, parsed)?;
         }
 
         // A wildcard bind is legal, advertising one is not: peers copy the
@@ -10950,6 +10979,63 @@ path = "/healthz"
         assert!(
             config.cluster.validate().is_ok(),
             "…and separator-free names must be accepted, or the rule is vacuous"
+        );
+    }
+
+    /// Port `0` means "any free port". That is a legal *bind*, because the node
+    /// advertises the port it was actually given — but it is never a legal
+    /// thing to publish or to dial, and a peer pointed at port 0 fails in a way
+    /// that reads as a network fault rather than as a typo.
+    #[test]
+    fn cluster_rejects_ephemeral_port_where_a_peer_must_dial() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+
+        // An ephemeral BIND is the documented default and must keep working.
+        config.cluster.bind_addr = "127.0.0.1:0".to_owned();
+        assert!(
+            config.cluster.validate().is_ok(),
+            "bind_addr with port 0 is the ephemeral-bind spelling and must be accepted"
+        );
+
+        config.cluster.advertise_addr = Some("10.0.0.4:0".to_owned());
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "an explicit advertise_addr on port 0 must be refused: peers dial it verbatim, \
+             got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.advertise_addr"),
+            "the error must name the offending key; got {message:?}"
+        );
+
+        config.cluster.advertise_addr = Some("10.0.0.4:7946".to_owned());
+        assert!(
+            config.cluster.validate().is_ok(),
+            "…and a real advertised port must be accepted, or the rule is vacuous"
+        );
+
+        config.cluster.seed_peers = vec!["10.0.0.5:7946".to_owned(), "10.0.0.6:0".to_owned()];
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "a seed peer on port 0 is equally undialable and must be refused, got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.seed_peers[1]"),
+            "the error must name which seed is wrong; got {message:?}"
+        );
+
+        config.cluster.seed_peers = vec!["10.0.0.5:7946".to_owned()];
+        assert!(
+            config.cluster.validate().is_ok(),
+            "…and dialable seeds must be accepted"
         );
     }
 

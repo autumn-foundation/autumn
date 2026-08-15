@@ -311,11 +311,6 @@ impl LivenessOverlay {
         }
     }
 
-    /// The push interval this overlay measures `Suspect` against.
-    pub const fn push_interval(&self) -> Duration {
-        self.push_interval
-    }
-
     /// The suspicion timeout this overlay measures `Down` against.
     pub const fn suspicion_timeout(&self) -> Duration {
         self.suspicion_timeout
