@@ -32,8 +32,6 @@
 //! and the peer re-dials with backoff (see
 //! [`RejectReason::closes_connection`]). Closing a connection is never an
 //! eviction; connection state carries zero liveness meaning.
-//!
-//! RED PHASE (TDD): bodies are inert stubs — see the module docs on [`super`].
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
@@ -66,9 +64,11 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq as _;
 
 use super::membership::ClusterState;
 use super::{Incarnation, NodeId};
+use crate::security::hmac_sha256_hex;
 
 /// Envelope version. Any other value is dropped.
 pub const WIRE_VERSION: u8 = 1;
@@ -185,10 +185,27 @@ pub fn signing_input(
     seq: u64,
     payload: &[u8],
 ) -> Vec<u8> {
-    // RED-PHASE STUB: must emit L(v) ‖ L(cluster) ‖ L(sender) ‖ L(incarnation)
-    // ‖ L(seq) ‖ L(payload).
-    let _ = (v, cluster, sender, incarnation, seq, payload);
-    Vec::new()
+    /// `L(x)`: the 8-byte big-endian length of `bytes`, then `bytes` itself.
+    fn delimited(out: &mut Vec<u8>, bytes: &[u8]) {
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+
+    // Six delimiters (48 bytes) plus the three fixed-width values.
+    let mut out = Vec::with_capacity(
+        65_usize
+            .saturating_add(cluster.len())
+            .saturating_add(sender.len())
+            .saturating_add(payload.len()),
+    );
+    delimited(&mut out, &[v]);
+    delimited(&mut out, cluster.as_bytes());
+    delimited(&mut out, sender.as_bytes());
+    delimited(&mut out, &incarnation.to_be_bytes());
+    delimited(&mut out, &seq.to_be_bytes());
+    delimited(&mut out, payload);
+    out
 }
 
 /// Serialize `message` and wrap it in a signed [`Envelope`].
@@ -203,9 +220,28 @@ pub fn sign_envelope(
     seq: u64,
     message: &ClusterMessage,
 ) -> Option<Envelope> {
-    // RED-PHASE STUB: serialize, build the signing input, HMAC it.
-    let _ = (secret, cluster, sender, incarnation, seq, message);
-    None
+    let payload = serde_json::to_string(message).ok()?;
+    let mac = hmac_sha256_hex(
+        secret,
+        &signing_input(
+            WIRE_VERSION,
+            cluster,
+            sender,
+            incarnation,
+            seq,
+            payload.as_bytes(),
+        ),
+    );
+    Some(Envelope {
+        v: WIRE_VERSION,
+        key_id: CURRENT_KEY_ID,
+        cluster: cluster.to_owned(),
+        sender: sender.to_owned(),
+        incarnation,
+        seq,
+        payload,
+        mac,
+    })
 }
 
 /// Length-prefix a serialized envelope. `None` when it does not fit
