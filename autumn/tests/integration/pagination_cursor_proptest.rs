@@ -22,6 +22,47 @@ prop_compose! {
     }
 }
 
+/// The identity of an HMAC key, for "are these two keys actually different?".
+///
+/// HMAC-SHA256 zero-pads any key shorter than its 64-byte block size, so `[]`,
+/// `[0]` and `[0, 0]` are all the *same* key and mint byte-identical
+/// signatures. Raw slice inequality therefore does not mean two keys differ as
+/// HMAC keys, and a forgery test that assumes it does is asking for a token
+/// signed with key A to be rejected under a key B that is, in fact, key A.
+/// Stripping trailing zero bytes collapses each key to the padded form HMAC
+/// actually uses, so `!=` on the result means what the test needs it to mean.
+///
+/// Scoped to keys at or under the block size, which is all this file draws
+/// (0..48 bytes); a longer key is hashed rather than padded, so it would need
+/// the hash, not this.
+fn hmac_key_identity(key: &[u8]) -> &[u8] {
+    let significant = key.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    &key[..significant]
+}
+
+/// Pins the padding property the assumption above encodes, so the reason that
+/// assumption is not simply `key_a != key_b` cannot be lost: two keys that
+/// differ only in trailing zero bytes verify each other's tokens, because they
+/// are one key as far as HMAC is concerned.
+#[test]
+fn keys_differing_only_in_zero_padding_are_one_hmac_key() {
+    let key = Key {
+        id: 7,
+        ts: 11,
+        tenant: "acme".to_owned(),
+    };
+    let token = Cursor::encode_signed(&key, &[0]).expect("encode_signed never fails");
+
+    let decoded: Option<Key> = Cursor::decode_signed(&token, &[]);
+
+    assert_eq!(
+        decoded,
+        Some(key),
+        "`[0]` and `[]` are the same HMAC key once zero-padded to the block \
+         size, so a token signed with one must verify under the other"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -51,14 +92,18 @@ proptest! {
     }
 
     /// Forgery rejection: a token signed with key A must NOT verify under a
-    /// different key B (when the keys actually differ).
+    /// key B that is genuinely a different key — see `hmac_key_identity` for
+    /// why "genuinely" is doing work there.
     #[test]
     fn signed_token_rejects_wrong_key(
         key in arb_key(),
         key_a in prop::collection::vec(any::<u8>(), 0..48),
         key_b in prop::collection::vec(any::<u8>(), 0..48),
     ) {
-        prop_assume!(key_a != key_b);
+        // Not `key_a != key_b`: keys differing only in trailing zero bytes are
+        // the same HMAC key (see `hmac_key_identity`), so that weaker
+        // assumption lets through pairs where rejection is impossible.
+        prop_assume!(hmac_key_identity(&key_a) != hmac_key_identity(&key_b));
         let token = Cursor::encode_signed(&key, &key_a).expect("encode_signed never fails");
         let decoded: Option<Key> = Cursor::decode_signed(&token, &key_b);
         prop_assert_eq!(decoded, None);

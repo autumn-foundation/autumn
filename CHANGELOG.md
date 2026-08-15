@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **config reads on the request path:** generated auth handlers, the admin
+  plugin, the `saas` starter, and the `blog`/`saas`/`teams` examples now read
+  configuration through `AppState::config_arc()` instead of
+  `AppState::config()`. `config()` returns an owned `AutumnConfig`, so every
+  call deep-clones **every** config section — 64 allocations and 1,384 bytes
+  against a default config, and more as an app's config grows — even to read a
+  single `bool` or `usize`. On a handler that cost is paid per request, and a
+  handler reading two or three sections paid it two or three times over: a
+  downstream app profiling its request path measured whole-config clones at
+  ~30% of its per-request allocations and ~42% of its per-request bytes.
+  `config_arc()` hands back the shared `Arc<AutumnConfig>` the state already
+  holds, so the same read is a refcount bump and handlers borrow the section
+  they need off the handle (`&config.auth.password`).
+
+  Nothing about the framework's own ingress path changed — that was already
+  allocation-free as of #2199 — and no public signature moved: `config()`
+  remains the per-boot owned-snapshot accessor, and the one generated call site
+  that still uses it is the boot-time `remember_me_startup` hook, which needs an
+  owned `RememberConfig`. Apps calling `state.config()` in their own handlers
+  keep compiling; switching them to `state.config_arc()` is the fix, and
+  `docs/guide/authentication.md` now teaches that as the default. A new
+  generator test pins the emitted handlers to `config_arc()` so the deep clone
+  cannot reappear in scaffolded apps.
+
 - **jobs:** the Postgres job worker's claim query (`SELECT … FOR UPDATE SKIP
   LOCKED`) no longer scans and sorts the entire ready backlog for a queue
   before picking one row, for apps that don't configure `[jobs] queues`
