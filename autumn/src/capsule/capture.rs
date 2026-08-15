@@ -389,6 +389,18 @@ impl CaptureScope {
             BodyTap::Teeing {
                 overflowed: true, ..
             } => Some(BODY_OVERFLOW_NOTE),
+            // A handler that read exactly `Content-Length` bytes and stopped
+            // has the whole body — it simply never polled once more for the
+            // `None` that sets `end_stream`. The captured length settles it,
+            // and treating that as partial would refuse a capsule whose body
+            // is complete (replay refuses partial bodies, so a false positive
+            // here costs a perfectly good reproduction).
+            BodyTap::Teeing {
+                declared_len: Some(declared),
+                buf,
+                end_stream: false,
+                ..
+            } if buf.len() >= *declared => None,
             BodyTap::Teeing {
                 end_stream: false, ..
             } => Some(BODY_PARTIAL_NOTE),
@@ -1156,6 +1168,58 @@ mod tests {
     /// A lock poisoned by a panic mid-record means the capsule is missing
     /// whatever was being written. Returning the degraded value alone would
     /// make that indistinguishable from "the request did none of this".
+    /// A handler that reads exactly `Content-Length` bytes and stops has the
+    /// whole body; it just never polled again for the end-of-stream that sets
+    /// the flag. Calling that partial would refuse a faithful capsule.
+    #[test]
+    fn a_body_read_to_its_declared_length_is_not_partial() {
+        let scope = CaptureScope::new(
+            "body".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        scope.arm_body(BodyTap::Teeing {
+            declared_len: Some(5),
+            buf: b"hello".to_vec(),
+            end_stream: false,
+            overflowed: false,
+        });
+        assert_eq!(
+            scope.body_note(),
+            None,
+            "a body captured up to its declared length is complete"
+        );
+
+        // One byte short is genuinely partial, and must still say so.
+        let scope = CaptureScope::new(
+            "body".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        scope.arm_body(BodyTap::Teeing {
+            declared_len: Some(5),
+            buf: b"hell".to_vec(),
+            end_stream: false,
+            overflowed: false,
+        });
+        assert_eq!(scope.body_note(), Some(BODY_PARTIAL_NOTE));
+
+        // A body of undeclared length has nothing to compare against, so the
+        // end-of-stream flag remains the only evidence.
+        let scope = CaptureScope::new(
+            "body".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        scope.arm_body(BodyTap::Teeing {
+            declared_len: None,
+            buf: b"hello".to_vec(),
+            end_stream: false,
+            overflowed: false,
+        });
+        assert_eq!(scope.body_note(), Some(BODY_PARTIAL_NOTE));
+    }
+
     #[test]
     fn a_poisoned_buffer_marks_the_capsule_truncated() {
         let scope = Arc::new(CaptureScope::new(

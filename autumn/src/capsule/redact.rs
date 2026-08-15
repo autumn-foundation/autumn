@@ -323,7 +323,7 @@ fn redact_headers(
         let name = name.as_str().to_owned();
         if header_is_sensitive(&name, filter) {
             values.insert(value.as_bytes());
-            record_credential_components(value.as_bytes(), values);
+            record_credential_components(&name, value.as_bytes(), values);
             keys.insert(format!("header:{name}"));
             out.push((name, FILTERED_PLACEHOLDER.to_owned()));
         } else if binary_names.contains(&name) {
@@ -348,11 +348,21 @@ fn redact_headers(
 /// Deliberately narrow: the token after a standard auth scheme, and each
 /// cookie value. Cookie *names* are not retained — they are ordinary words
 /// (`session`, `theme`) that would shred unrelated prose.
-fn record_credential_components(value: &[u8], values: &mut RedactedValues) {
+fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
     let Ok(text) = std::str::from_utf8(value) else {
         return;
     };
     let trimmed = text.trim();
+    // Only headers whose *syntax* this understands. A custom sensitive header
+    // named by `filter_parameters` carries whatever its application likes, and
+    // reading `password: not valid` as a scheme and a credential would put
+    // `valid` in the echo set — masking unrelated prose, and blanking any SQL
+    // bind that happens to equal it, which also drops that bind from replay's
+    // comparison. Guessing structure is worse here than recording nothing:
+    // the whole header value is already retained either way.
+    let name = name.to_ascii_lowercase();
+    let is_authorization = matches!(name.as_str(), "authorization" | "proxy-authorization");
+    let is_cookie = matches!(name.as_str(), "cookie" | "set-cookie");
 
     // `Authorization: <scheme> <credential>` / `Proxy-Authorization: …`.
     // Any syntactically valid scheme counts, not a list of the familiar ones:
@@ -364,7 +374,7 @@ fn record_credential_components(value: &[u8], values: &mut RedactedValues) {
     // read as one. The rest of the value is kept whole, so a credential that
     // itself contains spaces (`AWS4-HMAC-SHA256 Credential=…, Signature=…`)
     // stays intact.
-    if let Some((scheme, credential)) = trimmed.split_once(' ') {
+    if is_authorization && let Some((scheme, credential)) = trimmed.split_once(' ') {
         let credential = credential.trim();
         if is_auth_scheme(scheme) && !credential.is_empty() {
             values.insert(credential.as_bytes());
@@ -376,7 +386,7 @@ fn record_credential_components(value: &[u8], values: &mut RedactedValues) {
     // value are not, but retaining `/` or `HttpOnly` is harmless because the
     // echo floor and boundary rule in `mask_echoes` refuse to match them
     // inside prose.
-    if trimmed.contains('=') {
+    if is_cookie && trimmed.contains('=') {
         for pair in trimmed.split(';') {
             if let Some((_, cookie_value)) = pair.split_once('=') {
                 let cookie_value = cookie_value.trim().trim_matches('"');
@@ -1062,6 +1072,10 @@ mod tests {
             values.contains(b"sess-abcdef"),
             "each cookie value must be retained on its own"
         );
+        assert!(
+            !values.contains(b"session"),
+            "cookie names are ordinary words and must stay out of the echo set"
+        );
         // A scheme this code has never heard of is exactly where a credential
         // would otherwise go unmasked.
         assert!(is_auth_scheme("Negotiate") && is_auth_scheme("AWS4-HMAC-SHA256"));
@@ -1069,14 +1083,38 @@ mod tests {
             !is_auth_scheme("session=abc;"),
             "a cookie line is not an auth scheme"
         );
-        assert!(
-            !values.contains(b"session"),
-            "cookie names are ordinary words and must stay out of the echo set"
-        );
         // The point of all of it: the outcome is scrubbed of what the handler
         // actually carried.
         let masked = mask_echoes("token hunter2secret was rejected", &values);
         assert!(!masked.contains("hunter2secret"), "{masked}");
+    }
+
+    /// A custom sensitive header carries whatever its application likes, so
+    /// reading auth or cookie syntax into it invents secrets: `password: not
+    /// valid` would put `valid` in the echo set, masking unrelated prose and
+    /// blanking any SQL bind equal to it (which drops that bind from replay's
+    /// comparison too).
+    #[test]
+    fn component_parsing_is_limited_to_headers_whose_syntax_is_known() {
+        let (_request, values) = redact(
+            Request::get("/").header("password", "not valid"),
+            CapturedBody::Absent,
+            &filter_with(&["password"]),
+        );
+
+        assert!(
+            values.contains(b"not valid"),
+            "the whole value is still retained, as for any masked header"
+        );
+        assert!(
+            !values.contains(b"valid"),
+            "a custom header's value must not be split as though it were `Authorization`"
+        );
+        assert_eq!(
+            mask_echoes("the token was invalid", &values),
+            "the token was invalid",
+            "an invented component would have shredded this"
+        );
     }
 
     #[test]
