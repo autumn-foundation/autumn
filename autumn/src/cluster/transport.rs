@@ -295,7 +295,7 @@ impl TcpPeerTransport {
     /// than the suspicion timeout is already out of the view, and re-dialling
     /// costs it one push.
     #[must_use]
-    pub fn with_inbound_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+    pub const fn with_inbound_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.limits.idle_timeout = idle_timeout;
         self
     }
