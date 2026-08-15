@@ -98,10 +98,19 @@ Adopting the column on a table that already has rows? Add it, then
 | `purge` | `-1`, and only if the row was still live (a purge after a soft delete does not double-decrement) |
 | `upsert_many` | insert → `+1`; update → the before/after diff |
 | a parent's `dependent = destroy` cascade | the child's own counters move as each child is destroyed |
-| a parent's `dependent = delete_all` / `nullify` cascade | **not** maintained — see [Limits](#limits) |
+| a parent's `dependent = delete_all` cascade | `-1` on **every** counter-cached leg — the child rows go away entirely |
+| a parent's `dependent = nullify` cascade | `-1` on **only** the leg being cleared |
 
 A child whose foreign key is `NULL` moves nothing. A leg whose foreign key did
 not change issues no statement.
+
+The two bulk cascades resolve the affected child ids *before* their statement
+runs, because a `nullify` is about to overwrite the very foreign key that
+identifies them. `nullify` is deliberately narrower than `delete_all`: the
+children survive the detach, so their other counter-cached legs still hold them
+and decrementing every leg would permanently undercount those parents —
+clearing `comments.author_id` when a user is deleted must not drop
+`posts.comment_count` for comments still attached to their post.
 
 ### Same transaction, not "shortly after"
 
