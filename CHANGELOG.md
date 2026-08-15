@@ -56,6 +56,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cluster:** an embedded, zero-dependency self-clustering substrate (#1762).
+  Two instances of the same binary, started with a shared secret and no
+  external coordination service — no Redis, no Postgres, no etcd — discover
+  each other over authenticated TCP gossip, report a converged two-member
+  view, and expose the first shared distributed primitive: a cluster-wide
+  grow-only CRDT counter (`ClusterHandle::counter(name)`, `increment()` /
+  `get()`) whose cells are keyed by `(node id, boot incarnation)` and merged
+  by per-cell maximum, so an increment on one node is observable on the other
+  within a push interval and a restarted node can never undercount. One
+  periodic signed state push doubles as the heartbeat: membership is itself a
+  CRDT (`Alive`/`Left` records with SWIM-style incarnation refutation), while
+  `Suspect`/`Down` live in a purely local liveness overlay — a clean shutdown
+  sends a bounded best-effort leave, and a kill converges by suspicion
+  timeout, after which the surviving node keeps serving the counter and
+  reports a one-member view that is `UP`, never `DOWN`. Frames are
+  HMAC-SHA256-authenticated (cluster name, sender, incarnation, and sequence
+  are MAC-covered; constant-time verify before any payload parse; per-sender
+  replay watermarks) but not encrypted — deploy the cluster port on a trusted
+  network. Opt-in via the new `[cluster]` config section
+  (`AUTUMN_CLUSTER__*` env forms, fail-fast validation, secret required),
+  surfaced through the `cluster:membership` health indicator and
+  `autumn_cluster_*` metric families, and implemented with zero new crate
+  dependencies. See `docs/guide/clustering.md` for the wire format, failure
+  semantics, and a two-terminal walkthrough.
+
 - **failure capsules:** a failing request can now be recorded and replayed
   offline (#1598). With `[failure_capture] enabled = true`, every caught panic
   and every 5xx writes a **capsule** — one JSON file holding the redacted

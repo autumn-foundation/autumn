@@ -221,6 +221,10 @@ curl -s localhost:3000/actuator/health | jq '.components["cluster:membership"]'
 curl -s localhost:3001/actuator/health | jq '.components["cluster:membership"]'
 ```
 
+The `details` object renders only when health details are enabled
+(`health.detailed = true`) — the dev profile's default, which is what `cargo
+run` uses here. With details off you still get the component's `status`.
+
 ```json
 {
   "status": "UP",
@@ -270,6 +274,7 @@ alert on:
 | `autumn_cluster_pushes_received_total` | counter | Frames accepted after verification. |
 | `autumn_cluster_merges_applied_total` | counter | Merges that changed local state. |
 | `autumn_cluster_frames_rejected_total` | counter | Labelled `reason` — see the receive path below. |
+| `autumn_cluster_frames_dropped_total` | counter | Outbound frames swallowed by a full or closed peer queue. Anti-entropy re-sends the state, so drops are lossy only to latency. |
 
 A steady `frames_rejected_total{reason="mac"}` means somebody is talking to
 your port with the wrong secret.

@@ -13,7 +13,7 @@
 //!   and doubles as the heartbeat. Replicated member status is `Alive`/`Left`
 //!   only; liveness (`Alive` → `Suspect` → `Down`) is a *local* overlay driven
 //!   by time-since-last-push read through the injected
-//!   [`ClockSource`](crate::time::ClockSource). Views are therefore local and
+//!   [`ClockSource`]. Views are therefore local and
 //!   **eventually consistent** by construction.
 //! - **Exactly one distributed primitive.** A cluster-wide grow-only counter
 //!   ([`ClusterCounter`]), convergent (CRDT) because each node writes only its
