@@ -367,18 +367,28 @@ the signature:
 
 ```rust
 use autumn_web::extract::Path;
-use autumn_web::get;
+use autumn_web::{get, public};
 
 #[get("/users/{id}")]
+#[public]
 async fn get_user(id: Path<i64>) -> String {
     format!("User #{}", *id)
 }
 ```
 
+> **Why `#[public]` on every example from here on.** The scaffold's generated
+> `.github/workflows/ci.yml` runs `autumn routes audit`, which fails the build
+> on any mounted route carrying no security classification. A handler with no
+> `#[public]`, `#[secured]`, or `#[authorize]` is *unclassified*, not
+> *public* — it works locally and goes red on your first CI push. Saying
+> `#[public]` out loud is the whole point of the gate: an unauthenticated route
+> should be a decision, not an oversight.
+
 Multiple parameters destructure a tuple:
 
 ```rust
 #[get("/orgs/{org}/repos/{repo}")]
+#[public]
 async fn get_repo(Path((org, repo)): Path<(String, String)>) -> String {
     format!("{org}/{repo}")
 }
@@ -397,6 +407,7 @@ struct Pagination {
 }
 
 #[get("/items")]
+#[public]
 async fn list_items(Query(params): Query<Pagination>) -> String {
     let page = params.page.unwrap_or(1);
     let per_page = params.per_page.unwrap_or(20);
@@ -723,6 +734,7 @@ use crate::models::{NewTodo, Todo};
 use crate::schema::todos;
 
 #[get("/todos")]
+#[public]
 async fn list_todos(mut db: Db) -> AutumnResult<Json<Vec<Todo>>> {
     let all_todos = todos::table
         .order(todos::created_at.desc())
@@ -734,6 +746,7 @@ async fn list_todos(mut db: Db) -> AutumnResult<Json<Vec<Todo>>> {
 }
 
 #[post("/api/todos")]
+#[public]
 async fn create_todo(mut db: Db, body: Json<NewTodo>) -> AutumnResult<Json<Todo>> {
     let created: Todo = diesel::insert_into(todos::table)
         .values(&body.0)
@@ -787,6 +800,7 @@ templating library. Return `Markup` from a handler to send HTML:
 use autumn_web::prelude::*;
 
 #[get("/")]
+#[public]
 async fn index() -> Markup {
     html! {
         (maud::DOCTYPE)
@@ -820,7 +834,11 @@ Maud syntax in brief:
 Extract reusable layouts into functions:
 
 ```rust
-fn layout(title: &str, content: Markup) -> Markup {
+use autumn_web::HTMX_CSRF_JS_PATH;
+use autumn_web::prelude::*;
+use autumn_web::security::CsrfToken;
+
+fn layout(title: &str, csrf_token: Option<&str>, content: Markup) -> Markup {
     html! {
         (maud::DOCTYPE)
         html lang="en" {
@@ -828,8 +846,14 @@ fn layout(title: &str, content: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
+                // htmx reads the token from here. The CSRF cookie is HttpOnly,
+                // so JavaScript cannot get at it any other way.
+                @if let Some(token) = csrf_token {
+                    meta name="csrf-token" content=(token);
+                }
                 link rel="stylesheet" href=(asset_url("css/autumn.css"));
                 (javascript_include_tag("htmx"))
+                script src=(HTMX_CSRF_JS_PATH) {}
             }
             body class="bg-gray-100 min-h-screen" {
                 div class="max-w-2xl mx-auto py-10 px-4" {
@@ -841,13 +865,21 @@ fn layout(title: &str, content: Markup) -> Markup {
 }
 
 #[get("/about")]
-async fn about() -> Markup {
-    layout("About", html! {
+#[public]
+async fn about(csrf: Option<CsrfToken>) -> Markup {
+    layout("About", csrf.as_ref().map(CsrfToken::token), html! {
         h1 { "About this app" }
         p { "Built with Autumn, Maud, and Tailwind." }
     })
 }
 ```
+
+Those three CSRF lines are load-bearing the moment you add htmx. `HTMX_CSRF_JS_PATH`
+is a helper Autumn serves that copies the `csrf-token` meta tag into an
+`X-CSRF-Token` header on every htmx request. Without it, the `hx-post` and
+`hx-delete` calls in the next section sail through in `dev` and return
+`403 Forbidden` under `prod`, where CSRF protection is on by default. The
+`examples/reddit-clone` layout is the reference implementation.
 
 `asset_url` and `javascript_include_tag` resolve to plain paths in dev and to
 fingerprinted, integrity-pinned URLs after `autumn build` — so you get cache
@@ -910,6 +942,11 @@ subresource-integrity hash and serves it through
 `javascript_include_tag("htmx")`. Include that in your layout, then use htmx
 attributes in your templates.
 
+The handlers below mutate data, so they need the `csrf-token` meta tag and the
+`HTMX_CSRF_JS_PATH` helper from the [layout above](#render-html-with-maud). If
+you skipped that, add it now — otherwise these buttons will work on your
+machine and return `403` in production.
+
 Here is a toggle-and-delete pair that updates a todo without a full page
 reload:
 
@@ -952,6 +989,7 @@ fn todo_item(todo: &Todo) -> Markup {
 
 /// Toggle completion — returns the updated HTML fragment.
 #[post("/todos/{id}/toggle")]
+#[public]
 async fn toggle(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
     let updated: Todo = diesel::update(todos::table.find(*id))
         .set(todos::completed.eq(diesel::dsl::not(todos::completed)))
@@ -965,6 +1003,7 @@ async fn toggle(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
 
 /// Delete a todo — empty response body, so htmx removes the element.
 #[delete("/todos/{id}")]
+#[public]
 async fn delete_todo(id: Path<i64>, mut db: Db) -> AutumnResult<String> {
     diesel::delete(todos::table.find(*id))
         .execute(&mut *db)
@@ -1001,6 +1040,7 @@ use autumn_web::prelude::*;
 use autumn_web::security::CsrfToken;
 
 #[get("/todos/{id}/edit")]
+#[public]
 async fn edit_form(id: Path<i64>, csrf: Option<CsrfToken>) -> Markup {
     html! {
         form method="post" action=(format!("/todos/{}", *id)) {
@@ -1039,6 +1079,7 @@ Any `std::error::Error` converts to an `AutumnError` with HTTP 500:
 
 ```rust
 #[get("/users")]
+#[public]
 async fn list_users(mut db: Db) -> AutumnResult<Json<Vec<User>>> {
     let users = users::table.load(&mut *db).await?; // 500 on failure
     Ok(Json(users))
@@ -1051,6 +1092,7 @@ For expected failures, use a status constructor:
 
 ```rust
 #[get("/users/{id}")]
+#[public]
 async fn get_user(id: Path<i64>, mut db: Db) -> AutumnResult<Json<User>> {
     let user = users::table
         .find(*id)
@@ -1220,6 +1262,7 @@ use autumn_web::prelude::*;
 use autumn_web::AppState;
 
 #[get("/")]
+#[public]
 async fn index() -> &'static str { "ok" }
 
 #[autumn_web::main]
