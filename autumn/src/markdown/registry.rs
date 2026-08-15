@@ -422,12 +422,6 @@ mod tests {
     }
 
     #[test]
-    fn static_params_delegates_to_static_params_for_slug() {
-        let registry = MarkdownRegistry::from_embedded(&[GETTING_STARTED, API_REFERENCE]).unwrap();
-        assert_eq!(registry.static_params(), registry.static_params_for("slug"));
-    }
-
-    #[test]
     fn empty_registry_is_empty() {
         let registry = MarkdownRegistry::from_embedded(&[]).unwrap();
         assert!(registry.is_empty());

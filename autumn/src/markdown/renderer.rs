@@ -439,15 +439,31 @@ mod tests {
     #[test]
     fn duplicate_headings_get_unique_ids() {
         // Real docs repeat headings ("Example", "Usage", "Notes"). Emitting the
-        // same `id` twice is invalid HTML and makes both TOC links jump to the
-        // first occurrence.
-        let md = "## Example\n\nFirst.\n\n## Example\n\nSecond.\n";
+        // same `id` twice is invalid HTML and makes every TOC link for the
+        // repeated heading jump to the first occurrence.
+        let md = "## Example\n\nFirst.\n\n## Example\n\nSecond.\n\n## Example\n\nThird.\n";
         let result = render(md, RenderOptions::default());
-        assert_eq!(result.toc.len(), 2);
-        assert_eq!(result.toc[0].id, "example");
-        assert_eq!(result.toc[1].id, "example-1");
+        let ids: Vec<&str> = result.toc.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["example", "example-1", "example-2"]);
         assert!(result.html.contains(r#"<h2 id="example">"#));
         assert!(result.html.contains(r#"<h2 id="example-1">"#));
+        assert!(result.html.contains(r#"<h2 id="example-2">"#));
+    }
+
+    #[test]
+    fn anchors_do_not_leak_between_documents() {
+        // The allocator must be per-`render` call. If its state were ever
+        // shared (a `static`/`thread_local`, or a future caching refactor),
+        // the same document would render different anchors depending on what
+        // was rendered before it — silently breaking every published deep link
+        // on a multi-page docs build.
+        let md = "## Example\n\n## Example\n";
+        let first = render(md, RenderOptions::default());
+        let second = render(md, RenderOptions::default());
+        let ids_a: Vec<&str> = first.toc.iter().map(|t| t.id.as_str()).collect();
+        let ids_b: Vec<&str> = second.toc.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids_a, ids_b, "anchor state leaked across render() calls");
+        assert_eq!(ids_a, vec!["example", "example-1"]);
     }
 
     #[test]
@@ -462,14 +478,6 @@ mod tests {
     }
 
     #[test]
-    fn three_duplicate_headings_count_up() {
-        let md = "## Notes\n## Notes\n## Notes\n";
-        let result = render(md, RenderOptions::default());
-        let ids: Vec<&str> = result.toc.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids, vec!["notes", "notes-1", "notes-2"]);
-    }
-
-    #[test]
     fn dedup_suffix_skips_ids_already_taken_by_another_heading() {
         // "Example 1" naturally slugifies to "example-1", which is also the
         // suffix a second "Example" would want. The dedup counter must skip
@@ -478,11 +486,6 @@ mod tests {
         let result = render(md, RenderOptions::default());
         let ids: Vec<&str> = result.toc.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["example", "example-1", "example-2"]);
-        // Every emitted id must be distinct.
-        let mut sorted = ids.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), ids.len(), "ids must be unique: {ids:?}");
     }
 
     #[test]
@@ -537,18 +540,34 @@ mod tests {
 
     #[test]
     fn toc_ids_match_emitted_heading_ids() {
-        // The TOC is only useful if every entry's id actually exists in the
-        // rendered HTML.
+        // The TOC is only useful if every entry's id resolves to exactly one
+        // heading. A bare `contains` check would pass vacuously when several
+        // headings share an id, so assert each id appears *once* and that the
+        // document emits no ids beyond the ones the TOC lists.
         let md = "# Guide\n## Example\n### Example\n## Example\n";
         let result = render(md, RenderOptions::default());
-        for item in &result.toc {
-            assert!(
-                result.html.contains(&format!(r#" id="{}">"#, item.id)),
-                "TOC id {:?} has no matching heading in HTML:\n{}",
-                item.id,
+
+        let ids: Vec<&str> = result.toc.iter().map(|t| t.id.as_str()).collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "TOC ids must be distinct: {ids:?}");
+
+        for id in &ids {
+            let needle = format!(r#" id="{id}">"#);
+            assert_eq!(
+                result.html.matches(&needle).count(),
+                1,
+                "TOC id {id:?} must match exactly one heading in:\n{}",
                 result.html
             );
         }
+        assert_eq!(
+            result.html.matches(r#" id=""#).count(),
+            ids.len(),
+            "every emitted id must be represented in the TOC:\n{}",
+            result.html
+        );
     }
 
     #[test]
