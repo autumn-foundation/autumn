@@ -130,13 +130,16 @@ Per AC2, the gate covers modules that run **per request** or in
 `nested_form`), session and idempotency stores, the scheduler and job queues,
 channels, inbound-mail webhook parsing (`inbound_mail`, which turns unauthenticated
 RFC 5322 / MIME bytes into typed values), the shared saturating-arithmetic helpers
-those modules call (`time_math`), and the per-request middleware stack. These are
-the 30 files listed in the `REQUEST_PATH_MODULES` array in
+those modules call (`time_math`), the per-request middleware stack, and the
+failure-capsule capture path (`autumn/src/capsule/capture.rs`, `wire.rs`,
+`record_db.rs`: they tee a live request's body and its database connection, so
+a panic there would take down the very request they exist to record). These are
+the 37 files listed in the `REQUEST_PATH_MODULES` array in
 `scripts/check-panic-gate.sh`, each entry carrying the Cargo feature that gates
 its `mod` declaration.
 
 **Honest scoping — the manifest is the *enforced* subset, not the whole request
-path.** The 30 modules are the files the gate enforces today, not a claim that
+path.** The 37 modules are the files the gate enforces today, not a claim that
 they are the *only* per-request code. Other unambiguously per-request or
 framework-owned modules are **not yet gated** and still contain production-path
 panics — known examples include `router.rs`, `etag.rs`, `security/rate_limit.rs`,

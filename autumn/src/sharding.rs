@@ -1784,6 +1784,11 @@ impl Shards {
             metrics: ctx.metrics,
             slow_query_threshold: ctx.slow_query_threshold,
             interceptors: ctx.interceptors,
+            // Shard traffic is not recorded in this slice, and the shard gap
+            // is noted separately by `note_shard_capture_gap` on this same
+            // checkout path — the control topology's gap does not apply here.
+            #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+            capture_gap: None,
             clock: ctx.clock,
         })
         .await

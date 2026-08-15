@@ -47,7 +47,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,12 @@ pub enum ClientError {
     /// The outbound circuit breaker is open.
     #[error("outbound circuit breaker is open")]
     CircuitBreakerOpen,
+    /// Outbound HTTP is blocked because this process is replaying a failure
+    /// capsule (see the crate-internal `block_outbound_for_replay`).
+    #[error(
+        "outbound HTTP is not recorded in a failure capsule and is blocked during replay: {0} {1}"
+    )]
+    BlockedDuringReplay(String, String),
     /// A resolved connection target (or redirect target) is a blocked
     /// (private / link-local / loopback / reserved) IP address per the built-in
     /// SSRF policy. See [`is_blocked_ip`].
@@ -559,6 +565,28 @@ impl Default for MockRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Set while this process is replaying a failure capsule, blocking every
+/// outbound request (see [`block_outbound_for_replay`]).
+static OUTBOUND_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Fail every outbound HTTP request from now on.
+///
+/// Called by the capsule replay one-shot
+/// ([`AppBuilder::run`](crate::app::AppBuilder::run) under
+/// `AUTUMN_REPLAY_CAPSULE`), which rebuilds the real application — including
+/// its real `reqwest` client — and must not let it reach anything the capsule
+/// did not record. There is deliberately no way to unset it: a process that has
+/// started replaying a capsule never goes back to serving traffic.
+pub(crate) fn block_outbound_for_replay() {
+    OUTBOUND_BLOCKED.store(true, Ordering::SeqCst);
+}
+
+/// Whether outbound HTTP is blocked for capsule replay.
+#[must_use]
+pub(crate) fn outbound_blocked_for_replay() -> bool {
+    OUTBOUND_BLOCKED.load(Ordering::SeqCst)
 }
 
 /// Newtype stored in [`AppState`](crate::AppState) extensions so the
@@ -1341,6 +1369,20 @@ impl RequestBuilder {
         // Surface any error captured during builder construction.
         if let Some(err) = self.pending_error {
             return Err(err);
+        }
+
+        // A capsule records the request, the clock and the database — not the
+        // services the handler called. Letting a replay dial them would make it
+        // an unrepeatable experiment run against live third parties, so every
+        // outbound request fails closed with a message that says why. The block
+        // is checked here rather than on the client, because a handler can
+        // build one any way it likes (`Client::new()`, `from_state`, a stored
+        // one) and every path must be closed.
+        if outbound_blocked_for_replay() {
+            return Err(ClientError::BlockedDuringReplay(
+                self.method.to_string(),
+                self.url.clone(),
+            ));
         }
 
         // Bypassing circuit breaker if a mock registry is present.
@@ -2924,6 +2966,33 @@ mod tests {
         let err = ClientError::NoMock("GET".to_owned(), "/path".to_owned());
         assert!(err.to_string().contains("GET"));
         assert!(err.to_string().contains("/path"));
+    }
+
+    /// Capsule replay is offline by construction (issue #1598, AC4): a capsule
+    /// records the request, the clock and the database, and nothing about the
+    /// services the handler called. The block is process-wide and one-way, so
+    /// this checks the predicate's default and the message an operator sees —
+    /// the wiring itself is pinned by `app::tests::replay_reaches_nothing_outside_the_capsule`,
+    /// which cannot be expressed here without blocking the whole test binary.
+    #[test]
+    fn outbound_is_open_until_a_replay_blocks_it() {
+        assert!(
+            !outbound_blocked_for_replay(),
+            "a serving process must never start out blocked"
+        );
+        let error = ClientError::BlockedDuringReplay(
+            "GET".to_owned(),
+            "https://payments.example/charge".to_owned(),
+        )
+        .to_string();
+        assert!(
+            error.contains("blocked during replay") && error.contains("not recorded"),
+            "the error must say why the call did not happen, got {error}"
+        );
+        assert!(
+            error.contains("GET") && error.contains("https://payments.example/charge"),
+            "and which call it was, got {error}"
+        );
     }
 
     // TEST 40: Outbound circuit breaker integration trips and fails fast.

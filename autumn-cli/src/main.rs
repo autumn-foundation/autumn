@@ -36,6 +36,7 @@ mod pg;
 mod plugin_check;
 mod process;
 mod release;
+mod replay;
 mod routes;
 mod routes_audit;
 mod scaling_driver;
@@ -570,6 +571,63 @@ enum Commands {
         /// Model to fake rows for (e.g. `Post`). Requires --count.
         #[arg(long, requires = "count")]
         model: Option<String>,
+    },
+    /// Replay a recorded failure capsule against the application.
+    ///
+    /// A capsule is written by `[failure_capture] enabled = true` whenever a
+    /// request fails (a 5xx or a caught panic). Replaying one rebuilds the app
+    /// offline — the clock and the database are served from the capsule, no
+    /// socket is opened — drives the recorded request through it, and reports
+    /// whether the failure still happens.
+    ///
+    /// Exit codes: 0 the failure reproduced, 1 it did not (a mismatch, or the
+    /// code left the recorded database tape), 2 the capsule was refused and
+    /// nothing was replayed.
+    ///
+    /// # Examples
+    ///
+    ///   autumn replay tmp/autumn-capsules/01JB2K7Q.json
+    ///   autumn replay --package api tmp/autumn-capsules/01JB2K7Q.json
+    #[command(verbatim_doc_comment)]
+    Replay {
+        /// Path to the capsule JSON file to replay.
+        capsule: String,
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+        ///
+        /// Defaults to the profile the capsule recorded, so profile-gated
+        /// routes and configuration match the failing run; falls back to
+        /// `dev` for capsules that recorded none.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Compile the replay binary with `cargo build --release`.
+        ///
+        /// Defaults to the build kind the capsule recorded, so
+        /// `cfg(debug_assertions)`-gated code and release-only behaviour
+        /// match the failing run; falls back to a debug build for capsules
+        /// that recorded none.
+        #[arg(long, conflicts_with = "debug")]
+        release: bool,
+        /// Compile the replay binary as a debug build, even when the capsule
+        /// was recorded by a release build.
+        #[arg(long)]
+        debug: bool,
+        /// Cargo features to compile the replay binary with (forwarded to
+        /// `cargo build --features`).
+        ///
+        /// The capsule does not record the recording binary's feature set;
+        /// pass the features the failing binary was built with when they
+        /// gate code the failure depends on.
+        #[arg(long, value_name = "FEATURES")]
+        features: Option<String>,
+        /// Compile without default features (forwarded to `cargo build`).
+        #[arg(long)]
+        no_default_features: bool,
     },
     /// Run or list one-off operational tasks registered by the application.
     Task {
@@ -3117,6 +3175,28 @@ fn run_command(command: Commands) {
             count,
             model,
         } => seed::run(&profile, package.as_deref(), count, model.as_deref()),
+        Commands::Replay {
+            capsule,
+            package,
+            bin,
+            profile,
+            release,
+            debug,
+            features,
+            no_default_features,
+        } => run_replay_command(
+            &capsule,
+            package.as_deref(),
+            bin.as_deref(),
+            profile.as_deref(),
+            match (release, debug) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
+            features.as_deref(),
+            no_default_features,
+        ),
         Commands::Task {
             package,
             bin,
@@ -3529,6 +3609,26 @@ fn run_command(command: Commands) {
             }
         }
     }
+}
+
+fn run_replay_command(
+    capsule: &str,
+    package: Option<&str>,
+    bin: Option<&str>,
+    profile: Option<&str>,
+    build: Option<bool>,
+    features: Option<&str>,
+    no_default_features: bool,
+) {
+    replay::run(&replay::ReplayOptions {
+        capsule,
+        package,
+        bin,
+        profile,
+        build,
+        features,
+        no_default_features,
+    });
 }
 
 fn run_task_command(

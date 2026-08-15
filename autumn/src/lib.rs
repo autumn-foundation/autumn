@@ -105,6 +105,13 @@ pub use channels::{
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
 pub mod canary;
+/// Deterministic replay capsules: record a failing request (redacted request,
+/// clock reads, database traffic, outcome) and replay it offline.
+///
+/// Enabled by the `reporting` Cargo feature (on by default), armed by
+/// `[failure_capture] enabled = true` (off by default).
+#[cfg(feature = "reporting")]
+pub mod capsule;
 pub mod circuit_breaker;
 pub mod config;
 pub mod consent;

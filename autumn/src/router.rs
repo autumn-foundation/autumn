@@ -4144,6 +4144,13 @@ fn apply_middleware(
     // Per-request timeout (inner to RequestId so the request ID set by that
     // layer is available when the timeout fires — see request_timeout_handler).
     //
+    // Full ingress layer order (outermost → innermost):
+    //   TraceContext → AccessLog-fallback (applied in apply_startup_barrier) →
+    //   StartupBarrier → Compression → Metrics → ExceptionFilter → ErrorPageContext →
+    //   Session → SecurityHeaders → RequestId → LogContext → ServerTiming →
+    //   AccessLog-primary → FailureCapture → Reporting → Timeout → Tenancy →
+    //   TrustedProxies → [user layers] → BodyLimit/UploadConfig → MethodOverride →
+    //   RateLimit → CSRF → CORS → handler
     // `mirror_cors = true`: this layer is outside `CorsLayer` (CORS is in the
     // inner group above, hence inner), so its timeout 503 must carry CORS
     // headers itself.
@@ -4187,6 +4194,34 @@ fn apply_middleware(
                 })
             },
         );
+
+    // Failure-capsule capture (#1598). Outer to the reporting layer, because a
+    // request's capture scope has to exist before that layer snapshots its
+    // context — the scope is what the reporting layer seals into a capsule when
+    // the request turns out to have failed. Off unless
+    // `[failure_capture] enabled = true`; capsules hold real request data.
+    //
+    // This layer is the sole arming point for database attribution too: the
+    // connection-checkout marker fires only when a request carries a capture
+    // scope, and scopes exist only under this layer — so two apps with
+    // different capture settings in one process cannot disturb each other.
+    #[cfg(feature = "reporting")]
+    let capture_layer = tower::util::option_layer(config.failure_capture.enabled.then(|| {
+        // Same filter composition as the log context below, so one
+        // `[log] filter_parameters` list governs both.
+        let mut capture_filter_parameters = config.log.filter_parameters.clone();
+        capture_filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+        let capture_filter = Arc::new(crate::log::filter::ParameterFilter::new(
+            &capture_filter_parameters,
+            &config.log.unfilter_parameters,
+        ));
+        crate::capsule::CaptureLayer::new(
+            crate::capsule::settings_from_config(config),
+            capture_filter,
+        )
+    }));
+    #[cfg(not(feature = "reporting"))]
+    let capture_layer = tower::layer::util::Identity::new();
 
     // Request-scoped log context (#1169). Established for every request, inner
     // to `RequestIdLayer` (so the request id is available to seed it) and outer
@@ -4263,6 +4298,7 @@ fn apply_middleware(
         crate::middleware::LogContextLayer::new(log_context_filter),
         tower::util::option_layer(server_timing_layer),
         tower::util::option_layer(access_log_layer),
+        capture_layer,
         reporting_layer,
         tower::util::option_layer(timeout_layer),
         tower::util::option_layer(tenancy_layer),
@@ -5593,6 +5629,8 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: Some("test".to_owned()),
             role: crate::config::ProcessRole::Combined,
             started_at: crate::time::monotonic_now(),
