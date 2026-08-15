@@ -727,7 +727,11 @@ fn materialize_body(response: &mut Response) -> bool {
 
     for _ in 0..PROBE_FRAMES {
         match Pin::new(&mut body).poll_frame(&mut cx) {
-            Poll::Ready(None) => {
+            // The body is done — either cleanly, or with an error that ends it
+            // for the client just the same. Whichever it is, it happened
+            // without waiting, so the frames already pulled are the whole of
+            // what the client will receive.
+            Poll::Ready(None | Some(Err(_))) => {
                 *response.body_mut() = Body::from(concat_chunks(chunks));
                 return true;
             }
@@ -743,12 +747,6 @@ fn materialize_body(response: &mut Response) -> bool {
                 // the body deliver the rest of itself.
                 Err(_) => break,
             },
-            // An error ends the body for the client either way; the frames
-            // already pulled are what it will receive.
-            Poll::Ready(Some(Err(_))) => {
-                *response.body_mut() = Body::from(concat_chunks(chunks));
-                return true;
-            }
             Poll::Pending => break,
         }
     }
@@ -895,27 +893,6 @@ mod tests {
             (materialized, response)
         }
 
-        // In-memory bodies finish on the spot — nothing runs later.
-        assert!(probe(Body::empty()).0);
-        let (materialized, response) = probe(Body::from("boom details"));
-        assert!(materialized);
-        assert_eq!(
-            response
-                .into_body()
-                .collect()
-                .await
-                .expect("collect")
-                .to_bytes(),
-            "boom details",
-            "a materialized body must be handed on byte for byte"
-        );
-
-        // A stream never claims an exact size: reported lazy, never polled.
-        let streaming = Body::from_stream(futures::stream::once(async {
-            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"chunk"))
-        }));
-        assert!(!probe(streaming).0);
-
         // The case a size hint cannot catch: an exact length, produced lazily.
         struct ExactButLazy(u8);
         impl http_body::Body for ExactButLazy {
@@ -944,6 +921,27 @@ mod tests {
                 http_body::SizeHint::with_exact(4)
             }
         }
+
+        // In-memory bodies finish on the spot — nothing runs later.
+        assert!(probe(Body::empty()).0);
+        let (materialized, response) = probe(Body::from("boom details"));
+        assert!(materialized);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect")
+                .to_bytes(),
+            "boom details",
+            "a materialized body must be handed on byte for byte"
+        );
+
+        // A stream never claims an exact size: reported lazy, never polled.
+        let streaming = Body::from_stream(futures::stream::once(async {
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"chunk"))
+        }));
+        assert!(!probe(streaming).0);
 
         let (materialized, response) = probe(Body::new(ExactButLazy(0)));
         assert!(
