@@ -87,7 +87,7 @@ fn signup_page(min_len: usize, submit_token: &str, error: Option<&str>) -> Marku
 #[get("/signup")]
 pub async fn signup_form(State(state): State<AppState>, submit_token: SubmitToken) -> Markup {
     signup_page(
-        state.config().auth.password.min_length,
+        state.config_arc().auth.password.min_length,
         submit_token.token(),
         None,
     )
@@ -121,7 +121,10 @@ pub async fn signup(
     // the email, and optional HIBP breach check). On failure, re-render the form
     // with the specific message at HTTP 200 rather than accepting a weak
     // credential.
-    let password_cfg = state.config().auth.password;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()` would
+    // deep-clone every section just to read `[auth.password]` on a request path.
+    let config = state.config_arc();
+    let password_cfg = &config.auth.password;
     let mut policy = password_cfg.policy();
     if password_cfg.breach_check != autumn_web::auth::BreachCheck::Off {
         // Breach checking needs an HTTP client for the HIBP k-anonymity lookup;
@@ -249,14 +252,18 @@ pub async fn login(
     // Persistent "remember-me" opt-in (issue #1397): when the box is ticked and
     // the policy allows it, mint a rotating remember chain and attach its cookie
     // alongside the session cookie. Unticked → behaviour is unchanged.
-    if form.remember.is_some() && state.config().auth.remember.enabled {
+    // One shared read of the config for both the opt-in check and the resolved
+    // `[auth.remember]` section below — `config()` would deep-clone the whole
+    // config twice per login.
+    let config = state.config_arc();
+    if form.remember.is_some() && config.auth.remember.enabled {
         // Thread the resolved `[auth.remember]` config so cookie_name/duration
         // overrides are honoured (issue #1397.2).
-        let remember_cfg = state.config().auth.remember.clone();
+        let remember_cfg = &config.auth.remember;
         // `Db` derefs to the underlying connection; `&mut *db` reborrows it.
         let cookie = crate::remember::issue_remember_cookie(
             &mut db,
-            &remember_cfg,
+            remember_cfg,
             user.id,
             &user.tenant_id,
             &headers,
@@ -280,13 +287,15 @@ pub async fn logout(
     headers: HeaderMap,
 ) -> AutumnResult<Response> {
     // Thread the resolved `[auth.remember]` config so an overridden cookie name
-    // is the one we revoke and clear (issue #1397.2).
-    let remember_cfg = state.config().auth.remember.clone();
+    // is the one we revoke and clear (issue #1397.2). Read through the shared
+    // `Arc` — a logout must not deep-clone every config section.
+    let config = state.config_arc();
+    let remember_cfg = &config.auth.remember;
 
     // Revoke this device's remember chain (issue #1397) before tearing the
     // session down, so a stolen remember cookie cannot re-establish a login
     // after logout. No-op when no remember cookie is present.
-    crate::remember::revoke_current_chain(&mut db, &remember_cfg, &headers).await;
+    crate::remember::revoke_current_chain(&mut db, remember_cfg, &headers).await;
 
     // Clear the session contents and rotate the id so the old cookie cannot be
     // replayed.
@@ -295,7 +304,7 @@ pub async fn logout(
 
     let mut response = Redirect::to("/").into_response();
     if let Ok(header_value) =
-        HeaderValue::from_str(&crate::remember::clear_remember_cookie(&remember_cfg))
+        HeaderValue::from_str(&crate::remember::clear_remember_cookie(remember_cfg))
     {
         response.headers_mut().append(SET_COOKIE, header_value);
     }

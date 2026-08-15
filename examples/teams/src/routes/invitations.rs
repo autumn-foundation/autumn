@@ -502,8 +502,10 @@ pub async fn accept_invitation(
                         "Password must be at most 128 characters",
                     ));
                 }
-                let password_cfg = state.config().auth.password;
-                let policy = password_cfg.policy();
+                // Read through the shared `Arc`: `config()` would deep-clone
+                // every config section to reach `[auth.password]`.
+                let config = state.config_arc();
+                let policy = config.auth.password.policy();
                 let validation =
                     autumn_web::auth::validate_password(password, &policy, &[email.as_str()]).await;
                 if !validation.is_valid() {
