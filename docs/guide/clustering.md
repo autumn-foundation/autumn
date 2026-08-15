@@ -230,8 +230,8 @@ curl -s localhost:3001/actuator/health | jq '.components["cluster:membership"]'
     "local_addr": "127.0.0.1:7946",
     "member_count": 2,
     "members": [
-      { "id": "node-a", "addr": "127.0.0.1:7946", "status": "alive", "incarnation": 1765430001 },
-      { "id": "node-b", "addr": "127.0.0.1:7947", "status": "alive", "incarnation": 1765430017 }
+      { "id": "node-a", "addr": "127.0.0.1:7946", "status": "alive", "incarnation": 1765430001204 },
+      { "id": "node-b", "addr": "127.0.0.1:7947", "status": "alive", "incarnation": 1765430017861 }
     ]
   }
 }
@@ -373,11 +373,11 @@ future variant is a clean drop rather than a parse failure:
 ```json
 {"type":"state_push","state":{
   "members": {
-    "node-a": { "addr": "127.0.0.1:7946", "incarnation": 1765430001, "status": "alive" },
-    "node-b": { "addr": "127.0.0.1:7947", "incarnation": 1765430017, "status": "alive" }
+    "node-a": { "addr": "127.0.0.1:7946", "incarnation": 1765430001204, "status": "alive" },
+    "node-b": { "addr": "127.0.0.1:7947", "incarnation": 1765430017861, "status": "alive" }
   },
   "counters": {
-    "boids_sighted": { "node-a#1765430001": 3, "node-b#1765430017": 2 }
+    "boids_sighted": { "node-a#1765430001204": 3, "node-b#1765430017861": 2 }
   }
 }}
 ```
@@ -411,9 +411,14 @@ types:
    wins. This tie-break exists only to keep the merge commutative; it should
    never fire in practice.
 
-**Incarnation** is seeded at boot from the wall clock (Unix seconds, read
-through the injected clock), so a restart — clean or crash — normally comes
-back at a strictly higher incarnation with no persistence anywhere. That is
+**Incarnation** is seeded at boot from the wall clock (Unix **milliseconds**,
+read through the injected clock), so a restart — clean or crash — comes back
+at a strictly higher incarnation with no persistence anywhere. Millisecond
+granularity is load-bearing: no real process restarts within the same
+millisecond, so two boots can never mint equal incarnations — which is what
+keeps refutation's exact-echo check sound (a record byte-equal to this boot's
+own record really is an echo of this boot, never a leftover from the previous
+one). That is
 what lets a node with a stable `node_id` rejoin after a crash: its peer's
 replay watermark is keyed by `(sender, incarnation)`, and a fresh, higher
 incarnation starts a fresh sequence rather than colliding with the dead boot's
