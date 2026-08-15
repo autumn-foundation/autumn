@@ -697,7 +697,9 @@ async fn model_create(
     if let Some(Value::String(secret)) = record.get("token") {
         // Mirror the session cookie's Secure flag so the reveal cookie is
         // accepted in both HTTPS and explicit HTTP-only deployments.
-        let secure_attr = if state.config().session.secure {
+        // `config_arc` reads through the shared handle: reading one `bool` must
+        // not deep-clone every config section on a request path.
+        let secure_attr = if state.config_arc().session.secure {
             "; Secure"
         } else {
             ""
@@ -782,7 +784,7 @@ async fn model_detail(
     // Clear the reveal cookie so a page refresh does not show the token again.
     // Mirror the session cookie's Secure flag for consistency.
     if reveal_secret.is_some() {
-        let secure_attr = if state.config().session.secure {
+        let secure_attr = if state.config_arc().session.secure {
             "; Secure"
         } else {
             ""

@@ -225,7 +225,10 @@ all of them at once, rather than making the user fix one problem per round-trip:
 ```rust,ignore
 use autumn_web::auth::{BreachCheck, validate_password};
 
-let cfg = state.config().auth.password;
+// `config_arc` clones the `Arc`, not the config behind it, so reading policy
+// on a per-request path costs a refcount bump rather than a deep clone.
+let config = state.config_arc();
+let cfg = &config.auth.password;
 let mut policy = cfg.policy();
 if cfg.breach_check != BreachCheck::Off {
     // The HIBP lookup needs an HTTP client; the default-off path never builds one.
@@ -239,11 +242,18 @@ if !validation.is_valid() {
 }
 ```
 
-`state.config()` hands back an owned, independently mutable snapshot, which
-costs a deep clone of every config section. On a path that runs per request
-rather than per boot, read through `state.config_arc()` instead — it clones the
-`Arc`, not the config behind it — and clone only the section you need:
-`state.config_arc().auth.password.clone()`.
+Read config through `state.config_arc()` on anything that runs per request. It
+hands back a shared `Arc<AutumnConfig>`, so the read is a refcount bump: borrow
+the section you need off the handle (`&config.auth.password`), or clone just
+that section if you need it owned.
+
+`state.config()` is the per-boot accessor. It hands back an owned, independently
+mutable snapshot, and paying for one means deep-cloning **every** config section
+— 64 allocations and 1,384 bytes per call against a default config, more as your
+config grows — to read a single field. On a request path that cost is repeated
+on every request, and a handler that reads two or three sections pays it two or
+three times over. Reach for it in `on_startup` hooks and one-shot setup, not in
+handlers.
 
 ```toml
 [auth.password]
@@ -263,7 +273,7 @@ differ only in what happens when HIBP is unreachable — `fail_open` allows the
 password, `fail_closed` rejects it. Start with `fail_open`: a transient HIBP
 outage should not block legitimate sign-ups.
 
-Render the policy into the form (`minlength = state.config().auth.password
+Render the policy into the form (`minlength = state.config_arc().auth.password
 .min_length`) so the client-side hint always matches what the handler enforces.
 
 ---
@@ -350,20 +360,21 @@ pub async fn logout(
     mut db: Db,
     headers: HeaderMap,
 ) -> AutumnResult<Response> {
-    let remember_cfg = state.config().auth.remember.clone();
+    let config = state.config_arc();
+    let remember_cfg = &config.auth.remember;
 
     // Drop this device's tracking row, then revoke its remember chain — before
     // the session teardown, and only a no-op when neither is in play. Skipping
     // this is the classic bug: the session dies, the remember cookie survives,
     // and the next request logs the browser straight back in.
     let _ = untrack_current_session(&mut db, &session).await;
-    revoke_remember_from_cookie(&mut db, &remember_cfg, &headers).await;
+    revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await;
 
     session.clear().await;
     session.rotate_id().await;   // old cookie can no longer be replayed
 
     let mut response = Redirect::to("/").into_response();
-    append_set_cookie(&mut response, &build_remember_clear_cookie(&remember_cfg));
+    append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg));
     Ok(response)
 }
 ```

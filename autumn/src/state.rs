@@ -85,6 +85,13 @@ pub struct AppState {
     #[cfg(feature = "db")]
     pub(crate) shards: Option<crate::sharding::ShardSet>,
 
+    /// Why failure-capsule capture cannot record this app's database traffic,
+    /// copied from [`DatabaseTopology::capture_gap`](crate::db::DatabaseTopology::capture_gap)
+    /// when the pools were built. Per-app by construction: another app in the
+    /// same process carries its own state and its own gap.
+    #[cfg(all(feature = "db", feature = "reporting"))]
+    pub(crate) db_capture_gap: Option<Arc<str>>,
+
     /// Active profile name (e.g., "dev", "prod", "staging").
     pub(crate) profile: Option<String>,
 
@@ -898,6 +905,8 @@ impl AppState {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: crate::time::monotonic_now(),
@@ -957,6 +966,11 @@ impl DbState for AppState {
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         self.replica_pool.as_ref()
+    }
+
+    #[cfg(feature = "reporting")]
+    fn db_capture_gap(&self) -> Option<Arc<str>> {
+        self.db_capture_gap.clone()
     }
 
     fn read_pool(
@@ -1541,11 +1555,17 @@ mod tests {
         );
     }
 
-    /// `config`'s signature is load-bearing beyond this crate: autumn-cli's
-    /// auth generator emits `state.config()` move-out patterns as strings that
-    /// CI never compiles, so a change here surfaces only in generated apps.
+    /// Both accessors' signatures are load-bearing beyond this crate: autumn-cli's
+    /// auth generator emits reads against them as strings that CI never compiles,
+    /// so a change here surfaces only in generated apps.
+    ///
+    /// `config_arc` is the one generated request handlers call — they bind the
+    /// handle and borrow sections off it (`&config.auth.password`), so it has to
+    /// keep returning an owned `Arc` that outlives the borrow. `config` stays
+    /// pinned too: it remains the per-boot owned-snapshot accessor.
     #[test]
     fn config_signature_is_unchanged() {
         let _: fn(&AppState) -> crate::config::AutumnConfig = AppState::config;
+        let _: fn(&AppState) -> Arc<crate::config::AutumnConfig> = AppState::config_arc;
     }
 }

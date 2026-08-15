@@ -748,7 +748,7 @@ impl Default for SessionTrackingConfig {
 /// Passwordless magic-link login configuration (issue #1737).
 ///
 /// Read from the `[auth.magic_link]` section of `autumn.toml`. Consumed by the
-/// routes emitted by `autumn generate auth --magic-link` via `state.config()`.
+/// routes emitted by `autumn generate auth --magic-link` via `state.config_arc()`.
 /// All fields have safe production defaults.
 ///
 /// ```toml
@@ -2986,6 +2986,8 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
             started_at: crate::time::monotonic_now(),

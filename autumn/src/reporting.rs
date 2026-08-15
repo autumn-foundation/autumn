@@ -127,6 +127,13 @@ pub struct ErrorEvent {
     /// Panic details, present only when the failure originated from a caught
     /// handler panic.
     pub panic: Option<PanicInfo>,
+    /// The replay capsule written for this failure, when
+    /// `[failure_capture] enabled = true` and persistence succeeded.
+    ///
+    /// The capsule file already exists on disk by the time a reporter is
+    /// invoked, so a reporter may safely attach the path (or read the file)
+    /// while handling the event.
+    pub capsule: Option<crate::capsule::CapsuleRef>,
 }
 
 /// Details of a caught handler panic.
@@ -137,6 +144,20 @@ pub struct PanicInfo {
     pub payload: String,
     /// A captured backtrace, present only when `RUST_BACKTRACE` is set.
     pub backtrace: Option<String>,
+}
+
+/// Response-extension marker for a panic this layer caught and converted into
+/// a sanitized 500.
+///
+/// The wire never carries the payload — the client sees the generic Problem
+/// Details body — but an in-process caller driving the router directly (the
+/// capsule replay driver) needs to know the 500 *was* a panic, and which one,
+/// so a recorded panic is compared against the replayed panic's identity
+/// rather than against any response that happens to share the status code.
+#[derive(Debug, Clone)]
+pub struct CaughtPanic {
+    /// The panic payload as text, as [`ErrorEvent::message`] would carry it.
+    pub payload: String,
 }
 
 /// A sink for [`ErrorEvent`]s.
@@ -208,8 +229,24 @@ struct ReporterChain {
 impl ReporterChain {
     /// Decide whether to deliver this event, then dispatch it on a detached
     /// task so reporting never blocks (or breaks) the client response.
-    fn dispatch(self: &Arc<Self>, event: ErrorEvent) {
-        if !self.enabled || !sampled(self.sample_rate) {
+    ///
+    /// Capsule persistence rides along here rather than in the capture layer
+    /// because it must happen on the same detached task and *before* any
+    /// reporter runs: a reporter that receives
+    /// [`ErrorEvent::capsule`](ErrorEvent::capsule) must find the file already
+    /// on disk. That also means persistence is not gated on `enabled` or the
+    /// sample rate — an app with reporting turned off still writes capsules.
+    ///
+    /// Writing the capsule is blocking filesystem work (a directory scan, a
+    /// `write` + `sync_all`, a rename), so it goes to the blocking pool rather
+    /// than running inline on an async worker: an error storm against slow
+    /// storage would otherwise stall the workers that serve everyone else's
+    /// requests — and stall a current-thread runtime outright. Awaiting the
+    /// join handle before reporting keeps the ordering guarantee: the file is
+    /// on disk before any reporter sees the reference to it.
+    fn dispatch(self: &Arc<Self>, event: ErrorEvent, capture: Option<CaptureContext>) {
+        let deliver = self.enabled && sampled(self.sample_rate);
+        if !deliver && capture.is_none() {
             return;
         }
         // Reporting is best-effort: if we're somehow off-runtime, drop it
@@ -217,7 +254,26 @@ impl ReporterChain {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let chain = Arc::clone(self);
             handle.spawn(async move {
-                chain.report_all(&event).await;
+                let mut event = event;
+                // Held for the whole reporter chain: the capsule must stay
+                // out of pruning's reach until every reporter has had its
+                // chance to read the referenced file — a slow reporter must
+                // not outlive its evidence. The pin is taken *inside* the
+                // write (before the file is visible), so a concurrent
+                // failure's prune has no window to delete it first.
+                let _pin = match capture {
+                    Some(capture) => {
+                        let written = persist_capsule(capture).await;
+                        written.map(|(reference, pin)| {
+                            event.capsule = Some(reference);
+                            pin
+                        })
+                    }
+                    None => None,
+                };
+                if deliver {
+                    chain.report_all(&event).await;
+                }
             });
         }
     }
@@ -236,6 +292,50 @@ impl ReporterChain {
                     tracing::warn!("error reporter panicked constructing report future; ignoring");
                 }
             }
+        }
+    }
+}
+
+/// A request's capture scope plus the outcome that seals it.
+///
+/// Passed to [`ReporterChain::dispatch`] alongside the event so the capsule is
+/// written on the reporting task, before reporters see the event.
+struct CaptureContext {
+    handle: crate::capsule::CaptureHandle,
+    outcome: crate::capsule::CapsuleOutcome,
+}
+
+/// Write the capsule for a failed request on the blocking pool, and wait for
+/// it.
+///
+/// The wait is the point: [`ErrorEvent::capsule`](ErrorEvent::capsule) is only
+/// worth carrying if the file it names is already on disk when a reporter
+/// follows it, so this resolves before `report_all` runs. Moving the work off
+/// the async worker is what keeps a slow disk (or a burst of failures) from
+/// blocking the runtime while that happens.
+///
+/// A join failure — the blocking task panicked or the runtime is shutting down
+/// — is logged and reported as "no capsule", exactly like a write failure:
+/// capsule persistence must never make a bad request worse.
+async fn persist_capsule(
+    capture: CaptureContext,
+) -> Option<(
+    crate::capsule::CapsuleRef,
+    crate::capsule::persist::ReportingPin,
+)> {
+    let written = tokio::task::spawn_blocking(move || {
+        crate::capsule::persist::persist_pinned(capture.handle.scope(), capture.outcome)
+    })
+    .await;
+    match written {
+        Ok(reference) => reference,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "failure capsule could not be written on the blocking pool; \
+                 the failure itself is still reported"
+            );
+            None
         }
     }
 }
@@ -342,6 +442,9 @@ struct RequestContext {
     method: String,
     route: Option<String>,
     request_id: Option<String>,
+    /// Handle to the request's capsule buffer, snapshotted here for the same
+    /// reason the rest of this struct is: it must survive a handler unwind.
+    capture: Option<crate::capsule::CaptureHandle>,
 }
 
 /// Tower [`Layer`] that catches handler panics and reports panics + 5xx
@@ -422,10 +525,15 @@ where
             .extensions()
             .get::<RequestId>()
             .map(std::string::ToString::to_string);
+        let capture = req
+            .extensions()
+            .get::<crate::capsule::CaptureHandle>()
+            .cloned();
         let context = Some(RequestContext {
             method,
             route,
             request_id,
+            capture,
         });
 
         // Catch panics raised synchronously while the inner service constructs
@@ -488,9 +596,9 @@ where
         // poll keeps a panicking handler from aborting the worker task.
         match std::panic::catch_unwind(AssertUnwindSafe(move || inner.poll(cx))) {
             Ok(Poll::Pending) => Poll::Pending,
-            Ok(Poll::Ready(Ok(response))) => {
+            Ok(Poll::Ready(Ok(mut response))) => {
                 if let Some(context) = this.context.take() {
-                    report_response(&response, context, this.chain);
+                    report_response(&mut response, context, this.chain);
                 }
                 Poll::Ready(Ok(response))
             }
@@ -505,7 +613,7 @@ where
 }
 
 /// Report a completed response when it is a server error.
-fn report_response(response: &Response, context: RequestContext, chain: &Arc<ReporterChain>) {
+fn report_response(response: &mut Response, context: RequestContext, chain: &Arc<ReporterChain>) {
     if !response.status().is_server_error() {
         return;
     }
@@ -524,15 +632,226 @@ fn report_response(response: &Response, context: RequestContext, chain: &Arc<Rep
         |info| (info.message.clone(), info.problem_type.map(str::to_owned)),
     );
 
-    chain.dispatch(ErrorEvent {
-        status: response.status(),
-        message,
-        problem_type,
-        request_id: context.request_id,
-        route: context.route,
-        method: Some(context.method),
-        panic: None,
+    // A body that is not yet materialized can run more handler code as it is
+    // polled — database queries, clock reads — after the snapshot below, so
+    // those effects would be missing from the tape while the capsule claims to
+    // be complete. A replay drains the body and would report divergences that
+    // never happened. Probed only when a capsule is actually being written: with
+    // capture off the response is handed on exactly as the handler produced it.
+    let body_is_materialized = context.capture.is_some() && materialize_body(response);
+
+    let capture = context.capture.map(|handle| {
+        if !body_is_materialized {
+            handle.scope().note(
+                "the failing response body was still being produced when the response \
+                 head resolved; effects produced while the body streams are not recorded, \
+                 so the capsule is marked truncated",
+            );
+            handle.scope().mark_truncated();
+        }
+        // Close the scope here rather than leaving it to the capture layer's
+        // registry guard: persistence starts as soon as this is dispatched, and
+        // a connection recorder still appending effects would be racing the
+        // snapshot. Closing first makes the capsule's contents final.
+        handle.scope().close();
+        CaptureContext {
+            handle,
+            outcome: crate::capsule::CapsuleOutcome::Status {
+                code: response.status().as_u16(),
+                message: message.clone(),
+                problem_type: problem_type.clone(),
+            },
+        }
     });
+
+    chain.dispatch(
+        ErrorEvent {
+            status: response.status(),
+            message,
+            problem_type,
+            request_id: context.request_id,
+            route: context.route,
+            method: Some(context.method),
+            panic: None,
+            capsule: None,
+        },
+        capture,
+    );
+}
+
+/// Frames the probe will pull from a body before giving up on it.
+const PROBE_FRAMES: usize = 8;
+
+/// Bytes the probe will hold before giving up on a body.
+const PROBE_BYTES: usize = 64 * 1024;
+
+/// Whether the failing response's body was already produced in full, replacing
+/// it with an equivalent body either way.
+///
+/// The capture scope closes when the response future resolves, so anything a
+/// lazily-produced body does while it is polled happens *after* the capsule
+/// snapshot. Asking the body is the only way to know: a size hint states a
+/// byte count, not that the bytes exist yet, so a hand-written
+/// [`http_body::Body`] can advertise an exact length and still run database or
+/// clock work in `poll_frame`.
+///
+/// So the body is polled with a no-op waker, which cannot make it wait: a body
+/// that yields every frame and ends without once returning `Pending` had
+/// nothing left to run (axum's `String`/JSON/bytes responses take two polls),
+/// and its collected bytes are handed back as the response body. Anything that
+/// stalls, carries trailers, or outruns the probe budget is treated as lazy and
+/// handed back with the frames the probe pulled put back in front, so the
+/// client still sees the bytes the handler produced, in order.
+///
+/// A body of unknown length is never polled at all — an SSE stream would only
+/// answer `Pending` — so the common streaming case pays nothing and is reported
+/// as lazy, which it is.
+fn materialize_body(response: &mut Response) -> bool {
+    use axum::body::Body;
+    use bytes::Bytes;
+    use http_body::Body as _;
+
+    let body = response.body_mut();
+    if body.is_end_stream() {
+        return true;
+    }
+    if body.size_hint().exact().is_none() {
+        return false;
+    }
+
+    let mut body = std::mem::replace(response.body_mut(), Body::empty());
+    let mut frames: std::collections::VecDeque<http_body::Frame<Bytes>> =
+        std::collections::VecDeque::new();
+    let mut collected = 0usize;
+    // Trailers are frames too, and a body carrying them cannot be handed on as
+    // a plain buffer without losing them.
+    let mut data_only = true;
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+
+    for _ in 0..PROBE_FRAMES {
+        match Pin::new(&mut body).poll_frame(&mut cx) {
+            // Ended without ever waiting: everything it had is in `frames`.
+            Poll::Ready(None) => {
+                *response.body_mut() = rebuild_probed_body(frames, None, None, data_only);
+                return true;
+            }
+            // An error ends the body, but it is part of what the client must
+            // observe — collapsing it into a clean EOF would report a
+            // successful response the handler never produced. Keep it, and do
+            // not call the capsule complete: the body did not finish.
+            Poll::Ready(Some(Err(error))) => {
+                *response.body_mut() = rebuild_probed_body(frames, Some(error), None, data_only);
+                return false;
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    collected = collected.saturating_add(data.len());
+                } else {
+                    data_only = false;
+                }
+                frames.push_back(frame);
+                if collected > PROBE_BYTES {
+                    break;
+                }
+            }
+            Poll::Pending => break,
+        }
+    }
+
+    *response.body_mut() = rebuild_probed_body(frames, None, Some(body), data_only);
+    false
+}
+
+/// Rebuild a response body out of what the probe pulled and whatever is left.
+///
+/// The probe must be invisible to the client: every frame it took goes back,
+/// in order, ahead of the error that ended the body or the body itself.
+fn rebuild_probed_body(
+    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+    error: Option<axum::Error>,
+    rest: Option<axum::body::Body>,
+    data_only: bool,
+) -> axum::body::Body {
+    use axum::body::Body;
+
+    if frames.is_empty() && error.is_none() {
+        // Nothing was taken — a body that answered `Pending` on the first poll
+        // (every stream, in practice) goes back untouched.
+        return rest.unwrap_or_else(Body::empty);
+    }
+    if data_only && error.is_none() && rest.is_none() {
+        // The whole body, and all of it data: hand it on as a plain sized body
+        // so the response keeps an exact length.
+        return Body::from(concat_frames(frames));
+    }
+    Body::new(ProbedBody {
+        frames,
+        error,
+        rest,
+    })
+}
+
+/// Join the data frames the probe pulled into one buffer.
+fn concat_frames(
+    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+) -> bytes::Bytes {
+    use bytes::Bytes;
+
+    let mut chunks = frames
+        .into_iter()
+        .filter_map(|frame| frame.into_data().ok());
+    let Some(first) = chunks.next() else {
+        return Bytes::new();
+    };
+    let Some(second) = chunks.next() else {
+        // The overwhelmingly common shape: one frame, handed on without a copy.
+        return first;
+    };
+    let mut joined = Vec::with_capacity(first.len().saturating_add(second.len()));
+    joined.extend_from_slice(&first);
+    joined.extend_from_slice(&second);
+    for chunk in chunks {
+        joined.extend_from_slice(&chunk);
+    }
+    Bytes::from(joined)
+}
+
+/// The body the probe hands back: the frames it pulled, then the error that
+/// ended the body or the remainder of the body itself.
+struct ProbedBody {
+    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+    error: Option<axum::Error>,
+    rest: Option<axum::body::Body>,
+}
+
+impl http_body::Body for ProbedBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(frame) = self.frames.pop_front() {
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        if let Some(error) = self.error.take() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        self.rest
+            .as_mut()
+            .map_or_else(|| Poll::Ready(None), |rest| Pin::new(rest).poll_frame(cx))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.frames.is_empty()
+            && self.error.is_none()
+            && self
+                .rest
+                .as_ref()
+                .is_none_or(http_body::Body::is_end_stream)
+    }
 }
 
 /// Convert a caught panic into a sanitized 500 response and report it.
@@ -547,25 +866,51 @@ fn handle_panic(
         .and_then(|captured| captured.backtrace);
 
     if let Some(context) = context {
-        chain.dispatch(ErrorEvent {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.clone(),
-            problem_type: None,
-            request_id: context.request_id,
-            route: context.route,
-            method: Some(context.method),
-            panic: Some(PanicInfo {
-                payload: message,
-                backtrace,
-            }),
+        let capture = context.capture.map(|handle| {
+            // Same reason as `report_response`: seal the scope before the
+            // capsule is built, so nothing can append to it while it is
+            // being written.
+            handle.scope().close();
+            CaptureContext {
+                handle,
+                outcome: crate::capsule::CapsuleOutcome::Panic {
+                    status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    payload: message.clone(),
+                    backtrace: backtrace.clone(),
+                },
+            }
         });
+        chain.dispatch(
+            ErrorEvent {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: message.clone(),
+                problem_type: None,
+                request_id: context.request_id,
+                route: context.route,
+                method: Some(context.method),
+                panic: Some(PanicInfo {
+                    payload: message,
+                    backtrace,
+                }),
+                capsule: None,
+            },
+            capture,
+        );
     }
 
     // The client gets a clean, sanitized Problem Details 500 — the panic
     // payload only ever reaches the reporter, never the wire. The
     // `AutumnErrorInfo` stashed by `into_response` lets the exception-filter
-    // chain negotiate HTML error pages as usual.
-    crate::error::AutumnError::internal_server_error_msg("Internal server error").into_response()
+    // chain negotiate HTML error pages as usual. The `CaughtPanic` extension
+    // is in-process metadata for the replay driver; extensions are never
+    // serialized onto the wire.
+    let mut response =
+        crate::error::AutumnError::internal_server_error_msg("Internal server error")
+            .into_response();
+    response.extensions_mut().insert(CaughtPanic {
+        payload: format_panic_payload(payload),
+    });
+    response
 }
 
 #[cfg(test)]
@@ -596,6 +941,249 @@ mod tests {
         assert_eq!(format_panic_payload(&owned), "kaboom");
         let other: u32 = 7;
         assert_eq!(format_panic_payload(&other), "handler panicked");
+    }
+
+    /// A body that advertises an exact size proves nothing about whether its
+    /// bytes exist yet: `SizeHint` is a byte count, and a hand-written
+    /// `http_body::Body` can promise a length and still do database or clock
+    /// work the first time it is polled. Only asking the body settles it.
+    #[tokio::test]
+    async fn a_body_is_materialized_only_when_it_finishes_without_waiting() {
+        use axum::body::Body;
+        use http_body_util::BodyExt as _;
+
+        fn probe(body: Body) -> (bool, Response) {
+            let mut response = Response::new(body);
+            let materialized = materialize_body(&mut response);
+            (materialized, response)
+        }
+
+        // The case a size hint cannot catch: an exact length, produced lazily.
+        struct ExactButLazy(u8);
+        impl http_body::Body for ExactButLazy {
+            type Data = bytes::Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                self.0 = self.0.saturating_add(1);
+                match self.0 {
+                    // Pretend to await something: a real one would be querying.
+                    1 => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    2 => Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+                        b"late",
+                    ))))),
+                    _ => Poll::Ready(None),
+                }
+            }
+
+            fn size_hint(&self) -> http_body::SizeHint {
+                http_body::SizeHint::with_exact(4)
+            }
+        }
+
+        // In-memory bodies finish on the spot — nothing runs later.
+        assert!(probe(Body::empty()).0);
+        let (materialized, response) = probe(Body::from("boom details"));
+        assert!(materialized);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect")
+                .to_bytes(),
+            "boom details",
+            "a materialized body must be handed on byte for byte"
+        );
+
+        // A stream never claims an exact size: reported lazy, never polled.
+        let streaming = Body::from_stream(futures::stream::once(async {
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"chunk"))
+        }));
+        assert!(!probe(streaming).0);
+
+        let (materialized, response) = probe(Body::new(ExactButLazy(0)));
+        assert!(
+            !materialized,
+            "an exact size hint does not mean the bytes exist yet"
+        );
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect")
+                .to_bytes(),
+            "late",
+            "a probed body must still deliver everything it produces"
+        );
+    }
+
+    /// The probe must be invisible to the client. A trailer frame it pulls has
+    /// to go back into the response: enabling failure capture must not strip
+    /// integrity or diagnostic metadata off a 5xx.
+    #[tokio::test]
+    async fn a_probed_trailer_frame_is_put_back() {
+        use axum::body::Body;
+        use http_body_util::BodyExt as _;
+
+        struct DataThenTrailers(u8);
+        impl http_body::Body for DataThenTrailers {
+            type Data = bytes::Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                self.0 = self.0.saturating_add(1);
+                match self.0 {
+                    1 => Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+                        b"body",
+                    ))))),
+                    2 => {
+                        let mut trailers = axum::http::HeaderMap::new();
+                        trailers.insert("x-checksum", axum::http::HeaderValue::from_static("42"));
+                        Poll::Ready(Some(Ok(http_body::Frame::trailers(trailers))))
+                    }
+                    _ => Poll::Ready(None),
+                }
+            }
+
+            fn size_hint(&self) -> http_body::SizeHint {
+                http_body::SizeHint::with_exact(4)
+            }
+        }
+
+        let mut response = Response::new(Body::new(DataThenTrailers(0)));
+        assert!(
+            materialize_body(&mut response),
+            "the body finished without waiting, so the capsule is complete"
+        );
+        let collected = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect the rebuilt body");
+        let trailers = collected
+            .trailers()
+            .cloned()
+            .expect("the trailer frame must survive the probe");
+        assert_eq!(trailers.get("x-checksum").expect("checksum"), "42");
+        assert_eq!(collected.to_bytes(), "body");
+    }
+
+    /// A body that fails mid-stream must still fail for the client: turning the
+    /// error into a clean EOF would report a whole response the handler never
+    /// sent, and the capsule cannot claim to be complete either.
+    #[tokio::test]
+    async fn a_probed_body_error_is_preserved_and_marks_the_capsule_incomplete() {
+        use axum::body::Body;
+        use http_body_util::BodyExt as _;
+
+        struct DataThenError(bool);
+        impl http_body::Body for DataThenError {
+            type Data = bytes::Bytes;
+            type Error = std::io::Error;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                if self.0 {
+                    self.0 = false;
+                    return Poll::Ready(Some(Ok(http_body::Frame::data(
+                        bytes::Bytes::from_static(b"partial"),
+                    ))));
+                }
+                Poll::Ready(Some(Err(std::io::Error::other("upstream went away"))))
+            }
+
+            fn size_hint(&self) -> http_body::SizeHint {
+                http_body::SizeHint::with_exact(7)
+            }
+        }
+
+        let mut response = Response::new(Body::new(DataThenError(true)));
+        assert!(
+            !materialize_body(&mut response),
+            "a body that failed did not finish, so the capsule must not claim to be complete"
+        );
+        let error = response
+            .into_body()
+            .collect()
+            .await
+            .expect_err("the body error must reach the client, not be collapsed into EOF");
+        assert!(
+            error.to_string().contains("upstream went away"),
+            "the original error must survive the probe: {error}"
+        );
+    }
+
+    /// Frames the probe pulled before a body stalled must go back in front of
+    /// the remainder, or the client loses the beginning of the response.
+    #[tokio::test]
+    async fn probed_frames_are_put_back_in_front_of_a_stalling_body() {
+        use axum::body::Body;
+        use http_body_util::BodyExt as _;
+
+        struct ReadyThenStall(u8);
+        impl http_body::Body for ReadyThenStall {
+            type Data = bytes::Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                self.0 = self.0.saturating_add(1);
+                match self.0 {
+                    1 => Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+                        b"first",
+                    ))))),
+                    2 => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    3 => Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+                        b"-rest",
+                    ))))),
+                    _ => Poll::Ready(None),
+                }
+            }
+
+            fn size_hint(&self) -> http_body::SizeHint {
+                http_body::SizeHint::with_exact(10)
+            }
+        }
+
+        let mut response = Response::new(Body::new(ReadyThenStall(0)));
+        assert!(!materialize_body(&mut response), "the body stalls");
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect")
+                .to_bytes(),
+            "first-rest",
+            "the probed frame must not be lost"
+        );
+    }
+
+    #[test]
+    fn capture_context_can_cross_to_the_blocking_pool() {
+        // `persist_capsule` hands the context to `spawn_blocking`, which needs
+        // `Send + 'static`. A future field that is neither would only show up
+        // as a confusing error inside `dispatch`, so pin it here.
+        const fn assert_send_static<T: Send + 'static>() {}
+        assert_send_static::<CaptureContext>();
     }
 
     #[test]
@@ -636,6 +1224,77 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    /// A 5xx whose body is produced lazily can keep running handler code —
+    /// queries, clock reads — while the client drains it, after the capsule
+    /// snapshot. Such a capsule must say it is incomplete rather than send a
+    /// replay chasing divergences that never happened.
+    #[tokio::test]
+    async fn a_streaming_5xx_marks_its_capsule_truncated() {
+        use std::convert::Infallible;
+        use std::sync::Arc;
+
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        use crate::capsule::{CaptureHandle, CaptureLayer, CaptureSettings};
+        use crate::log::filter::ParameterFilter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seen: Arc<Mutex<Option<CaptureHandle>>> = Arc::new(Mutex::new(None));
+
+        let inner = {
+            let seen = Arc::clone(&seen);
+            tower::service_fn(move |req: Request<Body>| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    *seen.lock().expect("lock") = req.extensions().get::<CaptureHandle>().cloned();
+                    let stream = futures::stream::once(async {
+                        Ok::<_, Infallible>(bytes::Bytes::from_static(b"partial error page"))
+                    });
+                    let mut response = Response::new(Body::from_stream(stream));
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    Ok::<_, Infallible>(response)
+                }
+            })
+        };
+        // Same order as the router: capture outer, reporting inner, so the
+        // reporting layer finds the handle the capture layer inserted.
+        let reporting = ReportingLayer::new(Vec::new(), true, 1.0).layer(inner);
+        let service = CaptureLayer::new(
+            CaptureSettings {
+                dir: dir.path().to_string_lossy().into_owned(),
+                ..CaptureSettings::default()
+            },
+            Arc::new(ParameterFilter::new(&[], &[])),
+        )
+        .layer(reporting);
+
+        let response = service
+            .oneshot(Request::new(Body::empty()))
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let handle = seen
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("the capture layer inserts a handle");
+        assert!(
+            handle.scope().is_truncated(),
+            "a streaming 5xx body means the capsule cannot vouch for completeness"
+        );
+        assert!(
+            handle
+                .scope()
+                .notes()
+                .iter()
+                .any(|note| note.contains("still being produced")),
+            "the truncation must be explained in the notes: {:?}",
+            handle.scope().notes()
+        );
+    }
+
     #[tokio::test]
     async fn disabled_chain_does_not_dispatch() {
         #[derive(Clone)]
@@ -655,15 +1314,19 @@ mod tests {
             enabled: false,
             sample_rate: 1.0,
         });
-        chain.dispatch(ErrorEvent {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "x".into(),
-            problem_type: None,
-            request_id: None,
-            route: None,
-            method: None,
-            panic: None,
-        });
+        chain.dispatch(
+            ErrorEvent {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "x".into(),
+                problem_type: None,
+                request_id: None,
+                route: None,
+                method: None,
+                panic: None,
+                capsule: None,
+            },
+            None,
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(*count.lock().unwrap(), 0);
     }
@@ -677,6 +1340,7 @@ mod tests {
             route: Some("/x".into()),
             method: Some("GET".into()),
             panic: None,
+            capsule: None,
         }
     }
 
@@ -692,6 +1356,7 @@ mod tests {
                 payload: "kaboom".into(),
                 backtrace: Some("<backtrace>".into()),
             }),
+            capsule: None,
         }
     }
 
@@ -750,6 +1415,6 @@ mod tests {
             enabled: true,
             sample_rate: 1.0,
         });
-        chain.dispatch(server_error_event());
+        chain.dispatch(server_error_event(), None);
     }
 }

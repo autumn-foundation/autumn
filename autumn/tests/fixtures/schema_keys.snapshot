@@ -133,6 +133,12 @@ dev
 dev.inspector_capacity
 dev.inspector_n_plus_one_threshold
 dev.inspector_path
+failure_capture
+failure_capture.dir
+failure_capture.enabled
+failure_capture.max_body_bytes
+failure_capture.max_capsule_bytes
+failure_capture.max_capsules
 health
 health.detailed
 health.enabled

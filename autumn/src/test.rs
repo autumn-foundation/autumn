@@ -1817,6 +1817,11 @@ impl TestApp {
             #[cfg(all(feature = "db", feature = "sqlite"))]
             shards: crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
                 .expect("test shard pools should build from config"),
+            // The test harness attaches pools directly (`with_pool`), without
+            // a topology to carry a capture gap; a DB test that needs the gap
+            // noted asserts through the production seam instead.
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: self.config.profile.clone(),
             role: self.config.role,
             started_at,
@@ -1854,6 +1859,17 @@ impl TestApp {
                 .unwrap_or_else(|| std::sync::Arc::new(crate::entropy::OsEntropy)),
             app_id: crate::state::AppState::next_app_id(),
         };
+
+        // Mirror `App::run`'s failure-capsule clock wiring (#1598): the layer
+        // itself is installed by the shared router builder, but the recording
+        // clock replaces the state's clock, which the router never owns.
+        #[cfg(feature = "reporting")]
+        if self.config.failure_capture.enabled {
+            let recording =
+                std::sync::Arc::new(crate::capsule::RecordingClock::new(state.clock_arc()))
+                    as std::sync::Arc<dyn crate::time::ClockSource>;
+            state = state.with_clock(recording);
+        }
 
         for register in self.policy_registrations {
             register(state.policy_registry());

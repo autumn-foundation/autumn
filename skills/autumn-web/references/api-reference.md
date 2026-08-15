@@ -1117,6 +1117,46 @@ Frequently used env keys:
 | `AUTUMN_CACHE__BACKEND` | `cache.backend` |
 | `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (unreleased — trunk-dev) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
 
+### `[failure_capture]` — failure capsules (unreleased — trunk-dev, #1598)
+
+Opt-in deterministic replay capsules: every caught handler panic or 5xx writes
+one redacted JSON file (the request, the PostgreSQL wire traffic the handler
+produced, its clock readings, and the outcome), replayable offline with
+`autumn replay <capsule>`. Off by default; nothing is installed until enabled.
+
+```toml
+[failure_capture]
+enabled = true            # default: false — arms capture layer, recording pool, recording clock
+dir = "tmp/autumn-capsules"
+max_body_bytes = 65536    # request-body copy cap (64 KiB)
+max_capsule_bytes = 1048576
+max_capsules = 50         # oldest-first prune (capsule-named files only), before each write
+```
+
+- `autumn replay <file>` exit codes: `0` reproduced (status + message +
+  problem type match, tape fully consumed), `1` mismatch/diverged, `2`
+  refused (truncated capsule, unknown `format_version`, sqlite build).
+  Replay is offline by design: in-memory sessions, in-process channels,
+  fail-closed outbound HTTP, no port bound, DB served from the capsule's tape
+  by an in-process stub server. App-registered state initializers still run
+  as written (documented boundary — point them at stubs when replaying).
+- `autumn replay` compiles the replay binary with the build kind the capsule
+  recorded (`app.debug_assertions`) so `cfg(debug_assertions)` code paths
+  match the failing run; override with `--release`/`--debug`, and pass
+  `--features`/`--no-default-features` when feature-gated code matters (the
+  feature set itself is not recorded).
+- A failing response with a *streaming* body (SSE, `Body::from_stream`) marks
+  its capsule truncated: effects produced while the body streams are not on
+  the tape.
+- `ErrorEvent::capsule: Option<CapsuleRef>` — the file is on disk (and pinned
+  against pruning) before reporters run.
+- DB capture needs plaintext-TCP PostgreSQL: TLS-required URLs, Unix sockets,
+  sqlite builds, custom `DatabasePoolProvider`s and shard pools disable the
+  tape and mark capsules truncated (with a note saying why).
+- **A capsule is production data** — result rows, path segments, and SQL text
+  are not maskable; treat the directory like a database dump and read
+  `docs/guide/failure-capsules.md` (security section leads) before enabling.
+
 ### `[server.tls]` (feature `tls`, unreleased — trunk-dev, #1603)
 
 In-process HTTPS termination on the same host:port (off by default).
