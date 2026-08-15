@@ -103,8 +103,9 @@ warning:
 - `push_interval_ms` must be at least `10`.
 - `bind_addr`, `advertise_addr`, and every entry of `seed_peers` must parse as
   a `SocketAddr` (`host:port`, IP literal — hostnames are not resolved).
-- `node_id` and `cluster_name`, when set, must be non-empty and at most 64
-  bytes. Both travel in every frame and are covered by the MAC.
+- `node_id` and `cluster_name`, when set, must be non-empty, at most 64
+  bytes, and must not contain `#` (reserved as the separator in counter cell
+  keys). Both travel in every frame and are covered by the MAC.
 - An unknown key under `[cluster]` is a config error, like every other section.
 
 ### Choosing addresses
@@ -149,6 +150,20 @@ async fn record_sighting(State(state): State<AppState>) -> AutumnResult<Json<ser
         "node": cluster.node_id(),
         "members": cluster.members().len(),
         "boids_sighted": sightings.get(),
+    })))
+}
+
+#[get("/sightings")]
+async fn read_sightings(State(state): State<AppState>) -> AutumnResult<Json<serde_json::Value>> {
+    let cluster = state
+        .extension::<ClusterHandle>()
+        .ok_or_else(|| AutumnError::internal_server_error_msg("cluster is not enabled"))?;
+
+    // Read-only: no increment. This is the endpoint the two-terminal
+    // walkthrough polls on node B after incrementing on node A.
+    Ok(Json(serde_json::json!({
+        "node": cluster.node_id(),
+        "boids_sighted": cluster.counter("boids_sighted").get(),
     })))
 }
 ```
@@ -215,8 +230,8 @@ curl -s localhost:3001/actuator/health | jq '.components["cluster:membership"]'
     "local_addr": "127.0.0.1:7946",
     "member_count": 2,
     "members": [
-      { "id": "node-a", "addr": "127.0.0.1:7946", "status": "alive", "incarnation": 1 },
-      { "id": "node-b", "addr": "127.0.0.1:7947", "status": "alive", "incarnation": 1 }
+      { "id": "node-a", "addr": "127.0.0.1:7946", "status": "alive", "incarnation": 1765430001 },
+      { "id": "node-b", "addr": "127.0.0.1:7947", "status": "alive", "incarnation": 1765430017 }
     ]
   }
 }
@@ -317,9 +332,14 @@ cost an attacker a dropped frame, never a forged one.
 
 ### Receive path
 
-The order is normative. Every step that drops does so by logging and
-continuing: it never panics, never ends the read loop, and always increments
-`frames_rejected_total` with the named reason.
+The order is normative. Every rejection logs and increments
+`frames_rejected_total` with the named reason, and nothing ever panics. Steps
+2-7 drop the offending frame and continue the read loop. Step 1 is the one
+deliberate exception: a bad length prefix means the stream framing itself can
+no longer be trusted — there is no way to know where the next frame starts —
+so the connection closes and the peer re-dials with backoff. Closing a
+connection is never an eviction; connection state carries zero liveness
+meaning.
 
 1. **Length prefix** — `N == 0` or `N > 65536` closes the connection with no
    allocation (`reason="oversize"`).
@@ -353,11 +373,11 @@ future variant is a clean drop rather than a parse failure:
 ```json
 {"type":"state_push","state":{
   "members": {
-    "node-a": { "addr": "127.0.0.1:7946", "incarnation": 1, "status": "alive" },
-    "node-b": { "addr": "127.0.0.1:7947", "incarnation": 1, "status": "alive" }
+    "node-a": { "addr": "127.0.0.1:7946", "incarnation": 1765430001, "status": "alive" },
+    "node-b": { "addr": "127.0.0.1:7947", "incarnation": 1765430017, "status": "alive" }
   },
   "counters": {
-    "boids_sighted": { "node-a": 3, "node-b": 2 }
+    "boids_sighted": { "node-a#1765430001": 3, "node-b#1765430017": 2 }
   }
 }}
 ```
@@ -391,10 +411,24 @@ types:
    wins. This tie-break exists only to keep the merge commutative; it should
    never fire in practice.
 
-**Refutation** keeps a live node from being buried. A node that receives a
-document marking *itself* `Left` sets its incarnation to one above the highest
-it has seen for itself, marks itself `Alive`, and pushes immediately. Because
-rule 1 outranks rule 2, that refutation wins everywhere.
+**Incarnation** is seeded at boot from the wall clock (Unix seconds, read
+through the injected clock), so a restart — clean or crash — normally comes
+back at a strictly higher incarnation with no persistence anywhere. That is
+what lets a node with a stable `node_id` rejoin after a crash: its peer's
+replay watermark is keyed by `(sender, incarnation)`, and a fresh, higher
+incarnation starts a fresh sequence rather than colliding with the dead boot's
+watermark.
+
+**Refutation** keeps a live node from being buried, and covers the residual
+restart cases (a restart within the same clock second, a clock that stepped
+backwards). A node that receives any record about *itself* at an incarnation
+greater than or equal to its own — whatever the status, `Left` or a stale
+`Alive` — sets its incarnation to one above the highest it has seen for
+itself, marks itself `Alive`, and pushes immediately. Because rule 1 outranks
+rule 2, that refutation wins everywhere. The trigger works even when the
+returning node is being replay-dropped by its peer, because the peer's own
+pushes still reach it: the returning node's watermark table is fresh, so it
+accepts the peer's state, sees its own stale record, and bumps past it.
 
 **Local liveness** is *not* replicated. Each node times the silence since it
 last accepted a frame from each peer, using the injected monotonic clock:
@@ -437,10 +471,17 @@ propagates, and are pruned locally after ten suspicion timeouts.
 "observable on the other node" a property of the data rather than of the
 network's timing:
 
-- Each counter name maps to a map of `node id → u64`. A node writes **only its
-  own entry**, so no two nodes ever write the same cell.
-- `increment()` adds 1 to this node's entry, immediately and locally, then
-  nudges the push task. Local `get()` reflects it at once.
+- Each counter name maps to a map of `cell → u64`, where a cell is keyed by
+  `node id # incarnation` — one cell per node *per boot*. A node writes **only
+  its own current cell**, so no two writers ever share a cell, and a restarted
+  node never resumes a cell an older boot of itself already populated. Without
+  the incarnation in the key, a node restarting with a stable `node_id` would
+  start its cell at zero while its peer remembers the old, higher value; the
+  max-merge would then silently absorb every new increment until the new count
+  overtook the old one. Keying cells by boot removes that failure by
+  construction — no recovery step, no readiness gate.
+- `increment()` adds 1 to this node's current cell, immediately and locally,
+  then nudges the push task. Local `get()` reflects it at once.
 - Merge is **per-entry maximum**. That is commutative, associative, and
   idempotent, so pushes may arrive out of order, be duplicated, or be dropped
   entirely, and the result is the same once any later push lands.
@@ -496,25 +537,26 @@ timeout, which handles the kill, the crash, the pulled cable, and the lost
 leave identically.
 
 **Counter volatility.** Counters live in process memory for the lifetime of the
-process. There is no persistence. A restarted node returns with an empty entry
-of its own and re-learns the other entries from its peer, so a rolling restart
-of one node at a time preserves the total — but if every node is down at once,
-the count is gone. If you need a durable count, write it to the database (see
-[Counter Caches](counter-cache.md)) and use this for ephemeral, cluster-wide
-tallies.
+process. There is no persistence. A restarted node starts a fresh cell (its
+cells are keyed by boot incarnation) and re-learns every older cell — including
+its own previous boots' — from its peer, so a rolling restart of one node at a
+time preserves the total and new increments count from the first request; but
+if every node is down at once, the count is gone. If you need a durable count,
+write it to the database (see [Counter Caches](counter-cache.md)) and use this
+for ephemeral, cluster-wide tallies.
 
-**State growth.** The document holds one member record and one counter entry
-per distinct node id ever seen, plus one map per distinct counter name, and each
-node keeps one replay-watermark row per distinct sender it has accepted a frame
-from. Member records are pruned after their tombstone window; **counter entries
-and watermark rows are not** —
-dropping a counter entry would make `get()` move downward, and dropping a
+**State growth.** The document holds one member record per distinct node id
+ever seen, one counter cell per `(node id, boot incarnation)` that has
+incremented each counter name, and each node keeps one replay-watermark row
+per distinct sender it has accepted a frame from. Member records are pruned
+after their tombstone window; **counter cells and watermark rows are not** —
+dropping a counter cell would make `get()` move downward, and dropping a
 watermark row would re-open a replay window. The consequence is operational:
-with no configured `node_id`, every restart mints a fresh random id and leaves
-an entry behind forever. Set an explicit, stable `node_id` on any long-lived
-deployment, and keep counter names a small fixed set from your code rather than
-anything derived from user input. Entry garbage collection is out of scope for
-this slice.
+every boot that increments a counter leaves one `u64` cell behind, and a node
+with no configured `node_id` additionally mints a fresh member id per restart.
+Set an explicit, stable `node_id` on any long-lived deployment, and keep
+counter names a small fixed set from your code rather than anything derived
+from user input. Cell garbage collection is out of scope for this slice.
 
 **A one-member view is healthy.** `cluster:membership` reports `UP` with one
 member, exactly as with two. It is a `HealthOnly` indicator: it never gates
