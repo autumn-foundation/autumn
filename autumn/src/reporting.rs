@@ -596,9 +596,9 @@ where
         // poll keeps a panicking handler from aborting the worker task.
         match std::panic::catch_unwind(AssertUnwindSafe(move || inner.poll(cx))) {
             Ok(Poll::Pending) => Poll::Pending,
-            Ok(Poll::Ready(Ok(response))) => {
+            Ok(Poll::Ready(Ok(mut response))) => {
                 if let Some(context) = this.context.take() {
-                    report_response(&response, context, this.chain);
+                    report_response(&mut response, context, this.chain);
                 }
                 Poll::Ready(Ok(response))
             }
@@ -613,7 +613,7 @@ where
 }
 
 /// Report a completed response when it is a server error.
-fn report_response(response: &Response, context: RequestContext, chain: &Arc<ReporterChain>) {
+fn report_response(response: &mut Response, context: RequestContext, chain: &Arc<ReporterChain>) {
     if !response.status().is_server_error() {
         return;
     }
@@ -632,17 +632,20 @@ fn report_response(response: &Response, context: RequestContext, chain: &Arc<Rep
         |info| (info.message.clone(), info.problem_type.map(str::to_owned)),
     );
 
+    // A body that is not yet materialized can run more handler code as it is
+    // polled — database queries, clock reads — after the snapshot below, so
+    // those effects would be missing from the tape while the capsule claims to
+    // be complete. A replay drains the body and would report divergences that
+    // never happened. Probed only when a capsule is actually being written: with
+    // capture off the response is handed on exactly as the handler produced it.
+    let body_is_materialized = context.capture.is_some() && materialize_body(response);
+
     let capture = context.capture.map(|handle| {
-        // A body still streaming when the 5xx head resolved can run more
-        // handler code as it is polled — database queries, clock reads —
-        // after the snapshot below, so those effects would be missing from
-        // the tape while the capsule claims to be complete. A replay drains
-        // the body and would report divergences that never happened; mark
-        // the capsule truncated instead, so replay refuses it honestly.
-        if body_may_still_run(response.body()) {
+        if !body_is_materialized {
             handle.scope().note(
-                "the failing response returned a streaming body; effects produced while \
-                 the body streams are not recorded, so the capsule is marked truncated",
+                "the failing response body was still being produced when the response \
+                 head resolved; effects produced while the body streams are not recorded, \
+                 so the capsule is marked truncated",
             );
             handle.scope().mark_truncated();
         }
@@ -676,18 +679,116 @@ fn report_response(response: &Response, context: RequestContext, chain: &Arc<Rep
     );
 }
 
-/// Whether a failing response's body may still run handler code after the
-/// response head resolved.
+/// Frames the probe will pull from a body before giving up on it.
+const PROBE_FRAMES: usize = 8;
+
+/// Bytes the probe will hold before giving up on a body.
+const PROBE_BYTES: usize = 64 * 1024;
+
+/// Whether the failing response's body was already produced in full, replacing
+/// it with an equivalent body either way.
 ///
 /// The capture scope closes when the response future resolves, so anything a
-/// lazily-produced body does while it is polled happens after the capsule
-/// snapshot. A body that has already ended can do nothing more; one whose
-/// exact size is known is sitting in memory (axum's `String`/JSON/bytes
-/// responses) and produces no effects when polled. Everything else — an SSE
-/// stream, `Body::from_stream` — is generator code that has not run yet.
-fn body_may_still_run(body: &axum::body::Body) -> bool {
+/// lazily-produced body does while it is polled happens *after* the capsule
+/// snapshot. Asking the body is the only way to know: a size hint states a
+/// byte count, not that the bytes exist yet, so a hand-written
+/// [`http_body::Body`] can advertise an exact length and still run database or
+/// clock work in `poll_frame`.
+///
+/// So the body is polled with a no-op waker, which cannot make it wait: a body
+/// that yields every frame and ends without once returning `Pending` had
+/// nothing left to run (axum's `String`/JSON/bytes responses take two polls),
+/// and its collected bytes are handed back as the response body. Anything that
+/// stalls, carries trailers, or outruns the probe budget is treated as lazy and
+/// handed back with the frames the probe pulled put back in front, so the
+/// client still sees the bytes the handler produced, in order.
+///
+/// A body of unknown length is never polled at all — an SSE stream would only
+/// answer `Pending` — so the common streaming case pays nothing and is reported
+/// as lazy, which it is.
+fn materialize_body(response: &mut Response) -> bool {
+    use axum::body::Body;
+    use bytes::Bytes;
     use http_body::Body as _;
-    !body.is_end_stream() && body.size_hint().exact().is_none()
+
+    let body = response.body_mut();
+    if body.is_end_stream() {
+        return true;
+    }
+    if body.size_hint().exact().is_none() {
+        return false;
+    }
+
+    let mut body = std::mem::replace(response.body_mut(), Body::empty());
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut collected = 0usize;
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+
+    for _ in 0..PROBE_FRAMES {
+        match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(None) => {
+                *response.body_mut() = Body::from(concat_chunks(chunks));
+                return true;
+            }
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => {
+                    collected = collected.saturating_add(data.len());
+                    chunks.push(data);
+                    if collected > PROBE_BYTES {
+                        break;
+                    }
+                }
+                // Trailers: rebuilding would drop them, so stop here and let
+                // the body deliver the rest of itself.
+                Err(_) => break,
+            },
+            // An error ends the body for the client either way; the frames
+            // already pulled are what it will receive.
+            Poll::Ready(Some(Err(_))) => {
+                *response.body_mut() = Body::from(concat_chunks(chunks));
+                return true;
+            }
+            Poll::Pending => break,
+        }
+    }
+
+    *response.body_mut() = prepend_chunks(chunks, body);
+    false
+}
+
+/// Join probed frames into one buffer.
+fn concat_chunks(chunks: Vec<bytes::Bytes>) -> bytes::Bytes {
+    use bytes::Bytes;
+
+    match <[Bytes; 1]>::try_from(chunks) {
+        // The overwhelmingly common shape: one frame, handed on without a copy.
+        Ok([single]) => single,
+        Err(chunks) => {
+            let total = chunks.iter().map(Bytes::len).sum();
+            let mut joined = Vec::with_capacity(total);
+            for chunk in chunks {
+                joined.extend_from_slice(&chunk);
+            }
+            Bytes::from(joined)
+        }
+    }
+}
+
+/// Put probed frames back in front of the body they came from.
+fn prepend_chunks(chunks: Vec<bytes::Bytes>, body: axum::body::Body) -> axum::body::Body {
+    use axum::body::Body;
+    use futures::StreamExt as _;
+
+    if chunks.is_empty() {
+        // Nothing was taken (a body that answered `Pending` on the first
+        // poll — every stream, in practice), so it goes back untouched.
+        return body;
+    }
+    Body::from_stream(
+        futures::stream::iter(chunks.into_iter().map(Ok::<_, axum::Error>))
+            .chain(body.into_data_stream()),
+    )
 }
 
 /// Convert a caught panic into a sanitized 500 response and report it.
@@ -779,20 +880,137 @@ mod tests {
         assert_eq!(format_panic_payload(&other), "handler panicked");
     }
 
-    #[test]
-    fn only_streaming_bodies_count_as_still_running() {
+    /// A body that advertises an exact size proves nothing about whether its
+    /// bytes exist yet: `SizeHint` is a byte count, and a hand-written
+    /// `http_body::Body` can promise a length and still do database or clock
+    /// work the first time it is polled. Only asking the body settles it.
+    #[tokio::test]
+    async fn a_body_is_materialized_only_when_it_finishes_without_waiting() {
         use axum::body::Body;
+        use http_body_util::BodyExt as _;
 
-        // In-memory bodies are finished work: nothing runs when they are
-        // polled, so the capsule they belong to is genuinely complete.
-        assert!(!body_may_still_run(&Body::empty()));
-        assert!(!body_may_still_run(&Body::from("boom details")));
-        // A streamed body is generator code that has not run yet — whatever
-        // it does happens after the capture scope closed.
+        fn probe(body: Body) -> (bool, Response) {
+            let mut response = Response::new(body);
+            let materialized = materialize_body(&mut response);
+            (materialized, response)
+        }
+
+        // In-memory bodies finish on the spot — nothing runs later.
+        assert!(probe(Body::empty()).0);
+        let (materialized, response) = probe(Body::from("boom details"));
+        assert!(materialized);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect")
+                .to_bytes(),
+            "boom details",
+            "a materialized body must be handed on byte for byte"
+        );
+
+        // A stream never claims an exact size: reported lazy, never polled.
         let streaming = Body::from_stream(futures::stream::once(async {
             Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"chunk"))
         }));
-        assert!(body_may_still_run(&streaming));
+        assert!(!probe(streaming).0);
+
+        // The case a size hint cannot catch: an exact length, produced lazily.
+        struct ExactButLazy(u8);
+        impl http_body::Body for ExactButLazy {
+            type Data = bytes::Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                self.0 = self.0.saturating_add(1);
+                match self.0 {
+                    // Pretend to await something: a real one would be querying.
+                    1 => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    2 => Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+                        b"late",
+                    ))))),
+                    _ => Poll::Ready(None),
+                }
+            }
+
+            fn size_hint(&self) -> http_body::SizeHint {
+                http_body::SizeHint::with_exact(4)
+            }
+        }
+
+        let (materialized, response) = probe(Body::new(ExactButLazy(0)));
+        assert!(
+            !materialized,
+            "an exact size hint does not mean the bytes exist yet"
+        );
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect")
+                .to_bytes(),
+            "late",
+            "a probed body must still deliver everything it produces"
+        );
+    }
+
+    /// Frames the probe pulled before a body stalled must go back in front of
+    /// the remainder, or the client loses the beginning of the response.
+    #[tokio::test]
+    async fn probed_frames_are_put_back_in_front_of_a_stalling_body() {
+        use axum::body::Body;
+        use http_body_util::BodyExt as _;
+
+        struct ReadyThenStall(u8);
+        impl http_body::Body for ReadyThenStall {
+            type Data = bytes::Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                self.0 = self.0.saturating_add(1);
+                match self.0 {
+                    1 => Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+                        b"first",
+                    ))))),
+                    2 => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    3 => Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+                        b"-rest",
+                    ))))),
+                    _ => Poll::Ready(None),
+                }
+            }
+
+            fn size_hint(&self) -> http_body::SizeHint {
+                http_body::SizeHint::with_exact(10)
+            }
+        }
+
+        let mut response = Response::new(Body::new(ReadyThenStall(0)));
+        assert!(!materialize_body(&mut response), "the body stalls");
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect")
+                .to_bytes(),
+            "first-rest",
+            "the probed frame must not be lost"
+        );
     }
 
     #[test]
@@ -907,7 +1125,7 @@ mod tests {
                 .scope()
                 .notes()
                 .iter()
-                .any(|note| note.contains("streaming body")),
+                .any(|note| note.contains("still being produced")),
             "the truncation must be explained in the notes: {:?}",
             handle.scope().notes()
         );
