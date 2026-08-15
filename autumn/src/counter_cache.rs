@@ -1055,6 +1055,27 @@ pub async fn counter_cache_after_update_many<M: Send + Sync + 'static>(
 /// **update** and gets the before/after foreign-key diff; a record absent from it
 /// is an **insert** and gets a plain increment.
 ///
+/// # The one row this classification can get wrong
+///
+/// The snapshot is loaded `FOR UPDATE`, so every row that *existed* when it ran
+/// is locked: it cannot be re-parented underneath this chunk, and its diff is
+/// exact. The gap is the row that did **not** exist then — there is nothing to
+/// lock — and that another transaction inserts before this chunk's `INSERT …
+/// ON CONFLICT` runs. Postgres then updates that row rather than inserting it,
+/// while this classifies it as an insert: the `+1` duplicates the increment the
+/// other transaction already made, and if the upsert also moved the foreign key,
+/// the old parent never gets its decrement.
+///
+/// Closing it needs the discrimination to come from the statement that did the
+/// work (Postgres exposes it as `xmax = 0` in `RETURNING`), because no
+/// pre-upsert read can see a row that does not exist yet — row locks do not
+/// block inserts, and the advisory lock the *versioned* upsert takes only
+/// serializes upserts against each other, not against a plain `save` or a raw
+/// insert. It is drift, not corruption, and `recompute` repairs it.
+///
+/// `SQLite` is unaffected: `BEGIN IMMEDIATE` excludes every other writer for the
+/// duration of the transaction, so the window does not exist there.
+///
 /// # Errors
 ///
 /// Propagates any database error from the `UPDATE`s.

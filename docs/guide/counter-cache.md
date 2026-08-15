@@ -270,6 +270,16 @@ is raw SQL) but not readable from Rust.
   one, and it does not verify at compile time that the parent has it. A missing
   or mistyped column surfaces as a database error on the first mutation, not as
   silence.
+- **`upsert_many` on Postgres can miscount a row raced in by another writer.**
+  The upsert classifies each row as an insert or an update from the snapshot it
+  loaded `FOR UPDATE` beforehand, so every row that already existed is locked
+  and its diff is exact. A row that did *not* exist then — nothing to lock — and
+  that another transaction inserts before the `INSERT … ON CONFLICT` runs is
+  updated rather than inserted, but still counted as an insert: the `+1`
+  duplicates the other transaction's, and a foreign key moved by the same upsert
+  loses its old parent's decrement. It needs the same primary key to be written
+  concurrently by two paths. `SQLite` is unaffected (`BEGIN IMMEDIATE` excludes
+  other writers), and `recompute` is the repair.
 - **A row-suppressing `BEFORE` trigger will drift the counter.** The bulk
   decrement is computed from the same filters the `DELETE`/`UPDATE` applies, so
   a soft-deleted, cross-tenant or already-gone row is excluded from both. What
