@@ -233,23 +233,31 @@ pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
 /// the character before an occurrence is the last of the preceding segment,
 /// and the character after it is the first of the following one.
 fn replace_whole_tokens(text: &str, needle: &str, placeholder: &str) -> String {
+    let segments: Vec<&str> = text.split(needle).collect();
+    let last = segments.len().saturating_sub(1);
     let mut out = String::with_capacity(text.len());
-    let mut preceding: Option<&str> = None;
-    for segment in text.split(needle) {
-        if let Some(before) = preceding {
-            let starts_token = before
+    for (index, segment) in segments.iter().enumerate() {
+        // Every segment past the first is preceded by one occurrence.
+        if index > 0 {
+            // An *empty* neighbouring segment does not mean "nothing there":
+            // between two back-to-back occurrences (`123123` for `123`) it
+            // means the neighbour is the needle itself, whose own characters
+            // decide the boundary. Only an empty segment at the very start or
+            // end of the text is a true edge. Getting this wrong masked both
+            // halves of `123123`, which is not a whole token at all.
+            let before = segments
+                .get(index.saturating_sub(1))
+                .and_then(|previous| previous.chars().next_back())
+                .or_else(|| (index > 1).then(|| needle.chars().next_back()).flatten());
+            let after = segment
                 .chars()
-                .next_back()
-                .is_none_or(|c| !c.is_alphanumeric());
-            let ends_token = segment.chars().next().is_none_or(|c| !c.is_alphanumeric());
-            out.push_str(if starts_token && ends_token {
-                placeholder
-            } else {
-                needle
-            });
+                .next()
+                .or_else(|| (index < last).then(|| needle.chars().next()).flatten());
+            let bounded = before.is_none_or(|c| !c.is_alphanumeric())
+                && after.is_none_or(|c| !c.is_alphanumeric());
+            out.push_str(if bounded { placeholder } else { needle });
         }
         out.push_str(segment);
-        preceding = Some(segment);
     }
     out
 }
@@ -346,15 +354,20 @@ fn record_credential_components(value: &[u8], values: &mut RedactedValues) {
     };
     let trimmed = text.trim();
 
-    // `Authorization: <scheme> <token>` / `Proxy-Authorization: …`. Matching on
-    // the scheme rather than "anything after the first space" keeps a
-    // space-containing opaque credential intact.
-    if let Some((scheme, token)) = trimmed.split_once(' ') {
-        const SCHEMES: &[&str] = &["bearer", "basic", "digest", "token", "apikey"];
-        let scheme = scheme.trim().to_ascii_lowercase();
-        let token = token.trim();
-        if SCHEMES.contains(&scheme.as_str()) && !token.is_empty() {
-            values.insert(token.as_bytes());
+    // `Authorization: <scheme> <credential>` / `Proxy-Authorization: …`.
+    // Any syntactically valid scheme counts, not a list of the familiar ones:
+    // `Negotiate`, `AWS4-HMAC-SHA256` and every vendor scheme carry exactly
+    // the same risk, and a name this code has not heard of is precisely the
+    // case where the credential would go unmasked. A scheme is an RFC 7235
+    // token, so anything containing characters a token cannot hold — `=`, `;`,
+    // `,` — is not a scheme, which is what keeps a `Cookie:` line from being
+    // read as one. The rest of the value is kept whole, so a credential that
+    // itself contains spaces (`AWS4-HMAC-SHA256 Credential=…, Signature=…`)
+    // stays intact.
+    if let Some((scheme, credential)) = trimmed.split_once(' ') {
+        let credential = credential.trim();
+        if is_auth_scheme(scheme) && !credential.is_empty() {
+            values.insert(credential.as_bytes());
         }
     }
 
@@ -373,6 +386,32 @@ fn record_credential_components(value: &[u8], values: &mut RedactedValues) {
             }
         }
     }
+}
+
+/// Whether `word` is a syntactically valid authorization scheme — an RFC 7235
+/// token.
+fn is_auth_scheme(word: &str) -> bool {
+    !word.is_empty()
+        && word.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 /// Rewrite the request target with sensitive query parameters masked, leaving
@@ -1022,6 +1061,13 @@ mod tests {
         assert!(
             values.contains(b"sess-abcdef"),
             "each cookie value must be retained on its own"
+        );
+        // A scheme this code has never heard of is exactly where a credential
+        // would otherwise go unmasked.
+        assert!(is_auth_scheme("Negotiate") && is_auth_scheme("AWS4-HMAC-SHA256"));
+        assert!(
+            !is_auth_scheme("session=abc;"),
+            "a cookie line is not an auth scheme"
         );
         assert!(
             !values.contains(b"session"),
@@ -1789,6 +1835,18 @@ mod tests {
             mask_echoes("request 1234 took 5123ms at 12:31:23", &values),
             "request 1234 took 5123ms at 12:31:23",
             "a short value inside a longer run is not a secret occurrence"
+        );
+        // Back-to-back occurrences are a longer run, not two tokens: the
+        // neighbour of each is the needle itself.
+        assert_eq!(
+            mask_echoes("request 123123 failed", &values),
+            "request 123123 failed",
+            "adjacent occurrences form one alphanumeric run, not whole tokens"
+        );
+        assert_eq!(
+            mask_echoes("123", &values),
+            FILTERED_PLACEHOLDER,
+            "a value that is the entire text is a whole token"
         );
     }
 
