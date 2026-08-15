@@ -99,6 +99,16 @@ pub struct Capsule {
     /// Database traffic recorded for the request, when DB capture was active.
     #[serde(default)]
     pub db: Option<CapsuleDb>,
+    /// Database roles the recording application had configured, whatever
+    /// traffic the request produced.
+    ///
+    /// `db` is `None` when the request issued no wire traffic at all, which is
+    /// a different fact from "this application has no database": a handler or
+    /// state initializer that checks `state.pool()` or replica availability
+    /// *before* querying would otherwise see a shape production never had.
+    /// Absent in capsules recorded before this field existed.
+    #[serde(default)]
+    pub db_roles: Vec<String>,
     /// Set when a size cap stopped recording partway through; such a capsule
     /// is not replayable.
     #[serde(default)]
@@ -441,6 +451,7 @@ pub mod test_support {
             clock: Vec::new(),
             clock_monotonic_us: Vec::new(),
             db: None,
+            db_roles: Vec::new(),
             truncated: false,
             notes: Vec::new(),
         }

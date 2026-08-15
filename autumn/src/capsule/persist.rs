@@ -226,11 +226,19 @@ pub(crate) fn persist_pinned(
 fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     let raw = scope.raw_request()?;
     // The head was snapshotted when the request arrived; the body was copied
-    // as the handler read it, so it is only final now. A body the handler
-    // never finished reading is kept, with a note saying so.
+    // as the handler read it, so it is only final now.
     let raw_body = scope.captured_body();
     if let Some(note) = scope.body_note() {
+        // A body the handler did not read to its end — a prefix, or nothing at
+        // all — is *not* the body the failing request carried. Replaying it
+        // would drive the handler with shorter input than production had, and
+        // code that reads the remainder would hit EOF and answer differently:
+        // a `mismatch`, which the guide tells operators to read as "the bug is
+        // gone". Mark the capsule incomplete so replay refuses it instead,
+        // through the same path a skipped body already takes. The note says
+        // which case this was.
         scope.note(note);
+        scope.mark_truncated();
     }
     let (mut request, redacted, body_notes) =
         crate::capsule::redact::redact_request(raw, &raw_body, scope.filter());
@@ -293,6 +301,7 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
             .map(|offset| u64::try_from(offset.as_micros()).unwrap_or(u64::MAX))
             .collect(),
         db,
+        db_roles: settings.db_roles.clone(),
         truncated: scope.is_truncated(),
         notes: scope.notes(),
     })

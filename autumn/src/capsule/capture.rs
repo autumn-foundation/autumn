@@ -104,6 +104,10 @@ pub struct CaptureSettings {
     pub app_name: Option<String>,
     /// Recording application's active profile.
     pub profile: Option<String>,
+    /// Database roles the application has configured (`primary`, `replica`),
+    /// recorded so a replay can rebuild the same shape even for a request
+    /// that never touched the database.
+    pub db_roles: Vec<String>,
 }
 
 impl Default for CaptureSettings {
@@ -115,6 +119,7 @@ impl Default for CaptureSettings {
             max_capsules: 50,
             app_name: None,
             profile: None,
+            db_roles: Vec::new(),
         }
     }
 }

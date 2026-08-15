@@ -108,5 +108,37 @@ pub fn settings_from_config(config: &crate::config::AutumnConfig) -> CaptureSett
         max_capsules: config.failure_capture.max_capsules,
         app_name: Some(config.telemetry.service_name.clone()),
         profile: config.profile.clone(),
+        db_roles: configured_db_roles(config),
     }
+}
+
+/// The database roles the application has configured, recorded on every
+/// capsule so replay can rebuild the same shape even when the request issued
+/// no wire traffic (see [`Capsule::db_roles`](crate::capsule::Capsule)).
+#[cfg(feature = "db")]
+fn configured_db_roles(config: &crate::config::AutumnConfig) -> Vec<String> {
+    let mut roles = Vec::new();
+    if config
+        .database
+        .primary_url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        roles.push(crate::capsule::schema::TAPE_ROLE_PRIMARY.to_owned());
+    }
+    if config
+        .database
+        .replica_url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        roles.push(crate::capsule::schema::TAPE_ROLE_REPLICA.to_owned());
+    }
+    roles
+}
+
+/// Without the `db` feature there is no database to have a shape.
+#[cfg(not(feature = "db"))]
+fn configured_db_roles(_config: &crate::config::AutumnConfig) -> Vec<String> {
+    Vec::new()
 }

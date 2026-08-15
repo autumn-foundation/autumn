@@ -130,8 +130,10 @@ impl RedactedValues {
     }
 }
 
-/// Shortest value worth looking for *inside* free-form text (see
-/// [`mask_echoes`]); whole-value bind masking has no such floor.
+/// Shortest value [`mask_echoes`] will replace *anywhere* inside free-form
+/// text. Below this length a value is still masked, but only where it stands
+/// as a whole token — see [`replace_whole_tokens`]. Whole-value bind masking
+/// has no length rule at all.
 const MIN_ECHO_LEN: usize = 4;
 
 /// Build the capsule's request record, masking every sensitive value.
@@ -204,11 +206,52 @@ pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
         let Ok(needle) = std::str::from_utf8(value) else {
             continue;
         };
-        if needle.len() >= MIN_ECHO_LEN && masked.contains(needle) {
+        if needle.is_empty() || !masked.contains(needle) {
+            continue;
+        }
+        if needle.len() >= MIN_ECHO_LEN {
             masked = masked.replace(needle, FILTERED_PLACEHOLDER);
+        } else {
+            // A short value — a three-digit CVV, a PIN — is masked only where
+            // it stands as a whole token. Replacing it everywhere would shred
+            // timestamps, identifiers, byte counts and ordinary words that
+            // merely contain those characters, in failures that have nothing
+            // to do with the secret; leaving it alone entirely (which this
+            // did before) wrote the secret to disk whenever the failure
+            // quoted it back, as `CVV 123 rejected` does.
+            masked = replace_whole_tokens(&masked, needle, FILTERED_PLACEHOLDER);
         }
     }
     masked
+}
+
+/// Replace `needle` with `placeholder`, but only where it is not part of a
+/// longer alphanumeric run.
+///
+/// Written with [`str::split`] rather than index arithmetic so the
+/// request-path panic gate's `string_slice`/`indexing_slicing` denials hold:
+/// the character before an occurrence is the last of the preceding segment,
+/// and the character after it is the first of the following one.
+fn replace_whole_tokens(text: &str, needle: &str, placeholder: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut preceding: Option<&str> = None;
+    for segment in text.split(needle) {
+        if let Some(before) = preceding {
+            let starts_token = before
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+            let ends_token = segment.chars().next().is_none_or(|c| !c.is_alphanumeric());
+            out.push_str(if starts_token && ends_token {
+                placeholder
+            } else {
+                needle
+            });
+        }
+        out.push_str(segment);
+        preceding = Some(segment);
+    }
+    out
 }
 
 /// Mask any bind parameter whose bytes exactly echo a redacted request value.
@@ -272,6 +315,7 @@ fn redact_headers(
         let name = name.as_str().to_owned();
         if header_is_sensitive(&name, filter) {
             values.insert(value.as_bytes());
+            record_credential_components(value.as_bytes(), values);
             keys.insert(format!("header:{name}"));
             out.push((name, FILTERED_PLACEHOLDER.to_owned()));
         } else if binary_names.contains(&name) {
@@ -281,6 +325,54 @@ fn redact_headers(
         }
     }
     (out, binary)
+}
+
+/// Retain the secret *inside* a structured credential header, not just the
+/// header value as a whole.
+///
+/// A handler does not work with `Bearer hunter2` or with a whole `Cookie:`
+/// line — it extracts `hunter2`, or one cookie's value, and that is the form
+/// that reappears in an error message, a panic payload, or a SQL bind. The
+/// full value is already in the echo set; without its components,
+/// [`mask_echoes`] (a substring search) never matches what the handler
+/// actually held.
+///
+/// Deliberately narrow: the token after a standard auth scheme, and each
+/// cookie value. Cookie *names* are not retained — they are ordinary words
+/// (`session`, `theme`) that would shred unrelated prose.
+fn record_credential_components(value: &[u8], values: &mut RedactedValues) {
+    let Ok(text) = std::str::from_utf8(value) else {
+        return;
+    };
+    let trimmed = text.trim();
+
+    // `Authorization: <scheme> <token>` / `Proxy-Authorization: …`. Matching on
+    // the scheme rather than "anything after the first space" keeps a
+    // space-containing opaque credential intact.
+    if let Some((scheme, token)) = trimmed.split_once(' ') {
+        const SCHEMES: &[&str] = &["bearer", "basic", "digest", "token", "apikey"];
+        let scheme = scheme.trim().to_ascii_lowercase();
+        let token = token.trim();
+        if SCHEMES.contains(&scheme.as_str()) && !token.is_empty() {
+            values.insert(token.as_bytes());
+        }
+    }
+
+    // `Cookie: a=1; b=2` and `Set-Cookie: name=value; Path=/; HttpOnly`. Every
+    // value is a candidate secret; the attributes that follow a `Set-Cookie`
+    // value are not, but retaining `/` or `HttpOnly` is harmless because the
+    // echo floor and boundary rule in `mask_echoes` refuse to match them
+    // inside prose.
+    if trimmed.contains('=') {
+        for pair in trimmed.split(';') {
+            if let Some((_, cookie_value)) = pair.split_once('=') {
+                let cookie_value = cookie_value.trim().trim_matches('"');
+                if !cookie_value.is_empty() {
+                    values.insert(cookie_value.as_bytes());
+                }
+            }
+        }
+    }
 }
 
 /// Rewrite the request target with sensitive query parameters masked, leaving
@@ -904,6 +996,41 @@ mod tests {
             values.contains(b"Basic cHJveHk6c2VjcmV0cGFzcw=="),
             "the masked value must join the echo set"
         );
+    }
+
+    /// A handler does not hold `Bearer hunter2secret` — it holds the token.
+    /// The whole header value alone in the echo set never matches the form
+    /// that reaches an error message or a SQL bind.
+    #[test]
+    fn credential_components_join_the_echo_set() {
+        let (_request, values) = redact(
+            Request::get("/")
+                .header(header::AUTHORIZATION, "Bearer hunter2secret")
+                .header(header::COOKIE, "session=sess-abcdef; theme=dark"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        assert!(
+            values.contains(b"Bearer hunter2secret"),
+            "the whole header value is still retained"
+        );
+        assert!(
+            values.contains(b"hunter2secret"),
+            "the token after the auth scheme must be retained on its own"
+        );
+        assert!(
+            values.contains(b"sess-abcdef"),
+            "each cookie value must be retained on its own"
+        );
+        assert!(
+            !values.contains(b"session"),
+            "cookie names are ordinary words and must stay out of the echo set"
+        );
+        // The point of all of it: the outcome is scrubbed of what the handler
+        // actually carried.
+        let masked = mask_echoes("token hunter2secret was rejected", &values);
+        assert!(!masked.contains("hunter2secret"), "{masked}");
     }
 
     #[test]
@@ -1628,16 +1755,41 @@ mod tests {
     }
 
     #[test]
-    fn mask_echoes_prefers_the_longest_match_and_ignores_short_values() {
+    fn mask_echoes_prefers_the_longest_match() {
         let mut values = RedactedValues::default();
         values.insert(b"hunter2secret");
         values.insert(b"hunter2");
-        // Below `MIN_ECHO_LEN`: never recorded, so it cannot shred prose.
-        values.insert(b"ada");
 
-        let masked = mask_echoes("ada tried hunter2secret twice", &values);
+        let masked = mask_echoes("tried hunter2secret twice", &values);
 
-        assert_eq!(masked, format!("ada tried {FILTERED_PLACEHOLDER} twice"));
+        assert_eq!(masked, format!("tried {FILTERED_PLACEHOLDER} twice"));
+    }
+
+    /// A short secret — a CVV, a PIN — must not reach disk just because the
+    /// failure quoted it, but masking it *everywhere* would shred timestamps,
+    /// identifiers and ordinary words. It is masked exactly where it stands
+    /// as a token of its own.
+    #[test]
+    fn mask_echoes_masks_short_values_only_as_whole_tokens() {
+        let mut values = RedactedValues::default();
+        values.insert(b"123");
+
+        assert_eq!(
+            mask_echoes("CVV 123 rejected", &values),
+            format!("CVV {FILTERED_PLACEHOLDER} rejected"),
+            "a short secret quoted in the failure must be masked"
+        );
+        assert_eq!(
+            mask_echoes("cvv=123&ok=1", &values),
+            format!("cvv={FILTERED_PLACEHOLDER}&ok=1"),
+            "punctuation delimits a token just as whitespace does"
+        );
+        // Everything a naive substring replacement would have shredded.
+        assert_eq!(
+            mask_echoes("request 1234 took 5123ms at 12:31:23", &values),
+            "request 1234 took 5123ms at 12:31:23",
+            "a short value inside a longer run is not a secret occurrence"
+        );
     }
 
     #[test]
