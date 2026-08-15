@@ -10,10 +10,22 @@
 > `(subscriber, list_id)` index and falls back to a `Parallel Seq Scan` of the
 > whole table — a plan whose cost is roughly *fixed* per statement, so
 > splitting one large send into many 5,000-sized chunks was paying that fixed
-> cost multiple times for no benefit. `CHUNK_SIZE` is now `50_000` (chunking
-> exists only as a backstop against a truly pathological single send, not to
-> shape ordinary sends), and every number below is measured against the code
-> as shipped, including the chunk loop.
+> cost multiple times for no benefit. `CHUNK_SIZE` is now `50_000` on
+> Postgres (chunking exists only as a backstop against a truly pathological
+> single send, not to shape ordinary sends), and every number below is
+> measured against the code as shipped, including the chunk loop.
+>
+> A second review pass then caught that `50_000` isn't safe on every backend:
+> `DbSuppressionStore` runs under the `sqlite` feature too (it's generic over
+> `crate::db::RuntimeConnection`), and Diesel lowers `eq_any` to `IN (?, ?,
+> ...)` on SQLite — one bind parameter per element — instead of Postgres's
+> single array parameter. A 50,000-element chunk would exceed SQLite's
+> default `SQLITE_MAX_VARIABLE_NUMBER` (32,766) and fail the send outright.
+> `CHUNK_SIZE` is now backend-conditional: `50_000` on Postgres, and on
+> SQLite `repository::MAX_BIND_PARAMS - 1` (32,765) — reusing the same
+> backend-aware constant the generated bulk-write CRUD path already chunks
+> against, instead of a second hand-picked number that could drift out of
+> sync with it.
 
 ## 🎯 Workload
 
@@ -159,11 +171,14 @@ One change: `autumn/src/mail.rs`.
   sites to update.
 - `DbSuppressionStore::is_suppressed_many` overrides the default with one
   `SELECT subscriber FROM mail_unsubscribes WHERE list_id = $1 AND
-  subscriber = ANY($2)` per chunk of up to `CHUNK_SIZE = 50_000` recipients.
-  Chunking exists purely as a backstop against an unbounded array bind on a
-  pathological single send, not to shape ordinary sends — see the
-  correction note above and 🧭 Plan for why a small chunk size is actively
-  counterproductive here.
+  subscriber = ANY($2)` per chunk of up to `CHUNK_SIZE` recipients —
+  `50_000` on Postgres, `repository::MAX_BIND_PARAMS - 1` (32,765) on
+  SQLite, since SQLite binds `eq_any` as one parameter per element instead
+  of Postgres's single array parameter. Chunking exists purely as a
+  backstop (against an unbounded array bind on Postgres, against exceeding
+  the bind-parameter limit on SQLite), not to shape ordinary sends — see
+  the correction note above and 🧭 Plan for why a small Postgres chunk size
+  is actively counterproductive.
 - `send_list_mail` now validates every recipient's address format first (in
   original order, same fail-fast behavior), then calls
   `is_suppressed_many` **once** for the whole batch instead of

@@ -4363,22 +4363,35 @@ pub mod db_suppression {
             // Chunked, not one unbounded `= ANY(...)`, as a backstop against a
             // truly pathological single send (hundreds of thousands of
             // recipients) binding an unbounded array into one statement.
-            // `CHUNK_SIZE` is deliberately large, not tight: measured against
-            // a production-shaped `mail_unsubscribes` fixture, `subscriber =
-            // ANY(...)` keeps using the `(subscriber, list_id)` index up to a
-            // few thousand array elements, then the planner switches to a
-            // `Parallel Seq Scan` of the whole table — a plan whose cost is
-            // ~flat per statement regardless of how many more elements are in
-            // the array (it's already paying for the full scan). A chunk
-            // size near that crossover would needlessly re-pay the full-scan
-            // cost once per chunk (e.g. splitting one scan-plan statement
-            // into 10 smaller ones multiplies that fixed cost by 10 for no
-            // benefit); staying well above it keeps ordinary sends — even a
-            // full-list newsletter blast — in one statement, so chunking only
-            // ever engages for the pathological case it exists to bound. See
+            //
+            // On Postgres, `eq_any` binds the whole array as ONE parameter
+            // (`= ANY($n)`), so `CHUNK_SIZE` is deliberately large, not
+            // tight: measured against a production-shaped
+            // `mail_unsubscribes` fixture, `subscriber = ANY(...)` keeps
+            // using the `(subscriber, list_id)` index up to a few thousand
+            // array elements, then the planner switches to a `Parallel Seq
+            // Scan` of the whole table — a plan whose cost is ~flat per
+            // statement regardless of how many more elements are in the
+            // array (it's already paying for the full scan). A chunk size
+            // near that crossover would needlessly re-pay the full-scan cost
+            // once per chunk; staying well above it keeps ordinary sends —
+            // even a full-list newsletter blast — in one statement. See
             // docs/reports/2026-08-15-ledger-mail-suppression-batch/README.md
-            // for the measurements behind this number.
+            // for the measurements behind the Postgres number.
+            //
+            // SQLite has no array bind type: Diesel lowers `eq_any` to
+            // `IN (?, ?, ...)`, one bind parameter per element, so a
+            // 50,000-element chunk plus the `list_id` parameter would blow
+            // past `SQLITE_MAX_VARIABLE_NUMBER` (32,766 by default) and fail
+            // the whole send with "too many SQL variables". Reuse
+            // `repository::MAX_BIND_PARAMS` — the same backend-aware limit
+            // generated bulk-write code already chunks against — minus one
+            // for the `list_id` parameter, so this never depends on a second
+            // hand-picked constant drifting out of sync with that one.
+            #[cfg(not(feature = "sqlite"))]
             const CHUNK_SIZE: usize = 50_000;
+            #[cfg(feature = "sqlite")]
+            const CHUNK_SIZE: usize = crate::repository::MAX_BIND_PARAMS - 1;
             Box::pin(async move {
                 let mut suppressed = std::collections::HashSet::with_capacity(subscribers.len());
                 if subscribers.is_empty() {

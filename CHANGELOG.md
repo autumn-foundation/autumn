@@ -60,11 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `is_suppressed_many` method (default implementation loops over
   `is_suppressed`, so existing custom stores keep working unchanged);
   `DbSuppressionStore` overrides it with a single `WHERE list_id = $1 AND
-  subscriber = ANY($2)` query (chunked at 50,000 recipients — a backstop
-  against an unbounded single-statement bind, not a tuning knob for ordinary
-  sends: a tighter chunk size can land statements past a planner cost
-  crossover where `= ANY(...)` stops using the index and falls back to a
-  table scan, then re-pay that scan's fixed cost once per chunk). Measured
+  subscriber = ANY($2)` query, chunked at 50,000 recipients on Postgres (a
+  backstop against an unbounded single-statement bind, not a tuning knob for
+  ordinary sends: a tighter chunk size can land statements past a planner
+  cost crossover where `= ANY(...)` stops using the index and falls back to
+  a table scan, then re-pay that scan's fixed cost once per chunk) and at
+  `repository::MAX_BIND_PARAMS - 1` on SQLite, which binds `eq_any` as one
+  parameter per element instead of Postgres's single array parameter.
+  Measured
   (`pg_stat_statements`, production-shaped `mail_unsubscribes` fixture):
   statement count per send drops from N to 1 at every batch size tested
   (200/2,000/20,000 recipients); total buffers 660→604 (200), 6,600→6,004
