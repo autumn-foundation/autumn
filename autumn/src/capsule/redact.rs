@@ -228,67 +228,72 @@ pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
     if redacted.is_empty() || text.is_empty() {
         return text.to_owned();
     }
-    let mut masked = text.to_owned();
+    // Longest first, so a longer secret wins over one that is a substring of
+    // it: masking `hunter2` before `hunter2secret` would leave the longer
+    // secret's tail behind.
+    let mut needles: Vec<(&str, bool)> = Vec::new();
     for value in redacted.longest_first() {
         // Only values that were UTF-8 to begin with can appear in a message;
         // binary secrets are handled by `mask_binds`.
         let Ok(needle) = std::str::from_utf8(value) else {
             continue;
         };
-        if needle.is_empty() || !masked.contains(needle) {
+        if needle.is_empty() {
             continue;
         }
-        if needle.len() >= MIN_ECHO_LEN && !redacted.is_whole_token_only(value) {
-            masked = masked.replace(needle, FILTERED_PLACEHOLDER);
+        // A short value — a three-digit CVV, a PIN — and any structural field
+        // are masked only where they stand as a whole token. Replacing them
+        // everywhere would shred timestamps, identifiers, byte counts and
+        // ordinary words that merely contain those characters, in failures
+        // that have nothing to do with the secret; leaving them alone entirely
+        // wrote the secret to disk whenever the failure quoted it back, as
+        // `CVV 123 rejected` does.
+        let whole_token_only = needle.len() < MIN_ECHO_LEN || redacted.is_whole_token_only(value);
+        needles.push((needle, whole_token_only));
+    }
+
+    // One left-to-right pass over the *original* text, emitting placeholders
+    // as it goes. Replacing each needle in turn across the accumulating output
+    // instead would let a later secret match a placeholder an earlier one had
+    // just written — with `FILTER` in the set, `[FILTERED]` became
+    // `[[FILTERED]ED]`, which replay's own scrubbing never reproduces, turning
+    // a matching failure into a `mismatch`. Text this pass has emitted is
+    // never looked at again.
+    let mut masked = String::with_capacity(text.len());
+    let mut cursor = 0_usize;
+    while let Some(rest) = text.get(cursor..).filter(|rest| !rest.is_empty()) {
+        let matched = needles.iter().find(|(needle, whole_token_only)| {
+            rest.starts_with(*needle)
+                && (!*whole_token_only || stands_alone(text, cursor, needle, rest))
+        });
+        if let Some((needle, _)) = matched {
+            masked.push_str(FILTERED_PLACEHOLDER);
+            cursor = cursor.saturating_add(needle.len());
+        } else if let Some(next) = rest.chars().next() {
+            masked.push(next);
+            cursor = cursor.saturating_add(next.len_utf8());
         } else {
-            // A short value — a three-digit CVV, a PIN — is masked only where
-            // it stands as a whole token. Replacing it everywhere would shred
-            // timestamps, identifiers, byte counts and ordinary words that
-            // merely contain those characters, in failures that have nothing
-            // to do with the secret; leaving it alone entirely (which this
-            // did before) wrote the secret to disk whenever the failure
-            // quoted it back, as `CVV 123 rejected` does.
-            masked = replace_whole_tokens(&masked, needle, FILTERED_PLACEHOLDER);
+            break;
         }
     }
     masked
 }
 
-/// Replace `needle` with `placeholder`, but only where it is not part of a
-/// longer alphanumeric run.
+/// Whether the occurrence of `needle` at `cursor` stands as a whole token —
+/// that is, is not part of a longer alphanumeric run.
 ///
-/// Written with [`str::split`] rather than index arithmetic so the
-/// request-path panic gate's `string_slice`/`indexing_slicing` denials hold:
-/// the character before an occurrence is the last of the preceding segment,
-/// and the character after it is the first of the following one.
-fn replace_whole_tokens(text: &str, needle: &str, placeholder: &str) -> String {
-    let segments: Vec<&str> = text.split(needle).collect();
-    let last = segments.len().saturating_sub(1);
-    let mut out = String::with_capacity(text.len());
-    for (index, segment) in segments.iter().enumerate() {
-        // Every segment past the first is preceded by one occurrence.
-        if index > 0 {
-            // An *empty* neighbouring segment does not mean "nothing there":
-            // between two back-to-back occurrences (`123123` for `123`) it
-            // means the neighbour is the needle itself, whose own characters
-            // decide the boundary. Only an empty segment at the very start or
-            // end of the text is a true edge. Getting this wrong masked both
-            // halves of `123123`, which is not a whole token at all.
-            let before = segments
-                .get(index.saturating_sub(1))
-                .and_then(|previous| previous.chars().next_back())
-                .or_else(|| (index > 1).then(|| needle.chars().next_back()).flatten());
-            let after = segment
-                .chars()
-                .next()
-                .or_else(|| (index < last).then(|| needle.chars().next()).flatten());
-            let bounded = before.is_none_or(|c| !c.is_alphanumeric())
-                && after.is_none_or(|c| !c.is_alphanumeric());
-            out.push_str(if bounded { placeholder } else { needle });
-        }
-        out.push_str(segment);
-    }
-    out
+/// Both neighbours are read from the *original* text, which is what makes
+/// back-to-back occurrences come out right: in `123123` the character after
+/// the first `123` is the `1` of the second, so neither is a whole token.
+/// Written with [`str::get`] rather than indexing so the request-path panic
+/// gate's `string_slice`/`indexing_slicing` denials hold.
+fn stands_alone(text: &str, cursor: usize, needle: &str, rest: &str) -> bool {
+    let before = text.get(..cursor).and_then(|head| head.chars().next_back());
+    let after = rest
+        .get(needle.len()..)
+        .and_then(|tail| tail.chars().next());
+    before.is_none_or(|char| !char.is_alphanumeric())
+        && after.is_none_or(|char| !char.is_alphanumeric())
 }
 
 /// Mask any bind parameter whose bytes exactly echo a redacted request value.
@@ -455,7 +460,7 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
 /// which is what keeps `qop=auth` from masking the middle of *authentication*
 /// in every later failure.
 fn record_auth_params(credential: &str, values: &mut RedactedValues) {
-    for param in credential.split(',') {
+    for param in split_auth_params(credential) {
         let Some((name, value)) = param.split_once('=') else {
             continue;
         };
@@ -470,6 +475,42 @@ fn record_auth_params(credential: &str, values: &mut RedactedValues) {
             values.insert_whole_token_only(value.as_bytes());
         }
     }
+}
+
+/// Split an auth-param list on the commas that actually delimit it, and
+/// resolve quoted-pairs while doing so.
+///
+/// A `quoted-string` may contain both — `Digest response="abc,def"` is one
+/// param, and `response="abc\"def"` holds a literal quote. Splitting on every
+/// comma cuts that value in half and retains a fragment the handler never
+/// holds, which is the same as retaining nothing. Unescaping matters for the
+/// same reason: the handler works with `abc"def`, not with the backslash.
+///
+/// Returns owned strings because the unescaped value is not a slice of the
+/// input, and because the panic gate denies the index arithmetic a
+/// borrowing split would need.
+fn split_auth_params(credential: &str) -> Vec<String> {
+    let mut params = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in credential.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+        } else if character == '\\' && quoted {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+            current.push(character);
+        } else if character == ',' && !quoted {
+            params.push(std::mem::take(&mut current));
+        } else {
+            current.push(character);
+        }
+    }
+    params.push(current);
+    params
 }
 
 /// Retain what a `Basic` credential *decodes to*, not only its Base64 text.
@@ -1325,6 +1366,56 @@ mod tests {
             mask_echoes("scheme auth rejected", &digest),
             format!("scheme {FILTERED_PLACEHOLDER} rejected"),
             "it is still masked where it stands as a whole token"
+        );
+    }
+
+    /// A `quoted-string` may hold the very characters the list is delimited
+    /// by. Splitting on every comma keeps a fragment the handler never holds,
+    /// which protects nothing.
+    #[test]
+    fn quoted_auth_param_values_survive_commas_and_escapes() {
+        let (_request, values) = redact(
+            Request::get("/").header(
+                header::AUTHORIZATION,
+                r#"Digest response="abc,def", opaque="gh\"ij", qop=auth"#,
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        assert!(
+            values.contains(b"abc,def"),
+            "a comma inside a quoted value does not end the param"
+        );
+        assert!(
+            !values.contains(b"abc"),
+            "the fragment before the comma is not what the handler holds"
+        );
+        assert!(
+            values.contains(br#"gh"ij"#),
+            "a quoted-pair is resolved to the character the handler sees"
+        );
+        assert!(
+            values.contains(b"auth"),
+            "an unquoted param after a quoted one is still found"
+        );
+    }
+
+    /// Each needle is matched against the original text, never against output
+    /// an earlier needle produced.
+    #[test]
+    fn masking_does_not_rewrite_the_placeholders_it_just_wrote() {
+        let mut values = RedactedValues::default();
+        values.insert(b"hunter2");
+        // A secret that happens to be a substring of the placeholder itself.
+        values.insert(b"FILTER");
+
+        let masked = mask_echoes("login hunter2 failed", &values);
+
+        assert_eq!(
+            masked,
+            format!("login {FILTERED_PLACEHOLDER} failed"),
+            "the placeholder written for one secret must not be rewritten by another"
         );
     }
 
