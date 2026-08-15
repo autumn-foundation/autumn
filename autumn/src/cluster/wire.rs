@@ -248,25 +248,53 @@ pub fn sign_envelope(
 /// [`MAX_FRAME_BYTES`] or cannot be serialized — the sender applies the same
 /// cap rather than emitting something the peer must reject.
 pub fn encode_frame(envelope: &Envelope) -> Option<Vec<u8>> {
-    // RED-PHASE STUB.
-    let _ = envelope;
-    None
+    let body = serde_json::to_vec(envelope).ok()?;
+    // The sender applies the receiver's cap rather than emitting a frame the
+    // peer is obliged to refuse (and to close the connection over).
+    if body.is_empty() || body.len() > MAX_FRAME_BYTES {
+        return None;
+    }
+    let len = u32::try_from(body.len()).ok()?;
+    let mut frame = Vec::with_capacity(body.len().saturating_add(LENGTH_PREFIX_BYTES));
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&body);
+    Some(frame)
 }
 
 /// Read a length prefix, refusing `0` and anything over [`MAX_FRAME_BYTES`]
 /// **before** a buffer of that size is reserved.
 pub const fn frame_len(prefix: [u8; LENGTH_PREFIX_BYTES]) -> Option<usize> {
-    // RED-PHASE STUB: must accept a legal length and refuse 0 / oversized.
-    let _ = prefix;
-    None
+    // The comparison happens on the declared `u32`, so nothing of that size is
+    // ever reserved: an attacker's 4 GiB prefix costs four bytes and a branch.
+    match u32::from_be_bytes(prefix) {
+        0 => None,
+        declared if declared as usize > MAX_FRAME_BYTES => None,
+        declared => Some(declared as usize),
+    }
 }
 
 /// Parse a complete frame (prefix + body) into an envelope. Total: any
 /// malformed input yields `None`.
 pub fn decode_frame(frame: &[u8]) -> Option<Envelope> {
-    // RED-PHASE STUB.
-    let _ = frame;
-    None
+    let body = frame_body(frame).ok()?;
+    serde_json::from_slice(body).ok()
+}
+
+/// Take exactly the body a frame declares.
+///
+/// [`RejectReason::Oversize`] is the one connection-fatal verdict (step 1: a
+/// declared length of `0` or over the cap). [`RejectReason::Malformed`] covers
+/// a buffer too short to hold the prefix, or short of the body it declares —
+/// a partial read, which says nothing about the framing itself.
+fn frame_body(frame: &[u8]) -> Result<&[u8], RejectReason> {
+    let prefix: [u8; LENGTH_PREFIX_BYTES] = frame
+        .get(..LENGTH_PREFIX_BYTES)
+        .and_then(|head| <[u8; LENGTH_PREFIX_BYTES]>::try_from(head).ok())
+        .ok_or(RejectReason::Malformed)?;
+    let declared = frame_len(prefix).ok_or(RejectReason::Oversize)?;
+    frame
+        .get(LENGTH_PREFIX_BYTES..LENGTH_PREFIX_BYTES.saturating_add(declared))
+        .ok_or(RejectReason::Malformed)
 }
 
 /// Verifies inbound frames and remembers replay watermarks.
@@ -303,9 +331,81 @@ impl FrameVerifier {
     /// watermark, payload parse. The payload is only parsed once the MAC has
     /// verified.
     pub fn accept(&mut self, frame: &[u8]) -> Result<(Envelope, ClusterMessage), RejectReason> {
-        // RED-PHASE STUB: refuses everything and counts nothing.
-        let _ = frame;
-        Err(RejectReason::Malformed)
+        match self.verify(frame) {
+            Ok(accepted) => Ok(accepted),
+            Err(reason) => {
+                // Every refusal is counted, whatever the reason: a silent drop
+                // is not observable, and `frames_rejected_total{reason=…}` is
+                // how an operator sees somebody talking to the port.
+                self.rejected = self.rejected.saturating_add(1);
+                Err(reason)
+            }
+        }
+    }
+
+    /// The receive path proper. [`Self::accept`] owns the counter so that no
+    /// early return here can forget to increment it.
+    fn verify(&mut self, frame: &[u8]) -> Result<(Envelope, ClusterMessage), RejectReason> {
+        // 1. Length prefix — refused before anything of that size is reserved.
+        let body = frame_body(frame)?;
+
+        // 2. Envelope parse. Only the fixed envelope is parsed here; the
+        //    payload stays an opaque string until the MAC verifies.
+        let envelope: Envelope =
+            serde_json::from_slice(body).map_err(|_| RejectReason::Malformed)?;
+
+        // 3. Header checks.
+        if envelope.v != WIRE_VERSION {
+            return Err(RejectReason::Version);
+        }
+        if envelope.key_id != CURRENT_KEY_ID {
+            return Err(RejectReason::KeyId);
+        }
+        if envelope.cluster != self.cluster {
+            return Err(RejectReason::Cluster);
+        }
+
+        // 4. MAC, in constant time, before `serde_json` is allowed near the
+        //    payload. Nothing below this line runs on unauthenticated bytes.
+        let expected = hmac_sha256_hex(
+            &self.secret,
+            &signing_input(
+                envelope.v,
+                &envelope.cluster,
+                &envelope.sender,
+                envelope.incarnation,
+                envelope.seq,
+                envelope.payload.as_bytes(),
+            ),
+        );
+        if !bool::from(expected.as_bytes().ct_eq(envelope.mac.as_bytes())) {
+            return Err(RejectReason::Mac);
+        }
+
+        // 5. Self-origin, decided on the authenticated sender and never on the
+        //    peer address.
+        if envelope.sender == self.local_id {
+            return Err(RejectReason::SelfOrigin);
+        }
+
+        // 6. Replay watermark: lower incarnation, or the same incarnation
+        //    without a strictly higher seq, is a replay.
+        if let Some(&(incarnation, seq)) = self.watermarks.get(&envelope.sender)
+            && (envelope.incarnation < incarnation
+                || (envelope.incarnation == incarnation && envelope.seq <= seq))
+        {
+            return Err(RejectReason::Replay);
+        }
+
+        // 7. Payload parse — only now.
+        let message: ClusterMessage =
+            serde_json::from_str(&envelope.payload).map_err(|_| RejectReason::Payload)?;
+
+        // Accepted: adopt the incarnation (resetting the sequence watermark
+        // when it rose) and remember the sequence at it.
+        self.watermarks
+            .insert(envelope.sender.clone(), (envelope.incarnation, envelope.seq));
+        Ok((envelope, message))
     }
 
     /// The number of frames this verifier has refused, for any reason.

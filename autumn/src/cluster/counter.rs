@@ -118,11 +118,23 @@ impl CounterShards {
     }
 
     /// The tally recorded for one specific cell.
+    ///
+    /// Test observability only: nothing on the production path reads a single
+    /// cell — [`increment_cell`](Self::increment_cell) writes exactly one cell
+    /// by construction, and [`merge`](Self::merge) / [`value`](Self::value)
+    /// range over the whole map. Compiled under `cfg(test)` so the non-test
+    /// build stays free of dead code; ungate it if a health/metrics surface
+    /// ever needs per-cell facts.
+    #[cfg(test)]
     pub fn cell_value(&self, cell: &str) -> u64 {
         self.cells.get(cell).copied().unwrap_or(0)
     }
 
     /// How many distinct cells this counter holds (one per node per boot).
+    ///
+    /// Test observability only, for the same reason as
+    /// [`cell_value`](Self::cell_value).
+    #[cfg(test)]
     pub fn cell_count(&self) -> usize {
         self.cells.len()
     }
