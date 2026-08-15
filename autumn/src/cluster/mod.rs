@@ -222,7 +222,7 @@ impl ClusterHandle {
     /// With the default `bind_addr = "127.0.0.1:0"` this is the OS-assigned
     /// ephemeral port — the value to hand a second node as its seed peer.
     #[must_use]
-    pub const fn local_addr(&self) -> SocketAddr {
+    pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
     }
 

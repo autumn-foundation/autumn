@@ -122,13 +122,19 @@ REQUEST_PATH_MODULES=(
   autumn/src/capsule/redact.rs:reporting
   autumn/src/capsule/schema.rs:reporting
   autumn/src/search.rs:db
+  autumn/src/cluster/mod.rs:default
+  autumn/src/cluster/counter.rs:default
+  autumn/src/cluster/membership.rs:default
+  autumn/src/cluster/wire.rs:default
+  autumn/src/cluster/transport.rs:default
+  autumn/src/cluster/node.rs:default
   autumn-search/src/lib.rs:default
 )
 
 # The manifest may grow, never shrink. Deleting a gated module is a deliberate
 # act that has to move this number too, so a silent `git revert` of an entry
 # cannot quietly shrink the gate's surface.
-MODULE_COUNT_FLOOR=37
+MODULE_COUNT_FLOOR=43
 
 # Gated modules whose feature is KNOWINGLY not enabled by any enforcing CI clippy
 # lane, as `<path>:<feature>`. Their headers are real but unenforced: the deny

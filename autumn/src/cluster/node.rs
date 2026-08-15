@@ -135,7 +135,10 @@ impl ClusterNode {
             suspicion_timeout: config.suspicion_timeout,
             incarnation: AtomicU64::new(incarnation),
             state: std::sync::Mutex::new(state),
-            overlay: std::sync::Mutex::new(LivenessOverlay::new(config.suspicion_timeout)),
+            overlay: std::sync::Mutex::new(LivenessOverlay::new(
+                config.push_interval,
+                config.suspicion_timeout,
+            )),
             clock,
             entropy,
             transport,

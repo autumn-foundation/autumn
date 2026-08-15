@@ -10,17 +10,28 @@
 //!
 //! # Replicated status vs. local liveness
 //!
-//! Replicated [`MemberStatus`] is `Alive`/`Left` only — a clean semilattice
-//! ordered by `(incarnation, Left beats Alive at equal incarnation)`. Liveness
-//! (`Alive` → `Suspect` → `Down`) is **never** replicated: it lives in
-//! [`LivenessOverlay`], a pure function of per-peer last-push instants read
+//! Replicated [`MemberStatus`] is `Alive`/`Left` only. Records merge pairwise:
+//!
+//! 1. higher `incarnation` wins;
+//! 2. at equal incarnation, `Left` beats `Alive`;
+//! 3. at equal incarnation and equal status, the lexicographically greater
+//!    `addr` wins — a tie-break that exists only to keep the merge commutative.
+//!
+//! Liveness (`Alive` → `Suspect` → `Down`) is **never** replicated: it lives in
+//! [`LivenessOverlay`], a pure function of per-peer last-receipt instants read
 //! through the injected [`ClockSource`](crate::time::ClockSource). That split is
 //! what makes "views are local and eventually consistent" true in the type
 //! system rather than only in the docs.
 //!
-//! Incarnations exist even at two nodes: a node that sees *itself* marked
-//! `Left` bumps its incarnation and re-pushes (refutation), which is what
-//! defuses a replayed `Leave` as an eviction weapon.
+//! # Refutation
+//!
+//! Incarnations are seeded at boot from Unix seconds through the injected clock,
+//! so a restart normally comes back strictly higher with no persistence
+//! anywhere. Refutation covers the residual cases (a same-second restart, a
+//! backwards clock step) and keeps a live node from being buried: a node that
+//! sees **any** record about itself at an incarnation `>=` its own — `Left` or
+//! a stale `Alive` — adopts `observed + 1`, marks itself `Alive`, and pushes
+//! immediately. See [`ClusterState::refute`].
 //!
 //! RED PHASE (TDD): bodies are inert stubs — see the module docs on [`super`].
 
@@ -57,6 +68,9 @@ use serde::{Deserialize, Serialize};
 use super::counter::CounterShards;
 use super::{Incarnation, NodeId};
 use crate::time::MonotonicInstant;
+
+/// How many suspicion timeouts a `Left` tombstone is kept before pruning.
+pub(crate) const TOMBSTONE_TIMEOUT_MULTIPLE: u32 = 10;
 
 /// Replicated member status. Deliberately only two values: liveness is local
 /// (see [`LivenessOverlay`]) and is never gossiped.
@@ -101,11 +115,10 @@ impl MemberRecord {
         }
     }
 
-    /// Merge `other` into `self`: higher incarnation wins outright, and at an
-    /// equal incarnation `Left` beats `Alive`.
+    /// Merge `other` into `self` by the three-rule order in the module docs.
     pub(crate) fn merge(&mut self, other: &Self) {
-        // RED-PHASE STUB: must implement the (incarnation, Left > Alive)
-        // ordering that makes this type a join-semilattice.
+        // RED-PHASE STUB: must implement (incarnation, Left > Alive, greater
+        // addr) — the ordering that makes this type a join-semilattice.
         let _ = other;
     }
 }
@@ -116,7 +129,7 @@ pub(crate) struct ClusterState {
     /// `node id -> member record`. `BTreeMap` keeps the serialized form stable.
     #[serde(default)]
     pub(crate) members: BTreeMap<NodeId, MemberRecord>,
-    /// `counter name -> per-node shards`.
+    /// `counter name -> per-cell tallies`.
     #[serde(default)]
     pub(crate) counters: BTreeMap<String, CounterShards>,
 }
@@ -128,17 +141,25 @@ impl ClusterState {
     /// cross-node consistency reduces to.
     pub(crate) fn merge(&mut self, other: &Self) {
         // RED-PHASE STUB: must merge member records by their semilattice order
-        // and counter shards by per-shard max.
+        // and counter cells by per-cell max.
         let _ = other;
     }
 
-    /// Refute a record that marks **this** node as `Left` (or that carries a
-    /// stale incarnation for it) by re-emerging `Alive` one incarnation higher.
+    /// Reconcile this document's record for `me` against `own`, the node's own
+    /// authoritative self-record.
     ///
-    /// Returns the new incarnation when a refutation happened.
-    pub(crate) fn refute(&mut self, me: &str) -> Option<Incarnation> {
-        // RED-PHASE STUB: must bump `me`'s incarnation and set it back to Alive.
-        let _ = me;
+    /// Returns `Some(new_incarnation)` when a **refutation** is required: the
+    /// document holds a record about us at an incarnation `>=` ours that is not
+    /// the record we published (a `Left`, or a stale `Alive` from an earlier
+    /// boot at the same second). The node must adopt that incarnation, mark
+    /// itself `Alive`, and push immediately.
+    ///
+    /// Returns `None` when nothing needs refuting — including when the document
+    /// simply echoes our own record back at us, which must **not** bump (an
+    /// unconditional bump would ratchet forever).
+    pub(crate) fn refute(&mut self, me: &str, own: &MemberRecord) -> Option<Incarnation> {
+        // RED-PHASE STUB: must implement the generalized rule above.
+        let _ = (me, own);
         None
     }
 }
@@ -146,54 +167,71 @@ impl ClusterState {
 /// Locally-observed liveness of a peer. Never serialized, never gossiped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Liveness {
-    /// A push arrived within the suspicion timeout.
+    /// A frame arrived recently. In the view.
     Alive,
-    /// No push for at least one suspicion timeout.
+    /// Silence past two push intervals — a warning, not an eviction. Still in
+    /// the view.
     Suspect,
-    /// No push for at least two suspicion timeouts; drops out of the view.
+    /// Silence past the suspicion timeout. Drops out of the view.
     Down,
 }
 
-/// The local failure detector: last-push instants plus a pure classification.
+impl Liveness {
+    /// Whether a member in this state appears in [`members`](super::ClusterHandle::members).
+    pub(crate) const fn in_view(self) -> bool {
+        matches!(self, Self::Alive | Self::Suspect)
+    }
+}
+
+/// The local failure detector: last-receipt instants plus a pure
+/// classification.
 ///
-/// The contract this slice commits to, expressed in multiples of the configured
-/// suspicion timeout `T`:
+/// The contract, in terms of the configured `push_interval` `P` and
+/// `suspicion_timeout` `T` (config validation forces `T >= 3P`, so `Suspect`
+/// always strictly precedes `Down`):
 ///
-/// | time since last push | liveness |
-/// |----------------------|----------|
-/// | `< T`                | `Alive`  |
-/// | `>= T` and `< 2T`    | `Suspect`|
-/// | `>= 2T`              | `Down`   |
+/// | silence since the last accepted frame | liveness  | in view |
+/// |---------------------------------------|-----------|---------|
+/// | `<= 2P`                               | `Alive`   | yes     |
+/// | `> 2P` and `<= T`                     | `Suspect` | yes     |
+/// | `> T`                                 | `Down`    | no      |
 ///
-/// A peer that has never pushed is `Down`.
+/// A peer that has never been heard from is `Down`.
 #[derive(Debug)]
 pub(crate) struct LivenessOverlay {
+    push_interval: Duration,
     suspicion_timeout: Duration,
-    last_push: BTreeMap<NodeId, MonotonicInstant>,
+    last_seen: BTreeMap<NodeId, MonotonicInstant>,
 }
 
 impl LivenessOverlay {
     /// A fresh overlay with no observations.
-    pub(crate) const fn new(suspicion_timeout: Duration) -> Self {
+    pub(crate) const fn new(push_interval: Duration, suspicion_timeout: Duration) -> Self {
         Self {
+            push_interval,
             suspicion_timeout,
-            last_push: BTreeMap::new(),
+            last_seen: BTreeMap::new(),
         }
     }
 
-    /// The suspicion timeout this overlay classifies against.
+    /// The push interval this overlay measures `Suspect` against.
+    pub(crate) const fn push_interval(&self) -> Duration {
+        self.push_interval
+    }
+
+    /// The suspicion timeout this overlay measures `Down` against.
     pub(crate) const fn suspicion_timeout(&self) -> Duration {
         self.suspicion_timeout
     }
 
-    /// Record that a state push from `node` arrived at `at`.
-    pub(crate) fn record_push(&mut self, node: &str, at: MonotonicInstant) {
-        self.last_push.insert(node.to_owned(), at);
+    /// Record that a frame from `node` was accepted at `at`.
+    pub(crate) fn record_receipt(&mut self, node: &str, at: MonotonicInstant) {
+        self.last_seen.insert(node.to_owned(), at);
     }
 
     /// Drop every observation of `node` (it left cleanly, or was pruned).
     pub(crate) fn forget(&mut self, node: &str) {
-        self.last_push.remove(node);
+        self.last_seen.remove(node);
     }
 
     /// Classify `node` as of `now`. Pure: no clock read, no mutation.
@@ -206,11 +244,13 @@ impl LivenessOverlay {
 
 #[cfg(test)]
 mod tests {
-    use super::{Liveness, LivenessOverlay, MemberRecord, MemberStatus};
-    use crate::cluster::membership::ClusterState;
+    use super::{ClusterState, Liveness, LivenessOverlay, MemberRecord, MemberStatus};
     use crate::time::MonotonicInstant;
     use std::time::Duration;
 
+    /// The shipped defaults: `suspicion_timeout` is 5x the push interval, so
+    /// `Suspect` (at 2x push) strictly precedes `Down`.
+    const PUSH: Duration = Duration::from_millis(500);
     const SUSPICION: Duration = Duration::from_millis(2_500);
 
     fn at(millis: u64) -> MonotonicInstant {
@@ -268,100 +308,141 @@ mod tests {
             MemberStatus::Left,
             "…in either merge direction; observed {left_first:?}"
         );
+
+        // Rule 3: at equal incarnation AND equal status the greater addr wins,
+        // purely so the merge stays commutative.
+        let mut lower_addr = MemberRecord::alive("127.0.0.1:7001", 7);
+        lower_addr.merge(&MemberRecord::alive("127.0.0.1:7009", 7));
+        assert_eq!(
+            lower_addr.addr, "127.0.0.1:7009",
+            "the lexicographically greater addr must win the tie; observed {lower_addr:?}"
+        );
     }
 
+    /// The generalized refutation rule: ANY self-record at an incarnation `>=`
+    /// our own — `Left` or a stale `Alive` — is refuted at `observed + 1`.
     #[test]
     fn refutation_bumps_incarnation_over_stale_leave() {
-        let mut state = ClusterState::default();
-        state.members.insert(
-            "node-a".to_owned(),
-            MemberRecord::left("127.0.0.1:7001", 4),
-        );
+        let own = MemberRecord::alive("127.0.0.1:7001", 4);
 
-        let refuted = state.refute("node-a");
-
+        // A replayed / merged Leave at our own incarnation.
+        let mut buried = ClusterState::default();
+        buried
+            .members
+            .insert("node-a".to_owned(), MemberRecord::left("127.0.0.1:7001", 4));
         assert_eq!(
-            refuted,
+            buried.refute("node-a", &own),
             Some(5),
-            "a node that sees itself Left must re-emerge one incarnation higher"
+            "a Left about ourselves must be refuted one incarnation higher"
         );
-        let record = state
+        let record = buried
             .members
             .get("node-a")
             .expect("the refuting node must stay in its own document");
         assert_eq!(
-            record.status,
-            MemberStatus::Alive,
-            "refutation must restore Alive; observed {record:?}"
-        );
-        assert_eq!(
-            record.incarnation, 5,
-            "refutation must bump the incarnation; observed {record:?}"
+            (record.status, record.incarnation),
+            (MemberStatus::Alive, 5),
+            "refutation must restore Alive at the bumped incarnation; observed {record:?}"
         );
 
-        // A document that does not mark us Left needs no refutation.
-        let mut healthy = ClusterState::default();
-        healthy.members.insert(
+        // A STALE ALIVE from a previous boot at a higher incarnation (a
+        // same-second restart, or a clock that stepped backwards).
+        let mut stale_alive = ClusterState::default();
+        stale_alive.members.insert(
             "node-a".to_owned(),
-            MemberRecord::alive("127.0.0.1:7001", 5),
+            MemberRecord::alive("127.0.0.1:9999", 7),
         );
         assert_eq!(
-            healthy.refute("node-a"),
+            stale_alive.refute("node-a", &own),
+            Some(8),
+            "a stale Alive about ourselves at a higher incarnation must also be refuted"
+        );
+
+        // Our own record echoed back must NOT bump, or the incarnation
+        // ratchets forever on every push.
+        let mut echoed = ClusterState::default();
+        echoed.members.insert("node-a".to_owned(), own.clone());
+        assert_eq!(
+            echoed.refute("node-a", &own),
             None,
-            "an Alive self-record must not be refuted (that would bump forever)"
+            "an exact echo of our own record must not be refuted"
+        );
+
+        // An older record about us needs no refutation either.
+        let mut older = ClusterState::default();
+        older
+            .members
+            .insert("node-a".to_owned(), MemberRecord::left("127.0.0.1:7001", 2));
+        assert_eq!(
+            older.refute("node-a", &own),
+            None,
+            "a record older than ours loses the merge already; no bump needed"
         );
     }
 
     #[test]
     fn missed_pushes_transition_member_to_down() {
-        let mut overlay = LivenessOverlay::new(SUSPICION);
-        overlay.record_push("node-b", at(0));
+        let mut overlay = LivenessOverlay::new(PUSH, SUSPICION);
+        overlay.record_receipt("node-b", at(0));
 
         assert_eq!(
-            overlay.liveness("node-b", at(1_000)),
+            overlay.liveness("node-b", at(900)),
             Liveness::Alive,
-            "inside the suspicion timeout a member is Alive"
+            "within two push intervals a member is Alive"
         );
         assert_eq!(
-            overlay.liveness("node-b", at(2_500)),
+            overlay.liveness("node-b", at(1_100)),
             Liveness::Suspect,
-            "at exactly one suspicion timeout a member becomes Suspect"
+            "past two push intervals a member is Suspect — a warning, not an eviction"
+        );
+        assert!(
+            overlay.liveness("node-b", at(1_100)).in_view(),
+            "a Suspect member must still appear in the view"
         );
         assert_eq!(
-            overlay.liveness("node-b", at(5_000)),
+            overlay.liveness("node-b", at(2_600)),
             Liveness::Down,
-            "at two suspicion timeouts a member becomes Down and leaves the view"
+            "past the suspicion timeout a member is Down"
+        );
+        assert!(
+            !overlay.liveness("node-b", at(2_600)).in_view(),
+            "a Down member must leave the view"
         );
         assert_eq!(
             overlay.liveness("never-seen", at(0)),
             Liveness::Down,
-            "a peer that has never pushed is Down, not Alive"
+            "a peer never heard from is Down, not Alive"
         );
     }
 
     #[test]
     fn push_receipt_resets_suspicion() {
-        let mut overlay = LivenessOverlay::new(SUSPICION);
-        overlay.record_push("node-b", at(0));
+        let mut overlay = LivenessOverlay::new(PUSH, SUSPICION);
+        overlay.record_receipt("node-b", at(0));
 
         assert_eq!(
-            overlay.liveness("node-b", at(3_000)),
+            overlay.liveness("node-b", at(1_500)),
             Liveness::Suspect,
             "sanity: the member must be Suspect before the reset, or this test \
              proves nothing"
         );
 
-        overlay.record_push("node-b", at(3_000));
+        overlay.record_receipt("node-b", at(1_500));
 
         assert_eq!(
-            overlay.liveness("node-b", at(3_100)),
+            overlay.liveness("node-b", at(1_900)),
             Liveness::Alive,
-            "a fresh push must reset the suspicion clock"
+            "a fresh receipt must reset the suspicion clock"
         );
         assert_eq!(
-            overlay.liveness("node-b", at(5_600)),
+            overlay.liveness("node-b", at(2_700)),
             Liveness::Suspect,
-            "…and suspicion must then be measured from the NEW push"
+            "…and silence must then be measured from the NEW receipt"
+        );
+        assert_eq!(
+            overlay.liveness("node-b", at(4_100)),
+            Liveness::Down,
+            "…including the Down threshold"
         );
     }
 }

@@ -2,9 +2,9 @@
 //!
 //! # Frame
 //!
-//! `u32` big-endian length prefix, then that many bytes of JSON. The declared
-//! length is checked against [`MAX_FRAME_BYTES`] **before** anything is
-//! allocated, so a hostile prefix cannot make the receiver reserve 4 GiB.
+//! `u32` big-endian length prefix, then exactly that many bytes of JSON. `N` is
+//! capped at [`MAX_FRAME_BYTES`] and the cap is checked **before any
+//! allocation**, so a hostile prefix cannot make the receiver reserve 4 GiB.
 //!
 //! # Envelope
 //!
@@ -12,26 +12,26 @@
 //! { v, key_id, cluster, sender, incarnation, seq, payload, mac }
 //! ```
 //!
-//! `payload` is the serialized [`ClusterMessage`] as a string; `mac` is
-//! HMAC-SHA256 (via [`crate::security::hmac_sha256_hex`]) over the
-//! length-delimited concatenation of `v ‖ cluster ‖ sender ‖ incarnation ‖ seq
-//! ‖ payload`, compared in constant time with `subtle`. The MAC is verified
-//! **before** `serde_json` is allowed near the payload.
+//! `payload` is the serialized [`ClusterMessage`] as a JSON string; `mac` is
+//! lowercase-hex HMAC-SHA256 (via [`crate::security::hmac_sha256_hex`]) over
+//! the **length-delimited** concatenation
+//! `v ‖ cluster ‖ sender ‖ incarnation ‖ seq ‖ payload`, compared in constant
+//! time with `subtle`. The MAC is verified **before** `serde_json` is allowed
+//! near the payload.
 //!
-//! Each field in the signing input answers a specific attack:
+//! `key_id` is deliberately outside the signing input: it *selects* the key
+//! rather than being protected by it, so flipping it selects a key that does
+//! not exist and the MAC then fails.
 //!
-//! - `sender` — a reflected frame cannot masquerade as its own origin;
-//! - `cluster` — a frame from a different cluster sharing the secret is refused;
-//! - `incarnation` + `seq` — per-`(sender, incarnation)` high-watermarks drop
-//!   replays, and re-keying the watermark on incarnation survives a restart;
-//! - `key_id` — reserved (always `0` in this slice) for future key rotation;
-//! - `v` — reserved for a future wire revision.
+//! # Receive-path totality, with exactly one exception
 //!
-//! Self-origin frames are dropped by the **authenticated sender id**, never by
-//! source address.
-//!
-//! Every decode path is total: malformed input is dropped and counted, never
-//! panicked on and never fatal to the receive loop.
+//! Every rejection is counted with a named reason and nothing ever panics.
+//! Steps 2-7 drop the offending frame and continue the read loop. Step 1 — a
+//! length prefix of `0` or over the cap — is the one deliberate exception: the
+//! stream framing itself can no longer be trusted, so the **connection closes**
+//! and the peer re-dials with backoff (see
+//! [`RejectReason::closes_connection`]). Closing a connection is never an
+//! eviction; connection state carries zero liveness meaning.
 //!
 //! RED PHASE (TDD): bodies are inert stubs — see the module docs on [`super`].
 
@@ -67,7 +67,7 @@ use serde::{Deserialize, Serialize};
 use super::membership::ClusterState;
 use super::{Incarnation, NodeId};
 
-/// Wire revision. Bumped only for an incompatible envelope change.
+/// Envelope version. Any other value is dropped.
 pub(crate) const WIRE_VERSION: u8 = 1;
 
 /// Signing-key identifier. Reserved for rotation; always `0` in this slice.
@@ -79,76 +79,101 @@ pub(crate) const MAX_FRAME_BYTES: usize = 65_536;
 /// Width of the big-endian length prefix.
 pub(crate) const LENGTH_PREFIX_BYTES: usize = 4;
 
-/// The messages a node can send. Exactly one of them is periodic.
+/// The messages a node can send. Internally tagged, so an unknown future
+/// variant is a clean drop rather than a parse failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ClusterMessage {
     /// The whole replicated document. This IS the heartbeat.
-    StatePush(ClusterState),
-    /// Best-effort clean-departure notice, scoped to the sender's incarnation.
-    /// Advisory only: the suspicion timeout is the correctness path.
+    StatePush {
+        /// The sender's document at the moment it pushed.
+        state: ClusterState,
+    },
+    /// Best-effort clean-departure notice. It carries no fields at all: it
+    /// applies to the `(sender, incarnation)` pair in the authenticated
+    /// envelope, so a captured leave can never be replayed against a newer
+    /// incarnation of that node. Advisory only — the suspicion timeout is the
+    /// correctness path.
     Leave,
 }
 
 /// The authenticated wrapper every frame carries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Envelope {
-    /// Wire revision ([`WIRE_VERSION`]).
+    /// Envelope version ([`WIRE_VERSION`]).
     pub(crate) v: u8,
-    /// Signing-key id ([`CURRENT_KEY_ID`]).
+    /// Signing-key id ([`CURRENT_KEY_ID`]). Outside the signing input.
     #[serde(default)]
     pub(crate) key_id: u8,
-    /// Cluster name — a frame from another cluster is refused even under the
-    /// same secret.
+    /// Sender's cluster name — a frame from another cluster is refused even
+    /// under the same secret.
     pub(crate) cluster: String,
-    /// Authenticated sender id.
+    /// Authenticated sender id. The source address is never an identity.
     pub(crate) sender: NodeId,
-    /// The sender's incarnation, which keys the replay watermark.
+    /// The sender's incarnation when the frame was produced.
     pub(crate) incarnation: Incarnation,
-    /// Per-`(sender, incarnation)` monotonic sequence number.
+    /// Per-sender counter, reset to `0` when the incarnation increases.
     pub(crate) seq: u64,
-    /// The serialized [`ClusterMessage`].
+    /// The inner message as a JSON string. Opaque until the MAC verifies.
     pub(crate) payload: String,
-    /// Hex HMAC-SHA256 over [`signing_input`].
+    /// Lowercase hex HMAC-SHA256, 64 characters.
     pub(crate) mac: String,
 }
 
-/// Why a frame was refused. Every variant is a counted, observable outcome.
+/// Why a frame was refused. Labels match the guide's receive-path table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RejectReason {
-    /// The bytes are not a well-formed frame or envelope.
+    /// Step 1: `N == 0` or `N > MAX_FRAME_BYTES`. **Closes the connection.**
+    Oversize,
+    /// Step 2: the envelope is not well-formed JSON, or is missing a field.
     Malformed,
-    /// The declared length exceeds [`MAX_FRAME_BYTES`].
-    Oversized,
-    /// The MAC does not verify under the configured secret.
-    BadMac,
-    /// The envelope names a different cluster.
-    WrongCluster,
-    /// The envelope names an unsupported wire revision or key id.
-    UnsupportedVersion,
-    /// The sequence number is at or below the known high-watermark.
-    Replay,
-    /// The authenticated sender is this node.
+    /// Step 3: `v` is not [`WIRE_VERSION`].
+    Version,
+    /// Step 3: `key_id` is not [`CURRENT_KEY_ID`].
+    KeyId,
+    /// Step 3: the envelope names a different cluster.
+    Cluster,
+    /// Step 4: the MAC does not verify under the configured secret.
+    Mac,
+    /// Step 5: the authenticated sender is this node.
     SelfOrigin,
+    /// Step 6: at or below the per-sender replay watermark.
+    Replay,
+    /// Step 7: the (authenticated) payload is not a known message.
+    Payload,
 }
 
 impl RejectReason {
     /// Stable label used in metrics and logs.
     pub(crate) const fn label(self) -> &'static str {
         match self {
+            Self::Oversize => "oversize",
             Self::Malformed => "malformed",
-            Self::Oversized => "oversized",
-            Self::BadMac => "bad_mac",
-            Self::WrongCluster => "wrong_cluster",
-            Self::UnsupportedVersion => "unsupported_version",
-            Self::Replay => "replay",
+            Self::Version => "version",
+            Self::KeyId => "key_id",
+            Self::Cluster => "cluster",
+            Self::Mac => "mac",
             Self::SelfOrigin => "self_origin",
+            Self::Replay => "replay",
+            Self::Payload => "payload",
         }
+    }
+
+    /// Whether this rejection invalidates the stream's framing and therefore
+    /// requires closing the connection.
+    ///
+    /// Only step 1 does: after a bad length prefix there is no way to know
+    /// where the next frame starts. Everything else drops the frame and reads
+    /// on.
+    pub(crate) const fn closes_connection(self) -> bool {
+        matches!(self, Self::Oversize)
     }
 }
 
 /// The exact bytes the MAC covers: a length-delimited concatenation, so no
-/// field boundary can be shifted without changing the input.
+/// field value can be shifted into another field.
+///
+/// `L(x) = 8-byte big-endian byte length of x, followed by x`.
 pub(crate) fn signing_input(
     v: u8,
     cluster: &str,
@@ -157,7 +182,8 @@ pub(crate) fn signing_input(
     seq: u64,
     payload: &[u8],
 ) -> Vec<u8> {
-    // RED-PHASE STUB: must emit `v ‖ len(cluster) ‖ cluster ‖ … ‖ payload`.
+    // RED-PHASE STUB: must emit L(v) ‖ L(cluster) ‖ L(sender) ‖ L(incarnation)
+    // ‖ L(seq) ‖ L(payload).
     let _ = (v, cluster, sender, incarnation, seq, payload);
     Vec::new()
 }
@@ -180,14 +206,15 @@ pub(crate) fn sign_envelope(
 }
 
 /// Length-prefix a serialized envelope. `None` when it does not fit
-/// [`MAX_FRAME_BYTES`] or cannot be serialized.
+/// [`MAX_FRAME_BYTES`] or cannot be serialized — the sender applies the same
+/// cap rather than emitting something the peer must reject.
 pub(crate) fn encode_frame(envelope: &Envelope) -> Option<Vec<u8>> {
     // RED-PHASE STUB.
     let _ = envelope;
     None
 }
 
-/// Read a length prefix, refusing zero and anything over [`MAX_FRAME_BYTES`]
+/// Read a length prefix, refusing `0` and anything over [`MAX_FRAME_BYTES`]
 /// **before** a buffer of that size is reserved.
 pub(crate) const fn frame_len(prefix: [u8; LENGTH_PREFIX_BYTES]) -> Option<usize> {
     // RED-PHASE STUB: must accept a legal length and refuse 0 / oversized.
@@ -203,7 +230,7 @@ pub(crate) fn decode_frame(frame: &[u8]) -> Option<Envelope> {
     None
 }
 
-/// Verifies inbound frames and remembers replay high-watermarks.
+/// Verifies inbound frames and remembers replay watermarks.
 ///
 /// Owned by the receive loop; never shared, so a plain `&mut self` suffices.
 #[derive(Debug)]
@@ -211,8 +238,10 @@ pub(crate) struct FrameVerifier {
     cluster: String,
     local_id: NodeId,
     secret: Vec<u8>,
-    /// `(sender, incarnation) -> highest sequence accepted`.
-    watermarks: BTreeMap<(NodeId, Incarnation), u64>,
+    /// `sender -> (highest incarnation accepted, highest seq at it)`. A higher
+    /// incarnation adopts and **resets** the sequence watermark, which is what
+    /// lets a restarted node rejoin.
+    watermarks: BTreeMap<NodeId, (Incarnation, u64)>,
     rejected: u64,
 }
 
@@ -234,10 +263,14 @@ impl FrameVerifier {
 
     /// Verify and decode one frame.
     ///
-    /// Order is load-bearing: length cap, then envelope parse, then MAC, then
-    /// cluster/version, then self-origin, then the replay watermark. The
-    /// payload is only parsed once the MAC has verified.
-    pub(crate) fn accept(&mut self, frame: &[u8]) -> Result<(Envelope, ClusterMessage), RejectReason> {
+    /// Order is load-bearing and matches the guide's receive-path table:
+    /// length cap, envelope parse, header checks, MAC, self-origin, replay
+    /// watermark, payload parse. The payload is only parsed once the MAC has
+    /// verified.
+    pub(crate) fn accept(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<(Envelope, ClusterMessage), RejectReason> {
         // RED-PHASE STUB: refuses everything and counts nothing.
         let _ = frame;
         Err(RejectReason::Malformed)
@@ -253,16 +286,19 @@ impl FrameVerifier {
         &self.cluster
     }
 
+    /// The local node id whose frames are dropped as self-origin.
+    pub(crate) fn local_id(&self) -> &str {
+        &self.local_id
+    }
+
     /// The secret this verifier checks MACs against.
     pub(crate) fn secret(&self) -> &[u8] {
         &self.secret
     }
 
-    /// The highest sequence accepted so far for `(sender, incarnation)`.
-    pub(crate) fn watermark(&self, sender: &str, incarnation: Incarnation) -> Option<u64> {
-        self.watermarks
-            .get(&(sender.to_owned(), incarnation))
-            .copied()
+    /// The `(incarnation, seq)` watermark recorded for `sender`.
+    pub(crate) fn watermark(&self, sender: &str) -> Option<(Incarnation, u64)> {
+        self.watermarks.get(sender).copied()
     }
 }
 
@@ -283,24 +319,32 @@ mod tests {
         FrameVerifier::new(CLUSTER, LOCAL, SECRET.to_vec())
     }
 
+    fn state_push() -> ClusterMessage {
+        ClusterMessage::StatePush {
+            state: ClusterState::default(),
+        }
+    }
+
     fn envelope_for(
         secret: &[u8],
         cluster: &str,
         sender: &str,
+        incarnation: u64,
         seq: u64,
         message: &ClusterMessage,
     ) -> Option<Envelope> {
-        sign_envelope(secret, cluster, sender, 1, seq, message)
+        sign_envelope(secret, cluster, sender, incarnation, seq, message)
     }
 
     fn frame_for(
         secret: &[u8],
         cluster: &str,
         sender: &str,
+        incarnation: u64,
         seq: u64,
         message: &ClusterMessage,
     ) -> Vec<u8> {
-        envelope_for(secret, cluster, sender, seq, message)
+        envelope_for(secret, cluster, sender, incarnation, seq, message)
             .as_ref()
             .and_then(encode_frame)
             .unwrap_or_default()
@@ -308,11 +352,11 @@ mod tests {
 
     #[test]
     fn envelope_roundtrip() {
-        let message = ClusterMessage::StatePush(ClusterState::default());
-        let frame = frame_for(SECRET, CLUSTER, REMOTE, 1, &message);
+        let message = state_push();
+        let frame = frame_for(SECRET, CLUSTER, REMOTE, 1, 1, &message);
         assert!(
             !frame.is_empty(),
-            "signing and encoding a StatePush must produce a frame"
+            "signing and encoding a state push must produce a frame"
         );
 
         let result = verifier().accept(&frame);
@@ -325,8 +369,7 @@ mod tests {
 
     #[test]
     fn tampered_frame_rejected() {
-        let message = ClusterMessage::StatePush(ClusterState::default());
-        let envelope = envelope_for(SECRET, CLUSTER, REMOTE, 1, &message);
+        let envelope = envelope_for(SECRET, CLUSTER, REMOTE, 1, 1, &state_push());
         assert!(envelope.is_some(), "signing must produce an envelope");
         let Some(mut envelope) = envelope else { return };
 
@@ -338,7 +381,7 @@ mod tests {
         let result = verifier.accept(&frame);
         assert_eq!(
             result.err(),
-            Some(RejectReason::BadMac),
+            Some(RejectReason::Mac),
             "a flipped payload byte must fail the MAC before the payload is parsed"
         );
         assert_eq!(
@@ -346,57 +389,67 @@ mod tests {
             1,
             "a rejected frame must be counted (a silent drop is not observable)"
         );
+        assert!(
+            !RejectReason::Mac.closes_connection(),
+            "a MAC failure drops the frame and reads on — it never closes the connection"
+        );
     }
 
     #[test]
     fn wrong_secret_rejected() {
-        let frame = frame_for(b"a-completely-different-secret-xx", CLUSTER, REMOTE, 1, &ClusterMessage::Leave);
+        let frame = frame_for(
+            b"a-completely-different-secret-xx",
+            CLUSTER,
+            REMOTE,
+            1,
+            1,
+            &ClusterMessage::Leave,
+        );
         let mut verifier = verifier();
         let result = verifier.accept(&frame);
 
         assert_eq!(
             result.err(),
-            Some(RejectReason::BadMac),
+            Some(RejectReason::Mac),
             "a frame signed with another secret must not verify"
         );
-        assert_eq!(
-            verifier.rejected_total(),
-            1,
-            "the rejection must be counted"
-        );
+        assert_eq!(verifier.rejected_total(), 1, "the rejection must be counted");
     }
 
     #[test]
     fn wrong_cluster_name_rejected() {
-        let frame = frame_for(SECRET, "some-other-cluster", REMOTE, 1, &ClusterMessage::Leave);
+        let frame = frame_for(
+            SECRET,
+            "some-other-cluster",
+            REMOTE,
+            1,
+            1,
+            &ClusterMessage::Leave,
+        );
         let mut verifier = verifier();
         let result = verifier.accept(&frame);
 
         assert_eq!(
             result.err(),
-            Some(RejectReason::WrongCluster),
+            Some(RejectReason::Cluster),
             "a frame naming a different cluster must be refused even under the same secret"
         );
-        assert_eq!(
-            verifier.rejected_total(),
-            1,
-            "the rejection must be counted"
-        );
+        assert_eq!(verifier.rejected_total(), 1, "the rejection must be counted");
     }
 
     #[test]
     fn stale_sequence_dropped() {
-        let frame = frame_for(SECRET, CLUSTER, REMOTE, 5, &ClusterMessage::Leave);
+        let frame = frame_for(SECRET, CLUSTER, REMOTE, 1, 5, &ClusterMessage::Leave);
         let mut verifier = verifier();
 
         assert!(
             verifier.accept(&frame).is_ok(),
-            "the first frame at seq 5 must be accepted"
+            "the first frame at (incarnation 1, seq 5) must be accepted"
         );
         assert_eq!(
-            verifier.watermark(REMOTE, 1),
-            Some(5),
-            "accepting seq 5 must raise the (sender, incarnation) high-watermark"
+            verifier.watermark(REMOTE),
+            Some((1, 5)),
+            "accepting a frame must raise the per-sender watermark"
         );
 
         let replayed = verifier.accept(&frame);
@@ -405,10 +458,27 @@ mod tests {
             Some(RejectReason::Replay),
             "replaying a frame at or below the watermark must be dropped"
         );
+        assert_eq!(verifier.rejected_total(), 1, "the replay must be counted");
+
+        // A HIGHER incarnation adopts and resets the sequence watermark — this
+        // is what lets a restarted node rejoin instead of being replay-locked.
+        let rejoined = frame_for(SECRET, CLUSTER, REMOTE, 2, 0, &ClusterMessage::Leave);
+        assert!(
+            verifier.accept(&rejoined).is_ok(),
+            "a higher incarnation at seq 0 must be accepted, not treated as a replay"
+        );
         assert_eq!(
-            verifier.rejected_total(),
-            1,
-            "the replay must be counted"
+            verifier.watermark(REMOTE),
+            Some((2, 0)),
+            "a higher incarnation must adopt and reset the sequence watermark"
+        );
+
+        // …and the dead incarnation can no longer speak.
+        let stale_incarnation = frame_for(SECRET, CLUSTER, REMOTE, 1, 6, &ClusterMessage::Leave);
+        assert_eq!(
+            verifier.accept(&stale_incarnation).err(),
+            Some(RejectReason::Replay),
+            "a frame from a lower incarnation must be dropped once a higher one is known"
         );
     }
 
@@ -416,7 +486,7 @@ mod tests {
     fn self_origin_frame_dropped() {
         // Correctly signed, but the authenticated sender is us: a reflected
         // frame. It must be dropped by sender id, not by source address.
-        let frame = frame_for(SECRET, CLUSTER, LOCAL, 1, &ClusterMessage::Leave);
+        let frame = frame_for(SECRET, CLUSTER, LOCAL, 1, 1, &ClusterMessage::Leave);
         let mut verifier = verifier();
         let result = verifier.accept(&frame);
 
@@ -425,11 +495,7 @@ mod tests {
             Some(RejectReason::SelfOrigin),
             "a frame whose authenticated sender is this node must be dropped"
         );
-        assert_eq!(
-            verifier.rejected_total(),
-            1,
-            "the rejection must be counted"
-        );
+        assert_eq!(verifier.rejected_total(), 1, "the rejection must be counted");
     }
 
     #[test]
@@ -461,8 +527,12 @@ mod tests {
         oversized.extend_from_slice(b"{}");
         assert_eq!(
             verifier().accept(&oversized).err(),
-            Some(RejectReason::Oversized),
+            Some(RejectReason::Oversize),
             "the verifier must refuse an oversized declared length"
+        );
+        assert!(
+            RejectReason::Oversize.closes_connection(),
+            "a bad length prefix desynchronizes the framing, so the connection must close"
         );
     }
 
@@ -478,19 +548,27 @@ mod tests {
             &truncated,
             b"not-a-frame-at-all".as_slice(),
         ] {
+            let result = verifier.accept(bad);
             assert!(
-                verifier.accept(bad).is_err(),
+                result.is_err(),
                 "malformed input must be dropped, never accepted: {bad:?}"
             );
+            assert!(
+                result
+                    .err()
+                    .is_some_and(|reason| !reason.closes_connection()),
+                "a malformed body drops the frame and reads on; only a bad length \
+                 prefix closes the connection: {bad:?}"
+            );
         }
-        assert!(
-            LENGTH_PREFIX_BYTES == 4,
+        assert_eq!(
+            LENGTH_PREFIX_BYTES, 4,
             "the length prefix width is part of the wire contract"
         );
 
         // Positive control: the receive path survives garbage and still accepts
         // a valid frame afterwards (totality means "continue", not "give up").
-        let good = frame_for(SECRET, CLUSTER, REMOTE, 1, &ClusterMessage::Leave);
+        let good = frame_for(SECRET, CLUSTER, REMOTE, 1, 1, &ClusterMessage::Leave);
         assert!(
             verifier.accept(&good).is_ok(),
             "after malformed input the verifier must still accept a valid frame"
