@@ -44,16 +44,25 @@ harness (`fixture/workload_after.sql`) still reproduces the chunk loop
 generically so it stays correct if `CHUNK_SIZE` or the batch sizes tested
 here ever change.
 
-**Reproduce**:
-```
+**Reproduce** (repeat the seed/reset/run/profile block per batch size —
+200, 2,000, 20,000 below):
+```bash
 createdb ledger_bench
 psql -d ledger_bench -c "CREATE EXTENSION pg_stat_statements;"
 # shared_preload_libraries = 'pg_stat_statements', pg_stat_statements.track = 'all'
-
 psql -d ledger_bench -f fixture/schema.sql
-fixture/run_size.sh 2000   # seeds + runs before/after + prints calls,buffers CSV
-fixture/run_size.sh 200
-fixture/run_size.sh 20000
+
+for batch in 200 2000 20000; do
+  psql -d ledger_bench -v total=800000 -v batch="$batch" -f fixture/seed.sql
+
+  psql -d ledger_bench -c "SELECT pg_stat_statements_reset();"
+  psql -d ledger_bench -f fixture/workload_before.sql
+  psql -d ledger_bench -f fixture/profile.sql   # "before" calls/buffers for this batch size
+
+  psql -d ledger_bench -c "SELECT pg_stat_statements_reset();"
+  psql -d ledger_bench -f fixture/workload_after.sql
+  psql -d ledger_bench -f fixture/profile.sql   # "after" calls/buffers for this batch size
+done
 ```
 
 ## 📈 Profile
@@ -165,9 +174,10 @@ No migration, no new index, no lock — `mail_unsubscribes` and its existing
 
 ## 📊 Measurement
 
-`pg_stat_statements`, one simulated `send_list_mail` call per size
-(`fixture/run_size.sh`, resetting stats between the before/after run at each
-size; the "after" run executes `fixture/workload_after.sql`'s chunk loop,
+`pg_stat_statements`, one simulated `send_list_mail` call per size (the
+seed/reset/run/profile loop under 🎯 Workload's Reproduce block, resetting
+stats between the before/after run at each size; the "after" run executes
+`fixture/workload_after.sql`'s chunk loop,
 which for these three sizes is one chunk each since all are under
 `CHUNK_SIZE`):
 
@@ -254,13 +264,9 @@ no write-path or WAL impact to measure.
 
 ## 🔬 Reproduce
 
-SQL-level:
-```bash
-psql -d ledger_bench -f docs/reports/2026-08-15-ledger-mail-suppression-batch/fixture/schema.sql
-docs/reports/2026-08-15-ledger-mail-suppression-batch/fixture/run_size.sh 200
-docs/reports/2026-08-15-ledger-mail-suppression-batch/fixture/run_size.sh 2000
-docs/reports/2026-08-15-ledger-mail-suppression-batch/fixture/run_size.sh 20000
-```
+SQL-level: the full seed/reset/run/profile loop under 🎯 Workload's
+Reproduce block, run against
+`docs/reports/2026-08-15-ledger-mail-suppression-batch/fixture/`.
 
 Rust-side:
 ```bash
