@@ -134,6 +134,15 @@ pub struct CounterCacheSpec<M: 'static> {
     /// to match a post-update record back to the foreign keys captured for it
     /// before the update, and to scope the tenant predicate below.
     pub pk_of: fn(&M) -> i64,
+    /// Whether a record is live (not soft-deleted). Always `true` for a child
+    /// with no `deleted_at` column.
+    ///
+    /// The generated `update` does **not** filter soft-deleted rows, so an
+    /// already-deleted child can be re-parented. It is counted by nobody, so
+    /// neither its old nor its new parent may move — without this the update
+    /// would decrement a parent that had already dropped it and increment one
+    /// for a dead row.
+    pub live_of: fn(&M) -> bool,
     /// The tenant-discriminator column, from
     /// `#[belongs_to(…, counter_cache, counter_cache_tenant = "<column>")]`.
     ///
@@ -432,18 +441,57 @@ pub async fn counter_cache_after_insert_many<M: 'static>(
     records: &[M],
 ) -> AutumnResult<()> {
     for spec in specs {
-        let mut deltas: HashMap<i64, Fold> = HashMap::new();
+        let mut contributions: Vec<(i64, i64, i64)> = Vec::new();
         for record in records {
             if let Some(parent_id) = (spec.fk_of)(record) {
-                deltas
-                    .entry(parent_id)
-                    .or_insert_with(|| Fold::new((spec.pk_of)(record)))
-                    .delta += 1;
+                contributions.push((parent_id, 1, (spec.pk_of)(record)));
             }
         }
-        apply_folded(conn, spec, deltas).await?;
+        fold_or_apply_each(conn, spec, contributions).await?;
     }
     Ok(())
+}
+
+/// Apply per-parent deltas, folding only when it is safe to do so.
+///
+/// Folding a batch into one `UPDATE` per parent is a pure optimization. It is
+/// only sound when the association has no tenant column: the tenant predicate is
+/// scoped to a single witness child, so a mixed-tenant batch folded behind one
+/// arbitrary witness would either sweep cross-tenant children into the increment
+/// or drop legitimate ones. With a tenant column each contribution is therefore
+/// applied under its own witness.
+async fn fold_or_apply_each<M: 'static>(
+    conn: &mut RuntimeConnection,
+    spec: &CounterCacheSpec<M>,
+    contributions: Vec<(i64, i64, i64)>,
+) -> AutumnResult<()> {
+    if spec.tenant_column.is_some() {
+        // Sorted by parent id for the same lock-ordering reason folding is.
+        let mut each = contributions;
+        each.sort_unstable();
+        for (parent_id, delta, witness) in each {
+            if delta == 0 {
+                continue;
+            }
+            counter_cache_apply_delta(
+                conn,
+                spec,
+                parent_id,
+                delta,
+                TenantScope::SameTenantAsChild(witness),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    let mut folded: HashMap<i64, Fold> = HashMap::new();
+    for (parent_id, delta, witness) in contributions {
+        folded
+            .entry(parent_id)
+            .or_insert_with(|| Fold::new(witness))
+            .delta += delta;
+    }
+    apply_folded(conn, spec, folded).await
 }
 
 /// One parent's accumulated delta plus a witness child id.
@@ -467,6 +515,12 @@ impl Fold {
 /// Ascending order is what stops two concurrent batches touching the same
 /// parents from taking their row locks in opposite orders and deadlocking.
 /// Zero deltas are dropped rather than issued as `+ 0`.
+///
+/// **Only used when the association declares no tenant column.** The tenant
+/// predicate is scoped to one witness child, so folding a mixed-tenant batch
+/// behind a single arbitrary witness would either sweep cross-tenant children
+/// into the increment or drop legitimate ones. Where a tenant column exists the
+/// callers apply per child instead — see [`fold_or_apply_each`].
 async fn apply_folded<M: 'static>(
     conn: &mut RuntimeConnection,
     spec: &CounterCacheSpec<M>,
@@ -602,6 +656,33 @@ pub async fn counter_cache_before_delete_many<M: 'static>(
     Ok(())
 }
 
+/// [`counter_cache_before_delete_many`] restricted to the ONE leg whose foreign
+/// key is about to be cleared (`dependent = nullify`).
+///
+/// A nullify detaches the children from a single parent association; their other
+/// counter-cached legs are untouched, so decrementing every spec would
+/// permanently undercount them. For example, nullifying `comments.author_id`
+/// when a user is deleted must not drop `posts.comment_count` for comments that
+/// remain attached to their post.
+///
+/// # Errors
+///
+/// Propagates any database error from the `UPDATE`s.
+#[doc(hidden)]
+pub async fn counter_cache_before_detach_many<M: 'static>(
+    conn: &mut RuntimeConnection,
+    specs: &[CounterCacheSpec<M>],
+    fk_column: &str,
+    child_ids: &[i64],
+) -> AutumnResult<()> {
+    let detached: Vec<CounterCacheSpec<M>> = specs
+        .iter()
+        .filter(|spec| spec.fk_column == fk_column)
+        .copied()
+        .collect();
+    counter_cache_before_delete_many(conn, &detached, child_ids).await
+}
+
 /// Render `ids` as a literal SQL list.
 ///
 /// The values are `i64`, so their decimal rendering cannot contain anything a
@@ -673,10 +754,14 @@ pub async fn counter_cache_capture_fks<M: 'static>(
             fk_column,
             ..
         } = spec;
+        // A soft-deleted child is counted by nobody, so it has no "old parent"
+        // to move away from — reporting one would make a later re-parent
+        // decrement a counter that had already dropped this row.
+        let live = live_predicate(spec, true);
         let sql = format!(
             "SELECT {CHILD_ALIAS}.{fk_column} AS fk_value \
              FROM {child_table} AS {CHILD_ALIAS} \
-             WHERE {CHILD_ALIAS}.{child_pk} = {PH1}{FOR_UPDATE}"
+             WHERE {CHILD_ALIAS}.{child_pk} = {PH1}{live}{FOR_UPDATE}"
         );
         let row: Option<FkRow> = diesel::sql_query(sql)
             .bind::<BigInt, _>(child_id)
@@ -706,7 +791,14 @@ pub async fn counter_cache_after_update<M: 'static>(
 ) -> AutumnResult<()> {
     for (index, spec) in specs.iter().enumerate() {
         let old = before.get(index).copied().flatten();
-        let new = (spec.fk_of)(record);
+        // A soft-deleted child is counted by nobody, so neither its old nor its
+        // new parent may move. The generated `update` does not filter
+        // soft-deleted rows, so this is reachable.
+        let new = if (spec.live_of)(record) {
+            (spec.fk_of)(record)
+        } else {
+            None
+        };
         if old == new {
             continue;
         }
@@ -714,20 +806,14 @@ pub async fn counter_cache_after_update<M: 'static>(
         // swapping children between parents A and B would otherwise take the two
         // row locks in opposite orders and deadlock.
         let witness = (spec.pk_of)(record);
-        let mut moves: HashMap<i64, Fold> = HashMap::new();
+        let mut moves: Vec<(i64, i64, i64)> = Vec::with_capacity(2);
         if let Some(old_id) = old {
-            moves
-                .entry(old_id)
-                .or_insert_with(|| Fold::new(witness))
-                .delta -= 1;
+            moves.push((old_id, -1, witness));
         }
         if let Some(new_id) = new {
-            moves
-                .entry(new_id)
-                .or_insert_with(|| Fold::new(witness))
-                .delta += 1;
+            moves.push((new_id, 1, witness));
         }
-        apply_folded(conn, spec, moves).await?;
+        fold_or_apply_each(conn, spec, moves).await?;
     }
     Ok(())
 }
@@ -760,11 +846,12 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
             fk_column,
             ..
         } = spec;
+        let live = live_predicate(spec, true);
         let sql = format!(
             "SELECT {CHILD_ALIAS}.{child_pk} AS child_id, \
              {CHILD_ALIAS}.{fk_column} AS fk_value \
              FROM {child_table} AS {CHILD_ALIAS} \
-             WHERE {CHILD_ALIAS}.{child_pk} IN ({id_list}) \
+             WHERE {CHILD_ALIAS}.{child_pk} IN ({id_list}){live} \
              ORDER BY {CHILD_ALIAS}.{child_pk}{FOR_UPDATE}"
         );
         let rows: Vec<ChildFkRow> = diesel::sql_query(sql)
@@ -811,7 +898,7 @@ pub async fn counter_cache_after_update_many<M: 'static>(
         // folded deltas are applied in ascending parent id — two concurrent
         // batches swapping children between the same parents take their row
         // locks in the same order and cannot deadlock.
-        let mut deltas: HashMap<i64, Fold> = HashMap::new();
+        let mut contributions: Vec<(i64, i64, i64)> = Vec::new();
         for record in records {
             let child_id = pk_of(record);
             let Ok(found) = before.binary_search_by_key(&child_id, |(id, _)| *id) else {
@@ -821,24 +908,24 @@ pub async fn counter_cache_after_update_many<M: 'static>(
                 continue;
             };
             let old = before[found].1.get(index).copied().flatten();
-            let new = (spec.fk_of)(record);
+            // A soft-deleted child is counted by nobody, so neither its old nor
+            // its new parent may move.
+            let new = if (spec.live_of)(record) {
+                (spec.fk_of)(record)
+            } else {
+                None
+            };
             if old == new {
                 continue;
             }
             if let Some(old_id) = old {
-                deltas
-                    .entry(old_id)
-                    .or_insert_with(|| Fold::new(child_id))
-                    .delta -= 1;
+                contributions.push((old_id, -1, child_id));
             }
             if let Some(new_id) = new {
-                deltas
-                    .entry(new_id)
-                    .or_insert_with(|| Fold::new(child_id))
-                    .delta += 1;
+                contributions.push((new_id, 1, child_id));
             }
         }
-        apply_folded(conn, spec, deltas).await?;
+        fold_or_apply_each(conn, spec, contributions).await?;
     }
     Ok(())
 }
@@ -878,17 +965,18 @@ pub async fn counter_cache_after_upsert_many<M: 'static>(
     // update (the before/after diff). Same folding and same ascending-parent-id
     // ordering as the other bulk paths, for the same two reasons.
     for (index, spec) in specs.iter().enumerate() {
-        let mut deltas: HashMap<i64, Fold> = HashMap::new();
+        let mut contributions: Vec<(i64, i64, i64)> = Vec::new();
         for record in upserted {
             let child_id = pk_of(record);
-            let new = (spec.fk_of)(record);
+            let new = if (spec.live_of)(record) {
+                (spec.fk_of)(record)
+            } else {
+                None
+            };
             match before.get(&child_id) {
                 None => {
                     if let Some(parent_id) = new {
-                        deltas
-                            .entry(parent_id)
-                            .or_insert_with(|| Fold::new(child_id))
-                            .delta += 1;
+                        contributions.push((parent_id, 1, child_id));
                     }
                 }
                 Some(old_fks) => {
@@ -897,21 +985,15 @@ pub async fn counter_cache_after_upsert_many<M: 'static>(
                         continue;
                     }
                     if let Some(old_id) = old {
-                        deltas
-                            .entry(old_id)
-                            .or_insert_with(|| Fold::new(child_id))
-                            .delta -= 1;
+                        contributions.push((old_id, -1, child_id));
                     }
                     if let Some(new_id) = new {
-                        deltas
-                            .entry(new_id)
-                            .or_insert_with(|| Fold::new(child_id))
-                            .delta += 1;
+                        contributions.push((new_id, 1, child_id));
                     }
                 }
             }
         }
-        apply_folded(conn, spec, deltas).await?;
+        fold_or_apply_each(conn, spec, contributions).await?;
     }
     Ok(())
 }
@@ -947,12 +1029,16 @@ pub async fn counter_cache_recompute<M: 'static>(
             ..
         } = spec;
         let live = live_predicate(spec, true);
+        // The ground truth has to agree with what the deltas maintain: an
+        // ordinary delta skips a cross-tenant child, so a recompute that counted
+        // it would undo the isolation on the very next sweep.
+        let tenant = tenant_predicate_joined(spec);
         // The correlated sub-select aliases the child table so a self-referential
         // counter cache (child table == parent table) still binds the outer
         // `UPDATE` target on the right-hand side of the join predicate.
         let ground_truth = format!(
             "(SELECT COUNT(*) FROM {child_table} AS {CHILD_ALIAS} \
-              WHERE {CHILD_ALIAS}.{fk_column} = {parent_table}.{parent_pk}{live})"
+              WHERE {CHILD_ALIAS}.{fk_column} = {parent_table}.{parent_pk}{live}{tenant})"
         );
         // `IS DISTINCT FROM` so a sweep over a healthy table writes nothing:
         // under MVCC an unconditional assignment would rewrite every parent row
@@ -1024,6 +1110,7 @@ mod tests {
             counter_column: "comment_count",
             fk_of: |_| Some(1),
             pk_of: |_| 1,
+            live_of: |_| true,
             tenant_column: None,
         }
     }

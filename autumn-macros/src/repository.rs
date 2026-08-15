@@ -1363,6 +1363,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ).await?;
         }
     };
+    // `nullify` clears ONE foreign key; the children's other counter-cached legs
+    // still hold. Decrementing every spec (as `delete_all` correctly does, since
+    // the rows go away entirely) would permanently undercount them.
+    let cc_before_bulk_nullify = {
+        quote! {
+            if #cc_has {
+                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                struct __AutumnCcNullifyId {
+                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                    id: i64,
+                }
+                let __autumn_cc_nullify_q = format!(
+                    "SELECT id FROM \"{}\" WHERE \"{}\" = $1 ORDER BY id",
+                    __table, __fk_column
+                );
+                let __autumn_cc_nullify_ids: ::std::vec::Vec<i64> =
+                    ::autumn_web::reexports::diesel::sql_query(__autumn_cc_nullify_q)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                        .load::<__AutumnCcNullifyId>(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                        .into_iter()
+                        .map(|__r| __r.id)
+                        .collect();
+                ::autumn_web::repository::counter_cache_before_detach_many(
+                    conn, #cc_specs, __fk_column, &__autumn_cc_nullify_ids,
+                ).await?;
+            }
+        }
+    };
 
     // Soft-delete filter fragment: appended to every finder when soft_delete is true.    // Soft-delete filter fragment: appended to every finder when soft_delete is true.
     let sd_filter = if config.soft_delete {
@@ -1956,11 +1986,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::Nullify => {
-                        // #1325: the children survive but detach, so each one's
-                        // counter-cached parents lose it. Resolve the ids first
-                        // (the FK is about to be NULL, so they are unrecoverable
-                        // afterwards) and decrement before the UPDATE.
-                        #cc_before_bulk_detach
+                        // #1325: the children survive but detach, so the leg
+                        // being cleared loses them — and ONLY that leg. Resolve
+                        // the ids first (the FK is about to be NULL, so they are
+                        // unrecoverable afterwards) and decrement before the
+                        // UPDATE.
+                        #cc_before_bulk_nullify
                         let __q = format!(
                             "UPDATE \"{}\" SET \"{}\" = NULL WHERE \"{}\" = $1",
                             __table, __fk_column, __fk_column

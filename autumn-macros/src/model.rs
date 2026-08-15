@@ -1227,11 +1227,27 @@ fn emit_counter_caches_impl(
     // One shared primary-key extractor: the bulk update path matches a
     // post-update record back to the foreign keys captured for it before the
     // update, and every leg keys off the same child primary key.
-    let mut fk_fns: Vec<TokenStream> = vec![quote! {
-        fn __autumn_counter_cache_pk(__autumn_cc_record: &#model_ident) -> i64 {
-            __autumn_cc_record.#pk_ident
-        }
-    }];
+    // A soft-deleted child is counted by nobody. The generated `update` does not
+    // filter `deleted_at`, so one can still be re-parented — without this the
+    // move would decrement a parent that had already dropped the row and
+    // increment another for a row that stays deleted.
+    let live_body = if has_deleted_at {
+        quote! { __autumn_cc_record.deleted_at.is_none() }
+    } else {
+        quote! { { let _ = __autumn_cc_record; true } }
+    };
+    let mut fk_fns: Vec<TokenStream> = vec![
+        quote! {
+            fn __autumn_counter_cache_pk(__autumn_cc_record: &#model_ident) -> i64 {
+                __autumn_cc_record.#pk_ident
+            }
+        },
+        quote! {
+            fn __autumn_counter_cache_live(__autumn_cc_record: &#model_ident) -> bool {
+                #live_body
+            }
+        },
+    ];
     let mut spec_entries: Vec<TokenStream> = Vec::new();
     for (index, assoc) in cached.iter().enumerate() {
         let decl = assoc
@@ -1300,6 +1316,7 @@ fn emit_counter_caches_impl(
                 counter_column: #column,
                 fk_of: #fk_fn,
                 pk_of: __autumn_counter_cache_pk,
+                live_of: __autumn_counter_cache_live,
                 tenant_column: #tenant_column,
             }
         });

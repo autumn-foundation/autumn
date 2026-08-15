@@ -41,10 +41,32 @@ pub fn down_sql(parent_plural: &str, column: &str) -> String {
 }
 
 /// The migration directory name, e.g.
-/// `20260427000000_add_comment_count_to_posts`.
+/// `20260427000001_add_comment_count_to_posts`.
+///
+/// Diesel takes the numeric prefix as the migration **version**, and the
+/// scaffold has already claimed `{timestamp}` for its own
+/// `{timestamp}_create_{table}`. Two directories sharing a version cannot both
+/// be recorded in `__diesel_schema_migrations`, so one of the two schema changes
+/// would silently never apply. This one therefore runs at `timestamp + 1`, which
+/// also gives it the right ordering: the parent column is added after the child
+/// table exists.
 #[must_use]
 pub fn migration_dir_name(timestamp: &str, column: &str, parent_plural: &str) -> String {
-    format!("{timestamp}_add_{column}_to_{parent_plural}")
+    format!(
+        "{}_add_{column}_to_{parent_plural}",
+        next_migration_version(timestamp)
+    )
+}
+
+/// `timestamp + 1`, preserving width (`20260427000000` -> `20260427000001`).
+///
+/// Falls back to appending `1` for a non-numeric timestamp, which still yields a
+/// distinct version rather than a silent collision.
+fn next_migration_version(timestamp: &str) -> String {
+    timestamp.parse::<u64>().map_or_else(
+        |_| format!("{timestamp}1"),
+        |n| format!("{:0width$}", n + 1, width = timestamp.len()),
+    )
 }
 
 /// Push the counter-cache migration and the follow-up warning onto `plan`.
@@ -158,8 +180,29 @@ mod tests {
     fn the_migration_dir_names_both_sides() {
         assert_eq!(
             migration_dir_name("20260427000000", "comment_count", "posts"),
-            "20260427000000_add_comment_count_to_posts"
+            "20260427000001_add_comment_count_to_posts"
         );
+    }
+
+    #[test]
+    fn the_counter_migration_gets_its_own_diesel_version() {
+        // Diesel keys `__diesel_schema_migrations` on the numeric prefix, so
+        // sharing the scaffold's `{timestamp}_create_{table}` version would mean
+        // one of the two schema changes never applies.
+        let scaffold_version = "20260427000000";
+        let dir = migration_dir_name(scaffold_version, "comment_count", "posts");
+        let version = dir.split('_').next().expect("a version prefix");
+        assert_ne!(version, scaffold_version);
+        assert_eq!(version.len(), scaffold_version.len(), "width is preserved");
+        assert!(
+            version > scaffold_version,
+            "the parent column is added after the child table exists"
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_timestamp_still_gets_a_distinct_version() {
+        assert_eq!(next_migration_version("not-a-number"), "not-a-number1");
     }
 
     #[test]
