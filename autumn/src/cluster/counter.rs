@@ -24,8 +24,6 @@
 //! Every arithmetic step saturates at [`u64::MAX`]. A cluster that manages to
 //! overflow a `u64` reports `u64::MAX` forever rather than wrapping; the panic
 //! gate forbids the alternative.
-//!
-//! RED PHASE (TDD): bodies are inert stubs — see the module docs on [`super`].
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
@@ -90,20 +88,33 @@ impl CounterShards {
     /// Only ever called with the *local* node's current cell key: a node that
     /// writes another cell breaks the semilattice.
     pub fn increment_cell(&mut self, cell: &str, by: u64) {
-        // RED-PHASE STUB: must saturate into `self.cells[cell]`.
-        let _ = (cell, by);
+        // `entry` rather than `get_mut`/`insert` so a first increment and a
+        // subsequent one take the same path; `saturating_add` because the panic
+        // gate forbids the wrapping alternative.
+        let tally = self.cells.entry(cell.to_owned()).or_default();
+        *tally = tally.saturating_add(by);
     }
 
     /// Merge `other` into `self` by taking the per-cell maximum.
+    ///
+    /// Per-cell `max` over a map is the join of a join-semilattice, hence
+    /// commutative, associative and idempotent: pushes may arrive out of order,
+    /// be duplicated, or be dropped entirely and the result is the same once
+    /// any later push lands.
     pub fn merge(&mut self, other: &Self) {
-        // RED-PHASE STUB: must be commutative, associative and idempotent.
-        let _ = other;
+        for (cell, &their_tally) in &other.cells {
+            self.cells
+                .entry(cell.clone())
+                .and_modify(|ours| *ours = (*ours).max(their_tally))
+                .or_insert(their_tally);
+        }
     }
 
     /// This counter's value: the saturating sum of every cell.
     pub fn value(&self) -> u64 {
-        // RED-PHASE STUB.
-        0
+        self.cells
+            .values()
+            .fold(0_u64, |total, &tally| total.saturating_add(tally))
     }
 
     /// The tally recorded for one specific cell.
