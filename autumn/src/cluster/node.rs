@@ -493,7 +493,7 @@ fn apply(
     let now = inner.clock.monotonic();
     let refuted = {
         let mut state = inner.lock_state();
-        let refuted = match message {
+        let outcome = match message {
             ClusterMessage::StatePush { state: theirs } => {
                 let before = state.clone();
                 state.merge(theirs);
@@ -527,9 +527,12 @@ fn apply(
                 None
             }
         };
-        // State first, then overlay: one order, everywhere.
+        // Released before the overlay lock is taken, so the one ordering rule
+        // (document first, overlay second) holds without the two ever being
+        // held together.
+        drop(state);
         inner.lock_overlay().record_receipt(&envelope.sender, now);
-        refuted
+        outcome
     };
 
     if let Some(bumped) = refuted {
