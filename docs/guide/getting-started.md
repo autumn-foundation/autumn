@@ -45,9 +45,21 @@ rustc --version   # 1.88.0 or later
 cargo --version
 ```
 
-> **Not using a database at all?** Build a JSON API or daemon with
-> `autumn new my-app --api` or `--daemon`. Those flavors drop the view stack
-> or the database respectively; the rest of this guide still applies.
+Two scaffold flavors change that list, and they change it in different
+directions — pick by what you want to *drop*, not by what you want to build:
+
+> **No database at all?** `autumn new my-app --daemon` scaffolds a model-free
+> app with `autumn-web`'s `db` feature switched off, so it needs neither
+> Postgres nor `libpq` nor the Diesel CLI. It keeps the view stack, so
+> everything below except the database sections applies. (`--bundled-pg` is
+> the opposite trade: a daemon that *keeps* the database and manages a local
+> Postgres for you.)
+>
+> **Building a JSON API?** `autumn new my-app --api` drops the view stack —
+> Maud, Tailwind, htmx, the whole `static/` tree — but **keeps** the database
+> and migrations. The `libpq` prerequisite above still applies to it; the HTML,
+> Tailwind, and htmx sections of this guide do not. The two flags are not
+> combinable.
 
 ---
 
