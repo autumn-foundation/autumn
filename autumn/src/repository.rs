@@ -27,6 +27,20 @@
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+// Declarative counter caches (#1325) live in their own module but are part of
+// the repository surface as far as callers are concerned — `#[model]`-emitted
+// code, generated repositories and application escape hatches all name them
+// through `autumn_web::repository::…`, next to `AutumnDependents`.
+pub use crate::counter_cache::{
+    AutumnCounterCaches, ChildState, CounterCacheSpec, counter_cache_after_insert,
+    counter_cache_after_insert_by_id, counter_cache_after_insert_many, counter_cache_after_update,
+    counter_cache_apply_delta, counter_cache_apply_delta_by_child_id,
+    counter_cache_after_update_many, counter_cache_after_upsert_many,
+    counter_cache_before_delete_by_id,
+    counter_cache_before_delete_many, counter_cache_before_restore_by_id,
+    counter_cache_capture_fks, counter_cache_capture_fks_many, counter_cache_recompute,
+};
+
 /// Backend-portable `FOR UPDATE` seam for generated `#[repository]` CRUD.
 ///
 /// Postgres pessimistic-lock reads chain `.for_update()` onto a select query to

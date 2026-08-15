@@ -107,9 +107,16 @@ pub struct Tag {
     pub slug: String,
 }
 
+// Counter cache (#1325): `counter_cache` on the `Post` leg is the whole
+// `posts.comment_count` feature. The column already existed (this example has
+// shipped it since its first migration, and the default column convention is
+// `{snake(child)}_count` -> `comment_count`), so adding the option required
+// **no migration**. It retires the hand-written
+// `posts::comment_count.eq(posts::comment_count + 1)` that used to live in
+// `crate::routes::comments` -- along with the decrement nobody had written yet.
 #[autumn_web::model]
 #[belongs_to(User, fk = author_id)]
-#[belongs_to(Post)]
+#[belongs_to(Post, counter_cache)]
 pub struct Comment {
     #[id]
     pub id: i64,

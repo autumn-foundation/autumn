@@ -14,6 +14,8 @@ use scoped_futures::ScopedFutureExt;
 use crate::live_events::{
     comment_created_event, publish_stored_live_event_best_effort, store_activity_event_for_state,
 };
+use autumn_web::repository::AutumnCounterCaches as _;
+
 use crate::models::Comment;
 use crate::schema::{comments, posts, subreddits, users};
 
@@ -84,10 +86,21 @@ pub async fn create(
                     .get_result(conn)
                     .await?;
 
-                diesel::update(posts::table.find(post_id))
-                    .set(posts::comment_count.eq(posts::comment_count + 1))
-                    .execute(conn)
-                    .await?;
+                // Counter cache (#1325). This route inserts with raw Diesel
+                // (the comment id and the activity event have to land in one
+                // transaction), so it uses the documented escape hatch rather
+                // than going through `PgCommentRepository::save`. What used to
+                // be a hand-written `comment_count + 1` -- with no matching
+                // decrement anywhere -- is now the framework's atomic
+                // `UPDATE posts SET comment_count = comment_count + 1`,
+                // derived from `#[belongs_to(Post, counter_cache)]` on the
+                // model, running in this same transaction.
+                autumn_web::repository::counter_cache_after_insert_by_id(
+                    conn,
+                    Comment::counter_caches(),
+                    comment_id,
+                )
+                .await?;
 
                 let event = comment_created_event(
                     comment_id,

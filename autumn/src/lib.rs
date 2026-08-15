@@ -262,6 +262,9 @@ pub mod acme;
 pub mod sharding;
 
 #[cfg(feature = "db")]
+pub mod counter_cache;
+
+#[cfg(feature = "db")]
 pub mod repository;
 #[cfg(feature = "db")]
 pub(crate) mod repository_commit_hooks;
