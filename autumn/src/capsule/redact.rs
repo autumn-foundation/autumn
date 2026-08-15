@@ -94,6 +94,10 @@ pub struct RedactedValues {
     /// Values that must only ever be masked where they stand as a whole
     /// token, however long they are — see [`Self::insert_whole_token_only`].
     whole_token_only: BTreeSet<Vec<u8>>,
+    /// Values the request carried in their own right, which always get full
+    /// substring masking. Tracked separately so the two classifications can
+    /// meet on the same bytes in either order and the stronger one still wins.
+    direct: BTreeSet<Vec<u8>>,
 }
 
 impl RedactedValues {
@@ -110,6 +114,7 @@ impl RedactedValues {
             return;
         }
         self.values.insert(value.to_vec());
+        self.direct.insert(value.to_vec());
     }
 
     /// Record a value that is a *field* of something structured, rather than a
@@ -144,8 +149,15 @@ impl RedactedValues {
     }
 
     /// Whether this value may only be masked as a whole token.
+    ///
+    /// A direct [`insert`](Self::insert) always wins: the same bytes can reach
+    /// the set both ways — a filtered body password that the client also sent
+    /// as a `Digest` parameter — and the request carried that value in its own
+    /// right, so it needs full substring masking wherever it surfaces. Asking
+    /// both sets rather than mutating either on insert makes that independent
+    /// of which arrived first.
     fn is_whole_token_only(&self, value: &[u8]) -> bool {
-        self.whole_token_only.contains(value)
+        self.whole_token_only.contains(value) && !self.direct.contains(value)
     }
 
     /// The recorded values, longest first.
@@ -415,7 +427,14 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
             if scheme.eq_ignore_ascii_case("basic") {
                 record_basic_credentials(credential, values);
             }
-            record_auth_params(credential, values);
+            // A `token68` is one opaque blob, not a `name=value` list — its
+            // trailing `=` is Base64 padding. Reading `dTpwdw==` as a param
+            // would put a bare `=` in the echo set, and a lone `=` masked as a
+            // whole token rewrites `x = y` in any later failure text and
+            // blanks any bind equal to it.
+            if !is_token68(credential) {
+                record_auth_params(credential, values);
+            }
         }
     }
 
@@ -475,6 +494,20 @@ fn record_auth_params(credential: &str, values: &mut RedactedValues) {
             values.insert_whole_token_only(value.as_bytes());
         }
     }
+}
+
+/// Whether `credential` is an RFC 7235 `token68` — the single-blob form of a
+/// credential, as `Bearer`, `Basic` and a JWT all use.
+///
+/// `token68` is `1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`:
+/// padding only ever trails. That is what tells it apart from an auth-param
+/// list, whose `=` signs sit between a name and a value.
+fn is_token68(credential: &str) -> bool {
+    let unpadded = credential.trim_end_matches('=');
+    !unpadded.is_empty()
+        && unpadded.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
 }
 
 /// Split an auth-param list on the commas that actually delimit it, and
@@ -1399,6 +1432,55 @@ mod tests {
             values.contains(b"auth"),
             "an unquoted param after a quoted one is still found"
         );
+    }
+
+    /// A `token68` credential is one blob whose trailing `=` is padding, not a
+    /// `name=value` list. Reading it as one invents a bare `=` secret.
+    #[test]
+    fn token68_padding_is_not_read_as_an_auth_param() {
+        let (_request, values) = redact(
+            // base64("u:pw") — two padding characters.
+            Request::get("/").header(header::AUTHORIZATION, "Basic dTpwdw=="),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        assert!(
+            values.contains(b"dTpwdw=="),
+            "the credential itself is still retained"
+        );
+        assert!(
+            !values.contains(b"="),
+            "padding must not become a secret of its own"
+        );
+        assert_eq!(
+            mask_echoes("x = y", &values),
+            "x = y",
+            "an invented `=` secret would rewrite ordinary text"
+        );
+    }
+
+    /// The same bytes can arrive both ways — a filtered body password the
+    /// client also sent as a `Digest` parameter. The request carried it in its
+    /// own right, so it needs full substring masking either way round.
+    #[test]
+    fn a_direct_insert_outranks_the_whole_token_classification() {
+        for direct_first in [true, false] {
+            let mut values = RedactedValues::default();
+            if direct_first {
+                values.insert(b"hunter2");
+                values.insert_whole_token_only(b"hunter2");
+            } else {
+                values.insert_whole_token_only(b"hunter2");
+                values.insert(b"hunter2");
+            }
+
+            assert_eq!(
+                mask_echoes("token hunter2suffix rejected", &values),
+                format!("token {FILTERED_PLACEHOLDER}suffix rejected"),
+                "a directly captured secret is masked even mid-token (direct_first: {direct_first})"
+            );
+        }
     }
 
     /// Each needle is matched against the original text, never against output
