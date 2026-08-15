@@ -20595,6 +20595,106 @@ exempt_paths = [
         }
     }
 
+    /// The trash gate is computed TWICE — once in `plan_scaffold_with_options_impl`
+    /// (which decides what `main.rs` mounts and whether the lifecycle test is
+    /// appended) and once in `render_routes_file` (which decides what the routes
+    /// module emits). If they ever disagree, the generated app either mounts a
+    /// handler that does not exist — it will not compile — or emits dead code
+    /// nothing routes to. Rather than trusting the two comments that say "must
+    /// agree", check the actual outputs against each other across the whole flag
+    /// matrix.
+    #[test]
+    fn the_mounted_trash_routes_always_match_the_emitted_ones() {
+        /// One scaffold flag, applied to the options under test.
+        type Toggle = fn(&mut ScaffoldOptions);
+        let toggles: [(&str, Toggle); 7] = [
+            ("api", |o| o.api = true),
+            ("live", |o| o.live = true),
+            ("live_validation", |o| o.live_validation = true),
+            ("sharded", |o| o.model.sharded = true),
+            ("no_policy", |o| o.no_policy = true),
+            ("searchable", |o| {
+                o.model.searchable = vec!["title".to_owned()];
+            }),
+            ("soft_delete", |o| o.model.soft_delete = true),
+        ];
+        // Guard against the loop degenerating into a no-op: if a future planner
+        // change starts refusing most of the matrix (or the `else { continue }`
+        // below starts swallowing everything), the counters catch it rather than
+        // letting a green test cover nothing.
+        let mut planned = 0usize;
+        let mut with_trash = 0usize;
+        // Every subset of the toggles, crossed with "does the model carry an
+        // owner column" (which is what makes the index owner-scoped).
+        for mask in 0u32..(1 << toggles.len()) {
+            for owner in [false, true] {
+                let mut options = ScaffoldOptions::default();
+                let mut label: Vec<&str> = Vec::new();
+                for (bit, (name, apply)) in toggles.iter().enumerate() {
+                    if mask & (1 << bit) != 0 {
+                        apply(&mut options);
+                        label.push(name);
+                    }
+                }
+                if owner {
+                    label.push("owner");
+                }
+                // `--searchable` on an owner-scoped `--sharded` scaffold is
+                // refused outright (issue #1841), as is `--live` + searchable
+                // owner scoping; skip whatever the planner rejects rather than
+                // asserting on an error case this test is not about.
+                let extra_fields: &[&str] = if owner { &["user:references"] } else { &[] };
+                let tmp = project_with_main(default_main());
+                let mut fields = bulk_fields();
+                fields.extend(extra_fields.iter().map(|f| (*f).to_owned()));
+                let Ok(plan) = plan_scaffold_with_options(
+                    tmp.path(),
+                    "Post",
+                    &fields,
+                    "20260427000000",
+                    &options,
+                ) else {
+                    continue;
+                };
+                planned += 1;
+                let routes = action_contents(&plan, "src/routes/posts.rs");
+                let main = action_contents(&plan, "src/main.rs");
+                let label = label.join("+");
+                if routes.contains("pub async fn trash(") {
+                    with_trash += 1;
+                }
+                for name in ["trash", "restore", "purge"] {
+                    let emitted = routes.contains(&format!("pub async fn {name}("));
+                    let mounted = main.contains(&format!("routes::posts::{name}"));
+                    assert_eq!(
+                        emitted, mounted,
+                        "[{label}] `{name}` is emitted={emitted} but mounted={mounted} — \
+                         the two gates disagree, so the generated app would not compile"
+                    );
+                }
+                // The generated lifecycle test is appended under the same gate,
+                // so it must track the handlers too — a test posting to routes
+                // the scaffold never emitted documents a lie.
+                let test_src = action_contents(&plan, "tests/post.rs");
+                assert_eq!(
+                    routes.contains("pub async fn trash("),
+                    test_src.contains("trash_restore_purge_lifecycle"),
+                    "[{label}] the generated lifecycle test must track the trash handlers"
+                );
+            }
+        }
+        assert!(
+            planned > 200,
+            "the flag matrix should plan most of its {} combinations, planned {planned}",
+            2 << toggles.len()
+        );
+        assert!(
+            with_trash > 0,
+            "the matrix must include combinations that DO emit the trash surface, \
+             otherwise it only proves the feature is always off"
+        );
+    }
+
     #[test]
     fn soft_delete_slug_scaffold_reserves_the_trash_segment() {
         let tmp = project_with_main(default_main());
