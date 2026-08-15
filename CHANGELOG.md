@@ -32,6 +32,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **counter caches:** `#[belongs_to(Post, counter_cache)]` keeps a
+  `posts.comment_count` column current automatically (#1325). Creating a child
+  increments the parent, destroying one decrements it, soft-deleting decrements
+  and `restore` puts it back, and reassigning the foreign key moves the count
+  from the old parent to the new one — every one of them **inside the same
+  transaction as the row mutation**, so the column and the row commit or roll
+  back together. The arithmetic is a single atomic `UPDATE posts SET
+  comment_count = comment_count + $1`, never a read-modify-write, so N
+  concurrent inserts yield exactly N. The column name defaults to
+  `{snake(child)}_count` and takes an override (`counter_cache =
+  "subscriber_count"`); a counter on a `has_many`, on a `through =` join table,
+  or two legs resolving onto one parent column are directed compile errors. Every
+  counter-cached repository also gains `recompute_counter_caches()` /
+  `recompute_counter_caches_for(parent_id)` — an idempotent rebuild from the
+  source of truth, which is both the backfill for a table adopting the column and
+  the repair for drift introduced by writes that bypassed the repository.
+  `autumn generate scaffold … --belongs-to Post --counter-cache` emits the
+  `BIGINT NOT NULL DEFAULT 0` column and its migration, opts the generated child
+  model in, and prints the two parent-side lines (`src/schema.rs`, the model
+  field) rather than editing files it does not own and cannot cleanly revert. Models with no counter cache are unaffected: the spec slice is empty
+  and the presence flag is a `const false`, so no statement is issued and the
+  transaction-free single-statement mutation paths keep their exact prior
+  codegen. See `docs/guide/counter-cache.md`.
+
 - **generate scaffold:** `--belongs-to <Parent>` scaffolds the parent-side half
   of a parent → child relationship, which the flat scaffold has always omitted
   (#1323). Autumn already shipped every piece — the `references:` column

@@ -176,6 +176,36 @@ impl DependentAction {
     }
 }
 
+/// A resolved `counter_cache` declaration on a `#[belongs_to]` (#1325).
+///
+/// `#[belongs_to(Post, counter_cache)]` is the bare flag; `counter_cache =
+/// "comment_count"` names the parent column explicitly.
+#[derive(Clone, Debug)]
+struct CounterCacheDecl {
+    /// The explicitly named counter column, when given. `None` means the
+    /// convention applies: `{snake(ChildModel)}_count`.
+    ///
+    /// The convention is deliberately **singular** (`comment_count`, not Rails'
+    /// `comments_count`): it matches `#[votable(aggregate = count)]`'s
+    /// `{name}_count` and the `posts.comment_count` /
+    /// `subreddits.subscriber_count` columns autumn's own examples have shipped
+    /// since their first migration.
+    column: Option<String>,
+    /// The parent's tenant-discriminator column, from
+    /// `counter_cache_tenant = "<column>"`.
+    ///
+    /// Explicit rather than inferred: a counter update writes a parent row the
+    /// caller only had to name the id of, so on a shared multi-tenant table it
+    /// must be confined to the caller's tenant — but `#[model]` on the *child*
+    /// cannot see the parent's fields, and guessing `tenant_id` would break
+    /// every app whose tenant-scoped child hangs off a global parent with a hard
+    /// `column does not exist` error. Naming it is the author asserting the
+    /// parent really has it.
+    tenant_column: Option<String>,
+    /// Span of the `counter_cache` key, for diagnostics raised after parsing.
+    span: proc_macro2::Span,
+}
+
 /// A resolved association declaration: kind, target model, the (possibly
 /// inferred) foreign-key column, and the accessor/store name.
 struct Association {
@@ -207,6 +237,10 @@ struct Association {
     /// `following`, both through `Friendship` to `User`) without their
     /// target-derived helpers colliding.
     helper: Option<String>,
+    /// The `counter_cache` declaration on a `#[belongs_to]` (#1325). Drives the
+    /// runtime [`AutumnCounterCaches`] impl `#[model]` emits, which the child's
+    /// generated repository consults to keep `{parent}.{child}_count` current.
+    counter_cache: Option<CounterCacheDecl>,
 }
 
 /// The join-table half of a many-to-many `has_many(..., through = ...)`
@@ -619,6 +653,8 @@ fn parse_assoc_attr(
         explicit_target_fk,
         dependent,
         explicit_helper,
+        counter_cache,
+        counter_cache_tenant,
     ) = attr.parse_args_with(|input: ParseStream| {
         let target: syn::Ident = input.parse()?;
         let mut explicit_fk: Option<String> = None;
@@ -627,11 +663,25 @@ fn parse_assoc_attr(
         let mut explicit_target_fk: Option<String> = None;
         let mut dependent: Option<DependentAction> = None;
         let mut explicit_helper: Option<String> = None;
+        let mut counter_cache: Option<CounterCacheDecl> = None;
+        let mut counter_cache_tenant: Option<(String, proc_macro2::Span)> = None;
         // Zero or more trailing `, key = value` pairs (`fk`, `name`,
-        // `through`, `target_fk`, `helper`), any order.
+        // `through`, `target_fk`, `helper`), any order — plus `counter_cache`,
+        // the one key that is also legal as a bare flag.
         while input.peek(syn::Token![,]) {
             input.parse::<syn::Token![,]>()?;
             let key: syn::Ident = input.parse()?;
+            // `counter_cache` may appear bare (`#[belongs_to(Post,
+            // counter_cache)]`) or with an explicit column
+            // (`counter_cache = "comment_count"`), so its `=` is optional.
+            if key == "counter_cache" && !input.peek(syn::Token![=]) {
+                counter_cache = Some(CounterCacheDecl {
+                    column: None,
+                    tenant_column: None,
+                    span: key.span(),
+                });
+                continue;
+            }
             input.parse::<syn::Token![=]>()?;
             // Accept either a bare identifier (`fk = author_id`) or a string
             // literal (`fk = "author_id"`).
@@ -640,7 +690,17 @@ fn parse_assoc_attr(
             } else {
                 input.parse::<syn::Ident>()?.to_string()
             };
-            if key == "fk" {
+            if key == "counter_cache" {
+                check_counter_cache_column(&key, &value)?;
+                counter_cache = Some(CounterCacheDecl {
+                    column: Some(value),
+                    tenant_column: None,
+                    span: key.span(),
+                });
+            } else if key == "counter_cache_tenant" {
+                check_counter_cache_column(&key, &value)?;
+                counter_cache_tenant = Some((value, key.span()));
+            } else if key == "fk" {
                 explicit_fk = Some(value);
             } else if key == "name" {
                 explicit_name = Some(value);
@@ -656,8 +716,11 @@ fn parse_assoc_attr(
                 return Err(syn::Error::new_spanned(
                     &key,
                     "expected `fk = <column>`, `name = <accessor>`, \
-                         `through = <join_table>`, `target_fk = <column>`, or \
-                         `helper = <singular>` in association attribute",
+                         `through = <join_table>`, `target_fk = <column>`, \
+                         `helper = <singular>`, `counter_cache` / \
+                         `counter_cache = <column>`, or \
+                         `counter_cache_tenant = <column>` in association \
+                         attribute",
                 ));
             }
         }
@@ -669,8 +732,59 @@ fn parse_assoc_attr(
             explicit_target_fk,
             dependent,
             explicit_helper,
+            counter_cache,
+            counter_cache_tenant,
         ))
     })?;
+
+    // `counter_cache_tenant` scopes the counter cache; on its own it means
+    // nothing, and silently ignoring it would leave a multi-tenant app believing
+    // it was protected.
+    let counter_cache = match (counter_cache, counter_cache_tenant) {
+        (Some(decl), Some((tenant_column, _))) => Some(CounterCacheDecl {
+            tenant_column: Some(tenant_column),
+            ..decl
+        }),
+        (decl @ Some(_), None) => decl,
+        (None, Some((_, span))) => {
+            return Err(syn::Error::new(
+                span,
+                "`counter_cache_tenant = \"<column>\"` scopes a counter cache to \
+                 the caller's tenant, so it requires `counter_cache` on the same \
+                 association",
+            ));
+        }
+        (None, None) => None,
+    };
+
+    if let Some(decl) = counter_cache.as_ref()
+        && kind != AssocKind::BelongsTo
+    {
+        return Err(syn::Error::new(
+            decl.span,
+            format!(
+                "`counter_cache` is a `#[belongs_to]` option: the counter is \
+                 maintained by the child's repository — the side that owns the \
+                 foreign key and runs the insert/delete — so there is nothing on \
+                 this side to hang the maintenance off. Move it to the child \
+                 model's `#[belongs_to(...)]`, i.e. `#[belongs_to({model_ident}, \
+                 counter_cache)]` on `{target}`"
+            ),
+        ));
+    }
+    if let Some(decl) = counter_cache.as_ref()
+        && explicit_through.is_some()
+    {
+        return Err(syn::Error::new(
+            decl.span,
+            "`counter_cache` is not supported on a `through = <join_table>` \
+             (many-to-many) association: its foreign key names a column on the \
+             join table, not on this model, so the generated increment would \
+             read a column that does not exist. Counters over join tables are \
+             out of scope — map the join table as its own model and put \
+             `counter_cache` on its `#[belongs_to]`",
+        ));
+    }
 
     if explicit_through.is_some() && kind != AssocKind::HasMany {
         return Err(syn::Error::new_spanned(
@@ -732,7 +846,53 @@ fn parse_assoc_attr(
         through,
         dependent,
         helper: explicit_helper,
+        counter_cache,
     })
+}
+
+/// The `T` of an `Option<T>`, for any spelling of the path (`Option<T>`,
+/// `std::option::Option<T>`, `::core::option::Option<T>`).
+fn option_inner(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    args.args.iter().find_map(|arg| match arg {
+        syn::GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    })
+}
+
+/// Reject a `counter_cache = "<column>"` value that is not a plain identifier.
+///
+/// The value is spliced verbatim into generated SQL — `UPDATE posts SET
+/// <column> = <column> + $1 …` — so it is the one user-controlled name in the
+/// counter-cache codegen that reaches `format!`. Rejecting it here, spanned on
+/// the key, is what keeps that splice safe; the run-time
+/// `is_plain_identifier` guard in `autumn_web::counter_cache` is the backstop.
+fn check_counter_cache_column(key: &syn::Ident, value: &str) -> syn::Result<()> {
+    let plain = !value.is_empty()
+        && !value.starts_with(|c: char| c.is_ascii_digit())
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        return Ok(());
+    }
+    Err(syn::Error::new_spanned(
+        key,
+        format!(
+            "`{value}` is not a valid column name for `counter_cache = ...`: \
+             the value is spliced verbatim into the generated `UPDATE <parent> \
+             SET <column> = <column> + $1` statement, so it must be a plain \
+             identifier — ASCII letters, digits and underscores only, and no \
+             leading digit"
+        ),
+    ))
 }
 
 /// Collect all `#[belongs_to]` / `#[has_many]` / `#[has_one]` declarations from
@@ -755,7 +915,64 @@ fn resolve_associations(
         out.push(parse_assoc_attr(attr, kind, model_ident)?);
     }
     check_m2m_mutation_name_collisions(&out)?;
+    check_counter_cache_collisions(model_ident, &out)?;
     Ok(out)
+}
+
+/// The parent column a counter-cached association maintains: the explicit
+/// `counter_cache = "..."` override, else `{snake(ChildModel)}_count`.
+fn counter_cache_column(model_ident: &syn::Ident, assoc: &Association) -> Option<String> {
+    let decl = assoc.counter_cache.as_ref()?;
+    Some(
+        decl.column
+            .clone()
+            .unwrap_or_else(|| format!("{}_count", pascal_to_snake(&model_ident.to_string()))),
+    )
+}
+
+/// Reject two counter-cached legs that resolve onto the **same**
+/// `(parent table, counter column)` pair.
+///
+/// Both legs would move one column on every insert, double-counting silently
+/// and permanently. This is not a hypothetical: the default column name is
+/// derived from the *child* model, so two `belongs_to` legs to the same parent
+/// type (`Message` → `sender` / `recipient`, both `User`) collide by default.
+///
+/// Legs to *different* parent tables that happen to share a column name are
+/// fine — they are different columns on different tables — so the key is the
+/// pair, not the name.
+fn check_counter_cache_collisions(
+    model_ident: &syn::Ident,
+    assocs: &[Association],
+) -> syn::Result<()> {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for assoc in assocs {
+        let Some(column) = counter_cache_column(model_ident, assoc) else {
+            continue;
+        };
+        let parent_table = infer_table_name(&assoc.target);
+        let key = (parent_table.clone(), column.clone());
+        if seen.contains(&key) {
+            let span = assoc
+                .counter_cache
+                .as_ref()
+                .map_or_else(proc_macro2::Span::call_site, |d| d.span);
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "two counter-cached associations on `{model_ident}` both \
+                     maintain `{parent_table}.{column}`, so every insert would \
+                     count twice. The column name defaults to \
+                     `{{snake(model)}}_count`, which collides whenever two \
+                     `belongs_to` legs point at the same parent — give at least \
+                     one of them an explicit `counter_cache = \"<column>\"` (and \
+                     a matching column on `{parent_table}`)"
+                ),
+            ));
+        }
+        seen.push(key);
+    }
+    Ok(())
 }
 
 /// The singular form used to derive a many-to-many association's mutation
@@ -928,6 +1145,213 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
             }
         }
     }
+}
+
+/// Emit the inherent counter-cache items on the model (#1325): the
+/// `HAS_COUNTER_CACHES` flag and the `counter_caches()` spec slice the child's
+/// generated repository consults to keep each parent's `{child}_count` column
+/// current.
+///
+/// Only produced when at least one `#[belongs_to(…, counter_cache)]` is
+/// declared; otherwise the blanket `AutumnCounterCaches` impl supplies `false` /
+/// an empty slice and this emits nothing, so a model without counter caches
+/// keeps its exact prior codegen and its repository's mutation paths stay on
+/// their existing (transaction-free, where they were) shape.
+///
+/// Both items are **inherent**, which is what shadows the blanket impl — and
+/// which is why the generated repository names them by concrete path
+/// (`Comment::counter_caches()`) rather than through a generic bound.
+///
+/// The parent's table is convention-derived from the target type
+/// (`Post` → `posts`), the same assumption the preload codegen already makes for
+/// `belongs_to`; the parent's primary key is assumed to be `id`, matching the
+/// dependent-cascade specs. `fk_of` is emitted as a plain `fn` item per leg,
+/// which doubles as the type guard: a foreign-key field that is not `i64` /
+/// `Option<i64>` fails to coerce to `fn(&Model) -> Option<i64>`.
+// One resolution + validation arm per spec field (column, tenant column, the
+// foreign key's existence and nullability, the primary key's arity), so it grows
+// past the line lint as counter-cache options are added.
+#[allow(clippy::too_many_lines)]
+fn emit_counter_caches_impl(
+    model_ident: &syn::Ident,
+    table_name: &str,
+    pk_ident: Option<&syn::Ident>,
+    has_deleted_at: bool,
+    assocs: &[Association],
+    all_fields: &[&syn::Field],
+) -> syn::Result<TokenStream> {
+    let cached: Vec<&Association> = assocs
+        .iter()
+        .filter(|a| a.counter_cache.is_some())
+        .collect();
+    if cached.is_empty() {
+        return Ok(TokenStream::new());
+    }
+
+    // A composite key cannot back a counter cache: the maintenance addresses the
+    // child by ONE value, so with two `#[id]` fields the decrement would key on
+    // whichever rows share the first component and move every one of their
+    // parents. Reject rather than silently corrupt (the same call `#[votable]`
+    // makes for the same reason).
+    let id_fields: Vec<&syn::Ident> = all_fields
+        .iter()
+        .filter(|f| has_attr(f, "id"))
+        .filter_map(|f| f.ident.as_ref())
+        .collect();
+    if id_fields.len() > 1 {
+        let listed = id_fields
+            .iter()
+            .map(|i| format!("`{i}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let span = cached[0]
+            .counter_cache
+            .as_ref()
+            .map_or_else(proc_macro2::Span::call_site, |d| d.span);
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "`counter_cache` requires a single primary key: model \
+                 `{model_ident}` declares a composite key ({listed}), and the \
+                 counter maintenance identifies its child row by one id — the \
+                 decrement would key on every row sharing the first component"
+            ),
+        ));
+    }
+    let Some(pk_ident) = pk_ident else {
+        return Err(syn::Error::new_spanned(
+            model_ident,
+            "`counter_cache` requires the child model to have a primary-key \
+             field: the maintenance resolves the parent from the child row by \
+             primary key. Mark one with `#[id]`",
+        ));
+    };
+    let pk_column = pk_ident.to_string();
+
+    // One shared primary-key extractor: the bulk update path matches a
+    // post-update record back to the foreign keys captured for it before the
+    // update, and every leg keys off the same child primary key.
+    // A soft-deleted child is counted by nobody. The generated `update` does not
+    // filter `deleted_at`, so one can still be re-parented — without this the
+    // move would decrement a parent that had already dropped the row and
+    // increment another for a row that stays deleted.
+    let live_body = if has_deleted_at {
+        quote! { __autumn_cc_record.deleted_at.is_none() }
+    } else {
+        quote! { { let _ = __autumn_cc_record; true } }
+    };
+    let mut fk_fns: Vec<TokenStream> = vec![
+        quote! {
+            fn __autumn_counter_cache_pk(__autumn_cc_record: &#model_ident) -> i64 {
+                __autumn_cc_record.#pk_ident
+            }
+        },
+        quote! {
+            fn __autumn_counter_cache_live(__autumn_cc_record: &#model_ident) -> bool {
+                #live_body
+            }
+        },
+    ];
+    let mut spec_entries: Vec<TokenStream> = Vec::new();
+    for (index, assoc) in cached.iter().enumerate() {
+        let decl = assoc
+            .counter_cache
+            .as_ref()
+            .expect("filtered to Some above");
+        let column = counter_cache_column(model_ident, assoc)
+            .expect("filtered to a counter-cached association above");
+        // Explicit opt-in (`counter_cache_tenant = "<column>"`): the author is
+        // asserting the PARENT carries this column. Inferring it from the child
+        // would break every tenant-scoped child hanging off a global parent with
+        // a hard `column does not exist`, and this macro cannot see the parent's
+        // fields to check.
+        let tenant_column = decl.tenant_column.as_deref().map_or_else(
+            || quote! { ::core::option::Option::None },
+            |tenant| quote! { ::core::option::Option::Some(#tenant) },
+        );
+        let parent_table = infer_table_name(&assoc.target);
+        let fk = &assoc.fk;
+        let fk_ident = format_ident!("{fk}");
+
+        // The foreign key has to be a real field: without this check the
+        // generated `fn` would fail with a bare "no field `post_id`" pointing
+        // into macro-expanded code instead of at the attribute.
+        let fk_field = all_fields
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|i| i == fk));
+        let Some(fk_field) = fk_field else {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`counter_cache` foreign key `{fk}` is not a field of model \
+                     `{model_ident}`; add it, or name the right column with \
+                     `#[belongs_to({}, fk = <column>, counter_cache)]`",
+                    assoc.target
+                ),
+            ));
+        };
+        // A nullable foreign key yields the field as-is; a non-null one is
+        // wrapped, so both shapes satisfy `fn(&M) -> Option<i64>` and an
+        // unparented child is a no-op rather than a `WHERE id = NULL`.
+        // `option_inner_type` matches the LAST path segment, so every spelling
+        // of the type (`Option<i64>`, `std::option::Option<i64>`,
+        // `::core::option::Option<i64>`) takes the same arm — a token-text
+        // prefix check would send the qualified spellings down the wrapping arm
+        // and fail with a type error inside macro-expanded code.
+        let fk_expr = if option_inner(&fk_field.ty).is_some() {
+            quote! { __autumn_cc_record.#fk_ident }
+        } else {
+            quote! { ::core::option::Option::Some(__autumn_cc_record.#fk_ident) }
+        };
+        let fk_fn = format_ident!("__autumn_counter_cache_fk_{index}");
+        fk_fns.push(quote! {
+            fn #fk_fn(__autumn_cc_record: &#model_ident) -> ::core::option::Option<i64> {
+                #fk_expr
+            }
+        });
+        spec_entries.push(quote! {
+            ::autumn_web::repository::CounterCacheSpec {
+                child_table: #table_name,
+                child_pk: #pk_column,
+                child_soft_delete: #has_deleted_at,
+                fk_column: #fk,
+                parent_table: #parent_table,
+                parent_pk: "id",
+                counter_column: #column,
+                fk_of: #fk_fn,
+                pk_of: __autumn_counter_cache_pk,
+                live_of: __autumn_counter_cache_live,
+                tenant_column: #tenant_column,
+            }
+        });
+    }
+
+    Ok(quote! {
+        impl #model_ident {
+            /// Whether this model maintains any counter cache (#1325). An
+            /// inherent shadow of `AutumnCounterCaches::HAS_COUNTER_CACHES`;
+            /// framework plumbing, not a public API.
+            #[doc(hidden)]
+            pub const HAS_COUNTER_CACHES: bool = true;
+
+            /// Runtime counter-cache specs consulted by this model's generated
+            /// repository (#1325). An inherent shadow of
+            /// `AutumnCounterCaches::counter_caches`; framework plumbing, not a
+            /// public API.
+            #[doc(hidden)]
+            #[must_use]
+            pub fn counter_caches()
+                -> &'static [::autumn_web::repository::CounterCacheSpec<#model_ident>]
+            {
+                #(#fk_fns)*
+                const __AUTUMN_COUNTER_CACHES:
+                    &[::autumn_web::repository::CounterCacheSpec<#model_ident>] = &[
+                        #(#spec_entries),*
+                    ];
+                __AUTUMN_COUNTER_CACHES
+            }
+        }
+    })
 }
 
 /// Generate everything needed to make a model's associations preloadable:
@@ -4736,6 +5160,44 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // ── Counter caches (#1325) ──────────────────────────────────────────────
+    // Resolved here (rather than beside `resolve_associations`) because the
+    // spec needs `all_fields`: the foreign key must be a real field, and its
+    // nullability decides whether `fk_of` wraps or forwards. A `deleted_at`
+    // column makes the count reflect live rows only.
+    let counter_caches_impl = {
+        let cc_has_deleted_at = all_fields
+            .iter()
+            .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
+        // Same fallback every other primary-key consumer in this macro uses
+        // (`id_field_names`, the factory PK, `#[votable]`): an explicit `#[id]`,
+        // else the first integer field. Hard-requiring `#[id]` would reject
+        // models the rest of `#[model]` accepts — and, because the error
+        // short-circuits the whole macro, would bury it under a cascade of
+        // "cannot find type" errors from the paired `#[repository]`.
+        let cc_pk_ident = all_fields
+            .iter()
+            .find(|f| has_attr(f, "id"))
+            .or_else(|| {
+                all_fields.iter().find(|f| match &f.ty {
+                    syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                    _ => false,
+                })
+            })
+            .and_then(|f| f.ident.as_ref());
+        match emit_counter_caches_impl(
+            name,
+            &table_name,
+            cc_pk_ident,
+            cc_has_deleted_at,
+            &associations,
+            &all_fields,
+        ) {
+            Ok(tokens) => tokens,
+            Err(err) => return err.to_compile_error(),
+        }
+    };
+
     let mut search_field_names = Vec::new();
     let mut search_field_weights = Vec::new();
     // #1191: the field idents backing the searchable columns, so the derived
@@ -7255,6 +7717,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // ── Model-declared dependent cascade specs (#1738) ──────────────────
         #dependents_impl
 
+        // ── Model-declared counter-cache specs (#1325) ──────────────────────
+        #counter_caches_impl
+
         // ── Votable reactions (#[votable], #1362) ───────────────────────────
         #votable_items
     }
@@ -7576,6 +8041,163 @@ mod tests {
     // `#[has_many]` / `#[has_one]`, validates the action, and records it on the
     // association so `#[model]` can emit the runtime `AutumnDependents` dispatch.
     // An unknown action is still rejected; `#[belongs_to]` still errors.
+
+    // ── `counter_cache` on `#[belongs_to]` (#1325) ────────────────────────
+    //
+    // The attribute parses as a bare flag and as an explicit column, resolves
+    // the column by the `{snake(child)}_count` convention, and rejects the
+    // shapes that would silently produce wrong SQL: a counter on the parent's
+    // `has_many` (nothing there owns the foreign key), a counter over a
+    // `through =` join table (the foreign key is a join-table column), a
+    // non-identifier column name (it is spliced into `format!`ed SQL), and two
+    // legs resolving onto one parent column (both would move it).
+
+    /// `resolve_associations`' `Ok` type is not `Debug`, so unwrap the error by
+    /// matching rather than through `expect_err`.
+    fn expect_assoc_error(model: &syn::Ident, attrs: &[syn::Attribute]) -> String {
+        match resolve_associations(model, attrs) {
+            Ok(_) => panic!("expected the association to be rejected"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn counter_cache_bare_flag_derives_the_column_from_the_child() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache)])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 1);
+        assert!(assocs[0].counter_cache.is_some());
+        assert_eq!(
+            counter_cache_column(&model, &assocs[0]).as_deref(),
+            Some("comment_count"),
+            "the default column is singular: {{snake(child)}}_count"
+        );
+    }
+
+    #[test]
+    fn counter_cache_accepts_an_explicit_column() {
+        let model: syn::Ident = syn::parse_quote!(Subscription);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Subreddit, counter_cache = "subscriber_count")])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(
+            counter_cache_column(&model, &assocs[0]).as_deref(),
+            Some("subscriber_count")
+        );
+    }
+
+    #[test]
+    fn a_belongs_to_without_counter_cache_records_none() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[belongs_to(Post)])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert!(assocs[0].counter_cache.is_none());
+        assert_eq!(counter_cache_column(&model, &assocs[0]), None);
+    }
+
+    #[test]
+    fn counter_cache_tenant_is_explicit_and_recorded() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(Post, counter_cache, counter_cache_tenant = "tenant_id")]),
+        ];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(
+            assocs[0]
+                .counter_cache
+                .as_ref()
+                .and_then(|d| d.tenant_column.clone())
+                .as_deref(),
+            Some("tenant_id")
+        );
+    }
+
+    #[test]
+    fn counter_cache_defaults_to_no_tenant_predicate() {
+        // Not inferred from the child's fields: the parent's schema is invisible
+        // here, and guessing would break a tenant-scoped child hanging off a
+        // global parent with a hard `column does not exist`.
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache)])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert!(
+            assocs[0]
+                .counter_cache
+                .as_ref()
+                .expect("counter cache")
+                .tenant_column
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn counter_cache_tenant_without_counter_cache_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache_tenant = "tenant_id")])];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(message.contains("requires `counter_cache`"), "{message}");
+    }
+
+    #[test]
+    fn counter_cache_on_has_many_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Comment, counter_cache)])];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(
+            message.contains("`#[belongs_to]` option")
+                && message.contains("Move it to the child model's"),
+            "the error must name the leg to move it to: {message}"
+        );
+    }
+
+    #[test]
+    fn counter_cache_on_a_join_table_association_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Tag, through = post_tags, counter_cache)])];
+        assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    #[test]
+    fn a_non_identifier_counter_cache_column_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(Post, counter_cache = "comment_count; DROP TABLE posts")]),
+        ];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(message.contains("plain identifier"), "{message}");
+    }
+
+    #[test]
+    fn two_legs_onto_one_parent_column_collide() {
+        // Both legs point at `User` and both default to `message_count`, so
+        // every insert would count twice.
+        let model: syn::Ident = syn::parse_quote!(Message);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(User, fk = sender_id, name = sender, counter_cache)]),
+            syn::parse_quote!(#[belongs_to(User, fk = recipient_id, name = recipient, counter_cache)]),
+        ];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(message.contains("users.message_count"), "{message}");
+    }
+
+    #[test]
+    fn two_legs_onto_different_parent_tables_may_share_a_column_name() {
+        // `users.message_count` and `rooms.message_count` are different columns
+        // on different tables — not a collision.
+        let model: syn::Ident = syn::parse_quote!(Message);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(User, fk = sender_id, name = sender, counter_cache)]),
+            syn::parse_quote!(#[belongs_to(Room, fk = room_id, counter_cache)]),
+        ];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 2);
+    }
 
     #[test]
     fn has_many_dependent_destroy_is_recorded() {

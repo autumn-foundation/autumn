@@ -63,6 +63,17 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_votable_value_column_in_count_mode.rs");
 
+    // Counter caches (#1325): `counter_cache` is a `belongs_to` option (the
+    // child owns the foreign key and runs the maintenance), the column name is
+    // spliced into generated SQL so it must be a plain identifier, and two legs
+    // resolving onto one column would double-count every insert.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_counter_cache_on_has_many.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_counter_cache_bad_column.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_counter_cache_duplicate_column.rs");
+
     // Declarative-schema markers (#1975, slice 3.5): the `#[model]` macro
     // ACCEPTS `#[model(managed)]` / `#[unique]` / `#[references(...)]` but
     // rejects malformed shapes with a clear, actionable `compile_error!`.
@@ -183,6 +194,13 @@ fn compile_pass_tests() {
     // the attribute is stripped before the Diesel struct is emitted.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_votable_overrides.rs");
+
+    // Counter caches (#1325): the bare flag, an explicit column override, a
+    // nullable foreign key, a soft-deleting child, and a `belongs_to` with no
+    // counter cache at all — every branch of the spec emitter, plus the
+    // convention-derived names asserted at run time.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_counter_cache.rs");
 
     // Model draft accessors (requires db feature)
     #[cfg(feature = "db")]

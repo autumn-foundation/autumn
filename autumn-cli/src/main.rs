@@ -2750,6 +2750,14 @@ enum GenerateCommands {
         /// reference.
         #[arg(long, value_name = "PARENT")]
         belongs_to: Option<String>,
+        /// Maintain a `{child}_count` column on the parent (issue #1325).
+        /// Requires `--belongs-to`. Adds `counter_cache` to the generated
+        /// child model's `#[belongs_to(...)]`, so the child repository keeps
+        /// `{parent}.{child}_count` current atomically and in the same
+        /// transaction as each insert/delete, and emits a migration adding
+        /// `{child}_count BIGINT NOT NULL DEFAULT 0` to the parent's table.
+        #[arg(long)]
+        counter_cache: bool,
         /// Make these text fields full-text searchable (issue #1319): comma-
         /// separated or repeatable, e.g. `--searchable title,body`. Adds
         /// `#[searchable]` to the model, `searchable` to the repository, a
@@ -4199,6 +4207,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             live_validation,
             no_policy,
             belongs_to,
+            counter_cache,
             searchable,
             dry_run,
             force,
@@ -4258,6 +4267,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 live_validation,
                 no_policy,
                 belongs_to.as_deref(),
+                counter_cache,
                 &searchable,
             ) {
                 Ok(result) => result,
