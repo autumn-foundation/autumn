@@ -21,7 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inner instance found the extension already present and skipped recording,
   leaving `client_addr`/`client_host`/`client_scheme` empty on every
   production capsule while the test harness (which has no outer layer) recorded
-  them. Replay now rebuilds the database *shape* the recording had even when
+  them. A second cause sat behind the first: the capture layer passed
+  `inner.call(req)` to `CAPSULE_SCOPE.scope` as an *argument*, which Rust
+  evaluates before the call, so every inner layer's synchronous `call` — where
+  a hand-written Tower middleware does its work — ran before the task-local
+  existed and saw no scope. The inner call is now made from inside the scoped
+  future, which fixes the class rather than the one layer.
+  Replay now rebuilds the database *shape* the recording had even when
   the request issued no wire traffic at all — "this request ran no queries" and
   "this application has no database" were the same `None`, so a handler or
   state initializer that checks `state.pool()` or replica availability before

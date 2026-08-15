@@ -724,7 +724,16 @@ where
             // reporting layer marks a failing response whose body is still
             // streaming at that point as truncated (with a note), so such a
             // capsule is refused by replay rather than presented as complete.
-            CAPSULE_SCOPE.scope(scope, inner.call(req)).await
+            //
+            // `inner.call(req)` is deliberately made *inside* the scoped
+            // future rather than passed to `scope` as an argument: arguments
+            // are evaluated first, so an inner service that does its work in
+            // `call` itself — as a hand-written Tower middleware does, and as
+            // `TrustedProxiesService` does when it stamps the client identity
+            // — would run before the task-local existed and find no scope.
+            CAPSULE_SCOPE
+                .scope(scope, async move { inner.call(req).await })
+                .await
         })
     }
 }
@@ -956,6 +965,67 @@ mod tests {
             .clone()
             .expect("the capture layer must publish a handle in the request extensions");
         Arc::clone(handle.scope())
+    }
+
+    /// An inner service that does its work in `call` itself, the way a real
+    /// Tower middleware does — not inside the future it returns, the way
+    /// `service_fn` does.
+    #[derive(Clone)]
+    struct SyncProbe {
+        saw_scope: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl Service<Request<Body>> for SyncProbe {
+        type Response = Response<Body>;
+        type Error = std::convert::Infallible;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<Body>) -> Self::Future {
+            if let Ok(mut slot) = self.saw_scope.lock() {
+                *slot = Some(current_scope().is_some());
+            }
+            Box::pin(async { Ok(Response::new(Body::empty())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inner_service_sees_the_scope_from_call_not_only_from_its_future() {
+        // `CAPSULE_SCOPE.scope(scope, inner.call(req))` evaluates its argument
+        // *first*, so an inner service that records during `call` — which is
+        // what a hand-written Tower middleware does, and what
+        // `TrustedProxiesService` does when it stamps the client identity —
+        // ran outside the task-local and found no scope at all. Every layer
+        // inner to this one is affected, so the fix belongs here rather than
+        // in each of them.
+        //
+        // `service_fn` hides this: its closure body is the returned future, so
+        // it always runs inside the scope. Only a service that works in `call`
+        // itself can catch the regression.
+        let saw_scope = Arc::new(Mutex::new(None));
+        let probe = SyncProbe {
+            saw_scope: Arc::clone(&saw_scope),
+        };
+
+        let mut service = test_layer(CaptureSettings::default()).layer(probe);
+        let _response = service
+            .call(
+                Request::get("/x")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("probe is infallible");
+
+        assert_eq!(
+            *saw_scope.lock().expect("probe slot"),
+            Some(true),
+            "an inner service must see the capture scope from `call`, not only from its future"
+        );
     }
 
     #[tokio::test]
