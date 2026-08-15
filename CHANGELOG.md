@@ -13,13 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   document-unique heading `id`s. A page that repeated a heading — and real docs
   repeat "Example", "Usage", and "Notes" constantly — emitted the same `id`
   twice, which is invalid HTML and made every table-of-contents entry for the
-  repeated heading jump to the first occurrence. The first use of a slug is
-  still handed back unchanged, so anchors already published in URLs keep
-  resolving; later collisions get a `-1`, `-2`, … suffix, the convention
-  GitHub, mdBook, and Hugo share. The suffix search skips ids already claimed by
-  an unrelated heading, so `## Example` / `## Example 1` / `## Example` yields
-  `example`, `example-1`, `example-2` instead of colliding again on
-  `example-1`. Headings with no alphanumeric characters still emit no `id` at
+  repeated heading jump to the first occurrence. Every heading still keeps the
+  slug its own text produces, so anchors already published in URLs keep
+  resolving; only *repeats* of an already-claimed slug get a `-1`, `-2`, …
+  suffix, the convention GitHub, mdBook, and Hugo share. Because the renderer
+  reserves every heading's natural slug before handing out any suffix, a repeat
+  can never steal a slug another heading owns by name regardless of the order
+  the two appear in: `## Example` / `## Example` / `## Example 1` renders
+  `example`, `example-2`, `example-1`, leaving `#example-1` pointing at
+  "Example 1". Headings with no alphanumeric characters still emit no `id` at
   all and stay out of the anchor namespace.
 
 ### Added

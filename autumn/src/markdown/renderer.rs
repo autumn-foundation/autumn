@@ -7,9 +7,12 @@ use crate::markdown::types::{RenderOptions, RenderedMarkdown, TocItem};
 /// Render Markdown body text to HTML, injecting stable `id` attributes on
 /// every heading and returning an ordered table of contents.
 ///
-/// Anchors are unique within a document: a repeated heading keeps the plain
-/// slug on its first occurrence and gets a `-1`, `-2`, … suffix on later ones,
-/// so the HTML stays valid and every TOC entry links to its own heading.
+/// Anchors are unique within a document, so the HTML stays valid and every TOC
+/// entry links to its own heading. Each heading keeps the slug its own text
+/// produces; only *repeats* of an already-claimed slug are suffixed with `-1`,
+/// `-2`, … A suffix never takes a slug that another heading owns by name, so
+/// `## Example` / `## Example` / `## Example 1` renders `example`, `example-2`,
+/// `example-1` — `#example-1` still points at "Example 1" either way round.
 ///
 /// Fenced code blocks preserve their language hint as a `language-{lang}`
 /// CSS class. Raw HTML in the source is escaped rather than emitted — this
@@ -58,26 +61,14 @@ pub fn render(body: &str, options: RenderOptions) -> RenderedMarkdown {
 
     let mut toc: Vec<TocItem> = Vec::new();
     let mut output: Vec<Event<'_>> = Vec::with_capacity(raw.len());
-    let mut anchors = AnchorAllocator::default();
+    let mut anchors = AnchorAllocator::with_reserved(&raw);
 
     let mut i = 0;
     while i < raw.len() {
         match &raw[i] {
             Event::Start(Tag::Heading { level, .. }) => {
                 let level_u8 = heading_level_to_u8(*level);
-                // Look ahead to collect the heading's plain-text content.
-                let mut text = String::with_capacity(128);
-                let mut j = i + 1;
-                while j < raw.len() {
-                    match &raw[j] {
-                        Event::Text(t) | Event::Code(t) => text.push_str(t),
-                        // Preserve word boundaries across soft/hard line breaks.
-                        Event::SoftBreak | Event::HardBreak => text.push(' '),
-                        Event::End(TagEnd::Heading(_)) => break,
-                        _ => {}
-                    }
-                    j += 1;
-                }
+                let text = heading_text(&raw, i);
                 let id = anchors.allocate(&heading_id(&text));
                 // Only inject an id and add a TOC entry when the heading has
                 // at least one alphanumeric character.  An empty id (e.g. a
@@ -125,6 +116,22 @@ pub fn render(body: &str, options: RenderOptions) -> RenderedMarkdown {
     RenderedMarkdown { html, toc }
 }
 
+/// Collect a heading's plain-text content, given the index of its
+/// `Event::Start(Tag::Heading { .. })` in `events`.
+fn heading_text(events: &[Event<'_>], start: usize) -> String {
+    let mut text = String::with_capacity(128);
+    for event in &events[start + 1..] {
+        match event {
+            Event::Text(t) | Event::Code(t) => text.push_str(t),
+            // Preserve word boundaries across soft/hard line breaks.
+            Event::SoftBreak | Event::HardBreak => text.push(' '),
+            Event::End(TagEnd::Heading(_)) => break,
+            _ => {}
+        }
+    }
+    text
+}
+
 /// Hands out document-unique heading anchors.
 ///
 /// A document may legitimately repeat a heading ("Example", "Usage", "Notes"),
@@ -133,25 +140,53 @@ pub fn render(body: &str, options: RenderOptions) -> RenderedMarkdown {
 /// produces duplicate `id` attributes — invalid HTML — and makes every TOC
 /// link for the repeated heading jump to the first occurrence.
 ///
-/// The first use of a slug is handed back unchanged, so anchors already
-/// published in URLs keep resolving; later collisions get a `-1`, `-2`, …
-/// suffix (the convention GitHub, mdBook, and Hugo all use). The suffix search
-/// skips candidates already claimed by an unrelated heading, so a document
-/// containing `## Example`, `## Example 1`, `## Example` yields `example`,
-/// `example-1`, `example-2` rather than colliding on `example-1`.
-#[derive(Default)]
+/// Every heading keeps the slug its own text produces; only *repeats* of an
+/// already-claimed slug are suffixed with `-1`, `-2`, … (the convention
+/// GitHub, mdBook, and Hugo all use). To make that hold regardless of heading
+/// order, the allocator is seeded with every heading's natural slug up front
+/// and never hands one out as a suffix. A document containing `## Example`,
+/// `## Example`, `## Example 1` therefore yields `example`, `example-2`,
+/// `example-1` — the second `## Example` skips past `example-1` because
+/// `## Example 1` owns it by name, whether it appears before or after.
+///
+/// Without that reservation the suffix search would be first-come: the second
+/// `## Example` would take `example-1`, and a `#example-1` link already
+/// published against `## Example 1` would silently resolve to a different
+/// heading — worse for a docs site than a dead link.
 struct AnchorAllocator {
+    /// Slugs handed out so far.
     used: std::collections::HashSet<String>,
+    /// Every slug some heading in the document produces from its own text.
+    /// Never used as a collision suffix, so each such heading can claim it.
+    reserved: std::collections::HashSet<String>,
     /// Highest suffix tried per base slug, so a heading repeated `n` times
     /// costs O(n) probes in total rather than O(n²).
     next_suffix: std::collections::HashMap<String, usize>,
 }
 
 impl AnchorAllocator {
-    /// Reserve and return a unique anchor derived from `base`.
+    /// Seed the allocator with the natural slug of every heading in `events`.
+    fn with_reserved(events: &[Event<'_>]) -> Self {
+        let mut reserved = std::collections::HashSet::new();
+        for (i, event) in events.iter().enumerate() {
+            if matches!(event, Event::Start(Tag::Heading { .. })) {
+                let slug = heading_id(&heading_text(events, i));
+                if !slug.is_empty() {
+                    reserved.insert(slug);
+                }
+            }
+        }
+        Self {
+            used: std::collections::HashSet::new(),
+            reserved,
+            next_suffix: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Claim and return a unique anchor derived from `base`.
     ///
     /// An empty `base` (a heading with no alphanumeric characters) is returned
-    /// as-is and never reserved — the caller emits no `id` at all for it, so
+    /// as-is and never claimed — the caller emits no `id` at all for it, so
     /// such headings must not consume or collide in the anchor namespace.
     fn allocate(&mut self, base: &str) -> String {
         if base.is_empty() {
@@ -160,14 +195,21 @@ impl AnchorAllocator {
         if self.used.insert(base.to_owned()) {
             return base.to_owned();
         }
-        let counter = self.next_suffix.entry(base.to_owned()).or_insert(0);
-        loop {
-            *counter += 1;
+        // Resume from the highest suffix already tried for this base rather
+        // than rescanning from 1, then write it back below. Taken by value so
+        // the loop can borrow `self.used` mutably.
+        let mut counter = self.next_suffix.get(base).copied().unwrap_or(0);
+        let id = loop {
+            counter += 1;
             let candidate = format!("{base}-{counter}");
-            if self.used.insert(candidate.clone()) {
-                return candidate;
+            // Skip slugs some other heading owns by name, then skip anything
+            // already handed out.
+            if !self.reserved.contains(&candidate) && self.used.insert(candidate.clone()) {
+                break candidate;
             }
-        }
+        };
+        self.next_suffix.insert(base.to_owned(), counter);
+        id
     }
 }
 
@@ -441,6 +483,37 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len(), "ids must be unique: {ids:?}");
+    }
+
+    #[test]
+    fn duplicate_never_steals_another_headings_natural_slug() {
+        // "Example 1" slugifies naturally to "example-1". A second "Example"
+        // must not take that id just because it appears first — a published
+        // `#example-1` link would then silently resolve to the wrong heading,
+        // which is worse for a docs site than a dead link.
+        let md = "## Example\n\n## Example\n\n## Example 1\n";
+        let result = render(md, RenderOptions::default());
+        let ids: Vec<&str> = result.toc.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["example", "example-2", "example-1"]);
+        // The heading that owns "example-1" by its own text keeps it.
+        assert_eq!(result.toc[2].text, "Example 1");
+    }
+
+    #[test]
+    fn suffixes_never_nest() {
+        // A base slug that is itself a suffixed form must not produce `x-1-1`.
+        let md = "# x\n# x\n# x\n# x-1\n# x-2\n# x\n";
+        let result = render(md, RenderOptions::default());
+        let ids: Vec<&str> = result.toc.iter().map(|t| t.id.as_str()).collect();
+        for id in &ids {
+            assert!(
+                !id.contains("-1-"),
+                "nested suffix in {id:?} (all: {ids:?})"
+            );
+        }
+        // Headings whose own text yields "x-1"/"x-2" keep those ids.
+        assert_eq!(ids[3], "x-1");
+        assert_eq!(ids[4], "x-2");
     }
 
     #[test]
