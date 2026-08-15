@@ -89,7 +89,12 @@ pub enum CapturedBody {
 /// anything else (a hash, a truncation, a re-encoding) is not. This is a
 /// best-effort echo check, not a general secret scanner.
 #[derive(Debug, Clone, Default)]
-pub struct RedactedValues(BTreeSet<Vec<u8>>);
+pub struct RedactedValues {
+    values: BTreeSet<Vec<u8>>,
+    /// Values that must only ever be masked where they stand as a whole
+    /// token, however long they are — see [`Self::insert_whole_token_only`].
+    whole_token_only: BTreeSet<Vec<u8>>,
+}
 
 impl RedactedValues {
     /// Record a value that was masked out of the request.
@@ -104,19 +109,43 @@ impl RedactedValues {
         if value.is_empty() {
             return;
         }
-        self.0.insert(value.to_vec());
+        self.values.insert(value.to_vec());
+    }
+
+    /// Record a value that is a *field* of something structured, rather than a
+    /// value the request carried in its own right.
+    ///
+    /// Masked identically for binds — a bind carrying these bytes is still the
+    /// secret echoing back — but in free-form text only where it stands as a
+    /// whole token, regardless of length. An auth-param list mixes secrets
+    /// with metadata under names this code cannot rank (`Signature=…` next to
+    /// `qop=auth`), and a four-character metadata value substring-masked
+    /// everywhere would turn every later mention of *authentication* into a
+    /// placeholder. A field that echoes into prose or a bind arrives delimited
+    /// anyway, which is exactly what whole-token masking catches.
+    pub fn insert_whole_token_only(&mut self, value: &[u8]) {
+        if value.is_empty() {
+            return;
+        }
+        self.values.insert(value.to_vec());
+        self.whole_token_only.insert(value.to_vec());
     }
 
     /// Whether these bytes were masked out of the request.
     #[must_use]
     pub fn contains(&self, value: &[u8]) -> bool {
-        self.0.contains(value)
+        self.values.contains(value)
     }
 
     /// Whether anything was masked.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.values.is_empty()
+    }
+
+    /// Whether this value may only be masked as a whole token.
+    fn is_whole_token_only(&self, value: &[u8]) -> bool {
+        self.whole_token_only.contains(value)
     }
 
     /// The recorded values, longest first.
@@ -124,7 +153,7 @@ impl RedactedValues {
     /// Longest-first matters for substring masking: masking `"hunter2"` before
     /// `"hunter2secret"` would leave the tail of the longer secret behind.
     fn longest_first(&self) -> Vec<&[u8]> {
-        let mut values: Vec<&[u8]> = self.0.iter().map(Vec::as_slice).collect();
+        let mut values: Vec<&[u8]> = self.values.iter().map(Vec::as_slice).collect();
         values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         values
     }
@@ -209,7 +238,7 @@ pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
         if needle.is_empty() || !masked.contains(needle) {
             continue;
         }
-        if needle.len() >= MIN_ECHO_LEN {
+        if needle.len() >= MIN_ECHO_LEN && !redacted.is_whole_token_only(value) {
             masked = masked.replace(needle, FILTERED_PLACEHOLDER);
         } else {
             // A short value — a three-digit CVV, a PIN — is masked only where
@@ -381,6 +410,7 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
             if scheme.eq_ignore_ascii_case("basic") {
                 record_basic_credentials(credential, values);
             }
+            record_auth_params(credential, values);
         }
     }
 
@@ -404,6 +434,40 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
                     values.insert(cookie_value.as_bytes());
                 }
             }
+        }
+    }
+}
+
+/// Retain each value of an RFC 7235 auth-param list, not only the list.
+///
+/// A credential is either a `token68` (`Bearer hunter2`) or a comma-separated
+/// `name=value` list — `AWS4-HMAC-SHA256 Credential=…, SignedHeaders=…,
+/// Signature=…`, or a `Digest` response. A handler extracts one field from
+/// that list, and `Signature=…` alone neither equals nor is contained in the
+/// whole credential string, so the list on its own never matches what the
+/// handler held.
+///
+/// This is standardized syntax rather than a guess, which is what separates it
+/// from the custom headers this code refuses to parse. What it *cannot* do is
+/// tell a secret from metadata: `Signature` and `qop` are both auth-params,
+/// and only the names give them away — the same enumeration this code declined
+/// to make for schemes. So every value is retained, but as whole-token-only,
+/// which is what keeps `qop=auth` from masking the middle of *authentication*
+/// in every later failure.
+fn record_auth_params(credential: &str, values: &mut RedactedValues) {
+    for param in credential.split(',') {
+        let Some((name, value)) = param.split_once('=') else {
+            continue;
+        };
+        // An auth-param name is a token. This rejects the `=` padding of a
+        // `token68` credential, whose tail is not a name and whose value is
+        // empty anyway.
+        if !is_auth_scheme(name.trim()) {
+            continue;
+        }
+        let value = value.trim().trim_matches('"');
+        if !value.is_empty() {
+            values.insert_whole_token_only(value.as_bytes());
         }
     }
 }
@@ -1209,6 +1273,59 @@ mod tests {
         // actually carried.
         let masked = mask_echoes("token hunter2secret was rejected", &values);
         assert!(!masked.contains("hunter2secret"), "{masked}");
+    }
+
+    /// An RFC 7235 credential can be a comma-separated `name=value` list, and
+    /// a handler extracts one field from it — a field that neither equals nor
+    /// is contained in the whole credential string, so the list alone never
+    /// matches what the handler held.
+    ///
+    /// The list mixes secrets with metadata and only the *names* tell them
+    /// apart, which is the enumeration this code declines to make. Retaining
+    /// every value is safe only because they are masked as whole tokens.
+    #[test]
+    fn auth_param_values_are_masked_only_as_whole_tokens() {
+        let (_request, sigv4) = redact(
+            Request::get("/").header(
+                header::AUTHORIZATION,
+                "AWS4-HMAC-SHA256 Credential=AKIA/20260815/us-east-1/s3/aws4_request, \
+                 SignedHeaders=host;x-amz-date, Signature=abc123deadbeef",
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            sigv4.contains(b"abc123deadbeef"),
+            "the signature a handler extracts must be retained on its own"
+        );
+        assert_eq!(
+            mask_echoes("signature abc123deadbeef rejected", &sigv4),
+            format!("signature {FILTERED_PLACEHOLDER} rejected"),
+            "an auth-param value quoted back must still be masked"
+        );
+
+        let (_request, digest) = redact(
+            Request::get("/").header(
+                header::AUTHORIZATION,
+                r#"Digest username="alice", qop=auth, response="deadbeef""#,
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            digest.contains(b"deadbeef"),
+            "the digest response is retained"
+        );
+        assert_eq!(
+            mask_echoes("authentication failed during reauthorization", &digest),
+            "authentication failed during reauthorization",
+            "`qop=auth` must not shred every later word containing `auth`"
+        );
+        assert_eq!(
+            mask_echoes("scheme auth rejected", &digest),
+            format!("scheme {FILTERED_PLACEHOLDER} rejected"),
+            "it is still masked where it stands as a whole token"
+        );
     }
 
     /// A custom sensitive header carries whatever its application likes, so
