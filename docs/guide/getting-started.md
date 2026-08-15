@@ -460,15 +460,20 @@ understanding why before you go looking for the bug:
 - The read paths — `GET /posts`, `GET /posts/{id}`, the CSV export, and the
   JSON `GET /api/posts` — work immediately.
 - The write paths — `new_form`, `create`, `edit_form`, `update`, `destroy`,
-  `bulk_delete` — are emitted with `#[secured]`. A fresh `autumn new` app has
-  no login flow, so with no authenticated session those routes answer
-  `401 Unauthorized`.
+  `bulk_delete` — are locked twice over. Each is emitted with `#[secured]`, so
+  a request with no authenticated session is rejected at the route; and each
+  handler body *also* calls `authorize::<Post>(&state, &session, "update", &row)`
+  (or `authorize_create::<Post>`) against the `PostPolicy` registered in
+  `src/main.rs`. A fresh `autumn new` app has no login flow, so you get a
+  `401` at the route and, if you strip the attribute, a `403` from the policy.
 - The JSON *write* handlers are generated but deliberately **not** registered
   in `routes![]`. Mount them once you have written a real repository policy.
 
-That is the scaffold being secure by default rather than open by default: it
-would rather hand you a locked door than an unauthenticated `DELETE` endpoint
-you forgot about. `autumn routes audit` enforces the same posture in CI.
+That double gate is deliberate. `#[secured]` answers "is anyone signed in?" and
+the policy answers "may *this* user touch *this* row?" — deleting one attribute
+cannot silently open a mutation path, and `autumn routes audit` enforces the
+same posture in CI. It is the scaffold preferring to hand you a locked door
+over an unauthenticated `DELETE` endpoint you forgot about.
 
 To get writes working, generate the missing half — a full signup, login,
 logout, account, and password-reset flow, named after the model it creates:
@@ -481,15 +486,18 @@ autumn dev
 
 That writes the `users` migration, the session and remember-token models, the
 handlers, and registers all of them in `src/main.rs`. Sign up, sign in, and the
-create/edit/delete views become reachable. The
-generated `src/policies/post.rs` authorizes any authenticated user and marks
-itself with `SECURITY TODO` comments; replace those with a real per-record
-ownership rule before production. See [authentication](authentication.md) and
-[authorization](authorization.md).
+create/edit/delete views become reachable.
 
-If you only want to click around a demo, removing the `#[secured]` attributes
-from `src/routes/posts.rs` opens the write routes — it is your code to edit.
-Do that knowingly, and not on anything reachable from the internet.
+Read the generated `src/policies/post.rs` before you ship: with no owner column
+detected it authorizes *any* authenticated user and says so in `SECURITY TODO`
+comments. Replace those with a real per-record ownership rule. See
+[authentication](authentication.md) and [authorization](authorization.md).
+
+Generating the auth flow really is the short path here. Opening the writes to
+anonymous visitors instead means editing both layers — dropping every
+`#[secured]` attribute *and* rewriting `PostPolicy` to return `true` — which is
+more work than `autumn generate auth User`, and leaves you with a scaffold that
+no longer resembles the one the rest of the docs describe.
 
 ### More of the DSL
 
