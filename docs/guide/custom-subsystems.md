@@ -180,7 +180,7 @@ async fn main() {
 }
 ```
 
-When you install a custom store, `apply_session_layer` skips the
+When you install a custom store, `build_session_layer` skips the
 config-driven `memory` vs `redis` selection entirely — your store handles
 all sessions for the app.
 

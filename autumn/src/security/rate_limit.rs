@@ -1529,7 +1529,7 @@ pub async fn __check_throttle(
         return Ok(());
     }
 
-    let config = state.config();
+    let config = state.config_arc();
     let rl_config = &config.security.rate_limit;
     let trusted_proxies = &config.security.trusted_proxies;
 

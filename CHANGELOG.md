@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **jobs:** the Postgres job worker's claim query (`SELECT … FOR UPDATE SKIP
+  LOCKED`) no longer scans and sorts the entire ready backlog for a queue
+  before picking one row, for apps that don't configure `[jobs] queues`
+  priority (the common case: a single `"default"` queue). The claim query's
+  `ORDER BY array_position($2::text[], candidate.queue), candidate.run_at`
+  was opaque to the planner — `array_position` depends on the bound queue-
+  order array, so even though it's constant across every candidate row when
+  only one queue is in play, Postgres couldn't prove that and fell back to a
+  `Bitmap Heap Scan` of the whole ready-in-queue backlog followed by a
+  `Sort` and `LockRows` over every one of those rows, before `LIMIT 1`
+  picked the winner. Single-queue workers now send a query that drops
+  `array_position` from `ORDER BY` and uses `queue = $2` (scalar), which
+  lets the planner recognize the existing `idx_autumn_jobs_queue_ready
+  (queue, run_at)` index order and do a plain `Index Scan` + `Limit 1`
+  instead. Measured (`EXPLAIN (ANALYZE, BUFFERS)`, production-shaped
+  fixture): 703→21 buffers at 4.4k ready rows, 3,342→22 at 44.6k, and
+  57,093→22 (eliminating an external-merge sort spill to disk) at 444k;
+  workload-level (`pg_stat_statements`, 50 claims) 166,437→1,410 total
+  buffers, a 99.15% reduction. No index or migration changes — see
+  `docs/reports/2026-08-14-ledger-job-claim-single-queue/`.
+
 ### Added
 
 - **failure capsules:** a failing request can now be recorded and replayed
@@ -1636,8 +1659,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own `users` table end to end, so it inlines both integration points
   directly into `routes/auth.rs`) is the fully-wired ground truth this
   generator adapts from.
+- **`AppState::config_arc()`** — the cheap config accessor (#2198). It hands
+  back the `Arc<AutumnConfig>` the extension map already holds, so reading
+  configuration costs a refcount bump instead of a deep clone of every section.
+  `config()` is unchanged — same signature, same owned and independently
+  mutable snapshot, now expressed as `(*self.config_arc()).clone()` — and
+  remains the right call when you need to own and mutate a snapshot; reach for
+  `config_arc()` on anything that runs per request. Six framework read sites on
+  request paths moved over (the `#[throttle]` limiter, the upload size check,
+  the `TimeZone` extractor, both alert paths, and `TestClient`'s N+1 threshold
+  read), each of which was paying ~65 heap blocks per call for a config it only
+  read. When no config extension is installed — typically a test that doesn't
+  wire the full startup pipeline — the accessor yields a handle to a shared
+  process-wide default rather than allocating one, and never writes it back, so
+  a config installed afterwards is still observed. A new isolated test binary
+  (`autumn/tests/config_alloc_gate.rs`, on the new `allocation-counter`
+  dev-dependency — it installs a counting `#[global_allocator]`, a
+  process-wide side effect, so it cannot live in the consolidated suite) pins
+  the accessor at exactly zero allocations on both the installed and fallback
+  paths.
+
+  The plugin's `api-reference.md` (*Config layering and env keys*) documents
+  when to reach for which accessor.
 
 ### Changed
+
+- **Router: the whole ingress stack is now applied in ONE `Router::layer`
+  call.** #2193 collapsed ~26 sequential applications down to a handful; #2198
+  collapses what was left — the inner group, the user layers, the middle group,
+  the session, and the outer group — into a single
+  `router.layer((outer, session, NormalizeBody, middle, user, inner))`. Two
+  things blocked that. The session layer's type varies with the configured
+  backend, so it could never be a fixed member of a `tower-layer` tuple:
+  `build_session_layer` (renamed from `apply_session_layer`, which built *and*
+  applied it) now monomorphizes all three backends to
+  `SessionLayer<ArcSessionStore>` through the same bridge the custom-store path
+  has always used. That costs 1–2 boxed futures per request (a store load, plus
+  a save or destroy only when the session is dirty) and buys back a whole
+  nesting level — and a nesting level is not a one-off cost, since `Route::call`
+  deep-clones everything beneath it on *every* request. The other blocker was
+  the registered operator layers; see the next entry. `NormalizeBodyLayer` makes
+  explicit the response-body conversion each separate `Router::layer` call was
+  doing implicitly (`Route::new` maps through `IntoResponse`); its future is
+  un-boxed and it adds no nesting level of its own.
+
+  The number of times a request deep-clones the ingress stack falls from **16
+  to 13** on the default feature set (17 → 14 under CI's workspace-unified
+  features), which `middleware_stack_depth.rs` gates. Measured end-to-end with
+  `valgrind --tool=dhat` against the committed `request_pipeline` bench, with
+  the same marginal (zero-iteration-baseline-subtracted) methodology as #2193:
+  **~331 → ~222 allocations per request**, together with the `config_arc` work
+  above. No middleware changed position; #2193's ordering net passes unchanged.
+
+  [no-plugin] — internal router assembly: no new app-facing API, config key, or
+  pattern for the Claude plugin's skills to describe.
+
+- **Registering an app-wide layer no longer deepens the per-request clone
+  cascade.** `AppBuilder::layer` and `AppBuilder::static_gate` registrations —
+  including the ones plugins make through the same builder — are type-erased at
+  registration time and folded into a single composed application, so an
+  operator's *n*th layer costs the framework exactly what its first did: **+0**
+  ingress traversals per registration, where each one previously added +1
+  (#2198). What remains per registration is deliberately shallow and linear —
+  one erased box that is cloned (not cascaded) per traversal and one boxed
+  response future per request — instead of a `Route` nesting level that both
+  re-boxed the future AND joined the quadratic deep-clone cascade. Registration
+  order is untouched (first registered is outermost, matching
+  `tower::ServiceBuilder`), and the `TypeId`/`type_name` behind
+  `has_layer` / `get_layer_types` ride along on the registration, so plugin
+  pre-flight checks and the idempotency fail-closed classification behave
+  exactly as before. **Breaking:** `IntoAppLayer`'s sealed blanket impl is now
+  bound on `tower::Layer` over the new public
+  [`app::ErasedAppService`] alias instead of over `axum::routing::Route`. Any
+  layer that is generic over the service it wraps — every layer in this repo,
+  in the plugins, and in the docs, and every standard tower layer — satisfies
+  both bounds, so the move is invisible in practice; only a layer written
+  against `axum::routing::Route` specifically stops compiling, and its fix is
+  one line (see
+  [the migration guide](docs/migrations/next.md#app-wide-layers-are-now-erased)).
+  `docs/guide/middleware.md` describes the new shape.
+
+  [no-plugin] — internal router assembly: the registration API, its ordering
+  contract, and the introspection helpers are all unchanged for callers.
+
+- **Router: ~59% fewer heap allocations per request.** The framework's ingress
+  middleware stack is now assembled with a handful of *composed* `Router::layer`
+  calls instead of ~26 sequential ones (#2193). Every `Router::layer` call wraps
+  the whole downstream stack in another `tower::util::BoxCloneSyncService`
+  (axum's `Route::layer` ends in `Route::new`), and axum's `Route::call`
+  deep-clones that box on every invocation — so *N* stacked layers cost
+  `N(N+1)/2 + 2N` heap allocations per request, **quadratically**. Measured
+  against axum 0.8.9 with no-op layers: 38 allocations/request at N = 5, 263 at
+  N = 20, 1388 at N = 50; the same layers composed into a *single*
+  `Router::layer` call cost a flat 16 at any N.
+
+  Measured end-to-end on the real production router (`valgrind --tool=dhat`
+  against the new `request_pipeline` bench — three trivial handlers, no DB, no
+  business logic, with a zero-iteration baseline subtracted so the figure is
+  marginal rather than amortised over router construction): **800.0 → 331.0
+  allocations per request**. The number of times a request deep-clones the
+  ingress stack fell from 29 to 16.
+
+  `MaintenanceLayer` and `LoadShedLayer` additionally held their path
+  allow-lists by value, so each per-request clone deep-copied two `String`s and
+  two `Vec<String>`s; both now share them behind an `Arc`. The `UploadConfig`
+  extension is installed with `axum::Extension` rather than
+  `axum::middleware::from_fn`, dropping a boxed future and a boxed `Next` per
+  request.
+
+  **No middleware changed position.** Layers are composed with `tower-layer`'s
+  tuple `Layer` impls, whose **first element is outermost** — the reverse of
+  consecutive `Router::layer` calls, where the **last** call is outermost.
+  `autumn/tests/integration/middleware_stack_order.rs` pins the ordering
+  invariants that were previously documented only in prose (metrics attribution,
+  panic-to-500 with `X-Request-Id`, trusted-proxy resolution before
+  `ClientAddr`, security headers on short-circuits, disabled layers being
+  inert); `autumn/tests/integration/middleware_stack_depth.rs` gates the depth;
+  and `autumn/benches/request_pipeline.rs` is the profiler workload.
+
+  [no-plugin] — an internal router-assembly change: no new app-facing API,
+  config key, or pattern for the Claude plugin's skills to describe.
 
 - **generate model / generate scaffold:** `lock_version` is now a load-bearing
   column name (#1318) — see the Added entry above for the full behaviour. What

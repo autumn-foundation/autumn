@@ -144,6 +144,8 @@ mod mcp_schema_derive;
 mod mcp_streaming;
 mod middleware_introspection;
 mod middleware_pipeline;
+mod middleware_stack_depth;
+mod middleware_stack_order;
 #[cfg(feature = "db")]
 mod migrate_checksum_proptest;
 #[cfg(feature = "db")]

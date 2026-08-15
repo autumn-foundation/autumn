@@ -374,7 +374,7 @@ impl SessionStore for MemoryStore {
 // `SessionStore` uses RPIT (`-> impl Future + Send`) and is therefore not
 // dyn-compatible. To let `AppBuilder::with_session_store(impl SessionStore)`
 // erase the concrete type into something `AppBuilder` can store and
-// `apply_session_layer` can wrap into a `SessionLayer`, we keep a
+// `build_session_layer` can wrap into a `SessionLayer`, we keep a
 // pub(crate) dyn-compatible `BoxedSessionStore` shadow trait with a blanket
 // impl over any `SessionStore`, plus an `ArcSessionStore` newtype that
 // satisfies `SessionStore` by delegating through the trait object. Users
@@ -968,24 +968,71 @@ fn session_store_unavailable_response(error: &SessionStoreError) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "Session store unavailable").into_response()
 }
 
-pub(crate) fn apply_session_layer<S: Clone + Send + Sync + 'static>(
-    router: axum::Router<S>,
+/// Build the configured session layer, **monomorphized to a single type** by
+/// erasing every backend behind [`ArcSessionStore`].
+///
+/// # Why the store type is erased here
+///
+/// Each backend produces a differently-typed `SessionLayer<Store>`, so before
+/// this the session had to be applied through its own `Router::layer` call —
+/// nothing else in a `tower-layer` tuple can have a type that varies at
+/// runtime. Returning one concrete `SessionLayer<ArcSessionStore>` lets the
+/// caller fold the session into `apply_middleware`'s single merged
+/// `Router::layer((..))` application (issues #2193, #2198).
+///
+/// # What that costs, and why it is worth it
+///
+/// The `Arc<dyn BoxedSessionStore>` bridge adds one `Box::pin` per store
+/// operation — 1-2 per request (a `load`, plus a `save` or `destroy` only when
+/// the session is dirty). In exchange it removes one whole `Router::layer`
+/// nesting level, and a nesting level is not a one-off cost: `Route::call`
+/// deep-clones everything below it on *every* request, so each level is
+/// re-cloned by every level above it. One boxed future per store call is
+/// strictly cheaper than that.
+///
+/// The custom-store arm already paid this cost (a user store arrives as
+/// `Arc<dyn BoxedSessionStore>` and has always been wrapped); the memory and
+/// Redis arms now wrap their concrete store the same way.
+///
+/// # Errors
+///
+/// Returns [`SessionBackendConfigError`] when the configured backend cannot be
+/// built: a Redis backend requested without the `redis` feature compiled in, an
+/// unparseable Redis URL, or the production in-memory guard rejecting the
+/// configuration.
+pub(crate) fn build_session_layer(
     config: &SessionConfig,
     profile: Option<&str>,
     custom_store: Option<Arc<dyn BoxedSessionStore>>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
     entropy: &Arc<dyn crate::entropy::Entropy>,
-) -> Result<axum::Router<S>, SessionBackendConfigError> {
+) -> Result<SessionLayer<ArcSessionStore>, SessionBackendConfigError> {
+    // Shared tail of all three arms: entropy is always injected (determinism
+    // seam, #1797), signing keys only when the app configured a secret.
+    fn finish(
+        store: ArcSessionStore,
+        config: &SessionConfig,
+        signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+        entropy: &Arc<dyn crate::entropy::Entropy>,
+    ) -> SessionLayer<ArcSessionStore> {
+        let mut layer = SessionLayer::new(store, config.clone()).with_entropy(Arc::clone(entropy));
+        if let Some(keys) = signing_keys {
+            layer = layer.with_signing_keys(keys);
+        }
+        layer
+    }
+
     if let Some(store) = custom_store {
         tracing::debug!(
             "Custom session store installed via with_session_store(); skipping config-driven backend selection"
         );
-        let mut layer =
-            SessionLayer::new(ArcSessionStore(store), config.clone()).with_entropy(entropy.clone());
-        if let Some(keys) = signing_keys {
-            layer = layer.with_signing_keys(keys);
-        }
-        return Ok(router.layer(layer));
+        // Already an `Arc<dyn BoxedSessionStore>` — no second Arc.
+        return Ok(finish(
+            ArcSessionStore(store),
+            config,
+            signing_keys,
+            entropy,
+        ));
     }
 
     match config.backend_plan(profile)? {
@@ -996,28 +1043,27 @@ pub(crate) fn apply_session_layer<S: Clone + Send + Sync + 'static>(
                      session.allow_memory_in_production=true to acknowledge the risk"
                 );
             }
-            let mut layer =
-                SessionLayer::new(MemoryStore::new(), config.clone()).with_entropy(entropy.clone());
-            if let Some(keys) = signing_keys {
-                layer = layer.with_signing_keys(keys);
-            }
-            Ok(router.layer(layer))
+            Ok(finish(
+                ArcSessionStore(Arc::new(MemoryStore::new())),
+                config,
+                signing_keys,
+                entropy,
+            ))
         }
         SessionBackendPlan::Redis { .. } => {
             #[cfg(feature = "redis")]
             {
                 let store = crate::session_redis::RedisStore::from_config(config)?;
-                let mut layer =
-                    SessionLayer::new(store, config.clone()).with_entropy(entropy.clone());
-                if let Some(keys) = signing_keys {
-                    layer = layer.with_signing_keys(keys);
-                }
-                Ok(router.layer(layer))
+                Ok(finish(
+                    ArcSessionStore(Arc::new(store)),
+                    config,
+                    signing_keys,
+                    entropy,
+                ))
             }
 
             #[cfg(not(feature = "redis"))]
             {
-                let _ = router;
                 Err(SessionBackendConfigError::RedisFeatureDisabled)
             }
         }

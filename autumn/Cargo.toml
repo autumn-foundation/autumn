@@ -289,7 +289,14 @@ tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, optional = true }
 tokio-util = { workspace = true, features = ["io"] }
 toml.workspace = true
-tower.workspace = true
+# `util` is needed for `tower::util::option_layer`, which turns an
+# `Option<Layer>` into a `Layer` (`Either<L, Identity>`) so a conditionally
+# applied middleware can still join the statically-composed ingress layer
+# tuples in `router.rs` instead of costing its own `Router::layer` call — and
+# therefore its own `BoxCloneSyncService` nesting level (issue #2193). It pulls
+# in no crates the build does not already have: axum enables the same tower
+# feature.
+tower = { workspace = true, features = ["util"] }
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -356,6 +363,13 @@ image = { workspace = true, optional = true }
 nix = { version = "0.31.2", features = ["fs"] }
 
 [dev-dependencies]
+# Counting global allocator behind a safe API, used by the isolated
+# `config_alloc_gate` test binary. A hand-rolled `unsafe impl GlobalAlloc` is
+# not an option here: `[workspace.lints.rust] unsafe_code = "forbid"` applies to
+# this package's test targets too, and a crate-level `#![allow(unsafe_code)]`
+# cannot lift a forbid (E0453). The crate installs its `#[global_allocator]` on
+# link, so only binaries that actually reference it are affected.
+allocation-counter = "0.8.1"
 diesel = { version = "2", features = ["chrono", "postgres"] }
 filetime = "0.2"
 futures.workspace = true
@@ -405,6 +419,14 @@ harness = false
 name = "inspector"
 harness = false
 
+# Ingress-pipeline workload for profilers (issue #2193): drives real requests
+# through the production router so `valgrind --tool=callgrind|dhat` can attribute
+# the per-request framework overhead. Asserts nothing — see the file header for
+# the exact commands.
+[[bench]]
+name = "request_pipeline"
+harness = false
+
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
 # `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
 # guard, since a `[[bin]]` target — unlike a `[[test]]` — is simply skipped by
@@ -420,6 +442,14 @@ required-features = ["sim-testing"]
 [[test]]
 name = "integration_tests"
 path = "tests/integration_tests.rs"
+
+# Allocation gate for the config accessors (issue #2198). Its own binary because
+# it links `allocation-counter`, which installs a counting `#[global_allocator]`
+# for the whole process — a process-wide side effect per CLAUDE.md's isolated
+# test rules, and one that would tax every allocation in the consolidated suite.
+[[test]]
+name = "config_alloc_gate"
+path = "tests/config_alloc_gate.rs"
 
 # SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
 # `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default

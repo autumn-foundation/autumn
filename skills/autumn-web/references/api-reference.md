@@ -1061,6 +1061,13 @@ revalidating?). Both are re-exported from the prelude.
 
 ## Config layering and env keys
 
+Reading the resolved config from handler/service code (**unreleased** —
+trunk-dev, #2198): `AppState::config_arc() -> Arc<AutumnConfig>` is the cheap
+accessor — a refcount bump, no deep clone; reach for it on anything that runs
+per request. `AppState::config() -> AutumnConfig` is unchanged and still right
+when you need an owned, independently mutable snapshot — it deep-clones every
+section on each call.
+
 Layering order, lowest to highest:
 
 1. framework defaults

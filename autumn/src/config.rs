@@ -3773,14 +3773,14 @@ impl AutumnConfig {
         self.mail.validate(self.profile.as_deref())?;
         self.time_zone.validate()?;
         // Session backend validation deliberately lives in
-        // `crate::session::apply_session_layer`, not here. That function
+        // `crate::session::build_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
         // `AppBuilder::with_session_store(...)`, so the (then-irrelevant)
         // `session.backend = "redis"` config without a redis URL doesn't
         // need to fail the boot. Validating the same thing here would
         // defeat the override and exit the app before the custom store
         // ever gets a chance to apply. The "prod profile + memory backend"
-        // warning lives in `apply_session_layer` for the same reason.
+        // warning lives in `build_session_layer` for the same reason.
         Ok(())
     }
 
@@ -9330,7 +9330,7 @@ mod tests {
         // `session.backend_plan(profile)` which returned an error for
         // `backend = "redis"` without `redis.url`, exiting the boot before
         // a `with_session_store(...)` override could apply. Session
-        // backend validation now lives in `apply_session_layer`, which
+        // backend validation now lives in `build_session_layer`, which
         // short-circuits when a custom store is installed. `validate()`
         // is config-shape-only and must accept this combination.
         let mut config = AutumnConfig::default();
@@ -10067,12 +10067,12 @@ slots = ["8194-16383"]
 
     #[test]
     fn autumn_config_validate_no_longer_errors_on_invalid_session_backend() {
-        // Session backend validation moved to `apply_session_layer` so a
+        // Session backend validation moved to `build_session_layer` so a
         // custom store installed via `AppBuilder::with_session_store(...)`
         // can override an otherwise-invalid backend config without the boot
         // exiting first. `validate()` is config-shape-only now; runtime
         // session selection (and the backend error) lives in
-        // `apply_session_layer`, which short-circuits when a custom store
+        // `build_session_layer`, which short-circuits when a custom store
         // is installed. `crate::session::tests::session_backend_plan_*`
         // still cover the underlying error cases directly on
         // `SessionConfig::backend_plan`.

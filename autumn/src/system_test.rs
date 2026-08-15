@@ -448,7 +448,7 @@ impl SystemTest {
             .push(crate::app::CustomLayerRegistration {
                 type_id: std::any::TypeId::of::<L>(),
                 type_name: std::any::type_name::<L>(),
-                apply: Box::new(move |router| layer.apply_to(router)),
+                layer: layer.erase(),
             });
         self
     }
