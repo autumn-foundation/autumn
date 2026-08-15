@@ -949,23 +949,33 @@ handlers stay semantically honest:
 ```rust,no_run
 use autumn_web::form::method_input;
 use autumn_web::prelude::*;
+use autumn_web::security::CsrfToken;
 
 #[get("/todos/{id}/edit")]
-async fn edit_form(id: Path<i64>) -> Markup {
+async fn edit_form(id: Path<i64>, csrf: Option<CsrfToken>) -> Markup {
     html! {
         form method="post" action=(format!("/todos/{}", *id)) {
             (method_input("DELETE"))   // Autumn rewrites this POST to DELETE
+            @if let Some(token) = csrf.as_ref() {
+                input type="hidden" name="_csrf" value=(token.token());
+            }
             button type="submit" { "Delete" }
         }
     }
 }
 ```
 
-The override is accepted only for same-origin, form-urlencoded `POST` requests,
-CSRF still applies, and `autumn routes` keeps reporting the declared method. If
-you build forms with `ChangesetForm::form_tag`, the method and CSRF inputs are
-emitted for you. See [nested forms](nested-forms.md) and
-[submit tokens](submit-tokens.md) for the full form story.
+The `_csrf` field is not optional dressing. CSRF still treats the transport
+`POST` as unsafe, and the `prod` profile turns CSRF protection on by default —
+so a form that omits the token gets a `403 Forbidden` before your `#[delete]`
+handler ever runs, even though it works fine in `dev`.
+
+Beyond that, the override is accepted only for same-origin, form-urlencoded
+`POST` requests, and `autumn routes` keeps reporting the declared method so
+route listings and OpenAPI stay accurate. If you build forms with
+`ChangesetForm::form_tag`, the method and CSRF inputs are emitted for you. See
+[nested forms](nested-forms.md) and [submit tokens](submit-tokens.md) for the
+full form story.
 
 ---
 
