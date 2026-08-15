@@ -1283,7 +1283,18 @@ fn plan_scaffold_with_options_impl(
         search_enabled && !options_with_key.api,
         bulk_delete_enabled,
         export_enabled,
-        trash_enabled,
+        // Same shape as the `nested` predicate below, for the same reason: on the
+        // DESTROY path `--soft-delete` may not have been repeated on the command
+        // line, so `trash_enabled` is false — but `main.rs` still mounts the three
+        // trash handlers this resource emitted, and a revert that deleted the
+        // routes module while leaving them behind would leave the project
+        // uncompilable. Removing an entry that is not there is a no-op
+        // (`remove_routes_entries` filters to the ones present), so claiming them
+        // unconditionally on the revert path is safe even for a resource that
+        // never had a trash surface. The GENERATE path keeps the strict gate: what
+        // this run emits is decided by `trash_enabled` alone, and the prune below
+        // handles a re-run that dropped the flag.
+        trash_enabled || for_revert,
         &validated_field_names,
         &sm_field_names,
         &rich_text_field_names,
@@ -20764,6 +20775,54 @@ exempt_paths = [
         }
         // The routes that ARE still emitted stay mounted.
         assert!(main.contains("routes::posts::destroy"), "{main}");
+    }
+
+    #[test]
+    fn destroying_without_soft_delete_unmounts_the_trash_routes() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &bulk_fields(),
+            "20260427000000",
+            &trash_options(|_| {}),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        // `autumn destroy scaffold Post` without repeating `--soft-delete` —
+        // the flag was typed once, days ago. The revert deletes the routes
+        // module, so any trash entry it leaves behind in `main.rs` points at a
+        // module that no longer exists and the remaining app stops compiling.
+        plan_scaffold_with_options_for_revert(
+            tmp.path(),
+            "Post",
+            &bulk_fields(),
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .revert(Flags {
+            force: true,
+            ..Flags::default()
+        })
+        .unwrap();
+
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        for entry in [
+            "routes::posts::trash",
+            "routes::posts::restore",
+            "routes::posts::purge",
+            // The rest of the resource's entries come off the same way.
+            "routes::posts::index",
+            "routes::posts::destroy",
+        ] {
+            assert!(
+                !main.contains(entry),
+                "destroy without --soft-delete must unmount `{entry}`:\n{main}"
+            );
+        }
     }
 
     #[test]
