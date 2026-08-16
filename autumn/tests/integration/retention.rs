@@ -218,7 +218,7 @@ fn retention_task_info_uses_fleet_coordination_and_declared_batch_interval() {
     assert_eq!(info.name, "retention-sweep-rtsession");
     match info.schedule {
         Schedule::FixedDelay(d) => assert_eq!(d, std::time::Duration::from_secs(3600)),
-        Schedule::Cron { .. } => panic!("retention sweeps use FixedDelay, not cron"),
+        _ => panic!("retention sweeps use FixedDelay, not cron"),
     }
 }
 
