@@ -32,9 +32,17 @@
 //! What that integer counts is **every service above the probe that clones on
 //! call**, which is the `Route` box levels *plus* each
 //! `axum::middleware::from_fn` (its generated `Service::call` starts with
-//! `self.inner.clone()`). Collapsing `Router::layer` calls removes box levels;
-//! it does not remove `from_fn` traversals. So the number moves with both, and
-//! a new `from_fn` inside an existing tuple raises it without adding a box.
+//! `self.inner.clone()`) *plus* every hand-rolled service that has to clone its
+//! inner to move it into a boxed future. Collapsing `Router::layer` calls
+//! removes box levels; it does not remove clone-on-call traversals. So the
+//! number moves with both, and a new `from_fn` inside an existing tuple raises
+//! it without adding a box.
+//!
+//! Since #2214 that second half is also a proxy for a *heap allocation*: a
+//! service clones its inner precisely when it needs to own it inside a
+//! `Box::pin`ned future, which is the per-request allocation #2214 measured at
+//! 19.6% of all bytes. A service with a named `pin_project!` future neither
+//! clones nor boxes, so both costs leave together and this gate sees it.
 //!
 //! The probe is attached to a `MethodRouter` in a merged raw router, which
 //! `mount_raw_routers` mounts *after* `build_router_pre_state` has already
@@ -48,17 +56,22 @@
 //! The measured integer decomposes as **D + C**. *D* counts `Route` box levels
 //! above the probe: one per `Router::layer` call applied above it, plus one for
 //! the base `Route` box the leaf `MethodRouter` is stored in. *C* counts the
-//! clone-on-call services above the probe (each `from_fn`). Only *D* moves when
-//! `Router::layer` calls are collapsed; only *C* moves with the enabled Cargo
-//! features. `cargo test -p autumn-web` builds the 8 default features and
-//! measures **16** (D = 8, C = 8), while CI's `cargo test --workspace` unifies
-//! ~29 features across the workspace — `oauth2` (enabled by `examples/blog`)
-//! adds its HTTP-interceptor `from_fn` for **17** (D = 8, C = 9).
+//! clone-on-call services above the probe. Only *D* moves when `Router::layer`
+//! calls are collapsed; *C* moves with the enabled Cargo features and with how
+//! each middleware is written.
 //!
-//! Because *C* is feature-dependent, the assertion has to be a window rather
-//! than an equality; its ceiling is derived from the widest *predicted*
-//! configuration, not the widest current one, so the gate fails on the way back
-//! up. See [`INGRESS_TRAVERSAL_WINDOW`] for the arithmetic.
+//! Before #2214, `cargo test -p autumn-web` (the 8 default features) measured
+//! **13** (D = 5, C = 8) and CI's `cargo test --workspace` — which unifies ~29
+//! features across the workspace — measured **14**, because `oauth2` (enabled
+//! by `examples/blog`) contributed an extra HTTP-interceptor `from_fn`. #2214
+//! converted that interceptor along with the always-on `from_fn`s, so both
+//! configurations now measure **9** (D = 5, C = 4).
+//!
+//! The assertion is still a window rather than an equality: a feature not
+//! enabled anywhere in this workspace could reintroduce the spread, and the
+//! ceiling is derived from the widest *predicted* configuration rather than the
+//! widest current one, so the gate fails on the way back up. See
+//! [`INGRESS_TRAVERSAL_WINDOW`] for the arithmetic.
 //!
 //! The lower bound matters too. Without it, a refactor that mounted merged raw
 //! routers *after* the middleware — which is exactly how `/mcp` is treated —
@@ -146,22 +159,53 @@ async fn unused() -> &'static str {
 /// | CI workspace-unified features, before #2198 | 8 | 9 | **17** |
 /// | default features, after #2198 | 5 | 8 | **13** |
 /// | CI workspace-unified features, after #2198 | 5 | 9 | **14** |
+/// | default features, after #2214 | 5 | 4 | **9** |
+/// | CI workspace-unified features, after #2214 | 5 | 4 | **9** |
 ///
 /// #2198 removes three box levels by folding `apply_middleware`'s four
 /// remaining `Router::layer` calls — the inner group, the middle group, the
 /// session layer, and the outer group — into a single nested-tuple call.
 ///
-/// **Upper bound 15** = the widest predicted configuration (14) plus one, so
-/// restoring even ONE of the collapsed `.layer()` calls — which puts the
-/// measurement straight back to 16-17 — fails this gate.
+/// #2214 then removes four of the eight clone-on-call services by converting
+/// every `axum::middleware::from_fn` on the always-on ingress path into a
+/// hand-rolled `tower::Service` with a NAMED future. Four of those conversions
+/// are visible to this probe — `EventAppContextLayer`,
+/// `WebhookReplayCleanupLayer`, `MethodOverrideRejectionLayer`, and
+/// `TrustedHostLayer`. `StartupBarrierLayer` is a fifth, but `apply_startup_barrier`
+/// is production-only (`TestApp::build` mirrors just its two response-side
+/// fallbacks), so it never entered this count in the first place;
+/// `AssetCacheControlLayer` is a sixth, applied *before* the probe's mount
+/// point and therefore also outside it. Each conversion removes both a
+/// clone-on-call traversal (`FromFn::call` opens with `self.inner.clone()`) and
+/// the `Box::pin` `from_fn` wraps its otherwise-unnameable future in — the
+/// allocation #2214 is actually about. The *feature*-dependence of *C*
+/// disappears with them: `oauth2`'s HTTP-interceptor `from_fn` is converted
+/// too, so the default and workspace-unified measurements now agree.
 ///
-/// **Lower bound 6** is a sentinel, not a budget. It sits well under the
-/// `from_fn` floor (C alone is 8-9, so no legitimate composition of the current
-/// stack can reach it) and well above the 1-3 a probe measures once it has
-/// fallen out of the framework stack entirely — the failure mode described in
-/// the module header. It is deliberately slack: tightening it toward the real
-/// measurement would make every feature-set difference a failure without
-/// catching anything the ceiling does not already catch.
+/// **Upper bound 9** is the measurement itself, not the measurement plus slack.
+/// Before #2214 this bound carried a `+1` of headroom to absorb the feature
+/// spread — and that headroom is exactly what made the gate blind to the
+/// regression it is named for, since restoring one `from_fn` inside an existing
+/// tuple, or one collapsed `Router::layer` call, moves the number by exactly
+/// one. With `oauth2`'s interceptor converted there is no spread left to
+/// absorb: 9 was measured under the 8 default features AND under a
+/// 13-feature build adding `oauth2`, `mail`, `storage`, `ws` and `openapi`.
+/// So the bound is set to the measurement, and either regression fails it.
+///
+/// If a feature this workspace does not currently enable ever contributes a
+/// tenth traversal, this gate will fail on it. That is the intended outcome:
+/// identify the clone-on-call service the feature adds, convert it the way
+/// #2214 converted the rest, or widen the window deliberately with the
+/// measurement written down here — do not nudge the bound to make a red run
+/// green.
+///
+/// **Lower bound 6** is a sentinel, not a budget. It sits under the current
+/// floor (five box levels plus the four remaining clone-on-call services) and
+/// well above the 1-3 a probe measures once it has fallen out of the framework
+/// stack entirely — the failure mode described in the module header. It is
+/// deliberately slack: tightening it toward the real measurement would make
+/// every feature-set difference a failure without catching anything the ceiling
+/// does not already catch.
 ///
 /// # What this gate is blind to
 ///
@@ -178,8 +222,13 @@ async fn unused() -> &'static str {
 /// That is why the fix for #2198 collapses `Router::layer` calls — which
 /// deletes whole box levels — rather than erasing layer types, and why a future
 /// change that lowers this number by erasure must be judged on allocation
-/// counts instead of on this gate.
-const INGRESS_TRAVERSAL_WINDOW: std::ops::RangeInclusive<usize> = 6..=15;
+/// counts instead of on this gate. #2214's conversions are judged that way too:
+/// `per_request_allocations_stay_under_the_ceiling` and
+/// `per_request_allocated_bytes_stay_under_the_ceiling` in
+/// `tests/config_alloc_gate.rs` pin the blocks and bytes a request actually
+/// allocates, which is what a `from_fn` box costs and what this count can only
+/// stand proxy for.
+const INGRESS_TRAVERSAL_WINDOW: std::ops::RangeInclusive<usize> = 6..=9;
 
 /// Build the production router with a clone-counting probe at the innermost
 /// position, drive one request through it, and return the traversal count.
@@ -262,10 +311,17 @@ async fn ingress_stack_depth_stays_within_budget() {
     assert!(
         traversals <= *INGRESS_TRAVERSAL_WINDOW.end(),
         "a single request deep-cloned the ingress stack {traversals} times \
-         (max {}). Expected 13 on the default feature set and 14 under CI's \
-         workspace-unified features; 16-17 is the pre-#2198 measurement, i.e. \
-         one of the four collapsed `Router::layer` calls in `apply_middleware` \
-         is back. Every `Router::layer` call boxes the whole downstream stack in \
+         (max {}). Expected exactly 9 on every feature set. 10 means one more \
+         clone-on-call service or one more `Router::layer` call than the \
+         stack is supposed to have; 13-14 is the pre-#2214 \
+         measurement, i.e. an `axum::middleware::from_fn` is back on the \
+         always-on ingress path — each one clones the whole stack beneath it \
+         AND heap-allocates a `Box::pin` for its own future on every request \
+         (issue #2214); write a `tower::Service` with a named future instead, \
+         the way `TrustedHostLayer` and `StartupBarrierLayer` do. 16-17 is the \
+         pre-#2198 measurement, i.e. one of the four collapsed `Router::layer` \
+         calls in `apply_middleware` is back. Every `Router::layer` call boxes \
+         the whole downstream stack in \
          a `BoxCloneSyncService`, and axum clones that box on each call — so the \
          per-request cost is quadratic in the number of `.layer()` calls (issues \
          #2193, #2198). Compose the layers into one \
@@ -283,8 +339,8 @@ async fn ingress_stack_depth_stays_within_budget() {
     assert!(
         traversals >= *INGRESS_TRAVERSAL_WINDOW.start(),
         "the probe saw only {traversals} traversals (min {}), which is below the \
-         `from_fn` floor of the current stack (the clone-on-call services alone \
-         account for 8-9) and means the probe is no longer inside the \
+         floor of the current stack (five box levels alone account for it) and \
+         means the probe is no longer inside the \
          framework's ingress stack — so this gate is measuring nothing. Check \
          that `mount_raw_routers` still runs BEFORE `apply_middleware`; if \
          merged routers moved after it (the way `/mcp` is mounted), this test \

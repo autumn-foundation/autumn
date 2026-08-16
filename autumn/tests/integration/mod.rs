@@ -108,6 +108,7 @@ mod i18n_integration;
 mod idempotency_middleware;
 #[cfg(feature = "inbound-mail")]
 mod inbound_mail_integration;
+mod ingress_named_futures;
 mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;

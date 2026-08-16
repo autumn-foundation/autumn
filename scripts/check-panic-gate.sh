@@ -114,6 +114,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/middleware/maintenance.rs:default
   autumn/src/middleware/error_page_filter.rs:default
   autumn/src/middleware/load_shed.rs:default
+  autumn/src/middleware/short_circuit.rs:default
   autumn/src/capsule/capture.rs:reporting
   autumn/src/capsule/wire.rs:db
   autumn/src/capsule/record_db.rs:db
@@ -133,8 +134,10 @@ REQUEST_PATH_MODULES=(
 
 # The manifest may grow, never shrink. Deleting a gated module is a deliberate
 # act that has to move this number too, so a silent `git revert` of an entry
-# cannot quietly shrink the gate's surface.
-MODULE_COUNT_FLOOR=43
+# cannot quietly shrink the gate's surface. It tracks the manifest's length, so
+# it moves with every addition too — otherwise a one-entry revert would shrink
+# the manifest back under the floor while the gate still passed.
+MODULE_COUNT_FLOOR=44
 
 # Gated modules whose feature is KNOWINGLY not enabled by any enforcing CI clippy
 # lane, as `<path>:<feature>`. Their headers are real but unenforced: the deny

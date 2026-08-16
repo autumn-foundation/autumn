@@ -394,21 +394,125 @@ pub async fn asset_cache_control(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let path = req.uri().path().to_owned();
+    let header = cache_control_for_request(&req);
     let mut resp = next.run(req).await;
-    if path.starts_with("/static/") && resp.status().is_success() {
-        let is_immutable = path.strip_prefix("/static/").is_some_and(is_manifest_asset);
-        let header = if is_immutable {
+    apply_cache_control(&mut resp, header);
+    resp
+}
+
+/// `Cache-Control` value a `/static/...` request's successful response should
+/// carry, or `None` for any request that is not a static-asset request.
+///
+/// Resolved from the request *before* the response exists so the decision costs
+/// no allocation: the old form owned the path in a `String` for the whole
+/// downstream call, purely to re-read it afterwards.
+///
+/// One consequence of resolving up front: [`is_manifest_asset`] now runs for
+/// every `/static/...` request rather than only for successful ones, so a `404`
+/// for a missing asset can be the call that populates the process-lifetime
+/// manifest `OnceLock`. The manifest is written by `autumn build` before the
+/// server starts and never changes while it runs, so *which* request warms it
+/// is not observable; non-asset requests are unaffected either way, since
+/// `strip_prefix` returns `None` before any manifest lookup happens.
+fn cache_control_for_request<B>(req: &axum::http::Request<B>) -> Option<&'static str> {
+    req.uri().path().strip_prefix("/static/").map(|rel| {
+        if is_manifest_asset(rel) {
             "public, max-age=31536000, immutable"
         } else {
             "public, max-age=0, must-revalidate"
-        };
+        }
+    })
+}
+
+/// Stamp `header` onto `resp` when the request was for a static asset and the
+/// response succeeded. Shared by [`asset_cache_control`] and
+/// [`AssetCacheControlFuture`] so the two forms cannot drift.
+fn apply_cache_control<B>(resp: &mut axum::http::Response<B>, header: Option<&'static str>) {
+    if let Some(header) = header
+        && resp.status().is_success()
+    {
         resp.headers_mut().insert(
             http::header::CACHE_CONTROL,
             http::HeaderValue::from_static(header),
         );
     }
-    resp
+}
+
+/// Tower [`Layer`](tower::Layer) form of [`asset_cache_control`], used by the
+/// framework's ingress stack.
+///
+/// The `axum::middleware::from_fn` this replaces cost a `Box::pin` of the
+/// wrapped async block on every request — every request in the app, not just
+/// requests for `/static/...`, because this layer is applied globally — plus a
+/// deep clone of the erased service beneath it and a `String` clone of the
+/// request path (issue #2214). None of that survives here: the header is a
+/// `&'static str` decided up front and the future is the inner service's own.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AssetCacheControlLayer;
+
+impl<S> tower::Layer<S> for AssetCacheControlLayer {
+    type Service = AssetCacheControlService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AssetCacheControlService { inner }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`AssetCacheControlLayer`].
+#[derive(Clone, Debug)]
+pub(crate) struct AssetCacheControlService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody, ResBody> tower::Service<axum::http::Request<ReqBody>>
+    for AssetCacheControlService<S>
+where
+    S: tower::Service<axum::http::Request<ReqBody>, Response = axum::http::Response<ResBody>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = AssetCacheControlFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
+        AssetCacheControlFuture {
+            header: cache_control_for_request(&req),
+            inner: self.inner.call(req),
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Future returned by [`AssetCacheControlService`]: the inner service's own
+    /// future plus the `&'static str` header to stamp on its response.
+    pub(crate) struct AssetCacheControlFuture<F> {
+        #[pin]
+        inner: F,
+        header: Option<&'static str>,
+    }
+}
+
+impl<F, ResBody, E> std::future::Future for AssetCacheControlFuture<F>
+where
+    F: std::future::Future<Output = Result<axum::http::Response<ResBody>, E>>,
+{
+    type Output = Result<axum::http::Response<ResBody>, E>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        let mut response = std::task::ready!(this.inner.poll(cx))?;
+        apply_cache_control(&mut response, *this.header);
+        std::task::Poll::Ready(Ok(response))
+    }
 }
 
 /// Best-effort `Content-Type` for a static/embedded asset, derived from its
@@ -596,7 +700,7 @@ pub(crate) async fn serve_embedded(
 pub fn embedded_static_router() -> axum::Router {
     axum::Router::new()
         .route("/static/{*path}", axum::routing::get(serve_embedded))
-        .layer(axum::middleware::from_fn(asset_cache_control))
+        .layer(AssetCacheControlLayer)
 }
 
 #[cfg(test)]
@@ -711,5 +815,114 @@ mod tests {
         // Unknown / extensionless fall back to octet-stream.
         assert_eq!(content_type_for("data.bin"), "application/octet-stream");
         assert_eq!(content_type_for("LICENSE"), "application/octet-stream");
+    }
+}
+
+/// Direct coverage for [`AssetCacheControlService`] (issue #2214).
+///
+/// The framework's ingress installs the *layer*; the retained
+/// [`asset_cache_control`] `async fn` is what every pre-existing test exercises.
+/// An end-to-end test cannot cover the layer under default features either: the
+/// `/static` route is a `ServeDir` over a `static/` directory this crate does
+/// not ship, so every `/static/...` request in the test suite 404s and the
+/// success branch — the entire point of this middleware — is never reached.
+/// Driving the service directly over a stub inner service closes that.
+#[cfg(test)]
+mod cache_control_service_tests {
+    use super::{AssetCacheControlLayer, cache_control_for_request};
+    use axum::body::Body;
+    use axum::http::{Request, Response, StatusCode};
+    use tower::{Layer, Service, ServiceExt};
+
+    const REVALIDATE: &str = "public, max-age=0, must-revalidate";
+
+    /// Inner service that answers every request with `status` and no
+    /// `Cache-Control`, so any header on the way out came from the layer.
+    fn responder(
+        status: StatusCode,
+    ) -> impl Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible> + Clone
+    {
+        tower::service_fn(move |_req: Request<Body>| async move {
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(status)
+                    .body(Body::empty())
+                    .expect("response builds"),
+            )
+        })
+    }
+
+    /// `#[allow(future_not_send)]`: `tower::service_fn`'s closure is not
+    /// `Sync`, so this helper's future is `!Send`. It only ever runs on a
+    /// `#[tokio::test]` current-thread runtime, which never moves it.
+    #[allow(clippy::future_not_send)]
+    async fn cache_control_for(path: &str, status: StatusCode) -> Option<String> {
+        let service = AssetCacheControlLayer.layer(responder(status));
+        let response = service
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("infallible");
+        response
+            .headers()
+            .get(http::header::CACHE_CONTROL)
+            .map(|v| v.to_str().expect("ascii header").to_owned())
+    }
+
+    #[tokio::test]
+    async fn stamps_successful_static_responses() {
+        // Debug builds have no fingerprint manifest, so every asset is the
+        // revalidate (non-immutable) case.
+        assert_eq!(
+            cache_control_for("/static/css/app.css", StatusCode::OK).await,
+            Some(REVALIDATE.to_owned()),
+        );
+    }
+
+    #[tokio::test]
+    async fn leaves_non_static_routes_alone() {
+        assert_eq!(cache_control_for("/ping", StatusCode::OK).await, None);
+        // `/static` without the trailing slash is NOT an asset path — the
+        // predicate is a `/static/` prefix, matching the original `starts_with`.
+        assert_eq!(cache_control_for("/static", StatusCode::OK).await, None);
+        assert_eq!(cache_control_for("/staticky/x", StatusCode::OK).await, None);
+    }
+
+    #[tokio::test]
+    async fn leaves_unsuccessful_static_responses_alone() {
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert_eq!(
+                cache_control_for("/static/css/app.css", status).await,
+                None,
+                "only a successful response may be given a Cache-Control"
+            );
+        }
+    }
+
+    /// The request-side half of the decision, isolated: `/static/` exactly
+    /// yields an empty relative path and still counts as an asset request,
+    /// matching the original `starts_with(..) && strip_prefix(..)` pair.
+    #[test]
+    fn the_predicate_matches_the_original_starts_with_form() {
+        let req = |path: &str| {
+            Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("request builds")
+        };
+        assert!(cache_control_for_request(&req("/static/")).is_some());
+        assert!(cache_control_for_request(&req("/static/a.css")).is_some());
+        // Query strings are not part of `Uri::path()`, so they cannot affect it.
+        assert!(cache_control_for_request(&req("/static/a.css?v=1")).is_some());
+        assert!(cache_control_for_request(&req("/static")).is_none());
+        assert!(cache_control_for_request(&req("/")).is_none());
     }
 }

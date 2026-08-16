@@ -203,7 +203,19 @@ tokio::task_local! {
 ///
 /// Called by the RYW middleware for every request when mode is not `off`.
 pub async fn scope<F: std::future::Future>(pin: RequestPin, fut: F) -> F::Output {
-    PIN.scope(pin, fut).await
+    scope_future(pin, fut).await
+}
+
+/// [`scope`] as a **named** future rather than an `async fn`.
+///
+/// [`ReadYourWritesService`] needs the concrete type so its own `Service::Future`
+/// can be named and therefore need no `Box::pin` (issue #2214); `scope` above is
+/// the ergonomic `async fn` wrapper every other caller uses.
+pub(crate) fn scope_future<F: std::future::Future>(
+    pin: RequestPin,
+    fut: F,
+) -> tokio::task::futures::TaskLocalFuture<RequestPin, F> {
+    PIN.scope(pin, fut)
 }
 
 /// Mark that the current request has performed a primary write.
@@ -264,8 +276,11 @@ pub const RYW_COOKIE_NAME: &str = "autumn.ryw";
 /// Axum middleware function that installs the RYWW task-local for every
 /// request and, in `session` mode, handles the signed cookie lifecycle.
 ///
-/// Installed by `apply_middleware` in `router.rs` when
-/// `database.read_your_writes != "off"`.
+/// The framework itself installs `ReadYourWritesLayer` — the same logic as a
+/// `tower::Service` with a named future, so the ingress path pays no `Box::pin`
+/// per request (issue #2214) — rather than this function, which is retained as
+/// public API for callers wiring the middleware into an
+/// `axum::middleware::from_fn` of their own.
 pub async fn middleware(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
@@ -274,30 +289,188 @@ pub async fn middleware(
     keys: Option<std::sync::Arc<crate::security::config::ResolvedSigningKeys>>,
     metrics: crate::middleware::MetricsCollector,
 ) -> axum::http::Response<axum::body::Body> {
-    let pin = match mode {
-        crate::config::ReadYourWrites::Session => {
-            let cookie_val = extract_ryw_cookie_value(&req);
-            match (cookie_val, &keys) {
-                (Some(cv), Some(k)) => {
-                    RequestPin::with_session_cookie_and_metrics(&cv, k, window_secs, metrics)
-                }
-                _ => RequestPin::new_with_metrics(mode, metrics),
-            }
-        }
-        crate::config::ReadYourWrites::Request => RequestPin::new_with_metrics(mode, metrics),
-        crate::config::ReadYourWrites::Off => unreachable!("RYW middleware installed in off mode"),
+    let settings = ReadYourWritesSettings {
+        mode,
+        window_secs,
+        keys,
+        metrics,
     };
-
+    let pin = request_pin_for(&req, &settings);
     let pin_for_response = pin.clone();
 
     let mut response = scope(pin, next.run(req)).await;
 
     // Session mode: stamp a Set-Cookie if a write occurred so subsequent
     // requests within the freshness window also route to primary.
-    if mode == crate::config::ReadYourWrites::Session
-        && let Some(k) = &keys
-        && let Some(cv) = session_cookie_value(&pin_for_response, k)
+    stamp_ryw_cookie(&mut response, &settings, &pin_for_response);
+
+    response
+}
+
+/// Extract the `autumn.ryw` cookie value from raw `Cookie` headers.
+///
+/// Delegates to `session::get_cookie` so that duplicate-name rejection
+/// (cookie-tossing mitigation) and exact-name matching are handled uniformly
+/// with the session layer.
+fn extract_ryw_cookie_value<B>(req: &axum::http::Request<B>) -> Option<String> {
+    crate::session::get_cookie(req.headers(), RYW_COOKIE_NAME)
+}
+
+/// Everything the read-your-own-writes middleware resolves once at
+/// router-assembly time.
+///
+/// Behind an `Arc` in the layer because the produced service is cloned on every
+/// traversal of the ingress stack above it.
+struct ReadYourWritesSettings {
+    mode: crate::config::ReadYourWrites,
+    window_secs: u64,
+    keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+    metrics: crate::middleware::MetricsCollector,
+}
+
+/// Tower [`Layer`](tower::Layer) form of [`middleware`], used by the framework's
+/// ingress stack.
+///
+/// The `axum::middleware::from_fn` closure it replaces `Box::pin`ned its async
+/// block on every request and cloned the erased service beneath it to move it in
+/// (issue #2214). `PIN.scope(..)` already yields a named
+/// [`tokio::task::futures::TaskLocalFuture`], so the pin can be installed with
+/// no allocation at all.
+#[derive(Clone)]
+pub(crate) struct ReadYourWritesLayer {
+    settings: Arc<ReadYourWritesSettings>,
+}
+
+impl ReadYourWritesLayer {
+    /// Build the layer. `mode` must not be [`ReadYourWrites::Off`] — the
+    /// framework only installs this layer when read-your-own-writes is on.
+    pub(crate) fn new(
+        mode: crate::config::ReadYourWrites,
+        window_secs: u64,
+        keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+        metrics: crate::middleware::MetricsCollector,
+    ) -> Self {
+        Self {
+            settings: Arc::new(ReadYourWritesSettings {
+                mode,
+                window_secs,
+                keys,
+                metrics,
+            }),
+        }
+    }
+}
+
+impl<S> tower::Layer<S> for ReadYourWritesLayer {
+    type Service = ReadYourWritesService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ReadYourWritesService {
+            inner,
+            settings: Arc::clone(&self.settings),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`ReadYourWritesLayer`].
+#[derive(Clone)]
+pub(crate) struct ReadYourWritesService<S> {
+    inner: S,
+    settings: Arc<ReadYourWritesSettings>,
+}
+
+impl<S, ReqBody> tower::Service<axum::http::Request<ReqBody>> for ReadYourWritesService<S>
+where
+    S: tower::Service<axum::http::Request<ReqBody>, Response = axum::response::Response>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = ReadYourWritesFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
+        let pin = request_pin_for(&req, &self.settings);
+        let pin_for_response = pin.clone();
+        // Built inside the scope, not merely polled inside it: arguments are
+        // evaluated first, so passing `self.inner.call(req)` straight to
+        // `scope_future` would run the synchronous `Service::call` chain beneath
+        // this layer with `PIN` unset. `is_pinned()`/`mark_write()` are public
+        // and synchronous, so an operator's own Tower layer is entitled to call
+        // them from `call`. See `crate::capsule::capture` for the same hazard.
+        let inner = PIN.sync_scope(pin.clone(), || self.inner.call(req));
+        ReadYourWritesFuture {
+            inner: scope_future(pin, inner),
+            settings: Arc::clone(&self.settings),
+            pin: pin_for_response,
+        }
+    }
+}
+
+/// Mint the per-request pin, reading the signed `autumn.ryw` cookie in session
+/// mode. Shared by [`middleware`] and [`ReadYourWritesService`].
+fn request_pin_for<B>(
+    req: &axum::http::Request<B>,
+    settings: &ReadYourWritesSettings,
+) -> RequestPin {
+    match settings.mode {
+        crate::config::ReadYourWrites::Session => {
+            match (extract_ryw_cookie_value(req), &settings.keys) {
+                (Some(cv), Some(k)) => RequestPin::with_session_cookie_and_metrics(
+                    &cv,
+                    k,
+                    settings.window_secs,
+                    settings.metrics.clone(),
+                ),
+                _ => RequestPin::new_with_metrics(settings.mode, settings.metrics.clone()),
+            }
+        }
+        crate::config::ReadYourWrites::Request => {
+            RequestPin::new_with_metrics(settings.mode, settings.metrics.clone())
+        }
+        crate::config::ReadYourWrites::Off => {
+            // Unreachable: both call sites gate on `mode != Off`
+            // (`apply_middleware` only builds the layer inside that check, and
+            // `middleware` documents the same precondition). This used to be an
+            // `unreachable!()`; it is a `debug_assert!` plus an INERT pin now,
+            // because turning a caller's misconfiguration into a panic on the
+            // request path is the wrong trade for a middleware whose whole job
+            // is optional. The fallback is `Off`, not `Request`: `Request` is
+            // the *active* mode, so it would silently start pinning reads to
+            // the primary for an app that configured read-your-own-writes off —
+            // contradicting `is_pinned_off_mode_never_pins` below. `Off` is
+            // inert (`is_pinned` is false, no cookie is minted), which is what
+            // the configuration asked for.
+            debug_assert!(
+                false,
+                "read-your-own-writes middleware built in `off` mode; \
+                 both call sites are supposed to gate on `mode != Off`"
+            );
+            RequestPin::new_with_metrics(
+                crate::config::ReadYourWrites::Off,
+                settings.metrics.clone(),
+            )
+        }
+    }
+}
+
+/// Stamp the `autumn.ryw` `Set-Cookie` on `response` when session mode recorded
+/// a primary write. Shared by [`middleware`] and [`ReadYourWritesFuture`].
+fn stamp_ryw_cookie(
+    response: &mut axum::response::Response,
+    settings: &ReadYourWritesSettings,
+    pin: &RequestPin,
+) {
+    if settings.mode == crate::config::ReadYourWrites::Session
+        && let Some(k) = &settings.keys
+        && let Some(cv) = session_cookie_value(pin, k)
     {
+        let window_secs = settings.window_secs;
         let cookie_str = format!(
             "{RYW_COOKIE_NAME}={cv}; Max-Age={window_secs}; HttpOnly; \
              Secure; SameSite=Lax; Path=/"
@@ -308,17 +481,35 @@ pub async fn middleware(
                 .append(axum::http::header::SET_COOKIE, hv);
         }
     }
-
-    response
 }
 
-/// Extract the `autumn.ryw` cookie value from raw `Cookie` headers.
-///
-/// Delegates to `session::get_cookie` so that duplicate-name rejection
-/// (cookie-tossing mitigation) and exact-name matching are handled uniformly
-/// with the session layer.
-fn extract_ryw_cookie_value(req: &axum::http::Request<axum::body::Body>) -> Option<String> {
-    crate::session::get_cookie(req.headers(), RYW_COOKIE_NAME)
+pin_project_lite::pin_project! {
+    /// Future returned by [`ReadYourWritesService`]: the inner service's future
+    /// polled inside the task-local pin scope, then the session-mode
+    /// `Set-Cookie` stamp on the way out.
+    pub(crate) struct ReadYourWritesFuture<F> {
+        #[pin]
+        inner: tokio::task::futures::TaskLocalFuture<RequestPin, F>,
+        settings: Arc<ReadYourWritesSettings>,
+        pin: RequestPin,
+    }
+}
+
+impl<F, E> std::future::Future for ReadYourWritesFuture<F>
+where
+    F: std::future::Future<Output = Result<axum::response::Response, E>>,
+{
+    type Output = Result<axum::response::Response, E>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        let mut response = std::task::ready!(this.inner.poll(cx))?;
+        stamp_ryw_cookie(&mut response, this.settings, this.pin);
+        std::task::Poll::Ready(Ok(response))
+    }
 }
 
 #[cfg(test)]
@@ -689,5 +880,146 @@ mod tests {
             saw_pin.load(Ordering::Relaxed),
             "a valid incoming autumn.ryw cookie must activate the pin inside the handler"
         );
+    }
+}
+
+/// Direct coverage for [`ReadYourWritesService`] (issue #2214).
+///
+/// The framework's ingress installs the *layer*; the retained [`middleware`]
+/// `async fn` is what the pre-existing `middleware() integration tests` in this
+/// file exercise, through an `axum::middleware::from_fn`. Nothing drove the
+/// service form, so the two properties that live in the wiring rather than in
+/// the shared helpers — the task-local pin being installed, and the response-side
+/// cookie stamp — were untested on the path production actually takes.
+#[cfg(test)]
+mod service_tests {
+    use super::{ReadYourWritesLayer, is_pinned, mark_write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use axum::body::Body;
+    use axum::http::{Request, Response, StatusCode};
+    use tower::{Layer, Service, ServiceExt};
+
+    use crate::config::ReadYourWrites;
+
+    fn test_keys() -> Arc<crate::security::config::ResolvedSigningKeys> {
+        Arc::new(crate::security::config::ResolvedSigningKeys::new(
+            b"test-key-for-ryw-service".to_vec(),
+            vec![],
+        ))
+    }
+
+    /// Inner service that marks a primary write (the way a generated mutating
+    /// repository method does) and reports whether the pin was visible.
+    fn writing_handler(
+        saw_scope: Arc<AtomicBool>,
+        write: bool,
+    ) -> impl Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible> + Clone
+    {
+        tower::service_fn(move |_req: Request<Body>| {
+            let saw_scope = Arc::clone(&saw_scope);
+            async move {
+                if write {
+                    mark_write();
+                }
+                saw_scope.store(is_pinned(), Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::empty())
+                        .expect("response builds"),
+                )
+            }
+        })
+    }
+
+    /// `#[allow(future_not_send)]`: `tower::service_fn`'s closure is not
+    /// `Sync`, so this helper's future is `!Send`. It only ever runs on a
+    /// `#[tokio::test]` current-thread runtime, which never moves it.
+    #[allow(clippy::future_not_send)]
+    async fn run(
+        mode: ReadYourWrites,
+        keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+        write: bool,
+    ) -> (bool, Option<String>) {
+        let saw_scope = Arc::new(AtomicBool::new(false));
+        let layer = ReadYourWritesLayer::new(
+            mode,
+            60,
+            keys,
+            crate::middleware::MetricsCollector::default(),
+        );
+        let response = layer
+            .layer(writing_handler(Arc::clone(&saw_scope), write))
+            .oneshot(Request::builder().body(Body::empty()).expect("request"))
+            .await
+            .expect("infallible");
+        let cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .map(|v| v.to_str().expect("ascii cookie").to_owned());
+        (saw_scope.load(Ordering::SeqCst), cookie)
+    }
+
+    /// The whole reason this layer exists: the request-scoped pin must be
+    /// visible to everything beneath it. Without the task-local scope,
+    /// `is_pinned()` reads `false` after a write and every replica-eligible read
+    /// silently goes to the replica.
+    #[tokio::test]
+    async fn the_request_pin_scope_is_installed_for_the_inner_service() {
+        let (saw_scope, _) = run(ReadYourWrites::Request, None, true).await;
+        assert!(
+            saw_scope,
+            "a write inside the handler must leave `is_pinned()` true — the \
+             task-local pin scope is not reaching the inner service"
+        );
+    }
+
+    /// Control: no write, no pin. Proves the assertion above tracks the write
+    /// rather than being true for every request.
+    #[tokio::test]
+    async fn no_write_means_no_pin() {
+        let (saw_scope, _) = run(ReadYourWrites::Request, None, false).await;
+        assert!(!saw_scope);
+    }
+
+    /// Session mode stamps the signed `autumn.ryw` cookie after a write, with
+    /// the documented attributes, so the *next* request also routes to primary.
+    #[tokio::test]
+    async fn session_mode_stamps_the_ryw_cookie_after_a_write() {
+        let (_, cookie) = run(ReadYourWrites::Session, Some(test_keys()), true).await;
+        let cookie = cookie.expect("session mode must stamp autumn.ryw after a write");
+        assert!(cookie.starts_with("autumn.ryw="), "got {cookie}");
+        assert!(cookie.contains("Max-Age=60"), "got {cookie}");
+        assert!(cookie.contains("HttpOnly"), "got {cookie}");
+        assert!(cookie.contains("Secure"), "got {cookie}");
+        assert!(cookie.contains("SameSite=Lax"), "got {cookie}");
+        assert!(cookie.contains("Path=/"), "got {cookie}");
+    }
+
+    /// No write, no cookie — the freshness window is only opened by an actual
+    /// primary write.
+    #[tokio::test]
+    async fn session_mode_stamps_no_cookie_without_a_write() {
+        let (_, cookie) = run(ReadYourWrites::Session, Some(test_keys()), false).await;
+        assert_eq!(cookie, None);
+    }
+
+    /// Request mode is per-request only: it never mints a cross-request cookie,
+    /// even after a write.
+    #[tokio::test]
+    async fn request_mode_never_stamps_a_cookie() {
+        let (_, cookie) = run(ReadYourWrites::Request, Some(test_keys()), true).await;
+        assert_eq!(cookie, None);
+    }
+
+    /// Session mode with no signing key configured cannot sign the cookie, so
+    /// it stamps none — the warn-and-degrade path `apply_middleware` documents.
+    #[tokio::test]
+    async fn session_mode_without_keys_stamps_no_cookie() {
+        let (saw_scope, cookie) = run(ReadYourWrites::Session, None, true).await;
+        assert_eq!(cookie, None);
+        assert!(saw_scope, "in-request pinning still works without a key");
     }
 }

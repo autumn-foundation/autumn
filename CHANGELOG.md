@@ -161,6 +161,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **ingress middleware no longer boxes a future per layer per request:** every
+  `axum::middleware::from_fn` on the framework's always-on request path is now a
+  hand-rolled `tower::Service` with a **named** future. `from_fn` cannot avoid
+  the cost it was paying: the async block it generates has no nameable type, so
+  `FromFn::call` returns it as `Box::pin(..)` — one heap allocation per call
+  site per request, sized by everything that block captures across its single
+  `.await`, which for an outer layer is the whole downstream continuation. DHAT
+  measured those boxes at **19.57% of every byte** the `request_pipeline`
+  benchmark allocated (5,267,600 of 26,918,238 bytes over 650 requests) while
+  being only 2.14% of the blocks — the largest single allocation cost in the
+  profile (issue #2214).
+
+  Converted: the asset cache-control layer, the event-bus app context, the
+  webhook replay-key cleanup, the method-override rejection filter, the
+  trusted-host gate, the startup barrier, the per-request timeout, the
+  read-your-own-writes pin, and (under `oauth2`) the HTTP-interceptor scope.
+  Each keeps its behaviour and its position in the stack exactly; what goes away
+  is the box and, with it, the `self.inner.clone()` `from_fn` needed to move the
+  inner service into that box — which for an erased `BoxCloneSyncService` was a
+  recursive `clone_box` down the rest of the stack, so each conversion took a
+  whole deep-clone cascade with it too.
+
+  Re-run of the issue's own DHAT recipe on `benches/request_pipeline.rs`
+  (release, 200 iterations = 650 requests), before and after on the same
+  machine — filtering allocation sites whose second stack frame is
+  `FromFn<..>::call` exactly, as the issue specifies:
+
+  | | `FromFn::call` `Box::pin` | share of run bytes | marginal blocks/req | marginal bytes/req |
+  | --- | ---: | ---: | ---: | ---: |
+  | before | 3,250 blocks / 5,215,600 bytes | 19.80% | 168.8 | 36,826 |
+  | after | **0 / 0** (0 sites) | **0%** | 139.2 | 25,943 |
+
+  The before column reproduces the issue's measurement exactly on block count
+  (3,250) and to within 1% on bytes. Overall: **−17.5% allocations** and
+  **−29.6% bytes** per request.
+
+  The same movement is pinned as a regression gate in the debug profile, where
+  it is deterministic run to run: **172 → 140 allocation blocks** and
+  **37,819 → 26,030 bytes** per request under the default feature set. The ingress clone-on-call traversal count drops from 13 to 9 in
+  the same move, on the default set and on a 13-feature build alike. One layer
+  also sheds an allocation of its own: the asset cache-control layer no longer
+  clones the request path into a `String` on every request in the app.
+
+  Two middlewares are deliberately **not** converted, because they `.await`
+  before calling the inner service and their futures therefore cannot be named
+  without `type_alias_impl_trait`: the tenancy middleware (async tenant
+  extraction) and the rate-limit principal shim (async session read). Both are
+  off by default. `webhook_replay_cleanup` keeps one box, taken only on a `5xx`
+  that actually registered replay keys; on every other request its future is
+  unboxed (it still mints the per-request replay cell it always did).
+
+  One public behaviour change: `read_your_writes::middleware` used to
+  `unreachable!()` when handed `ReadYourWrites::Off`. It now debug-asserts and
+  falls back to an inert `Off` pin instead of panicking on the request path.
+  Both call sites gate on `mode != Off`, so the arm stays unreachable in
+  practice. Otherwise nothing public moved: `asset_cache_control`,
+  `method_override_rejection_filter` and `webhook_replay_cleanup_middleware`
+  remain exported `async fn`s with identical behaviour, now sharing their
+  decision logic with the layers so the two forms cannot drift.
+
+  Four gates keep the win from eroding: a per-request allocation **blocks**
+  ceiling tight enough that restoring a single `from_fn` fails it, a companion
+  **bytes** ceiling derived under the wider feature set CI actually gates with,
+  the ingress traversal count pinned to its exact measurement, and a
+  `type_name`-based assertion that none of the converted services ever returns a
+  `Pin<Box<dyn Future>>` again.
+
 - **config reads on the request path:** generated auth handlers, the admin
   plugin, the `saas` starter, and the `blog`/`saas`/`teams` examples now read
   configuration through `AppState::config_arc()` instead of

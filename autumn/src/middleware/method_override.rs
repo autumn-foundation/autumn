@@ -141,6 +141,7 @@ use std::task::{Context, Poll};
 use axum::http::{Request, Response, StatusCode};
 use tower::{Layer, Service};
 
+use crate::middleware::short_circuit::ShortCircuitFuture;
 use crate::security::trusted_proxies::ResolvedClientIdentity;
 
 /// Default form field name for the method override.
@@ -210,48 +211,105 @@ pub async fn method_override_rejection_filter(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use crate::middleware::exception_filter::AutumnErrorInfo;
-    use axum::response::IntoResponse;
-
-    if let Some(rejection) = request
-        .extensions()
-        .get::<MethodOverrideRejection>()
-        .copied()
-    {
-        let (status, message) = match rejection {
-            MethodOverrideRejection::InvalidValue => (
-                StatusCode::BAD_REQUEST,
-                "Invalid method override value: must be PUT, PATCH, or DELETE.",
-            ),
-            MethodOverrideRejection::BodyTooLarge => (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "Form body too large for method-override scanning.",
-            ),
-        };
-        let mut response = (
-            status,
-            [(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("text/plain; charset=utf-8"),
-            )],
-            message,
-        )
-            .into_response();
-        // Surface this as a framework error so the exception filter
-        // chain (problem-details normalization, custom HTML error-page
-        // rendering) processes it the same as any handler-generated
-        // error response. Without this extension, `ExceptionFilterFuture`
-        // treats the response as pre-formed and skips renegotiation.
-        response.extensions_mut().insert(AutumnErrorInfo {
-            status,
-            message: message.to_owned(),
-            details: None,
-            problem_type: None,
-            backtrace_string: None,
-        });
+    if let Some(response) = rejection_response(&request) {
         return response;
     }
     next.run(request).await
+}
+
+/// The rejection response for a request carrying a [`MethodOverrideRejection`]
+/// extension, or `None` when it carries none (the overwhelmingly common case).
+///
+/// Shared by [`method_override_rejection_filter`] and
+/// [`MethodOverrideRejectionService`] so the two forms of the same middleware
+/// cannot drift.
+fn rejection_response<B>(request: &Request<B>) -> Option<Response<axum::body::Body>> {
+    use crate::middleware::exception_filter::AutumnErrorInfo;
+    use axum::response::IntoResponse;
+
+    let rejection = request
+        .extensions()
+        .get::<MethodOverrideRejection>()
+        .copied()?;
+    let (status, message) = match rejection {
+        MethodOverrideRejection::InvalidValue => (
+            StatusCode::BAD_REQUEST,
+            "Invalid method override value: must be PUT, PATCH, or DELETE.",
+        ),
+        MethodOverrideRejection::BodyTooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Form body too large for method-override scanning.",
+        ),
+    };
+    let mut response = (
+        status,
+        [(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        )],
+        message,
+    )
+        .into_response();
+    // Surface this as a framework error so the exception filter
+    // chain (problem-details normalization, custom HTML error-page
+    // rendering) processes it the same as any handler-generated
+    // error response. Without this extension, `ExceptionFilterFuture`
+    // treats the response as pre-formed and skips renegotiation.
+    response.extensions_mut().insert(AutumnErrorInfo {
+        status,
+        message: message.to_owned(),
+        details: None,
+        problem_type: None,
+        backtrace_string: None,
+    });
+    Some(response)
+}
+
+/// Tower [`Layer`](tower::Layer) form of [`method_override_rejection_filter`],
+/// used by the framework's ingress stack.
+///
+/// Behaviourally identical to the `async fn` above; it exists because
+/// `axum::middleware::from_fn` has to `Box::pin` the future of whatever it
+/// wraps, paying a heap allocation on every request whether or not a rejection
+/// is present — and this layer sits on the always-on path, so that was one
+/// allocation per request for a check that is a no-op almost every time
+/// (issue #2214). [`ShortCircuitFuture`] holds the inner service's future in
+/// place instead.
+#[derive(Clone, Copy, Debug)]
+pub struct MethodOverrideRejectionLayer;
+
+impl<S> Layer<S> for MethodOverrideRejectionLayer {
+    type Service = MethodOverrideRejectionService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        MethodOverrideRejectionService { inner }
+    }
+}
+
+/// Tower [`Service`] produced by [`MethodOverrideRejectionLayer`].
+#[derive(Clone, Debug)]
+pub struct MethodOverrideRejectionService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody> Service<Request<ReqBody>> for MethodOverrideRejectionService<S>
+where
+    S: Service<Request<ReqBody>, Response = Response<axum::body::Body>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = ShortCircuitFuture<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        rejection_response(&req).map_or_else(
+            || ShortCircuitFuture::forward(self.inner.call(req)),
+            ShortCircuitFuture::short_circuit,
+        )
+    }
 }
 
 /// Tower [`Layer`] that applies the HTML form method override convention.
