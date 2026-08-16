@@ -2839,6 +2839,16 @@ impl AppBuilder {
             return;
         }
 
+        // ── Retention dry-run mode ──────────────────────────────────────
+        // When AUTUMN_RETENTION_DRY_RUN=1, count (never delete) the rows every
+        // registered `#[repository(..., retention(...))]` policy would sweep,
+        // print the report as JSON, and exit — never starting the HTTP server.
+        // Triggered by `autumn retention --dry-run` (issue #1342).
+        if is_retention_dry_run_mode() {
+            self.run_retention_dry_run_mode().await;
+            return;
+        }
+
         // ── Capsule replay mode ────────────────────────────────────────
         // When AUTUMN_REPLAY_CAPSULE=<path> is set, rebuild this application
         // offline, drive the request the capsule recorded through it, print the
@@ -2870,7 +2880,7 @@ impl AppBuilder {
             api_versions,
             route_sources: _,
             current_plugin: _,
-            tasks,
+            mut tasks,
             one_off_tasks: _,
             mut jobs,
             listeners,
@@ -2953,6 +2963,13 @@ impl AppBuilder {
             #[cfg(feature = "inbound-mail")]
             inbound_mail_router,
         } = self;
+
+        // #1342: every `#[repository(..., retention(...))]` policy compiled
+        // into this binary auto-registers here — no `tasks![...]` entry
+        // required. `inventory`-collected, so this is a no-op allocation
+        // when no model declares a policy.
+        #[cfg(feature = "db")]
+        tasks.extend(crate::retention::collect_retention_tasks());
 
         let all_routes = routes;
 
@@ -5351,6 +5368,89 @@ impl AppBuilder {
         std::process::exit(0);
     }
 
+    /// Count (never delete) the rows every registered
+    /// `#[repository(..., retention(...))]` policy would sweep right now,
+    /// print the report as JSON, and exit.
+    ///
+    /// Triggered by `AUTUMN_RETENTION_DRY_RUN=1` from `autumn retention
+    /// --dry-run` (issue #1342). Boots just enough context to query the
+    /// database — no HTTP listener, no job/mail/i18n machinery — mirroring
+    /// `run_migrate_only_mode`'s minimal footprint.
+    #[cfg(feature = "db")]
+    async fn run_retention_dry_run_mode(self) {
+        let Self {
+            migrations,
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+            pool_provider_factory,
+            shard_provider_factory,
+            shard_router,
+            directory_shard_router,
+            #[cfg(feature = "ws")]
+            channels_backend,
+            ..
+        } = self;
+
+        let (config, _telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
+
+        let database = setup_database(
+            &config,
+            migrations,
+            pool_provider_factory,
+            shard_provider_factory,
+            shard_router,
+            directory_shard_router,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
+
+        let state = build_state(
+            &config,
+            database.topology.as_ref(),
+            database.shards,
+            #[cfg(feature = "ws")]
+            channels_backend,
+        );
+
+        let model_filter = retention_dry_run_model_filter_from_env();
+        match crate::retention::run_retention_dry_run(&state, model_filter.as_deref()).await {
+            Ok(reports) => {
+                let json = serde_json::to_string(&reports).unwrap_or_else(|error| {
+                    eprintln!("retention dry-run: failed to serialize report: {error}");
+                    std::process::exit(1);
+                });
+                println!("{json}");
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("retention dry-run: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    /// The `AUTUMN_RETENTION_DRY_RUN=1` one-shot on a build compiled WITHOUT
+    /// database support: there is nothing to sweep, so report and exit 0
+    /// (never starting the server).
+    #[cfg(not(feature = "db"))]
+    #[allow(clippy::unused_async)]
+    async fn run_retention_dry_run_mode(self) {
+        eprintln!(
+            "autumn retention --dry-run: this build has no database support — nothing to report"
+        );
+        std::process::exit(0);
+    }
+
     /// Run a registered one-off task with full application context and exit.
     ///
     /// Triggered by `AUTUMN_RUN_TASK=<name>` from `autumn task <name>`.
@@ -6063,6 +6163,24 @@ pub(crate) fn is_list_one_off_tasks_mode() -> bool {
 /// traffic is flipped to the new release.
 pub(crate) fn is_migrate_only_mode() -> bool {
     std::env::var("AUTUMN_MIGRATE").as_deref() == Ok("1")
+}
+
+/// Whether `AUTUMN_RETENTION_DRY_RUN=1` requests the retention dry-run
+/// one-shot: count (never delete) what every declared `retention(...)`
+/// policy would sweep and exit. Set by `autumn retention --dry-run`
+/// (issue #1342).
+pub(crate) fn is_retention_dry_run_mode() -> bool {
+    std::env::var("AUTUMN_RETENTION_DRY_RUN").as_deref() == Ok("1")
+}
+
+/// `AUTUMN_RETENTION_MODEL=<name>` narrows the dry-run report to one model's
+/// policy. Set by `autumn retention --dry-run --model <name>`.
+#[cfg(feature = "db")]
+fn retention_dry_run_model_filter_from_env() -> Option<String> {
+    std::env::var("AUTUMN_RETENTION_MODEL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 /// Whether `AUTUMN_REPLAY_CAPSULE=<path>` requests the capsule-replay one-shot:
@@ -10381,6 +10499,85 @@ mod tests {
         temp_env::with_var("AUTUMN_DUMP_JOBS", None::<&str>, || {
             assert!(!is_dump_jobs_mode(), "unset must not select the dump path");
         });
+    }
+
+    #[test]
+    fn is_retention_dry_run_mode_only_true_for_exactly_one() {
+        // `autumn retention --dry-run` sets AUTUMN_RETENTION_DRY_RUN=1 to
+        // select the dry-run path in `run()`. Any other value (or an unset
+        // var) must fall through to the normal boot path (issue #1342).
+        temp_env::with_var("AUTUMN_RETENTION_DRY_RUN", Some("1"), || {
+            assert!(
+                is_retention_dry_run_mode(),
+                "`1` must select the retention dry-run path"
+            );
+        });
+        temp_env::with_var("AUTUMN_RETENTION_DRY_RUN", Some("0"), || {
+            assert!(
+                !is_retention_dry_run_mode(),
+                "`0` must not select the dry-run path"
+            );
+        });
+        temp_env::with_var("AUTUMN_RETENTION_DRY_RUN", Some("true"), || {
+            assert!(
+                !is_retention_dry_run_mode(),
+                "only the literal `1` enables the mode"
+            );
+        });
+        temp_env::with_var("AUTUMN_RETENTION_DRY_RUN", None::<&str>, || {
+            assert!(
+                !is_retention_dry_run_mode(),
+                "unset must not select the dry-run path"
+            );
+        });
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn retention_dry_run_model_filter_from_env_trims_and_ignores_blank() {
+        temp_env::with_var("AUTUMN_RETENTION_MODEL", Some("  Widget  "), || {
+            assert_eq!(
+                retention_dry_run_model_filter_from_env().as_deref(),
+                Some("Widget")
+            );
+        });
+        temp_env::with_var("AUTUMN_RETENTION_MODEL", Some(""), || {
+            assert_eq!(retention_dry_run_model_filter_from_env(), None);
+        });
+        temp_env::with_var("AUTUMN_RETENTION_MODEL", None::<&str>, || {
+            assert_eq!(retention_dry_run_model_filter_from_env(), None);
+        });
+    }
+
+    #[test]
+    fn retention_dry_run_one_shot_dispatches_before_server_start() {
+        // Mirrors `migrate_only_one_shot_applies_and_exits_without_serving`:
+        // AUTUMN_RETENTION_DRY_RUN=1 must be handled BEFORE the `let Self {`
+        // destructure that begins the serving path, so a dry-run never binds
+        // a port (issue #1342).
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let run_start = source.find("pub async fn run(self)").expect("run() exists");
+        let run_end = source
+            .find("async fn run_build_mode(self)")
+            .expect("build mode follows run()");
+        let run_body = &source[run_start..run_end];
+
+        let dispatch = run_body
+            .find("if is_retention_dry_run_mode() {")
+            .expect("run() dispatches the retention dry-run one-shot");
+        let server_start = run_body
+            .find("let Self {")
+            .expect("run() destructures self to start the server");
+        assert!(
+            dispatch < server_start,
+            "AUTUMN_RETENTION_DRY_RUN must be handled before the server-start path"
+        );
+        let dry_run_branch = &run_body[dispatch..server_start];
+        assert!(
+            dry_run_branch.contains("self.run_retention_dry_run_mode().await;")
+                && dry_run_branch.contains("return;"),
+            "the retention dry-run one-shot must run then return before server start"
+        );
     }
 
     #[test]
