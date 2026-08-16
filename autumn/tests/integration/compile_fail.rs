@@ -217,6 +217,7 @@ fn compile_pass_tests() {
     // Full versioned repository over an encrypted model (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_encrypted.rs");
+    t.pass("tests/compile-pass/repository_encrypted_broadcasts.rs");
 
     // Sharding extractors + repository with_pool over a shard (requires db feature)
     #[cfg(feature = "db")]

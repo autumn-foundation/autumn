@@ -73,7 +73,10 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
 
     // Attachment fields require the `storage` autumn-web feature and are not
     // meaningful as job arguments (pass a storage key or file ID instead).
-    for field in &parsed_fields {
+    // `parse_fields` builds `parsed_fields` from `fields` one-to-one with no
+    // skips, so `fields[i]` is the token that produced `parsed_fields[i]` — the
+    // refusals below can echo what the user actually typed.
+    for (i, field) in parsed_fields.iter().enumerate() {
         if matches!(field.kind, FieldKind::Attachment) {
             return Err(GenerateError::InvalidField {
                 token: format!("{}:Attachment", field.name),
@@ -89,7 +92,10 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
         // the author believed was protected.
         if field.is_encrypted() {
             return Err(GenerateError::InvalidField {
-                token: format!("{}:String{{encrypted}}", field.name),
+                // Echo the token the user typed rather than synthesizing one:
+                // `notes:Text{encrypted:deterministic}` must not be reported
+                // back as `notes:String{encrypted}`.
+                token: fields[i].clone(),
                 reason: "the `encrypted` modifier applies to model columns, not job arguments: \
                          job args are serialized into the queue payload, not stored in a \
                          column, so there is no `#[model]` field for `#[encrypted]` to attach \

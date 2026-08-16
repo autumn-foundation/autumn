@@ -412,41 +412,36 @@ fn encrypted_scaffold_cargo_checks() {
     cargo_check_against_workspace(&project);
 }
 
-/// The same compile proof for the scaffold variants that reach the database
-/// through a different write path than the standard HTML one: `--api` (no HTML
-/// routes at all, JSON via the repository), `--live` (repository extractor +
-/// `repo.save`/`repo.update`), and a nested `--belongs-to` child (its own raw
-/// diesel insert). Each has been a distinct source of "compiles for a plain
-/// model, not for an encrypted one" in this slice, so each gets checked.
+/// The same compile proof for the `--api` variant, which emits no HTML routes
+/// at all and reaches the database only through the repository macro.
 ///
-/// Ignored by default; run with
-/// `cargo test -p autumn-cli --test cli_tests -- --ignored encrypted_scaffold_variants_cargo_check`.
+/// Split into one test per variant (rather than a loop) so a CI failure names
+/// the shape that broke. Each of these has been a distinct source of "compiles
+/// for a plain model, not for an encrypted one" in this slice.
 #[test]
-#[ignore = "slow: cargo-checks three fresh projects — run with `cargo test -p autumn-cli -- --ignored`"]
-fn encrypted_scaffold_variants_cargo_check() {
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn encrypted_api_scaffold_cargo_checks() {
+    let project = encrypted_variant_project("encrypted-api-app", &["--api"]);
+    cargo_check_against_workspace(&project.1);
+}
+
+/// `--live`: writes go through the repository extractor (`repo.save` /
+/// `repo.update` with a `Patch::Set` changeset) rather than the raw diesel
+/// statements the standard HTML path uses.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn encrypted_live_scaffold_cargo_checks() {
+    let project = encrypted_variant_project("encrypted-live-app", &["--live"]);
+    cargo_check_against_workspace(&project.1);
+}
+
+/// A nested `--belongs-to` child carrying an encrypted column: its inline "add"
+/// form posts through the nested create handler's own raw diesel insert, a
+/// third distinct write path.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn encrypted_nested_scaffold_cargo_checks() {
     let tmp = tempfile::tempdir().expect("tempdir");
-
-    for (name, extra) in [
-        ("encrypted-api-app", vec!["--api"]),
-        ("encrypted-live-app", vec!["--live"]),
-    ] {
-        run_autumn_ok(tmp.path(), &["new", name]);
-        let project = tmp.path().join(name);
-        let mut args = vec![
-            "generate",
-            "scaffold",
-            "Account",
-            "username:String",
-            "api_token:String{encrypted}",
-            "email:String{encrypted:deterministic}",
-        ];
-        args.extend(extra);
-        run_autumn_ok(&project, &args);
-        cargo_check_against_workspace(&project);
-    }
-
-    // A nested child resource carrying an encrypted column: its inline "add"
-    // form posts through the nested create handler's own raw diesel insert.
     run_autumn_ok(tmp.path(), &["new", "encrypted-nested-app"]);
     let project = tmp.path().join("encrypted-nested-app");
     run_autumn_ok(&project, &["generate", "scaffold", "Post", "title:String"]);
@@ -463,6 +458,25 @@ fn encrypted_scaffold_variants_cargo_check() {
         ],
     );
     cargo_check_against_workspace(&project);
+}
+
+/// `autumn new` + an encrypted scaffold with `extra` flags appended. The
+/// `TempDir` is returned alongside the project path so it outlives the check.
+fn encrypted_variant_project(name: &str, extra: &[&str]) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", name]);
+    let project = tmp.path().join(name);
+    let mut args = vec![
+        "generate",
+        "scaffold",
+        "Account",
+        "username:String",
+        "api_token:String{encrypted}",
+        "email:String{encrypted:deterministic}",
+    ];
+    args.extend_from_slice(extra);
+    run_autumn_ok(&project, &args);
+    (tmp, project)
 }
 
 /// `cargo check --tests` a generated project against this workspace's

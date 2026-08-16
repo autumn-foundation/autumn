@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`#[repository]` with hooks over an `#[encrypted]` model:** a repository
+  declared `broadcasts = true` (or with an explicit `hooks = …` type) over a
+  model carrying any `#[encrypted]` column failed to compile —
+  `the trait bound `&Model: AsChangeset` is not satisfied`. The hooks-aware
+  bulk-update path bound a *borrowed* proposed row to `.set(…)`, and diesel
+  implements `AsChangeset` only for the owned model once a field uses
+  `#[diesel(serialize_as = …)]`, as every encrypted field does. It now passes
+  the owned record, matching the single-record hooks paths. Reachable from
+  `autumn generate scaffold --live` with an encrypted column.
+
 - **duplicate Markdown heading anchors:** `markdown::render` now hands out
   document-unique heading `id`s. A page that repeated a heading — and real docs
   repeat "Example", "Usage", and "Notes" constantly — emitted the same `id`
@@ -39,14 +49,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Previously the only way to encrypt a scaffolded column was to remember to
   hand-edit the generated model, and forgetting shipped plaintext silently.
   Because randomized ciphertext can never satisfy an equality predicate, the
-  generator now refuses — at generate time, pointing at
-  `{encrypted:deterministic}` — the combinations that would otherwise fail at
-  runtime with `EncryptionError::RandomizedEqualityLookup` or fail to compile:
-  `:unique`/`--unique`, `--query`, `--searchable`, `--default`, `Option<…>`,
-  non-text field kinds, and `:states(…)`. Encrypted columns are also left out
-  of the scaffolded index view's sortable headers (the database would order by
-  envelope bytes), and `generate` prints the `autumn credentials edit` next
-  step naming the exact key material the column needs.
+  generator now refuses at generate time — pointing at
+  `{encrypted:deterministic}` as the fix — the combinations that would
+  otherwise fail at runtime with `EncryptionError::RandomizedEqualityLookup`:
+  `:unique`/`--unique`, `--query`, and `--index`. A second set of combinations
+  is refused in *both* modes, because no mode makes them work: `--searchable`
+  (full-text search indexes the stored ciphertext), `--default` (a defaulted
+  column bypasses the encrypting insert), `--shard-key` (the shard is chosen by
+  hashing the stored value), `Option<…>` and non-text field kinds (the v1
+  attribute is non-null `String` only), a `:states(…)` state machine (the
+  transition handler's raw write would bypass encryption), and deriving a
+  `slug{from:…}` from an encrypted column (a slug is stored in its own
+  plaintext column *and* used as the record's URL).
+
+  The generated app's own surfaces follow suit: the index table renders
+  `••••••••` with no sort link, the CSV export omits the column entirely (as
+  the admin panel's export already did), and the admin no longer offers to sort
+  by it. The `show` view and `edit` form still render the value — you routed to
+  one record deliberately, and a form has to show what it is editing.
+  `generate` also prints the `autumn credentials edit` next step naming the
+  exact key material the new column needs.
 
 - **`MarkdownRegistry::static_params_for(param)`:** derive SSG params for a
   `#[static_get]` route whose path parameter is not named `slug` — e.g.

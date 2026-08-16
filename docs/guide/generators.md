@@ -192,10 +192,37 @@ autumn generate scaffold Account 'api_token:String{encrypted}:unique'
 #   `{encrypted:deterministic}` to support `find_by`/`exists_by` equality lookups …
 ```
 
-The same refusal covers `--unique`, `--query find_by_x:x`, `--searchable` (FTS
-would index ciphertext) and `--default` (a defaulted column bypasses the
-encrypting insert). Encrypted columns are also left out of the index view's
-sortable headers, since the database would order by envelope bytes.
+That refusal covers `:unique`/`--unique`, `--query find_by_x:x`, and `--index`
+— switching to `{encrypted:deterministic}` is the fix for all three. A second
+set of refusals applies to **both** modes, because no mode makes them work:
+`--searchable` (full-text search indexes the stored ciphertext, so plaintext
+searches never match), `--default` (a defaulted column bypasses the insert path
+that encrypts), `--shard-key` (the shard is chosen by hashing the stored
+value), `Option<…>`, a non-text field kind, a `:states(…)` state machine, and
+deriving a `slug{from:…}` from an encrypted column — a slug is stored in its
+own plaintext column *and* used as the record's URL.
+
+### What the generated app does and does not hide
+
+`#[encrypted]` protects data **at rest**. In Rust the column is a plain
+`String`, so what the generated app *renders* is a separate choice, and the
+scaffold makes these:
+
+- the **index table** shows `••••••••`, with no sort link — a list is a
+  bulk-disclosure surface, and ordering by envelope bytes is meaningless;
+- the **`show` view and the `edit` form** render the real value: you routed to
+  one record deliberately, and a form has to show what it is editing;
+- the **CSV export** omits the column entirely, matching the admin panel's own
+  export — a downloaded file leaves the app;
+- the **admin** redacts it (`••••••••`) and will not sort by it;
+- an `--api` scaffold **omits it from JSON responses** — `#[encrypted]` implies
+  `#[serde(skip_serializing)]` unless the field opts in with
+  `#[encrypted(admin_visible)]`. The column can still be *written* over the API.
+
+All of that is ordinary generated code; edit any of it if your app wants
+different behavior. One surface the generator cannot guard is a runtime
+`?filter[col]=` / `?sort=` query naming an encrypted column: it matches nothing
+and orders by ciphertext.
 
 One requirement remains yours: key material. `autumn generate` prints the exact
 next step, and the app fails fast in production without it:

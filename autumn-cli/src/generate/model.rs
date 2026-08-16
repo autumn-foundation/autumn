@@ -4,7 +4,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::dsl::{Field, FieldConstraints, FieldKind, IdType, parse_fields};
+use super::dsl::{
+    EncryptedMode, Field, FieldConstraints, FieldKind, IdType, parse_fields,
+    randomized_equality_lookup_reason,
+};
 use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
@@ -185,8 +188,11 @@ fn plan_model_with_options_impl(
     // Issue #1340: the flag spellings of "make this encrypted column
     // equality-queryable"/"give it a default" only become visible once
     // `--unique`/`--default` have been folded in, so this runs after
-    // `apply_unique_flags` and before anything is emitted.
-    validate_encrypted_fields(&fields, options)?;
+    // `apply_unique_flags` and before anything is emitted. Generation-only —
+    // see the function's contract for why `destroy` must skip it.
+    if !for_revert {
+        validate_encrypted_fields(&fields, options)?;
+    }
     let pascal_name = pascal(name);
     validate_enum_field_collisions(&pascal_name, &fields)?;
     let metadata = parse_model_metadata(&fields, options)?;
@@ -1809,20 +1815,11 @@ pub fn parse_model_metadata(
                 field.rust_type()
             )));
         }
-        // Issue #1340: full-text search builds the stored `search_vector` from
-        // the DATABASE column value, which for an encrypted column is
-        // ciphertext — so a plaintext search would never match. The `#[model]`
-        // macro rejects `#[searchable]` + `#[encrypted]` outright; mirror that
-        // here so the failure names the field at generate time instead of
-        // surfacing as a macro error in the generated app.
-        if field.is_encrypted() {
-            return Err(GenerateError::Config(format!(
-                "--searchable field '{field_name}' is `{{encrypted}}`: full-text search indexes \
-                 the stored column, which holds ciphertext, so plaintext searches would never \
-                 match (the `#[model]` macro rejects `#[searchable]` on an encrypted field). \
-                 Drop it from --searchable, or keep a separate non-encrypted column to search."
-            )));
-        }
+        // NOTE: the `--searchable` + `{encrypted}` refusal deliberately lives in
+        // `validate_encrypted_fields`, not here — this function also runs while
+        // planning a `destroy`, where a generation-only refusal would strand the
+        // files the user is trying to remove (see this function's contract
+        // above, and `plan_model_with_options_for_revert`).
         let weight = b"ABCD"[i.min(3)] as char;
         metadata.searchable.push((field_name.to_owned(), weight));
     }
@@ -1844,6 +1841,12 @@ pub fn parse_model_metadata(
 /// (non-`String` kinds, `Option<…>`, `:unique`, `:states(…)`). What is left are
 /// the *flag* spellings, which only exist once the caller's options are known.
 ///
+/// Generation-only, like [`validate_lock_version_field`]: `autumn destroy`
+/// recomputes the plan it is about to revert, and refusing there would strand
+/// the very files the user asked to delete — before `Plan::revert` ever sees
+/// `--force`. Nothing these rules reject can be generated in the first place
+/// today, but the destroy path must not depend on that staying true.
+///
 /// # Errors
 /// [`GenerateError::InvalidField`] naming the offending field and the fix.
 pub fn validate_encrypted_fields(
@@ -1859,7 +1862,58 @@ pub fn validate_encrypted_fields(
         if field.is_randomized_encrypted() && field.unique {
             return Err(GenerateError::InvalidField {
                 token: field.name.clone(),
-                reason: super::dsl::randomized_equality_lookup_reason(&field.name, "is `unique`"),
+                reason: randomized_equality_lookup_reason(&field.name, "is `unique`"),
+            });
+        }
+        // `--index` is the third spelling of "make this column
+        // equality-queryable". A B-tree index over RANDOMIZED ciphertext can
+        // never serve a lookup — every write produces a different key for the
+        // same plaintext — so it is pure write amplification that also
+        // advertises a queryability the column does not have. (On a
+        // deterministic column the index is genuinely useful, which is the
+        // whole point of that mode, so it is allowed.)
+        if field.is_randomized_encrypted() && options.indexes.iter().any(|i| i.trim() == field.name)
+        {
+            return Err(GenerateError::InvalidField {
+                token: field.name.clone(),
+                reason: randomized_equality_lookup_reason(&field.name, "has an `--index`"),
+            });
+        }
+        // The shard key routes a query to a physical shard by hashing the
+        // value the caller supplies. For a randomized column the caller only
+        // ever holds plaintext, whose ciphertext differs on every write, so no
+        // lookup could resolve the shard; for a deterministic one the shard
+        // assignment would leak plaintext equality at the topology level.
+        if options.shard_key.as_deref().map(str::trim) == Some(field.name.as_str()) {
+            return Err(GenerateError::InvalidField {
+                token: field.name.clone(),
+                reason: format!(
+                    "field '{}' is `{{encrypted}}` and cannot be the `--shard-key`: the shard is \
+                     chosen by hashing the column value, which is ciphertext on disk — a \
+                     randomized column hashes differently on every write, and a deterministic \
+                     one would leak plaintext equality through shard placement. Shard on a \
+                     non-encrypted column (e.g. `tenant_id`).",
+                    field.name
+                ),
+            });
+        }
+        // Full-text search builds the stored `search_vector` from the DATABASE
+        // column value, which for an encrypted column is ciphertext — so a
+        // plaintext search would never match, in EITHER mode. The `#[model]`
+        // macro rejects `#[searchable]` + `#[encrypted]` outright; mirror that
+        // here so the failure names the field at generate time instead of
+        // surfacing as a macro error in the generated app.
+        if options.searchable.iter().any(|s| s.trim() == field.name) {
+            return Err(GenerateError::InvalidField {
+                token: field.name.clone(),
+                reason: format!(
+                    "field '{}' is `{{encrypted}}` and cannot be `--searchable`: full-text \
+                     search indexes the stored column, which holds ciphertext, so plaintext \
+                     searches would never match (the `#[model]` macro refuses `#[searchable]` \
+                     + `#[encrypted]`). Drop it from `--searchable`, or keep a separate \
+                     non-encrypted column to search.",
+                    field.name
+                ),
             });
         }
         // `#[encrypted]` columns must flow through the encrypting `serialize_as`
@@ -1906,32 +1960,28 @@ pub fn encryption_key_material_warning(fields: &[Field]) -> Option<String> {
     }
     let deterministic = fields
         .iter()
-        .any(|f| f.encrypted_mode() == Some(super::dsl::EncryptedMode::Deterministic));
-    // Name the credentials as dotted paths, matching the runtime's own
+        .any(|f| f.encrypted_mode() == Some(EncryptedMode::Deterministic));
+    // One flowing paragraph, like every other `plan.warn` — `Plan::print_warnings`
+    // prefixes `Warning: ` and does no continuation-line handling, so an
+    // embedded TOML block would hang off that prefix at the wrong indent. The
+    // credentials are named as dotted paths, matching the runtime's own
     // "Attribute encryption misconfiguration" diagnostic, so the two are
-    // greppable against each other.
-    let mut warning = String::from(
-        "This model has at-rest encrypted column(s). Reads and writes will fail until key \
-         material exists: set `active_record_encryption.primary_key` and \
-         `active_record_encryption.key_derivation_salt`",
-    );
-    if deterministic {
-        warning.push_str(
-            " (plus `active_record_encryption.deterministic_key`, required by the \
-             deterministic column(s) declared here)",
-        );
-    }
-    warning.push_str(
-        ". Run `autumn credentials edit` and add:\n    \
-         [active_record_encryption]\n    \
-         primary_key         = \"<openssl rand -hex 32>\"\n    \
-         key_derivation_salt = \"<openssl rand -hex 16>\"",
-    );
-    if deterministic {
-        warning.push_str("\n    deterministic_key   = \"<openssl rand -hex 32>\"");
-    }
-    warning.push_str("\n  See docs/guide/attribute-encryption.md.");
-    Some(warning)
+    // greppable against each other; the guide carries the block to paste.
+    let extra = if deterministic {
+        " and `active_record_encryption.deterministic_key` (required by the \
+         deterministic column(s) declared here)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "This model has at-rest encrypted column(s), which are inert until key material \
+         exists: reads and writes of them fail in dev and the app refuses to boot in \
+         production. Run `autumn credentials edit` and set \
+         `active_record_encryption.primary_key`, \
+         `active_record_encryption.key_derivation_salt`{extra} — each a fresh \
+         `openssl rand -hex 32` (16 for the salt). \
+         See docs/guide/attribute-encryption.md."
+    ))
 }
 
 fn split_key_value(token: &str, sep: char) -> Result<(&str, &str), GenerateError> {
@@ -2550,8 +2600,12 @@ fn render_model_file(
         // model source to redact the column, so the spelling here is a
         // contract, not cosmetics. Absent for a plaintext column — that no-op
         // path is what keeps unencrypted output byte-identical.
-        if let Some(attribute) = f.encrypted_attribute() {
-            let _ = writeln!(out, "    {attribute}");
+        match f.encrypted_mode() {
+            Some(EncryptedMode::Randomized) => out.push_str("    #[encrypted]\n"),
+            Some(EncryptedMode::Deterministic) => {
+                out.push_str("    #[encrypted(deterministic)]\n");
+            }
+            None => {}
         }
         // Issue #1255: a `richtext` column renders as a bare `String`, exactly
         // like `String`/`Text`, so nothing in the emitted source would otherwise
@@ -6313,6 +6367,121 @@ autumn-web = \"0.3\"\n";
         assert!(
             msg.contains("lock_version") && msg.contains("non-nullable"),
             "the nullability guard must be what rejects it: {msg}"
+        );
+    }
+
+    /// Review finding (AC6 hole): `--index` is the third spelling of "make this
+    /// column equality-queryable". A B-tree index over randomized ciphertext
+    /// can never serve a lookup, so it is pure write amplification that also
+    /// advertises a queryability the column does not have.
+    #[test]
+    fn index_flag_on_randomized_encrypted_field_is_rejected() {
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Account",
+            &["api_token:String{encrypted}".into()],
+            "20260427000000",
+            &ModelOptions {
+                indexes: vec!["api_token".into()],
+                ..ModelOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("api_token"), "must name the field: {msg}");
+        assert!(
+            msg.contains("deterministic"),
+            "must point at the fix: {msg}"
+        );
+    }
+
+    /// …but on a DETERMINISTIC column an index is exactly what makes the mode
+    /// worth its equality-leakage cost, so it is allowed.
+    #[test]
+    fn index_flag_on_deterministic_encrypted_field_is_allowed() {
+        let tmp = project();
+        let plan = plan_model_with_options(
+            tmp.path(),
+            "Account",
+            &["email:String{encrypted:deterministic}".into()],
+            "20260427000000",
+            &ModelOptions {
+                indexes: vec!["email".into()],
+                ..ModelOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_accounts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("CREATE INDEX idx_accounts_email ON accounts (email);"),
+            "up.sql: {up}"
+        );
+    }
+
+    /// Review finding: the shard is chosen by hashing the column value, which
+    /// is ciphertext on disk — unusable for a randomized column, and a
+    /// plaintext-equality leak at the topology level for a deterministic one.
+    #[test]
+    fn shard_key_on_an_encrypted_field_is_rejected() {
+        for mode in ["encrypted", "encrypted:deterministic"] {
+            let tmp = project();
+            let err = plan_model_with_options(
+                tmp.path(),
+                "Account",
+                &[format!("tenant:String{{{mode}}}")],
+                "20260427000000",
+                &ModelOptions {
+                    sharded: true,
+                    shard_key: Some("tenant".into()),
+                    ..ModelOptions::default()
+                },
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("tenant"), "must name the field: {msg}");
+            assert!(msg.contains("shard-key"), "must name the flag: {msg}");
+        }
+    }
+
+    /// The generation-only encryption refusals must NOT fire while `destroy`
+    /// recomputes the plan it is about to revert — that would strand exactly
+    /// the files the user asked to delete, before `Plan::revert` ever sees
+    /// `--force`. (Same posture as `validate_lock_version_field`.)
+    #[test]
+    fn destroy_recompute_skips_the_generation_only_encryption_refusals() {
+        let tmp = project();
+        let options = ModelOptions {
+            uniques: vec!["api_token".into()],
+            ..ModelOptions::default()
+        };
+        // Generating this is refused…
+        assert!(
+            plan_model_with_options(
+                tmp.path(),
+                "Account",
+                &["api_token:String{encrypted}".into()],
+                "20260427000000",
+                &options,
+            )
+            .is_err()
+        );
+        // …but recomputing it for a destroy must still produce a plan.
+        assert!(
+            plan_model_with_options_for_revert(
+                tmp.path(),
+                "Account",
+                &["api_token:String{encrypted}".into()],
+                "20260427000000",
+                &options,
+            )
+            .is_ok(),
+            "destroy must be able to recompute a plan it is about to revert"
         );
     }
 }

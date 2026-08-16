@@ -79,17 +79,6 @@ pub enum EncryptedMode {
 }
 
 impl EncryptedMode {
-    /// The exact `#[encrypted(...)]` attribute line the model generator emits
-    /// for this mode, in the spelling the `#[model]` macro parses (a bare path
-    /// for randomized, a `deterministic` option otherwise).
-    #[must_use]
-    pub const fn attribute(self) -> &'static str {
-        match self {
-            Self::Randomized => "#[encrypted]",
-            Self::Deterministic => "#[encrypted(deterministic)]",
-        }
-    }
-
     /// Parse the value half of an `encrypted:<mode>` modifier.
     ///
     /// `admin_visible` and `versioned_ciphertext` are real `#[encrypted(...)]`
@@ -344,16 +333,6 @@ impl Field {
     #[must_use]
     pub const fn is_randomized_encrypted(&self) -> bool {
         matches!(self.constraints.encrypted, Some(EncryptedMode::Randomized))
-    }
-
-    /// The `#[encrypted(...)]` attribute line the model generator emits for
-    /// this field, or `None` when the column is not encrypted.
-    #[must_use]
-    pub const fn encrypted_attribute(&self) -> Option<&'static str> {
-        match self.constraints.encrypted {
-            Some(mode) => Some(mode.attribute()),
-            None => None,
-        }
     }
 
     /// For a [`FieldKind::References`] field, the referenced table name —
@@ -689,6 +668,36 @@ impl FieldKind {
         match backend {
             DatabaseBackend::Postgres => self.schema_type(),
             DatabaseBackend::Sqlite => self.sqlite_schema_type(),
+        }
+    }
+
+    /// The DSL token a user writes for this kind, for error messages that need
+    /// to name the field's *declared* type rather than its Rust storage type.
+    ///
+    /// [`FieldKind::rust_type`] is the wrong thing to report in a diagnostic
+    /// about the DSL: `richtext`, `enum{…}` and `slug{…}` all render as
+    /// `String` in Rust, so "only applies to `String` fields … got a `String`
+    /// field" is what a user would see for `body:richtext{encrypted}`.
+    #[must_use]
+    pub const fn dsl_token(self) -> &'static str {
+        match self {
+            Self::String => "String",
+            Self::Text => "Text",
+            Self::RichText => "richtext",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::Bool => "bool",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+            Self::Uuid => "Uuid",
+            Self::NaiveDateTime => "NaiveDateTime",
+            Self::DateTime => "DateTime",
+            Self::Bytea => "Bytea",
+            Self::Attachment => "Attachment",
+            Self::References => "references",
+            Self::Enum => "enum{…}",
+            Self::Decimal { .. } => "decimal{…}",
+            Self::Slug => "slug{…}",
         }
     }
 
@@ -1158,18 +1167,24 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
                     .into(),
             });
         }
-        // A `:states(…)` column is a low-entropy closed set. Randomized mode
-        // makes every state query impossible; deterministic mode leaks each
-        // row's state through ciphertext equality — the exact case the
-        // encryption guide warns never to use deterministic mode for. Neither
-        // is what the author meant, so refuse the pair.
+        // The concrete blocker: the scaffold's generated transition handler
+        // writes the new state with a RAW `diesel::update(...).set(col.eq(
+        // new_state))`, which never passes through the `serialize_as` wrapper
+        // that encrypts the column — so every transition would store PLAINTEXT
+        // in a column the reader then tries to decrypt. (Encrypting a state
+        // column is also semantically wrong: it is a low-entropy closed set, so
+        // randomized mode makes state queries impossible and deterministic mode
+        // leaks every row's state through ciphertext equality.) Refuse the pair
+        // rather than half-support it.
         if state_machine.is_some() {
             return Err(GenerateError::InvalidField {
                 token: token.to_owned(),
                 reason: "an `encrypted` field cannot also declare a `states(…)` state machine: \
-                         a state column is a low-entropy closed set, so randomized encryption \
-                         would make state queries impossible and deterministic encryption would \
-                         leak every row's state through ciphertext equality."
+                         the generated transition handler writes the new state with a raw \
+                         `UPDATE … SET col = 'state'` that bypasses encryption, so transitions \
+                         would store plaintext in the encrypted column. (A state column is also \
+                         a low-entropy closed set, where randomized mode makes state queries \
+                         impossible and deterministic mode leaks every row's state.)"
                     .into(),
             });
         }
@@ -1414,8 +1429,13 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
             match key.trim() {
                 "label" => set_label_constraint(&mut c, value.trim(), is_reference)?,
                 "from" => set_from_constraint(&mut c, value.trim(), is_slug)?,
+                // The kind check runs FIRST: on `count:i64{encrypted:bogus}` the
+                // useful diagnosis is that `encrypted` doesn't apply to an
+                // `i64` at all, not that `bogus` isn't a mode.
                 "encrypted" => {
-                    set_encrypted_constraint(&mut c, EncryptedMode::parse(value.trim())?, kind)?;
+                    reject_encrypted_on_kind(kind)?;
+                    reject_repeated_encrypted(&c)?;
+                    c.encrypted = Some(EncryptedMode::parse(value.trim())?);
                 }
                 other => return Err(unknown_constraint_message(other, kind)),
             }
@@ -1435,7 +1455,11 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
                 }
                 // A bare `{encrypted}` is the safe default mode, exactly like a
                 // bare `#[encrypted]` attribute.
-                "encrypted" => set_encrypted_constraint(&mut c, EncryptedMode::Randomized, kind)?,
+                "encrypted" => {
+                    reject_encrypted_on_kind(kind)?;
+                    reject_repeated_encrypted(&c)?;
+                    c.encrypted = Some(EncryptedMode::Randomized);
+                }
                 _ => return Err(unknown_constraint_message(tok, kind)),
             }
         }
@@ -1625,9 +1649,8 @@ fn set_from_constraint(c: &mut FieldConstraints, value: &str, is_slug: bool) -> 
     Ok(())
 }
 
-/// Record a `{encrypted}` / `{encrypted:<mode>}` modifier (issue #1340),
-/// rejecting it on any field kind the `#[encrypted]` attribute macro does not
-/// support.
+/// Reject a `{encrypted}` modifier on any field kind the `#[encrypted]`
+/// attribute macro does not support (issue #1340).
 ///
 /// v1 of the encryption runtime accepts **non-null `String` columns only**
 /// (`autumn-macros`' `validate_encrypted_field`): the plaintext is held in
@@ -1639,21 +1662,40 @@ fn set_from_constraint(c: &mut FieldConstraints, value: &str, is_slug: bool) -> 
 /// the DSL says so plainly instead of generating broken code.) The nullability
 /// half of that rule is enforced in [`parse_field`], which is where the
 /// `Option<…>` wrapper has already been peeled off.
-fn set_encrypted_constraint(
-    c: &mut FieldConstraints,
-    mode: EncryptedMode,
-    kind: FieldKind,
-) -> Result<(), String> {
-    if !matches!(kind, FieldKind::String | FieldKind::Text) {
-        return Err(format!(
-            "the `encrypted` modifier only applies to `String`/`Text` fields; \
-             `#[encrypted]` supports non-null `String` columns in v1 (encrypt structured \
-             data before storing it). Got a `{}` field.",
-            kind.rust_type()
-        ));
+/// Refuse a second `encrypted` modifier in the same `{…}` block (issue #1340).
+///
+/// The other repeatable modifiers last-win harmlessly (`{min=1,min=2}` is just
+/// a sloppier `{min=2}`), but a repeated `encrypted` silently changes the
+/// *security* of the column in whichever direction the last token happens to
+/// name: `{encrypted,encrypted:deterministic}` quietly upgrades a randomized
+/// declaration to deterministic — trading away plaintext-equality hiding — and
+/// `{encrypted:deterministic,encrypted}` quietly takes away the equality
+/// lookups the author asked for. Neither should be inferred from token order.
+fn reject_repeated_encrypted(c: &FieldConstraints) -> Result<(), String> {
+    if c.encrypted.is_some() {
+        return Err(
+            "the `encrypted` modifier is declared more than once — the modes differ in what \
+             they leak, so the mode must be unambiguous. Keep exactly one of `encrypted` \
+             (randomized) or `encrypted:deterministic`."
+                .to_owned(),
+        );
     }
-    c.encrypted = Some(mode);
     Ok(())
+}
+
+fn reject_encrypted_on_kind(kind: FieldKind) -> Result<(), String> {
+    if matches!(kind, FieldKind::String | FieldKind::Text) {
+        return Ok(());
+    }
+    // Name the DSL token, not `rust_type()` — `richtext`, `enum{…}` and `slug`
+    // all render as `String` in Rust, so reporting the Rust type would produce
+    // the self-contradicting "only applies to `String` … Got a `String` field".
+    Err(format!(
+        "the `encrypted` modifier only applies to `String`/`Text` fields; \
+         `#[encrypted]` supports non-null `String` columns in v1 (encrypt structured \
+         data before storing it). Got a `{}` field.",
+        kind.dsl_token()
+    ))
 }
 
 /// A per-kind "unknown constraint" message that names the offending token and
@@ -1954,6 +1996,28 @@ fn validate_slug_fields(tokens: &[String], fields: &[Field]) -> Result<(), Gener
                      slug can only derive from a String/Text/richtext field",
                     slug_field.name,
                     source.rust_type()
+                ),
+            });
+        }
+        // Issue #1340: a slug is derived by `slugify`ing the source value and
+        // is then stored in its OWN plaintext, UNIQUE-indexed column *and* used
+        // as the record's route key. Deriving one from an `{encrypted}` column
+        // would therefore write a lightly-mangled copy of the secret to disk in
+        // the clear (defeating the encryption entirely), leak plaintext
+        // equality through the unique index, and put it in URL paths — where it
+        // reaches access logs, `Referer` headers, browser history, and proxy
+        // caches. Refuse the pair outright; there is no mode of encryption that
+        // makes it safe.
+        if source.is_encrypted() {
+            return Err(GenerateError::InvalidField {
+                token,
+                reason: format!(
+                    "slug field '{}' derives `from:{from}`, but '{from}' is `{{encrypted}}`: \
+                     the slug is stored in its own PLAINTEXT column and used as the record's \
+                     URL, so deriving it from an encrypted column would write the secret to \
+                     disk in the clear and put it in every request path. Derive the slug from \
+                     a non-encrypted field instead.",
+                    slug_field.name
                 ),
             });
         }
@@ -3221,7 +3285,6 @@ mod tests {
         assert_eq!(f.encrypted_mode(), Some(EncryptedMode::Randomized));
         assert!(f.is_encrypted());
         assert!(f.is_randomized_encrypted());
-        assert_eq!(f.encrypted_attribute(), Some("#[encrypted]"));
     }
 
     #[test]
@@ -3233,7 +3296,6 @@ mod tests {
         assert_eq!(f.encrypted_mode(), Some(EncryptedMode::Deterministic));
         assert!(f.is_encrypted());
         assert!(!f.is_randomized_encrypted());
-        assert_eq!(f.encrypted_attribute(), Some("#[encrypted(deterministic)]"));
     }
 
     #[test]
@@ -3242,7 +3304,6 @@ mod tests {
         // option; the DSL mirrors it so a reader can spell out the choice.
         let f = parse_field("token:String{encrypted:randomized}").unwrap();
         assert_eq!(f.encrypted_mode(), Some(EncryptedMode::Randomized));
-        assert_eq!(f.encrypted_attribute(), Some("#[encrypted]"));
     }
 
     #[test]
@@ -3270,7 +3331,6 @@ mod tests {
         assert_eq!(f.encrypted_mode(), None);
         assert!(!f.is_encrypted());
         assert!(!f.is_randomized_encrypted());
-        assert_eq!(f.encrypted_attribute(), None);
     }
 
     #[test]
@@ -3297,35 +3357,113 @@ mod tests {
     #[test]
     fn encrypted_modifier_on_non_string_kinds_is_rejected() {
         // R2: every non-`String`/`Text` kind is rejected at parse time with a
-        // message naming the v1 limitation — including `Bytea`, which the
-        // issue's AC text mentions but the runtime does not support.
-        for token in [
-            "payload:Bytea{encrypted}",
-            "count:i64{encrypted}",
-            "ratio:f64{encrypted}",
-            "flag:bool{encrypted}",
-            "at:DateTime{encrypted}",
-            "body:richtext{encrypted}",
-            "post:references{encrypted}",
-            "slug:slug{from:title,encrypted}",
+        // message naming the v1 limitation — including `Bytea` (and its
+        // `Vec<u8>` spelling), which the issue's AC text mentions but the
+        // runtime does not support.
+        //
+        // The assertion is on the REASON and the kind it names, never on the
+        // echoed token: `GenerateError::InvalidField` renders as
+        // `invalid field '{token}': {reason}`, so a token containing the word
+        // "encrypted" would satisfy `contains("encrypted")` for ANY failure —
+        // including an unrelated parse error that never reached this check.
+        for (token, kind_name) in [
+            ("payload:Bytea{encrypted}", "Bytea"),
+            ("payload:Vec<u8>{encrypted}", "Bytea"),
+            ("count:i64{encrypted}", "i64"),
+            ("ratio:f64{encrypted}", "f64"),
+            ("flag:bool{encrypted}", "bool"),
+            ("at:DateTime{encrypted}", "DateTime"),
+            ("body:richtext{encrypted}", "richtext"),
+            ("post:references{encrypted}", "references"),
+            ("handle:slug{from:title,encrypted}", "slug{…}"),
         ] {
             let err = parse_field(token).unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("encrypted"),
-                "`{token}` must be rejected naming the modifier: {msg}"
+                msg.contains("the `encrypted` modifier only applies to `String`/`Text` fields"),
+                "`{token}` must be rejected by the kind guard: {msg}"
+            );
+            // `richtext`, `slug{…}` and `enum{…}` all render as `String` in
+            // Rust, so the message must name the DECLARED kind or it reads
+            // "only applies to String … got a String field".
+            assert!(
+                msg.contains(&format!("Got a `{kind_name}` field")),
+                "`{token}` must name the declared kind `{kind_name}`: {msg}"
             );
         }
     }
 
     #[test]
+    fn encrypted_modifier_on_nullable_text_alias_is_rejected() {
+        // The `Option<Text>` spelling hits the same non-null rule as
+        // `Option<String>`.
+        let err = parse_field("notes:Option<Text>{encrypted}").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be nullable"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn encrypted_modifier_tolerates_whitespace_around_the_mode() {
+        let f = parse_field("email:String{ encrypted : deterministic }").unwrap();
+        assert_eq!(f.encrypted_mode(), Some(EncryptedMode::Deterministic));
+    }
+
+    #[test]
+    fn repeated_encrypted_modifier_is_rejected() {
+        // Last-wins would SILENTLY change what the column leaks: the first form
+        // below would upgrade a randomized declaration to deterministic, the
+        // second would take away the equality lookups the author asked for.
+        for token in [
+            "token:String{encrypted,encrypted:deterministic}",
+            "token:String{encrypted:deterministic,encrypted}",
+            "token:String{encrypted,encrypted}",
+        ] {
+            let err = parse_field(token).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("declared more than once"),
+                "`{token}` must be refused as ambiguous: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_mode_error_prefers_the_kind_diagnosis() {
+        // On `count:i64{encrypted:bogus}` the useful diagnosis is that
+        // `encrypted` does not apply to an `i64` at all — not that `bogus`
+        // is not a mode.
+        let err = parse_field("count:i64{encrypted:bogus}").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("only applies to `String`/`Text` fields"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn encrypted_modifier_on_enum_field_is_rejected() {
-        // `enum{…}`'s braces are part of the TYPE, so the modifier can only be
-        // spelled as a trailing block; either spelling must be refused.
+        // `enum{…}`'s braces are part of the TYPE, so `enum{a,b}{encrypted}`
+        // never even reaches the constraint parser — the variant list swallows
+        // the second block and fails as a bad variant name. That is a fine
+        // outcome (the token IS malformed), but it proves nothing about
+        // encryption, so assert the case that does: an `enum` field reaching
+        // the kind guard through the `Option<…>`-free scalar path.
         let err = parse_field("status:enum{draft,published}{encrypted}").unwrap_err();
         assert!(
-            err.to_string().contains("encrypted") || err.to_string().contains("enum"),
+            err.to_string()
+                .contains("not a valid snake_case identifier")
+                || err
+                    .to_string()
+                    .contains("only applies to `String`/`Text` fields"),
             "unexpected error: {err}"
+        );
+        // The kind guard itself refuses `Enum`, named as the DSL token.
+        assert!(
+            reject_encrypted_on_kind(FieldKind::Enum)
+                .unwrap_err()
+                .contains("Got a `enum{…}` field")
         );
     }
 
@@ -3367,8 +3505,12 @@ mod tests {
         // what the author meant.
         let err = parse_field("status:String{encrypted}:states(draft -> published)").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("encrypted"), "must name the modifier: {msg}");
-        assert!(msg.contains("states"), "must name the conflict: {msg}");
+        // Assert the REASON, not the echoed token — which contains both
+        // "encrypted" and "states" for free.
+        assert!(
+            msg.contains("bypasses encryption"),
+            "must name the concrete blocker (the transition handler's raw write): {msg}"
+        );
     }
 
     #[test]
@@ -3394,6 +3536,32 @@ mod tests {
         let f = parse_field("email:String{encrypted:deterministic}:unique").unwrap();
         assert!(f.unique);
         assert_eq!(f.encrypted_mode(), Some(EncryptedMode::Deterministic));
+    }
+
+    #[test]
+    fn slug_cannot_derive_from_an_encrypted_field() {
+        // A slug is stored in its own PLAINTEXT, unique-indexed column and used
+        // as the route key, so deriving one from an encrypted column would put
+        // a lightly-mangled copy of the secret on disk in the clear and in
+        // every URL. Neither mode makes that safe.
+        for mode in ["encrypted", "encrypted:deterministic"] {
+            let err = parse_fields(&[
+                format!("api_token:String{{{mode}}}"),
+                "handle:slug{from:api_token}".to_owned(),
+            ])
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("api_token"), "must name the source: {msg}");
+            assert!(msg.contains("encrypted"), "must name the reason: {msg}");
+        }
+        // Deriving from a plaintext sibling is still fine on the same model.
+        let fields = parse_fields(&[
+            "title:String".to_owned(),
+            "api_token:String{encrypted}".to_owned(),
+            "handle:slug{from:title}".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(fields.len(), 3);
     }
 
     #[test]

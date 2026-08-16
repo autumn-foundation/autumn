@@ -42,10 +42,14 @@ autumn generate scaffold Account username:String \
 That emits the `#[encrypted]` / `#[encrypted(deterministic)]` attributes shown
 above, an unbounded `TEXT` column sized for the ciphertext envelope, and an
 admin that redacts the column — no hand-editing. `{encrypted}` is `String`/`Text`
-and non-null only (matching the v1 attribute), and the generator refuses to pair
-randomized encryption with `:unique`, `--query`, `--searchable`, or `--default`,
-so you find out at generate time rather than at runtime. See the
-[generators guide](./generators.md#encrypted-columns-with-encrypted).
+and non-null only (matching the v1 attribute). The generator refuses randomized
+encryption anywhere an equality lookup would be generated (`:unique`/`--unique`,
+`--query`, `--index`), pointing at `deterministic`; and refuses *both* modes
+where no mode would work (`--searchable`, `--default`, `--shard-key`, a
+`:states(…)` state machine, or a `slug{from:…}` derived from the column). So you
+find out at generate time rather than at runtime. See the
+[generators guide](./generators.md#encrypted-columns-with-encrypted), which also
+lists exactly which generated surfaces render the value and which hide it.
 
 To encrypt a column that already exists, use the backfill migration instead —
 `autumn generate migration EncryptApiTokenOnAccounts` — and read

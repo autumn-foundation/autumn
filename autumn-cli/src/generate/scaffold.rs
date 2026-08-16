@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use super::dsl::{EncryptedMode, Field, FieldKind, IdType, parse_fields};
+use super::dsl::{
+    EncryptedMode, Field, FieldKind, IdType, parse_fields, randomized_equality_lookup_reason,
+};
 use super::emit::{Action, Plan, Revert};
 use super::model::{
     ModelOptions, augment_fields_for_soft_delete, field_by_name, parse_model_metadata,
@@ -591,7 +593,7 @@ fn plan_scaffold_with_options_impl(
             slug.name
         )));
     }
-    let queries = parse_query_specs(&fields, &options_with_key.queries)?;
+    let queries = parse_query_specs(&fields, &options_with_key.queries, for_revert)?;
     let form_fields = fields
         .iter()
         .filter(|field| !metadata.defaults().contains_key(&field.name))
@@ -1857,9 +1859,14 @@ fn validate_enum_field_names_against_routes_imports(
     Ok(())
 }
 
+/// `for_revert` skips the generation-only refusals: `autumn destroy scaffold`
+/// recomputes the plan it is about to revert, and refusing there would strand
+/// the very files the user asked to delete (same posture as the `slug`/
+/// `lock_version` gates in `plan_scaffold_with_options_impl`).
 fn parse_query_specs(
     fields: &[Field],
     queries: &[String],
+    for_revert: bool,
 ) -> Result<Vec<QuerySpec>, GenerateError> {
     let mut parsed = Vec::with_capacity(queries.len());
     for query in queries {
@@ -1911,10 +1918,10 @@ fn parse_query_specs(
         // registry, which raises `EncryptionError::RandomizedEqualityLookup`
         // because a fresh nonce per write means the needle's ciphertext can
         // never equal the stored one. Refuse it where the fix is one word away.
-        if field.is_randomized_encrypted() {
+        if !for_revert && field.is_randomized_encrypted() {
             return Err(GenerateError::InvalidField {
                 token: query.clone(),
-                reason: crate::generate::dsl::randomized_equality_lookup_reason(
+                reason: randomized_equality_lookup_reason(
                     field_name,
                     "has a `--query` derived equality lookup",
                 ),
@@ -8193,9 +8200,20 @@ const CSV_TEXT_CELL_HELPER: &str = "\n\n\
 /// export, and a column that is always blank is noise in a spreadsheet.
 fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
     use std::fmt::Write as _;
+    // Issue #1340: an at-rest encrypted column is excluded from the export. The
+    // model holds PLAINTEXT in memory, so including it would stream the
+    // decrypted secret of every listed row into a file that then lives outside
+    // the app entirely — a downloaded `.csv` in a Downloads folder, an email
+    // attachment, a shared drive. That is the one place the "plaintext in Rust,
+    // ciphertext at rest" bargain stops holding, and it is exactly why
+    // `autumn-admin-plugin`'s own `AdminModel::csv_export_columns` already
+    // filters `!f.encrypted`. The scaffolded export matches that posture rather
+    // than contradicting the admin for the same column. Re-add the column here
+    // (plus a matching `to_csv_record` entry) if the export genuinely needs it.
+    let exported: Vec<&Field> = fields.iter().filter(|f| !f.is_encrypted()).collect();
     let mut headers = String::from("\"id\"");
     let mut record = String::from("            self.id.to_string(),\n");
-    for f in fields {
+    for f in &exported {
         let _ = write!(headers, ", \"{}\"", f.name);
         let _ = writeln!(record, "            {},", csv_value_expr(f));
     }
@@ -8204,7 +8222,7 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
     // The formula guard is emitted only when some column actually routes through
     // it — an unused `fn` in the generated app is a `dead_code` warning, and the
     // scaffold's contract is that generated code compiles warning-free.
-    let text_cell_helper = if fields.iter().any(|f| csv_kind_is_text(f.kind)) {
+    let text_cell_helper = if exported.iter().any(|f| csv_kind_is_text(f.kind)) {
         CSV_TEXT_CELL_HELPER
     } else {
         ""
@@ -8232,6 +8250,12 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
          /// time-bounded URL the `show` view renders — a spreadsheet cell has no\n\
          /// use for a URL that expires. Drop the column here if those keys should\n\
          /// not leave the app.\n\
+         ///\n\
+         /// An at-rest `#[encrypted]` column is OMITTED entirely (issue #1340):\n\
+         /// the model holds plaintext in memory, so exporting it would write the\n\
+         /// decrypted secret of every listed row into a file that leaves the app.\n\
+         /// The admin panel's own CSV export omits encrypted columns for the same\n\
+         /// reason. Add the column to BOTH lists below if you really need it.\n\
          impl autumn_web::data::csv::CsvSchema for {pascal_name} {{\n    \
          fn csv_columns() -> &'static [&'static str] {{\n        \
          &[{headers}]\n    \
@@ -8337,9 +8361,24 @@ fn render_columns_vec(
         } else {
             cell_value_expr(f)
         };
+        // Issue #1340: an at-rest encrypted column renders a redaction marker in
+        // a LIST cell, never the decrypted value. A list is a bulk-disclosure
+        // surface — one page shows every row's secret at once, to everyone the
+        // index is authorized for, and ends up in screenshots, printouts, and
+        // page caches. The single-record `show` view and the `edit` form still
+        // render the real value: the reader routed there deliberately, for one
+        // record, and a form has to show what it is editing. That split mirrors
+        // the admin panel's own `.encrypted()` / `.encrypted_visible()`. The
+        // closure binds `_row` because the cell ignores it, keeping the
+        // generated app warning-free.
+        let (binding, cell_expr) = if f.is_encrypted() {
+            ("_row", "\"••••••••\"".to_owned())
+        } else {
+            ("row", cell_expr)
+        };
         let _ = writeln!(
             out,
-            "        autumn_web::widgets::Column::new(\"{header}\", |row: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
+            "        autumn_web::widgets::Column::new(\"{header}\", |{binding}: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
         );
     }
     // Show link column. Keyed off the slug (issue #1260) when the model has
@@ -21296,5 +21335,102 @@ exempt_paths = [
             "the nested create must not borrow an encrypted record:\n{routes}"
         );
         assert!(routes.contains(".values(new)"), "routes:\n{routes}");
+    }
+
+    /// Review finding: the scaffolded `GET /{plural}/export.csv` streamed the
+    /// DECRYPTED value of every encrypted column into a file that then leaves
+    /// the app entirely. `autumn-admin-plugin`'s own `csv_export_columns`
+    /// already filters `!f.encrypted`; the scaffold now matches it.
+    #[test]
+    fn scaffold_csv_export_omits_encrypted_columns() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+                "email:String{encrypted:deterministic}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+
+        assert!(
+            routes.contains(r#"&["id", "username", "created_at"]"#),
+            "the CSV header row must omit both encrypted columns:\n{routes}"
+        );
+        for leaked in ["self.api_token", "self.email"] {
+            assert!(
+                !routes.contains(leaked),
+                "an encrypted column must not reach `to_csv_record`: `{leaked}`\n{routes}"
+            );
+        }
+        // The plaintext column still exports, still through the formula guard.
+        assert!(
+            routes.contains("csv_text_cell(self.username.clone())"),
+            "routes:\n{routes}"
+        );
+    }
+
+    /// …and a scaffold whose ONLY text column is encrypted must not emit the
+    /// now-unused `csv_text_cell` helper: an unused `fn` is a `dead_code`
+    /// warning, and the scaffold's contract is warning-free generated code.
+    #[test]
+    fn scaffold_csv_export_drops_the_formula_guard_when_only_encrypted_text_remains() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &["views:i64".into(), "api_token:String{encrypted}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+        assert!(
+            !routes.contains("fn csv_text_cell"),
+            "no exported column is text-backed, so the guard must not be emitted:\n{routes}"
+        );
+    }
+
+    /// Review finding: the index table rendered every row's decrypted secret.
+    /// A list is a bulk-disclosure surface, so the cell is redacted; the
+    /// single-record `show` view still renders the real value.
+    #[test]
+    fn scaffold_index_redacts_encrypted_cells_but_show_does_not() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+
+        // Index column: redacted, and the closure binds `_row` so the generated
+        // app stays warning-free.
+        assert!(
+            routes.contains(
+                "Column::new(\"Api Token\", |_row: &Account| maud::html! { (\"••••••••\") })"
+            ),
+            "the index cell must be redacted:\n{routes}"
+        );
+        // Show view: the real value, because the reader routed to one record.
+        assert!(
+            routes.contains("(\"Api token\", maud::html! { (&row.api_token) })"),
+            "the show view must still render the value:\n{routes}"
+        );
+        // The plaintext sibling is untouched in both.
+        assert!(
+            routes.contains(
+                "Column::new(\"Username\", |row: &Account| maud::html! { (&row.username) })"
+            ),
+            "routes:\n{routes}"
+        );
     }
 }

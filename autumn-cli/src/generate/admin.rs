@@ -157,9 +157,14 @@ pub fn plan_admin_with_options(
     // Issue #1340: a `{encrypted}` field-DSL token is a second, independent
     // declaration that the column is sensitive. Fold it in so the admin redacts
     // it even if the on-disk model was hand-edited (or generated before the
-    // attribute existed) — the safe direction to disagree in is "hide it".
-    // Redundant with the AST detection above in the normal case; deduped
-    // because `AdminOptions::encrypted` is a plain list the renderer scans.
+    // attribute existed) — when the two sources disagree by omission, hide it.
+    //
+    // An explicit `#[encrypted(admin_visible)]` on the model is NOT overridden:
+    // that is a deliberate, hand-written opt-in to showing decrypted plaintext
+    // in the (authorization-gated) admin, and the DSL has no way to spell it,
+    // so a bare `{encrypted}` token must not silently revoke it. Redundant with
+    // the AST detection above in the normal case; deduped because
+    // `AdminOptions::encrypted` is a plain list the renderer scans.
     for field in &fields {
         if field.is_encrypted()
             && !options.encrypted.contains(&field.name)
@@ -870,6 +875,13 @@ fn render_apply_sort(
         .iter()
         .filter(|f| !options.exclude.contains(&f.name))
         .filter(|f| !is_lock_version_field(f, lock_version_field))
+        // At-rest encrypted columns hold a base64 envelope, so `ORDER BY` sorts
+        // by ciphertext bytes — arbitrary for a randomized column (and
+        // reshuffled by every write), and unrelated to plaintext order for a
+        // deterministic one. Falling through to the `id` default is honest;
+        // emitting an arm that claims to sort by a column it cannot is not.
+        // Same rationale as the scaffolded index's `.sortable(..)` suppression.
+        .filter(|f| !admin_field_is_encrypted(options, &f.name))
         .collect();
 
     let mut arms = String::new();
@@ -2298,6 +2310,68 @@ pub struct Account {
         assert!(
             admin.contains(".encrypted()"),
             "a DSL-declared encrypted column must be redacted:\n{admin}"
+        );
+    }
+
+    /// Review finding: the generated admin emitted `ORDER BY` arms for
+    /// encrypted columns, i.e. it sorted by base64 envelope bytes — arbitrary
+    /// for a randomized column and unrelated to plaintext order for a
+    /// deterministic one. Those arms are now omitted so the sort falls through
+    /// to the honest `id` default, matching the scaffolded index's
+    /// `.sortable(..)` suppression.
+    #[test]
+    fn admin_does_not_sort_by_encrypted_columns() {
+        let tokens = [
+            "username:String".to_owned(),
+            "api_token:String{encrypted}".to_owned(),
+        ];
+        let fields = crate::generate::dsl::parse_fields(&tokens).unwrap();
+        let model_source =
+            crate::generate::model::render_model_file_for_test("Account", "accounts", &fields);
+        let tmp = project_with_model_source("account", &model_source);
+        let plan = plan_admin(tmp.path(), "Account", &tokens).unwrap();
+        let admin = admin_adapter_contents(&plan);
+
+        assert!(
+            admin.contains("accounts::username.asc()"),
+            "a plaintext column keeps its sort arms:\n{admin}"
+        );
+        assert!(
+            !admin.contains("accounts::api_token.asc()")
+                && !admin.contains("accounts::api_token.desc()"),
+            "an encrypted column must not get an ORDER BY arm:\n{admin}"
+        );
+    }
+
+    /// Precedence when the model file and the DSL token disagree: an explicit,
+    /// hand-written `#[encrypted(admin_visible)]` is a deliberate opt-in the
+    /// DSL cannot spell, so a bare `{encrypted}` token must not silently revoke
+    /// it. (The reverse — a model with no attribute, a token that says
+    /// encrypted — fails closed and redacts; see the test above.)
+    #[test]
+    fn model_admin_visible_opt_in_wins_over_a_bare_encrypted_token() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Account {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   #[encrypted(admin_visible)]\n\
+            \x20   pub api_token: String,\n\
+            }\n";
+        let tmp = project_with_model_source("account", model_source);
+        let plan = plan_admin(
+            tmp.path(),
+            "Account",
+            &["api_token:String{encrypted}".to_owned()],
+        )
+        .unwrap();
+        let admin = admin_adapter_contents(&plan);
+        assert!(
+            admin.contains(".encrypted_visible()"),
+            "the model's explicit opt-in must survive:\n{admin}"
+        );
+        assert!(
+            !admin.contains(".encrypted()"),
+            "the column must not be marked both ways:\n{admin}"
         );
     }
 }

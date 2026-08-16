@@ -689,7 +689,7 @@ enum Commands {
     /// # Example
     ///
     ///   autumn generate scaffold Post title:String body:Text published:bool
-    ///   autumn generate scaffold Account `api_token:String{encrypted}`
+    ///   autumn generate scaffold Account 'token:String{encrypted}'
     #[command(subcommand, verbatim_doc_comment)]
     Generate(GenerateCommands),
 
