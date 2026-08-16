@@ -21,6 +21,7 @@ use super::model::{
     plan_cargo_deps, plan_model_with_options,
 };
 use super::naming::{humanize_label, pascal, pluralize, snake};
+use super::scaffold_i18n;
 use super::schema_edit::{
     add_mod_declaration, create_table_sql_with_metadata_and_id, ensure_autumn_web_feature,
     ensure_dependency_feature, ensure_dev_dependency_test_support,
@@ -76,6 +77,18 @@ pub struct ScaffoldOptions {
     /// the generated child model's `#[belongs_to(...)]` and a migration adding
     /// `{child}_count BIGINT NOT NULL DEFAULT 0` to the parent's table.
     pub counter_cache: bool,
+    /// Emit translatable views (issue #1349) — `--i18n`. Every user-facing
+    /// string in the generated HTML views (page titles, headings, buttons,
+    /// links, per-field labels) becomes a `t!(locale, "key")` lookup, each
+    /// view-rendering handler takes the `Locale` extractor, and the keys are
+    /// back-filled into `i18n/en.ftl` with their English values — so a
+    /// default-locale app renders exactly as it does without the flag, and
+    /// adding a locale is a `.ftl` file rather than a Rust edit.
+    ///
+    /// `false` (the default) keeps the scaffold's output byte-for-byte
+    /// unchanged: [`super::scaffold_i18n::ViewLabels`] is an identity function
+    /// over the literal expressions the plain path emits.
+    pub i18n: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,6 +475,54 @@ fn plan_scaffold_with_options_impl(
             ));
         }
     }
+    // Gate (issue #1349): `--i18n` rewrites the standard HTML views' strings
+    // into `t!(locale, "key")` lookups, which need a `Locale` extractor in scope
+    // at the render site. Two families of view code have no such scope:
+    //
+    //   * `--live`/`--live-validation` render list rows from a `LiveFragment`
+    //     impl driven by an SSE broadcast — there is no request, so no locale;
+    //   * `--belongs-to` renders the child list and inline create form through
+    //     the nested renderer, which splices markup into the PARENT resource's
+    //     already-generated `show` handler (whose signature this generator does
+    //     not own).
+    //
+    // Emitting half-translated views under a flag that promises translatable
+    // output is worse than refusing: the untranslated half only surfaces once
+    // someone adds a second locale. Same posture as the `slug` gates above.
+    //
+    // `for_revert` skips the gate so `autumn destroy scaffold` can still clean
+    // up a resource generated before a refusal existed (issue #1834).
+    if !for_revert && options.i18n {
+        let unsupported = if options.live {
+            Some((
+                "--live",
+                "the SSE live list renders its rows from a `LiveFragment` impl outside any \
+                 request, so no `Locale` extractor is in scope",
+            ))
+        } else if options.live_validation {
+            Some((
+                "--live-validation",
+                "the inline-validation fragments re-render single form controls outside the \
+                 handlers that carry the `Locale` extractor",
+            ))
+        } else if options.belongs_to.is_some() {
+            Some((
+                "--belongs-to",
+                "the nested child list and inline create form are spliced into the parent \
+                 resource's already-generated `show` handler, whose signature this scaffold \
+                 does not own",
+            ))
+        } else {
+            None
+        };
+        if let Some((variant, why)) = unsupported {
+            return Err(GenerateError::Config(format!(
+                "`--i18n` is not yet supported together with `{variant}`: {why}. Drop \
+                 `{variant}` to get translatable views, or drop `--i18n` to keep the \
+                 English-only scaffold."
+            )));
+        }
+    }
     // Gate (issue #1318): a `lock_version` column rewrites the HTML `update`
     // handler's write into a `WHERE lock_version = $expected` guarded statement
     // and adds a 409 re-render branch. That rewrite is wired for the standard
@@ -557,6 +618,7 @@ fn plan_scaffold_with_options_impl(
         no_policy: options.no_policy,
         belongs_to: options.belongs_to.clone(),
         counter_cache: options.counter_cache,
+        i18n: options.i18n,
     };
     let mut plan = if for_revert {
         super::model::plan_model_with_options_for_revert(
@@ -999,6 +1061,13 @@ fn plan_scaffold_with_options_impl(
         } else {
             read_or_empty(&own_routes_path)
         };
+        // Issue #1349: the one seam every user-facing string in the generated
+        // views passes through. With `--i18n` off it returns each caller's
+        // literal expression verbatim, so the rendered file is byte-for-byte
+        // what it was before this feature existed; with it on, each string
+        // becomes a `t!(locale, "key")` lookup and the key/English pair is
+        // recorded for the `i18n/en.ftl` back-fill below.
+        let labels = scaffold_i18n::ViewLabels::new(options_with_key.i18n);
         let fresh_own_routes = render_routes_file(
             project_root,
             &pascal_name,
@@ -1017,6 +1086,7 @@ fn plan_scaffold_with_options_impl(
             owner_column.as_ref().map(|o| o.name.as_str()),
             &options_with_key.model.searchable,
             nesting.as_ref(),
+            &labels,
         );
         let own_routes = super::nested::reapply_children(&previous_own_routes, &fresh_own_routes)
             .map_err(|refused| {
@@ -1036,6 +1106,77 @@ fn plan_scaffold_with_options_impl(
             ))
         })?;
         plan.create(own_routes_path, own_routes);
+
+        // Issue #1349: back-fill `i18n/en.ftl` with every key the views just
+        // referenced, and wire the three project-level bits that make those
+        // lookups resolve with no further config (AC4).
+        //
+        // Order matters for the *file*, not the plan: `t!` validates key
+        // existence at COMPILE time against the default locale's bundle, so a
+        // referenced key missing from `en.ftl` is a `compile_error!` in the
+        // user's app rather than a runtime miss. `labels.used_keys()` is the
+        // exact set the render emitted — no more (which `autumn i18n check`
+        // would flag as unused) and no fewer.
+        let referenced_keys = labels.used_keys();
+        if labels.enabled() && !referenced_keys.is_empty() {
+            let ftl_path = project_root.join("i18n").join("en.ftl");
+            let existing_ftl = read_or_empty(&ftl_path);
+            let merged = scaffold_i18n::merge_en_ftl(
+                &existing_ftl,
+                &pascal_name,
+                &snake_name,
+                &referenced_keys,
+            );
+            if merged != existing_ftl {
+                // `create` rather than `modify` when the file is new: the plan's
+                // collision check should treat a first-time `i18n/en.ftl` like
+                // any other generated file.
+                if existing_ftl.is_empty() && !ftl_path.exists() {
+                    plan.create(ftl_path.clone(), merged);
+                } else {
+                    plan.modify(ftl_path.clone(), merged);
+                }
+            }
+            // Destroy takes back this resource's keys only. The shared
+            // `common.*` block and the file itself always survive: sibling
+            // resources reuse the chrome, and `.i18n_auto()` panics at startup
+            // if the default locale's file is missing.
+            plan.push_revert(Revert::I18nFtlKeys {
+                path: ftl_path,
+                pascal: pascal_name.clone(),
+                snake: snake_name.clone(),
+            });
+
+            // (The `i18n` Cargo feature is enabled further down, alongside
+            // `maud`/`csv`/`htmx` — `plan_cargo_deps` runs between here and
+            // there and rebuilds its Cargo.toml action from DISK, so an edit
+            // made at this point would be silently dropped.)
+
+            // `[i18n]` in `autumn.toml` names the default locale the bundle
+            // loads. Only touched when the project actually has an
+            // `autumn.toml` to edit and does not already configure i18n — a
+            // project on a non-`en` default must keep it.
+            let autumn_toml_path = project_root.join("autumn.toml");
+            if autumn_toml_path.exists() {
+                let base = plan
+                    .actions
+                    .iter()
+                    .rev()
+                    .find_map(|a| match a {
+                        Action::Modify { path, contents } if path == &autumn_toml_path => {
+                            Some(contents.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| read_or_empty(&autumn_toml_path));
+                let updated = scaffold_i18n::ensure_i18n_config_block(&base);
+                if updated != base {
+                    plan.actions.retain(|a| a.path() != autumn_toml_path);
+                    plan.modify(autumn_toml_path, updated);
+                }
+            }
+        }
+
         let route_mod_path = routes_dir.join("mod.rs");
         plan.modify(
             route_mod_path.clone(),
@@ -1356,6 +1497,20 @@ fn plan_scaffold_with_options_impl(
     } else {
         updated
     };
+    // Issue #1349: `.i18n_auto()` in the builder chain is what makes the
+    // generated `t!` lookups resolve to real translations instead of echoing
+    // their keys — AC4's "zero further config". Folded into the same `Modify`
+    // action as everything else main.rs gains. Idempotent, and a no-op for a
+    // project that already installs a bundle its own way (`.i18n(...)`).
+    //
+    // No matching `Revert`: this is project-level wiring shared by every
+    // `--i18n` resource, and removing it while a sibling still emits `t!` calls
+    // would leave that resource rendering raw keys. Leaving it is inert.
+    let updated = if options_with_key.i18n && !options_with_key.api {
+        scaffold_i18n::ensure_i18n_auto(&updated)
+    } else {
+        updated
+    };
     plan.modify(main_path.clone(), updated);
     // `mod models;`/`mod schema;`/`mod repositories;`/`mod routes;`/`mod policies;`
     // are shared infrastructure declarations, not owned by this resource — see
@@ -1441,6 +1596,34 @@ fn plan_scaffold_with_options_impl(
             feature: "maud".to_owned(),
             owner_dir: Some(project_root.join("src").join("routes")),
         });
+    }
+
+    // Issue #1349: the generated views' `t!(locale, …)` lookups and the `Locale`
+    // extractor they read live behind autumn-web's `i18n` feature, and the
+    // `.i18n_auto()` call folded into `main.rs` above is gated on it too.
+    // Without this the generated app would not compile.
+    //
+    // Deliberately NO matching `Revert`, unlike `maud`/`csv`/`htmx`: that
+    // `.i18n_auto()` call is project-level wiring this generator does not take
+    // back out (a sibling `--i18n` resource would stop resolving its keys), so
+    // removing the feature under it would break the build. Leaving a feature
+    // enabled is inert; removing one that is still called is not.
+    if options_with_key.i18n && !options_with_key.api {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, "i18n");
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path, updated);
+        }
     }
 
     // Issue #1315: the emitted `CsvSchema` impl and `export.csv` handler call
@@ -2601,8 +2784,179 @@ fn render_routes_file(
     // `show` view renders. `None` keeps every emission below byte-identical to
     // the pre-#1323 flat scaffold.
     nesting: Option<&super::nested::Nesting>,
+    // Issue #1349: the seam every user-facing view string passes through.
+    // Disabled (`--i18n` off) it returns each caller's literal expression
+    // verbatim, so this whole template renders byte-for-byte as before.
+    labels: &scaffold_i18n::ViewLabels,
 ) -> String {
     let id_rust = id_type.rust_type();
+    // Issue #1349: with `--i18n`, every view-rendering handler takes the
+    // `Locale` extractor so the `t!` calls below have a `locale` in scope. It
+    // goes FIRST in every signature: `Locale` is a `FromRequestParts`
+    // extractor, and axum requires the single body-consuming (`FromRequest`)
+    // argument — `body: Bytes`, `Multipart` — to be last. Empty without the
+    // flag, keeping each signature byte-identical.
+    let locale_param = if labels.enabled() {
+        "locale: Locale,\n    "
+    } else {
+        ""
+    };
+    // Same, for the handlers whose parameter lists are written inline on one
+    // line rather than one-per-line.
+    let locale_param_inline = if labels.enabled() {
+        "locale: Locale, "
+    } else {
+        ""
+    };
+    // The display name of the resource, bound once per handler that needs it as
+    // a Fluent argument (`common.new = New { $resource }`). A nested `t!` inside
+    // another `t!`'s argument list would borrow a temporary that the macro's
+    // expansion drops before the lookup runs, so this has to be a real binding.
+    let resource_bind = if labels.enabled() {
+        format!(
+            "    let l_resource = {};\n",
+            labels.lit(&format!("{snake_name}.name"), pascal_name)
+        )
+    } else {
+        String::new()
+    };
+    // The same binding at the indentation the create/edit form bodies use.
+    let resource_bind_form = if resource_bind.is_empty() {
+        String::new()
+    } else {
+        format!("    {resource_bind}")
+    };
+    // The three page-furniture strings every HTML index variant renders, and the
+    // create/edit chrome shared by the form views. Computed once so the six
+    // index templates and both search templates below stay literal-free without
+    // repeating the key/English pair eight times.
+    let index_title = labels.lit_ref(
+        &format!("{snake_name}.index.title"),
+        &format!("{pascal_name} index"),
+    );
+    let index_heading = labels.markup(
+        &format!("{snake_name}.name.plural"),
+        &format!("{pascal_name}s"),
+    );
+    let new_link_text = labels.expr(
+        "common.new",
+        "New { $resource }",
+        &format!("\"New {pascal_name}\""),
+        &[("resource", "&l_resource")],
+    );
+    let new_link_markup = labels.markup_expr(
+        "common.new",
+        "New { $resource }",
+        &format!("\"New {pascal_name}\""),
+        &[("resource", "&l_resource")],
+    );
+    let back_to_list = labels.lit("common.back", "Back to list");
+    let back_to_list_markup = labels.markup("common.back", "Back to list");
+    let edit_link_text = labels.lit("common.edit", "Edit");
+    // Create/edit form chrome. `common.new` carries the pattern and the resource
+    // display name arrives as a Fluent argument, so a translation controls word
+    // order instead of having "New" concatenated in front of a noun.
+    let new_title = labels.expr_ref(
+        "common.new",
+        "New { $resource }",
+        &format!("\"New {pascal_name}\""),
+        &[("resource", "&l_resource")],
+    );
+    let new_heading = labels.markup_expr(
+        "common.new",
+        "New { $resource }",
+        &format!("\"New {pascal_name}\""),
+        &[("resource", "&l_resource")],
+    );
+    let create_button = labels.lit("common.create", "Create");
+    let create_button_ref = labels.lit_ref("common.create", "Create");
+    let save_button = labels.lit("common.save", "Save");
+    let save_button_ref = labels.lit_ref("common.save", "Save");
+    let delete_button = labels.markup("common.delete", "Delete");
+    // The shared `{snake}_form_for` helper renders every labeled control, so it
+    // needs the locale too. By reference — it only forwards it into `t!`-built
+    // `override_label` values, so there is nothing to own.
+    let form_for_locale_arg = if labels.enabled() {
+        "locale.clone(), "
+    } else {
+        ""
+    };
+    // The generated routes module imports explicitly (no `prelude::*`), so the
+    // extractor and the macro both need naming. Both live behind autumn-web's
+    // `i18n` feature, which the plan enables on the project's Cargo.toml.
+    let i18n_imports = if labels.enabled() {
+        "use autumn_web::i18n::Locale;\nuse autumn_web::t;\n"
+    } else {
+        ""
+    };
+    // Empty-state copy. `DataTableConfig::new` takes `&str`, and the config is a
+    // temporary borrowed only for the `data_table(...)` call, so an inline
+    // `&t!(…)` is fine here — no binding needed.
+    let index_empty = labels.lit_ref(
+        &format!("{snake_name}.index.empty"),
+        &format!("No {plural} yet."),
+    );
+    // The strings only the flag-gated surfaces render. Registered lazily so a
+    // scaffold without the flag never defines a key nothing references — which
+    // is exactly what `autumn i18n check` reports as unused.
+    let (search_empty, search_box_label, search_box_placeholder) = if searchable.is_empty() {
+        (String::new(), String::new(), String::new())
+    } else {
+        (
+            labels.lit_ref(
+                &format!("{snake_name}.search.empty"),
+                &format!("No {plural} found."),
+            ),
+            labels.lit_ref(
+                &format!("{snake_name}.search.title"),
+                &format!("Search {pascal_name}s"),
+            ),
+            labels.lit_ref(
+                &format!("{snake_name}.search.placeholder"),
+                &format!("Search {pascal_name}s…"),
+            ),
+        )
+    };
+    // The destructive button keeps its `window.confirm` guard, so the prompt has
+    // to travel through a JS string literal. Maud escapes the attribute value for
+    // HTML, but not for JavaScript — a translation containing an apostrophe
+    // ("Supprimer cet article ?" is fine, "Voulez-vous l'effacer ?" is not) would
+    // otherwise terminate the literal early and break the handler. Escaping it at
+    // render time is the only place that knows the translated text.
+    let delete_confirm_key = format!("{snake_name}.delete.confirm");
+    let delete_confirm_ftl = format!("Delete this {pascal_name}?");
+    let (delete_confirm_bind, delete_confirm_attr) = if labels.enabled() {
+        (
+            format!(
+                r#"@let delete_confirm_js = format!("return confirm('{{}}')", {}.replace('\'', "\\'"));
+            "#,
+                labels.lit(&delete_confirm_key, &delete_confirm_ftl)
+            ),
+            "(delete_confirm_js)".to_owned(),
+        )
+    } else {
+        (
+            String::new(),
+            format!("\"return confirm('Delete this {pascal_name}?')\""),
+        )
+    };
+    // `--searchable` only. Registered lazily so a non-searchable scaffold never
+    // writes these keys into `en.ftl` (an unreferenced key is exactly what
+    // `autumn i18n check` reports as unused).
+    let (search_title, search_heading) = if searchable.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (
+            labels.lit_ref(
+                &format!("{snake_name}.search.title"),
+                &format!("Search {pascal_name}s"),
+            ),
+            labels.markup(
+                &format!("{snake_name}.search.title"),
+                &format!("Search {pascal_name}s"),
+            ),
+        )
+    };
     // Issue #1260: a `slug` field reroutes `show`/`edit`/`update`/`delete` (and
     // their generated links) to key off the slug instead of `id`. The
     // `plan_scaffold_with_options_impl` gate above ensures a slug never
@@ -2645,6 +2999,86 @@ fn render_routes_file(
     // last use of `row` in the surrounding handler.
     let route_key_display_expr: String =
         route_key_field.map_or_else(|| "row.id".to_owned(), |f| format!("&row.{f}"));
+    // Issue #1349: the detail page's title and heading both render
+    // "{Model} #{key}". The Fluent value interpolates the key rather than
+    // concatenating around it, so a translation can place it wherever its
+    // language puts it.
+    let show_title_key = format!("{snake_name}.show.title");
+    let show_title_ftl = format!("{pascal_name} #{{ $id }}");
+    let show_id_arg = format!("&({route_key_display_expr}).to_string()");
+    let show_title = labels.expr_ref(
+        &show_title_key,
+        &show_title_ftl,
+        &format!("&format!(\"{pascal_name} #{{}}\", {route_key_display_expr})"),
+        &[("id", &show_id_arg)],
+    );
+    let show_heading = labels.markup_expr(
+        &show_title_key,
+        &show_title_ftl,
+        &format!("\"{pascal_name} #\" ({route_key_display_expr})"),
+        &[("id", &show_id_arg)],
+    );
+    // The `:states(...)` variant renders the same page from a shared `show_view`
+    // helper, which is always `id`-keyed (a slug column and a state-machine
+    // column are refused together upstream).
+    let show_view_title = labels.expr_ref(
+        &show_title_key,
+        &show_title_ftl,
+        &format!("&format!(\"{pascal_name} #{{}}\", row.id)"),
+        &[("id", "&row.id.to_string()")],
+    );
+    let show_view_heading = labels.markup_expr(
+        &show_title_key,
+        &show_title_ftl,
+        &format!("\"{pascal_name} #\" (row.id)"),
+        &[("id", "&row.id.to_string()")],
+    );
+    // The edit form's title/heading. Keyed per-resource because the English
+    // carries the model's own name; the row key is a Fluent argument so a
+    // translation can position it. Two shapes: the standard form keys off
+    // `{id_value_expr}` (a slug column reroutes it), the live-validation form
+    // always off `*id`.
+    let edit_title_key = format!("{snake_name}.edit.title");
+    let edit_title_ftl = format!("Edit {pascal_name} #{{ $id }}");
+    let edit_id_arg = format!("&({id_value_expr}).to_string()");
+    let edit_title = labels.expr_ref(
+        &edit_title_key,
+        &edit_title_ftl,
+        &format!("&format!(\"Edit {pascal_name} #{{}}\", {id_value_expr})"),
+        &[("id", &edit_id_arg)],
+    );
+    let edit_heading = labels.markup_expr(
+        &edit_title_key,
+        &edit_title_ftl,
+        &format!("\"Edit {pascal_name} #\" ({id_value_expr})"),
+        &[("id", &edit_id_arg)],
+    );
+    let edit_title_live = labels.expr_ref(
+        &edit_title_key,
+        &edit_title_ftl,
+        &format!("&format!(\"Edit {pascal_name} #{{}}\", *id)"),
+        &[("id", "&(*id).to_string()")],
+    );
+    let edit_heading_live = labels.markup_expr(
+        &edit_title_key,
+        &edit_title_ftl,
+        &format!("\"Edit {pascal_name} #\" (*id)"),
+        &[("id", "&(*id).to_string()")],
+    );
+    // `show_view` is a plain helper, not a handler, so it takes the locale as an
+    // ordinary argument — BY VALUE. `t!` expands to `Locale::t(&locale, …)`, and
+    // a `&Locale` binding would make that a `&&Locale` the signature rejects.
+    // `Locale` is a cheap clone: a tag string plus an `Arc` to the shared bundle.
+    let (show_view_locale_param, show_view_locale_arg, show_view_locale_arg_multiline) =
+        if labels.enabled() {
+            (
+                "locale: Locale,\n    ",
+                "locale.clone(), ",
+                "locale.clone(), ",
+            )
+        } else {
+            ("", "", "")
+        };
     // The value the `update` handler's SUCCESS redirect resolves the row
     // by — unlike `id_value_expr` (the path extractor's PRE-update value,
     // still correct for the not-found message above it), this must read the
@@ -2736,6 +3170,13 @@ fn render_routes_file(
     // emits no HTML routes module at all), or `main.rs` would mount a route this
     // module never emitted.
     let export_enabled = owner_scoped_standard || (!owner_scoped_index && !live && !sharded);
+    // Issue #1349: the export link's text, registered only where the export is
+    // actually emitted so a non-exporting scaffold defines no unused key.
+    let export_csv_text = if export_enabled {
+        labels.lit("common.export.csv", "Export CSV")
+    } else {
+        String::new()
+    };
     // Issue #1332: the `GET /{plural}/trash` recycle bin plus its per-row
     // `POST /{plural}/{id}/restore` and `POST /{plural}/{id}/purge` controls,
     // finishing #689's AC6. Emitted ONLY for a `--soft-delete` resource — there
@@ -3064,6 +3505,19 @@ fn render_routes_file(
          submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,",
         1,
     );
+
+    // Issue #1349: `create`/`update` re-render the form on a rejected submission,
+    // so they render labels and need the locale. Prepended, keeping `body: Bytes`
+    // last for the same reason the CSRF pair is inserted rather than appended:
+    // axum allows exactly one body-consuming extractor and it must come last.
+    let (create_signature, update_signature) = if labels.enabled() {
+        (
+            format!("locale: Locale, {create_signature}"),
+            format!("locale: Locale,\n    {update_signature}"),
+        )
+    } else {
+        (create_signature, update_signature)
+    };
 
     // Issue #1135: reference selects need a DB handle to load their options
     // in every handler that renders the form. `create`/`update` already carry
@@ -3977,28 +4431,28 @@ mod attachment_read_back_tests {
         // it carries an `onclick` confirm the current `Button` API can't express,
         // and converting would drop the confirmation guard.
         let new_form_layout = format!(
-            "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
-             h1 {{ \"New {pascal_name}\" }}\n        \
+            "{layout_fn}({new_title}, {cp_new}{flash_arg}, html! {{\n        \
+             h1 {{ {new_heading} }}\n        \
              form action=(paths::create()) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{changeset_inputs}            \
-             (autumn_web::a11y::Button::new(\"Create\").submit())\n        \
+             (autumn_web::a11y::Button::new({create_button}).submit())\n        \
              }}\n    \
              }})"
         );
         let edit_form_layout = format!(
-            "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
-             h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
+            "{layout_fn}({edit_title_live}, {cp_edit}{flash_arg}, html! {{\n        \
+             h1 {{ {edit_heading_live} }}\n        \
              {lock_conflict_banner}\
              {edit_current_attachment_markup}\
              form action=(paths::update(*id)) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{lock_version_hidden_input}{changeset_inputs}            \
-             (autumn_web::a11y::Button::new(\"Save\").submit())\n        \
+             (autumn_web::a11y::Button::new({save_button}).submit())\n        \
              }}\n        \
              form action=(paths::delete(*id)) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
-             button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
+             {delete_confirm_bind}button type=\"submit\" onclick={delete_confirm_attr} {{ {delete_button} }}\n        \
              }}\n    \
              }})"
         );
@@ -4007,6 +4461,7 @@ mod attachment_read_back_tests {
             edit_form_layout,
             &option_loads,
             &edit_attachment_url_binds,
+            &resource_bind_form,
         );
         // The referenced-row option loaders are emitted regardless: they
         // populate the in-form `<select>` (issue #1750) AND the issue #1146
@@ -4053,20 +4508,20 @@ mod attachment_read_back_tests {
             ""
         };
         let new_form_layout = format!(
-            "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
-             h1 {{ \"New {pascal_name}\" }}\n        \
-             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_create}{form_lock_create}{form_parent_fk}))\n    \
+            "{layout_fn}({new_title}, {cp_new}{flash_arg}, html! {{\n        \
+             h1 {{ {new_heading} }}\n        \
+             ({snake_name}_form_for({form_for_locale_arg}&changeset, paths::create(), {create_button_ref}, csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_create}{form_lock_create}{form_parent_fk}))\n    \
              }})"
         );
         let edit_form_layout = format!(
-            "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", {id_value_expr}), {cp_edit}{flash_arg}, html! {{\n        \
-             h1 {{ \"Edit {pascal_name} #\" ({id_value_expr}) }}\n        \
+            "{layout_fn}({edit_title}, {cp_edit}{flash_arg}, html! {{\n        \
+             h1 {{ {edit_heading} }}\n        \
              {lock_conflict_banner}\
              {edit_current_attachment_markup}\
-             ({snake_name}_form_for(&changeset, paths::update({id_value_expr}), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}{form_lock_edit}{form_parent_fk}))\n        \
+             ({snake_name}_form_for({form_for_locale_arg}&changeset, paths::update({id_value_expr}), {save_button_ref}, csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}{form_lock_edit}{form_parent_fk}))\n        \
              form action=(paths::delete({id_value_expr})) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
-             button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
+             {delete_confirm_bind}button type=\"submit\" onclick={delete_confirm_attr} {{ {delete_button} }}\n        \
              }}\n    \
              }})"
         );
@@ -4075,6 +4530,7 @@ mod attachment_read_back_tests {
             edit_form_layout,
             &option_loads,
             &edit_attachment_url_binds,
+            &resource_bind_form,
         );
         (
             new_form_body,
@@ -4083,6 +4539,7 @@ mod attachment_read_back_tests {
                 pascal_name,
                 snake_name,
                 fields,
+                labels,
                 missing_reference_targets,
                 lock_version.map(|_| lock_version_ty.as_str()),
                 nesting.map(|n| n.fk.as_str()),
@@ -4820,11 +5277,13 @@ mod attachment_read_back_tests {
         // Rebound as `mut` so the two trash-only columns can be pushed after it.
         let trash_columns = render_columns_vec(
             pascal_name,
+            snake_name,
             fields,
             &reference_displays,
             false,
             route_key_field,
             false,
+            labels,
         )
         .replacen("    let columns:", "    let mut columns:", 1);
         // Restore and Purge act on the row the trash page just listed, so they
@@ -4876,6 +5335,36 @@ mod attachment_read_back_tests {
         // other index column header is (`title_case`), so the trash table reads
         // like the list it mirrors.
         let deleted_at_header = title_case("deleted_at");
+        // Issue #1349: the trash view's own strings. `confirm_action`'s title is
+        // built per row, so the localized pattern interpolates the row key the
+        // same way the detail page's title does; the `ConfirmActionConfig` and
+        // the two `Column`s all borrow for the length of one statement, so these
+        // can stay inline rather than needing `let` bindings.
+        let deleted_at_header_expr = labels.lit_ref("common.field.deleted_at", &deleted_at_header);
+        let actions_header_expr = labels.lit_ref("common.actions", "Actions");
+        let purge_title_expr = labels.expr(
+            &format!("{snake_name}.purge.confirm"),
+            &format!("Permanently delete {snake_name} {{ $id }}?"),
+            &format!(
+                "format!(\"Permanently delete {snake_name} {{}}?\", {route_key_display_expr})"
+            ),
+            &[("id", &format!("&({route_key_display_expr}).to_string()"))],
+        );
+        let purge_warning = labels.markup(
+            "common.purge.warning",
+            "This action cannot be undone. Restore it instead if you might need it later.",
+        );
+        let restore_button = labels.lit("common.restore", "Restore");
+        let purge_button = labels.lit_ref("common.purge", "Purge");
+        let trash_title = labels.lit_ref(
+            &format!("{snake_name}.trash.title"),
+            &format!("{pascal_name} trash"),
+        );
+        let trash_heading = labels.markup(
+            &format!("{snake_name}.trash.heading"),
+            &format!("Deleted {pascal_name}s"),
+        );
+        let trash_empty = labels.lit_ref("common.trash.empty", "Trash is empty.");
         format!(
             r#"
 
@@ -4890,7 +5379,7 @@ mod attachment_read_back_tests {
 #[secured]
 #[get("/{plural}/trash")]
 pub async fn trash(
-    page_req: PageRequest,
+    {locale_param}page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
     flash: Flash,
     csrf: Option<CsrfToken>,
@@ -4911,18 +5400,18 @@ pub async fn trash(
     // columns stay at the end of the row.
     columns.insert(
         columns.len() - 1,
-        autumn_web::widgets::Column::new("{deleted_at_header}", |row: &{pascal_name}| maud::html! {{ (row.deleted_at.as_ref().map(ToString::to_string).unwrap_or_default()) }}),
+        autumn_web::widgets::Column::new({deleted_at_header_expr}, |row: &{pascal_name}| maud::html! {{ (row.deleted_at.as_ref().map(ToString::to_string).unwrap_or_default()) }}),
     );
-    columns.push(autumn_web::widgets::Column::new("Actions", |row: &{pascal_name}| {{
+    columns.push(autumn_web::widgets::Column::new({actions_header_expr}, |row: &{pascal_name}| {{
         // Titled per row rather than once for the whole page: a page-sized
         // trash renders one dialog per row, and identical titles would put a
         // run of indistinguishable `<h2>`s in the heading outline — and leave
         // the person confirming an irreversible delete with nothing on screen
         // saying WHICH {snake_name} they are about to destroy.
-        let purge_title = format!("Permanently delete {snake_name} {{}}?", {route_key_display_expr});
+        let purge_title = {purge_title_expr};
         let purge_confirm = autumn_web::widgets::ConfirmActionConfig::new()
             .title(&purge_title)
-            .message(maud::html! {{ p {{ "This action cannot be undone. Restore it instead if you might need it later." }} }});
+            .message(maud::html! {{ p {{ {purge_warning} }} }});
         let purge_confirm = match csrf_field.as_ref() {{
             Some(field) => purge_confirm.csrf_field(field.0.as_str()),
             None => purge_confirm,
@@ -4930,11 +5419,11 @@ pub async fn trash(
         maud::html! {{
             form action=(paths::restore({route_key_display_expr})) method="post" {{
                 (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
-                (autumn_web::a11y::Button::new("Restore").submit())
+                (autumn_web::a11y::Button::new({restore_button}).submit())
             }}
             (autumn_web::widgets::confirm_action(
                 &format!("purge-{{}}", row.id),
-                "Purge",
+                {purge_button},
                 &paths::purge({route_key_display_expr}),
                 autumn_web::reexports::http::Method::POST,
                 purge_csrf,
@@ -4942,10 +5431,10 @@ pub async fn trash(
             ))
         }}
     }}));
-    Ok({layout_fn}("{pascal_name} trash", {cp_trash}{flash_arg}, html! {{
-        h1 {{ "Deleted {pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
-        (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("Trash is empty.").base_path(&paths::trash())))
+    Ok({layout_fn}({trash_title}, {cp_trash}{flash_arg}, html! {{
+        h1 {{ {trash_heading} }}
+        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
+        (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({trash_empty}).base_path(&paths::trash())))
         (pagination_nav(&page_data, &PagerOptions::new(&paths::trash())))
     }}))
 }}
@@ -5030,11 +5519,13 @@ pub async fn purge(
     } else {
         render_columns_vec(
             pascal_name,
+            snake_name,
             fields,
             &reference_displays,
             false,
             route_key_field,
             true,
+            labels,
         )
     };
     let index_label_loads = if live {
@@ -5061,11 +5552,13 @@ pub async fn purge(
     } else {
         render_columns_vec(
             pascal_name,
+            snake_name,
             fields,
             &reference_displays,
             true,
             route_key_field,
             true,
+            labels,
         )
     };
     // Issue #1312: the shared columns prelude the index AND the search-results
@@ -5118,11 +5611,11 @@ pub async fn purge(
         // (non-sort/filter) config. Wiring owner-scoped sort/filter there is a
         // follow-up (issue #1841 covers the standard Db path only).
         format!(
-            r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index())))"#
+            r"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({index_empty}).base_path(&paths::index())))"
         )
     } else {
         format!(
-            r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index()).query(raw_query.as_deref().unwrap_or_default()).active_sort(list_query.sort().unwrap_or_default()).active_dir(list_query.direction())))"#
+            r"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({index_empty}).base_path(&paths::index()).query(raw_query.as_deref().unwrap_or_default()).active_sort(list_query.sort().unwrap_or_default()).active_dir(list_query.direction())))"
         )
     };
 
@@ -5190,18 +5683,24 @@ pub async fn purge(
             // nodes, so without it the two anchors render as one glued run
             // ("New PostExport CSV"). Same separator the generated `show` view
             // puts between its "Back to list" and "Edit" links.
-            "\n        \" \"\n        \
-             (autumn_web::a11y::Link::new(export_href, \"Export CSV\"))",
+            format!(
+                "\n        \" \"\n        \
+                 (autumn_web::a11y::Link::new(export_href, {export_csv_text}))"
+            ),
         )
     } else {
-        ("", "")
+        ("", String::new())
     };
     // The furniture slot takes the link only when there is no search box to
     // invalidate it; otherwise `index_list_block` places it inside the container.
     // The two slots differ only in indentation — furniture is a direct child of
     // the `html! {` block (8 spaces), the in-results copy is one level deeper
     // inside the container `div` (12) — so the generated file stays readable.
-    let export_link_furniture = if search_enabled { "" } else { export_link };
+    let export_link_furniture = if search_enabled {
+        ""
+    } else {
+        export_link.as_str()
+    };
     // Issue #1332 AC2: the index's "Trash" link. Page furniture next to "New
     // {pascal_name}" — unlike "Export CSV" it describes no row set, so a search
     // that swaps the results container cannot leave it pointing at stale rows,
@@ -5210,16 +5709,21 @@ pub async fn purge(
     // export link and the show view use: Maud drops template whitespace between
     // nodes, so without it the anchors render as one glued run.
     let trash_link_furniture = if trash_enabled {
-        "\n        \" \"\n        \
-         (autumn_web::a11y::Link::new(paths::trash(), \"Trash\"))"
+        format!(
+            "\n        \" \"\n        \
+             (autumn_web::a11y::Link::new(paths::trash(), {}))",
+            labels.lit("common.trash", "Trash")
+        )
     } else {
-        ""
+        String::new()
     };
     let export_link_in_results = if search_enabled {
-        "\n            \" \"\n            \
-         (autumn_web::a11y::Link::new(export_href, \"Export CSV\"))"
+        format!(
+            "\n            \" \"\n            \
+             (autumn_web::a11y::Link::new(export_href, {export_csv_text}))"
+        )
     } else {
-        ""
+        String::new()
     };
     // Issue #1312: the list itself (data_table + pager) is wrapped in the
     // bulk-actions `<form>` so each row's checkbox submits with the
@@ -5254,9 +5758,9 @@ pub async fn purge(
         };
         format!(
             "script src=(autumn_web::htmx::HTMX_JS_PATH) {{}}\n        \
-             (autumn_web::widgets::active_search_input(\"{snake_name}-search\", \"Search {pascal_name}s\", \
+             (autumn_web::widgets::active_search_input(\"{snake_name}-search\", {search_box_label}, \
              &autumn_web::widgets::ActiveSearchConfig::new(\"/{plural}/search\", \"#{plural}-search-results\")\
-             .placeholder(\"Search {pascal_name}s…\")))\n        \
+             .placeholder({search_box_placeholder})))\n        \
              {inner}"
         )
     } else if bulk_delete_enabled {
@@ -5266,7 +5770,8 @@ pub async fn purge(
     } else {
         format!("{list_render}\n        {pager_line}")
     };
-    let show_rows = render_show_property_rows(all_fields, &reference_displays);
+    let show_rows = render_show_property_rows(all_fields, &reference_displays, labels);
+    let show_prop_binds = render_show_property_label_binds(all_fields, snake_name, labels);
     // The `show` handler pre-loads each displayable reference's parent label
     // (issue #1146) before building its property rows.
     let show_label_loads = render_show_reference_label_loads(all_fields, &reference_displays);
@@ -5305,7 +5810,7 @@ pub async fn purge(
 #[get("/{plural}")]
 #[allow(clippy::too_many_arguments)]
 pub async fn index(
-    list_query: ListQuery,
+    {locale_param}list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
@@ -5317,9 +5822,9 @@ pub async fn index(
     let owner_id = ctx.user_id_i64().unwrap_or(-1);
     let page_data: Page<{pascal_name}> = repo.list_scoped(owner_id, &list_query, &page_req).await?;
     let pager_query = raw_query.as_deref().unwrap_or("");
-{export_href_let}{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        a href=(paths::new()) {{ "New {pascal_name}" }}{export_link_furniture}
+{export_href_let}{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        a href=(paths::new()) {{ {new_link_markup} }}{export_link_furniture}
         {index_list_block}
     }}))
 }}"#
@@ -5345,7 +5850,7 @@ pub async fn index(
 #[get("/{plural}")]
 #[allow(clippy::too_many_arguments)]
 pub async fn index(
-    page_req: PageRequest,
+    {locale_param}page_req: PageRequest,
     autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
     session: autumn_web::session::Session,
     {owner_index_db_param},
@@ -5366,9 +5871,9 @@ pub async fn index(
         .load(&mut *db)
         .await?;
     let page_data: Page<{pascal_name}> = Page::new(items, total, &page_req);
-{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new("/{plural}/new", "New {pascal_name}"))
+{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new("/{plural}/new", {new_link_text}))
         {list_render}
         (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
     }}))
@@ -5385,15 +5890,15 @@ pub async fn index(
 #[get("/{plural}")]
 #[allow(clippy::too_many_arguments)]
 pub async fn index(
-    page_req: PageRequest,
+    {locale_param}page_req: PageRequest,
     db: ShardedDb,
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let repo = Pg{pascal_name}Repository::from_shard(&db);
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
+{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text}))
         {index_list_block}
     }}))
 }}"#
@@ -5410,7 +5915,7 @@ pub async fn index(
 #[get("/{plural}")]
 #[allow(clippy::too_many_arguments)]
 pub async fn index(
-    list_query: ListQuery,
+    {locale_param}list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     {sharded_index_db},
@@ -5419,9 +5924,9 @@ pub async fn index(
     let repo = Pg{pascal_name}Repository::from_shard(&db);
     let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
     let pager_query = raw_query.as_deref().unwrap_or("");
-{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
+{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text}))
         {index_list_block}
     }}))
 }}"#
@@ -5437,14 +5942,14 @@ pub async fn index(
 #[get("/{plural}")]
 #[allow(clippy::too_many_arguments)]
 pub async fn index(
-    page_req: PageRequest,
+    {locale_param}page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
+{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text}))
         {index_list_block}
     }}))
 }}"#
@@ -5460,7 +5965,7 @@ pub async fn index(
 #[get("/{plural}")]
 #[allow(clippy::too_many_arguments)]
 pub async fn index(
-    list_query: ListQuery,
+    {locale_param}list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
@@ -5468,9 +5973,9 @@ pub async fn index(
 ) -> AutumnResult<Markup> {{
     let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
     let pager_query = raw_query.as_deref().unwrap_or("");
-{export_href_let}{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}")){export_link_furniture}{trash_link_furniture}
+{export_href_let}{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text})){export_link_furniture}{trash_link_furniture}
         {index_list_block}
     }}))
 }}"#
@@ -5763,7 +6268,7 @@ pub async fn index(
     // replace the form's innards with checkboxes that have no `<form>` (and no
     // submit button) around them, silently breaking bulk delete after a search.
     let search_results_table = format!(
-        r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} found.").base_path("/{plural}/search")))"#
+        r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({search_empty}).base_path("/{plural}/search")))"#
     );
     let search_results_pager = format!(
         r#"(pagination_nav(&page_data, &PagerOptions::new("/{plural}/search").query(pager_query)))"#
@@ -5832,7 +6337,7 @@ pub struct {pascal_name}SearchQuery {{
 #[secured]
 #[get("/{plural}/search")]
 pub async fn search(
-    autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
+    {locale_param}autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
     autumn_web::reexports::axum::extract::RawQuery(raw_query): autumn_web::reexports::axum::extract::RawQuery,
     list_query: ListQuery,
     page_req: PageRequest,
@@ -5860,9 +6365,9 @@ pub async fn search(
     if hx.is_htmx {{
         return Ok(results);
     }}
-    Ok({layout_fn}("Search {pascal_name}s", {cp_index}{flash_arg}, html! {{
-        h1 {{ "Search {pascal_name}s" }}
-        a href="/{plural}" {{ "Back to list" }}
+    Ok({layout_fn}({search_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {search_heading} }}
+        a href="/{plural}" {{ {back_to_list_markup} }}
         div id="{plural}-search-results" {{ (results) }}
     }}))
 }}"#
@@ -5898,7 +6403,7 @@ pub struct {pascal_name}SearchQuery {{
 
 #[get("/{plural}/search")]
 pub async fn search(
-    autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
+    {locale_param}autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
     autumn_web::reexports::axum::extract::RawQuery(raw_query): autumn_web::reexports::axum::extract::RawQuery,
     page_req: PageRequest,
     hx: autumn_web::htmx::HxRequest,
@@ -5920,9 +6425,9 @@ pub async fn search(
     if hx.is_htmx {{
         return Ok(results);
     }}
-    Ok({layout_fn}("Search {pascal_name}s", {cp_index}{flash_arg}, html! {{
-        h1 {{ "Search {pascal_name}s" }}
-        (autumn_web::a11y::Link::new("/{plural}", "Back to list"))
+    Ok({layout_fn}({search_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {search_heading} }}
+        (autumn_web::a11y::Link::new("/{plural}", {back_to_list}))
         div id="{plural}-search-results" {{ (results) }}
     }}))
 }}"#
@@ -5938,7 +6443,7 @@ pub async fn search(
 //! these are ordinary user code.
 {attachment_note}
 use autumn_web::extract::Path;
-use autumn_web::pagination::{{Page, PageRequest}};
+{i18n_imports}use autumn_web::pagination::{{Page, PageRequest}};
 {sort_imports}use autumn_web::reexports::axum::body::Bytes;
 use autumn_web::reexports::serde_json;
 use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
@@ -6076,20 +6581,20 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
 /// each state-machine transition handler's 422 re-render, so the detail-page
 /// markup has a single source of truth (issue #1326).
 async fn show_view(
-    {show_view_db_param},
+    {show_view_locale_param}{show_view_db_param},
     row: &{pascal_name},
     flash: Markup,
     csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,{show_view_state_param}
 ) -> AutumnResult<Markup> {{
-{show_label_loads}{show_view_attachment_url_binds}    let props: Vec<(&str, maud::Markup)> = vec![
+{show_label_loads}{show_view_attachment_url_binds}{show_prop_binds}    let props: Vec<(&str, maud::Markup)> = vec![
 {show_rows}    ];
-    Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}flash, html! {{
-        h1 {{ "{pascal_name} #" (row.id) }}
+    Ok({layout_fn}({show_view_title}, {cp_show}flash, html! {{
+        h1 {{ {show_view_heading} }}
         (autumn_web::widgets::property_list(&props))
-{show_transition_controls}        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
+{show_transition_controls}        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
         " "
-        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit")){show_parent_backlink}
+        (autumn_web::a11y::Link::new(paths::edit(row.id), {edit_link_text})){show_parent_backlink}
     }}))
 }}"#
             );
@@ -6097,7 +6602,7 @@ async fn show_view(
                 r#"/// `GET /{plural}/{{id}}` — show one {snake_name}.
 #[get("/{plural}/{{id}}")]
 pub async fn show(
-    id: Path<{id_rust}>,
+    {locale_param}id: Path<{id_rust}>,
     mut db: {db_ty},
     flash: Flash,
     csrf: Option<CsrfToken>,
@@ -6109,7 +6614,7 @@ pub async fn show(
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-{show_authz_call}    show_view(db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref(){show_view_state_arg_call}).await
+{show_authz_call}    show_view({show_view_locale_arg}db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref(){show_view_state_arg_call}).await
 }}"#
             );
             // Issue #1326 security fix (IDOR): a transition mutates an existing
@@ -6230,7 +6735,7 @@ pub async fn show(
                      // request loaded: the reader is deciding again, and the legal\n                \
                      // transitions may well be different from the ones they saw.\n                \
                      let view = show_view(\n                    \
-                     db,\n                    \
+                     {show_view_locale_arg_multiline}db,\n                    \
                      &current,\n                    \
                      flash_messages(&flash.consume().await),\n                    \
                      csrf.as_ref(),\n                    \
@@ -6281,7 +6786,7 @@ pub async fn transition_{field}(
         Err(err) => {{
             flash.error(err.to_string()).await;
             let view = show_view(
-                db,
+                {show_view_locale_arg_multiline}db,
                 &row,
                 flash_messages(&flash.consume().await),
                 csrf.as_ref(),
@@ -6305,21 +6810,21 @@ pub async fn transition_{field}(
 
 /// `GET /{plural}/{{{id_url_segment}}}` — show one {snake_name}.
 #[get("/{plural}/{{{id_url_segment}}}")]
-pub async fn show({id_param_decl}, mut db: {db_ty}, flash: Flash{show_state_param}) -> AutumnResult<Markup> {{
+pub async fn show({locale_param_inline}{id_param_decl}, mut db: {db_ty}, flash: Flash{show_state_param}) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
         .{find_expr}
         .select({pascal_name}::as_select())
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-{show_authz_call}{show_label_loads}{show_attachment_url_binds}    let props: Vec<(&str, maud::Markup)> = vec![
+{show_authz_call}{show_label_loads}{show_attachment_url_binds}{show_prop_binds}    let props: Vec<(&str, maud::Markup)> = vec![
 {show_rows}    ];
-    Ok({layout_fn}(&format!("{pascal_name} #{{}}", {route_key_display_expr}), {cp_show}{flash_arg}, html! {{
-        h1 {{ "{pascal_name} #" ({route_key_display_expr}) }}
+    Ok({layout_fn}({show_title}, {cp_show}{flash_arg}, html! {{
+        h1 {{ {show_heading} }}
         (autumn_web::widgets::property_list(&props))
-        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
+        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
         " "
-        (autumn_web::a11y::Link::new(paths::edit({route_key_display_expr}), "Edit")){show_parent_backlink}
+        (autumn_web::a11y::Link::new(paths::edit({route_key_display_expr}), {edit_link_text})){show_parent_backlink}
     }}))
 }}
 "#
@@ -6356,7 +6861,7 @@ fn submit_token_input(submit_token: Option<&SubmitToken>, field: Option<&SubmitF
 #[secured]
 #[get("/{plural}/new", name = "new")]
 pub async fn new_form(
-    {new_form_db_param}flash: Flash,
+    {locale_param}{new_form_db_param}flash: Flash,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
     submit_token: Option<SubmitToken>,
@@ -6374,7 +6879,7 @@ pub async fn new_form(
 #[secured]
 #[get("/{plural}/{{{id_url_segment}}}/edit", name = "edit")]
 pub async fn edit_form(
-    {id_param_decl},
+    {locale_param}{id_param_decl},
     mut db: {db_ty},
     flash: Flash,
     csrf: Option<CsrfToken>,
@@ -6533,11 +7038,17 @@ fn render_nested_section(
     }
     let columns = render_columns_vec(
         pascal_name,
+        snake_name,
         &list_fields,
         reference_displays,
         true,
         route_key_field,
         false,
+        // Issue #1349: `--belongs-to` is refused alongside `--i18n` upstream —
+        // this section splices markup into the PARENT's already-generated `show`
+        // handler, whose signature carries no `Locale` extractor — so the nested
+        // child list always renders the plain English labels.
+        &scaffold_i18n::ViewLabels::disabled(),
     );
 
     // Select options for the inline form's OTHER `references` columns. The
@@ -6896,11 +7407,15 @@ fn wrap_form_bodies(
     edit_form_layout: String,
     option_loads: &str,
     edit_attachment_url_binds: &str,
+    // Issue #1349: bindings only the NEW form needs — the localized resource
+    // display name its "New {Model}" title and heading interpolate. Empty
+    // without `--i18n`, so the wrapping below stays byte-identical.
+    new_form_binds: &str,
 ) -> (String, String) {
-    let new_body = if option_loads.is_empty() {
+    let new_body = if option_loads.is_empty() && new_form_binds.is_empty() {
         new_form_layout
     } else {
-        format!("{{\n{option_loads}        {new_form_layout}\n    }}")
+        format!("{{\n{new_form_binds}{option_loads}        {new_form_layout}\n    }}")
     };
     let edit_body = if option_loads.is_empty() && edit_attachment_url_binds.is_empty() {
         edit_form_layout
@@ -6990,6 +7505,10 @@ fn render_form_for_helper(
     pascal_name: &str,
     snake_name: &str,
     fields: &[Field],
+    // Issue #1349: relabels every control through `{snake}.field.{name}` when
+    // `--i18n` is on, and is an identity function over the derived English
+    // labels when it is off.
+    labels: &scaffold_i18n::ViewLabels,
     missing_reference_targets: &BTreeSet<String>,
     // The Rust type of the model's `lock_version` counter (issue #1318), or
     // `None` when the model declares no optimistic-locking column.
@@ -7033,15 +7552,23 @@ fn render_form_for_helper(
                 );
             }
             FieldKind::Enum => {
-                let placeholder = if f.nullable {
-                    "— Unset —"
+                let (placeholder_key, placeholder) = if f.nullable {
+                    ("common.select.unset", "— Unset —")
                 } else {
-                    "— Select —"
+                    ("common.select.prompt", "— Select —")
                 };
-                let mut options = format!("(\"\".into(), \"{placeholder}\".into())");
+                // `.into()` on a `&str` literal and on the `String` a `t!` call
+                // returns both land on `String`, so the emitted `vec!` element
+                // is well-typed either way.
+                let mut options = format!(
+                    "(\"\".into(), {}.into())",
+                    labels.lit(placeholder_key, placeholder)
+                );
                 for v in &f.variants {
                     let vlabel = humanize_label(v);
-                    let _ = write!(options, ", (\"{v}\".into(), \"{vlabel}\".into())");
+                    let vexpr =
+                        labels.lit(&format!("{snake_name}.field.{name}.option.{v}"), &vlabel);
+                    let _ = write!(options, ", (\"{v}\".into(), {vexpr}.into())");
                 }
                 let _ = write!(
                     builder_calls,
@@ -7063,7 +7590,10 @@ fn render_form_for_helper(
                 // `[security.submit_token].field_name` (issue #1843), not just
                 // the default — the helper already has the `SubmitFormField`
                 // extractor in scope for `submit_token_input`.
-                let label = humanize_label(name);
+                // `rich_text_area_*` takes `&str` (unlike the `a11y` builders'
+                // `impl Into<String>`), so this label site borrows.
+                let label =
+                    labels.lit_ref(&format!("{snake_name}.field.{name}"), &humanize_label(name));
                 // A non-nullable column takes the `required_*` variant, exactly
                 // like every other generated control — `String` and `TEXT NOT
                 // NULL` both accept `""`, so without it an empty editor would
@@ -7077,7 +7607,7 @@ fn render_form_for_helper(
                 let _ = write!(
                     appends,
                     "\n        .append(autumn_web::form::{helper}(\
-                     changeset, \"{name}\", \"{label}\", &paths::preview_{name}(), \
+                     changeset, \"{name}\", {label}, &paths::preview_{name}(), \
                      submit_field.map_or(\"_submit_token\", |f| f.0.as_str())))"
                 );
             }
@@ -7099,7 +7629,8 @@ fn render_form_for_helper(
             // `.append()` escape hatch the other schema-specific overrides
             // use, minus the `required_builders` those emit.
             FieldKind::Slug => {
-                let label = humanize_label(name);
+                let label =
+                    labels.lit(&format!("{snake_name}.field.{name}"), &humanize_label(name));
                 let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
                 let _ = write!(
                     appends,
@@ -7107,7 +7638,7 @@ fn render_form_for_helper(
                      @let errors = changeset.errors_for(\"{name}\");\n            \
                      div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
                      (autumn_web::a11y::TextField::new(\"{name}\")\n                    \
-                     .label(\"{label}\")\n                    \
+                     .label({label})\n                    \
                      .label_class(\"autumn-field__label\")\n                    \
                      .input_type(\"text\")\n                    \
                      .value(changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
@@ -7135,15 +7666,21 @@ fn render_form_for_helper(
                 if missing_reference_targets.contains(name) {
                     continue;
                 }
-                let placeholder = if f.nullable {
-                    "— Unset —"
+                let (placeholder_key, placeholder) = if f.nullable {
+                    ("common.select.unset", "— Unset —")
                 } else {
-                    "— Select —"
+                    ("common.select.prompt", "— Select —")
                 };
+                let placeholder_expr = labels.expr(
+                    placeholder_key,
+                    placeholder,
+                    &format!("\"{placeholder}\".to_string()"),
+                    &[],
+                );
                 let _ = write!(extra_params, ",\n    {name}_options: &[(String, String)]");
                 let _ = write!(
                     preludes,
-                    "    let mut {name}_select = vec![(String::new(), \"{placeholder}\".to_string())];\n    \
+                    "    let mut {name}_select = vec![(String::new(), {placeholder_expr})];\n    \
                      {name}_select.extend({name}_options.iter().cloned());\n"
                 );
                 let _ = write!(
@@ -7162,7 +7699,8 @@ fn render_form_for_helper(
             // inline-error/ARIA skeleton matches the derived controls.
             _ => {
                 if let Some((input_type, _)) = html5_constraint_spec(f) {
-                    let label = humanize_label(name);
+                    let label =
+                        labels.lit(&format!("{snake_name}.field.{name}"), &humanize_label(name));
                     let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
                     if matches!(f.kind, FieldKind::Text) && input_type == "text" {
                         // A `text` DSL column with a length/plain constraint is a
@@ -7201,7 +7739,7 @@ fn render_form_for_helper(
                              @let errors = changeset.errors_for(\"{name}\");\n            \
                              div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
                              (autumn_web::a11y::TextArea::new(\"{name}\")\n                    \
-                             .label(\"{label}\")\n                    \
+                             .label({label})\n                    \
                              .label_class(\"autumn-field__label\")\n                    \
                              .value(changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
                              {constraint_builders}{required_builders}\n                    \
@@ -7238,7 +7776,7 @@ fn render_form_for_helper(
                              @let errors = changeset.errors_for(\"{name}\");\n            \
                              div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
                              (autumn_web::a11y::TextField::new(\"{name}\")\n                    \
-                             .label(\"{label}\")\n                    \
+                             .label({label})\n                    \
                              .label_class(\"autumn-field__label\")\n                    \
                              .input_type(\"{input_type}\")\n                    \
                              .value(changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
@@ -7318,6 +7856,29 @@ fn render_form_for_helper(
         let _ = write!(extra_params, ",\n    exclude_parent_fk: bool");
         format!("    if exclude_parent_fk {{\n        form = form.exclude(\"{name}\");\n    }}\n")
     });
+    // Issue #1349: the helper renders every labeled control, so with `--i18n` it
+    // takes the request's locale. By value for the same reason `show_view` does:
+    // `t!` expands to `Locale::t(&locale, …)`, which a `&Locale` binding would
+    // turn into a `&&Locale`.
+    let form_for_locale_param = if labels.enabled() {
+        "locale: Locale,\n    "
+    } else {
+        ""
+    };
+    // Relabel every control the `FormModel` derive renders. The derive humanizes
+    // the column name into Title Case; `.override_label` swaps in the `t!`
+    // lookup for the SAME key the index header and show row use, so one
+    // translation serves all three surfaces.
+    if labels.enabled() {
+        for f in fields {
+            let name = &f.name;
+            let _ = write!(
+                builder_calls,
+                "\n        .override_label(\"{name}\", {})",
+                labels.lit(&format!("{snake_name}.field.{name}"), &humanize_label(name))
+            );
+        }
+    }
     format!(
         "/// Render the create/edit form in a single `form_for` call (issue #1135).\n\
          ///\n\
@@ -7328,7 +7889,7 @@ fn render_form_for_helper(
          /// them.\n\
          #[allow(clippy::too_many_arguments)]\n\
          fn {snake_name}_form_for(\n    \
-         changeset: &Changeset<{pascal_name}Form>,\n    \
+         {form_for_locale_param}changeset: &Changeset<{pascal_name}Form>,\n    \
          action: String,\n    \
          submit_label: &str,\n    \
          csrf: Option<&CsrfToken>,\n    \
@@ -8370,8 +8931,15 @@ const fn field_is_sortable(field: &Field) -> bool {
 /// (the sort key is the column's snake name) so the `data_table` renders header
 /// links that the generated `list()` method applies against the model's column
 /// allowlist (#1126). The trailing "Show" action column is never sortable.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one column-vec renderer serving the index, the search fragment, the \
+              trash table, and the nested child list — splitting it would fork the \
+              header/cell emission the four surfaces must agree on"
+)]
 fn render_columns_vec(
     pascal_name: &str,
+    snake_name: &str,
     fields: &[Field],
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
     use_label_maps: bool,
@@ -8383,22 +8951,54 @@ fn render_columns_vec(
     // reloads the identical list and stamps an `aria-sort` that never changes —
     // an accessibility lie, not just a dead control.
     sortable: bool,
+    // Issue #1349: with `--i18n`, each header becomes a `let`-bound `t!` lookup
+    // rather than an inline literal — `Column::new` borrows its header for the
+    // column's lifetime, so a `&t!(…)` temporary inside the `vec![…]` would be
+    // dropped before the table renders.
+    labels: &scaffold_i18n::ViewLabels,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 150 + 300);
+    // Header bindings first: `Column::new` takes `&'a str`, so a translated
+    // header has to outlive the `vec![…]` it is built into.
+    let id_header = labels.lit_ref("common.field.id", "Id");
+    if labels.enabled() {
+        let _ = writeln!(
+            out,
+            "    let l_col_id = {};",
+            labels.lit("common.field.id", "Id")
+        );
+        for f in fields {
+            let name = &f.name;
+            let _ = writeln!(
+                out,
+                "    let l_col_{name} = {};",
+                labels.lit(&format!("{snake_name}.field.{name}"), &title_case(name))
+            );
+        }
+    }
     let _ = writeln!(
         out,
         "    let columns: Vec<autumn_web::widgets::Column<{pascal_name}>> = vec!["
     );
     // ID column — always sortable (the default order is `id DESC`).
     let id_sortable = if sortable { ".sortable(\"id\")" } else { "" };
+    let id_header = if labels.enabled() {
+        "&l_col_id".to_owned()
+    } else {
+        id_header
+    };
     let _ = writeln!(
         out,
-        "        autumn_web::widgets::Column::new(\"Id\", |row: &{pascal_name}| maud::html! {{ (row.id) }}){id_sortable},"
+        "        autumn_web::widgets::Column::new({id_header}, |row: &{pascal_name}| maud::html! {{ (row.id) }}){id_sortable},"
     );
     // One column per field
     for f in fields {
-        let header = title_case(&f.name);
+        let header = if labels.enabled() {
+            format!("&l_col_{}", f.name)
+        } else {
+            format!("\"{}\"", title_case(&f.name))
+        };
         let sortable_suffix = if sortable && field_is_sortable(f) {
             format!(".sortable(\"{}\")", f.name)
         } else {
@@ -8442,7 +9042,7 @@ fn render_columns_vec(
         };
         let _ = writeln!(
             out,
-            "        autumn_web::widgets::Column::new(\"{header}\", |{binding}: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
+            "        autumn_web::widgets::Column::new({header}, |{binding}: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
         );
     }
     // Show link column. Keyed off the slug (issue #1260) when the model has
@@ -8452,7 +9052,8 @@ fn render_columns_vec(
         route_key_field.map_or_else(|| "row.id".to_owned(), |field| format!("&row.{field}"));
     let _ = writeln!(
         out,
-        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ (autumn_web::a11y::Link::new(paths::show({show_link_arg}), \"Show\")) }}),"
+        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ (autumn_web::a11y::Link::new(paths::show({show_link_arg}), {})) }}),",
+        labels.lit("common.show", "Show")
     );
     let _ = writeln!(out, "    ];");
     out
@@ -8468,11 +9069,29 @@ fn render_columns_vec(
 fn render_show_property_rows(
     fields: &[Field],
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
+    // Issue #1349: `property_list` takes `&[(&str, Markup)]`, so a translated
+    // label is a `let` binding (see [`render_show_property_label_binds`]) rather
+    // than an inline `t!` call whose `String` would be dropped with the `vec![…]`
+    // temporary.
+    labels: &scaffold_i18n::ViewLabels,
 ) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 100 + 150);
-    out.push_str("        (\"Id\", maud::html! { (row.id) }),\n");
+    let id_label = if labels.enabled() {
+        "&l_prop_id".to_owned()
+    } else {
+        "\"Id\"".to_owned()
+    };
+    let _ = writeln!(out, "        ({id_label}, maud::html! {{ (row.id) }}),");
     for f in fields {
-        let label = humanize(&f.name);
+        // One key per field, shared with the index header and the form control.
+        // The English is the derive's Title Case rather than this view's older
+        // sentence case, so all three surfaces read alike once translated.
+        let label = if labels.enabled() {
+            format!("&l_prop_{}", f.name)
+        } else {
+            format!("\"{}\"", humanize(&f.name))
+        };
         let cell_expr = if f.kind.is_reference() && reference_displays.contains_key(&f.name) {
             format!("{}_label", f.name)
         } else if f.kind.is_attachment() {
@@ -8499,13 +9118,60 @@ fn render_show_property_rows(
         } else {
             cell_value_expr(f)
         };
-        out.push_str("        (\"");
+        out.push_str("        (");
         out.push_str(&label);
-        out.push_str("\", maud::html! { (");
+        out.push_str(", maud::html! { (");
         out.push_str(&cell_expr);
         out.push_str(") }),\n");
     }
-    out.push_str("        (\"Created at\", maud::html! { (row.created_at.to_string()) }),\n");
+    let created_label = if labels.enabled() {
+        "&l_prop_created_at".to_owned()
+    } else {
+        "\"Created at\"".to_owned()
+    };
+    let _ = writeln!(
+        out,
+        "        ({created_label}, maud::html! {{ (row.created_at.to_string()) }}),"
+    );
+    out
+}
+
+/// The `let l_prop_* = t!(…);` bindings the `show` view evaluates before
+/// building its `props` vec (issue #1349).
+///
+/// Separate from [`render_show_property_rows`] because `property_list` borrows
+/// each label for the life of the slice: a `t!` call spliced straight into the
+/// `vec![…]` would produce a `String` temporary dropped at the end of that
+/// statement. Empty without `--i18n`, where the labels are `&'static str`
+/// literals with nothing to bind.
+fn render_show_property_label_binds(
+    fields: &[Field],
+    snake_name: &str,
+    labels: &scaffold_i18n::ViewLabels,
+) -> String {
+    use std::fmt::Write as _;
+    if !labels.enabled() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(fields.len() * 60 + 120);
+    let _ = writeln!(
+        out,
+        "    let l_prop_id = {};",
+        labels.lit("common.field.id", "Id")
+    );
+    for f in fields {
+        let name = &f.name;
+        let _ = writeln!(
+            out,
+            "    let l_prop_{name} = {};",
+            labels.lit(&format!("{snake_name}.field.{name}"), &title_case(name))
+        );
+    }
+    let _ = writeln!(
+        out,
+        "    let l_prop_created_at = {};",
+        labels.lit("common.field.created_at", "Created at")
+    );
     out
 }
 
@@ -21665,6 +22331,580 @@ exempt_paths = [
                 "Column::new(\"Username\", |row: &Account| maud::html! { (&row.username) })"
             ),
             "routes:\n{routes}"
+        );
+    }
+    // ── Issue #1349: `--i18n` translatable scaffold views ────────────────
+
+    /// Every `t!(locale, "key")` key referenced by `src`, in source order.
+    fn t_macro_keys(src: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut rest = src;
+        while let Some(pos) = rest.find("t!(locale, \"") {
+            let after = &rest[pos + "t!(locale, \"".len()..];
+            let Some(end) = after.find('"') else { break };
+            keys.push(after[..end].to_owned());
+            rest = &after[end..];
+        }
+        keys
+    }
+
+    /// Every top-level key defined in an `.ftl` source.
+    fn ftl_keys(src: &str) -> BTreeSet<String> {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .filter(|l| !l.starts_with(' ') && !l.starts_with('\t'))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, _)| k.trim().to_owned())
+            .collect()
+    }
+
+    fn i18n_options() -> ScaffoldOptions {
+        ScaffoldOptions {
+            i18n: true,
+            ..Default::default()
+        }
+    }
+
+    /// A five-field resource — the shape the issue's success metric measures.
+    fn i18n_fields() -> Vec<String> {
+        vec![
+            "title:String".into(),
+            "body:Text".into(),
+            "published:bool".into(),
+            "views:i64".into(),
+            "author_name:String".into(),
+        ]
+    }
+
+    /// The `html! { … }` view bodies of a generated routes file — every span
+    /// between a `html! {` and the handler's closing `}))`. Used to assert that
+    /// no user-facing English literal survives in the markup itself (AC7).
+    fn view_bodies(routes: &str) -> String {
+        let mut out = String::new();
+        let mut rest = routes;
+        while let Some(pos) = rest.find("html! {") {
+            let after = &rest[pos..];
+            let end = after.find("\n}").unwrap_or(after.len());
+            out.push_str(&after[..end]);
+            out.push('\n');
+            rest = &after[end..];
+        }
+        out
+    }
+
+    /// AC6: without `--i18n`, scaffold output is byte-for-byte unchanged.
+    #[test]
+    fn i18n_omitted_is_byte_identical_to_default() {
+        let fields = i18n_fields();
+
+        let tmp_default = project_with_main(default_main());
+        plan_scaffold(tmp_default.path(), "Post", &fields, "20260427000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let tmp_explicit = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp_explicit.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions {
+                i18n: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        for rel in [
+            "src/routes/posts.rs",
+            "src/models/post.rs",
+            "src/repositories/post.rs",
+            "migrations/20260427000000_create_posts/up.sql",
+            "src/main.rs",
+            "Cargo.toml",
+        ] {
+            let a = fs::read_to_string(tmp_default.path().join(rel)).unwrap();
+            let b = fs::read_to_string(tmp_explicit.path().join(rel)).unwrap();
+            assert_eq!(a, b, "`i18n: false` must not change `{rel}`");
+            assert!(
+                !b.contains("t!(locale"),
+                "non-i18n `{rel}` must carry no `t!` lookups:\n{b}"
+            );
+        }
+        assert!(
+            !tmp_default.path().join("i18n/en.ftl").exists(),
+            "a non-i18n scaffold must not create an `.ftl` stub"
+        );
+    }
+
+    /// AC2: page titles, buttons, links, and per-field labels are `t!` lookups.
+    #[test]
+    fn i18n_scaffold_emits_t_macro_lookups_for_every_view_string() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        let keys: BTreeSet<String> = t_macro_keys(&routes).into_iter().collect();
+        for expected in [
+            "common.create",
+            "common.save",
+            "common.back",
+            "common.edit",
+            "common.new",
+            "common.delete",
+            "post.name",
+            "post.name.plural",
+            "post.field.title",
+            "post.field.author_name",
+        ] {
+            assert!(
+                keys.contains(expected),
+                "missing `t!` key `{expected}`; got {keys:?}"
+            );
+        }
+    }
+
+    /// AC7: no hardcoded English label literal survives in the view body.
+    #[test]
+    fn i18n_view_bodies_carry_no_hardcoded_label_literals() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let bodies = view_bodies(&routes);
+
+        for literal in [
+            "\"New Post\"",
+            "\"Create\"",
+            "\"Save\"",
+            "\"Delete\"",
+            "\"Back to list\"",
+            "\"Edit\"",
+            "\"Show\"",
+            "\"Post index\"",
+            "\"Posts\"",
+            "\"Title\"",
+            "\"Author Name\"",
+            "\"Author name\"",
+        ] {
+            assert!(
+                !bodies.contains(literal),
+                "view body still carries the hardcoded literal {literal}:\n{bodies}"
+            );
+        }
+        // The whole file, not just the markup: labels reach the widgets through
+        // `let` bindings and `override_label` calls outside `html! { … }` too.
+        assert!(
+            !routes.contains("Column::new(\"Title\""),
+            "index column headers must be translated:\n{routes}"
+        );
+        assert!(
+            !routes.contains("(\"Created at\", maud::html!"),
+            "show property labels must be translated:\n{routes}"
+        );
+    }
+
+    /// AC4/AC7: every referenced key exists in the emitted `en.ftl`, and the
+    /// file carries no key the views never reference (which `autumn i18n check`
+    /// would report as unused).
+    #[test]
+    fn i18n_en_ftl_matches_the_referenced_key_set_exactly() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        let referenced: BTreeSet<String> = t_macro_keys(&routes).into_iter().collect();
+        let defined = ftl_keys(&ftl);
+        assert!(!referenced.is_empty(), "expected `t!` keys in:\n{routes}");
+        let missing: Vec<_> = referenced.difference(&defined).collect();
+        assert!(
+            missing.is_empty(),
+            "keys referenced but not defined in en.ftl: {missing:?}\n{ftl}"
+        );
+        let unused: Vec<_> = defined.difference(&referenced).collect();
+        assert!(
+            unused.is_empty(),
+            "keys defined in en.ftl but never referenced: {unused:?}\n{routes}"
+        );
+        // English values, so an `en` app reads exactly like the plain scaffold.
+        assert!(ftl.contains("common.create = Create"), "{ftl}");
+        assert!(ftl.contains("common.save = Save"), "{ftl}");
+        assert!(ftl.contains("common.back = Back to list"), "{ftl}");
+        assert!(ftl.contains("post.name = Post"), "{ftl}");
+        assert!(ftl.contains("post.field.title = Title"), "{ftl}");
+        assert!(
+            ftl.contains("post.field.author_name = Author Name"),
+            "{ftl}"
+        );
+    }
+
+    /// AC3: every view-rendering handler takes the `Locale` extractor so the
+    /// macro has a `locale` in scope.
+    #[test]
+    fn i18n_view_handlers_take_the_locale_extractor() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("use autumn_web::i18n::Locale;"),
+            "routes must import the extractor:\n{routes}"
+        );
+        for handler in [
+            "pub async fn index(",
+            "pub async fn show(",
+            "pub async fn new_form(",
+            "pub async fn edit_form(",
+            "pub async fn create(",
+            "pub async fn update(",
+        ] {
+            let start = routes
+                .find(handler)
+                .unwrap_or_else(|| panic!("missing handler `{handler}`:\n{routes}"));
+            let sig_end = routes[start..].find(") ->").unwrap_or_else(|| {
+                panic!("unterminated signature for `{handler}`");
+            });
+            let sig = &routes[start..start + sig_end];
+            assert!(
+                sig.contains("locale: Locale"),
+                "`{handler}` must take the Locale extractor, got:\n{sig}"
+            );
+        }
+        // The extractor must precede any body-consuming extractor — axum only
+        // allows one `FromRequest` argument, and it has to be last.
+        if let Some(start) = routes.find("pub async fn create(") {
+            let sig = &routes[start..start + routes[start..].find(") ->").unwrap()];
+            let locale_at = sig.find("locale: Locale").unwrap();
+            if let Some(body_at) = sig.find("body: Bytes") {
+                assert!(locale_at < body_at, "Locale must precede the body:\n{sig}");
+            }
+        }
+    }
+
+    /// AC3: the `--api` (JSON) path is unaffected — no labels to translate, so
+    /// no `t!` calls, no `Locale` extractor, and no `.ftl` stub.
+    #[test]
+    fn i18n_api_scaffold_output_is_unaffected() {
+        let fields = i18n_fields();
+        let tmp_plain = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp_plain.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let tmp_i18n = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp_i18n.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions {
+                api: true,
+                i18n: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        for rel in [
+            "src/models/post.rs",
+            "src/repositories/post.rs",
+            "Cargo.toml",
+        ] {
+            let a = fs::read_to_string(tmp_plain.path().join(rel)).unwrap();
+            let b = fs::read_to_string(tmp_i18n.path().join(rel)).unwrap();
+            assert_eq!(a, b, "`--api --i18n` must not change `{rel}`");
+        }
+        assert!(
+            !tmp_i18n.path().join("i18n/en.ftl").exists(),
+            "an `--api` scaffold references no labels, so it writes no `.ftl`"
+        );
+    }
+
+    /// AC5: shared chrome keys are emitted once and reused — a second resource
+    /// adds only its own nouns, never a duplicate `common.*` entry.
+    #[test]
+    fn i18n_common_chrome_keys_are_emitted_once_across_resources() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into()],
+            "20260427000001",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert_eq!(
+            ftl.matches("common.create =").count(),
+            1,
+            "shared chrome must be emitted exactly once:\n{ftl}"
+        );
+        assert_eq!(ftl.matches("common.back =").count(), 1, "{ftl}");
+        let keys = ftl_keys(&ftl);
+        assert!(keys.contains("post.field.title"), "{ftl}");
+        assert!(keys.contains("comment.field.body"), "{ftl}");
+        assert!(
+            !keys.iter().any(|k| k.starts_with("comment.create")),
+            "chrome must not be duplicated per model:\n{ftl}"
+        );
+    }
+
+    /// AC4: an `en.ftl` the user has already translated survives regeneration —
+    /// existing values are never rewritten, only missing keys are appended.
+    #[test]
+    fn i18n_merges_into_an_existing_en_ftl_without_clobbering_values() {
+        let tmp = project_with_main(default_main());
+        fs::create_dir_all(tmp.path().join("i18n")).unwrap();
+        fs::write(
+            tmp.path().join("i18n/en.ftl"),
+            "# hand-written\nwelcome.title = Welcome\ncommon.create = Add\n",
+        )
+        .unwrap();
+
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert!(ftl.contains("welcome.title = Welcome"), "{ftl}");
+        assert!(
+            ftl.contains("common.create = Add"),
+            "an existing value must not be rewritten:\n{ftl}"
+        );
+        assert!(!ftl.contains("common.create = Create"), "{ftl}");
+        assert!(ftl.contains("post.field.title = Title"), "{ftl}");
+    }
+
+    /// AC4 ("zero further config"): the generated app actually resolves the
+    /// keys — the `i18n` feature is on, `[i18n]` is configured, and the builder
+    /// loads the bundle.
+    #[test]
+    fn i18n_wires_the_project_so_keys_resolve_with_no_further_config() {
+        let tmp = project_with_main(default_main());
+        fs::write(tmp.path().join("autumn.toml"), "[server]\nport = 3000\n").unwrap();
+        // A real `autumn new` project declares autumn-web; the bare fixture does
+        // not, and a feature cannot be added to a dependency that isn't there.
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n",
+        )
+        .unwrap();
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("\"i18n\""),
+            "the `i18n` feature must be enabled:\n{cargo}"
+        );
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert!(toml.contains("[i18n]"), "{toml}");
+        assert!(toml.contains("default_locale = \"en\""), "{toml}");
+        let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains(".i18n_auto()"),
+            "the builder must load the bundle:\n{main_rs}"
+        );
+    }
+
+    /// AC1: `--i18n` composes with `--searchable` and `--soft-delete`; the
+    /// strings those variants add are translated too.
+    #[test]
+    fn i18n_composes_with_searchable_and_soft_delete() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                i18n: true,
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    soft_delete: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        let referenced: BTreeSet<String> = t_macro_keys(&routes).into_iter().collect();
+        let defined = ftl_keys(&ftl);
+        assert!(
+            referenced.difference(&defined).next().is_none(),
+            "searchable+trash keys must all be defined:\n{ftl}"
+        );
+        assert!(
+            !routes.contains("\"Search Posts\""),
+            "the search page's strings must be translated:\n{routes}"
+        );
+        assert!(
+            !routes.contains("\"Restore\"") && !routes.contains("\"Trash is empty.\""),
+            "the trash view's strings must be translated:\n{routes}"
+        );
+    }
+
+    /// The variants whose views render outside a request handler (`--live`'s
+    /// SSE fragment) or through a separate nested renderer are refused up front
+    /// rather than silently emitting English under an i18n flag.
+    #[test]
+    fn i18n_rejects_the_view_variants_it_cannot_translate() {
+        for (label, options) in [
+            (
+                "--live",
+                ScaffoldOptions {
+                    i18n: true,
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--live-validation",
+                ScaffoldOptions {
+                    i18n: true,
+                    live_validation: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--belongs-to",
+                ScaffoldOptions {
+                    i18n: true,
+                    belongs_to: Some("Post".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let tmp = project_with_main(default_main());
+            let err = plan_scaffold_with_options(
+                tmp.path(),
+                "Comment",
+                &["body:Text".into()],
+                "20260427000000",
+                &options,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "{label}: expected a Config error, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("--i18n") && msg.contains(label),
+                "{label}: the error must name both flags: {msg}"
+            );
+        }
+    }
+
+    /// AC2: per-field labels flow through one key per field, used by the index
+    /// column header, the show property row, and the form control alike.
+    #[test]
+    fn i18n_field_labels_share_one_key_per_field() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "author_name:String".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains(".override_label(\"title\", t!(locale, \"post.field.title\"))"),
+            "form controls must relabel through the field key:\n{routes}"
+        );
+        // One key, three surfaces: index header, show row, form label.
+        assert!(
+            routes.matches("\"post.field.author_name\"").count() >= 3,
+            "the field key must serve index, show, and form:\n{routes}"
         );
     }
 }

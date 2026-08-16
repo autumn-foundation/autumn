@@ -1223,6 +1223,83 @@ Bulk restore/purge, retention/auto-purge scheduling, and cascading
 restore across associations are deliberately out of scope; compose them
 with the bulk-actions widgets, `#[scheduled]`, and your own policy.
 
+### Translatable views (`--i18n`)
+
+Autumn ships the whole Fluent stack — the `t!(locale, "key")` macro with
+compile-time key validation, `Locale::t()`, the `i18n/<tag>.ftl`
+convention, fallback chains, and an `Accept-Language` `Locale` extractor
+(see [i18n](./i18n.md)). `--i18n` is what wires the scaffold into it
+(issue #1349), so a generated resource is translatable the moment it
+exists instead of needing every English string hand-replaced:
+
+```bash
+autumn generate scaffold Post title:String body:Text published:bool --i18n
+```
+
+- Every user-facing string in the generated views — page titles, `h1`
+  headings, buttons, links, index column headers, show-page property
+  labels, and form control labels — is emitted as a `t!(locale, "key")`
+  lookup instead of a literal.
+- Each view-rendering handler takes the `Locale` extractor as its **first**
+  parameter (`Locale` is a `FromRequestParts` extractor, and axum requires
+  the one body-consuming argument to stay last).
+- `i18n/en.ftl` is created — or merged into, if it already exists — with
+  every key the views reference, valued with the English the plain
+  scaffold renders. So an `en` app looks exactly like a non-`--i18n` one,
+  and adding French means translating that file, not editing Rust.
+- The project is wired so those lookups actually resolve: autumn-web's
+  `i18n` feature is enabled, `[i18n] default_locale = "en"` is added to
+  `autumn.toml` if it has no `[i18n]` block, and `.i18n_auto()` goes into
+  the `AppBuilder` chain in `main.rs`.
+
+Keys are split so a translator sees each string exactly once:
+
+| Kind | Examples | Written |
+| ---- | -------- | ------- |
+| Shared chrome | `common.create`, `common.save`, `common.back`, `common.edit`, `common.delete`, `common.show`, `common.new` | Once per project. A second resource reuses the block rather than duplicating it per model. |
+| This resource's nouns | `post.name`, `post.name.plural`, `post.field.<column>`, `post.index.title`, `post.show.title`, `post.edit.title` | Once per resource, under a marked comment block. |
+
+Patterns that wrap a noun or a row key take a **Fluent argument** rather
+than concatenating around it, so a translation controls word order and
+placement: `common.new = New { $resource }`,
+`post.show.title = { $pascal } #{ $id }`-style values are interpolated at
+lookup time.
+
+Notes and limits:
+
+- **One key per field, three surfaces.** `post.field.title` labels the
+  index column header, the show-page property row, and the form control
+  alike, so one translation serves all three. The English value is the
+  Title Case the form derive already uses, which means a **multi-word**
+  column's show-page label normalizes from "Author name" to "Author Name"
+  under `--i18n`. Single-word columns are unaffected.
+- **Re-running never clobbers a translation.** The `.ftl` merge only adds
+  keys that are missing; an existing value is left exactly as edited.
+- **`autumn destroy scaffold … --i18n`** removes that resource's key block
+  and leaves the shared `common.*` chrome and the file itself in place —
+  `.i18n_auto()` panics at startup if the default locale's file is gone,
+  and sibling resources reuse the chrome. The `i18n` feature and the
+  `.i18n_auto()` call are project-level wiring and are likewise left alone.
+- **Composes with** `--searchable`, `--soft-delete`, `--sharded`, and the
+  CSV export — the strings those surfaces add (search box and its
+  placeholder, Trash/Restore/Purge, "Export CSV", empty-state copy) are
+  translated too. `--api` renders no labels, so the flag is a no-op there:
+  the output is byte-identical and no `.ftl` is written.
+- **Refused with** `--live`, `--live-validation`, and `--belongs-to`. The
+  first two render list rows and inline-validation fragments outside any
+  request (so there is no `Locale` in scope), and the third splices markup
+  into the *parent* resource's already-generated `show` handler, whose
+  signature this generator does not own. Half-translated views under a flag
+  that promises translatable output are worse than a refusal, so the
+  generator says so and writes nothing.
+- **Without `--i18n`, output is byte-for-byte unchanged.** The default
+  scaffold stays zero-i18n-config.
+
+Translating the framework's own strings (error pages, validation
+messages), locale-prefixed routing ([#1251](./i18n.md)), missing/unused
+key linting (`autumn i18n check`), and machine-translating non-English
+`.ftl` files are all out of scope here.
+
 Metadata flags let you keep common model and repository polish in the
 generation step:
 
@@ -1244,6 +1321,7 @@ autumn generate scaffold Bookmark url:String title:String tag:String alive:bool 
 | `--default FIELD=VALUE` | Adds `#[default]` and a SQL `DEFAULT` for bool, string/text, integer, and float fields. `i32` defaults must fit PostgreSQL's `INTEGER` range. Defaulted fields are omitted from generated HTML forms and update columns because the model macro keeps them out of `NewX`. |
 | `--query METHOD:FIELD` | Adds a derived repository method such as `find_by_tag(tag: String) -> Vec<Model>`. The `find_by_` suffix must match `FIELD`. |
 | `--api` | Generates a JSON API-only scaffold (skips HTML routes/templates, registers 5 REST JSON routes, and generates a JSON-based smoke test). |
+| `--i18n` | Emits translatable views: every view string becomes a `t!(locale, "key")` lookup, view handlers take the `Locale` extractor, and `i18n/en.ftl` is back-filled with the English. See [Translatable views](#translatable-views---i18n). |
 
 | Generated file                        | Existing concept it maps to                                                                |
 | ------------------------------------- | ------------------------------------------------------------------------------------------ |

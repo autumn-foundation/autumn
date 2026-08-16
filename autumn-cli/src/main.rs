@@ -2863,6 +2863,19 @@ enum GenerateCommands {
         /// `search_vector` migration, and a wired search box in the index view.
         #[arg(long, value_name = "FIELD,FIELD", value_delimiter = ',')]
         searchable: Vec<String>,
+        /// Emit i18n-ready views (issue #1349): every page title, heading,
+        /// button, link, and field label in the generated HTML views becomes a
+        /// `t!(locale, "key")` lookup, each view handler takes the `Locale`
+        /// extractor, and the referenced keys are written to `i18n/en.ftl` with
+        /// their English values — so an `en` app renders identically and adding
+        /// a locale means translating a `.ftl`, not editing Rust. Also enables
+        /// autumn-web's `i18n` feature, adds `[i18n]` to `autumn.toml`, and
+        /// wires `.i18n_auto()` into `main.rs`. Composes with `--searchable`,
+        /// `--soft-delete`, and `--sharded`; `--api` scaffolds render no labels,
+        /// so the flag is a no-op there. Not supported with `--live`,
+        /// `--live-validation`, or `--belongs-to`.
+        #[arg(long)]
+        i18n: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -4350,6 +4363,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             belongs_to,
             counter_cache,
             searchable,
+            i18n,
             dry_run,
             force,
         } => {
@@ -4410,6 +4424,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 belongs_to.as_deref(),
                 counter_cache,
                 &searchable,
+                i18n,
             ) {
                 Ok(result) => result,
                 Err(e) => {

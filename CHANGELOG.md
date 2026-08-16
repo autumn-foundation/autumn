@@ -111,6 +111,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`autumn generate scaffold --i18n` emits translatable views** (issue #1349).
+  Autumn already shipped the whole Fluent stack — the `t!(locale, "key")` macro
+  with compile-time key validation, the `i18n/<tag>.ftl` convention, fallback
+  chains, and an `Accept-Language` `Locale` extractor — but the scaffold emitted
+  hardcoded English into every view, so localizing a generated resource meant
+  hand-replacing roughly a dozen strings and hand-authoring the matching keys,
+  per resource. With the new flag: every user-facing string in the generated
+  views (page titles, `h1` headings, buttons, links, index column headers,
+  show-page property labels, and form control labels) is emitted as a `t!`
+  lookup; each view-rendering handler takes the `Locale` extractor as its first
+  parameter; and `i18n/en.ftl` is created — or merged into, preserving values
+  you have already translated — with every key the views reference, valued with
+  the English the plain scaffold renders. The project is wired so those lookups
+  resolve with no further config: autumn-web's `i18n` feature is enabled,
+  `[i18n] default_locale = "en"` is added to `autumn.toml` when it has no
+  `[i18n]` block, and `.i18n_auto()` goes into the `AppBuilder` chain. Shared
+  chrome (`common.create`/`save`/`back`/`edit`/`new`/`delete`) is written once
+  per project and reused across resources rather than duplicated per model;
+  patterns that wrap a noun or a row key take a Fluent argument
+  (`common.new = New { $resource }`) so translations control word order.
+  Composes with `--searchable`, `--soft-delete`, `--sharded`, and the CSV
+  export, whose added strings are translated too; `--api` renders no labels, so
+  the flag is a no-op there and writes no `.ftl`. Refused with `--live`,
+  `--live-validation`, and `--belongs-to`, whose views render outside a request
+  or inside the parent resource's handler. **Without `--i18n`, scaffold output
+  is byte-for-byte unchanged.** One caveat: with the flag on, a single key per
+  field labels the index header, the show row, and the form control alike, so a
+  *multi-word* column's show-page label normalizes from "Author name" to
+  "Author Name" (single-word columns are unaffected).
+
 - **`json`/`jsonb` scaffold field type (#1341):** `autumn generate scaffold Setting config:json` (or `config:jsonb`, `Json`, `Jsonb` — like `Attachment`/`attachment`, both the lowercase and PascalCase spelling of each alias are accepted) adds a `config` field whose model type is bare `serde_json::Value` — no wrapper struct — mapped to a Postgres `JSONB` column (`Nullable<Jsonb>` for `Option<json>`), matching loco's `... data:jsonb` in a single command. Unlike the existing JSONB-backed `Attachment` field (`autumn_web::storage::Blob`), which needed hand-written `FromSql`/`ToSql` because `Blob` is a local type, `json`/`jsonb` needs **zero** new `autumn-web` conversion code: diesel itself already implements `FromSql`/`ToSql<Jsonb, Pg>` for `serde_json::Value`, and — on the `SQLite` dev/test backend — `FromSql`/`ToSql<Json, Sqlite>` too (diesel 2.3+, behind the `serde_json`/`sqlite` cargo features this workspace already turns on unconditionally). The `SQLite` column is `TEXT` via diesel's `Json` sql-type specifically, not its `Jsonb` sql-type, which uses a proprietary binary encoding rather than plain-text JSON.
 
   The generated `<textarea>`-based create/edit form parses the submitted text as JSON in `into_new`, the same `serde_json::Value: FromStr` + `AutumnError::bad_request_msg` pattern already used for `Decimal`/`Uuid`/enum fields — invalid JSON is a 400, not a 500, and a blank *optional* textarea means "no value" rather than a parse failure. The auto-generated JSON API round-trips the field as a native object/array for free (`serde_json::Value: Serialize`/`Deserialize` as itself). CSV export wraps it in the existing formula-injection guard defensively; it is excluded from server-side column sorting (same as `Attachment`/`Enum`/`Bytea` — `serde_json::Value` isn't in the `#[model]` macro's orderable allowlist) and, like `Text`/`RichText`, hidden from the admin's default list view — the admin panel already had a purpose-built `AdminFieldKind::Json` (monospace textarea + submit-time JSON coercion) that the new DSL token now reaches. That coercion step now rejects malformed non-blank JSON with a `400` instead of silently persisting the raw unparsed string (a pre-existing gap in `autumn-admin-plugin`'s form handling, hardened alongside this since the new DSL wiring made it newly reachable). `--default` is supported (`config:json={}`), validating the literal is syntactically valid JSON before quoting it verbatim into the migration's `DEFAULT` clause. [no-plugin]
