@@ -509,11 +509,16 @@ impl ColumnType {
     /// [`Json`](Self::Json) is the one exception to the leaf-matching rule
     /// above: `Value` is common enough as a bare identifier (unlike the
     /// domain-specific `Blob`/`Decimal`/`Uuid`/`NaiveDateTime`) that an
-    /// unrelated hand-written type sharing the name (`domain::Value`) would
-    /// otherwise be misclassified as JSON. Only the unqualified `Value` token
-    /// or the exact `serde_json::Value` path resolve to `Json`; any other
-    /// qualified path (`domain::Value`, `my_crate::sub::Value`) resolves to
-    /// `None`.
+    /// unrelated hand-written type sharing the name would otherwise be
+    /// misclassified as JSON — and this function only ever sees the type
+    /// token as written in the struct field, never the file's `use`
+    /// declarations, so even a *bare* `Value` can't be safely resolved to a
+    /// crate without that import context. Only the exact `serde_json::Value`
+    /// path resolves to `Json`; a bare `Value` (however it was imported) or
+    /// any other qualified path (`domain::Value`, `my_crate::sub::Value`)
+    /// resolves to `None`. The DSL/scaffold generator is unaffected — it
+    /// always emits the fully-qualified `serde_json::Value` in generated
+    /// model structs (see [`Self::rust_type`]), never a bare `Value`.
     #[must_use]
     pub fn from_rust_type(rust: &str) -> Option<Self> {
         // Normalise away all whitespace so `DateTime < Utc >` and
@@ -526,10 +531,13 @@ impl ColumnType {
             return Some(Self::TimestampTz);
         }
         // See the doc comment above: `Value` is too generic a bare name to
-        // safely leaf-match through an arbitrary path, so this checks the
-        // full normalised string rather than falling through to the
+        // safely leaf-match through an arbitrary path — and with no `use`
+        // context available here, even a bare `Value` can't be told apart
+        // from an unrelated same-named type — so only the fully-qualified
+        // `serde_json::Value` path is accepted, checked against the full
+        // normalised string rather than falling through to the
         // `rsplit("::")` leaf split below.
-        if normalized == "Value" || normalized == "serde_json::Value" {
+        if normalized == "serde_json::Value" {
             return Some(Self::Json);
         }
 
@@ -1370,7 +1378,6 @@ mod tests {
             ColumnType::from_rust_type("serde_json::Value"),
             Some(ColumnType::Json)
         );
-        assert_eq!(ColumnType::from_rust_type("Value"), Some(ColumnType::Json));
         // Whitespace tolerance around the generic.
         assert_eq!(
             ColumnType::from_rust_type("chrono::DateTime < chrono::Utc >"),
@@ -1381,12 +1388,18 @@ mod tests {
     #[test]
     fn from_rust_type_value_leaf_match_is_scoped_to_serde_json() {
         // Unlike `Blob`/`Decimal`/`Uuid`, `Value` is not leaf-matched through an
-        // arbitrary path — only the bare token or the exact `serde_json::Value`
-        // path resolve to `Json`. An unrelated hand-written type sharing the
-        // name must not be misclassified as JSON (Codex review finding on #1341).
+        // arbitrary path — only the exact `serde_json::Value` path resolves to
+        // `Json`. An unrelated hand-written type sharing the name must not be
+        // misclassified as JSON (Codex review finding on #1341).
         assert_eq!(ColumnType::from_rust_type("domain::Value"), None);
         assert_eq!(ColumnType::from_rust_type("my_crate::sub::Value"), None);
         assert_eq!(ColumnType::from_rust_type("crate::Value"), None);
+        // A bare `Value` is ALSO rejected now (a follow-up Codex finding):
+        // this function only sees the type token, never the file's `use`
+        // declarations, so a bare `Value` imported via `use domain::Value;`
+        // is indistinguishable from one imported via `use serde_json::Value;`.
+        // Only the fully-qualified path is unambiguous.
+        assert_eq!(ColumnType::from_rust_type("Value"), None);
     }
 
     #[test]
