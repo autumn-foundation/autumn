@@ -234,6 +234,48 @@ jobs:
             integration::scaffold_form_for::generated_attachment_scaffold_multipart_test_passes \
             -- --ignored --exact
 
+      # ── `{encrypted}` field-DSL modifier (#1340) ────────────────────────
+      #
+      # The ONLY machine proof that the emitted `#[encrypted(...)]` attribute
+      # is one the `#[model]`/`#[repository]` macros actually accept — every
+      # other assertion in that slice string-matches generated text. These
+      # also pin two facts that are invisible to a string match: diesel's
+      # `serialize_as` makes `&New{Model}` non-`Insertable` (so the scaffold
+      # must insert the OWNED record), and the raw-diesel update's
+      # `autumn_web::encryption::{Randomized,Deterministic}Text::from(..)`
+      # bind type-checks inside the `.set((..))` tuple. One leg per write
+      # path, so a failure names the shape that broke. Same `cli_tests`
+      # caveat as the blocks above — named explicitly or they never run.
+      - name: encrypted_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_encrypted::encrypted_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: encrypted_api_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_encrypted::encrypted_api_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: encrypted_live_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_encrypted::encrypted_live_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: encrypted_nested_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_encrypted::encrypted_nested_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: encrypted_admin_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_encrypted::encrypted_admin_scaffold_cargo_checks \
+            -- --ignored --exact
+
   # ── Generated-app variant conformance matrix ────────────────────────────────
   #
   # One matrixed job that scaffolds a fresh project in a specific "variant"

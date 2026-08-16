@@ -60,11 +60,17 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 | `console_playground_target_compiles_with_a_repository_round_trip` | `integration/console.rs` | playground + `repo.find_all()` → `cargo check --bin playground` |
 | `console_run_exits_non_zero_when_the_database_is_unreachable` | `integration/console.rs` | `autumn console` propagates config/connection failures non-zero |
 | `console_run_surfaces_a_compile_error_in_the_playground` | `integration/console.rs` | a broken playground edit surfaces cargo diagnostics, non-zero |
+| `encrypted_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` scaffold → `cargo check --tests` |
+| `encrypted_api_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--api` → `cargo check --tests` |
+| `encrypted_live_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--live` → `cargo check --tests` |
+| `encrypted_nested_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--belongs-to` → `cargo check --tests` |
+| `encrypted_admin_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `generate admin` (wired in) → `cargo check --tests` |
 
-The four `console.rs` entries compile into the consolidated `cli_tests` binary,
-whose only other CI `--ignored` invocation filters on `offsite`. They are
-therefore named **explicitly** in `.github/workflows/generator-conformance.yml`;
-a new `#[ignore]`d console test that is not added there will never run in CI.
+The `console.rs` and `scaffold_encrypted.rs` entries compile into the
+consolidated `cli_tests` binary, whose only other CI `--ignored` invocation
+filters on `offsite`. They are therefore named **explicitly** in
+`.github/workflows/generator-conformance.yml`; a new `#[ignore]`d test in that
+binary which is not added there will never run in CI.
 
 ### Why `#[ignore]`?
 

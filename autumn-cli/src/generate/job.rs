@@ -73,12 +73,34 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
 
     // Attachment fields require the `storage` autumn-web feature and are not
     // meaningful as job arguments (pass a storage key or file ID instead).
-    for field in &parsed_fields {
+    // `parse_fields` builds `parsed_fields` from `fields` one-to-one with no
+    // skips, so `fields[i]` is the token that produced `parsed_fields[i]` — the
+    // refusals below can echo what the user actually typed.
+    for (i, field) in parsed_fields.iter().enumerate() {
         if matches!(field.kind, FieldKind::Attachment) {
             return Err(GenerateError::InvalidField {
                 token: format!("{}:Attachment", field.name),
                 reason: "Attachment fields are not supported in job args structs; \
                          pass a storage key (String) or file ID (i64) instead"
+                    .into(),
+            });
+        }
+        // Issue #1340: at-rest column encryption is a `#[model]` concern. A job
+        // args struct is a serde payload serialized into the queue, not a
+        // database column, so `#[encrypted]` has nothing to attach to — and
+        // silently dropping the modifier would hand back a plaintext argument
+        // the author believed was protected.
+        if field.is_encrypted() {
+            return Err(GenerateError::InvalidField {
+                // Echo the token the user typed rather than synthesizing one:
+                // `notes:Text{encrypted:deterministic}` must not be reported
+                // back as `notes:String{encrypted}`.
+                token: fields[i].clone(),
+                reason: "the `encrypted` modifier applies to model columns, not job arguments: \
+                         job args are serialized into the queue payload, not stored in a \
+                         column, so there is no `#[model]` field for `#[encrypted]` to attach \
+                         to. Declare the encrypted column with `generate model`/`generate \
+                         scaffold` and pass the record's id as the job argument instead."
                     .into(),
             });
         }
@@ -959,5 +981,28 @@ async fn main() {
         assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
         assert!(plan.warnings[0].contains("rust_decimal"));
         assert!(plan.warnings[0].contains("db-diesel2-postgres"));
+    }
+
+    // ── `{encrypted}` is not a `generate job` token (issue #1340) ───────────
+
+    /// R9: a job args struct is a serde payload, not a database column — there
+    /// is no `#[model]` for `#[encrypted]` to attach to, and the args are
+    /// serialized into the job queue. Refuse rather than silently drop the
+    /// modifier and hand back a plaintext argument.
+    #[test]
+    fn job_args_reject_the_encrypted_modifier() {
+        let tmp = project_with_main("fn main() {}\n");
+        let err = plan_job(
+            tmp.path(),
+            "SendWelcomeEmail",
+            &["api_token:String{encrypted}".into()],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("encrypted"), "must name the modifier: {msg}");
+        assert!(
+            msg.contains("generate model") || msg.contains("generate scaffold"),
+            "must point at where the modifier belongs: {msg}"
+        );
     }
 }

@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`generate admin` over an `#[encrypted]` model:** the generated admin adapter
+  did not compile — it bound `&new_row` to `.values(…)` and `&diesel_changeset`
+  to `.set(…)`, and diesel implements `Insertable`/`AsChangeset` only for the
+  owned value once a column uses `#[diesel(serialize_as = …)]`, as every
+  encrypted field does. Both now pass owned records when the model has an
+  encrypted column; plaintext models keep the borrowed form byte-for-byte.
+  Separately, **every admin edit of such a model failed**: the plugin renders an
+  encrypted column's edit control disabled and with no `name` (it is managed
+  outside the admin), so the form submits no key for it, while the handler
+  deserialized the submitted map into `New{Model}`, where the encrypted `String`
+  is required — so `serde_json::from_value` returned a "missing field" error even
+  when only a plaintext column was edited. Encrypted columns are now excluded
+  from the update entirely (matching what the form can actually submit), and the
+  handler back-fills a placeholder purely to satisfy that deserialization. That
+  exclusion also closes a plaintext write: the `lock_version` update path emits a
+  raw `col.eq(value)` tuple that never builds an `Update{Model}` changeset, so it
+  would have bypassed the encrypting wrapper and stored **plaintext** in the
+  encrypted column.
+
+- **`#[repository]` with hooks over an `#[encrypted]` model:** a repository
+  declared `broadcasts = true` (or with an explicit `hooks = …` type) over a
+  model carrying any `#[encrypted]` column failed to compile —
+  `the trait bound `&Model: AsChangeset` is not satisfied`. The hooks-aware
+  bulk-update path bound a *borrowed* proposed row to `.set(…)`, and diesel
+  implements `AsChangeset` only for the owned model once a field uses
+  `#[diesel(serialize_as = …)]`, as every encrypted field does. It now passes
+  the owned record, matching the single-record hooks paths. Reachable from
+  `autumn generate scaffold --live` with an encrypted column.
+
 - **failure capsules:** the resolved client identity now obeys
   `[log] filter_parameters`. `client_addr`/`client_host`/`client_scheme` are
   derived from `Forwarded`, `X-Forwarded-*` and `Host`, and were copied into
@@ -81,6 +110,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   all and stay out of the anchor namespace.
 
 ### Added
+
+- **`{encrypted}` field-DSL modifier:** `autumn generate scaffold`/`model` can
+  now declare an at-rest encrypted column in one token —
+  `'api_token:String{encrypted}'` emits `#[encrypted]` on the generated model
+  field, and `'email:String{encrypted:deterministic}'` emits
+  `#[encrypted(deterministic)]` so the column still supports
+  `find_by`/`exists_by` equality lookups and a real `UNIQUE` index. The
+  migration column is unbounded `TEXT` — sized for the base64 ciphertext
+  envelope, not the plaintext — with a comment saying so, and the admin
+  generator's existing auto-detection picks the attribute up end to end, so a
+  scaffolded encrypted column is redacted in the admin with no extra flags.
+  Previously the only way to encrypt a scaffolded column was to remember to
+  hand-edit the generated model, and forgetting shipped plaintext silently.
+  Because randomized ciphertext can never satisfy an equality predicate, the
+  generator now refuses at generate time — pointing at
+  `{encrypted:deterministic}` as the fix — the combinations that would
+  otherwise fail at runtime with `EncryptionError::RandomizedEqualityLookup`:
+  `:unique`/`--unique`, `--query`, and `--index`. A second set of combinations
+  is refused in *both* modes, because no mode makes them work: `--searchable`
+  (full-text search indexes the stored ciphertext), `--default` (a defaulted
+  column bypasses the encrypting insert), `--shard-key` (the shard is chosen by
+  hashing the stored value), `Option<…>` and non-text field kinds (the v1
+  attribute is non-null `String` only), a `:states(…)` state machine (the
+  transition handler's raw write would bypass encryption), and deriving a
+  `slug{from:…}` from an encrypted column (a slug is stored in its own
+  plaintext column *and* used as the record's URL). `generate admin` refuses a
+  `{encrypted}` token the on-disk model does not back with the attribute:
+  redacting a column the model stores in plaintext would manufacture a false
+  at-rest guarantee rather than provide one.
+
+  The generated app's own surfaces follow suit: the index table renders
+  `••••••••` with no sort link, the CSV export omits the column entirely (as
+  the admin panel's export already did), and the admin no longer offers to sort
+  by it. The `show` view and `edit` form still render the value — you routed to
+  one record deliberately, and a form has to show what it is editing.
+  `generate` also prints the `autumn credentials edit` next step naming the
+  exact key material the new column needs.
 
 - **`MarkdownRegistry::static_params_for(param)`:** derive SSG params for a
   `#[static_get]` route whose path parameter is not named `slug` — e.g.

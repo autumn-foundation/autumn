@@ -3156,6 +3156,103 @@ fn generate_scaffold_help_documents_unique_field() {
     assert!(stdout.contains("--unique"), "got:\n{stdout}");
 }
 
+/// Issue #1340: the `{encrypted}` modifier must be discoverable from the help
+/// of the two subcommands that actually accept it. Documenting it only on the
+/// parent `autumn generate --help` is not enough — clap builds each
+/// subcommand's long help from its own doc block, and `model`/`scaffold` are
+/// what a user checking "how do I declare this field?" actually runs.
+#[test]
+fn generate_model_help_documents_the_encrypted_modifier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "model", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("{encrypted}"), "got:\n{stdout}");
+    assert!(
+        stdout.contains("{encrypted:deterministic}"),
+        "got:\n{stdout}"
+    );
+    // The one manual step the generator cannot do for the user.
+    assert!(stdout.contains("autumn credentials edit"), "got:\n{stdout}");
+}
+
+#[test]
+fn generate_scaffold_help_documents_the_encrypted_modifier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "scaffold", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("{encrypted}"), "got:\n{stdout}");
+    assert!(
+        stdout.contains("{encrypted:deterministic}"),
+        "got:\n{stdout}"
+    );
+    assert!(stdout.contains("autumn credentials edit"), "got:\n{stdout}");
+}
+
+/// The advertised examples must survive a copy-paste into bash/zsh: an
+/// unquoted `{…}` is brace-expanded by the shell before `autumn` ever sees it,
+/// so every `String{encrypted…}` token shown in help must be single-quoted.
+///
+/// Checked positionally rather than per-line, so it holds whichever way clap
+/// wraps the block (`verbatim_doc_comment` or reflowed) and for examples given
+/// inline in a paragraph as well as in an `Examples:` list.
+#[test]
+fn generate_help_encrypted_examples_are_shell_quoted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    for args in [
+        vec!["generate", "--help"],
+        vec!["generate", "model", "--help"],
+        vec!["generate", "scaffold", "--help"],
+    ] {
+        let label = args.join(" ");
+        let output = Command::new(autumn_bin)
+            .args(&args)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut checked = 0usize;
+        for (idx, _) in stdout.match_indices("String{encrypted") {
+            // Walk back to the start of the `name:String{encrypted…}` token.
+            let token_start = stdout[..idx]
+                .rfind(|c: char| c.is_whitespace())
+                .map_or(0, |i| i + 1);
+            // Only the runnable examples need quoting — a bare mention of the
+            // syntax in prose is wrapped in markdown backticks instead.
+            let is_example = stdout[..token_start].ends_with("autumn generate ")
+                || stdout[..token_start]
+                    .rsplit('\n')
+                    .next()
+                    .is_some_and(|line| line.contains("autumn generate "));
+            if !is_example {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                stdout[token_start..].starts_with('\''),
+                "`{label}` shows an unquoted example — bash/zsh would \
+                 brace-expand it before `autumn` sees it: {}",
+                &stdout[token_start
+                    ..stdout[token_start..]
+                        .find(char::is_whitespace)
+                        .map_or(stdout.len(), |i| token_start + i)]
+            );
+        }
+        // `generate --help` and both subcommands each advertise at least one.
+        assert!(checked > 0, "`{label}` shows no runnable encrypted example");
+    }
+}
+
 #[test]
 fn generate_scaffold_help_documents_unique_is_html_only() {
     // Regression guard (issue #1032 review follow-up): `unique`'s 422
