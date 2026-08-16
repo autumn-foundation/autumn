@@ -308,9 +308,14 @@ box with no manual edits.
 - **YAML/JSON/CSV loaders** — author a thin loader inside your seed binary if
   you want declarative fixtures.
 - **Relationship-aware faking** — `.fake()` fills scalar fields on a single
-  model; it does not generate a fake foreign key that points at a real seeded
-  parent row. Build the parent first (or set the FK field explicitly) and let
-  `.fake()` fill the rest.
+  model; it does not know which rows exist in a parent table, so a foreign-key
+  field left unset gets a plain fake integer (or stays at `Default::default()`
+  without `.fake()`) rather than a valid parent id — either way, inserting
+  without addressing the FK will fail. For a model with a foreign key, either
+  set that field explicitly (`.user_id(id)`) or mark it `#[factory_assoc(Type)]`
+  in the `#[model]` definition so the factory creates (or accepts) a parent
+  automatically; see the `#[factory_assoc]` docs for the associated-model
+  factory pattern.
 - **`autumn generate seed`** — tracked in #493 follow-up work.
 
 ---
