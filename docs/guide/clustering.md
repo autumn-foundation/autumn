@@ -289,7 +289,7 @@ alert on:
 | `autumn_cluster_pushes_received_total` | counter | State pushes accepted from peers after verification. A `leave` is verified and applied without being counted here. |
 | `autumn_cluster_merges_applied_total` | counter | Merges that changed local state. |
 | `autumn_cluster_frames_rejected_total` | counter | Labelled `reason` — see the receive path below. Every label is published from boot, zeroes included, and `reason="oversize"` covers the connection-fatal step-1 rejections too. |
-| `autumn_cluster_frames_dropped_total` | counter | Outbound frames swallowed by a full or closed peer queue. Anti-entropy re-sends the state, so drops are lossy only to latency. |
+| `autumn_cluster_frames_dropped_total` | counter | Outbound frames swallowed by a full or closed peer queue. Anti-entropy re-sends the state, so drops are lossy only to latency — with one exception, the departure, which travels on a lane of its own and is warned about when it cannot be handed over ([Leave is advisory](#failure-semantics)). |
 
 A steady `frames_rejected_total{reason="mac"}` means somebody is talking to
 your port with the wrong secret. Any `pushes_unsendable_total` at all means
@@ -514,7 +514,10 @@ followed by the `leave`, together bounded to **250 ms** so they always fit
 inside the shutdown drain budget. The final push is what keeps an increment
 that arrived after the last push round from dying with the process; the `leave`
 that follows costs one frame and covers the peer that holds no record for this
-node at all. That is the fast path, and it is best-effort.
+node at all. Both frames take a per-peer *departure lane* that the writer reads
+ahead of anything already queued, so a peer stalled long enough to fill its send
+queue cannot swallow them (see [Failure semantics](#failure-semantics)). That is
+the fast path, and it is best-effort.
 
 The departure runs **after** in-flight HTTP requests have drained, not when the
 listener closes: a request served during shutdown can still increment a
@@ -678,6 +681,32 @@ keeping the port off the public internet.
 Correctness comes from the suspicion timeout, which handles the kill, the
 crash, the pulled cable, and the lost leave identically. A shutdown that
 overruns its drain budget is a kill as far as the peer is concerned.
+
+Both departure frames travel on a small per-peer lane of their own, which the
+peer's writer reads before anything queued: **a farewell supersedes the state
+pushes already queued** for that peer, so a peer stalled long enough to fill its
+64-deep send queue cannot swallow this node's last words along with them. That
+is safe because every push carries the whole document — the queued frames are
+older copies of the one the farewell carries, at lower sequence numbers, and the
+peer's replay watermark discards whichever of them still arrive. When even that
+lane cannot take the frame, the departure is **counted in
+`autumn_cluster_frames_dropped_total` and warned about** on the way out rather
+than being lost quietly: **a dead writer still means the suspicion path**.
+
+**Known residuals (slice 2).** Three bounded consequences of the above, none of
+them correctness:
+
+- Pushes still queued behind a farewell are written after it and rejected by the
+  survivor's replay watermark, so `frames_rejected_total{reason="replay"}` can
+  move by up to one queue's worth at a clean departure of a stalled peer.
+- The departure flush waits for *every* queued frame, not just the farewell, so
+  a departing node whose queue had backed up normally spends its whole 250 ms
+  budget and logs the "not fully flushed" line even though its farewell left
+  first.
+- The lane guarantees the farewell reaches the writer; it does not guarantee the
+  writer gets to write it. A writer parked in a dial or a write when shutdown
+  begins is cancelled at the end of the same 250 ms grace, and the peer converges
+  on the suspicion timeout.
 
 **Counter volatility.** Counters live in process memory for the lifetime of the
 process. There is no persistence. A restarted node starts a fresh cell (its

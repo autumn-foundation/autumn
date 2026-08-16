@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -93,7 +93,26 @@ fn start_node(
     seed: u64,
     seed_peers: Vec<String>,
 ) -> TestNode {
-    let transport = router.endpoint();
+    start_node_on(
+        router.endpoint() as Arc<dyn PeerTransport>,
+        clock,
+        secret,
+        node_id,
+        seed,
+        seed_peers,
+    )
+}
+
+/// Start a node on an already-built transport: the seam for tests that need to
+/// wrap the router endpoint in a spy.
+fn start_node_on(
+    transport: Arc<dyn PeerTransport>,
+    clock: &TickingClock,
+    secret: &[u8],
+    node_id: &str,
+    seed: u64,
+    seed_peers: Vec<String>,
+) -> TestNode {
     let addr = transport.local_addr().to_string();
     let token = CancellationToken::new();
 
@@ -312,6 +331,12 @@ impl PeerTransport for RetainSpy {
         self.inner.send(to, frame);
     }
 
+    // Delegated rather than left to the trait default, which would report every
+    // departure as handed over: a spy must not answer for the transport it wraps.
+    fn send_farewell(&self, to: &str, frame: Vec<u8>) -> bool {
+        self.inner.send_farewell(to, frame)
+    }
+
     fn take_incoming(&self) -> Option<IncomingFrames> {
         self.inner.take_incoming()
     }
@@ -384,6 +409,10 @@ impl PeerTransport for RejectionSpy {
         self.inner.send(to, frame);
     }
 
+    fn send_farewell(&self, to: &str, frame: Vec<u8>) -> bool {
+        self.inner.send_farewell(to, frame)
+    }
+
     fn take_incoming(&self) -> Option<IncomingFrames> {
         self.inner.take_incoming()
     }
@@ -402,6 +431,96 @@ impl PeerTransport for RejectionSpy {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(from.to_owned());
         self.inner.note_unauthenticated_frame(from);
+    }
+}
+
+/// A [`PeerTransport`] whose ordinary per-peer queue can be declared **full**,
+/// and whose departure lane can be declared dead.
+///
+/// The loopback router has no per-peer queue at all, so nothing else in this
+/// suite can see the case the TCP transport lives with: a peer stalled long
+/// enough that `try_send` starts dropping. Once [`stall`](Self::stall) is set,
+/// every ordinary `send` is discarded exactly as it would be at
+/// `PEER_QUEUE_CAPACITY`; [`go_deaf`](Self::go_deaf) then does the same to the
+/// departure lane, which is the other half of the contract — a farewell that
+/// cannot be handed over must be *counted*, never quietly lost.
+///
+/// `dropped_frames` here counts refused farewells **only**. A push discarded by
+/// a full queue is a non-event the real transport counts and no test asserts
+/// on; keeping it out means a node-level `frames_dropped` that moves can only
+/// have come from the departure, which is the wiring under test.
+struct StalledPeerTransport {
+    inner: Arc<dyn PeerTransport>,
+    stalled: AtomicBool,
+    deaf: AtomicBool,
+    refused_farewells: AtomicU64,
+    farewells: std::sync::Mutex<Vec<String>>,
+}
+
+impl StalledPeerTransport {
+    fn new(inner: Arc<dyn PeerTransport>) -> Self {
+        Self {
+            inner,
+            stalled: AtomicBool::new(false),
+            deaf: AtomicBool::new(false),
+            refused_farewells: AtomicU64::new(0),
+            farewells: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// From here on the peer's push queue is full: every `send` drops.
+    fn stall(&self) {
+        self.stalled.store(true, Ordering::Relaxed);
+    }
+
+    /// …and the departure lane cannot take the farewell either.
+    fn go_deaf(&self) {
+        self.deaf.store(true, Ordering::Relaxed);
+    }
+
+    /// Every address a farewell was offered for, in order.
+    fn farewell_targets(&self) -> Vec<String> {
+        self.farewells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl PeerTransport for StalledPeerTransport {
+    fn send(&self, to: &str, frame: Vec<u8>) {
+        if self.stalled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.inner.send(to, frame);
+    }
+
+    fn send_farewell(&self, to: &str, frame: Vec<u8>) -> bool {
+        self.farewells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(to.to_owned());
+        if self.deaf.load(Ordering::Relaxed) {
+            self.refused_farewells.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.inner.send_farewell(to, frame)
+    }
+
+    fn take_incoming(&self) -> Option<IncomingFrames> {
+        self.inner.take_incoming()
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.inner.local_addr()
+    }
+
+    fn start(&self, shutdown: &CancellationToken, entropy: &Arc<dyn Entropy>) {
+        self.inner.start(shutdown, entropy);
+    }
+
+    fn dropped_frames(&self) -> u64 {
+        self.refused_farewells.load(Ordering::Relaxed)
     }
 }
 
@@ -675,6 +794,161 @@ async fn loopback_departure_carries_the_final_document() {
         member_ids(&a.handle),
         vec!["node-a".to_owned()],
         "…and the departure must still converge the view to one member; {}",
+        view_of(&a)
+    );
+
+    a.token.cancel();
+}
+
+/// The departure must survive a peer whose ordinary send queue is already full.
+///
+/// `send` drops on a full queue by design, because the next round carries the
+/// same merged document — and the departure is the one message that argument
+/// does not cover, since there is no next round. A peer stalled long enough to
+/// fill its 64-deep queue plus a shutdown would take the final document *and*
+/// the leave with it, without a trace: the survivor keeps this node in view
+/// until the suspicion timeout, and every increment accepted since the last
+/// push round dies with the process. Nothing else in this suite can see it —
+/// the loopback router has no queue to fill.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn loopback_departure_survives_a_full_peer_queue() {
+    let router = LoopbackRouter::new();
+    let clock = test_clock();
+
+    let a = start_node(&router, &clock, SECRET, "node-a", 1, Vec::new());
+    let stalled = Arc::new(StalledPeerTransport::new(
+        router.endpoint() as Arc<dyn PeerTransport>
+    ));
+    let b = start_node_on(
+        Arc::clone(&stalled) as Arc<dyn PeerTransport>,
+        &clock,
+        SECRET,
+        "node-b",
+        2,
+        vec![a.addr.clone()],
+    );
+    settle(&clock, 6).await;
+    assert_converged(
+        &a,
+        &b,
+        &["node-a", "node-b"],
+        "the pair must converge while B's queue still drains, or the departure \
+         below proves nothing",
+    );
+
+    // B's peer queue fills — every ordinary push is dropped from here on,
+    // exactly as `try_send` does at PEER_QUEUE_CAPACITY.
+    stalled.stall();
+
+    // Written on B and cancelled in the same breath, with the queue already
+    // full: the departure lane is the only way out of this process.
+    b.handle.counter(COUNTER).increment_by(7);
+    b.token.cancel();
+    advance_time(&clock, Duration::from_millis(250)).await;
+    settle(&clock, 1).await;
+
+    assert!(
+        stalled.farewell_targets().contains(&a.addr),
+        "the departure must be offered to the transport's departure lane, not \
+         to the queue it would be dropped from; observed {:?}",
+        stalled.farewell_targets()
+    );
+    assert_eq!(
+        a.handle.counter(COUNTER).get(),
+        7,
+        "the survivor must still receive the increments the departing node held \
+         at cancellation — a stalled peer must not turn a clean leave into lost \
+         writes; {} | {}",
+        view_of(&a),
+        view_of(&b)
+    );
+    assert_eq!(
+        member_ids(&a.handle),
+        vec!["node-a".to_owned()],
+        "…and the departure must still converge the view to one member well \
+         inside the suspicion timeout; {}",
+        view_of(&a)
+    );
+
+    a.token.cancel();
+}
+
+/// …and when even the departure lane cannot take it, the loss is **counted**
+/// rather than reported as a clean leave.
+///
+/// A dead writer is a real outcome and the protocol survives it — this is the
+/// suspicion path, which is the actual contract. What must not happen is
+/// silence: the departing node's own `frames_dropped` has to carry the drop,
+/// because it is the last thing this process publishes about itself.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn loopback_a_refused_departure_is_counted_and_leaves_the_suspicion_path() {
+    let router = LoopbackRouter::new();
+    let clock = test_clock();
+
+    let a = start_node(&router, &clock, SECRET, "node-a", 1, Vec::new());
+    let stalled = Arc::new(StalledPeerTransport::new(
+        router.endpoint() as Arc<dyn PeerTransport>
+    ));
+    let b = start_node_on(
+        Arc::clone(&stalled) as Arc<dyn PeerTransport>,
+        &clock,
+        SECRET,
+        "node-b",
+        2,
+        vec![a.addr.clone()],
+    );
+    settle(&clock, 6).await;
+    assert_converged(
+        &a,
+        &b,
+        &["node-a", "node-b"],
+        "the pair must converge before B's transport goes dead",
+    );
+    assert_eq!(
+        b.handle
+            .inner
+            .metrics
+            .frames_dropped
+            .load(Ordering::Relaxed),
+        0,
+        "sanity: nothing has been dropped yet"
+    );
+
+    // The peer's queue is full and its writer is gone: nothing B says can
+    // reach A any more.
+    stalled.stall();
+    stalled.go_deaf();
+    b.token.cancel();
+    advance_time(&clock, Duration::from_millis(250)).await;
+    settle(&clock, 1).await;
+
+    assert!(
+        b.handle
+            .inner
+            .metrics
+            .frames_dropped
+            .load(Ordering::Relaxed)
+            > 0,
+        "a departure the transport refused must be counted on the way out — it \
+         is the last thing this process can say about itself, and a silent \
+         degradation here reads exactly like a clean leave"
+    );
+    assert_eq!(
+        member_ids(&a.handle),
+        vec!["node-a".to_owned(), "node-b".to_owned()],
+        "sanity: nothing reached A, so its view is still the pair; {}",
+        view_of(&a)
+    );
+
+    // And the contract holds anyway: a lost farewell costs latency, not
+    // correctness.
+    advance_time(&clock, SUSPICION).await;
+    settle(&clock, 1).await;
+    assert_eq!(
+        member_ids(&a.handle),
+        vec!["node-a".to_owned()],
+        "past the suspicion timeout the survivor must converge without ever \
+         having heard the departure; {}",
         view_of(&a)
     );
 

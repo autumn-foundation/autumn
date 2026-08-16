@@ -525,19 +525,17 @@ fn target_addresses(
     targets
 }
 
-/// Sign `message` for `target` and hand the frame to the transport. `false`
-/// when the message could not be signed or framed — a drop, never a panic.
+/// Sign and frame `message`, or count why it could not be sent.
 ///
-/// Both failures are counted and (rate-limited) logged by
-/// [`note_unsendable`]: unlike a transport-level drop they are *permanent*,
-/// because the same document is re-serialized on every round.
-fn send_signed(
+/// Both failures are counted and (rate-limited) logged by [`note_unsendable`]:
+/// unlike a transport-level drop they are *permanent*, because the same
+/// document is re-serialized on every round.
+fn signed_frame(
     inner: &ClusterInner,
-    target: &str,
     incarnation: Incarnation,
     seq: u64,
     message: &ClusterMessage,
-) -> bool {
+) -> Option<Vec<u8>> {
     let Some(envelope) = wire::sign_envelope(
         &inner.secret,
         &inner.cluster_name,
@@ -547,14 +545,51 @@ fn send_signed(
         message,
     ) else {
         note_unsendable(inner, None);
-        return false;
+        return None;
     };
     let Some(frame) = wire::encode_frame(&envelope) else {
         note_unsendable(inner, wire::encoded_body_len(&envelope));
+        return None;
+    };
+    Some(frame)
+}
+
+/// Sign `message` for `target` and hand the frame to the transport. `false`
+/// when the message could not be signed or framed — a drop, never a panic.
+fn send_signed(
+    inner: &ClusterInner,
+    target: &str,
+    incarnation: Incarnation,
+    seq: u64,
+    message: &ClusterMessage,
+) -> bool {
+    let Some(frame) = signed_frame(inner, incarnation, seq, message) else {
         return false;
     };
     inner.transport.send(target, frame);
     true
+}
+
+/// The same, on the transport's **departure lane**: the frame supersedes every
+/// state push still queued for `target`.
+///
+/// `false` is a real answer here, and the difference from [`send_signed`] is the
+/// point. An ordinary push handed to the transport may still be dropped for a
+/// full queue and nobody needs to know, because the next round carries the same
+/// document; a farewell is the last frame this node will ever send, so the
+/// caller has to hear that it did not make it — see
+/// [`PeerTransport::send_farewell`].
+fn send_farewell_signed(
+    inner: &ClusterInner,
+    target: &str,
+    incarnation: Incarnation,
+    seq: u64,
+    message: &ClusterMessage,
+) -> bool {
+    let Some(frame) = signed_frame(inner, incarnation, seq, message) else {
+        return false;
+    };
+    inner.transport.send_farewell(target, frame)
 }
 
 /// Count — and at most once per [`UNSENDABLE_WARN_INTERVAL`], warn about — an
@@ -626,9 +661,18 @@ fn note_unsendable(inner: &ClusterInner, serialized_bytes: Option<usize>) {
 /// `Left` beats `Alive` at equal incarnation — so the `leave` that follows is
 /// belt and braces for a peer that has never held a record for us at all.
 ///
+/// **Both frames take the transport's departure lane**
+/// ([`PeerTransport::send_farewell`]), which is sized for exactly this pair and
+/// read ahead of anything queued. On the ordinary path they would inherit the
+/// state push's bargain — full queue means drop, the next round re-sends — and
+/// there is no next round: a peer stalled long enough to fill its queue would
+/// take this node's last words with it, without a line in the log.
+///
 /// Best effort by design. If the process is killed, the network eats the frame,
 /// or the peer is mid-reconnect, the peer still converges at the suspicion
-/// timeout — which is the actual contract.
+/// timeout — which is the actual contract. What is *not* acceptable is losing
+/// it quietly, so a farewell the transport refuses outright is counted and
+/// warned about below.
 async fn depart(inner: &Arc<ClusterInner>, mut seq: u64) {
     let incarnation = inner.incarnation.load(Ordering::Relaxed);
     let (document, targets) = {
@@ -644,13 +688,37 @@ async fn depart(inner: &Arc<ClusterInner>, mut seq: u64) {
     };
 
     let farewell = ClusterMessage::StatePush { state: document };
+    // Peers whose copy of the final document could not even be handed over. The
+    // `leave` alone still converges a peer's view, so it is the *document* that
+    // is worth a line: its loss is the increments accepted since the last round
+    // dying with this process.
+    let mut lost: usize = 0;
     for target in &targets {
-        if send_signed(inner, target, incarnation, seq, &farewell) {
+        if send_farewell_signed(inner, target, incarnation, seq, &farewell) {
+            seq = seq.saturating_add(1);
+        } else {
+            lost = lost.saturating_add(1);
+        }
+        if send_farewell_signed(inner, target, incarnation, seq, &ClusterMessage::Leave) {
             seq = seq.saturating_add(1);
         }
-        if send_signed(inner, target, incarnation, seq, &ClusterMessage::Leave) {
-            seq = seq.saturating_add(1);
-        }
+    }
+    // Mirrored here and not only in the push round: this *is* the last round,
+    // so drops the departure itself made would otherwise never reach the series.
+    inner
+        .metrics
+        .frames_dropped
+        .store(inner.transport.dropped_frames(), Ordering::Relaxed);
+    if lost > 0 {
+        tracing::warn!(
+            node_id = %inner.node_id,
+            peers = lost,
+            frames_dropped = inner.metrics.frames_dropped.load(Ordering::Relaxed),
+            "cluster: this node's final document could not be handed to the \
+             transport for one or more peers, so its departure is lost: those \
+             peers keep this node in view until the suspicion timeout, and any \
+             increment accepted since the last push round dies with this process"
+        );
     }
 
     // Bounded so a clean departure never extends the app's drain budget. A

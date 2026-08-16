@@ -5,8 +5,10 @@
 //! *detail* rather than a commitment. Two implementations ship:
 //!
 //! - [`TcpPeerTransport`]: one listener, length-prefixed frames, per-peer
-//!   bounded writer queues that **drop on full** (anti-entropy self-heals), and
-//!   a capped, entropy-jittered reconnect backoff.
+//!   bounded writer queues that **drop on full** (anti-entropy self-heals), a
+//!   two-frame *departure lane* per peer that the writer reads first (the one
+//!   frame anti-entropy never re-sends is the farewell), and a capped,
+//!   entropy-jittered reconnect backoff.
 //! - `LoopbackTransport` (test-only): an in-process router keyed by address, so
 //!   two whole nodes run deterministically in one process with no sockets.
 //!
@@ -79,6 +81,14 @@ pub type IncomingFrames = mpsc::Receiver<(PeerAddr, Vec<u8>)>;
 /// Per-peer send-queue depth. Full means drop: the next state push carries the
 /// same (merged) document anyway.
 pub const PEER_QUEUE_CAPACITY: usize = 64;
+
+/// Depth of a peer's **departure lane**, the side channel a farewell travels on
+/// and the writer reads in preference to the queue above.
+///
+/// Exactly one departure: this node's final document and the `Leave` that
+/// follows it. Sized to that message rather than to a buffer, because there is
+/// no third frame — a node says goodbye once and then exits.
+pub const FAREWELL_LANE_CAPACITY: usize = 2;
 
 /// First delay before re-dialling a peer that refused a connection.
 pub const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(50);
@@ -155,6 +165,30 @@ pub trait PeerTransport: Send + Sync + 'static {
     /// queue drops, because anti-entropy re-sends the whole document anyway.
     fn send(&self, to: &str, frame: Vec<u8>);
 
+    /// Queue this node's **farewell** for `to`, superseding every state push
+    /// still queued for that peer.
+    ///
+    /// [`send`](Self::send)'s bargain — full means drop, the next push carries
+    /// the same merged document — holds for state pushes and fails for exactly
+    /// one frame: there is no next push after the departure. A peer stalled
+    /// long enough to fill its queue would otherwise lose the final document
+    /// and the `Leave` together, and its survivor would sit out the suspicion
+    /// timeout having been told nothing at all. So the departure travels on
+    /// capacity of its own, ahead of whatever is queued; a full-document
+    /// protocol makes that safe, because the farewell *is* the latest state and
+    /// everything behind it is a strictly older copy of the same thing.
+    ///
+    /// Returns whether the frame was handed over. Unlike a dropped push this
+    /// one is never re-sent, so the caller counts and logs a refusal rather
+    /// than reporting a departure it did not make.
+    ///
+    /// The default is [`send`](Self::send) and `true`: a transport that
+    /// delivers synchronously has no queue to supersede.
+    fn send_farewell(&self, to: &str, frame: Vec<u8>) -> bool {
+        self.send(to, frame);
+        true
+    }
+
     /// Take the inbound frame stream. Returns `Some` exactly once.
     fn take_incoming(&self) -> Option<IncomingFrames>;
 
@@ -187,8 +221,9 @@ pub trait PeerTransport: Send + Sync + 'static {
         0
     }
 
-    /// Frames dropped because a peer's queue was full, its writer had exited,
-    /// or the transport was never started. Monotonic; never an error path.
+    /// Frames dropped because a peer's queue (or departure lane) was full, its
+    /// writer had exited, or the transport was never started. Monotonic; never
+    /// an error path.
     fn dropped_frames(&self) -> u64 {
         0
     }
@@ -381,6 +416,35 @@ impl Drop for InboundSlot {
     }
 }
 
+/// The two channels one peer's writer task reads.
+///
+/// Two rather than one, because the frames on them have opposite contracts: a
+/// state push is *worth* dropping when the queue is full (the next one carries
+/// the same merged document), and a farewell is the last thing this node will
+/// ever say to that peer. One shared queue makes the second inherit the first's
+/// bargain, which is how a stalled peer plus a shutdown loses a departure with
+/// no trace at all.
+#[derive(Clone)]
+struct PeerLanes {
+    /// Ordinary state pushes, [`PEER_QUEUE_CAPACITY`] deep. Full means drop.
+    pushes: mpsc::Sender<Vec<u8>>,
+    /// The departure lane: [`FAREWELL_LANE_CAPACITY`] deep and read *first* by
+    /// the writer, so a farewell overtakes every push already queued.
+    farewell: mpsc::Sender<Vec<u8>>,
+}
+
+impl PeerLanes {
+    /// Frames sitting in either lane that the writer has not taken yet.
+    fn queued(&self) -> usize {
+        Self::depth(&self.pushes).saturating_add(Self::depth(&self.farewell))
+    }
+
+    /// One lane's occupancy: a bounded channel's permits are its free space.
+    fn depth(lane: &mpsc::Sender<Vec<u8>>) -> usize {
+        lane.max_capacity().saturating_sub(lane.capacity())
+    }
+}
+
 /// The production transport: a single TCP listener plus per-peer writers.
 pub struct TcpPeerTransport {
     local_addr: SocketAddr,
@@ -389,9 +453,9 @@ pub struct TcpPeerTransport {
     incoming: Mutex<Option<IncomingFrames>>,
     /// Kept alive so the receiver stays open before the accept loop exists.
     inbound_tx: mpsc::Sender<(PeerAddr, Vec<u8>)>,
-    /// `dial address -> that peer's bounded writer queue`, created lazily on
+    /// `dial address -> that peer's bounded writer lanes`, created lazily on
     /// the first frame addressed to a peer.
-    peers: Mutex<BTreeMap<PeerAddr, mpsc::Sender<Vec<u8>>>>,
+    peers: Mutex<BTreeMap<PeerAddr, PeerLanes>>,
     io: Mutex<Option<TransportIo>>,
     dropped: AtomicU64,
     /// Frames a writer task has taken off its queue and not yet disposed of.
@@ -474,7 +538,7 @@ impl TcpPeerTransport {
         self.inbound_tx.clone()
     }
 
-    fn lock_peers(&self) -> std::sync::MutexGuard<'_, BTreeMap<PeerAddr, mpsc::Sender<Vec<u8>>>> {
+    fn lock_peers(&self) -> std::sync::MutexGuard<'_, BTreeMap<PeerAddr, PeerLanes>> {
         self.peers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -516,16 +580,17 @@ impl TcpPeerTransport {
         self.lock_peers().len()
     }
 
-    /// The queue for `to`, spawning that peer's writer task on first use.
+    /// The lanes for `to`, spawning that peer's writer task on first use.
     ///
     /// `None` before [`PeerTransport::start`] has run (nothing can be written
     /// yet) — the caller counts that as a dropped frame rather than blocking a
     /// push round on it.
-    fn writer_for(&self, to: &str) -> Option<mpsc::Sender<Vec<u8>>> {
+    fn writer_for(&self, to: &str) -> Option<PeerLanes> {
         let mut peers = self.lock_peers();
-        // A closed queue means that writer task exited (cancelled, or its
-        // connection is unrecoverable). Forget it so the next frame re-dials.
-        if peers.get(to).is_some_and(mpsc::Sender::is_closed) {
+        // A closed lane means that writer task exited (cancelled, or its
+        // connection is unrecoverable); both lanes close together, since the
+        // writer owns both receivers. Forget it so the next frame re-dials.
+        if peers.get(to).is_some_and(|lanes| lanes.pushes.is_closed()) {
             peers.remove(to);
         }
         if let Some(existing) = peers.get(to) {
@@ -533,23 +598,26 @@ impl TcpPeerTransport {
         }
 
         let (runtime, shutdown, entropy) = self.spawn_context()?;
-        let (tx, queue) = mpsc::channel(PEER_QUEUE_CAPACITY);
+        let (pushes, queue) = mpsc::channel(PEER_QUEUE_CAPACITY);
+        let (farewell, departure) = mpsc::channel(FAREWELL_LANE_CAPACITY);
         runtime.spawn(peer_writer(
             to.to_owned(),
             queue,
+            departure,
             shutdown,
             entropy,
             Arc::clone(&self.in_flight),
         ));
-        peers.insert(to.to_owned(), tx.clone());
+        let lanes = PeerLanes { pushes, farewell };
+        peers.insert(to.to_owned(), lanes.clone());
         drop(peers);
-        Some(tx)
+        Some(lanes)
     }
 }
 
 impl PeerTransport for TcpPeerTransport {
     fn send(&self, to: &str, frame: Vec<u8>) {
-        let Some(queue) = self.writer_for(to) else {
+        let Some(lanes) = self.writer_for(to) else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
@@ -557,7 +625,7 @@ impl PeerTransport for TcpPeerTransport {
         // to stall the push loop, and the next push carries the same (merged)
         // document anyway. Full and closed are both simply "the packet was
         // lost", which the protocol is built to tolerate.
-        if queue.try_send(frame).is_err() {
+        if lanes.pushes.try_send(frame).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 peer = %to,
@@ -565,6 +633,28 @@ impl PeerTransport for TcpPeerTransport {
                  (anti-entropy re-sends the document)"
             );
         }
+    }
+
+    fn send_farewell(&self, to: &str, frame: Vec<u8>) -> bool {
+        let Some(lanes) = self.writer_for(to) else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        // The departure lane, never the queue: a peer stalled long enough to
+        // fill 64 frames' worth of pushes is precisely the case this exists
+        // for. The writer reads this channel first, so the farewell overtakes
+        // those pushes instead of queueing behind them — and they are stale by
+        // construction, being older copies of the document this frame carries
+        // at a lower sequence, so the peer's replay watermark discards whichever
+        // of them the writer still gets to.
+        if lanes.farewell.try_send(frame).is_ok() {
+            return true;
+        }
+        // Refused: the writer is gone, or a whole departure is already waiting.
+        // Counted and reported, never swallowed — nothing re-sends this frame,
+        // so a silent drop here is a departure that never happened.
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        false
     }
 
     fn take_incoming(&self) -> Option<IncomingFrames> {
@@ -613,11 +703,9 @@ impl PeerTransport for TcpPeerTransport {
     }
 
     fn pending_frames(&self) -> usize {
-        let queued: usize = self
-            .lock_peers()
-            .values()
-            .map(|queue| queue.max_capacity().saturating_sub(queue.capacity()))
-            .sum();
+        // Both lanes: a farewell waiting in the departure lane is the one frame
+        // the flush that reads this number exists to wait for.
+        let queued: usize = self.lock_peers().values().map(PeerLanes::queued).sum();
         // Plus whatever the writer tasks are holding: a tokio permit comes back
         // the moment `recv()` yields, so queue depth alone reports a frame as
         // flushed while its writer is still inside a two-second dial.
@@ -637,9 +725,9 @@ impl PeerTransport for TcpPeerTransport {
     }
 
     fn retain_peers(&self, live: &BTreeSet<String>) {
-        // Dropping the queue's sender is the retirement: the writer's `recv`
-        // then yields `None` once it has drained whatever was queued, so a
-        // frame already handed over is still transmitted.
+        // Dropping a peer's lane senders is the retirement: the writer's queue
+        // `recv` then yields `None` once it has drained whatever was queued, so
+        // a frame already handed over is still transmitted.
         self.lock_peers().retain(|addr, _| live.contains(addr));
     }
 }
@@ -866,16 +954,30 @@ impl Drop for InFlightFrame {
 /// and still dialling and writing, when the node's cancellation arm queues its
 /// farewell.
 ///
-/// The queue arm is `biased` so that a frame *already queued* is preferred to
-/// the token while both are ready. That is a preference, not a drain guarantee,
-/// and the distinction matters: the dial and write arms below race the same
-/// token unbiased, so a frame picked up at or after the end of the grace can
-/// still be abandoned rather than written. The grace is sized to make the
-/// healthy case comfortable, and the actual contract remains the suspicion
-/// timeout — a lost farewell costs latency, never correctness.
+/// The `biased` order is the whole mechanism, and it reads top to bottom: the
+/// **departure lane first**, then the queue, then the token.
+///
+/// - Departure before queue, because a farewell supersedes every push already
+///   queued for this peer. They carry older copies of the same document at
+///   lower sequence numbers, so nothing is lost by overtaking them, while
+///   waiting behind a stalled peer's 64 queued frames loses the departure
+///   itself — the one frame anti-entropy never re-sends.
+/// - Queue before token, so a frame *already queued* is preferred to the token
+///   while both are ready. That is a preference, not a drain guarantee, and the
+///   distinction matters: the dial and write arms below race the same token
+///   unbiased, so a frame picked up at or after the end of the grace can still
+///   be abandoned rather than written. The grace is sized to make the healthy
+///   case comfortable, and the actual contract remains the suspicion timeout —
+///   a lost farewell costs latency, never correctness.
+///
+/// The departure arm matches `Some(frame)` rather than binding the whole
+/// `Option`: a lane whose sender was dropped ([`PeerTransport::retain_peers`]
+/// retiring this peer) yields `None` at once, and disabling that branch is what
+/// lets the queue still drain the frames it was handed before retirement.
 async fn peer_writer(
     to: PeerAddr,
     mut queue: mpsc::Receiver<Vec<u8>>,
+    mut departure: mpsc::Receiver<Vec<u8>>,
     shutdown: CancellationToken,
     entropy: Arc<dyn Entropy>,
     in_flight: Arc<AtomicUsize>,
@@ -886,6 +988,7 @@ async fn peer_writer(
     loop {
         let queued = tokio::select! {
             biased;
+            Some(frame) = departure.recv() => Some(frame),
             frame = queue.recv() => frame,
             () = shutdown.cancelled() => None,
         };
@@ -948,8 +1051,8 @@ async fn peer_writer(
 #[cfg(test)]
 mod tcp_tests {
     use super::{
-        DIAL_TIMEOUT, MAX_INBOUND_CONNECTIONS, MAX_UNAUTHENTICATED_FRAMES, PeerTransport as _,
-        TcpPeerTransport,
+        DIAL_TIMEOUT, FAREWELL_LANE_CAPACITY, MAX_INBOUND_CONNECTIONS, MAX_UNAUTHENTICATED_FRAMES,
+        PEER_QUEUE_CAPACITY, PeerTransport as _, TcpPeerTransport,
     };
     use crate::entropy::SeededEntropy;
     use std::collections::BTreeSet;
@@ -1367,6 +1470,134 @@ mod tcp_tests {
         token.cancel();
     }
 
+    /// A full per-peer queue must not be able to swallow the departure.
+    ///
+    /// Dropping a state push on a full queue is the design — the next push
+    /// carries the same merged document — and the farewell is the single frame
+    /// that argument does not cover, because there is no next push. A peer
+    /// stalled long enough to fill its 64-deep queue plus a shutdown would
+    /// otherwise lose the final document and the `Leave` together, silently:
+    /// the survivor waits out the suspicion timeout, and every increment
+    /// accepted since the last push round dies with the process.
+    ///
+    /// Deterministic by construction: a current-thread runtime with no await
+    /// between the sends means the writer task cannot run and cannot drain a
+    /// single frame, so the queue is provably full when the farewell is offered.
+    #[tokio::test]
+    async fn a_departure_is_queued_even_when_the_peer_queue_is_full() {
+        // Nobody is listening, and nothing here awaits, so no writer ever
+        // touches these frames.
+        const PEER: &str = "127.0.0.1:9";
+
+        let (transport, token) = started(IDLE);
+        for _ in 0..PEER_QUEUE_CAPACITY {
+            transport.send(PEER, vec![0_u8; 8]);
+        }
+        assert_eq!(
+            transport.dropped_frames(),
+            0,
+            "sanity: a queue of {PEER_QUEUE_CAPACITY} must hold \
+             {PEER_QUEUE_CAPACITY} frames"
+        );
+        transport.send(PEER, vec![0_u8; 8]);
+        assert_eq!(
+            transport.dropped_frames(),
+            1,
+            "sanity: the queue must now be full and dropping, or the farewell \
+             below is not being offered the case it exists for"
+        );
+
+        // A whole departure still fits: the final document and the `Leave`.
+        for frame in 0..FAREWELL_LANE_CAPACITY {
+            assert!(
+                transport.send_farewell(PEER, vec![1_u8; 8]),
+                "frame {frame} of a departure must be accepted while the peer's \
+                 push queue is full — the farewell is the one frame nothing \
+                 re-sends"
+            );
+        }
+        assert_eq!(
+            transport.dropped_frames(),
+            1,
+            "…and neither frame may cost a drop"
+        );
+        assert_eq!(
+            transport.pending_frames(),
+            PEER_QUEUE_CAPACITY.saturating_add(FAREWELL_LANE_CAPACITY),
+            "a farewell waiting in the departure lane must count as pending, or \
+             the departure flush returns before it has reached the wire"
+        );
+
+        // The lane is bounded like everything else here, and a refusal is
+        // REPORTED rather than swallowed: nothing re-sends a farewell, so a
+        // silent drop is a departure that never happened.
+        assert!(
+            !transport.send_farewell(PEER, vec![2_u8; 8]),
+            "a departure lane holding a whole departure must refuse a third \
+             frame instead of pretending to have taken it"
+        );
+        assert_eq!(
+            transport.dropped_frames(),
+            2,
+            "…and that refusal must be counted"
+        );
+        token.cancel();
+    }
+
+    /// The departure lane is not just capacity — the writer has to *prefer* it.
+    ///
+    /// A farewell sitting behind 64 queued state pushes on a stalled peer is a
+    /// farewell that never leaves inside the departure budget. This is the
+    /// ordering half of the contract, observed on a real socket: pushes queued
+    /// first, the departure queued last, the departure on the wire first.
+    #[tokio::test]
+    async fn the_writer_takes_the_departure_lane_before_anything_queued() {
+        const STALE: u8 = 0x11;
+        const FAREWELL: u8 = 0x22;
+        const FRAME_BYTES: usize = 8;
+
+        // A real peer, so the ordering is read off an actual connection rather
+        // than inferred from a counter.
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding an ephemeral loopback port must succeed");
+        let peer_addr = peer
+            .local_addr()
+            .expect("the peer listener must report its address")
+            .to_string();
+        let (transport, token) = started(IDLE);
+
+        // Current-thread runtime, no await in between: the writer task cannot
+        // run until the accept below parks, so it meets both lanes ready at
+        // once — the exact shape a stalled peer plus a shutdown produces.
+        for _ in 0..8_u8 {
+            transport.send(&peer_addr, vec![STALE; FRAME_BYTES]);
+        }
+        assert!(
+            transport.send_farewell(&peer_addr, vec![FAREWELL; FRAME_BYTES]),
+            "sanity: the departure lane must accept the farewell"
+        );
+
+        let (mut accepted, _) = tokio::time::timeout(Duration::from_secs(5), peer.accept())
+            .await
+            .expect("the writer must dial its peer")
+            .expect("accepting the writer's connection must succeed");
+        let mut first = [0_u8; FRAME_BYTES];
+        tokio::time::timeout(Duration::from_secs(5), accepted.read_exact(&mut first))
+            .await
+            .expect("the writer must write a frame")
+            .expect("reading the writer's first frame must succeed");
+
+        assert_eq!(
+            first, [FAREWELL; FRAME_BYTES],
+            "the first frame on the wire must be the departure, not a queued \
+             state push: a farewell that waits its turn behind a stalled peer's \
+             queue is one the peer never hears, and the survivor falls back to \
+             the suspicion timeout it was supposed to be spared"
+        );
+        token.cancel();
+    }
+
     /// A node id that comes back at a new address must not leave the old
     /// address's writer task and queue alive for the life of the process.
     #[tokio::test(flavor = "multi_thread")]
@@ -1506,6 +1737,15 @@ mod loopback {
         fn send(&self, to: &str, frame: Vec<u8>) {
             // Loss is a legal outcome; anti-entropy re-sends the document.
             let _delivered = self.router.deliver(&self.addr.to_string(), to, frame);
+        }
+
+        fn send_farewell(&self, to: &str, frame: Vec<u8>) -> bool {
+            // No per-peer queue to supersede — the router hands the frame
+            // straight to the destination — so the only question this answers
+            // is whether the endpoint is still plugged in. Reported honestly
+            // rather than defaulted to `true`: an unplugged endpoint (a hard
+            // kill) must not look like a delivered departure.
+            self.router.deliver(&self.addr.to_string(), to, frame)
         }
 
         fn take_incoming(&self) -> Option<IncomingFrames> {
