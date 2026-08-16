@@ -2078,11 +2078,18 @@ fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
             // top-level string like `"hello"` must render WITH its quotes, or a
             // pure no-op resave either fails to parse (`hello` isn't valid JSON)
             // or silently changes type (a stored string `"true"`/`"42"` reparses
-            // as a bool/number). `Value::Null` still renders blank, matching the
-            // existing "blank means no value" convention (Codex review finding
-            // on #1341).
+            // as a bool/number). `Value::Null` renders blank ONLY for an
+            // optional field, matching the "blank means no value" convention —
+            // but a REQUIRED json column can never be SQL NULL, so a stored
+            // `Value::Null` there is the legitimate JSON scalar `null`, not an
+            // absence, and must render as the literal `null` text: otherwise the
+            // browser's `required` attribute blocks saving any OTHER field on
+            // the record without the admin re-typing `null` by hand, and a
+            // programmatic blank submission would coerce into the string `""`
+            // instead of round-tripping back to `Value::Null` (Codex review
+            // finding on #1341).
             let json_val = match &current_value {
-                Value::Null => String::new(),
+                Value::Null if !field.required => String::new(),
                 v => v.to_string(),
             };
             html! {
@@ -2446,13 +2453,29 @@ mod tests {
             "object values still render as JSON: {form}"
         );
 
-        // A NULL value still renders as a blank textarea, matching the
-        // existing "blank means no value" convention.
+        // A NULL value on an OPTIONAL field renders as a blank textarea,
+        // matching the existing "blank means no value" convention.
+        let optional_field = AdminField::new("config", AdminFieldKind::Json).optional();
         let record = serde_json::json!({ "config": null });
-        let form = render_form_widget(&field, Some(&record)).into_string();
+        let form = render_form_widget(&optional_field, Some(&record)).into_string();
         assert!(
             !form.contains("null"),
-            "a NULL json value should render blank, not the literal word null: {form}"
+            "an optional NULL json value should render blank, not the literal word null: {form}"
+        );
+
+        // A NULL value on a REQUIRED field is the legitimate JSON scalar
+        // `null` (a NOT NULL JSONB column can still hold the JSON literal
+        // `null` — it just can't be SQL NULL), not an absent value, and must
+        // render as the literal text `null`. Rendering it blank would let the
+        // browser's `required` attribute block saving any other field on the
+        // record without the admin re-typing `null` by hand, and a
+        // programmatic blank submission would coerce into `""` instead of
+        // round-tripping back to `Value::Null` (Codex review finding on
+        // #1341).
+        let form = render_form_widget(&field, Some(&record)).into_string();
+        assert!(
+            form.contains(">null<") || form.contains("null"),
+            "a required NULL json value must render the literal `null`, not blank: {form}"
         );
     }
 

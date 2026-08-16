@@ -1486,13 +1486,18 @@ fn coerce_form_value(value: &mut Value, field: &AdminField) -> Result<(), String
         // malformed submission here needs its own explicit rejection: a
         // required field would otherwise silently persist a string like
         // `"{broken"` as the "JSON" value instead of surfacing a validation
-        // error (issue #1341 review). A blank submission is exempt — for a
-        // required column it deliberately falls through unparsed, matching
-        // the required-text convention below; for an optional column the
-        // blank-to-null short-circuit above already handled it.
+        // error (issue #1341 review). Only the exact empty string is exempt
+        // — for a required column it deliberately falls through unparsed,
+        // matching the required-text convention below (and ONLY that exact
+        // convention: a whitespace-only submission like `"   "` is not
+        // "blank", it's malformed JSON, and must still be rejected — a
+        // browser's `required` validation accepts whitespace as non-empty,
+        // so `raw.trim().is_empty()` would have silently let it through
+        // unparsed). For an optional column the blank-to-null short-circuit
+        // above already handled every whitespace-only submission.
         AdminFieldKind::Json => {
             if let Value::String(raw) = value
-                && !raw.trim().is_empty()
+                && !raw.is_empty()
             {
                 match serde_json::from_str::<Value>(raw) {
                     Ok(parsed) => *value = parsed,
@@ -1775,6 +1780,27 @@ mod tests {
         let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
         let out = coerce_form_fields(json!({"settings": "\"not broken\""}), &fields).unwrap();
         assert_eq!(out, json!({"settings": "not broken"}));
+    }
+
+    #[test]
+    fn coerce_form_fields_rejects_whitespace_only_required_json() {
+        // Issue #1341 review: a browser's `required` validation treats
+        // whitespace as satisfying the constraint, so a required JSON field
+        // can receive "   " even though it's not the exact blank string the
+        // required-text convention exempts. Whitespace-only content is
+        // malformed JSON (not valid on its own) and must be rejected — not
+        // silently skipped past parsing and persisted as a literal
+        // `Value::String("   ")`.
+        let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
+        assert!(
+            coerce_form_fields(json!({"settings": "   "}), &fields).is_err(),
+            "whitespace-only required JSON must be rejected, not silently stored"
+        );
+
+        // The exact empty string is still exempt (unchanged pre-existing
+        // behavior, matching the required-text convention).
+        let out = coerce_form_fields(json!({"settings": ""}), &fields).unwrap();
+        assert_eq!(out, json!({"settings": ""}));
     }
 
     #[test]
