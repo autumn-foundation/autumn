@@ -87,7 +87,8 @@ emits both `NULL` in the migration SQL and `Nullable<T>` in `schema.rs`.
 
 ### `json`/`jsonb` — flexible structured data
 
-`config:json` (or `config:jsonb` — both spellings accepted, case-insensitively)
+`config:json` (or `config:jsonb`, `Json`, `Jsonb` — the lowercase and PascalCase
+spelling of each alias are both accepted, not arbitrary casing)
 stores arbitrary structured data as a Postgres `JSONB` column, typed as a bare
 `serde_json::Value` in the generated model — no wrapper struct, so it composes
 directly with `serde_json::json!(...)`, `Value::get`, etc. The generated
