@@ -130,15 +130,15 @@ The island crate that produces the wasm lives in `examples/island-flock`
 
 ---
 
-### `examples/wiki` — Mutation Hooks and Revision History
+### `examples/wiki` — Mutation Hooks, Revision History, and Markdown Docs
 
 <!-- catalog:example name=wiki tier=supported -->
 
 | Field | Value |
 |-------|-------|
-| **Persona** | Developer adding audit trails and lifecycle hooks to a content model |
-| **Journey** | Hooks/revisions: slug lifecycle, before/after-save hooks, full revision history, REST API |
-| **Key capabilities** | `#[model]` hooks, revision tracking, slug generation, generated REST API |
+| **Persona** | Developer adding audit trails and lifecycle hooks to a content model, or serving Markdown-backed docs pages |
+| **Journey** | Hooks/revisions: slug lifecycle, before/after-save hooks, full revision history, REST API. Docs: embedded `content/*.md` rendered live at `/docs/{slug}` and pre-rendered to `dist/` by the same handler |
+| **Key capabilities** | `#[model]` hooks, revision tracking, slug generation, generated REST API, `markdown` feature (`MarkdownRegistry` + frontmatter + TOC) composed with `#[static_get]` SSG |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL |
 | **Run command** | `cargo run -p wiki` |
 | **Success proof** | `curl http://localhost:3000/api/v1/pages` returns `[]` |
@@ -269,6 +269,7 @@ can pick the closest starting point without overlap.
 | Distributed deployment | `bookmarks-distributed` | Primary + replica Postgres, multi-replica web tier, Docker Compose |
 | Horizontal sharding | `bookmarks-sharded` | Tenant → slot → shard routing, control DB, cross-shard fan-out, Docker Compose |
 | Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
+| Markdown docs + SSG | `wiki` | `markdown` feature: embedded `.md` with frontmatter, TOC, heading anchors, rendered live at `/docs/{slug}` and pre-rendered via `#[static_get]` |
 | Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting — the complete feature showcase |
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 | Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |

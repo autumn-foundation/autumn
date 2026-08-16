@@ -1,0 +1,6 @@
+ calls | total_buffers | buffers_per_call | temp_blks_read | temp_blks_written |                                                                  query_text                                                                  
+-------+---------------+------------------+----------------+-------------------+----------------------------------------------------------------------------------------------------------------------------------------------
+     1 |          6954 |          6954.00 |              0 |                 0 | DO $$ DECLARE r RECORD; hit_count BIGINT; total_calls BIGINT := 0; BEGIN FOR r IN SELECT subscriber FROM batch_recipients ORDER BY ord LOOP 
+  2000 |          6600 |             3.30 |              0 |                 0 | SELECT COUNT(*) FROM mail_unsubscribes WHERE subscriber = r.subscriber AND list_id = $7
+(2 rows)
+
