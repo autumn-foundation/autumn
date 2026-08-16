@@ -79,10 +79,29 @@ set.
 | `data:Bytea` *(or `Vec<u8>`)* | `Vec<u8>`           | `Bytea`            | `BYTEA`             |
 | `post:references` | `i64`                           | `Int8`             | `BIGINT`            |
 | `slug:slug{from:title}` | `String`                  | `Text`              | `TEXT`              |
+| `config:json` *(or `jsonb`)* | `serde_json::Value`    | `Jsonb`             | `JSONB`              |
 
 Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
 emits both `NULL` in the migration SQL and `Nullable<T>` in `schema.rs`.
+
+### `json`/`jsonb` — flexible structured data
+
+`config:json` (or `config:jsonb` — both spellings accepted, case-insensitively)
+stores arbitrary structured data as a Postgres `JSONB` column, typed as a bare
+`serde_json::Value` in the generated model — no wrapper struct, so it composes
+directly with `serde_json::json!(...)`, `Value::get`, etc. The generated
+create/edit form renders a `<textarea>` and parses the submitted text as JSON
+on write; invalid JSON is a `400`, not a `500`, and leaving an *optional*
+`Option<json>` textarea blank stores `NULL` rather than failing to parse. The
+JSON API round-trips the field as a native object/array, not a stringified
+blob. On the `SQLite` dev/test backend the column is `TEXT` (plain-text JSON) —
+diesel provides the `serde_json::Value` conversion on both backends directly,
+so this needs no `--sqlite`-specific caveat the way `Uuid`/`decimal` do.
+
+```bash
+autumn generate scaffold Setting name:String config:json
+```
 
 ### `richtext` — safe user-submitted Markdown
 

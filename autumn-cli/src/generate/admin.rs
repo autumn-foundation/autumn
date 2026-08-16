@@ -513,6 +513,13 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         // Bytea and Attachment both render as hidden in the admin panel —
         // binary blobs and file metadata aren't suitable for direct inline editing.
         FieldKind::Bytea | FieldKind::Attachment => "AdminFieldKind::Hidden",
+        // `json`/`jsonb` (issue #1341) uses the admin panel's existing
+        // `AdminFieldKind::Json`: a monospace textarea whose submission is
+        // coerced back to a real JSON value by `coerce_form_value` before the
+        // generic `serde_json::from_value::<New{Model}>` deserialize — this
+        // kind already exists (see `AdminField`'s own `variants`/`settings`
+        // examples) and is exactly what a raw `serde_json::Value` column needs.
+        FieldKind::Json => "AdminFieldKind::Json",
     }
 }
 
@@ -546,9 +553,12 @@ fn is_default_hide_from_list(field: &Field) -> bool {
     // TextArea bodies and binary blobs clutter the table; updated_at is redundant noise.
     // `RichText` renders as a TextArea too (see `admin_field_kind`), and a
     // Markdown body is the single worst column to inline in a list view.
+    // `Json` (issue #1341) renders as `AdminFieldKind::Json` — the same
+    // textarea-shaped raw-value editor — so a structured-data blob is just as
+    // unsuitable for an inline list cell.
     matches!(
         field.kind,
-        FieldKind::Text | FieldKind::RichText | FieldKind::Bytea
+        FieldKind::Text | FieldKind::RichText | FieldKind::Bytea | FieldKind::Json
     ) || field.name == "updated_at"
 }
 
@@ -1374,6 +1384,27 @@ mod tests {
         assert_eq!(
             is_default_hide_from_list(&rich),
             is_default_hide_from_list(&text)
+        );
+    }
+
+    #[test]
+    fn json_column_uses_the_existing_admin_json_kind_and_is_hidden_from_the_list() {
+        // Issue #1341: `AdminFieldKind::Json` already existed (monospace
+        // textarea + `coerce_form_value` round-trip) for hand-written admin
+        // configs — the DSL's new `json`/`jsonb` field just needs to reach it.
+        let field = Field {
+            name: "config".to_owned(),
+            kind: FieldKind::Json,
+            nullable: false,
+            variants: Vec::new(),
+            unique: false,
+            constraints: crate::generate::dsl::FieldConstraints::default(),
+            state_machine: None,
+        };
+        assert_eq!(admin_field_kind(&field), "AdminFieldKind::Json");
+        assert!(
+            is_default_hide_from_list(&field),
+            "a structured-data blob must not clutter the admin list table"
         );
     }
 

@@ -553,6 +553,21 @@ path = "tests/sqlite_crud_basic.rs"
 name = "sqlite_field_conversions"
 path = "tests/sqlite_field_conversions.rs"
 
+# `serde_json::Value` model-field round-trip on SQLite (issue #1341): proves a
+# `#[model]` carrying a required `serde_json::Value` and an
+# `Option<serde_json::Value>` (-> diesel's own `Json` sql-type, TEXT-backed)
+# compiles AND round-trips on an in-memory SQLite pool with no Docker —
+# objects, arrays, bare scalar JSON values (string/number/bool/null), and a
+# NULL optional column. Unlike #1924's Attachment/DateTime conversions, this
+# needs zero `autumn-web` FromSql/ToSql code — diesel implements the
+# serde_json::Value <-> Json/Sqlite conversion itself. Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_json_field_conversion`.
+[[test]]
+name = "sqlite_json_field_conversion"
+path = "tests/sqlite_json_field_conversion.rs"
+
 # SQLite upsert isolation + optimistic-lock proof (issue #1996, PR #2021): the two
 # P1 fixes on the cfg-dual `__autumn_execute_upsert` SQLite arm. Proves (Bug 2,
 # SECURITY) a tenant-scoped `upsert_many` under tenant B with tenant A's id leaves

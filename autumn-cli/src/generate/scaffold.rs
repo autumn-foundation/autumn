@@ -2412,6 +2412,40 @@ fn render_model_form(
                     "            {name}: match &row.{name} {{ {arms}}},"
                 );
             }
+        } else if f.kind == FieldKind::Json {
+            // Issue #1341 AC5: represented as a `String` on the form (the
+            // `<textarea>`'s wire shape — see `render_form_for_helper`'s
+            // `FieldControl::Textarea` override), so it always decodes;
+            // `into_new` parses it into `serde_json::Value`
+            // (`serde_json::Value: FromStr<Err = serde_json::Error>`), a bad
+            // value yielding a 400 naming the field — the same
+            // `bad_request_msg` pattern as the enum/datetime arms above, not
+            // a 500. A blank OPTIONAL textarea means "no value" (`None`), not
+            // invalid JSON — mirrors the nullable-`DateTime` blank-is-absent
+            // filter below; a blank REQUIRED field is correctly rejected as
+            // invalid JSON (empty input is not valid JSON syntax).
+            if f.nullable {
+                let _ = writeln!(struct_fields, "    pub {name}: Option<String>,");
+                let _ = writeln!(
+                    into_new,
+                    "        {name}: form.{name}.as_deref().filter(|value| !value.trim().is_empty())\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.map(|value| value.parse::<serde_json::Value>())\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.transpose()\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?,"
+                );
+                let _ = writeln!(
+                    from_row,
+                    "            {name}: row.{name}.as_ref().map(ToString::to_string),"
+                );
+            } else {
+                let _ = writeln!(struct_fields, "    pub {name}: String,");
+                let _ = writeln!(
+                    into_new,
+                    "        {name}: form.{name}.parse::<serde_json::Value>()\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?,"
+                );
+                let _ = writeln!(from_row, "            {name}: row.{name}.to_string(),");
+            }
         } else if is_constrained_required_numeric {
             // A required numeric with a `{min,max}` range (issue #1388) is
             // `Option<T>` on the form struct (issue #1748). `validator`'s
@@ -6988,6 +7022,16 @@ fn render_form_for_helper(
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::File)"
                 );
             }
+            FieldKind::Json => {
+                // Issue #1341: the derive sees an opaque `serde_json::Value`
+                // column and falls back to a single-line text control (same
+                // fallback `Attachment`'s raw `Blob` hits above) — promote it
+                // to a `<textarea>` so a real JSON object/array fits.
+                let _ = write!(
+                    builder_calls,
+                    "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Textarea)"
+                );
+            }
             FieldKind::Enum => {
                 let placeholder = if f.nullable {
                     "— Unset —"
@@ -7629,6 +7673,16 @@ fn render_changeset_form_inputs(
                 (FieldKind::NaiveDateTime | FieldKind::DateTime, true) => {
                     format!("(autumn_web::form::datetime_input(&{cv}, \"{name}\", \"{label}\"))")
                 }
+                // Issue #1341: a real `<textarea>`, not the derived control's
+                // single-line text input fallback. There is no
+                // `required_textarea_input` helper (textarea has never had a
+                // required variant, unlike text/number/datetime/select), so
+                // both nullable and non-nullable route through the same call
+                // — the server-side JSON parse in `into_new` still 400s a
+                // blank required field.
+                (FieldKind::Json, _) => {
+                    format!("(autumn_web::form::textarea_input(&{cv}, \"{name}\", \"{label}\"))")
+                }
                 (FieldKind::Enum, _) => {
                     let placeholder = if f.nullable {
                         "— Unset —"
@@ -8130,7 +8184,14 @@ fn csv_value_expr(field: &Field) -> String {
 /// parsing. `Enum` is a generated Rust enum whose variants are compile-time
 /// idents, so it is closed-set too. `Bytea` and `Attachment` are included: the
 /// first is lossy UTF-8 of arbitrary bytes, and the second is a store key whose
-/// tail is a browser-supplied filename.
+/// tail is a browser-supplied filename. `Json` is included defensively too
+/// (issue #1341): its rendered text is *usually* self-quoting JSON (an
+/// object/array/string literal always starts with `{`/`[`/`"`, never
+/// `=`/`+`/`@`), except a bare top-level negative number (`-5`), which — like
+/// the excluded numeric kinds — would be a false-positive guard, but here
+/// there's no legitimate spreadsheet arithmetic on a JSON column to protect,
+/// so guarding costs nothing and stays consistent with the arbitrary,
+/// user-controlled data this field type exists for.
 const fn csv_kind_is_text(kind: FieldKind) -> bool {
     matches!(
         kind,
@@ -8140,6 +8201,7 @@ const fn csv_kind_is_text(kind: FieldKind) -> bool {
             | FieldKind::Slug
             | FieldKind::Bytea
             | FieldKind::Attachment
+            | FieldKind::Json
     )
 }
 
@@ -8271,15 +8333,17 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
 /// `list()` method (#1126).
 ///
 /// Mirrors the orderable-type allowlist in the `#[model]` macro: every scalar
-/// column is sortable EXCEPT binary blobs (`Bytea`/`Attachment`) and closed-set
+/// column is sortable EXCEPT binary blobs (`Bytea`/`Attachment`), closed-set
 /// `Enum` columns (whose Rust type is a generated enum the macro doesn't emit a
-/// sort arm for). Emitting `.sortable(..)` only for these keeps the rendered
-/// header links symmetric with what the server actually applies — a link that
-/// resolves to the default order would be a dead affordance.
+/// sort arm for), and `Json` columns (`serde_json::Value` isn't in the macro's
+/// orderable allowlist either — issue #1341). Emitting `.sortable(..)` only for
+/// these keeps the rendered header links symmetric with what the server
+/// actually applies — a link that resolves to the default order would be a
+/// dead affordance.
 const fn kind_is_sortable(kind: FieldKind) -> bool {
     !matches!(
         kind,
-        FieldKind::Bytea | FieldKind::Attachment | FieldKind::Enum
+        FieldKind::Bytea | FieldKind::Attachment | FieldKind::Enum | FieldKind::Json
     )
 }
 
@@ -10717,6 +10781,7 @@ fn sql_sample_literal(kind: FieldKind) -> String {
         // Always nullable (see `FieldKind::Attachment`'s doc comment), so it
         // never needs a sample literal to satisfy a `NOT NULL` constraint.
         FieldKind::Attachment => "NULL".to_owned(),
+        FieldKind::Json => "'{}'::jsonb".to_owned(),
     }
 }
 
@@ -10983,6 +11048,7 @@ fn unique_sample_literal(kind: FieldKind) -> String {
         FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz".to_owned(),
         FieldKind::Bytea => "'\\xDEADBEEF'::bytea".to_owned(),
         FieldKind::Attachment => "NULL".to_owned(),
+        FieldKind::Json => "'{\"seed\": 1}'::jsonb".to_owned(),
     }
 }
 
@@ -11017,6 +11083,7 @@ fn unique_sample_literal_variant(kind: FieldKind) -> String {
         FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz".to_owned(),
         FieldKind::Bytea => "'\\xBEEFDEAD'::bytea".to_owned(),
         FieldKind::Attachment => "NULL".to_owned(),
+        FieldKind::Json => "'{\"seed\": 2}'::jsonb".to_owned(),
     }
 }
 
@@ -14022,6 +14089,104 @@ async fn main() {
         // test `scaffold_attachment_emits_zero_js_multipart_handlers`.
     }
 
+    #[test]
+    fn execute_writes_json_field_textarea_and_parse_on_write() {
+        // Issue #1341 AC1/AC5: `config:json` (required) and `settings:Option<json>`
+        // (nullable) — the generated form renders both as `<textarea>` controls,
+        // and the write path parses the submitted text as JSON, 400ing (not
+        // 500ing) on invalid input rather than deserializing it directly.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "config:json".into(),
+                "settings:Option<jsonb>".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        let migration = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+
+        // AC2: the migration emits the JSONB column, `NOT NULL` for the
+        // required field and nullable for the `Option<jsonb>` one.
+        assert!(migration.contains("config JSONB NOT NULL"), "{migration}");
+        assert!(migration.contains("settings JSONB"), "{migration}");
+        assert!(
+            !migration.contains("settings JSONB NOT NULL"),
+            "{migration}"
+        );
+
+        // Form control: a real `<textarea>`, not the derived opaque-type
+        // fallback single-line text input.
+        assert!(
+            routes
+                .contains(".override_field(\"config\", autumn_web::form::FieldControl::Textarea)"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(
+                ".override_field(\"settings\", autumn_web::form::FieldControl::Textarea)"
+            ),
+            "{routes}"
+        );
+
+        // `PostForm` carries both fields as strings (the browser's wire shape),
+        // never the native `serde_json::Value` (which would silently wrap raw
+        // urlencoded text as a JSON *string* instead of parsing it).
+        assert!(routes.contains("pub config: String,"), "{routes}");
+        assert!(routes.contains("pub settings: Option<String>,"), "{routes}");
+        assert!(
+            !routes.contains("pub config: serde_json::Value"),
+            "{routes}"
+        );
+
+        // `into_new` parses via `serde_json::Value`'s `FromStr`, 400ing (not
+        // panicking/500ing) on invalid JSON — the same `bad_request_msg`
+        // pattern as decimal/enum/datetime fields, naming the field.
+        assert!(
+            routes.contains("form.config.parse::<serde_json::Value>()"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(
+                ".map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"config: {err}\")))?"
+            ),
+            "{routes}"
+        );
+        // Nullable: a blank textarea means "no value" (`None`), not a 400 —
+        // filtered before parsing, mirroring the nullable-`DateTime` pattern.
+        assert!(
+            routes.contains("form.settings.as_deref().filter(|value| !value.trim().is_empty())"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(".map(|value| value.parse::<serde_json::Value>())"),
+            "{routes}"
+        );
+
+        // The generated `#[model]` struct field is the real, native type —
+        // `serde_json::Value`/`Option<serde_json::Value>` — not the form's
+        // `String` shadow, and the diesel `schema.rs` token is `Jsonb`.
+        assert!(model.contains("pub config: serde_json::Value,"), "{model}");
+        assert!(
+            model.contains("pub settings: Option<serde_json::Value>,"),
+            "{model}"
+        );
+        assert!(schema.contains("config -> Jsonb,"), "{schema}");
+        assert!(schema.contains("settings -> Nullable<Jsonb>,"), "{schema}");
+    }
+
     // ── Typed form-input widgets (issue #1131) ──────────────────────
 
     #[test]
@@ -15350,6 +15515,9 @@ async fn main() {
         assert!(!kind_is_sortable(FieldKind::Bytea));
         assert!(!kind_is_sortable(FieldKind::Attachment));
         assert!(!kind_is_sortable(FieldKind::Enum));
+        // Issue #1341: `serde_json::Value` isn't in the `#[model]` macro's
+        // orderable allowlist either.
+        assert!(!kind_is_sortable(FieldKind::Json));
     }
 
     /// A bare `Field` for the `csv_value_expr` table below.
@@ -15451,6 +15619,23 @@ async fn main() {
             csv_value_expr(&csv_test_field("status", FieldKind::Enum, false)),
             "self.status.to_string()"
         );
+    }
+
+    #[test]
+    fn csv_value_expr_json_uses_display_and_carries_the_formula_guard() {
+        // Issue #1341: `serde_json::Value` DOES implement `Display` (unlike
+        // `Blob`/`Vec<u8>`), so it falls through to the generic `.to_string()`
+        // arm — but is still wrapped in `csv_text_cell` (`csv_kind_is_text`),
+        // defensively guarding the rare top-level-negative-number case.
+        assert_eq!(
+            csv_value_expr(&csv_test_field("config", FieldKind::Json, false)),
+            "csv_text_cell(self.config.to_string())"
+        );
+        assert_eq!(
+            csv_value_expr(&csv_test_field("config", FieldKind::Json, true)),
+            "csv_text_cell(self.config.as_ref().map(ToString::to_string).unwrap_or_default())"
+        );
+        assert!(csv_kind_is_text(FieldKind::Json));
     }
 
     #[test]
@@ -17291,6 +17476,27 @@ async fn main() {
                 scale,
             });
             assert!(a != b && b != c && a != c, "scale {scale}: {a}, {b}, {c}");
+        }
+    }
+
+    #[test]
+    fn json_sample_literals_are_pairwise_distinct_and_valid_jsonb() {
+        let a = sql_sample_literal(FieldKind::Json);
+        let b = unique_sample_literal(FieldKind::Json);
+        let c = unique_sample_literal_variant(FieldKind::Json);
+        assert!(a != b && b != c && a != c, "{a}, {b}, {c}");
+        for literal in [&a, &b, &c] {
+            assert!(
+                literal.ends_with("'::jsonb"),
+                "must be a jsonb-cast SQL literal: {literal}"
+            );
+            let inner = literal
+                .trim_start_matches('\'')
+                .trim_end_matches("'::jsonb");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(inner).is_ok(),
+                "{literal} must contain valid JSON"
+            );
         }
     }
 

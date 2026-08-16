@@ -409,3 +409,19 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_scaffold_serves_posts_index_and_json_api -- --ignored --exact
+
+      # ── `json`/`jsonb` scaffold field type (#1341) ──────────────────────
+      #
+      # The ONLY machine proof of AC6/the Success Metric: scaffolds a
+      # `Setting` resource with a `json` and a nullable `jsonb` field,
+      # compiles the generated app, migrates it against real Postgres, and
+      # inserts/selects a JSON object and array through the exact JSONB
+      # column the generator emitted — proving the round-trip, not just the
+      # generated text. Same `cli_tests` caveat as the blocks above — named
+      # explicitly here or it never runs anywhere (autumn-cli's Docker-gated
+      # tests are not auto-swept the way autumn-web's are).
+      - name: scaffolded_json_field_generates_compiles_inserts_and_selects
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::generate_json_postgres::scaffolded_json_field_generates_compiles_inserts_and_selects \
+            -- --ignored --exact

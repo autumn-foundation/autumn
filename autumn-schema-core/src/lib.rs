@@ -127,6 +127,15 @@ pub enum ColumnType {
     /// PG `JSONB` / `SQLite` `TEXT`. Conventionally nullable (`Option<Blob>`); the
     /// bytes themselves live in the configured storage backend.
     Attachment,
+    /// Arbitrary structured data — PG `JSONB` / `SQLite` `TEXT` (issue #1341).
+    /// Unlike [`Attachment`](Self::Attachment), maps directly to bare
+    /// `serde_json::Value` (no wrapper struct): diesel itself already
+    /// implements `FromSql`/`ToSql<Jsonb, Pg>` **and** `<Json, Sqlite>` for
+    /// `serde_json::Value`, so no `autumn-web` conversion code is needed on
+    /// either backend. On `SQLite` the column is `TEXT` via diesel's `Json`
+    /// sql-type specifically — not diesel's `Jsonb` sql-type on `SQLite`,
+    /// which uses a proprietary binary encoding rather than plain-text JSON.
+    Json,
     /// An exact-precision decimal — PG `NUMERIC(precision, scale)` / `SQLite`
     /// `TEXT` (`SQLite`'s `NUMERIC` affinity would coerce to a lossy float, so the
     /// value round-trips through `rust_decimal`'s text form instead). Defaults to
@@ -190,6 +199,7 @@ impl ColumnType {
             Self::TimestampTz => "chrono::DateTime<chrono::Utc>",
             Self::Bytes => "Vec<u8>",
             Self::Attachment => "autumn_web::storage::Blob",
+            Self::Json => "serde_json::Value",
             Self::Decimal { .. } => "rust_decimal::Decimal",
         }
         .to_owned()
@@ -218,7 +228,7 @@ impl ColumnType {
                 Self::Timestamp => "Timestamp",
                 Self::TimestampTz => "Timestamptz",
                 Self::Bytes => "Bytea",
-                Self::Attachment => "Jsonb",
+                Self::Attachment | Self::Json => "Jsonb",
                 Self::Decimal { .. } => "Numeric",
             },
             Backend::Sqlite => match self {
@@ -241,6 +251,10 @@ impl ColumnType {
                 // app's `autumn-web` sqlite feature.
                 Self::TimestampTz => "TimestamptzSqlite",
                 Self::Bytes => "Binary",
+                // Diesel's own `Json` sql-type — not `Text` (no built-in
+                // `serde_json::Value` conversion) and not `Jsonb` (SQLite's
+                // proprietary binary encoding). See the `Json` variant's doc.
+                Self::Json => "Json",
             },
         }
     }
@@ -266,7 +280,7 @@ impl ColumnType {
                 Self::Timestamp => "TIMESTAMP".to_owned(),
                 Self::TimestampTz => "TIMESTAMPTZ".to_owned(),
                 Self::Bytes => "BYTEA".to_owned(),
-                Self::Attachment => "JSONB".to_owned(),
+                Self::Attachment | Self::Json => "JSONB".to_owned(),
                 Self::Decimal { precision, scale } => format!("NUMERIC({precision},{scale})"),
                 // Preserved verbatim: the raw Postgres type name round-trips.
                 Self::Opaque { pg_type } => pg_type.clone(),
@@ -277,6 +291,7 @@ impl ColumnType {
                 | Self::Timestamp
                 | Self::TimestampTz
                 | Self::Attachment
+                | Self::Json
                 | Self::Decimal { .. }
                 | Self::Enum { .. } => "TEXT".to_owned(),
                 Self::Int32 | Self::Int64 | Self::Bool => "INTEGER".to_owned(),
@@ -319,7 +334,10 @@ impl ColumnType {
     /// every other type — including [`Timestamp`](Self::Timestamp) via the core,
     /// ungated diesel `Timestamp` sql-type, [`TimestampTz`](Self::TimestampTz)
     /// via diesel's `SQLite` `TimestamptzSqlite`, and [`Attachment`](Self::Attachment)
-    /// via `autumn-web`'s local `Blob` `Text`/`Sqlite` conversion (all #1924).
+    /// via `autumn-web`'s local `Blob` `Text`/`Sqlite` conversion (all #1924),
+    /// and [`Json`](Self::Json) via diesel's own `FromSql`/`ToSql<Json,
+    /// Sqlite> for serde_json::Value` — no `autumn-web` code needed at all
+    /// (issue #1341).
     #[must_use]
     pub const fn sqlite_has_diesel_conversion(&self) -> bool {
         !matches!(
@@ -342,9 +360,10 @@ impl ColumnType {
     /// error rather than silently dropping a column. Two types are deliberately
     /// unsupported even though the forward mapping produces them:
     ///
-    /// - **`jsonb` → `None`**: although [`Attachment`](Self::Attachment) forward-maps
-    ///   to `JSONB`, the inverse is ambiguous — a brownfield `jsonb` column is
-    ///   usually arbitrary application JSON, not an Autumn `Blob`, and
+    /// - **`jsonb` → `None`**: although [`Attachment`](Self::Attachment) (and,
+    ///   since issue #1341, [`Json`](Self::Json) too) forward-maps to `JSONB`,
+    ///   the inverse is ambiguous — a brownfield `jsonb` column could be
+    ///   arbitrary application JSON, an Autumn `Blob`, or a `Json` field, and
     ///   introspection cannot tell them apart.
     /// - **`numeric` → `None`**: a bare `numeric` `udt_name` carries no
     ///   precision/scale, so it cannot be reconstructed into a
@@ -459,6 +478,13 @@ impl ColumnType {
                 },
             };
         }
+        // Deliberately unchanged by issue #1341: a `json`/`jsonb` field ALSO
+        // forward-maps to `jsonb` now, deepening rather than resolving this
+        // ambiguity (see `from_pg_udt`'s doc). `schema pull` prioritises a
+        // clean round-trip of the common case (an Autumn-managed table's
+        // attachment column) over guessing at a brownfield column's intent;
+        // resolving the ambiguity is out of this issue's forward-generation
+        // scope.
         if udt == "jsonb" {
             return Self::Attachment;
         }
@@ -508,6 +534,7 @@ impl ColumnType {
             "NaiveDateTime" => Some(Self::Timestamp),
             "Vec<u8>" => Some(Self::Bytes),
             "Blob" => Some(Self::Attachment),
+            "Value" => Some(Self::Json),
             "Decimal" => Some(Self::Decimal {
                 precision: 12,
                 scale: 2,
@@ -860,6 +887,7 @@ mod tests {
             ColumnType::TimestampTz,
             ColumnType::Bytes,
             ColumnType::Attachment,
+            ColumnType::Json,
             ColumnType::Decimal {
                 precision: 12,
                 scale: 2,
@@ -887,6 +915,7 @@ mod tests {
                 ColumnType::TimestampTz => "chrono::DateTime<chrono::Utc>",
                 ColumnType::Bytes => "Vec<u8>",
                 ColumnType::Attachment => "autumn_web::storage::Blob",
+                ColumnType::Json => "serde_json::Value",
                 ColumnType::Decimal { .. } => "rust_decimal::Decimal",
             };
             assert_eq!(ct.rust_type(), expected, "rust_type for {ct:?}");
@@ -907,6 +936,7 @@ mod tests {
             (ColumnType::TimestampTz, "Timestamptz"),
             (ColumnType::Bytes, "Bytea"),
             (ColumnType::Attachment, "Jsonb"),
+            (ColumnType::Json, "Jsonb"),
             (
                 ColumnType::Decimal {
                     precision: 12,
@@ -944,6 +974,10 @@ mod tests {
             (ColumnType::TimestampTz, "TimestamptzSqlite"),
             (ColumnType::Bytes, "Binary"),
             (ColumnType::Attachment, "Text"),
+            // Diesel's own `Json` sql-type — distinct from both `Text` (no
+            // built-in `serde_json::Value` conversion) and `Jsonb` (SQLite's
+            // proprietary binary encoding). See the `Json` variant's doc.
+            (ColumnType::Json, "Json"),
             (
                 ColumnType::Decimal {
                     precision: 12,
@@ -981,6 +1015,7 @@ mod tests {
             (ColumnType::TimestampTz, "TIMESTAMPTZ"),
             (ColumnType::Bytes, "BYTEA"),
             (ColumnType::Attachment, "JSONB"),
+            (ColumnType::Json, "JSONB"),
             (
                 ColumnType::Enum {
                     variants: vec!["a".into()],
@@ -1011,6 +1046,7 @@ mod tests {
             (ColumnType::TimestampTz, "TEXT"),
             (ColumnType::Bytes, "BLOB"),
             (ColumnType::Attachment, "TEXT"),
+            (ColumnType::Json, "TEXT"),
             (
                 ColumnType::Enum {
                     variants: vec!["a".into()],
@@ -1315,6 +1351,11 @@ mod tests {
                 scale: 2
             })
         );
+        assert_eq!(
+            ColumnType::from_rust_type("serde_json::Value"),
+            Some(ColumnType::Json)
+        );
+        assert_eq!(ColumnType::from_rust_type("Value"), Some(ColumnType::Json));
         // Whitespace tolerance around the generic.
         assert_eq!(
             ColumnType::from_rust_type("chrono::DateTime < chrono::Utc >"),
