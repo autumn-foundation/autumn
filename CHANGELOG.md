@@ -1752,6 +1752,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **docs:** rewrote the getting-started guide (`docs/guide/getting-started.md`)
+  against the current scaffold and CLI. The guide had drifted: it announced the
+  "0.4 release line" while pinning 0.6 commands, taught Tailwind v3 directives
+  (`@tailwind base;`) against a scaffold that ships v4 (`@import "tailwindcss";`),
+  showed a legacy `{"error": {...}}` body where the framework answers RFC 9457
+  Problem Details, listed a project tree and an `autumn doctor` transcript that
+  no longer matched what `autumn new` and `doctor` actually emit, put
+  `AUTUMN_PROFILE` ahead of `AUTUMN_ENV` in the profile precedence chain, and
+  pinned `diesel-async` 0.8 against the workspace's 0.9. The prerequisites were
+  wrong in a way that broke the first build: the guide said Postgres was needed
+  "only if you want database features", but `db` is a default feature, so a
+  fresh project links `libpq` at compile time whether or not a database is
+  configured — that, the Diesel CLI requirement, and a Docker one-liner for a
+  throwaway Postgres are now stated up front. Model examples moved to the
+  `BIGSERIAL`/`i64` primary-key convention the generators and `#[repository]`
+  assume, replacing `SERIAL`/`i32`.
+
+  Three sections the guide never had were added. First, `autumn generate
+  scaffold`, previously reachable only from the generators guide — and
+  documented for what it actually produces: the read paths serve immediately,
+  while every write stays locked behind both `#[secured]` and the generated
+  policy until `autumn generate auth` is run, and the JSON write handlers are
+  generated but left unregistered. The guide explains that double gate rather
+  than treating it as a caveat, and walks the signup → email-confirmation →
+  login flow that unlocks the write views. Second, a testing section built on
+  the `tests/integration_test.rs` the scaffold already writes, plus `autumn
+  test`. Third, the prebuilt-binary install path. In exchange, the ~100-line
+  route-collision-diagnostics appendix and the
+  `_method` override's same-origin bullet list were compressed to their
+  first-hour essentials and now link onward, and the production checklist moved
+  from the middle of the walkthrough to the end. The `#configuration`,
+  `#environment-variable-overrides`, and `#route-collision-diagnostics` anchors
+  are preserved, so the inbound links from `deployment.md`, `openapi.md`, and
+  `skills/autumn-web/SKILL.md` still resolve. Version pins remain on the
+  published 0.6.0 line enforced by `first_run_docs_match_current_release_line`.
+  [no-plugin]
+
 - **Router: the whole ingress stack is now applied in ONE `Router::layer`
   call.** #2193 collapsed ~26 sequential applications down to a handful; #2198
   collapses what was left — the inner group, the user layers, the middle group,
