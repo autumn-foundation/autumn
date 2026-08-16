@@ -403,9 +403,9 @@ async fn tcp_clean_leave_converges_before_the_suspicion_timeout() {
     /// Long enough that reaching it would take the test far past its poll
     /// budget, so a convergence observed below can only have come from a
     /// delivered `Leave`.
-    const SUSPICION: Duration = Duration::from_millis(6_000);
+    const SUSPICION: Duration = Duration::from_secs(6);
     /// A generous fraction of that: a leave crosses loopback in microseconds.
-    const LEAVE_BUDGET: Duration = Duration::from_millis(2_000);
+    const LEAVE_BUDGET: Duration = Duration::from_secs(2);
 
     let shutdown_a = CancellationToken::new();
     let shutdown_b = CancellationToken::new();
