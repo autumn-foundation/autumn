@@ -110,10 +110,21 @@ GATED_MODULES=(
   # ban enforce something rather than sit unreachable.
   autumn/src/session.rs:default
   autumn/src/middleware/request_id.rs:default
+  # The embedded cluster control plane (#1762). Every node id comes from the
+  # injected `Entropy`, every elapsed measurement and the boot incarnation come
+  # from the injected `ClockSource` — the deterministic two-node suite in
+  # `src/cluster/tests.rs` is only reproducible because of that, so the gate is
+  # load-bearing here rather than decorative.
+  autumn/src/cluster/mod.rs:default
+  autumn/src/cluster/counter.rs:default
+  autumn/src/cluster/membership.rs:default
+  autumn/src/cluster/wire.rs:default
+  autumn/src/cluster/transport.rs:default
+  autumn/src/cluster/node.rs:default
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=9
+MODULE_COUNT_FLOOR=15
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(
