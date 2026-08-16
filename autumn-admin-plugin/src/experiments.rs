@@ -712,11 +712,25 @@ impl ExperimentRow {
             "name": self.name,
             "description": self.description,
             "state": self.state,
-            "variants": self.variants,
+            "variants": self.variants.map(decode_variants),
             "winner": self.winner,
             "updated_at": self.updated_at.to_rfc3339(),
         })
     }
+}
+
+/// Decode a `variants` `TEXT` column's raw content (JSON-serialized on write
+/// — see the admin's update/create handling) into the real `serde_json::Value`
+/// array it represents, rather than embedding the raw serialized text as an
+/// opaque `Value::String`. `render_form_widget`'s `AdminFieldKind::Json` arm
+/// re-serializes whatever `Value` it's given as JSON syntax, so wrapping
+/// already-JSON text in `Value::String` would get it double-encoded into a
+/// quoted, escaped blob instead of the editable array the form used to show
+/// (Codex review finding on #1341). A parse failure — unreachable in
+/// practice, since this column is always written as `serde_json::to_string`
+/// output — falls back to the raw text rather than panicking.
+fn decode_variants(raw: String) -> Value {
+    serde_json::from_str(&raw).unwrap_or(Value::String(raw))
 }
 
 /// Row returned from detail (get) queries — includes `exclusion_group`.
@@ -747,7 +761,7 @@ impl ExperimentDetailRow {
             "name": self.name,
             "description": self.description,
             "state": self.state,
-            "variants": self.variants,
+            "variants": self.variants.map(decode_variants),
             "winner": self.winner,
             "exclusion_group": self.exclusion_group,
             "updated_at": self.updated_at.to_rfc3339(),
@@ -888,5 +902,31 @@ mod tests {
             err.to_string().contains("empty"),
             "expected empty-name error, got: {err}"
         );
+    }
+
+    #[test]
+    fn decode_variants_parses_stored_json_text_into_a_real_value() {
+        // Codex review finding on #1341: `variants` is a TEXT column storing
+        // serialized JSON. Embedding that raw text as `Value::String` (the
+        // old behavior) made `render_form_widget`'s `AdminFieldKind::Json` arm
+        // double-encode it into a quoted, escaped blob once that arm started
+        // re-serializing `Value::String` as JSON syntax (to correctly
+        // round-trip a GENUINE top-level JSON string scalar). Decoding here
+        // means the edit form sees the real array and displays it correctly.
+        let decoded = decode_variants(r#"[{"name":"control","weight":50}]"#.to_owned());
+        assert_eq!(
+            decoded,
+            serde_json::json!([{"name": "control", "weight": 50}])
+        );
+        assert!(matches!(decoded, Value::Array(_)));
+    }
+
+    #[test]
+    fn decode_variants_falls_back_to_raw_text_on_unparseable_input() {
+        // Unreachable through normal use (this column is always written as
+        // `serde_json::to_string` output), but must not panic on legacy or
+        // hand-edited data.
+        let decoded = decode_variants("not json".to_owned());
+        assert_eq!(decoded, Value::String("not json".to_owned()));
     }
 }
