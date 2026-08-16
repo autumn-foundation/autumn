@@ -126,11 +126,36 @@ impl MarkdownRegistry {
     /// ```
     #[must_use]
     pub fn static_params(&self) -> Vec<StaticParams> {
-        self.all_sorted()
-            .into_iter()
+        self.static_params_for("slug")
+    }
+
+    /// Derive one [`StaticParams`] per page, binding each page's slug to the
+    /// route parameter named `param`.
+    ///
+    /// Use this when the `#[static_get]` route names its parameter something
+    /// other than `slug` — e.g. `#[static_get("/docs/{page}", …)]` needs
+    /// `static_params_for("page")`, because a `StaticParams` entry keyed
+    /// `"slug"` would leave `{page}` unsubstituted.
+    ///
+    /// Pages are returned in sorted order (same as [`MarkdownRegistry::all_sorted`]).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// async fn doc_params(_router: axum::Router) -> Vec<StaticParams> {
+    ///     docs_registry().static_params_for("page")
+    /// }
+    ///
+    /// #[static_get("/docs/{page}", params = doc_params)]
+    /// async fn show_doc(Path(page): Path<String>) -> AutumnResult<Markup> { ... }
+    /// ```
+    #[must_use]
+    pub fn static_params_for(&self, param: &str) -> Vec<StaticParams> {
+        self.pages
+            .values()
             .map(|p| {
                 let mut params = StaticParams::new();
-                params.insert("slug".to_owned(), p.slug.clone());
+                params.insert(param.to_owned(), p.slug.clone());
                 params
             })
             .collect()
@@ -381,6 +406,19 @@ mod tests {
         let params = registry.static_params();
         assert_eq!(params[0].get("slug").unwrap(), "getting-started");
         assert_eq!(params[1].get("slug").unwrap(), "api-reference");
+    }
+
+    #[test]
+    fn static_params_for_uses_custom_param_name() {
+        // `#[static_get("/docs/{page}")]` binds a param named `page`, not
+        // `slug`. Without a keyed helper, SSG for such a route gets params it
+        // cannot substitute.
+        let registry = MarkdownRegistry::from_embedded(&[GETTING_STARTED, API_REFERENCE]).unwrap();
+        let params = registry.static_params_for("page");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].get("page").unwrap(), "getting-started");
+        assert_eq!(params[1].get("page").unwrap(), "api-reference");
+        assert!(!params[0].contains_key("slug"));
     }
 
     #[test]

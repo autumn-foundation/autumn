@@ -1372,6 +1372,35 @@ pub trait SuppressionStore: Send + Sync {
         list_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, MailError>> + Send + 'a>>;
 
+    /// Returns the subset of `subscribers` that have unsubscribed from
+    /// `list_id`.
+    ///
+    /// The list-mail send path calls this once per outgoing message instead
+    /// of [`is_suppressed`](Self::is_suppressed) once per recipient, so a
+    /// batch backend (like the `db`-feature `DbSuppressionStore`) can
+    /// resolve the whole recipient list in a single round trip. The default
+    /// implementation loops over `is_suppressed`, calling it in `subscribers`
+    /// order and stopping at the first error — the same sequential behavior
+    /// as before this method existed — so implementors that don't override
+    /// it keep working unchanged.
+    fn is_suppressed_many<'a>(
+        &'a self,
+        subscribers: &'a [&'a str],
+        list_id: &'a str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<std::collections::HashSet<String>, MailError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut suppressed = std::collections::HashSet::new();
+            for &subscriber in subscribers {
+                if self.is_suppressed(subscriber, list_id).await? {
+                    suppressed.insert(subscriber.to_owned());
+                }
+            }
+            Ok(suppressed)
+        })
+    }
+
     /// Record that `subscriber` unsubscribed from `list_id` (idempotent).
     fn suppress<'a>(
         &'a self,
@@ -1809,13 +1838,32 @@ impl Mailer {
         // bare address is used for the suppression / token key so a formatted
         // `Ada <ada@example.com>` recipient matches an opt-out recorded as
         // `ada@example.com`; the display string is preserved for actual delivery.
-        let mut deliveries: Vec<(String, String)> = Vec::with_capacity(mail.to.len());
+        //
+        // Validate every recipient's address format first (in order, so a
+        // malformed address still fails fast the same way it always has),
+        // then resolve suppression for the whole batch in one call instead of
+        // one store round trip per recipient — `is_suppressed_many` is the
+        // only DB-backed lookup in this function's hot path, and it used to
+        // scale linearly with the recipient count.
+        let mut candidates: Vec<(String, String)> = Vec::with_capacity(mail.to.len());
         for recipient in &mail.to {
             parse_mailbox(recipient)?;
-            let subscriber = canonical_subscriber(recipient);
-            if let Some(store) = runtime.suppression.as_ref()
-                && store.is_suppressed(&subscriber, &list_id).await?
-            {
+            candidates.push((recipient.clone(), canonical_subscriber(recipient)));
+        }
+
+        let suppressed = if let Some(store) = runtime.suppression.as_ref() {
+            let subscribers: Vec<&str> = candidates
+                .iter()
+                .map(|(_, subscriber)| subscriber.as_str())
+                .collect();
+            store.is_suppressed_many(&subscribers, &list_id).await?
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        let mut deliveries: Vec<(String, String)> = Vec::with_capacity(candidates.len());
+        for (recipient, subscriber) in candidates {
+            if suppressed.contains(&subscriber) {
                 tracing::info!(
                     target: "mail",
                     list_id = %list_id,
@@ -1824,7 +1872,7 @@ impl Mailer {
                 );
                 continue;
             }
-            deliveries.push((recipient.clone(), subscriber));
+            deliveries.push((recipient, subscriber));
         }
 
         for (recipient, subscriber) in deliveries {
@@ -4301,6 +4349,75 @@ pub mod db_suppression {
             })
         }
 
+        fn is_suppressed_many<'a>(
+            &'a self,
+            subscribers: &'a [&'a str],
+            list_id: &'a str,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<std::collections::HashSet<String>, MailError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            // Chunked, not one unbounded `= ANY(...)`, as a backstop against a
+            // truly pathological single send (hundreds of thousands of
+            // recipients) binding an unbounded array into one statement.
+            //
+            // On Postgres, `eq_any` binds the whole array as ONE parameter
+            // (`= ANY($n)`), so `CHUNK_SIZE` is deliberately large, not
+            // tight: measured against a production-shaped
+            // `mail_unsubscribes` fixture, `subscriber = ANY(...)` keeps
+            // using the `(subscriber, list_id)` index up to a few thousand
+            // array elements, then the planner switches to a `Parallel Seq
+            // Scan` of the whole table — a plan whose cost is ~flat per
+            // statement regardless of how many more elements are in the
+            // array (it's already paying for the full scan). A chunk size
+            // near that crossover would needlessly re-pay the full-scan cost
+            // once per chunk; staying well above it keeps ordinary sends —
+            // even a full-list newsletter blast — in one statement. See
+            // docs/reports/2026-08-15-ledger-mail-suppression-batch/README.md
+            // for the measurements behind the Postgres number.
+            //
+            // SQLite has no array bind type: Diesel lowers `eq_any` to
+            // `IN (?, ?, ...)`, one bind parameter per element, so a
+            // 50,000-element chunk plus the `list_id` parameter would blow
+            // past `SQLITE_MAX_VARIABLE_NUMBER` (32,766 by default) and fail
+            // the whole send with "too many SQL variables". Reuse
+            // `repository::MAX_BIND_PARAMS` — the same backend-aware limit
+            // generated bulk-write code already chunks against — minus one
+            // for the `list_id` parameter, so this never depends on a second
+            // hand-picked constant drifting out of sync with that one.
+            #[cfg(not(feature = "sqlite"))]
+            const CHUNK_SIZE: usize = 50_000;
+            #[cfg(feature = "sqlite")]
+            const CHUNK_SIZE: usize = crate::repository::MAX_BIND_PARAMS - 1;
+            Box::pin(async move {
+                let mut suppressed = std::collections::HashSet::with_capacity(subscribers.len());
+                if subscribers.is_empty() {
+                    return Ok(suppressed);
+                }
+                let mut conn =
+                    self.pool.get().await.map_err(|e| {
+                        MailError::RuntimeUnavailable(format!("suppression pool: {e}"))
+                    })?;
+                for chunk in subscribers.chunks(CHUNK_SIZE) {
+                    let owned: Vec<&str> = chunk.to_vec();
+                    let hits: Vec<String> = mail_unsubscribes::table
+                        .filter(mail_unsubscribes::list_id.eq(list_id))
+                        .filter(mail_unsubscribes::subscriber.eq_any(owned))
+                        .select(mail_unsubscribes::subscriber)
+                        .load(&mut conn)
+                        .await
+                        .map_err(|e| {
+                            MailError::RuntimeUnavailable(format!("suppression query: {e}"))
+                        })?;
+                    suppressed.extend(hits);
+                }
+                Ok(suppressed)
+            })
+        }
+
         fn suppress<'a>(
             &'a self,
             subscriber: &'a str,
@@ -5953,6 +6070,98 @@ mod tests {
         assert!(
             sent.lock().unwrap().is_empty(),
             "suppressed recipient must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_list_mail_resolves_suppression_in_one_batched_call() {
+        use std::sync::atomic::AtomicUsize;
+
+        // A store that counts how many times each trait method is invoked, so
+        // this test proves `send_list_mail` calls `is_suppressed_many` once
+        // for the whole recipient batch instead of `is_suppressed` once per
+        // recipient (the N+1 this change eliminates).
+        struct CountingStore {
+            is_suppressed_calls: AtomicUsize,
+            is_suppressed_many_calls: AtomicUsize,
+            suppressed: std::collections::HashSet<String>,
+        }
+        impl SuppressionStore for CountingStore {
+            fn is_suppressed<'a>(
+                &'a self,
+                subscriber: &'a str,
+                _list_id: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, MailError>> + Send + 'a>> {
+                self.is_suppressed_calls.fetch_add(1, Ordering::SeqCst);
+                let hit = self.suppressed.contains(subscriber);
+                Box::pin(async move { Ok(hit) })
+            }
+            fn is_suppressed_many<'a>(
+                &'a self,
+                subscribers: &'a [&'a str],
+                _list_id: &'a str,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<std::collections::HashSet<String>, MailError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                self.is_suppressed_many_calls.fetch_add(1, Ordering::SeqCst);
+                let hits: std::collections::HashSet<String> = subscribers
+                    .iter()
+                    .filter(|s| self.suppressed.contains(**s))
+                    .map(|s| (*s).to_owned())
+                    .collect();
+                Box::pin(async move { Ok(hits) })
+            }
+            fn suppress<'a>(
+                &'a self,
+                _subscriber: &'a str,
+                _list_id: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                Box::pin(async move { Ok(()) })
+            }
+        }
+
+        let mut suppressed = std::collections::HashSet::new();
+        suppressed.insert("banned@example.com".to_owned());
+        let store = Arc::new(CountingStore {
+            is_suppressed_calls: AtomicUsize::new(0),
+            is_suppressed_many_calls: AtomicUsize::new(0),
+            suppressed,
+        });
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = CapturingTransport { sent: sent.clone() };
+        let mailer = Mailer::with_transport(transport)
+            .with_unsubscribe(unsubscribe_runtime(Some(store.clone())));
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("first@example.com")
+            .to("banned@example.com")
+            .to("third@example.com")
+            .subject("Digest")
+            .text("hello")
+            .list_unsubscribe("weekly_digest")
+            .build()
+            .unwrap();
+        mailer.send(mail).await.unwrap();
+
+        assert_eq!(
+            store.is_suppressed_many_calls.load(Ordering::SeqCst),
+            1,
+            "suppression for the whole recipient batch must resolve in exactly one call, \
+             regardless of recipient count"
+        );
+        assert_eq!(
+            store.is_suppressed_calls.load(Ordering::SeqCst),
+            0,
+            "the per-recipient is_suppressed path must not be used when a batch override exists"
+        );
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "only the two non-suppressed recipients are delivered"
         );
     }
 

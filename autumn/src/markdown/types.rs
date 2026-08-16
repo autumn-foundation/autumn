@@ -72,7 +72,13 @@ impl Default for RenderOptions {
 /// The output from rendering a [`MarkdownPage`].
 #[derive(Debug, Clone)]
 pub struct RenderedMarkdown {
-    /// Safe HTML produced from the Markdown body.
+    /// HTML produced from the Markdown body.
+    ///
+    /// Raw HTML in the source is escaped rather than emitted, but this is
+    /// **not** sanitized output — see
+    /// [`render`](crate::markdown::render), which is for trusted build-time
+    /// content only. For user-submitted Markdown use
+    /// [`render_user_content_html`](crate::markdown::render_user_content_html).
     pub html: String,
     /// Table of contents extracted from headings, in document order.
     pub toc: Vec<TocItem>,

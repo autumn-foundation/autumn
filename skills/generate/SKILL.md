@@ -214,7 +214,8 @@ owner-scopes the index; pass `--no-policy` to opt out (issue #1125).
 **Scaffold typed path module (trunk-dev)**: scaffolds reference a generated
 `autumn_web::paths![index, show, new, create, edit, update, delete]` module
 (`+events` under `--live`, `+validate_{field}` under `--live-validation`,
-`+nested_index, nested_create` under `--belongs-to`) for
+`+nested_index, nested_create` under `--belongs-to`, `+trash, restore, purge`
+under `--soft-delete`) for
 every href/action/redirect/SSE endpoint/`hx-post` target instead of literal URL
 strings (issue #1133).
 
@@ -259,6 +260,23 @@ pass through an emitted `csv_text_cell` guard against spreadsheet formula
 injection (numeric/date/bool/enum columns are not guarded — guarding them
 would corrupt a negative number). Not emitted for `--live`, `--sharded`,
 owner-scoped `--live-validation`, or `--api` (issue #1315).
+
+**Scaffold Trash view (trunk-dev)**: a `--soft-delete` standard HTML scaffold
+also ships the recover-from-trash UI — a `#[secured] GET /<plural>/trash` page
+listing deleted rows through the repository's generated `page_only_deleted`
+(the paginated `only_deleted` scope; the handler writes no `deleted_at` filter
+of its own), a **Trash** link in the index furniture, a `Deleted` column with
+each row's `deleted_at` stamp, and per row a CSRF-protected **Restore**
+(`POST /<plural>/{id}/restore` → `restore(id)`) and **Purge**
+(`POST /<plural>/{id}/purge` → `purge(id)`) control — Purge behind
+`confirm_action`'s server-rendered dialog, because the default
+`script-src 'self'` CSP blocks an inline `onclick` confirm. Both write handlers
+load their target with `deleted_at IS NOT NULL` first (so a crafted POST cannot
+hard-delete a live row) and record-authorize it with the same `"delete"` action
+`destroy` uses. The generated test walks create → soft delete → Trash →
+restore → purge. Not emitted for `--live`, `--live-validation`, `--sharded`, an
+owner-scoped index, `--api`, or any scaffold without `--soft-delete`
+(issue #1332).
 
 **Scaffold no-JS uploads (trunk-dev)**: `Attachment` fields produce working
 `multipart/form-data` uploads without JS — the create/update handlers take a
