@@ -139,7 +139,7 @@ mod tests {
         }]);
 
         assert!(table.contains("Widget"));
-        assert!(table.contains('42'));
+        assert!(table.contains("42"));
     }
 
     #[test]
