@@ -107,6 +107,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/sync/engine.rs:offline-sync
   autumn/src/middleware/access_log.rs:default
   autumn/src/middleware/exception_filter.rs:default
+  autumn/src/middleware/gate.rs:default
   autumn/src/middleware/request_id.rs:default
   autumn/src/middleware/method_override.rs:default
   autumn/src/middleware/metrics.rs:default

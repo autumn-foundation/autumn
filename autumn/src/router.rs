@@ -4113,7 +4113,7 @@ fn apply_middleware(
         // `axum::middleware::from_fn(method_override_rejection_filter)`:
         // same behavior, but without `from_fn`'s per-request `Box::pin` of
         // its wrapped future and inner-service clone (issue #2214).
-        crate::middleware::method_override_rejection_layer(),
+        crate::middleware::method_override::method_override_rejection_layer(),
         tower::util::option_layer(build_bot_protection_layer(config)),
         tower::util::option_layer(build_csrf_layer(config, signing_keys_opt.clone())),
         // Inner to the CSRF layer so CSRF is validated first on the request
@@ -4124,7 +4124,7 @@ fn apply_middleware(
         // decision is a synchronous look at the request's authority/Host and
         // the forward path returns the inner response untouched, so it fits
         // the allocation-free gate shape (issue #2214).
-        crate::middleware::GateLayer::new(move |req: &Request<axum::body::Body>| {
+        crate::middleware::gate::GateLayer::new(move |req: &Request<axum::body::Body>| {
             trusted_host_rejection(req, &trusted_host_policy)
         }),
         tower::util::option_layer(build_ingress_cors_layer(config)),
@@ -4554,7 +4554,7 @@ fn apply_layers_in_registration_order(
 ///
 /// This is a pure synchronous predicate rather than an
 /// `axum::middleware::from_fn` middleware so the production stack can run it
-/// through the allocation-free [`GateLayer`](crate::middleware::GateLayer),
+/// through the allocation-free crate-internal `GateLayer`,
 /// which neither boxes a future nor clones the inner service per request
 /// (issue #2214). Behavior is unchanged from the `trusted_host_middleware`
 /// `async fn` this replaced — the branches are identical, only the

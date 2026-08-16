@@ -208,11 +208,11 @@ pub enum MethodOverrideRejection {
 /// is safe to apply to every route in the router.
 ///
 /// Kept as a plain `async fn` for existing `axum::middleware::from_fn`
-/// callers and tests; the production router applies
-/// [`method_override_rejection_layer`] instead, which runs the same
-/// [`rejection_response`] check through the allocation-free
-/// [`GateLayer`](crate::middleware::gate::GateLayer) rather than paying
-/// `from_fn`'s per-request `Box::pin` and inner-service clone (issue #2214).
+/// callers and tests; the production router applies the crate-internal
+/// `method_override_rejection_layer` instead, which runs the same
+/// `rejection_response` check through the allocation-free `GateLayer` rather
+/// than paying `from_fn`'s per-request `Box::pin` and inner-service clone
+/// (issue #2214).
 pub async fn method_override_rejection_filter(
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -270,22 +270,23 @@ fn rejection_response<B>(request: &Request<B>) -> Option<axum::response::Respons
     Some(response)
 }
 
-/// Signature of the synchronous rejection check handed to
-/// [`GateLayer`](crate::middleware::gate::GateLayer) by
-/// [`method_override_rejection_layer`]. A plain `fn` pointer (rather than a
-/// closure) so the layer stays `Copy` and nameable.
-type RejectionCheck = fn(&Request<axum::body::Body>) -> Option<Response<axum::body::Body>>;
+/// Signature of the synchronous rejection check handed to the crate-internal
+/// `GateLayer` by [`method_override_rejection_layer`]. A plain `fn` pointer
+/// (rather than a closure) so the layer stays `Copy` and nameable.
+pub(crate) type RejectionCheck =
+    fn(&Request<axum::body::Body>) -> Option<Response<axum::body::Body>>;
 
 /// Allocation-free equivalent of
 /// `axum::middleware::from_fn(method_override_rejection_filter)`.
 ///
 /// Same behavior — convert a stamped [`MethodOverrideRejection`] into its
 /// `400`/`413` response, forward everything else untouched — but routed
-/// through [`GateLayer`](crate::middleware::gate::GateLayer), so it neither
-/// boxes a future nor clones the inner service per request (issue #2214).
-/// This is what `router::apply_middleware` installs.
+/// through the crate-internal `GateLayer`, so it neither boxes a future nor
+/// clones the inner service per request (issue #2214). This is what
+/// `router::apply_middleware` installs.
 #[must_use]
-pub fn method_override_rejection_layer() -> crate::middleware::gate::GateLayer<RejectionCheck> {
+pub(crate) fn method_override_rejection_layer() -> crate::middleware::gate::GateLayer<RejectionCheck>
+{
     crate::middleware::gate::GateLayer::new(rejection_response as RejectionCheck)
 }
 

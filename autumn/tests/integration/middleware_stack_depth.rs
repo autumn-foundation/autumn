@@ -155,9 +155,9 @@ async fn unused() -> &'static str {
 ///
 /// #2214 removes two *C* counts (not box levels — D is unchanged) by moving
 /// the method-override rejection filter and the trusted-host check off
-/// `axum::middleware::from_fn` and onto
-/// [`GateLayer`](autumn_web::middleware::GateLayer), whose `call` forwards to
-/// its inner service directly instead of cloning it the way every
+/// `axum::middleware::from_fn` and onto the framework-internal `GateLayer`,
+/// whose `call` forwards to its inner service directly instead of cloning it
+/// the way every
 /// `from_fn`-generated service does. This is the legitimate way to lower *C*:
 /// real clone-on-call sites removed by writing a real `Service`/`Future`
 /// pair, **not** `BoxCloneSyncServiceLayer` type-erasure (which the "What

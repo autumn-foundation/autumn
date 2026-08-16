@@ -32,7 +32,38 @@
 //! something of its own (a store lookup), that inspects or rewrites the
 //! response on the way out, or that needs to hold a guard across the inner
 //! call, does not fit this shape and needs its own `Service`/`Future` pair
-//! (see [`crate::middleware::maintenance`] for one written by hand).
+//! (see [`crate::middleware::maintenance`] for one written by hand — its
+//! `MaintenanceService` is exactly this pattern, specialised).
+//!
+//! # Readiness precondition: the inner service must be always-ready
+//!
+//! [`GateService::poll_ready`] **delegates** to the inner service, which is
+//! the correct tower contract for a service that calls `inner.call(req)`
+//! synchronously inside its own `call`. It does mean two things that differ
+//! from the `axum::middleware::from_fn` this replaces, whose `poll_ready` is
+//! an unconditional `Poll::Ready(Ok(()))` (it can afford that because it
+//! clones the inner service and drives it through a `Oneshot` inside the
+//! boxed future — the very clone this type exists to avoid):
+//!
+//! 1. If the inner service is `Pending`, even a request the gate would reject
+//!    outright waits for inner readiness instead of short-circuiting.
+//! 2. If the inner service *reserves* capacity in `poll_ready` (`Buffer`,
+//!    `ConcurrencyLimit`), a short-circuited request leaves that reservation
+//!    unconsumed until the next `call`.
+//!
+//! Neither is reachable with an always-ready inner service, which is why this
+//! type is `pub(crate)`: every current user sits inner to the framework's only
+//! backpressuring layer (`LoadShedLayer`, applied *outside* both gates in
+//! `apply_middleware`'s inner group), and everything beneath them —
+//! `BotProtection`, `CSRF`, `SubmitToken`, `TrustedHost`, `CORS`, and
+//! ultimately `axum::routing::Route`, whose `poll_ready` is
+//! `Poll::Ready(Ok(()))` — is always-ready. Load shedding is therefore
+//! unaffected by this type.
+//!
+//! **Do not export this without revisiting that.** Wrapping a genuinely
+//! backpressured service needs either a documented always-ready bound or a
+//! different readiness design, and neither is justified until there is a
+//! caller that needs it.
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
@@ -71,13 +102,13 @@ use tower::{Layer, Service};
 /// shape described in the [module docs](self) — it is behaviorally identical
 /// and allocates nothing per request.
 #[derive(Clone, Copy, Debug)]
-pub struct GateLayer<G> {
+pub(crate) struct GateLayer<G> {
     gate: G,
 }
 
 impl<G> GateLayer<G> {
     /// Wrap `gate` as a layer.
-    pub const fn new(gate: G) -> Self {
+    pub(crate) const fn new(gate: G) -> Self {
         Self { gate }
     }
 }
@@ -98,7 +129,7 @@ where
 
 /// Tower [`Service`] produced by [`GateLayer`].
 #[derive(Clone, Copy, Debug)]
-pub struct GateService<S, G> {
+pub(crate) struct GateService<S, G> {
     inner: S,
     gate: G,
 }
@@ -135,7 +166,7 @@ pin_project! {
     /// path) or delegates to the wrapped inner service's own future. Neither
     /// variant boxes.
     #[project = GateFutureProj]
-    pub enum GateFuture<F> {
+    pub(crate) enum GateFuture<F> {
         ShortCircuit { response: Option<Response<Body>> },
         Forward { #[pin] inner: F },
     }
