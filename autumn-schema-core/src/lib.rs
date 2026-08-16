@@ -514,11 +514,12 @@ impl ColumnType {
     /// token as written in the struct field, never the file's `use`
     /// declarations, so even a *bare* `Value` can't be safely resolved to a
     /// crate without that import context. Only the exact `serde_json::Value`
-    /// path resolves to `Json`; a bare `Value` (however it was imported) or
-    /// any other qualified path (`domain::Value`, `my_crate::sub::Value`)
-    /// resolves to `None`. The DSL/scaffold generator is unaffected — it
-    /// always emits the fully-qualified `serde_json::Value` in generated
-    /// model structs (see [`Self::rust_type`]), never a bare `Value`.
+    /// path resolves to `Json` (an optional leading `::` — an absolute path —
+    /// is tolerated); a bare `Value` (however it was imported) or any other
+    /// qualified path (`domain::Value`, `my_crate::sub::Value`) resolves to
+    /// `None`. The DSL/scaffold generator is unaffected — it always emits
+    /// the fully-qualified `serde_json::Value` in generated model structs
+    /// (see [`Self::rust_type`]), never a bare `Value`.
     #[must_use]
     pub fn from_rust_type(rust: &str) -> Option<Self> {
         // Normalise away all whitespace so `DateTime < Utc >` and
@@ -536,8 +537,14 @@ impl ColumnType {
         // from an unrelated same-named type — so only the fully-qualified
         // `serde_json::Value` path is accepted, checked against the full
         // normalised string rather than falling through to the
-        // `rsplit("::")` leaf split below.
-        if normalized == "serde_json::Value" {
+        // `rsplit("::")` leaf split below. An optional leading `::` (an
+        // absolute path, `::serde_json::Value`, sometimes written to avoid
+        // shadowing by a local module of the same name) is stripped first —
+        // this doesn't reopen the ambiguity the exact match exists for,
+        // since `::domain::Value` still normalises to `domain::Value` and
+        // correctly falls through to `None` below.
+        let unprefixed = normalized.strip_prefix("::").unwrap_or(normalized.as_str());
+        if unprefixed == "serde_json::Value" {
             return Some(Self::Json);
         }
 
@@ -1400,6 +1407,21 @@ mod tests {
         // is indistinguishable from one imported via `use serde_json::Value;`.
         // Only the fully-qualified path is unambiguous.
         assert_eq!(ColumnType::from_rust_type("Value"), None);
+    }
+
+    #[test]
+    fn from_rust_type_accepts_an_absolute_serde_json_value_path() {
+        // `::serde_json::Value` (a leading `::`, an absolute path — sometimes
+        // written defensively to avoid shadowing by a local module of the
+        // same name) is valid Rust and must still resolve to `Json`. This
+        // doesn't reopen the `Value` collision risk: `::domain::Value` still
+        // normalises to `domain::Value`, which correctly stays `None`
+        // (Codex review finding on #1341).
+        assert_eq!(
+            ColumnType::from_rust_type("::serde_json::Value"),
+            Some(ColumnType::Json)
+        );
+        assert_eq!(ColumnType::from_rust_type("::domain::Value"), None);
     }
 
     #[test]
