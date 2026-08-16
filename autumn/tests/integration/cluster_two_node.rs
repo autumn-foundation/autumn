@@ -815,8 +815,12 @@ async fn disabled_cluster_installs_nothing() {
         "a disabled cluster must not install a ClusterHandle extension"
     );
 
+    // Deliberately NOT `assert_ok()`: the aggregate health status can be
+    // legitimately DOWN from components unrelated to this test (e.g. a
+    // circuit-breaker indicator tripped by a concurrently running test in the
+    // same process). The claim under test is cluster-scoped: no
+    // `cluster:membership` component may exist, whatever the overall status.
     let response = app.get("/actuator/health").send().await;
-    response.assert_ok();
     response.assert_json::<serde_json::Value, _>(|value| {
         assert!(
             value["components"]["cluster:membership"].is_null(),
