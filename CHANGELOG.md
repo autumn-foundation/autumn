@@ -179,10 +179,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recursive `clone_box` down the rest of the stack, so each conversion took a
   whole deep-clone cascade with it too.
 
-  Measured end-to-end on a `TestApp` round trip (debug profile, deterministic
-  across runs): **172 → 140 allocation blocks** and **37,819 → 26,030 bytes**
-  per request under the default feature set — 18.6% fewer allocations and 31.2%
-  fewer bytes. The ingress clone-on-call traversal count drops from 13 to 9 in
+  Re-run of the issue's own DHAT recipe on `benches/request_pipeline.rs`
+  (release, 200 iterations = 650 requests), before and after on the same
+  machine — filtering allocation sites whose second stack frame is
+  `FromFn<..>::call` exactly, as the issue specifies:
+
+  | | `FromFn::call` `Box::pin` | share of run bytes | marginal blocks/req | marginal bytes/req |
+  | --- | ---: | ---: | ---: | ---: |
+  | before | 3,250 blocks / 5,215,600 bytes | 19.80% | 168.8 | 36,826 |
+  | after | **0 / 0** (0 sites) | **0%** | 139.2 | 25,943 |
+
+  The before column reproduces the issue's measurement exactly on block count
+  (3,250) and to within 1% on bytes. Overall: **−17.5% allocations** and
+  **−29.6% bytes** per request.
+
+  The same movement is pinned as a regression gate in the debug profile, where
+  it is deterministic run to run: **172 → 140 allocation blocks** and
+  **37,819 → 26,030 bytes** per request under the default feature set. The ingress clone-on-call traversal count drops from 13 to 9 in
   the same move, on the default set and on a 13-feature build alike. One layer
   also sheds an allocation of its own: the asset cache-control layer no longer
   clones the request path into a `String` on every request in the app.
