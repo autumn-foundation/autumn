@@ -123,9 +123,12 @@ differ whenever the bind is a wildcard or the node sits behind NAT:
   connection to the address it learned from the pushed state, so a node its
   peer cannot dial — behind NAT, or on a container network that only publishes
   one port — is a node its peer can accept frames *from* and never send frames
-  *to*. That is a one-way cluster: the dialing node converges on a two-member
-  view while its peer never learns anything. `seed_peers` decides who makes
-  first contact, not who has to be reachable.
+  *to*. That is a one-way cluster, and the asymmetry runs opposite to
+  intuition: the **reachable** node converges on a two-member view, because it
+  keeps accepting the unreachable node's pushes and learning its record, while
+  the **unreachable** node receives nothing back and stays at a one-member view
+  forever — even though it is the one that dialed first. `seed_peers` decides
+  who makes first contact, not who has to be reachable.
 - Leaving `bind_addr` at the default ephemeral port is therefore fine only when
   the peer can reach the resolved port — same host, same pod network — because
   that resolved port is what gets advertised. Give each node a fixed port and a
@@ -282,13 +285,16 @@ alert on:
 | --- | --- | --- |
 | `autumn_cluster_members` | gauge | Size of the local view. |
 | `autumn_cluster_pushes_sent_total` | counter | State pushes written. |
-| `autumn_cluster_pushes_received_total` | counter | Frames accepted after verification. |
+| `autumn_cluster_pushes_unsendable_total` | counter | Outbound messages that could not be signed or framed, so the transport never saw them. Anything above zero is almost always a document past the 64 KiB frame cap — see [State growth](#failure-semantics). |
+| `autumn_cluster_pushes_received_total` | counter | State pushes accepted from peers after verification. A `leave` is verified and applied without being counted here. |
 | `autumn_cluster_merges_applied_total` | counter | Merges that changed local state. |
 | `autumn_cluster_frames_rejected_total` | counter | Labelled `reason` — see the receive path below. Every label is published from boot, zeroes included, and `reason="oversize"` covers the connection-fatal step-1 rejections too. |
 | `autumn_cluster_frames_dropped_total` | counter | Outbound frames swallowed by a full or closed peer queue. Anti-entropy re-sends the state, so drops are lossy only to latency. |
 
 A steady `frames_rejected_total{reason="mac"}` means somebody is talking to
-your port with the wrong secret.
+your port with the wrong secret. Any `pushes_unsendable_total` at all means
+this node has stopped gossiping and its peer is about to evict it — the push is
+also the heartbeat, so that failure is otherwise invisible from the inside.
 
 ## How it works
 
@@ -318,7 +324,7 @@ The envelope:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `v` | u8 | Envelope version. `1` in this slice; any other value is dropped. |
-| `key_id` | u8 | Which signing key made the MAC. Always `0`; reserved for key rotation. Anything else is dropped. |
+| `key_id` | u8 | Which signing key made the MAC. Always `0`; reserved for key rotation. Anything else is dropped, and so is an envelope that omits the field. |
 | `cluster` | string | Sender's `cluster_name`. A mismatch with the local name is dropped. |
 | `sender` | string | Sender's node id — the *authenticated* identity. The source address is never an identity. |
 | `incarnation` | u64 | Sender's incarnation when the frame was produced. |
@@ -407,9 +413,12 @@ heartbeat — there is no separate ping. `leave` carries no fields at all: it
 applies to the `(sender, incarnation)` pair in the authenticated envelope, so a
 captured leave can never be replayed against a newer incarnation of that node.
 
-Wire structs tolerate unknown fields and default missing ones, so a newer node
-can add fields without breaking an older peer. (This is the opposite of the
-config layer, where an unknown key is an error.)
+Wire structs tolerate unknown fields, and the structs *inside* the payload
+default missing ones, so a newer node can add fields without breaking an older
+peer. (This is the opposite of the config layer, where an unknown key is an
+error.) The envelope itself is the exception: every one of its fields is
+required, and one that is absent is a step-2 `malformed` drop — an envelope is
+what authenticates a frame, so there is nothing in it to be lenient about.
 
 ### Membership
 
@@ -431,25 +440,37 @@ types:
 read through the injected clock), so a restart — clean or crash — comes back
 at a strictly higher incarnation with no persistence anywhere. Millisecond
 granularity is load-bearing: no real process restarts within the same
-millisecond, so two boots can never mint equal incarnations — which is what
-keeps refutation's exact-echo check sound (a record byte-equal to this boot's
-own record really is an echo of this boot, never a leftover from the previous
-one). That is
-what lets a node with a stable `node_id` rejoin after a crash: its peer's
-replay watermark is keyed by `(sender, incarnation)`, and a fresh, higher
-incarnation starts a fresh sequence rather than colliding with the dead boot's
-watermark.
+millisecond, so in practice two boots do not mint equal incarnations — which is
+what keeps refutation's exact-echo check sound (a record byte-equal to this
+boot's own record really is an echo of this boot, rather than a leftover from
+the previous one). That is what lets a node with a stable `node_id` rejoin
+after a crash: its peer's replay watermark is keyed by `(sender, incarnation)`,
+and a fresh, higher incarnation starts a fresh sequence rather than colliding
+with the dead boot's watermark.
+
+That argument is a probability, not a guarantee. A clock that is frozen,
+pre-epoch (the reading clamps to `0`), or stepped backwards onto the exact
+millisecond a previous boot read *will* mint an equal incarnation, and the two
+boots then share a counter cell and a replay watermark until an operator
+restarts one of them. Run the cluster on hosts with a working clock; the
+millisecond seeding makes the collision a coincidence, not a routine
+same-second restart.
 
 **Refutation** keeps a live node from being buried, and covers the residual
-restart cases (a restart within the same clock second, a clock that stepped
-backwards). A node that receives any record about *itself* at an incarnation
-greater than or equal to its own — whatever the status, `Left` or a stale
-`Alive` — sets its incarnation to one above the highest it has seen for
+restart cases (a restart within the same clock *millisecond*, or a clock that
+stepped backwards). A node that receives any record about *itself* at an
+incarnation greater than or equal to its own — whatever the status, `Left` or a
+stale `Alive` — sets its incarnation to one above the highest it has seen for
 itself, marks itself `Alive`, and pushes immediately. Because rule 1 outranks
 rule 2, that refutation wins everywhere. The trigger works even when the
 returning node is being replay-dropped by its peer, because the peer's own
 pushes still reach it: the returning node's watermark table is fresh, so it
-accepts the peer's state, sees its own stale record, and bumps past it.
+accepts the peer's state, sees its own stale record, and bumps past it —
+provided the peer still holds a record about it at all. Once that record has
+been pruned there is nothing left to refute, which is why pruning a member
+forgets it *whole*: the peer drops the pruned node's replay watermark along
+with its tombstone, so the returning node's next frame is judged as a fresh
+sender at whatever incarnation it carries.
 
 **Local liveness** is *not* replicated. Each node times the silence since it
 last accepted a frame from each peer, using the injected monotonic clock:
@@ -503,6 +524,12 @@ is the only channel by which a node that restarted with a *lower* incarnation
 (a clock that stepped backwards) can hear its own `Left` record, refute it, and
 rejoin — its pushes are being replay-dropped by the peer that holds the
 tombstone, so it has to be told.
+
+Pruning that tombstone therefore drops the departed node's replay watermark
+with it. Once the record is gone there is no `Left` to hear and no address to
+push to, so a watermark that outlived it would replay-drop the returning node's
+every frame with no way left to argue — a permanent partition between two nodes
+that both look healthy. A member is forgotten whole or not at all.
 
 ### The counter
 
@@ -604,14 +631,23 @@ for ephemeral, cluster-wide tallies.
 ever seen, one counter cell per `(node id, boot incarnation)` that has
 incremented each counter name, and each node keeps one replay-watermark row
 per distinct sender it has accepted a frame from. Member records are pruned
-after their tombstone window; **counter cells and watermark rows are not** —
-dropping a counter cell would make `get()` move downward, and dropping a
-watermark row would re-open a replay window. The consequence is operational:
-every boot that increments a counter leaves one `u64` cell behind, and a node
-with no configured `node_id` additionally mints a fresh member id per restart.
-Set an explicit, stable `node_id` on any long-lived deployment, and keep
-counter names a small fixed set from your code rather than anything derived
-from user input. Cell garbage collection is out of scope for this slice.
+after their tombstone window, and the pruned member's watermark row goes with
+it — a member is forgotten whole, which is what lets it come back (see
+Refutation above). **Counter cells are not pruned**: dropping one would make
+`get()` move downward. The consequence is operational: every boot that
+increments a counter leaves one `u64` cell behind, and a node with no
+configured `node_id` additionally mints a fresh member id per restart. Set an
+explicit, stable `node_id` on any long-lived deployment, and keep counter names
+a small fixed set from your code rather than anything derived from user input.
+Cell garbage collection is out of scope for this slice.
+
+A document that outgrows the 64 KiB frame cap stops being sendable at all —
+and since the state push *is* the heartbeat, the node then keeps merging its
+peer's pushes and looks healthy to itself while the peer sees silence and
+evicts it at the suspicion timeout. That is what
+`autumn_cluster_pushes_unsendable_total` is for: it counts every message the
+node could not frame, and a warning naming the serialized size against the cap
+is logged (at most once a minute) the moment it starts.
 
 **A one-member view is healthy.** `cluster:membership` reports `UP` with one
 member, exactly as with two. It is a `HealthOnly` indicator: it never gates

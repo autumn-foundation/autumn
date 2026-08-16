@@ -106,7 +106,12 @@ pub struct Envelope {
     /// Envelope version ([`WIRE_VERSION`]).
     pub v: u8,
     /// Signing-key id ([`CURRENT_KEY_ID`]). Outside the signing input.
-    #[serde(default)]
+    ///
+    /// **Required, deliberately not `#[serde(default)]`.** The guide's receive
+    /// path is normative that an envelope missing a field is dropped as
+    /// `malformed`, and a default here would silently make one documented field
+    /// optional — an alternate implementation written against the published
+    /// table would then disagree with this parser about what is well-formed.
     pub key_id: u8,
     /// Sender's cluster name — a frame from another cluster is refused even
     /// under the same secret.
@@ -258,6 +263,17 @@ pub fn encode_frame(envelope: &Envelope) -> Option<Vec<u8>> {
     Some(framed(len.to_be_bytes(), &body))
 }
 
+/// How many bytes [`encode_frame`]'s body would be, whether or not it fits
+/// [`MAX_FRAME_BYTES`].
+///
+/// Only ever called on the failure path, so paying for a second serialization
+/// buys the one number an operator needs — "how far over the cap am I?" — at no
+/// cost to the path that succeeds. `None` when the envelope cannot be
+/// serialized at all.
+pub fn encoded_body_len(envelope: &Envelope) -> Option<usize> {
+    serde_json::to_vec(envelope).ok().map(|body| body.len())
+}
+
 /// Join a length prefix and the body it declares into one frame buffer.
 ///
 /// The single place the on-wire layout `prefix ‖ body` is spelled out: the
@@ -303,7 +319,11 @@ fn frame_body(frame: &[u8]) -> Result<&[u8], RejectReason> {
 /// Verifies inbound frames and remembers replay watermarks.
 ///
 /// Owned by the receive loop; never shared, so a plain `&mut self` suffices.
-#[derive(Debug)]
+///
+/// [`Debug`] is hand-written and **omits the secret**: the key arrives here as
+/// a plain `Vec<u8>` copied out of a
+/// [`SecretString`](secrecy::SecretString), and a derived `Debug` would print
+/// it as a byte array the first time somebody added `?verifier` to a log line.
 pub struct FrameVerifier {
     cluster: String,
     local_id: NodeId,
@@ -313,6 +333,18 @@ pub struct FrameVerifier {
     /// lets a restarted node rejoin.
     watermarks: BTreeMap<NodeId, (Incarnation, u64)>,
     rejected: u64,
+}
+
+impl std::fmt::Debug for FrameVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the secret, and never the watermark table (unbounded).
+        f.debug_struct("FrameVerifier")
+            .field("cluster", &self.cluster)
+            .field("local_id", &self.local_id)
+            .field("senders", &self.watermarks.len())
+            .field("rejected", &self.rejected)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FrameVerifier {
@@ -413,6 +445,23 @@ impl FrameVerifier {
         Ok((envelope, message))
     }
 
+    /// Forget everything remembered about `sender`, so its next frame is
+    /// judged as if it had never been heard from.
+    ///
+    /// **Pruning a member must forget it whole.** A `Left` tombstone is pruned
+    /// once the departure has had ten suspicion timeouts to propagate; from
+    /// that moment the document holds no record of the departed node and
+    /// nothing pushes to it, so the refutation channel that lets a node
+    /// returning at a *lower* incarnation (a clock that stepped backwards)
+    /// argue its way back is gone. Keeping the watermark past that point turns
+    /// the returning node into a permanent one-way partition — every frame it
+    /// sends is dropped as a replay and nothing can ever tell it why. Dropping
+    /// the row re-opens a replay window only for a sender the node has already
+    /// forgotten entirely, which is exactly the same window a fresh boot has.
+    pub fn forget(&mut self, sender: &str) {
+        self.watermarks.remove(sender);
+    }
+
     /// The number of frames this verifier has refused, for any reason.
     pub const fn rejected_total(&self) -> u64 {
         self.rejected
@@ -432,10 +481,12 @@ impl FrameVerifier {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClusterMessage, Envelope, FrameVerifier, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES,
-        RejectReason, encode_frame, frame_len, sign_envelope,
+        CURRENT_KEY_ID, ClusterMessage, Envelope, FrameVerifier, LENGTH_PREFIX_BYTES,
+        MAX_FRAME_BYTES, RejectReason, WIRE_VERSION, encode_frame, frame_len, framed,
+        sign_envelope, signing_input,
     };
     use crate::cluster::membership::ClusterState;
+    use crate::security::hmac_sha256_hex;
 
     const SECRET: &[u8] = b"cluster-test-secret-0123456789ab";
     const CLUSTER: &str = "autumn";
@@ -475,6 +526,264 @@ mod tests {
             .as_ref()
             .and_then(encode_frame)
             .unwrap_or_default()
+    }
+
+    /// Length-prefix arbitrary bytes, so a test can feed the verifier a body
+    /// that is not something [`Envelope`] can produce.
+    fn frame_bytes(body: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
+        framed(len.to_be_bytes(), body)
+    }
+
+    /// A correctly signed envelope carrying `payload` verbatim — the only way
+    /// to reach the payload-parse step with something `ClusterMessage` cannot
+    /// serialize (an unknown future variant).
+    fn signed_raw_payload(sender: &str, incarnation: u64, seq: u64, payload: &str) -> Envelope {
+        let mac = hmac_sha256_hex(
+            SECRET,
+            &signing_input(
+                WIRE_VERSION,
+                CLUSTER,
+                sender,
+                incarnation,
+                seq,
+                payload.as_bytes(),
+            ),
+        );
+        Envelope {
+            v: WIRE_VERSION,
+            key_id: CURRENT_KEY_ID,
+            cluster: CLUSTER.to_owned(),
+            sender: sender.to_owned(),
+            incarnation,
+            seq,
+            payload: payload.to_owned(),
+            mac,
+        }
+    }
+
+    /// The verifier holds the HMAC key as a plain `Vec<u8>`, so `Debug` is
+    /// hand-written to omit it. Re-deriving `Debug` would print the whole key
+    /// the first time somebody added `?verifier` to the reject-path log line in
+    /// the receive loop, and clippy has no lint for it.
+    #[test]
+    fn verifier_debug_never_prints_the_secret() {
+        let mut verifier = verifier();
+        let frame = frame_for(SECRET, CLUSTER, REMOTE, 1, 1, &ClusterMessage::Leave);
+        assert!(
+            verifier.accept(&frame).is_ok(),
+            "sanity: the frame verifies"
+        );
+
+        let rendered = format!("{verifier:?}");
+        assert!(
+            !rendered.contains("secret"),
+            "the secret field must not appear in Debug output at all; got {rendered}"
+        );
+        assert!(
+            !rendered.contains("99, 108, 117"),
+            "…and certainly not as the byte array a derived Debug would print \
+             (`clu` = 99, 108, 117); got {rendered}"
+        );
+        assert!(
+            rendered.contains(CLUSTER) && rendered.contains(LOCAL),
+            "the diagnosable fields must still be there, or redaction has cost \
+             the struct its usefulness; got {rendered}"
+        );
+    }
+
+    /// Step 3, first half: `v != 1` is refused with `reason="version"`, and
+    /// refused *before* the MAC — an older node must not be made to compute an
+    /// HMAC over an envelope it could never have understood.
+    #[test]
+    fn wrong_envelope_version_rejected() {
+        let signed = envelope_for(SECRET, CLUSTER, REMOTE, 1, 1, &state_push());
+        assert!(signed.is_some(), "signing must produce an envelope");
+        let Some(mut envelope) = signed else { return };
+        envelope.v = WIRE_VERSION.saturating_add(1);
+        let frame = encode_frame(&envelope).unwrap_or_default();
+
+        let mut verifier = verifier();
+        assert_eq!(
+            verifier.accept(&frame).err(),
+            Some(RejectReason::Version),
+            "an envelope naming another wire version must be dropped as \
+             `version`, not accepted and not mislabelled"
+        );
+        assert_eq!(
+            verifier.rejected_total(),
+            1,
+            "the rejection must be counted"
+        );
+        assert!(
+            !RejectReason::Version.closes_connection(),
+            "a version mismatch drops the frame and reads on"
+        );
+        assert_eq!(
+            verifier.watermark(REMOTE),
+            None,
+            "a refused frame must never advance the replay watermark"
+        );
+    }
+
+    /// Step 3, second half: `key_id != 0` is refused with `reason="key_id"`.
+    ///
+    /// The `key_id` is deliberately outside the signing input — it *selects* a
+    /// key rather than being protected by one — so this frame's MAC still
+    /// verifies. The header check is the only thing standing between it and
+    /// acceptance, which is exactly why it needs a test of its own.
+    #[test]
+    fn unknown_key_id_rejected() {
+        let signed = envelope_for(SECRET, CLUSTER, REMOTE, 1, 1, &ClusterMessage::Leave);
+        assert!(signed.is_some(), "signing must produce an envelope");
+        let Some(mut envelope) = signed else { return };
+        envelope.key_id = CURRENT_KEY_ID.saturating_add(1);
+        let frame = encode_frame(&envelope).unwrap_or_default();
+
+        let mut verifier = verifier();
+        assert_eq!(
+            verifier.accept(&frame).err(),
+            Some(RejectReason::KeyId),
+            "an envelope naming a key this node does not have must be dropped \
+             as `key_id` — and it is NOT re-signed here, proving the field is \
+             outside the MAC"
+        );
+        assert_eq!(
+            verifier.rejected_total(),
+            1,
+            "the rejection must be counted"
+        );
+        assert_eq!(
+            verifier.watermark(REMOTE),
+            None,
+            "a refused frame must never advance the replay watermark"
+        );
+    }
+
+    /// Step 2: `key_id` is a required field. The guide's receive path is
+    /// normative that an envelope missing a field is dropped as `malformed`,
+    /// and the envelope table lists `key_id` among the fields every frame
+    /// carries — a `#[serde(default)]` here would quietly accept it instead.
+    #[test]
+    fn envelope_missing_key_id_is_malformed() {
+        let signed = envelope_for(SECRET, CLUSTER, REMOTE, 1, 1, &ClusterMessage::Leave);
+        assert!(signed.is_some(), "signing must produce an envelope");
+        let Some(envelope) = signed else { return };
+
+        let mut json = serde_json::to_value(&envelope).unwrap_or(serde_json::Value::Null);
+        assert!(
+            json.get("key_id").is_some(),
+            "sanity: a signed envelope must carry key_id in the first place"
+        );
+        if let Some(object) = json.as_object_mut() {
+            object.remove("key_id");
+        }
+        let body = serde_json::to_vec(&json).unwrap_or_default();
+
+        let mut verifier = verifier();
+        assert_eq!(
+            verifier.accept(&frame_bytes(&body)).err(),
+            Some(RejectReason::Malformed),
+            "an envelope with key_id omitted must be dropped as `malformed`, \
+             matching the normative receive path — the parser and the published \
+             format must agree on what is well-formed"
+        );
+        assert_eq!(
+            verifier.rejected_total(),
+            1,
+            "the rejection must be counted"
+        );
+    }
+
+    /// Step 7: an authenticated payload this node cannot understand is a clean
+    /// `payload` drop, not an envelope-level `malformed` one — that difference
+    /// is the documented forward-compatibility property (a newer node may add a
+    /// message type without desyncing an older peer).
+    #[test]
+    fn unknown_payload_variant_rejected_after_the_mac() {
+        let mut verifier = verifier();
+        let unknown = signed_raw_payload(REMOTE, 4, 9, r#"{"type":"future_variant"}"#);
+        let frame = encode_frame(&unknown).unwrap_or_default();
+
+        assert_eq!(
+            verifier.accept(&frame).err(),
+            Some(RejectReason::Payload),
+            "an unknown message type inside a VALID envelope must be dropped as \
+             `payload` — mapping it to `malformed` would blame the envelope for \
+             a payload a newer peer is entitled to send"
+        );
+        assert_eq!(
+            verifier.rejected_total(),
+            1,
+            "the rejection must be counted"
+        );
+        assert_eq!(
+            verifier.watermark(REMOTE),
+            None,
+            "a payload this node dropped must not advance the watermark, or the \
+             sender's next (understandable) frame at the same seq is replayed away"
+        );
+
+        // A malformed payload behind the same valid envelope lands in the same
+        // series, and the loop reads on either way.
+        let garbage = signed_raw_payload(REMOTE, 4, 10, "not json at all");
+        assert_eq!(
+            verifier
+                .accept(&encode_frame(&garbage).unwrap_or_default())
+                .err(),
+            Some(RejectReason::Payload),
+            "a malformed authenticated payload is a `payload` drop too"
+        );
+
+        let good = frame_for(SECRET, CLUSTER, REMOTE, 4, 11, &ClusterMessage::Leave);
+        assert!(
+            verifier.accept(&good).is_ok(),
+            "…and the verifier must still accept the sender's next good frame"
+        );
+    }
+
+    /// Pruning a member must forget it **whole**: the replay watermark goes
+    /// with the tombstone, so a node that comes back at a LOWER incarnation (a
+    /// clock that stepped backwards) is judged as a fresh sender instead of
+    /// being replay-dropped forever.
+    ///
+    /// Without this the returning node is permanently partitioned: its frames
+    /// never reach the merge, the peer's pruned document holds no record about
+    /// it to refute, and nothing on either side can break the deadlock.
+    #[test]
+    fn forgetting_a_sender_accepts_a_lower_incarnation_again() {
+        let mut verifier = verifier();
+        let high = frame_for(SECRET, CLUSTER, REMOTE, 5_000, 7, &ClusterMessage::Leave);
+        assert!(
+            verifier.accept(&high).is_ok(),
+            "sanity: the departing node's frame must be accepted first"
+        );
+
+        let rejoin = frame_for(SECRET, CLUSTER, REMOTE, 42, 0, &ClusterMessage::Leave);
+        assert_eq!(
+            verifier.accept(&rejoin).err(),
+            Some(RejectReason::Replay),
+            "sanity: while the watermark stands, a lower incarnation is a replay \
+             — otherwise this test proves nothing"
+        );
+
+        verifier.forget(REMOTE);
+        assert_eq!(
+            verifier.watermark(REMOTE),
+            None,
+            "forgetting a sender must drop its watermark row"
+        );
+        assert!(
+            verifier.accept(&rejoin).is_ok(),
+            "after the sender is forgotten its lower incarnation must be accepted \
+             as a fresh sender — this is the only way back for a node that \
+             restarted behind a backward clock step"
+        );
+        assert_eq!(
+            verifier.watermark(REMOTE),
+            Some((42, 0)),
+            "…and the fresh watermark must start from the frame just accepted"
+        );
     }
 
     #[test]

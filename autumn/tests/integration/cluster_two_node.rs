@@ -180,6 +180,93 @@ fn membership(health: &serde_json::Value) -> (u64, usize) {
     )
 }
 
+/// Assert the `cluster:membership` details map is **exactly** the object the
+/// guide publishes: `{node_id, cluster, local_addr, member_count, members}`
+/// with member rows of `{id, addr, status, incarnation}`.
+///
+/// `ClusterHealthIndicator::snapshot`'s rustdoc promises "the details map,
+/// exactly as documented", and operators write `jq` against that shape — but
+/// `member_count` and the array length are all any other assertion here reads,
+/// so a renamed row key or a change in the `status` casing would sail through
+/// the whole suite and break every dashboard built on the guide.
+fn assert_documented_details_shape(health: &serde_json::Value, expected_node_id: &str) {
+    let details = &health["components"]["cluster:membership"]["details"];
+    let object = details.as_object().unwrap_or_else(|| {
+        panic!("cluster:membership must publish a details object; got {health}")
+    });
+
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "cluster",
+            "local_addr",
+            "member_count",
+            "members",
+            "node_id"
+        ],
+        "the details map must carry exactly the documented keys; got {details}"
+    );
+    assert_eq!(
+        details["node_id"].as_str(),
+        Some(expected_node_id),
+        "node_id must name this node; got {details}"
+    );
+    assert!(
+        details["cluster"].as_str().is_some_and(|s| !s.is_empty()),
+        "cluster must be the cluster name as a string; got {details}"
+    );
+    assert!(
+        details["local_addr"]
+            .as_str()
+            .is_some_and(|addr| addr.parse::<SocketAddr>().is_ok()),
+        "local_addr must be a dialable host:port string; got {details}"
+    );
+
+    let rows = details["members"]
+        .as_array()
+        .unwrap_or_else(|| panic!("members must be an array of rows; got {details}"));
+    assert!(
+        !rows.is_empty(),
+        "a node is always in its own view, so there is always at least one row; got {details}"
+    );
+    for row in rows {
+        let row_object = row
+            .as_object()
+            .unwrap_or_else(|| panic!("each member row must be an object; got {details}"));
+        let mut row_keys: Vec<&str> = row_object.keys().map(String::as_str).collect();
+        row_keys.sort_unstable();
+        assert_eq!(
+            row_keys,
+            vec!["addr", "id", "incarnation", "status"],
+            "each member row must carry exactly {{id, addr, status, incarnation}}; got {details}"
+        );
+        assert!(
+            row["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "a row's id must be a non-empty string; got {details}"
+        );
+        assert!(
+            row["addr"].is_string(),
+            "a row's addr must be a string; got {details}"
+        );
+        assert!(
+            matches!(row["status"].as_str(), Some("alive" | "suspect")),
+            "a row's status must be the documented lowercase \"alive\"/\"suspect\" \
+             — a member this node considers down is not in the view at all; got {details}"
+        );
+        assert!(
+            row["incarnation"].as_u64().is_some(),
+            "a row's incarnation must be a NUMBER, not a string; got {details}"
+        );
+    }
+    assert_eq!(
+        details["member_count"].as_u64(),
+        u64::try_from(rows.len()).ok(),
+        "member_count must be the number the members array summarises; got {details}"
+    );
+}
+
 /// The JSON body of an HTTP/1.1 response, or `Null` when there isn't one.
 fn json_body(response: &str) -> serde_json::Value {
     response
@@ -439,6 +526,9 @@ async fn full_app_two_nodes_health_and_counter_via_http() {
         health_a["components"]["cluster:membership"]["status"], "UP",
         "the cluster:membership indicator must report UP; got {health_a}"
     );
+    // …and the whole documented JSON shape, not just the two numbers above.
+    assert_documented_details_shape(&health_a, handle_a.node_id());
+    assert_documented_details_shape(&health_b, handle_b.node_id());
 
     // AC3: written on A through the extension handle, read on B.
     handle_a.counter(COUNTER).increment();
@@ -474,6 +564,9 @@ async fn full_app_two_nodes_health_and_counter_via_http() {
         "a one-member view is HEALTHY: reporting DOWN would let a liveness probe \
          restart the last surviving node; got {survivor}"
     );
+    // The shape must survive the departure too: a one-member view is the shape
+    // an operator reads most often, on exactly the node they are worried about.
+    assert_documented_details_shape(&survivor, handle_b.node_id());
     assert_eq!(
         handle_b.counter(COUNTER).get(),
         1,
@@ -565,6 +658,87 @@ async fn install_refuses_a_second_node_on_one_state() {
             .map(|handle| handle.node_id().to_owned()),
         Some(first),
         "the refused install must not replace the running node's handle"
+    );
+
+    shutdown.cancel();
+}
+
+/// The cluster's actuator surface is not optional.
+///
+/// If the app has already claimed `cluster:membership` for a health indicator
+/// or a metrics source of its own, the cluster's registration is rejected. Warn
+/// and carry on would leave the node binding, gossiping and resolving through
+/// the extension while `/actuator/health` and `/actuator/metrics` described
+/// somebody else's component — so an operator watching the membership view or
+/// `autumn_cluster_frames_rejected_total` would see nothing at all while this
+/// node was partitioned or under attack. Boot must fail instead, and the node
+/// that was already started must not be left running behind the failure.
+#[tokio::test]
+async fn install_refuses_a_collision_on_the_membership_component_name() {
+    struct Impostor;
+    impl autumn_web::actuator::HealthIndicator for Impostor {
+        fn check(&self) -> futures::future::BoxFuture<'_, autumn_web::actuator::HealthCheckOutput> {
+            Box::pin(std::future::ready(
+                autumn_web::actuator::HealthCheckOutput::up(),
+            ))
+        }
+    }
+
+    // A port we know is free, so a leaked node is observable as a port that
+    // never comes back.
+    let probe = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a probe port");
+    let bind_addr = probe.local_addr().expect("probe local_addr");
+    drop(probe);
+
+    let config = ClusterConfig {
+        bind_addr: bind_addr.to_string(),
+        ..cluster_config(Vec::new())
+    };
+    let app = TestApp::new().config(app_config(config.clone())).build();
+    let shutdown = CancellationToken::new();
+
+    app.state()
+        .health_indicator_registry()
+        .register(
+            "cluster:membership",
+            autumn_web::actuator::IndicatorGroup::Readiness,
+            std::sync::Arc::new(Impostor),
+        )
+        .expect("the app must be able to register its own indicator first");
+
+    let result = install_from_config(app.state(), &config, &shutdown);
+    assert!(
+        result.is_err(),
+        "installing over an app-registered cluster:membership indicator must \
+         fail the boot, not warn and run unobservably; got {result:?}"
+    );
+    let message = result
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(
+        message.contains("cluster:membership"),
+        "the error must name the colliding registration so an operator can \
+         rename theirs; got {message:?}"
+    );
+    assert!(
+        app.state().extension::<ClusterHandle>().is_none(),
+        "a refused install must leave no ClusterHandle behind"
+    );
+
+    // …and the node it had already started must have been shut down: its
+    // listener has to give the port back.
+    poll_until(CONVERGE_TIMEOUT, || async move {
+        TcpListener::bind(bind_addr).await.is_ok()
+    })
+    .await;
+    assert!(
+        TcpListener::bind(bind_addr).await.is_ok(),
+        "the refused install must cancel the node it started — a listener still \
+         holding {bind_addr} means a whole node is gossiping behind a boot that \
+         reported failure"
     );
 
     shutdown.cancel();

@@ -11040,6 +11040,121 @@ path = "/healthz"
         );
     }
 
+    /// `0.0.0.0` is a bind, never a dial address. A node that gossips it hands
+    /// its peer an address nothing can reach — the one-way cluster the guide's
+    /// "Choosing addresses" section warns about, which then looks exactly like
+    /// a network fault from the other side rather than like the typo it is.
+    #[test]
+    fn cluster_rejects_a_wildcard_advertised_address() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+
+        // A wildcard bind with nothing to advertise: the bound address IS what
+        // peers would be told to dial.
+        config.cluster.bind_addr = "0.0.0.0:7946".to_owned();
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "binding a wildcard with no advertise_addr must be refused: the node \
+             would gossip 0.0.0.0 as its dial address, got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.bind_addr"),
+            "the error must name the key the operator has to fix; got {message:?}"
+        );
+
+        // An EXPLICIT wildcard advertise is the same mistake, spelled out.
+        config.cluster.advertise_addr = Some("0.0.0.0:7946".to_owned());
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "an explicit wildcard advertise_addr must be refused too, got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.advertise_addr"),
+            "…and must blame advertise_addr, not the (legal) wildcard bind; \
+             got {message:?}"
+        );
+
+        // …while a wildcard bind WITH a concrete advertised address — the
+        // documented container spelling — must pass, or the rule is a ban on
+        // the very deployment shape the guide recommends.
+        config.cluster.advertise_addr = Some("10.0.1.7:7946".to_owned());
+        assert!(
+            config.cluster.validate().is_ok(),
+            "0.0.0.0 bind + explicit advertise_addr is the documented spelling \
+             and must be accepted"
+        );
+
+        // The rule is scoped to enabled sections: a disabled one binds nothing.
+        config.cluster.enabled = false;
+        config.cluster.advertise_addr = None;
+        assert!(
+            config.cluster.validate().is_ok(),
+            "a disabled section advertises nothing, so the wildcard rule must \
+             not fire on it"
+        );
+    }
+
+    /// `node_id` and `cluster_name` travel in every frame and are covered by
+    /// the MAC, so the 64-byte cap keeps a push's fixed overhead predictable.
+    #[test]
+    fn cluster_rejects_over_long_idents() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+
+        let at_cap = "n".repeat(MAX_CLUSTER_IDENT_LEN);
+        let over_cap = "n".repeat(MAX_CLUSTER_IDENT_LEN.saturating_add(1));
+
+        config.cluster.node_id = Some(at_cap.clone());
+        assert!(
+            config.cluster.validate().is_ok(),
+            "exactly {MAX_CLUSTER_IDENT_LEN} bytes must be accepted, or the cap \
+             is off by one"
+        );
+
+        config.cluster.node_id = Some(over_cap.clone());
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "a node_id one byte over {MAX_CLUSTER_IDENT_LEN} must be refused, \
+             got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.node_id"),
+            "the error must name the offending key; got {message:?}"
+        );
+
+        config.cluster.node_id = Some("node-a".to_owned());
+        config.cluster.cluster_name = over_cap;
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "an over-long cluster_name must be refused for the same reason, \
+             got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.cluster_name"),
+            "…naming cluster_name this time; got {message:?}"
+        );
+
+        config.cluster.cluster_name = at_cap;
+        assert!(
+            config.cluster.validate().is_ok(),
+            "…and a cluster_name at the cap must be accepted, or the rule is vacuous"
+        );
+    }
+
     #[test]
     fn cluster_env_overrides_apply() {
         let env = MockEnv::new()

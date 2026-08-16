@@ -86,11 +86,24 @@ const PUSH_FLOOR_DIVISOR: u32 = 4;
 /// be rarer than the periodic one.
 const PUSH_FLOOR_MIN: Duration = Duration::from_millis(50);
 
+/// Minimum gap between two "this node cannot send" warnings.
+///
+/// The failure is permanent once it starts (the document only grows), and the
+/// push loop retries every interval, so an unthrottled warning would be a log
+/// flood at gossip rate. One line per minute is enough to be noticed and few
+/// enough to be kept.
+const UNSENDABLE_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Everything a node needs that does not come from the app.
 ///
 /// Built from [`ClusterConfig`](crate::config::ClusterConfig) by
 /// [`install_from_config`](super::install_from_config), or by hand in tests.
-#[derive(Debug, Clone)]
+///
+/// [`Debug`] is hand-written and **omits the secret**: the key is copied in
+/// here out of a [`SecretString`](secrecy::SecretString) as a plain
+/// `Vec<u8>`, and a derived `Debug` would print it in full the first time
+/// somebody added `?config` to a boot log line.
+#[derive(Clone)]
 pub struct ClusterRuntimeConfig {
     /// Cluster name; part of every MAC, so two clusters cannot cross-talk.
     pub cluster_name: String,
@@ -106,6 +119,21 @@ pub struct ClusterRuntimeConfig {
     pub push_interval: Duration,
     /// How long without a push before a peer becomes `Suspect`.
     pub suspicion_timeout: Duration,
+}
+
+impl std::fmt::Debug for ClusterRuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never `secret`, not even its length: a key that reaches a log line is
+        // a key that has to be rotated.
+        f.debug_struct("ClusterRuntimeConfig")
+            .field("cluster_name", &self.cluster_name)
+            .field("node_id", &self.node_id)
+            .field("advertise_addr", &self.advertise_addr)
+            .field("seed_peers", &self.seed_peers)
+            .field("push_interval", &self.push_interval)
+            .field("suspicion_timeout", &self.suspicion_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Constructor for a running cluster node.
@@ -196,6 +224,7 @@ impl ClusterNode {
                 config.push_interval,
                 config.suspicion_timeout,
             )),
+            pruned_senders: std::sync::Mutex::new(BTreeSet::new()),
             clock,
             entropy,
             transport,
@@ -263,6 +292,19 @@ fn validate_ident(field: &str, value: &str) -> AutumnResult<()> {
 
 /// This boot's incarnation: Unix milliseconds through the injected clock,
 /// saturating at `0` for a pre-epoch clock and at [`u64::MAX`] beyond range.
+///
+/// Milliseconds, not seconds, and the granularity is load-bearing: two boots
+/// that mint the same incarnation produce a byte-identical self-record, which
+/// [`ClusterState::refute`] is obliged to read as this boot's own echo rather
+/// than as the dead boot's leftover — see [`super::membership`].
+///
+/// **The one caveat**: that argument is probabilistic, not absolute. A clock
+/// that is frozen, clamped (a pre-epoch reading saturates to `0`), or stepped
+/// backwards onto the exact millisecond a previous boot read will mint an equal
+/// incarnation, and the two boots then share a counter cell and a replay
+/// watermark until an operator intervenes. Milliseconds make that a
+/// coincidence rather than a routine same-second restart; nothing here makes it
+/// impossible.
 fn seed_incarnation(clock: &dyn ClockSource) -> Incarnation {
     u64::try_from(clock_unix_duration(clock).as_millis()).unwrap_or(u64::MAX)
 }
@@ -350,8 +392,17 @@ fn push_round(inner: &Arc<ClusterInner>, seq: &mut u64, published: &mut Incarnat
         state.observe_tombstones(&mut overlay, now);
         let pruned = state.prune_tombstones(&mut overlay, now);
         drop(overlay);
-        if pruned > 0 {
-            tracing::debug!(pruned, "cluster: pruned expired Left tombstones");
+        if !pruned.is_empty() {
+            tracing::debug!(
+                pruned = pruned.len(),
+                "cluster: pruned expired Left tombstones"
+            );
+            // Pruning forgets a node WHOLE. The receive loop owns the replay
+            // watermarks, so it is handed the ids here: leaving a pruned
+            // sender's watermark behind permanently partitions that node if it
+            // comes back at a lower incarnation, because the document no longer
+            // holds a record it could refute.
+            inner.note_pruned_senders(pruned);
         }
         publish_self(&mut state, inner, incarnation);
         let targets = push_targets(&state, inner);
@@ -461,6 +512,10 @@ fn target_addresses(
 
 /// Sign `message` for `target` and hand the frame to the transport. `false`
 /// when the message could not be signed or framed — a drop, never a panic.
+///
+/// Both failures are counted and (rate-limited) logged by
+/// [`note_unsendable`]: unlike a transport-level drop they are *permanent*,
+/// because the same document is re-serialized on every round.
 fn send_signed(
     inner: &ClusterInner,
     target: &str,
@@ -476,13 +531,72 @@ fn send_signed(
         seq,
         message,
     ) else {
+        note_unsendable(inner, None);
         return false;
     };
     let Some(frame) = wire::encode_frame(&envelope) else {
+        note_unsendable(inner, wire::encoded_body_len(&envelope));
         return false;
     };
     inner.transport.send(target, frame);
     true
+}
+
+/// Count — and at most once per [`UNSENDABLE_WARN_INTERVAL`], warn about — an
+/// outbound message that never reached the transport.
+///
+/// This is the observability hole that made an oversized document a *silent*
+/// cluster split: the push is also the heartbeat, so a node whose document has
+/// outgrown [`MAX_FRAME_BYTES`](wire::MAX_FRAME_BYTES) keeps merging its peer's
+/// pushes and looks healthy to itself while the peer watches it fall silent and
+/// evicts it. `frames_dropped` cannot see it (the transport never got the
+/// frame) and `frames_rejected` is inbound-only, so it gets a series of its
+/// own plus a line naming the serialized size against the cap.
+fn note_unsendable(inner: &ClusterInner, serialized_bytes: Option<usize>) {
+    inner
+        .metrics
+        .pushes_unsendable
+        .fetch_add(1, Ordering::Relaxed);
+
+    // Rate limited on the injected clock, so a test can drive it and a
+    // permanent failure costs one line a minute rather than two a second.
+    let now_ms = u64::try_from(inner.clock.monotonic().since_origin().as_millis())
+        .unwrap_or(u64::MAX)
+        // Offset by one so `0` can mean "never warned" without a second field.
+        .saturating_add(1);
+    let due = inner
+        .metrics
+        .unsendable_warned_at_ms
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            let elapsed_ms =
+                u64::try_from(UNSENDABLE_WARN_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+            (last == 0 || now_ms.saturating_sub(last) >= elapsed_ms).then_some(now_ms)
+        })
+        .is_ok();
+    if !due {
+        return;
+    }
+
+    let Some(bytes) = serialized_bytes else {
+        tracing::warn!(
+            node_id = %inner.node_id,
+            unsendable_total = inner.metrics.pushes_unsendable.load(Ordering::Relaxed),
+            "cluster: an outbound message could not be serialized at all and was \
+             dropped before the transport"
+        );
+        return;
+    };
+    tracing::warn!(
+        node_id = %inner.node_id,
+        serialized_bytes = bytes,
+        frame_cap_bytes = wire::MAX_FRAME_BYTES,
+        unsendable_total = inner.metrics.pushes_unsendable.load(Ordering::Relaxed),
+        "cluster: this node's replicated document no longer fits one frame, so \
+         every state push (which is also the heartbeat) is discarded before the \
+         transport; peers will evict this node at the suspicion timeout. Counter \
+         cells are never pruned — set a stable node_id and keep counter names a \
+         small fixed set (see docs/guide/clustering.md, State growth)"
+    );
 }
 
 /// The cancellation arm: mark ourselves `Left`, push the final document to the
@@ -567,6 +681,14 @@ async fn receive_loop(
         let Some((from, frame)) = received else {
             return;
         };
+
+        // A member the push loop pruned is forgotten WHOLE: its replay
+        // watermark goes with its tombstone. Draining here rather than in the
+        // push round is what keeps the verifier unshared — it stays a local of
+        // this loop, and the two loops never hold each other's state.
+        for pruned in inner.take_pruned_senders() {
+            verifier.forget(&pruned);
+        }
 
         match verifier.accept(&frame) {
             Ok((envelope, message)) => apply(&inner, &envelope, &from, &message),
@@ -657,8 +779,18 @@ fn apply(
 /// can never be replayed against a newer incarnation of that node.
 fn apply_leave(state: &mut ClusterState, envelope: &Envelope, peer_addr: &str) {
     // The document's address is authoritative; the source address is only a
-    // fallback for a departure from a node we never met (whose tombstone is
-    // never dialled anyway, because `Left` is not a push target).
+    // fallback for a departure from a node we never met — a `leave` that
+    // arrives before (or instead of) that node's final state push.
+    //
+    // That fallback address is the accepted connection's remote endpoint, which
+    // for a peer that dialled us is its ephemeral source port, not its
+    // listener. Tombstones DO stay push targets until they are pruned (see
+    // `target_addresses`), so this node will dial that dead port for one
+    // tombstone window and gossip it onward. Both costs are bounded and both
+    // are preferred to the alternative: dropping the address would publish a
+    // tombstone nobody can ever push to, and the departed node's own record —
+    // carrying its real advertised address — wins the merge the moment any
+    // state push about it arrives.
     let addr = state
         .members
         .get(&envelope.sender)
@@ -689,8 +821,9 @@ pub fn resolve_node_id(configured: Option<&str>, entropy: &dyn Entropy) -> NodeI
 
 #[cfg(test)]
 mod tests {
-    use super::{PUSH_FLOOR_MIN, push_floor, target_addresses};
+    use super::{PUSH_FLOOR_MIN, push_floor, seed_incarnation, target_addresses};
     use crate::cluster::membership::{ClusterState, MemberRecord};
+    use crate::time::FixedClock;
     use std::time::Duration;
 
     fn document(records: &[(&str, MemberRecord)]) -> ClusterState {
@@ -749,6 +882,87 @@ mod tests {
             vec!["127.0.0.1:7100".to_owned()],
             "seeds must be trimmed, blanks and address-less members skipped, and \
              every address of this node removed; observed {targets:?}"
+        );
+    }
+
+    /// The runtime config holds the HMAC key as a plain `Vec<u8>` copied out
+    /// of a `SecretString`, so `Debug` is hand-written to omit it. Re-deriving
+    /// `Debug` would print the whole key the first time somebody added
+    /// `?config` to a boot log line, and clippy has no lint for it.
+    #[test]
+    fn runtime_config_debug_never_prints_the_secret() {
+        let config = super::ClusterRuntimeConfig {
+            cluster_name: "orchard".to_owned(),
+            secret: b"a-shared-cluster-secret-value-32".to_vec(),
+            node_id: Some("node-a".to_owned()),
+            advertise_addr: Some("10.0.1.7:7946".to_owned()),
+            seed_peers: vec!["10.0.1.8:7946".to_owned()],
+            push_interval: Duration::from_millis(500),
+            suspicion_timeout: Duration::from_millis(2_500),
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("secret"),
+            "the secret field must not appear in Debug output at all; got {rendered}"
+        );
+        assert!(
+            !rendered.contains("97, 45, 115"),
+            "…and certainly not as the byte array a derived Debug would print \
+             (`a-s` = 97, 45, 115); got {rendered}"
+        );
+        assert!(
+            rendered.contains("orchard") && rendered.contains("10.0.1.7:7946"),
+            "the diagnosable fields must still be there, or redaction has cost \
+             the struct its usefulness; got {rendered}"
+        );
+    }
+
+    /// Incarnations are Unix **milliseconds**, and the granularity is
+    /// load-bearing rather than cosmetic: at second granularity a crash-restart
+    /// inside one second mints a byte-identical self-record, which
+    /// `ClusterState::refute` is required to treat as this boot's own echo —
+    /// so the dead boot's record is never refuted, the peer's replay watermark
+    /// never resets, and both boots share one counter cell.
+    ///
+    /// A regression to `as_secs()` (or to the existing `clock_unix_secs`
+    /// helper) is a one-line change that nothing else in the suite can see.
+    #[test]
+    fn incarnation_is_seeded_from_unix_milliseconds() {
+        let clock = FixedClock::at(
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_765_430_000, 250_000_000)
+                .unwrap_or_default(),
+        );
+
+        assert_eq!(
+            seed_incarnation(&clock),
+            1_765_430_000_250,
+            "the incarnation must be the clock's Unix MILLISECONDS: seconds \
+             granularity (or truncation of the sub-second part) would let two \
+             boots inside one second mint byte-identical self-records"
+        );
+
+        // …and one millisecond really is a distinguishable boot.
+        let one_ms_later = FixedClock::at(
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_765_430_000, 251_000_000)
+                .unwrap_or_default(),
+        );
+        assert!(
+            seed_incarnation(&one_ms_later) > seed_incarnation(&clock),
+            "a boot one millisecond later must come back strictly higher"
+        );
+
+        // The documented clamp: a pre-epoch clock saturates at 0 rather than
+        // wrapping. Two boots on such a clock DO collide — the caveat named in
+        // `seed_incarnation`'s docs and in the guide, not a property to rely on.
+        let pre_epoch = FixedClock::at(
+            chrono::DateTime::<chrono::Utc>::from_timestamp(-10, 0).unwrap_or_default(),
+        );
+        assert_eq!(
+            seed_incarnation(&pre_epoch),
+            0,
+            "a pre-epoch clock must clamp to 0, never wrap to a huge incarnation \
+             no later boot could beat"
         );
     }
 

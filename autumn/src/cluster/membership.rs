@@ -188,8 +188,8 @@ impl ClusterState {
     ///
     /// Returns `Some(new_incarnation)` when a **refutation** is required: the
     /// document holds a record about us at an incarnation `>=` ours that is not
-    /// the record we published (a `Left`, or a stale `Alive` from an earlier
-    /// boot at the same second). The node must adopt that incarnation, mark
+    /// the record we published (a `Left`, or a stale `Alive` from a boot whose
+    /// clock ran ahead of this one). The node must adopt that incarnation, mark
     /// itself `Alive`, and push immediately.
     ///
     /// Returns `None` when nothing needs refuting — including when the document
@@ -246,7 +246,15 @@ impl ClusterState {
     }
 
     /// Drop `Left` tombstones that have outlived their window, forgetting the
-    /// pruned members in `overlay` too. Returns how many records were dropped.
+    /// pruned members in `overlay` too. Returns the ids that were dropped.
+    ///
+    /// **The ids are returned, not counted, because a prune must forget the
+    /// node *whole*.** The caller also owes the receive path's
+    /// [`FrameVerifier`](super::wire::FrameVerifier) a
+    /// [`forget`](super::wire::FrameVerifier::forget) for each id: once the
+    /// tombstone is gone there is no record left to refute and nothing pushes
+    /// to the departed address, so a node returning at a *lower* incarnation
+    /// would be replay-dropped with no way back at all.
     ///
     /// A tombstone exists so a leave *propagates*; once every peer has had
     /// [`TOMBSTONE_TIMEOUT_MULTIPLE`] suspicion timeouts to hear it, keeping it
@@ -263,7 +271,7 @@ impl ClusterState {
         &mut self,
         overlay: &mut LivenessOverlay,
         now: MonotonicInstant,
-    ) -> usize {
+    ) -> Vec<NodeId> {
         let window = overlay.tombstone_timeout();
         let expired: Vec<NodeId> = self
             .members
@@ -281,7 +289,7 @@ impl ClusterState {
             self.members.remove(id);
             overlay.forget(id);
         }
-        expired.len()
+        expired
     }
 }
 
@@ -514,8 +522,8 @@ mod tests {
             "refutation must restore Alive at the bumped incarnation; observed {record:?}"
         );
 
-        // A STALE ALIVE from a previous boot at a higher incarnation (a
-        // same-second restart, or a clock that stepped backwards).
+        // A STALE ALIVE from a previous boot at a higher incarnation (a clock
+        // that stepped backwards, or two boots that read the same millisecond).
         let mut stale_alive = ClusterState::default();
         stale_alive.members.insert(
             "node-a".to_owned(),
@@ -639,25 +647,35 @@ mod tests {
 
         assert_eq!(
             state.prune_tombstones(&mut overlay, at(window_ms)),
-            0,
+            Vec::<String>::new(),
             "a tombstone must survive its whole window — pruning it early would \
              let a straggling push resurrect the departed member; observed {state:?}"
         );
 
+        // A FRESH receipt for the departing member, recorded a hair before the
+        // prune. Without it the `Down` assertion below is vacuous: 25 s of
+        // silence reads as `Down` whether or not the row was forgotten, so a
+        // `forget` that stopped removing `last_seen` would pass unnoticed and
+        // pruned members' receipt rows would accumulate forever under node-id
+        // churn. With it, a surviving row reads `Alive` and the assertion bites.
+        overlay.record_receipt("node-b", at(window_ms));
+
         assert_eq!(
             state.prune_tombstones(&mut overlay, at(window_ms.saturating_add(1))),
-            1,
-            "past ten suspicion timeouts the tombstone must be pruned; observed {state:?}"
+            vec!["node-b".to_owned()],
+            "past ten suspicion timeouts the tombstone must be pruned, and the \
+             pruned id must be REPORTED so the caller can forget the sender's \
+             replay watermark too; observed {state:?}"
         );
         assert!(
             !state.members.contains_key("node-b"),
             "the pruned tombstone must leave the document; observed {state:?}"
         );
         assert_eq!(
-            overlay.liveness("node-b", at(window_ms)),
+            overlay.liveness("node-b", at(window_ms.saturating_add(1))),
             Liveness::Down,
             "pruning must forget the overlay row too, so a pruned member reads \
-             as never-seen rather than as a stale receipt"
+             as never-seen rather than as a one-millisecond-old receipt"
         );
         assert!(
             state.members.contains_key("node-a"),
@@ -687,7 +705,7 @@ mod tests {
         state.observe_tombstones(&mut overlay, at(0));
         assert_eq!(
             state.prune_tombstones(&mut overlay, at(window_ms.saturating_add(1))),
-            1,
+            vec!["node-b".to_owned()],
             "sanity: the first tombstone must prune, or this test proves nothing"
         );
 
@@ -706,7 +724,7 @@ mod tests {
 
         assert_eq!(
             state.prune_tombstones(&mut overlay, reintroduced.saturating_add(window)),
-            0,
+            Vec::<String>::new(),
             "a freshly re-learned tombstone must survive a full window; observed {state:?}"
         );
         assert_eq!(
@@ -716,7 +734,7 @@ mod tests {
                     .saturating_add(window)
                     .saturating_add(Duration::from_millis(1)),
             ),
-            1,
+            vec!["node-b".to_owned()],
             "a REINTRODUCED tombstone must expire one window after it was \
              re-observed — otherwise repeated departures grow the document \
              without bound; observed {state:?}"

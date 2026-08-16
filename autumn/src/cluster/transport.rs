@@ -157,6 +157,12 @@ pub trait PeerTransport: Send + Sync + 'static {
     /// reach zero, but never for longer than
     /// [`LEAVE_BUDGET`](super::node::LEAVE_BUDGET). Zero for a transport that
     /// delivers synchronously.
+    ///
+    /// "Not yet handed to the OS" is literal and includes the frame a writer
+    /// task is *holding* — mid-dial or mid-write — not only the ones still
+    /// queued. Queue depth alone is not that number: a bounded-channel permit
+    /// is returned the instant `recv()` yields, so a frame the writer will
+    /// spend the next two seconds dialling for would read as flushed.
     fn pending_frames(&self) -> usize {
         0
     }
@@ -248,6 +254,10 @@ pub struct TcpPeerTransport {
     peers: Mutex<BTreeMap<PeerAddr, mpsc::Sender<Vec<u8>>>>,
     io: Mutex<Option<TransportIo>>,
     dropped: AtomicU64,
+    /// Frames a writer task has taken off its queue and not yet disposed of.
+    /// Added to queue depth by [`PeerTransport::pending_frames`] — see its
+    /// contract.
+    in_flight: Arc<AtomicUsize>,
     limits: InboundLimits,
 }
 
@@ -288,6 +298,7 @@ impl TcpPeerTransport {
             peers: Mutex::new(BTreeMap::new()),
             io: Mutex::new(None),
             dropped: AtomicU64::new(0),
+            in_flight: Arc::new(AtomicUsize::new(0)),
             limits: InboundLimits {
                 idle_timeout: DEFAULT_INBOUND_IDLE_TIMEOUT,
                 live: Arc::new(AtomicUsize::new(0)),
@@ -382,7 +393,13 @@ impl TcpPeerTransport {
 
         let (runtime, shutdown, entropy) = self.spawn_context()?;
         let (tx, queue) = mpsc::channel(PEER_QUEUE_CAPACITY);
-        runtime.spawn(peer_writer(to.to_owned(), queue, shutdown, entropy));
+        runtime.spawn(peer_writer(
+            to.to_owned(),
+            queue,
+            shutdown,
+            entropy,
+            Arc::clone(&self.in_flight),
+        ));
         peers.insert(to.to_owned(), tx.clone());
         drop(peers);
         Some(tx)
@@ -455,10 +472,15 @@ impl PeerTransport for TcpPeerTransport {
     }
 
     fn pending_frames(&self) -> usize {
-        self.lock_peers()
+        let queued: usize = self
+            .lock_peers()
             .values()
             .map(|queue| queue.max_capacity().saturating_sub(queue.capacity()))
-            .sum()
+            .sum();
+        // Plus whatever the writer tasks are holding: a tokio permit comes back
+        // the moment `recv()` yields, so queue depth alone reports a frame as
+        // flushed while its writer is still inside a two-second dial.
+        queued.saturating_add(self.in_flight.load(Ordering::Relaxed))
     }
 
     fn dropped_frames(&self) -> u64 {
@@ -643,21 +665,57 @@ async fn connection_reader(
     }
 }
 
+/// One frame a writer task has taken off its queue and not yet disposed of.
+///
+/// Counted separately from queue depth because a bounded-channel permit is
+/// released the instant `recv()` yields — see [`PeerTransport::pending_frames`].
+/// The decrement is a `Drop`, so *every* disposal path gives the count back on
+/// the same line: written, dropped after a failed dial or write, or abandoned
+/// when the writer token fires mid-I/O.
+struct InFlightFrame(Arc<AtomicUsize>);
+
+impl InFlightFrame {
+    /// Count one frame as in flight until the returned guard is dropped.
+    fn claim(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for InFlightFrame {
+    fn drop(&mut self) {
+        // `fetch_update` rather than `fetch_sub`: an underflow would wrap to
+        // `usize::MAX` and make every departure flush wait out its whole budget.
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(held.saturating_sub(1))
+            });
+    }
+}
+
 /// Own one peer's outbound connection: dial on demand, write queued frames,
 /// re-dial with a capped, jittered backoff.
 ///
-/// Two things make the departure work, and both are load-bearing. `shutdown`
-/// here is the transport's **writer** token, retired one [`WRITER_DRAIN_GRACE`]
-/// after the app begins shutting down rather than with it — so this task is
-/// still alive when the node's cancellation arm queues its farewell. And the
-/// queue arm is `biased`, so a frame already queued always wins over
-/// cancellation: at the end of the grace the task drains what it holds and only
-/// then sees the token.
+/// What makes the departure work is the token: `shutdown` here is the
+/// transport's **writer** token, retired one [`WRITER_DRAIN_GRACE`] after the
+/// app begins shutting down rather than with it — so this task is still alive,
+/// and still dialling and writing, when the node's cancellation arm queues its
+/// farewell.
+///
+/// The queue arm is `biased` so that a frame *already queued* is preferred to
+/// the token while both are ready. That is a preference, not a drain guarantee,
+/// and the distinction matters: the dial and write arms below race the same
+/// token unbiased, so a frame picked up at or after the end of the grace can
+/// still be abandoned rather than written. The grace is sized to make the
+/// healthy case comfortable, and the actual contract remains the suspicion
+/// timeout — a lost farewell costs latency, never correctness.
 async fn peer_writer(
     to: PeerAddr,
     mut queue: mpsc::Receiver<Vec<u8>>,
     shutdown: CancellationToken,
     entropy: Arc<dyn Entropy>,
+    in_flight: Arc<AtomicUsize>,
 ) {
     let mut connection: Option<tokio::net::TcpStream> = None;
     let mut backoff = RECONNECT_BACKOFF_MIN;
@@ -669,6 +727,9 @@ async fn peer_writer(
             () = shutdown.cancelled() => None,
         };
         let Some(frame) = queued else { return };
+        // Held for the rest of this iteration, so the frame stays visible to
+        // `pending_frames` for exactly as long as this task owes the OS a write.
+        let _held = InFlightFrame::claim(&in_flight);
 
         if connection.is_none() {
             // Bounded: a *refused* connection comes back at once, but a
@@ -851,6 +912,51 @@ mod tcp_tests {
              reaches the verifier"
         );
         token.cancel();
+    }
+
+    /// The departure flush polls `pending_frames()` to zero as its proof that
+    /// the farewell reached the wire, so the number has to include the frame a
+    /// writer is *holding*: a tokio permit is returned the instant `recv()`
+    /// yields, and queue depth alone would report "flushed" while the writer
+    /// was still inside a two-second dial or write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_frames_counts_the_frame_a_writer_still_holds() {
+        /// Far larger than any plausible socket send+receive buffer, so
+        /// `write_all` cannot complete against a peer that never reads.
+        const UNWRITABLE_BYTES: usize = 16 * 1024 * 1024;
+
+        let (transport, token) = started(Duration::from_secs(30));
+
+        // A peer that accepts the connection and then never reads a byte: the
+        // dial succeeds, so the frame leaves the queue, and the write then
+        // parks with the frame in the writer's hand.
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a sink listener must succeed");
+        let sink_addr = sink.local_addr().expect("the sink must report its address");
+        let holder = tokio::spawn(async move {
+            let accepted = sink.accept().await;
+            // Never read; just keep the connection open past the assertions.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(accepted);
+        });
+
+        transport.send(&sink_addr.to_string(), vec![0_u8; UNWRITABLE_BYTES]);
+
+        // Well past the queue pickup and the loopback dial, and well inside
+        // WRITE_TIMEOUT: by now the queue is provably empty and the writer is
+        // parked in `write_all`.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            transport.pending_frames(),
+            1,
+            "a frame the writer took off its queue and has not written yet must \
+             still count as pending — reporting 0 here tells the departure flush \
+             the Leave is on the wire when it is not"
+        );
+
+        token.cancel();
+        holder.abort();
     }
 
     /// A node id that comes back at a new address must not leave the old

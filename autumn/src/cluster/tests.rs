@@ -10,16 +10,20 @@
 //! `ClusterNode` and the wire types are `pub(crate)`: the public integration
 //! tests use only the public surface.
 
+use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use super::membership::{ClusterState, MemberRecord, TOMBSTONE_TIMEOUT_MULTIPLE};
 use super::node::{ClusterNode, ClusterRuntimeConfig};
-use super::transport::{LoopbackRouter, PeerTransport as _};
-use super::wire::{self, ClusterMessage};
-use super::{ClusterHandle, ClusterMemberStatus};
-use crate::entropy::SeededEntropy;
+use super::transport::{IncomingFrames, LoopbackRouter, PeerTransport};
+use super::wire::{self, ClusterMessage, RejectReason};
+use super::{ClusterHandle, ClusterMemberStatus, ClusterMetrics, REJECT_REASONS};
+use crate::entropy::{Entropy, SeededEntropy};
 use crate::time::TickingClock;
 
 const CLUSTER: &str = "autumn";
@@ -137,6 +141,155 @@ fn pushes_sent(node: &TestNode) -> u64 {
         .metrics
         .pushes_sent
         .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Outbound messages this node could not sign or frame at all.
+fn pushes_unsendable(node: &TestNode) -> u64 {
+    node.handle
+        .inner
+        .metrics
+        .pushes_unsendable
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Grow `node`'s replicated document past [`wire::MAX_FRAME_BYTES`] the way a
+/// real one grows: one never-pruned counter cell per `(node id, boot)`.
+///
+/// Synchronous on purpose — the document lock must not be held across an await.
+fn grow_document_past_the_frame_cap(node: &TestNode, cells: u64) {
+    let mut filler = super::counter::CounterShards::default();
+    for boot in 0..cells {
+        filler.increment_cell(
+            &super::counter::cell_key("node-a-long-enough-id-to-model-a-real-one", boot),
+            1,
+        );
+    }
+    let mut state = node.handle.inner.lock_state();
+    state
+        .counters
+        .entry(COUNTER.to_owned())
+        .or_default()
+        .merge(&filler);
+    drop(state);
+}
+
+/// Every `autumn_cluster_*` family this node publishes right now.
+fn collect_families(node: &TestNode) -> Vec<crate::actuator::MetricFamily> {
+    use crate::actuator::MetricsSource as _;
+    super::ClusterMetricsSource {
+        handle: node.handle.clone(),
+    }
+    .collect()
+}
+
+/// One unlabelled family's single sample value, or `None` when the family is
+/// missing (which the caller asserts on, rather than panicking here).
+fn family_value(families: &[crate::actuator::MetricFamily], name: &str) -> Option<f64> {
+    families
+        .iter()
+        .find(|family| family.name == name)
+        .and_then(|family| family.samples.first())
+        .map(|sample| sample.value)
+}
+
+/// `autumn_cluster_frames_rejected_total` as `(reason, value)` pairs, in the
+/// order the family publishes them.
+fn rejected_series(families: &[crate::actuator::MetricFamily]) -> Vec<(String, f64)> {
+    families
+        .iter()
+        .find(|family| family.name == "autumn_cluster_frames_rejected_total")
+        .map(|family| {
+            family
+                .samples
+                .iter()
+                .map(|sample| {
+                    let reason = sample
+                        .labels
+                        .first()
+                        .map_or_else(String::new, |(_, reason)| reason.clone());
+                    (reason, sample.value)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The reason series an untouched node publishes: every documented label, all
+/// at zero.
+fn zeroed_series() -> Vec<(String, f64)> {
+    REJECT_REASONS
+        .iter()
+        .map(|reason| (reason.label().to_owned(), 0.0))
+        .collect()
+}
+
+/// A [`PeerTransport`] that records every `retain_peers` call set and delegates
+/// everything else.
+///
+/// Exists because the deterministic suite's loopback transport inherits the
+/// trait's no-op `retain_peers`, which makes the production call site in
+/// `push_round` invisible to every test — the writer-retirement unit test calls
+/// the transport method directly and never goes through a node.
+struct RetainSpy {
+    inner: Arc<dyn PeerTransport>,
+    retained: std::sync::Mutex<Vec<BTreeSet<String>>>,
+}
+
+impl RetainSpy {
+    fn new(inner: Arc<dyn PeerTransport>) -> Self {
+        Self {
+            inner,
+            retained: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The most recent target set the node asked the transport to retain.
+    fn last_retained(&self) -> BTreeSet<String> {
+        self.retained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last()
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+impl PeerTransport for RetainSpy {
+    fn send(&self, to: &str, frame: Vec<u8>) {
+        self.inner.send(to, frame);
+    }
+
+    fn take_incoming(&self) -> Option<IncomingFrames> {
+        self.inner.take_incoming()
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.inner.local_addr()
+    }
+
+    fn start(&self, shutdown: &CancellationToken, entropy: &Arc<dyn Entropy>) {
+        self.inner.start(shutdown, entropy);
+    }
+
+    fn pending_frames(&self) -> usize {
+        self.inner.pending_frames()
+    }
+
+    fn dropped_frames(&self) -> u64 {
+        self.inner.dropped_frames()
+    }
+
+    fn framing_rejections(&self) -> u64 {
+        self.inner.framing_rejections()
+    }
+
+    fn retain_peers(&self, live: &BTreeSet<String>) {
+        self.retained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(live.clone());
+        self.inner.retain_peers(live);
+    }
 }
 
 /// A one-line description of a node's view, for failure messages.
@@ -480,7 +633,7 @@ async fn loopback_write_storm_is_bounded_by_the_push_cadence_floor() {
 /// `rate()` nobody wrote an alert for.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn metrics_source_emits_every_cluster_family() {
-    use crate::actuator::{MetricKind, MetricsSource as _};
+    use crate::actuator::MetricKind;
 
     let router = LoopbackRouter::new();
     let clock = test_clock();
@@ -488,10 +641,7 @@ async fn metrics_source_emits_every_cluster_family() {
     let b = start_node(&router, &clock, SECRET, "node-b", 2, vec![a.addr.clone()]);
     settle(&clock, 6).await;
 
-    let source = super::ClusterMetricsSource {
-        handle: a.handle.clone(),
-    };
-    let families = source.collect();
+    let families = collect_families(&a);
     let names: Vec<&str> = families.iter().map(|family| family.name.as_str()).collect();
 
     assert_eq!(
@@ -499,13 +649,21 @@ async fn metrics_source_emits_every_cluster_family() {
         vec![
             "autumn_cluster_members",
             "autumn_cluster_pushes_sent_total",
+            "autumn_cluster_pushes_unsendable_total",
             "autumn_cluster_pushes_received_total",
             "autumn_cluster_merges_applied_total",
             "autumn_cluster_frames_dropped_total",
             "autumn_cluster_frames_rejected_total",
         ],
-        "the six documented families must all be emitted, under exactly the \
+        "the seven documented families must all be emitted, under exactly the \
          names docs/guide/clustering.md tells operators to alert on"
+    );
+    assert_eq!(
+        family_value(&families, "autumn_cluster_pushes_unsendable_total"),
+        Some(0.0),
+        "a healthy node publishes the unsendable series at zero — an alert on a \
+         label that only appears once the document outgrows the frame cap is an \
+         alert nobody wrote"
     );
 
     let members = families
@@ -532,23 +690,426 @@ async fn metrics_source_emits_every_cluster_family() {
         view_of(&a)
     );
 
-    let rejected = families
+    assert_eq!(
+        rejected_series(&families),
+        zeroed_series(),
+        "every reason label must be published from boot, and on a healthy \
+         cluster every one of them must read ZERO — asserting only the labels \
+         leaves the values, which are the thing an alert fires on, unpinned"
+    );
+
+    a.token.cancel();
+    b.token.cancel();
+}
+
+/// The per-reason mapping itself, in isolation: each [`RejectReason`] owns one
+/// series, and the transport's framing rejections fold into `oversize`.
+///
+/// The guide sells both to operators — "a steady `frames_rejected_total`
+/// `{reason="mac"}` means somebody is talking to your port with the wrong
+/// secret", and "`reason="oversize"` covers the connection-fatal step-1
+/// rejections too" — and both are one off-by-one away from silently attributing
+/// an attack to the wrong series.
+#[test]
+fn rejection_counters_are_per_reason_and_fold_framing_into_oversize() {
+    let metrics = ClusterMetrics::default();
+
+    assert_eq!(
+        metrics.rejections_by_reason(),
+        REJECT_REASONS
+            .iter()
+            .map(|reason| (reason.label(), 0))
+            .collect::<Vec<_>>(),
+        "a fresh node must publish every documented series at zero"
+    );
+
+    // One frame per reason: every series must move by exactly one, which no
+    // "always increment slot 0" or off-by-one indexing can satisfy.
+    for reason in REJECT_REASONS {
+        metrics.record_rejection(reason);
+    }
+    assert_eq!(
+        metrics.rejections_by_reason(),
+        REJECT_REASONS
+            .iter()
+            .map(|reason| (reason.label(), 1))
+            .collect::<Vec<_>>(),
+        "each reason must increment its OWN series, never a shared or shifted one"
+    );
+
+    // A second wrong-secret frame moves only `mac`.
+    metrics.record_rejection(RejectReason::Mac);
+    // …and the framing layer's connection-fatal rejections fold into
+    // `oversize`, the series the guide says covers them.
+    metrics.framing_rejected.store(3, Ordering::Relaxed);
+
+    let expected: Vec<(&str, u64)> = REJECT_REASONS
         .iter()
-        .find(|family| family.name == "autumn_cluster_frames_rejected_total")
-        .expect("the rejection family is in the list asserted above");
-    let labels: Vec<&str> = rejected
-        .samples
-        .iter()
-        .filter_map(|sample| sample.labels.first())
-        .map(|(_, reason)| reason.as_str())
+        .map(|reason| match *reason {
+            RejectReason::Oversize => (reason.label(), 4),
+            RejectReason::Mac => (reason.label(), 2),
+            other => (other.label(), 1),
+        })
         .collect();
     assert_eq!(
-        labels,
-        super::REJECT_REASONS
-            .iter()
-            .map(|reason| reason.label())
-            .collect::<Vec<_>>(),
-        "every reason label must be published from boot, zeroes included"
+        metrics.rejections_by_reason(),
+        expected,
+        "the transport's framing rejections must land in `oversize` (not \
+         `malformed`, and not in a series of their own), while every other \
+         reason keeps its own count"
+    );
+    assert_eq!(
+        metrics.rejected_total(),
+        13,
+        "the unlabelled aggregate must be the sum over every reason INCLUDING \
+         the folded framing rejections"
+    );
+}
+
+/// The same mapping, end to end through a running node: a forged frame per
+/// representative reason must move exactly that reason's published series.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn forged_frames_are_attributed_to_their_own_reason_series() {
+    let router = LoopbackRouter::new();
+    let clock = test_clock();
+    let a = start_node(&router, &clock, SECRET, "node-a", 1, Vec::new());
+    // An endpoint with no node behind it: purely a return address the router
+    // will accept frames from.
+    let hostile = router.endpoint();
+    let hostile_addr = hostile.local_addr().to_string();
+    settle(&clock, 2).await;
+
+    assert_eq!(
+        rejected_series(&collect_families(&a)),
+        zeroed_series(),
+        "sanity: nothing has been rejected yet, or the deltas below prove nothing"
+    );
+
+    let forge = |secret: &[u8], cluster: &str, sender: &str, incarnation: u64, seq: u64| {
+        wire::sign_envelope(
+            secret,
+            cluster,
+            sender,
+            incarnation,
+            seq,
+            &ClusterMessage::Leave,
+        )
+        .as_ref()
+        .and_then(wire::encode_frame)
+        .unwrap_or_default()
+    };
+
+    // Wrong secret → `mac`. Wrong cluster name → `cluster`. A frame delivered
+    // twice → `replay` on the second.
+    let wrong_secret = forge(OTHER_SECRET, CLUSTER, "node-intruder", 9, 1);
+    let wrong_cluster = forge(SECRET, "some-other-cluster", "node-stranger", 9, 1);
+    let replayed = forge(SECRET, CLUSTER, "node-ghost", 9, 1);
+
+    for frame in [
+        wrong_secret,
+        wrong_cluster,
+        replayed.clone(),
+        replayed.clone(),
+    ] {
+        assert!(
+            router.deliver(&hostile_addr, &a.addr, frame),
+            "every forged frame must reach node A, or this test proves nothing"
+        );
+        settle(&clock, 1).await;
+    }
+
+    let expected: Vec<(String, f64)> = REJECT_REASONS
+        .iter()
+        .map(|reason| {
+            let value = match *reason {
+                RejectReason::Mac | RejectReason::Cluster | RejectReason::Replay => 1.0,
+                _ => 0.0,
+            };
+            (reason.label().to_owned(), value)
+        })
+        .collect();
+    assert_eq!(
+        rejected_series(&collect_families(&a)),
+        expected,
+        "a wrong-secret frame must move ONLY `mac`, a foreign cluster name only \
+         `cluster`, and a replayed frame only `replay` — an operator alerting \
+         on `mac` must not be looking at a series somebody else's traffic \
+         increments; {}",
+        view_of(&a)
+    );
+
+    a.token.cancel();
+}
+
+/// A document that no longer fits one frame must be **observable**.
+///
+/// The push is also the heartbeat, so a node whose document has outgrown the
+/// 64 KiB cap keeps merging its peer's pushes and looks perfectly healthy to
+/// itself while the peer sees pure silence and evicts it. `frames_dropped`
+/// cannot see it (the transport never receives the frame) and `frames_rejected`
+/// is inbound-only, so without a series of its own the failure is invisible.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_oversized_document_is_counted_as_unsendable() {
+    /// Enough `(node, boot)` cells that the serialized document is comfortably
+    /// past `MAX_FRAME_BYTES`, built the way a real one grows: cells are never
+    /// pruned, and a node with no configured `node_id` mints a fresh member id
+    /// per restart.
+    const FILLER_CELLS: u64 = 2_000;
+
+    let router = LoopbackRouter::new();
+    let clock = test_clock();
+    let a = start_node(&router, &clock, SECRET, "node-a", 1, Vec::new());
+    let b = start_node(&router, &clock, SECRET, "node-b", 2, vec![a.addr.clone()]);
+    settle(&clock, 6).await;
+
+    assert_eq!(
+        pushes_unsendable(&a),
+        0,
+        "sanity: a healthy node must be able to send; {}",
+        view_of(&a)
+    );
+
+    grow_document_past_the_frame_cap(&a, FILLER_CELLS);
+
+    let sent_before = pushes_sent(&a);
+    settle(&clock, 3).await;
+
+    assert!(
+        pushes_unsendable(&a) > 0,
+        "a document past the frame cap must increment the unsendable counter — \
+         silently dropping every heartbeat is the one failure an operator has no \
+         other way to see; {}",
+        view_of(&a)
+    );
+    assert_eq!(
+        pushes_sent(&a),
+        sent_before,
+        "…and it must NOT be counted as a push that was sent; {}",
+        view_of(&a)
+    );
+    assert_eq!(
+        family_value(
+            &collect_families(&a),
+            "autumn_cluster_pushes_unsendable_total"
+        ),
+        Some(f64::from(
+            u32::try_from(pushes_unsendable(&a)).unwrap_or(u32::MAX)
+        )),
+        "the counter must be published as autumn_cluster_pushes_unsendable_total"
+    );
+
+    a.token.cancel();
+    b.token.cancel();
+}
+
+/// Pruning a tombstone must forget the departed node **whole** — its replay
+/// watermark included — or a node that comes back at a LOWER incarnation is
+/// partitioned for good.
+///
+/// After the tombstone window the survivor's document holds no record of the
+/// departed node, and nothing pushes to its address any more, so refutation
+/// (the documented recovery for a clock that stepped backwards) has nothing to
+/// trigger on. If the watermark outlives the record, every frame the returning
+/// node sends is dropped as a replay, both nodes serve a one-member view, and
+/// only an operator restarting one of them can break the deadlock.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn loopback_pruned_member_rejoins_at_a_lower_incarnation() {
+    let router = LoopbackRouter::new();
+    let clock = test_clock();
+
+    let a = start_node(&router, &clock, SECRET, "node-a", 1, Vec::new());
+    let b = start_node(&router, &clock, SECRET, "node-b", 2, vec![a.addr.clone()]);
+    settle(&clock, 6).await;
+    assert_converged(
+        &a,
+        &b,
+        &["node-a", "node-b"],
+        "the pair must converge before B departs, or the prune below proves nothing",
+    );
+    let departed_incarnation = b.handle.incarnation();
+
+    // A clean departure, then the whole tombstone window: ten suspicion
+    // timeouts after A first observed the leave, A prunes the record.
+    b.token.cancel();
+    advance_time(&clock, Duration::from_millis(250)).await;
+    let window_rounds = u32::try_from(
+        SUSPICION
+            .saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE)
+            .as_millis()
+            .saturating_div(PUSH.as_millis().max(1))
+            .saturating_add(2),
+    )
+    .unwrap_or(u32::MAX);
+    settle(&clock, window_rounds).await;
+
+    let still_held = {
+        let state = a.handle.inner.lock_state();
+        state.members.contains_key(&b.id)
+    };
+    assert!(
+        !still_held,
+        "sanity: A must have pruned B's tombstone after ten suspicion timeouts, \
+         or the rejoin below is testing the pre-prune path instead; {}",
+        view_of(&a)
+    );
+
+    // B comes back on the same node id behind a clock that stepped backwards:
+    // a strictly LOWER incarnation than the one A last accepted.
+    let rejoin_incarnation = 1;
+    assert!(
+        rejoin_incarnation < departed_incarnation,
+        "the rejoin must really be lower than the watermark A recorded \
+         ({departed_incarnation}), or this test asserts nothing"
+    );
+    let mut returning = ClusterState::default();
+    returning.members.insert(
+        b.id.clone(),
+        MemberRecord::alive(b.addr.clone(), rejoin_incarnation),
+    );
+    let frame = wire::sign_envelope(
+        SECRET,
+        CLUSTER,
+        &b.id,
+        rejoin_incarnation,
+        0,
+        &ClusterMessage::StatePush { state: returning },
+    )
+    .as_ref()
+    .and_then(wire::encode_frame)
+    .unwrap_or_default();
+    assert!(
+        router.deliver(&b.addr, &a.addr, frame),
+        "the returning node's push must reach A to prove anything"
+    );
+
+    settle(&clock, 1).await;
+
+    assert_eq!(
+        member_ids(&a.handle),
+        vec!["node-a".to_owned(), "node-b".to_owned()],
+        "a pruned member is a forgotten member: its next push must be judged as \
+         a FRESH sender, whatever incarnation it carries. Holding the watermark \
+         past the tombstone leaves the returning node replay-dropped with no \
+         record left to refute — a permanent partition; {}",
+        view_of(&a)
+    );
+
+    a.token.cancel();
+}
+
+/// The production wiring of `retain_peers`: an address that leaves the target
+/// set must be retired **through the push loop**, not just when a test calls
+/// the transport method by hand.
+///
+/// Deleting the call from `push_round` leaves the whole suite green otherwise,
+/// while a member that returns at a new address keeps its old address's writer
+/// task and bounded queue alive for the life of the process.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn push_round_retires_writers_for_addresses_that_left_the_target_set() {
+    const OLD_ADDR: &str = "127.0.0.1:47901";
+    const NEW_ADDR: &str = "127.0.0.1:47902";
+
+    let router = LoopbackRouter::new();
+    let clock = test_clock();
+    let spy = Arc::new(RetainSpy::new(router.endpoint()));
+    let token = CancellationToken::new();
+
+    let handle = ClusterNode::start(
+        ClusterRuntimeConfig {
+            cluster_name: CLUSTER.to_owned(),
+            secret: SECRET.to_vec(),
+            node_id: Some("node-a".to_owned()),
+            advertise_addr: None,
+            seed_peers: Vec::new(),
+            push_interval: PUSH,
+            suspicion_timeout: SUSPICION,
+        },
+        Arc::new(SeededEntropy::new(11)),
+        Arc::new(clock.clone()),
+        token.clone(),
+        Arc::clone(&spy) as Arc<dyn PeerTransport>,
+    )
+    .expect("a cluster node must start on a spying transport");
+
+    // Teach the node a peer at one address…
+    handle
+        .inner
+        .lock_state()
+        .members
+        .insert("node-x".to_owned(), MemberRecord::alive(OLD_ADDR, 1));
+    settle(&clock, 2).await;
+    assert!(
+        spy.last_retained().contains(OLD_ADDR),
+        "a known member's address must be in the retained set; observed {:?}",
+        spy.last_retained()
+    );
+
+    // …then move it, exactly as a merge of a higher-incarnation record does.
+    handle
+        .inner
+        .lock_state()
+        .members
+        .insert("node-x".to_owned(), MemberRecord::alive(NEW_ADDR, 2));
+    settle(&clock, 2).await;
+
+    let retained = spy.last_retained();
+    assert!(
+        retained.contains(NEW_ADDR),
+        "the member's new address must become a target; observed {retained:?}"
+    );
+    assert!(
+        !retained.contains(OLD_ADDR),
+        "the abandoned address must be retired through the push round, or its \
+         writer task and queue outlive the address forever; observed {retained:?}"
+    );
+
+    token.cancel();
+}
+
+/// `Suspect` must be visible on the surface the guide documents: two missed
+/// pushes are "worth showing an operator", and the row an operator reads is
+/// `ClusterHandle::members()` (and the health rows built from it).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn loopback_silent_peer_reads_as_suspect_before_it_drops_out() {
+    let router = LoopbackRouter::new();
+    let clock = test_clock();
+
+    let a = start_node(&router, &clock, SECRET, "node-a", 1, Vec::new());
+    let b = start_node(&router, &clock, SECRET, "node-b", 2, vec![a.addr.clone()]);
+    settle(&clock, 6).await;
+    assert_converged(
+        &a,
+        &b,
+        &["node-a", "node-b"],
+        "the pair must be Alive before B goes silent",
+    );
+
+    // Unplug B and stop short of the suspicion timeout: past 2x push (1000ms),
+    // well inside the 2500ms eviction.
+    router.disconnect(&b.addr);
+    advance_time(&clock, PUSH.saturating_mul(3)).await;
+
+    let view = a.handle.members();
+    let peer = view.iter().find(|member| member.id == b.id);
+    assert_eq!(
+        peer.map(|member| member.status),
+        Some(ClusterMemberStatus::Suspect),
+        "a peer silent past two push intervals must be reported Suspect — not \
+         quietly Alive, and not evicted; observed {view:?}"
+    );
+    assert_eq!(
+        view.iter()
+            .find(|member| member.id == a.id)
+            .map(|member| member.status),
+        Some(ClusterMemberStatus::Alive),
+        "…while this node itself stays Alive in its own view; observed {view:?}"
+    );
+    assert_eq!(
+        member_ids(&a.handle),
+        vec!["node-a".to_owned(), "node-b".to_owned()],
+        "a Suspect member is a warning, not an eviction: it must still be in \
+         the view; {}",
+        view_of(&a)
     );
 
     a.token.cancel();

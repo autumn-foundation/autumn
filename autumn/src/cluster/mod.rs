@@ -171,6 +171,24 @@ pub(crate) struct ClusterMetrics {
     pub(crate) merges_applied: AtomicU64,
     /// State pushes handed to the transport.
     pub(crate) pushes_sent: AtomicU64,
+    /// Outbound messages that could not be signed or framed at all, so the
+    /// transport never saw them.
+    ///
+    /// Almost always one thing: the replicated document has outgrown
+    /// [`MAX_FRAME_BYTES`](wire::MAX_FRAME_BYTES), so the sender refuses to
+    /// emit a frame its peer would be obliged to reject. That is silent
+    /// otherwise — `frames_dropped` only sees drops the *transport* made and
+    /// `frames_rejected` is inbound-only — and since the push is also the
+    /// heartbeat, a node in that state keeps merging its peer's pushes while
+    /// the peer watches it go `Suspect`, then `Down`. Anything above zero on
+    /// this series is that failure and needs an operator.
+    pub(crate) pushes_unsendable: AtomicU64,
+    /// Monotonic milliseconds (since the injected clock's origin, plus one) at
+    /// which the last unsendable-push warning was logged; `0` for "never".
+    ///
+    /// The offset by one is what lets `0` mean "never" without a second field:
+    /// a node whose very first push is unsendable reads the clock at origin.
+    pub(crate) unsendable_warned_at_ms: AtomicU64,
     /// State pushes accepted from peers.
     pub(crate) pushes_received: AtomicU64,
     /// Frames the transport could not queue (a peer's bounded writer queue was
@@ -256,6 +274,17 @@ pub(crate) struct ClusterInner {
     pub(crate) state: Mutex<membership::ClusterState>,
     /// Local, never-replicated failure detector.
     pub(crate) overlay: Mutex<membership::LivenessOverlay>,
+    /// Members whose `Left` tombstone the push loop has pruned and whose replay
+    /// watermark the receive loop has not dropped yet.
+    ///
+    /// The one channel between the two loops that is not the document itself.
+    /// Pruning happens in the push round; the [`wire::FrameVerifier`] that
+    /// holds the watermarks is a local of the receive loop, and a prune must
+    /// forget a node *whole* — see
+    /// [`FrameVerifier::forget`](wire::FrameVerifier::forget). The receive loop
+    /// drains this set before every verification, so the two never need a lock
+    /// at the same time.
+    pub(crate) pruned_senders: Mutex<std::collections::BTreeSet<NodeId>>,
     pub(crate) clock: Arc<dyn ClockSource>,
     /// Source of the per-node push jitter and of the default node id.
     pub(crate) entropy: Arc<dyn crate::entropy::Entropy>,
@@ -277,6 +306,25 @@ impl ClusterInner {
     /// Lock the local liveness overlay, recovering from poisoning.
     pub(crate) fn lock_overlay(&self) -> std::sync::MutexGuard<'_, membership::LivenessOverlay> {
         self.overlay.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Hand the receive loop a set of pruned member ids to forget.
+    pub(crate) fn note_pruned_senders(&self, pruned: impl IntoIterator<Item = NodeId>) {
+        let mut queued = self
+            .pruned_senders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        queued.extend(pruned);
+    }
+
+    /// Take everything [`note_pruned_senders`](Self::note_pruned_senders) has
+    /// queued since the last drain. Empty almost always, and cheap when it is.
+    pub(crate) fn take_pruned_senders(&self) -> std::collections::BTreeSet<NodeId> {
+        let mut queued = self
+            .pruned_senders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut queued)
     }
 }
 
@@ -517,6 +565,14 @@ impl crate::actuator::MetricsSource for ClusterMetricsSource {
                 samples: unlabelled(metrics.pushes_sent.load(Ordering::Relaxed)),
             },
             MetricFamily {
+                name: "autumn_cluster_pushes_unsendable_total".to_owned(),
+                help: "Outbound cluster messages that could not be signed or framed \
+                       (almost always a document past the 64 KiB frame cap)."
+                    .to_owned(),
+                kind: MetricKind::Counter,
+                samples: unlabelled(metrics.pushes_unsendable.load(Ordering::Relaxed)),
+            },
+            MetricFamily {
                 name: "autumn_cluster_pushes_received_total".to_owned(),
                 help: "State pushes accepted from peers after verification.".to_owned(),
                 kind: MetricKind::Counter,
@@ -574,7 +630,12 @@ impl crate::actuator::MetricsSource for ClusterMetricsSource {
 ///   and a third time inside the node, because falling back to an empty HMAC
 ///   key would authenticate every peer on the port;
 /// - the cluster listener cannot bind `bind_addr`, or the node cannot start. A
-///   node that cannot join must not boot pretending it did.
+///   node that cannot join must not boot pretending it did;
+/// - the app has already registered a health indicator or a metrics source
+///   called `cluster:membership`. The cluster's own actuator surface would be
+///   shadowed by an unrelated component, leaving the membership view and the
+///   rejection counters invisible; the just-started node is cancelled and the
+///   boot fails rather than running unobservably.
 pub fn install_from_config(
     state: &AppState,
     config: &ClusterConfig,
@@ -645,35 +706,49 @@ pub fn install_from_config(
     // A short secret is refused inside `ClusterNode::start`, before any frame is
     // signed — same rule as `ClusterConfig::validate`, enforced at the seam that
     // actually holds the key.
+    let node_shutdown = shutdown.child_token();
     let handle = node::ClusterNode::start(
         runtime,
         state.entropy_arc(),
         state.clock_arc(),
-        shutdown.child_token(),
+        node_shutdown.clone(),
         Arc::new(transport),
     )?;
 
-    // Registration only fails when the name is already taken on THIS state,
-    // i.e. the installer was called twice for one app. Warn rather than fail
-    // the boot: the already-registered component still reports a live node, and
-    // the extension below still resolves. (Two nodes in one *process* — which
-    // the two-node tests do — have one `AppState` each and never collide.)
-    if let Err(error) = state.health_indicator_registry().register(
-        MEMBERSHIP_COMPONENT,
-        crate::actuator::IndicatorGroup::HealthOnly,
-        Arc::new(ClusterHealthIndicator {
-            handle: handle.clone(),
-        }),
-    ) {
-        tracing::warn!("cluster: {error}");
-    }
-    if let Err(error) = state.metrics_source_registry().register(
-        MEMBERSHIP_COMPONENT,
-        Arc::new(ClusterMetricsSource {
-            handle: handle.clone(),
-        }),
-    ) {
-        tracing::warn!("cluster: {error}");
+    // Either registration failing means the app already owns the
+    // `cluster:membership` name — the duplicate-install guard above has already
+    // taken the "installer called twice" case. That is a hard error, not a
+    // warning: the node would bind, gossip and resolve through the extension
+    // while `/actuator/health` and `/actuator/metrics` described somebody
+    // else's component, so an operator watching the membership view or
+    // `autumn_cluster_frames_rejected_total` would see nothing at all while
+    // this node was partitioned or under attack. Booting is refused instead,
+    // and the node that was just started is cancelled on the way out so a
+    // refused install leaves no loops and no listener behind.
+    let registered = state
+        .health_indicator_registry()
+        .register(
+            MEMBERSHIP_COMPONENT,
+            crate::actuator::IndicatorGroup::HealthOnly,
+            Arc::new(ClusterHealthIndicator {
+                handle: handle.clone(),
+            }),
+        )
+        .and_then(|()| {
+            state.metrics_source_registry().register(
+                MEMBERSHIP_COMPONENT,
+                Arc::new(ClusterMetricsSource {
+                    handle: handle.clone(),
+                }),
+            )
+        });
+    if let Err(error) = registered {
+        node_shutdown.cancel();
+        return Err(AutumnError::internal_server_error_msg(format!(
+            "cluster: {error} — the {MEMBERSHIP_COMPONENT} name is reserved for the cluster's \
+             own health component and metrics source; rename the app's registration, because a \
+             cluster whose membership and rejection counters are invisible cannot be operated"
+        )));
     }
 
     state.insert_extension(handle);
