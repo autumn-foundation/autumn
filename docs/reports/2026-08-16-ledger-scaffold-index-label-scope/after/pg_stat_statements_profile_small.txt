@@ -1,0 +1,7 @@
+ calls | total_buffers | rows |                         query_text                         
+-------+---------------+------+------------------------------------------------------------
+     1 |            54 |   20 | SELECT id, title FROM posts WHERE id = ANY($1::bigint[])
+     1 |            36 |    1 | SELECT count(*) FROM comments
+     1 |             3 |   20 | SELECT * FROM comments ORDER BY id DESC LIMIT $1 OFFSET $2
+(3 rows)
+

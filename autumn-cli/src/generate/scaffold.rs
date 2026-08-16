@@ -4009,9 +4009,11 @@ mod attachment_read_back_tests {
             &edit_attachment_url_binds,
         );
         // The referenced-row option loaders are emitted regardless: they
-        // populate the in-form `<select>` (issue #1750) AND the issue #1146
-        // index parent-label map (`render_index_reference_label_loads` collects
-        // each `{name}_select_options(...)` into a `HashMap`).
+        // populate the in-form `<select>` (issue #1750). The issue #1146 index
+        // parent-label map is built separately, scoped to the page's own rows
+        // (`render_index_reference_label_loads`, #835) rather than through
+        // these loaders, which fetch every row of the referenced table — right
+        // for a `<select>`'s full option list, wrong for labeling ~20 rows.
         let option_loaders =
             render_reference_option_loaders(&display_reference_fields, db_ty, &reference_displays);
         (new_form_body, edit_form_body, option_loaders)
@@ -6515,20 +6517,49 @@ fn render_nested_section(
     let list_fields: Vec<Field> = fields.iter().filter(|f| f.name != fk).cloned().collect();
 
     // Display-label maps for the remaining `references` columns, mirroring what
-    // the flat index loads. Written here rather than reusing
+    // the flat index loads (#835: scoped to `page_data.content`'s own FK
+    // values via `WHERE id = ANY(...)`, not a full-table load — the nested
+    // list is paginated exactly like the flat index, so the same over-fetch
+    // applied here too). Written here rather than reusing
     // `render_index_reference_label_loads` because this helper holds the
     // connection as `&mut Db` (so a parent can render several children off one
-    // connection), which needs a reborrow at each call site.
+    // connection), which needs a double-deref reborrow (`&mut **db`) at each
+    // call site — matching `total`/`items` above, not the single-deref owned
+    // `db: Db` the flat index handlers take.
     let mut label_loads = String::new();
     for f in reference_fields {
-        if f.name == fk || !reference_displays.contains_key(&f.name) {
+        if f.name == fk {
             continue;
         }
+        let Some(display) = reference_displays.get(&f.name) else {
+            continue;
+        };
+        let Some(table) = f.reference_table() else {
+            continue;
+        };
         let name = &f.name;
+        let column = &display.column;
+        let (load_ty, label_expr) = if display.column_nullable {
+            ("Option<String>", "label.unwrap_or_else(|| id.to_string())")
+        } else {
+            ("String", "label")
+        };
+        let ids_expr = if f.nullable {
+            format!("page_data.content.iter().filter_map(|row| row.{name}).collect()")
+        } else {
+            format!("page_data.content.iter().map(|row| row.{name}).collect()")
+        };
         let _ = writeln!(
             label_loads,
-            "    let {name}_labels: std::collections::HashMap<String, String> =\n        \
-             {name}_select_options(&mut *db).await?.into_iter().collect();"
+            "    let {name}_ids: Vec<i64> = {ids_expr};\n    \
+             let {name}_labels: std::collections::HashMap<String, String> = {table}::table\n        \
+             .filter({table}::id.eq_any({name}_ids))\n        \
+             .select(({table}::id, {table}::{column}))\n        \
+             .load::<(i64, {load_ty})>(&mut **db)\n        \
+             .await?\n        \
+             .into_iter()\n        \
+             .map(|(id, label)| (id.to_string(), {label_expr}))\n        \
+             .collect();"
         );
     }
     let columns = render_columns_vec(
@@ -8560,10 +8591,13 @@ fn render_show_reference_label_loads(
 /// Emit the `let {name}_labels: HashMap<String, String> = …;` bindings the
 /// plain (non-sharded) `index` handler evaluates before building its data-table
 /// columns, one per `references` field with a resolved display column
-/// (issue #1146). Each reuses the field's `{name}_select_options` loader (a
-/// simple per-view fetch; the batched variant is out of scope, #835) to map
-/// each parent id string to its display label, which the column closures then
-/// look up per row. Empty when the resource has no displayable references.
+/// (issue #1146, batched per #835). Unlike the in-FORM `<select>`, which
+/// needs every possible parent row, the index only ever displays the parent
+/// label for the page's own rows — so this queries just the FK ids present
+/// in `page_data.content` (`WHERE id = ANY(...)`, at most one page's worth of
+/// ids) instead of reusing the form's `{name}_select_options` loader, which
+/// scans the WHOLE referenced table on every index view regardless of page
+/// size. Empty when the resource has no displayable references.
 fn render_index_reference_label_loads(
     reference_fields: &[&Field],
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
@@ -8571,14 +8605,35 @@ fn render_index_reference_label_loads(
     use std::fmt::Write as _;
     let mut out = String::new();
     for f in reference_fields {
-        if !reference_displays.contains_key(&f.name) {
+        let Some(display) = reference_displays.get(&f.name) else {
             continue;
-        }
+        };
+        let Some(table) = f.reference_table() else {
+            continue;
+        };
         let name = &f.name;
+        let column = &display.column;
+        let (load_ty, label_expr) = if display.column_nullable {
+            ("Option<String>", "label.unwrap_or_else(|| id.to_string())")
+        } else {
+            ("String", "label")
+        };
+        let ids_expr = if f.nullable {
+            format!("page_data.content.iter().filter_map(|row| row.{name}).collect()")
+        } else {
+            format!("page_data.content.iter().map(|row| row.{name}).collect()")
+        };
         let _ = writeln!(
             out,
-            "    let {name}_labels: std::collections::HashMap<String, String> =\n        \
-             {name}_select_options(&mut db).await?.into_iter().collect();"
+            "    let {name}_ids: Vec<i64> = {ids_expr};\n    \
+             let {name}_labels: std::collections::HashMap<String, String> = {table}::table\n        \
+             .filter({table}::id.eq_any({name}_ids))\n        \
+             .select(({table}::id, {table}::{column}))\n        \
+             .load::<(i64, {load_ty})>(&mut *db)\n        \
+             .await?\n        \
+             .into_iter()\n        \
+             .map(|(id, label)| (id.to_string(), {label_expr}))\n        \
+             .collect();"
         );
     }
     out
