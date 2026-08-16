@@ -234,7 +234,51 @@ struct RepoConfig {
     /// users' rows. The column may be `BigInt` or `Nullable<BigInt>`; a nullable
     /// owner never matches NULL (unowned) rows, which is the intended semantics.
     owner_column: Option<String>,
+    /// `retention(...)` declarative data-retention policy (issue #1342).
+    /// `None` (the default) emits nothing extra: every existing `#[repository]`
+    /// is unaffected — retention is opt-in.
+    retention: Option<RetentionSpec>,
 }
+
+/// Parsed `retention(...)` clause (issue #1342).
+///
+/// At least one of `after` (with `basis`) or `purge_deleted_after` is always
+/// present — `parse_repo_args` rejects an empty `retention()` and rejects
+/// `after` without `basis` before this is ever constructed.
+struct RetentionSpec {
+    /// Age threshold (a `parse_duration`-compatible string, e.g. `"30d"`)
+    /// past which a row is stale, measured from `basis`. Soft-deletes the row
+    /// on a `soft_delete` repository, hard-deletes otherwise.
+    after: Option<String>,
+    /// Column read against `after` (e.g. `created_at`). Required when `after`
+    /// is set.
+    basis: Option<Ident>,
+    /// Age threshold past which an already soft-deleted row is hard-purged.
+    /// Requires `soft_delete`.
+    purge_deleted_after: Option<String>,
+    /// Rows deleted per batch. Defaults to
+    /// [`DEFAULT_RETENTION_BATCH_SIZE`] when unset.
+    batch_size: Option<u64>,
+    /// How often the sweep runs. Defaults to
+    /// [`DEFAULT_RETENTION_SWEEP_INTERVAL`] when unset.
+    every: Option<String>,
+}
+
+/// Default rows-per-batch for a `retention(...)` sweep when `batch_size` is
+/// not given. Small enough that a single `DELETE`/`UPDATE` never holds a long
+/// lock or spikes replication lag; large enough to drain realistic backlogs
+/// in a bounded number of round trips.
+const DEFAULT_RETENTION_BATCH_SIZE: u64 = 500;
+
+/// Default recurring interval for a `retention(...)` sweep when `every` is
+/// not given.
+const DEFAULT_RETENTION_SWEEP_INTERVAL: &str = "1h";
+
+/// Upper bound on batches processed in a single sweep run, regardless of
+/// `batch_size`. Bounds one run's wall-clock time so a huge backlog drains
+/// across multiple scheduled ticks instead of one very long run; the AC's
+/// "per-run cap" (issue #1342).
+const MAX_RETENTION_BATCHES_PER_RUN: u32 = 1000;
 
 #[allow(clippy::too_many_lines)]
 fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
@@ -264,6 +308,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut dependents: Vec<DependentSpec> = Vec::new();
     let mut validate_on_update_fetch = false;
     let mut owner_column: Option<String> = None;
+    let mut retention: Option<RetentionSpec> = None;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -467,12 +512,69 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                 action,
             });
             Ok(())
+        } else if meta.path.is_ident("retention") {
+            // `retention(after = "30d", basis = created_at)` and/or
+            // `retention(purge_deleted_after = "90d")`, plus optional
+            // `batch_size = N` and `every = "..."` (issue #1342).
+            let mut after: Option<String> = None;
+            let mut basis: Option<Ident> = None;
+            let mut purge_deleted_after: Option<String> = None;
+            let mut batch_size: Option<u64> = None;
+            let mut every: Option<String> = None;
+            meta.parse_nested_meta(|nested| {
+                if nested.path.is_ident("after") {
+                    let value: LitStr = nested.value()?.parse()?;
+                    after = Some(value.value());
+                    Ok(())
+                } else if nested.path.is_ident("basis") {
+                    let value: Ident = nested.value()?.parse()?;
+                    basis = Some(value);
+                    Ok(())
+                } else if nested.path.is_ident("purge_deleted_after") {
+                    let value: LitStr = nested.value()?.parse()?;
+                    purge_deleted_after = Some(value.value());
+                    Ok(())
+                } else if nested.path.is_ident("batch_size") {
+                    let value: syn::LitInt = nested.value()?.parse()?;
+                    batch_size = Some(value.base10_parse()?);
+                    Ok(())
+                } else if nested.path.is_ident("every") {
+                    let value: LitStr = nested.value()?.parse()?;
+                    every = Some(value.value());
+                    Ok(())
+                } else {
+                    Err(nested.error(
+                        "expected `after = \"...\"`, `basis = <column>`, \
+                         `purge_deleted_after = \"...\"`, `batch_size = N`, or `every = \"...\"`",
+                    ))
+                }
+            })?;
+            if after.is_none() && purge_deleted_after.is_none() {
+                return Err(meta.error(
+                    "retention(...) requires `after = \"...\"` (with `basis = <column>`), \
+                     `purge_deleted_after = \"...\"`, or both",
+                ));
+            }
+            if after.is_some() && basis.is_none() {
+                return Err(meta.error(
+                    "retention(after = \"...\") requires `basis = <column>` — the timestamp \
+                     column age is measured from, e.g. `basis = created_at`",
+                ));
+            }
+            retention = Some(RetentionSpec {
+                after,
+                basis,
+                purge_deleted_after,
+                batch_size,
+                every,
+            });
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, owner = column, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, owner = column, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), retention(after = \"...\", basis = column, purge_deleted_after = \"...\", batch_size = N, every = \"...\"), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
             ))
         }
     })
@@ -502,6 +604,25 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "validate_on_update = fetch requires the generated update draft (from_patch), \
              which no_upsert_trait repositories do not have; remove one of the two",
         ));
+    }
+    if let Some(spec) = &retention {
+        if spec.purge_deleted_after.is_some() && !soft_delete {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(purge_deleted_after = \"...\") requires soft_delete: there is no \
+                 deleted_at column to purge against without it. Add `soft_delete` to \
+                 #[repository(...)], or use retention(after = \"...\", basis = <column>) for a \
+                 hard-delete policy instead",
+            ));
+        }
+        if sharded {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support sharded repositories yet: a sweep would only \
+                 reach the pool it happens to be given, silently skipping every other shard. \
+                 Remove `sharded`, or sweep each shard's table by hand for now",
+            ));
+        }
     }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
     let generated_internal_hooks = false;
@@ -533,6 +654,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         dependents,
         validate_on_update_fetch,
         owner_column,
+        retention,
     })
 }
 
@@ -11058,6 +11180,272 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // ── #1342: declarative retention sweeps ─────────────────────────────
+    //
+    // `retention(...)` compiles to a batched sweep method plus a companion
+    // `TaskInfo` builder (mirroring `#[scheduled]`'s `__autumn_task_info_*`
+    // pattern) and an `inventory::submit!` descriptor, so the sweep is
+    // auto-collected by `autumn_web::retention::collect_retention_tasks()`
+    // at boot with zero `tasks![...]` wiring and zero hand-written SQL.
+    let (retention_sweep_methods, retention_inventory_registration) =
+        if let Some(spec) = &config.retention {
+            let batch_size = spec.batch_size.unwrap_or(DEFAULT_RETENTION_BATCH_SIZE);
+            #[allow(clippy::cast_possible_wrap)]
+            let batch_size_i64 = batch_size as i64;
+            let every_str = spec
+                .every
+                .clone()
+                .unwrap_or_else(|| DEFAULT_RETENTION_SWEEP_INTERVAL.to_string());
+            let max_batches = MAX_RETENTION_BATCHES_PER_RUN;
+            let model_name_str = model_name.to_string();
+            let task_name_str = format!("retention-sweep-{}", model_name_str.to_lowercase());
+
+            // Age-based branch: soft-deletes on a soft_delete repository
+            // (never re-touching an already soft-deleted row), hard-deletes
+            // otherwise. Absent unless `after` was declared.
+            let age_block = spec.after.as_ref().map_or_else(
+                || quote! {},
+                |after| {
+                    let basis_ident = spec
+                        .basis
+                        .as_ref()
+                        .expect("validated by parse_repo_args: after requires basis");
+                    let apply_stmt = if config.soft_delete {
+                        quote! {
+                            if !dry_run {
+                                let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
+                                ::autumn_web::reexports::diesel::update(
+                                    #table_ident::table
+                                        .filter(#table_ident::id.eq_any(ids))
+                                        .filter(#table_ident::deleted_at.is_null())
+                                )
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                .execute(&mut conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                            }
+                        }
+                    } else {
+                        quote! {
+                            if !dry_run {
+                                ::autumn_web::reexports::diesel::delete(
+                                    #table_ident::table.filter(#table_ident::id.eq_any(ids))
+                                )
+                                .execute(&mut conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                            }
+                        }
+                    };
+                    let not_already_deleted_filter = if config.soft_delete {
+                        quote! { .filter(#table_ident::deleted_at.is_null()) }
+                    } else {
+                        quote! {}
+                    };
+                    quote! {
+                        {
+                            let __after_duration = ::autumn_web::task::parse_duration(#after)
+                                .expect(concat!(
+                                    "invalid duration in #[repository(..., retention(after = \"",
+                                    #after,
+                                    "\"))]"
+                                ));
+                            let __after_chrono =
+                                ::autumn_web::reexports::chrono::Duration::from_std(__after_duration)
+                                    .expect("retention `after` duration out of range");
+                            let __cutoff =
+                                ::autumn_web::time::ClockSource::now(state.clock()).naive_utc() - __after_chrono;
+                            let mut __last_id: i64 = 0;
+                            let mut __batches: u32 = 0;
+                            loop {
+                                let ids: ::std::vec::Vec<i64> = #table_ident::table
+                                    .filter(#table_ident::#basis_ident.lt(__cutoff))
+                                    .filter(#table_ident::id.gt(__last_id))
+                                    #not_already_deleted_filter
+                                    .order(#table_ident::id.asc())
+                                    .select(#table_ident::id)
+                                    .limit(#batch_size_i64)
+                                    .load::<i64>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                if ids.is_empty() {
+                                    break;
+                                }
+                                let __n = ids.len() as u64;
+                                __last_id = *ids.last().expect("ids non-empty");
+                                #apply_stmt
+                                rows_swept += __n;
+                                __batches += 1;
+                                if __n < #batch_size_i64 as u64 || __batches >= #max_batches {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                },
+            );
+
+            // Purge branch: always a hard DELETE of rows soft-deleted longer
+            // than `purge_deleted_after`. Absent unless declared (and only
+            // ever declared alongside `soft_delete` — enforced above).
+            let purge_block = spec.purge_deleted_after.as_ref().map_or_else(
+                || quote! {},
+                |purge_after| {
+                    quote! {
+                        {
+                            let __purge_duration = ::autumn_web::task::parse_duration(#purge_after)
+                                .expect(concat!(
+                                    "invalid duration in #[repository(..., retention(purge_deleted_after = \"",
+                                    #purge_after,
+                                    "\"))]"
+                                ));
+                            let __purge_chrono =
+                                ::autumn_web::reexports::chrono::Duration::from_std(__purge_duration)
+                                    .expect("retention `purge_deleted_after` duration out of range");
+                            let __cutoff =
+                                ::autumn_web::time::ClockSource::now(state.clock()).naive_utc() - __purge_chrono;
+                            let mut __last_id: i64 = 0;
+                            let mut __batches: u32 = 0;
+                            loop {
+                                let ids: ::std::vec::Vec<i64> = #table_ident::table
+                                    .filter(#table_ident::deleted_at.lt(__cutoff))
+                                    .filter(#table_ident::id.gt(__last_id))
+                                    .order(#table_ident::id.asc())
+                                    .select(#table_ident::id)
+                                    .limit(#batch_size_i64)
+                                    .load::<i64>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                if ids.is_empty() {
+                                    break;
+                                }
+                                let __n = ids.len() as u64;
+                                __last_id = *ids.last().expect("ids non-empty");
+                                if !dry_run {
+                                    ::autumn_web::reexports::diesel::delete(
+                                        #table_ident::table.filter(#table_ident::id.eq_any(ids))
+                                    )
+                                    .execute(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                }
+                                rows_swept += __n;
+                                __batches += 1;
+                                if __n < #batch_size_i64 as u64 || __batches >= #max_batches {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                },
+            );
+
+            let methods = quote! {
+                /// Run this model's declared `retention(...)` policy once,
+                /// deleting (or soft-deleting) stale rows in bounded batches.
+                /// Registered as a fleet-coordinated scheduled task
+                /// automatically — apps never call this directly. See
+                /// `docs/guide/retention-sweeps.md`.
+                #[doc(hidden)]
+                pub async fn __autumn_retention_sweep(
+                    state: &::autumn_web::AppState,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::retention::RetentionSweepReport> {
+                    Self::__autumn_retention_run(state, false).await
+                }
+
+                /// Count (never delete) the rows this policy would sweep
+                /// right now. Powers `autumn retention --dry-run`.
+                #[doc(hidden)]
+                pub fn __autumn_retention_dry_run(
+                    state: ::autumn_web::AppState,
+                ) -> ::std::pin::Pin<::std::boxed::Box<
+                    dyn ::std::future::Future<
+                        Output = ::autumn_web::AutumnResult<::autumn_web::retention::RetentionSweepReport>,
+                    > + Send,
+                >> {
+                    ::std::boxed::Box::pin(async move {
+                        Self::__autumn_retention_run(&state, true).await
+                    })
+                }
+
+                #[doc(hidden)]
+                async fn __autumn_retention_run(
+                    state: &::autumn_web::AppState,
+                    dry_run: bool,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::retention::RetentionSweepReport> {
+                    use ::autumn_web::db::DbState as _;
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    use ::autumn_web::time::ClockSource as _;
+
+                    let __started = state.monotonic();
+                    let pool = state
+                        .pool()
+                        .ok_or_else(|| {
+                            ::autumn_web::AutumnError::service_unavailable_msg(
+                                "retention sweep: no database pool configured",
+                            )
+                        })?
+                        .clone();
+                    let repo = Self::with_pool_untracked(pool);
+                    let mut conn = repo.__autumn_acquire_conn().await?;
+                    let mut rows_swept: u64 = 0;
+
+                    #age_block
+                    #purge_block
+
+                    #[allow(clippy::cast_possible_truncation)]
+                    let duration_ms =
+                        state.monotonic().saturating_duration_since(__started).as_millis() as u64;
+                    Ok(::autumn_web::retention::RetentionSweepReport {
+                        model: #model_name_str.to_string(),
+                        rows_swept,
+                        duration_ms,
+                        dry_run,
+                    })
+                }
+
+                /// Builds the recurring `TaskInfo` `autumn_web::retention`
+                /// auto-registers with the scheduler.
+                #[doc(hidden)]
+                pub fn __autumn_retention_task_info() -> ::autumn_web::task::TaskInfo {
+                    ::autumn_web::task::TaskInfo {
+                        name: #task_name_str.to_string(),
+                        schedule: ::autumn_web::task::Schedule::FixedDelay(
+                            ::autumn_web::task::parse_duration(#every_str)
+                                .expect(concat!(
+                                    "invalid duration in #[repository(..., retention(every = \"",
+                                    #every_str,
+                                    "\"))]"
+                                ))
+                        ),
+                        coordination: ::autumn_web::task::TaskCoordination::Fleet,
+                        handler: |state: ::autumn_web::AppState| {
+                            ::std::boxed::Box::pin(async move {
+                                let report = Self::__autumn_retention_sweep(&state).await?;
+                                ::autumn_web::retention::log_retention_sweep(&report);
+                                Ok(())
+                            })
+                        },
+                    }
+                }
+            };
+
+            let registration = quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::retention::RetentionSweepDescriptor {
+                        model_name: stringify!(#model_name),
+                        task_info: #pg_name::__autumn_retention_task_info,
+                        dry_run: #pg_name::__autumn_retention_dry_run,
+                    }
+                }
+            };
+
+            (methods, registration)
+        } else {
+            (quote! {}, quote! {})
+        };
+
     // ── Pagination methods (`page` always; `cursor_page` when cursor_key is declared) ──
     //
     // `page` executes a COUNT(*) + a LIMIT/OFFSET query and wraps the result in
@@ -16117,6 +16505,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #counter_cache_recompute_methods
             #hook_support_methods
             #dependent_child_helper
+            #retention_sweep_methods
 
             /// Returns a clone of this repository whose generated read
             /// methods are pinned to the primary pool for the rest of the
@@ -16460,6 +16849,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #hook_inventory_registration
         #versioned_inventory_registration
+        #retention_inventory_registration
 
         #api_handlers
 
@@ -21449,6 +21839,182 @@ mod tests {
         assert!(
             !generated.contains("cross-shard writes are not supported"),
             "sharded-only repo must not contain cross-shard write guard: {generated}"
+        );
+    }
+
+    // ── #1342: declarative retention sweeps ─────────────────────────────
+
+    #[test]
+    fn retention_age_based_parses_after_and_basis() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let retention = config.retention.expect("retention should be parsed");
+        assert_eq!(retention.after.as_deref(), Some("30d"));
+        assert_eq!(retention.basis.as_ref().map(ToString::to_string).as_deref(), Some("created_at"));
+        assert!(retention.purge_deleted_after.is_none());
+    }
+
+    #[test]
+    fn retention_purge_deleted_after_requires_soft_delete() {
+        let tokens: proc_macro2::TokenStream = "Post, retention(purge_deleted_after = \"90d\")"
+            .parse()
+            .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("purge_deleted_after without soft_delete must be rejected");
+        };
+        assert!(
+            error.to_string().contains("soft_delete"),
+            "purge_deleted_after without soft_delete must error mentioning soft_delete: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_purge_deleted_after_with_soft_delete_parses() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, retention(purge_deleted_after = \"90d\")"
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let retention = config.retention.expect("retention should be parsed");
+        assert_eq!(retention.purge_deleted_after.as_deref(), Some("90d"));
+    }
+
+    #[test]
+    fn retention_after_requires_basis() {
+        let tokens: proc_macro2::TokenStream = "Post, retention(after = \"30d\")".parse().unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("after without basis must be rejected");
+        };
+        assert!(
+            error.to_string().contains("basis"),
+            "after without basis must error mentioning basis: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_requires_after_or_purge_deleted_after() {
+        // Empty `retention()` is a syn nested-meta-list parse error (there is
+        // nothing to iterate), not our own validation — still a compile
+        // error pointing at the empty parens, just not our custom wording.
+        let tokens: proc_macro2::TokenStream = "Post, retention()".parse().unwrap();
+        assert!(
+            parse_repo_args(tokens).is_err(),
+            "empty retention(...) must be rejected"
+        );
+
+        // `retention(batch_size = 10)` alone (no after/purge_deleted_after)
+        // reaches our own validation and must name both real options.
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(batch_size = 10)".parse().unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention(...) with no after/purge_deleted_after must be rejected");
+        };
+        assert!(
+            error.to_string().contains("after") && error.to_string().contains("purge_deleted_after"),
+            "retention(...) missing both options must error naming both: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_sharded() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, sharded, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + sharded must be rejected");
+        };
+        assert!(
+            error.to_string().contains("sharded"),
+            "retention + sharded must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_accepts_batch_size_and_every() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(after = \"30d\", basis = created_at, batch_size = 250, every = \"15m\")"
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let retention = config.retention.expect("retention should be parsed");
+        assert_eq!(retention.batch_size, Some(250));
+        assert_eq!(retention.every.as_deref(), Some("15m"));
+    }
+
+    #[test]
+    fn repository_without_retention_has_no_retention_spec() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.retention.is_none());
+    }
+
+    #[test]
+    fn repository_macro_retention_generates_sweep_and_task_info() {
+        let generated = repository_macro(
+            quote! { Post, retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__autumn_retention_sweep"),
+            "retention(...) must generate a sweep method: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_retention_dry_run"),
+            "retention(...) must generate a dry-run method: {generated}"
+        );
+        assert!(
+            generated.contains("RetentionSweepDescriptor"),
+            "retention(...) must register an inventory descriptor: {generated}"
+        );
+        assert!(
+            generated.contains("TaskCoordination :: Fleet"),
+            "retention sweeps must use fleet coordination for multi-replica safety: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_without_retention_generates_no_sweep() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        assert!(
+            !generated.contains("__autumn_retention_sweep"),
+            "a repository with no retention(...) must not generate a sweep method: {generated}"
+        );
+        assert!(
+            !generated.contains("RetentionSweepDescriptor"),
+            "a repository with no retention(...) must not register a descriptor: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_retention_age_based_soft_deletes() {
+        // Age-based retention on a soft-delete model must SET deleted_at, not
+        // hard-delete: AC "soft-delete-aware" (issue #1342).
+        let generated = repository_macro(
+            quote! { Post, soft_delete, retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__autumn_retention_sweep"),
+            "retention(...) must generate a sweep method: {generated}"
+        );
+        // The generated sweep body must reference deleted_at (soft-delete path).
+        let sweep_start = generated
+            .find("__autumn_retention_sweep")
+            .expect("sweep method present");
+        let sweep_region = &generated[sweep_start..(sweep_start + 4000).min(generated.len())];
+        assert!(
+            sweep_region.contains("deleted_at"),
+            "soft-delete age-based sweep must reference deleted_at: {sweep_region}"
         );
     }
 }
