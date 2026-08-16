@@ -300,12 +300,29 @@ pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
 /// Written with [`str::get`] rather than indexing so the request-path panic
 /// gate's `string_slice`/`indexing_slicing` denials hold.
 fn stands_alone(text: &str, cursor: usize, needle: &str, rest: &str) -> bool {
-    let before = text.get(..cursor).and_then(|head| head.chars().next_back());
-    let after = rest
-        .get(needle.len()..)
-        .and_then(|tail| tail.chars().next());
-    before.is_none_or(|char| !is_identifier_char(char))
-        && after.is_none_or(|char| !is_identifier_char(char))
+    let head = text.get(..cursor).unwrap_or_default();
+    let tail = rest.get(needle.len()..).unwrap_or_default();
+
+    // A dot only joins an identifier when it has one on *both* sides:
+    // `api.v1.error` is one dotted name, but the dot in `CVV 123.` ends a
+    // sentence. Treating every dot as interior would leave a secret before a
+    // full stop unmasked, which trades a false mismatch for a real leak — so
+    // the neighbour *past* the dot decides.
+    let mut before = head.chars().rev();
+    let joined_before = match before.next() {
+        Some('.') => before.next().is_some_and(char::is_alphanumeric),
+        Some(character) => is_identifier_char(character),
+        None => false,
+    };
+
+    let mut after = tail.chars();
+    let joined_after = match after.next() {
+        Some('.') => after.next().is_some_and(char::is_alphanumeric),
+        Some(character) => is_identifier_char(character),
+        None => false,
+    };
+
+    !joined_before && !joined_after
 }
 
 /// Whether `character` can sit *inside* an identifier, and so does not end a
@@ -316,6 +333,10 @@ fn stands_alone(text: &str, cursor: usize, needle: &str, rest: &str) -> bool {
 /// spellings, so a whole-token-only `auth` that rewrote them to
 /// `[FILTERED]-error` would shred exactly the static messages replay compares
 /// against — the false `mismatch` this classification exists to prevent.
+///
+/// The dot is deliberately *not* here: it joins only when flanked by
+/// alphanumerics, which [`stands_alone`] decides, because a trailing dot is
+/// far more often a full stop than part of a name.
 fn is_identifier_char(character: char) -> bool {
     character.is_alphanumeric() || character == '-' || character == '_'
 }
@@ -1474,6 +1495,18 @@ mod tests {
             mask_echoes("auth-error and auth_error raised", &digest),
             "auth-error and auth_error raised",
             "identifier punctuation does not make a value stand alone"
+        );
+        // A dot joins only when flanked: `api.auth.error` is one dotted name,
+        // but a trailing dot is a full stop and must not shield the secret.
+        assert_eq!(
+            mask_echoes("api.auth.error raised", &digest),
+            "api.auth.error raised",
+            "a dot between alphanumerics joins the name"
+        );
+        assert_eq!(
+            mask_echoes("scheme was auth.", &digest),
+            format!("scheme was {FILTERED_PLACEHOLDER}."),
+            "a sentence-ending dot must not leave the secret unmasked"
         );
     }
 
