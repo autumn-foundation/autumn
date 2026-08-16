@@ -4108,15 +4108,24 @@ fn apply_middleware(
         // them. Placed outside CSRF so a `BodyTooLarge` (empty body)
         // doesn't get masked by a `403` from CSRF's missing-token branch,
         // and a clear `400 invalid _method` outranks "missing CSRF".
-        axum::middleware::from_fn(crate::middleware::method_override_rejection_filter),
+        //
+        // `method_override_rejection_layer()` rather than
+        // `axum::middleware::from_fn(method_override_rejection_filter)`:
+        // same behavior, but without `from_fn`'s per-request `Box::pin` of
+        // its wrapped future and inner-service clone (issue #2214).
+        crate::middleware::method_override_rejection_layer(),
         tower::util::option_layer(build_bot_protection_layer(config)),
         tower::util::option_layer(build_csrf_layer(config, signing_keys_opt.clone())),
         // Inner to the CSRF layer so CSRF is validated first on the request
         // path; a replayed `_submit_token` is still short-circuited even when
         // the request carries a valid `_csrf` (issue #1360, AC #4).
         tower::util::option_layer(submit_token_layer),
-        axum::middleware::from_fn(move |req, next| {
-            trusted_host_middleware(req, next, trusted_host_policy.clone())
+        // Trusted-host check. A `GateLayer` rather than a `from_fn`: the
+        // decision is a synchronous look at the request's authority/Host and
+        // the forward path returns the inner response untouched, so it fits
+        // the allocation-free gate shape (issue #2214).
+        crate::middleware::GateLayer::new(move |req: &Request<axum::body::Body>| {
+            trusted_host_rejection(req, &trusted_host_policy)
         }),
         tower::util::option_layer(build_ingress_cors_layer(config)),
     );
@@ -4518,16 +4527,27 @@ fn apply_layers_in_registration_order(
     router.layer(ComposedRegisteredLayers::new(layers))
 }
 
-async fn trusted_host_middleware(
-    req: Request<axum::body::Body>,
-    next: Next,
-    policy: TrustedHostPolicy,
-) -> axum::response::Response {
+/// Decide whether `req` fails the trusted-host policy.
+///
+/// Returns `Some(400 problem-details response)` when the request must be
+/// rejected, or `None` when it should be forwarded untouched.
+///
+/// This is a pure synchronous predicate rather than an
+/// `axum::middleware::from_fn` middleware so the production stack can run it
+/// through the allocation-free [`GateLayer`](crate::middleware::GateLayer),
+/// which neither boxes a future nor clones the inner service per request
+/// (issue #2214). Behavior is unchanged from the `trusted_host_middleware`
+/// `async fn` this replaced — the branches are identical, only the
+/// forward path is expressed by returning `None` instead of awaiting `next`.
+fn trusted_host_rejection<B>(
+    req: &Request<B>,
+    policy: &TrustedHostPolicy,
+) -> Option<axum::response::Response> {
     let path = req.uri().path();
     if (req.method() == http::Method::GET || req.method() == http::Method::HEAD)
         && policy.probe_bypass_paths.contains(path)
     {
-        return next.run(req).await;
+        return None;
     }
     let authority = req.uri().authority().map(http::uri::Authority::as_str);
     let host_header = req
@@ -4542,28 +4562,29 @@ async fn trusted_host_middleware(
         .filter(|h| !h.is_empty());
     let host_source_present = raw_host.is_some();
     if host.is_none() && !host_source_present && policy.allow_missing_host {
-        return next.run(req).await;
+        return None;
     }
     if host.as_deref().is_some_and(|host| policy.allows_host(host)) {
-        next.run(req).await
-    } else {
-        tracing::warn!(host = ?host, "trusted host rejected request");
-        let body = crate::error::problem_details_json_string(
-            StatusCode::BAD_REQUEST,
-            "Invalid Host header",
-            None,
-            None,
-            None,
-            None,
-            true,
-        );
+        return None;
+    }
+    tracing::warn!(host = ?host, "trusted host rejected request");
+    let body = crate::error::problem_details_json_string(
+        StatusCode::BAD_REQUEST,
+        "Invalid Host header",
+        None,
+        None,
+        None,
+        None,
+        true,
+    );
+    Some(
         (
             StatusCode::BAD_REQUEST,
             [(http::header::CONTENT_TYPE, "application/problem+json")],
             body,
         )
-            .into_response()
-    }
+            .into_response(),
+    )
 }
 
 pub fn extract_host_without_port(header: &str) -> Option<&str> {
@@ -5045,6 +5066,15 @@ fn apply_startup_barrier(
         trace_context,
         tower::util::option_layer(server_timing_fallback),
         tower::util::option_layer(access_log_fallback),
+        // NOTE (#2214): this `from_fn_with_state` is the same synchronous
+        // forward-or-short-circuit shape that `GateLayer` exists to serve, and
+        // converting it would remove a boxed future and an inner-service clone
+        // from every request a deployed app serves. It is left alone
+        // deliberately: `apply_startup_barrier` runs OUTSIDE
+        // `try_build_router_inner`, so neither `benches/request_pipeline.rs`
+        // nor `tests/config_alloc_gate.rs` traverses it and the win cannot be
+        // measured by any committed harness today. Convert it once a harness
+        // exercises this layer, not before.
         axum::middleware::from_fn_with_state(barrier_state, startup_barrier),
     ))
 }
@@ -11821,7 +11851,7 @@ impl TrustedHostPolicy {
     }
 
     /// Whether a request carrying no usable `Host` is allowed through. Mirrors
-    /// `trusted_host_middleware`'s missing-host branch for callers (e.g. the MCP
+    /// `trusted_host_rejection`'s missing-host branch for callers (e.g. the MCP
     /// envelope) that enforce the policy outside that middleware.
     ///
     /// Only the `mcp` feature consumes this today; gated so default-feature

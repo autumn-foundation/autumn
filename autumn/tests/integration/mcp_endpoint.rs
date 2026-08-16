@@ -1254,7 +1254,7 @@ async fn proxy_resolved_same_origin_is_allowed() {
 
 #[tokio::test]
 async fn untrusted_host_is_rejected_even_without_origin() {
-    // Parity with normal routes' `trusted_host_middleware`: a request whose Host
+    // Parity with normal routes' `trusted_host_rejection`: a request whose Host
     // isn't trusted is refused (400) even when it carries no `Origin` (so the
     // DNS-rebinding Origin check is skipped). Without this gate a no-`Origin`
     // agent could call `initialize`/`tools/list` with an arbitrary Host and
@@ -1280,7 +1280,7 @@ async fn untrusted_host_is_rejected_even_without_origin() {
 async fn http2_authority_without_host_header_is_honored() {
     // An HTTP/2 client carries the target host in the request URI `:authority`
     // and may omit the `Host` header. The endpoint must resolve the host from
-    // the URI authority — exactly as `trusted_host_middleware` does for direct
+    // the URI authority — exactly as `trusted_host_rejection` does for direct
     // routes — instead of treating it as a missing host and 400'ing a trusted
     // authority. (`resolve_client_host` only consults the `Host` header, so
     // `ResolvedClientIdentity.host` is `None` here and the authority fallback is

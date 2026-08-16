@@ -146,17 +146,35 @@ async fn unused() -> &'static str {
 /// | CI workspace-unified features, before #2198 | 8 | 9 | **17** |
 /// | default features, after #2198 | 5 | 8 | **13** |
 /// | CI workspace-unified features, after #2198 | 5 | 9 | **14** |
+/// | default features, after #2214 | 5 | 6 | **11** |
+/// | CI workspace-unified features, after #2214 | 5 | 7 | **12** |
 ///
 /// #2198 removes three box levels by folding `apply_middleware`'s four
 /// remaining `Router::layer` calls — the inner group, the middle group, the
 /// session layer, and the outer group — into a single nested-tuple call.
 ///
-/// **Upper bound 15** = the widest predicted configuration (14) plus one, so
-/// restoring even ONE of the collapsed `.layer()` calls — which puts the
-/// measurement straight back to 16-17 — fails this gate.
+/// #2214 removes two *C* counts (not box levels — D is unchanged) by moving
+/// the method-override rejection filter and the trusted-host check off
+/// `axum::middleware::from_fn` and onto
+/// [`GateLayer`](autumn_web::middleware::GateLayer), whose `call` forwards to
+/// its inner service directly instead of cloning it the way every
+/// `from_fn`-generated service does. This is the legitimate way to lower *C*:
+/// real clone-on-call sites removed by writing a real `Service`/`Future`
+/// pair, **not** `BoxCloneSyncServiceLayer` type-erasure (which the "What
+/// this gate is blind to" section below warns trades this count for a hidden
+/// per-request boxed-future allocation instead). The corresponding
+/// allocation drop is gated separately and deterministically by
+/// `tests/config_alloc_gate.rs`.
+///
+/// **Upper bound 15** = the widest predicted configuration before #2214 (14)
+/// plus one, so restoring even ONE of the collapsed `.layer()` calls — which
+/// puts the measurement straight back to 16-17 — fails this gate. #2214 left
+/// the bound where it was rather than re-tightening it around 12: the *C*
+/// term is feature-dependent, and the allocation gate now pins the win that
+/// actually matters.
 ///
 /// **Lower bound 6** is a sentinel, not a budget. It sits well under the
-/// `from_fn` floor (C alone is 8-9, so no legitimate composition of the current
+/// `from_fn` floor (C alone is 6-7 as of #2214, so no legitimate composition of the current
 /// stack can reach it) and well above the 1-3 a probe measures once it has
 /// fallen out of the framework stack entirely — the failure mode described in
 /// the module header. It is deliberately slack: tightening it toward the real
@@ -262,8 +280,9 @@ async fn ingress_stack_depth_stays_within_budget() {
     assert!(
         traversals <= *INGRESS_TRAVERSAL_WINDOW.end(),
         "a single request deep-cloned the ingress stack {traversals} times \
-         (max {}). Expected 13 on the default feature set and 14 under CI's \
-         workspace-unified features; 16-17 is the pre-#2198 measurement, i.e. \
+         (max {}). Expected 11 on the default feature set and 12 under CI's \
+         workspace-unified features (as of #2214); 16-17 is the pre-#2198 \
+         measurement, i.e. \
          one of the four collapsed `Router::layer` calls in `apply_middleware` \
          is back. Every `Router::layer` call boxes the whole downstream stack in \
          a `BoxCloneSyncService`, and axum clones that box on each call — so the \
@@ -284,7 +303,7 @@ async fn ingress_stack_depth_stays_within_budget() {
         traversals >= *INGRESS_TRAVERSAL_WINDOW.start(),
         "the probe saw only {traversals} traversals (min {}), which is below the \
          `from_fn` floor of the current stack (the clone-on-call services alone \
-         account for 8-9) and means the probe is no longer inside the \
+         account for 6-7, as of #2214) and means the probe is no longer inside the \
          framework's ingress stack — so this gate is measuring nothing. Check \
          that `mount_raw_routers` still runs BEFORE `apply_middleware`; if \
          merged routers moved after it (the way `/mcp` is mounted), this test \

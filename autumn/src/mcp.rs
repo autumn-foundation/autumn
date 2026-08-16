@@ -1113,14 +1113,14 @@ struct ReplayContext<'a> {
 /// before the request body is buffered.
 ///
 /// The `/mcp` envelope is merged after `apply_middleware`, so it does not pass
-/// through the global [`trusted_host_middleware`](crate::router) every direct
+/// through the global trusted-host gate (`router::trusted_host_rejection`) every direct
 /// route runs; this layer restores that gate for the endpoint. Running as a
 /// layer (rather than inside `serve_mcp`) means a bad-`Host` request is rejected
 /// before the handler's `Bytes` extractor reads up to the configured
 /// `max_request_size_bytes`, exactly as a direct route rejects in middleware
 /// before handler extraction.
 ///
-/// Host resolution mirrors `trusted_host_middleware`: the proxy-resolved
+/// Host resolution mirrors `trusted_host_rejection`: the proxy-resolved
 /// identity first (honouring `X-Forwarded-Host` from trusted upstreams), then
 /// the HTTP/2 `:authority` carried in the request URI, then the `Host` header —
 /// so an HTTP/2 client that sends `:authority` without a `Host` header is not
@@ -1201,7 +1201,7 @@ async fn serve_mcp(
     // `mcp_host_origin_guard` layer (applied in `build_mcp_router`) rather than
     // here, so an untrusted Host or disallowed Origin is rejected *before* this
     // handler buffers `body` up to the configured `max_request_size_bytes` —
-    // mirroring how direct routes reject in `trusted_host_middleware` before
+    // mirroring how direct routes reject in `trusted_host_rejection` before
     // handler extraction.
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,

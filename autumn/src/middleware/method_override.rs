@@ -206,52 +206,87 @@ pub enum MethodOverrideRejection {
 ///
 /// The filter is a no-op when no rejection extension is present, so it
 /// is safe to apply to every route in the router.
+///
+/// Kept as a plain `async fn` for existing `axum::middleware::from_fn`
+/// callers and tests; the production router applies
+/// [`method_override_rejection_layer`] instead, which runs the same
+/// [`rejection_response`] check through the allocation-free
+/// [`GateLayer`](crate::middleware::gate::GateLayer) rather than paying
+/// `from_fn`'s per-request `Box::pin` and inner-service clone (issue #2214).
 pub async fn method_override_rejection_filter(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use crate::middleware::exception_filter::AutumnErrorInfo;
-    use axum::response::IntoResponse;
-
-    if let Some(rejection) = request
-        .extensions()
-        .get::<MethodOverrideRejection>()
-        .copied()
-    {
-        let (status, message) = match rejection {
-            MethodOverrideRejection::InvalidValue => (
-                StatusCode::BAD_REQUEST,
-                "Invalid method override value: must be PUT, PATCH, or DELETE.",
-            ),
-            MethodOverrideRejection::BodyTooLarge => (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "Form body too large for method-override scanning.",
-            ),
-        };
-        let mut response = (
-            status,
-            [(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("text/plain; charset=utf-8"),
-            )],
-            message,
-        )
-            .into_response();
-        // Surface this as a framework error so the exception filter
-        // chain (problem-details normalization, custom HTML error-page
-        // rendering) processes it the same as any handler-generated
-        // error response. Without this extension, `ExceptionFilterFuture`
-        // treats the response as pre-formed and skips renegotiation.
-        response.extensions_mut().insert(AutumnErrorInfo {
-            status,
-            message: message.to_owned(),
-            details: None,
-            problem_type: None,
-            backtrace_string: None,
-        });
+    if let Some(response) = rejection_response(&request) {
         return response;
     }
     next.run(request).await
+}
+
+/// Build the `400`/`413` response for a request carrying a stamped
+/// [`MethodOverrideRejection`] extension, or `None` when the request should
+/// be forwarded unchanged. Shared by [`method_override_rejection_filter`]
+/// and [`method_override_rejection_layer`] so the two entry points can never
+/// disagree on the response they produce.
+fn rejection_response<B>(request: &Request<B>) -> Option<axum::response::Response> {
+    use crate::middleware::exception_filter::AutumnErrorInfo;
+    use axum::response::IntoResponse;
+
+    let rejection = request
+        .extensions()
+        .get::<MethodOverrideRejection>()
+        .copied()?;
+    let (status, message) = match rejection {
+        MethodOverrideRejection::InvalidValue => (
+            StatusCode::BAD_REQUEST,
+            "Invalid method override value: must be PUT, PATCH, or DELETE.",
+        ),
+        MethodOverrideRejection::BodyTooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Form body too large for method-override scanning.",
+        ),
+    };
+    let mut response = (
+        status,
+        [(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        )],
+        message,
+    )
+        .into_response();
+    // Surface this as a framework error so the exception filter
+    // chain (problem-details normalization, custom HTML error-page
+    // rendering) processes it the same as any handler-generated
+    // error response. Without this extension, `ExceptionFilterFuture`
+    // treats the response as pre-formed and skips renegotiation.
+    response.extensions_mut().insert(AutumnErrorInfo {
+        status,
+        message: message.to_owned(),
+        details: None,
+        problem_type: None,
+        backtrace_string: None,
+    });
+    Some(response)
+}
+
+/// Signature of the synchronous rejection check handed to
+/// [`GateLayer`](crate::middleware::gate::GateLayer) by
+/// [`method_override_rejection_layer`]. A plain `fn` pointer (rather than a
+/// closure) so the layer stays `Copy` and nameable.
+type RejectionCheck = fn(&Request<axum::body::Body>) -> Option<Response<axum::body::Body>>;
+
+/// Allocation-free equivalent of
+/// `axum::middleware::from_fn(method_override_rejection_filter)`.
+///
+/// Same behavior — convert a stamped [`MethodOverrideRejection`] into its
+/// `400`/`413` response, forward everything else untouched — but routed
+/// through [`GateLayer`](crate::middleware::gate::GateLayer), so it neither
+/// boxes a future nor clones the inner service per request (issue #2214).
+/// This is what `router::apply_middleware` installs.
+#[must_use]
+pub fn method_override_rejection_layer() -> crate::middleware::gate::GateLayer<RejectionCheck> {
+    crate::middleware::gate::GateLayer::new(rejection_response as RejectionCheck)
 }
 
 /// Tower [`Layer`] that applies the HTML form method override convention.

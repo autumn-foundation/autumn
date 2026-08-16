@@ -35,6 +35,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **ingress `from_fn` layers:** the method-override rejection filter and the
+  trusted-host check no longer run through `axum::middleware::from_fn`. That
+  helper costs a heap allocation per request twice over: it `Box::pin`s the
+  async block it wraps (sized by everything that block holds across its
+  `.await`, which for an outer layer includes the whole downstream
+  continuation — profiled at ~1.1–2.2 KB per box), and the `Service` it
+  generates begins its `call` with `self.inner.clone()`, which deep-clones
+  every `BoxCloneSyncService` level beneath it. Both layers are pure
+  synchronous decisions that forward the inner response untouched, so they now
+  use a new `middleware::GateLayer` — a `Layer`/`Service`/`Future` trio whose
+  future is a two-variant enum (ready response, or the inner future) and whose
+  `call` forwards without cloning. Measured with the debug-profile
+  `allocation-counter` gate (`autumn/tests/config_alloc_gate.rs`), a
+  `TestClient` request drops from 220 to 204 allocation blocks (-7.3%) and
+  from 38,683 to 34,477 bytes (-10.9%), identical across repeated runs; the
+  ingress-traversal gate falls from 13 to 11. No behavior changed — both
+  middlewares keep their `async fn` form for existing `from_fn` callers and
+  tests, and each shares one decision function with its gate so the two paths
+  cannot diverge.
+
+  `GateLayer` is reusable for any ingress layer of the same shape. Layers that
+  await something of their own, rewrite the response on the way out, or hold a
+  guard across the inner call do not fit it and still need a hand-written
+  `Service`. The startup barrier is a known remaining candidate, left alone
+  deliberately because it is applied outside `try_build_router_inner` and no
+  committed harness traverses it, so the win could not be measured.
+
 - **config reads on the request path:** generated auth handlers, the admin
   plugin, the `saas` starter, and the `blog`/`saas`/`teams` examples now read
   configuration through `AppState::config_arc()` instead of

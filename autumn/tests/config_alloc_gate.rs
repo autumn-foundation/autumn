@@ -119,13 +119,25 @@ async fn ping() -> &'static str {
 /// decorative.
 ///
 /// Numbers behind the constant, all from the debug profile with default
-/// features on the pre-fix tree: a request allocates exactly 320 blocks
-/// (identical across three runs — the whole path is deterministic, so there is
-/// no noise budget to reserve), of which one whole-config deep clone accounts
-/// for 65 (measured by the sibling tests above). Serving that read from a
-/// shared handle instead therefore lands a request near 255, and the ceiling
-/// sits between the two: it trips today and clears afterwards with roughly a
-/// tenth of the budget to spare.
+/// features, and identical across repeated runs — the whole path is
+/// deterministic, so there is no noise budget to reserve:
+///
+/// | tree | blocks/request | bytes/request |
+/// | --- | ---: | ---: |
+/// | before #2198's `config_arc` work | 320 | — |
+/// | after #2198 (the tree #2214 branched from) | 220 | 38,683 |
+/// | after #2214 | **204** | **34,477** |
+///
+/// #2214 moved two ingress layers — the method-override rejection filter and
+/// the trusted-host check — off `axum::middleware::from_fn` and onto
+/// `GateLayer`. Each removal is worth ~8 blocks rather than the 1 you would
+/// expect from deleting a single `Box::pin`, because a `from_fn`-generated
+/// service *also* clones its inner service on every call, and the ingress
+/// stack is a tower of `BoxCloneSyncService`s: one clone-on-call site removed
+/// deletes a whole deep-clone traversal of everything beneath it. The bytes
+/// column falls faster than the block column (-10.9% vs -7.3%) because the
+/// boxed `from_fn` futures are individually large — they hold the whole
+/// downstream continuation across their single `.await`.
 ///
 /// A ceiling this close to the measured value is a deliberate trade: it can
 /// only stay honest while the number stays deterministic. If this ever fails
@@ -136,7 +148,7 @@ fn per_request_allocations_stay_under_the_ceiling() {
     use autumn_web::routes;
     use autumn_web::test::TestApp;
 
-    const CEILING: u64 = 288;
+    const CEILING: u64 = 225;
     const WARMUP: usize = 3;
     const MEASURED: u64 = 10;
 
