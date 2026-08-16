@@ -505,6 +505,15 @@ impl ColumnType {
     /// enum renders as its concrete `PascalCase` type name, not `String`, and
     /// its variant set cannot be recovered from a bare type token — so an enum
     /// type resolves to `None`.
+    ///
+    /// [`Json`](Self::Json) is the one exception to the leaf-matching rule
+    /// above: `Value` is common enough as a bare identifier (unlike the
+    /// domain-specific `Blob`/`Decimal`/`Uuid`/`NaiveDateTime`) that an
+    /// unrelated hand-written type sharing the name (`domain::Value`) would
+    /// otherwise be misclassified as JSON. Only the unqualified `Value` token
+    /// or the exact `serde_json::Value` path resolve to `Json`; any other
+    /// qualified path (`domain::Value`, `my_crate::sub::Value`) resolves to
+    /// `None`.
     #[must_use]
     pub fn from_rust_type(rust: &str) -> Option<Self> {
         // Normalise away all whitespace so `DateTime < Utc >` and
@@ -515,6 +524,13 @@ impl ColumnType {
         // `::` tail would otherwise mangle the `<…>` (`Utc>` etc.).
         if normalized.contains("DateTime<") {
             return Some(Self::TimestampTz);
+        }
+        // See the doc comment above: `Value` is too generic a bare name to
+        // safely leaf-match through an arbitrary path, so this checks the
+        // full normalised string rather than falling through to the
+        // `rsplit("::")` leaf split below.
+        if normalized == "Value" || normalized == "serde_json::Value" {
+            return Some(Self::Json);
         }
 
         // Take the final `::`-separated segment (path-tolerant); a token with no
@@ -534,7 +550,6 @@ impl ColumnType {
             "NaiveDateTime" => Some(Self::Timestamp),
             "Vec<u8>" => Some(Self::Bytes),
             "Blob" => Some(Self::Attachment),
-            "Value" => Some(Self::Json),
             "Decimal" => Some(Self::Decimal {
                 precision: 12,
                 scale: 2,
@@ -1361,6 +1376,17 @@ mod tests {
             ColumnType::from_rust_type("chrono::DateTime < chrono::Utc >"),
             Some(ColumnType::TimestampTz)
         );
+    }
+
+    #[test]
+    fn from_rust_type_value_leaf_match_is_scoped_to_serde_json() {
+        // Unlike `Blob`/`Decimal`/`Uuid`, `Value` is not leaf-matched through an
+        // arbitrary path — only the bare token or the exact `serde_json::Value`
+        // path resolve to `Json`. An unrelated hand-written type sharing the
+        // name must not be misclassified as JSON (Codex review finding on #1341).
+        assert_eq!(ColumnType::from_rust_type("domain::Value"), None);
+        assert_eq!(ColumnType::from_rust_type("my_crate::sub::Value"), None);
+        assert_eq!(ColumnType::from_rust_type("crate::Value"), None);
     }
 
     #[test]
