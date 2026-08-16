@@ -304,8 +304,20 @@ fn stands_alone(text: &str, cursor: usize, needle: &str, rest: &str) -> bool {
     let after = rest
         .get(needle.len()..)
         .and_then(|tail| tail.chars().next());
-    before.is_none_or(|char| !char.is_alphanumeric())
-        && after.is_none_or(|char| !char.is_alphanumeric())
+    before.is_none_or(|char| !is_identifier_char(char))
+        && after.is_none_or(|char| !is_identifier_char(char))
+}
+
+/// Whether `character` can sit *inside* an identifier, and so does not end a
+/// token.
+///
+/// Hyphen and underscore count, not only alphanumerics: `auth-error` and
+/// `auth_error` are single identifiers in error strings, log keys and enum
+/// spellings, so a whole-token-only `auth` that rewrote them to
+/// `[FILTERED]-error` would shred exactly the static messages replay compares
+/// against — the false `mismatch` this classification exists to prevent.
+fn is_identifier_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '-' || character == '_'
 }
 
 /// Mask any bind parameter whose bytes exactly echo a redacted request value.
@@ -1454,6 +1466,14 @@ mod tests {
             mask_echoes("scheme auth rejected", &digest),
             format!("scheme {FILTERED_PLACEHOLDER} rejected"),
             "it is still masked where it stands as a whole token"
+        );
+        // `-` and `_` sit *inside* identifiers, so they do not end a token:
+        // `auth-error` is one word, and rewriting it would shred the static
+        // messages replay compares against.
+        assert_eq!(
+            mask_echoes("auth-error and auth_error raised", &digest),
+            "auth-error and auth_error raised",
+            "identifier punctuation does not make a value stand alone"
         );
     }
 
