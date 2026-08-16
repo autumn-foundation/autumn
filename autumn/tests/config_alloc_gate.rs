@@ -162,16 +162,27 @@ async fn ping() -> &'static str {
 /// request allocates, which is what makes this ceiling meaningful rather than
 /// decorative.
 ///
-/// Numbers behind the constant, all from the debug profile with default
-/// features, and identical across repeated runs — the whole path is
-/// deterministic, so there is no noise budget to reserve:
+/// # The measurement is deterministic per feature set, NOT across feature sets
 ///
-/// | tree | blocks/request | bytes/request |
-/// | --- | ---: | ---: |
-/// | before #2198's `config_arc` work | 320 | — |
-/// | after #2198 | 220 | — |
-/// | after #2205 (`AppState` strings behind `Arc<str>`) | 172 | 37,819 |
-/// | after #2214 (two `from_fn` layers onto `GateLayer`) | **160** | **33,667** |
+/// Read this before re-deriving either constant. The per-request count is
+/// exactly reproducible for a *given* set of enabled Cargo features — the path
+/// is deterministic and there is no run-to-run noise budget to reserve — but it
+/// moves with the feature set, because feature-gated ingress layers add real
+/// per-request work. `cargo test -p autumn-web` builds the 8 default features;
+/// CI's `cargo test --workspace` unifies ~29 features across the workspace
+/// (`examples/blog` turns on `oauth2`, which adds its HTTP-interceptor
+/// `from_fn` to the stack), and measures a correspondingly larger number. This
+/// is the same feature-dependence `tests/integration/middleware_stack_depth.rs`
+/// documents for its traversal count.
+///
+/// Both columns, debug profile:
+///
+/// | tree | blocks (default) | bytes (default) | blocks (workspace-unified) | bytes (workspace-unified) |
+/// | --- | ---: | ---: | ---: | ---: |
+/// | before #2198's `config_arc` work | 320 | — | — | — |
+/// | after #2198 | 220 | — | — | — |
+/// | after #2205 (`AppState` strings behind `Arc<str>`) | 172 | 37,819 | — | — |
+/// | after #2214 (two `from_fn` layers onto `GateLayer`) | **160** | **33,667** | **168** | **40,907** |
 ///
 /// #2205 moved `AppState::profile` and `AppState::auth_session_key` from owned
 /// `String`/`Option<String>` to `Arc<str>`
@@ -197,33 +208,46 @@ async fn ping() -> &'static str {
 /// clone-on-call sites from the layer stack, and #2214's margin measured the
 /// same (-7% blocks / -11% bytes) against the pre-#2205 and post-#2205 trees.
 ///
-/// # Why both ceilings sit BELOW the previous measurement
+/// # How the two constants are derived, and what each one can promise
 ///
-/// A ceiling only protects a win if reverting the change trips it. Both
-/// constants therefore sit strictly between the new measurement and the old
-/// one, not at "new plus comfortable headroom": `BLOCK_CEILING` is under the
-/// pre-#2214 172, and `BYTE_CEILING` is under the pre-#2214 37,819, so
-/// restoring either `from_fn` layer fails this test rather than sliding
-/// underneath it.
+/// A ceiling only protects a win if reverting the change trips it, and it is
+/// only usable if the widest feature set CI builds still passes it. Those two
+/// constraints squeeze from opposite sides, and they do not resolve the same
+/// way for the two dimensions.
 ///
-/// The byte ceiling is not decorative duplication of the block ceiling. This
-/// change's effect is mostly on *size* rather than *count* (-11.0% bytes vs
-/// -7.0% blocks) because a boxed `from_fn` future is individually large, so a
-/// block-only gate would let most of the regression back in. Both numbers are
-/// deterministic, so both can be pinned this tightly.
+/// **`BLOCK_CEILING` = 170 genuinely protects #2214.** It has to be `>= 168`
+/// (the workspace-unified measurement, or CI fails) and `< 172` (the
+/// default-feature pre-#2214 measurement, or a revert slides underneath), which
+/// leaves 168..=171. Under workspace-unified features a revert also trips it:
+/// that tree is the 172 default-feature tree *plus* the extra feature-gated
+/// layers, and layers only ever add allocations, so its count exceeds 172 and
+/// therefore exceeds 170. (That specific figure is reasoned, not measured —
+/// only the four numbers in the table above were measured directly.)
 ///
-/// Ceilings this close to the measured values are a deliberate trade: they can
-/// only stay honest while the numbers stay deterministic. If this ever fails
-/// just over a line rather than by a regression-sized jump, re-measure and
-/// re-derive rather than nudging the constants upwards.
+/// **`BYTE_CEILING` = 43,000 cannot protect #2214, and does not claim to.** The
+/// arithmetic forbids it: passing CI needs `>= 40,907`, while tripping a
+/// default-feature revert needs `< 37,819`, and there is no such number. The
+/// feature-set spread in bytes (40,907 - 33,667 = 7,240) is larger than the
+/// whole byte win (37,819 - 33,667 = 4,152), so no single constant can
+/// distinguish "someone reverted #2214" from "CI enabled more features". It is
+/// kept as a coarse catch for gross byte regressions — a handful of boxed
+/// futures or a whole-config deep clone reappearing — which the block count
+/// alone under-weights, since a boxed `from_fn` future is individually large.
+/// The block ceiling is what pins this change.
+///
+/// If either ever fails *just* over its line rather than by a regression-sized
+/// jump, re-measure under BOTH feature sets and re-derive — do not nudge the
+/// constants upwards.
 #[test]
 fn per_request_allocations_stay_under_the_ceiling() {
     use autumn_web::routes;
     use autumn_web::test::TestApp;
 
-    // Measured 160 blocks / 33,667 bytes; pre-#2214 was 172 / 37,819.
-    const BLOCK_CEILING: u64 = 166;
-    const BYTE_CEILING: u64 = 35_500;
+    // See the derivation in this test's doc comment before changing either.
+    // default features: 160 blocks / 33,667 bytes (pre-#2214: 172 / 37,819)
+    // workspace-unified (CI): 168 blocks / 40,907 bytes
+    const BLOCK_CEILING: u64 = 170;
+    const BYTE_CEILING: u64 = 43_000;
     const WARMUP: usize = 3;
     const MEASURED: u64 = 10;
 
@@ -267,9 +291,10 @@ fn per_request_allocations_stay_under_the_ceiling() {
         bytes_per_request <= BYTE_CEILING,
         "a request allocated {bytes_per_request} bytes, over the \
          {BYTE_CEILING} ceiling ({} blocks and {} bytes across {MEASURED} \
-         requests). This gate is what keeps #2214's -11% byte win from being \
-         quietly given back — a boxed `from_fn` future is large, so a \
-         regression shows up here before it shows up in the block count.",
+         requests). This is a coarse catch for gross byte regressions, not a \
+         tight gate on #2214 — see this test's doc comment for why no byte \
+         ceiling can be both CI-passing and revert-tripping. A jump here means \
+         boxed futures or a large clone came back on the request path.",
         info.count_total,
         info.bytes_total
     );

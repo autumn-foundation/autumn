@@ -171,10 +171,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `call` forwards without cloning. Measured with the debug-profile
   `allocation-counter` gate (`autumn/tests/config_alloc_gate.rs`), a
   `TestClient` request drops from 172 to 160 allocation blocks (-7.0%) and
-  from 37,819 to 33,667 bytes (-11.0%), identical across repeated runs; the
-  ingress-traversal gate falls from 13 to 11. Independent of and composing
-  with the `AppState`/`Arc<str>` fix above: the same -7%/-11% margin was
-  measured against the tree both before and after that change landed. No behavior changed — both
+  from 37,819 to 33,667 bytes (-11.0%) on the default feature set; the
+  ingress-traversal gate falls from 13 to 11. The absolute figures move with
+  the enabled features — a workspace-unified build measures 168 blocks /
+  40,907 bytes after this change, because feature-gated ingress layers
+  (`oauth2`'s interceptor and friends) add real per-request work — but the
+  measurement is exactly reproducible for any given feature set. Independent
+  of and composing with the `AppState`/`Arc<str>` fix above: the same
+  -7%/-11% margin was measured against the tree both before and after that
+  change landed. No behavior changed — both
   middlewares keep their `async fn` form for existing `from_fn` callers and
   tests, and each shares one decision function with its gate so the two paths
   cannot diverge.
