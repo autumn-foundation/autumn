@@ -234,6 +234,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (200/2,000/20,000 recipients); total buffers 660→604 (200), 6,600→6,004
   (2,000), and 66,000→8,070 (20,000, −87.8%). No index or migration changes
   — see `docs/reports/2026-08-15-ledger-mail-suppression-batch/`.
+- **scaffold:** the generated `index` page for a `belongs_to`/`references`
+  field with a resolved display column (#1146) no longer scans the *entire*
+  referenced table to label the ~20 rows on one page. `autumn-cli`'s
+  `render_index_reference_label_loads` reused the create/edit form's
+  `{name}_select_options` loader — a full, unfiltered `SELECT id, col FROM
+  table ORDER BY id` that genuinely needs every row for a `<select>` — to
+  build the index's parent-label map too, so every index page view re-read
+  the whole referenced table regardless of page size. It now scopes the
+  query to `WHERE id = ANY(...)` the page's own FK values
+  (`page_data.content`, already fetched), and the identical fix applies to
+  the `--belongs-to` nested list (`children_section_with`). Measured
+  (`EXPLAIN (ANALYZE, BUFFERS)` + `pg_stat_statements`, production-shaped
+  fixture): rows read at the scan node drop from 500,000→20 (-99.996%) at
+  500k parent rows, with total buffers 7,051→83 (-98.8%); 707→61 (-91.4%)
+  at 50k rows and 72→54 (-25.0%) at 5k rows. No index or migration changes
+  — see `docs/reports/2026-08-16-ledger-scaffold-index-label-scope/`.
 
 ### Added
 
