@@ -10795,9 +10795,10 @@ const API_SMOKE_TEST_SEED_ROWS: usize = 25;
 /// `generate_series` index bound to `g` (1..=[`API_SMOKE_TEST_SEED_ROWS`]).
 ///
 /// The index is woven into the value for the types that can vary it while
-/// staying valid (text, integers, floats, timestamps) so that a `unique`
-/// column of one of those types does not collide across the seeded rows; the
-/// remaining types fall back to [`sql_sample_literal`]'s constant sample.
+/// staying valid (text, integers, floats, timestamps, json) so that a
+/// `unique` column of one of those types does not collide across the seeded
+/// rows; the remaining types fall back to [`sql_sample_literal`]'s constant
+/// sample.
 /// Those constant types (enum's closed set, a `references` FK id, bool,
 /// decimal at a fixed scale, bytea) cannot hold [`API_SMOKE_TEST_SEED_ROWS`]
 /// distinct values anyway — an inherent limit that only matters for the
@@ -10821,6 +10822,10 @@ fn sql_seed_value_expr(f: &Field) -> String {
         FieldKind::Enum => {
             format!("'{}'", f.variants.first().expect("enum field has variants"))
         }
+        // A constant `'{}'::jsonb` for every row (issue #1341 review) would
+        // collide on the very first re-insert for a `unique` json column —
+        // vary it with `g`, same as the text/numeric arms above.
+        FieldKind::Json => "('{\"seed\": ' || g || '}')::jsonb".to_owned(),
         _ => sql_sample_literal(f.kind),
     }
 }
@@ -17498,6 +17503,29 @@ async fn main() {
                 "{literal} must contain valid JSON"
             );
         }
+    }
+
+    #[test]
+    fn json_seed_value_varies_per_row_for_unique_columns() {
+        // Issue #1341 review: a constant `'{}'::jsonb` for every row (the
+        // `sql_sample_literal` fallback) would collide on the very first
+        // re-insert for a `unique` json column in the `--api` smoke test's
+        // 25-row (`API_SMOKE_TEST_SEED_ROWS`) seed — must vary with `g`, same
+        // as the text/numeric/timestamp arms.
+        let f = csv_test_field("config", FieldKind::Json, false);
+        let expr = sql_seed_value_expr(&f);
+        assert!(
+            expr.contains(" g "),
+            "must vary per row via the generate_series index: {expr}"
+        );
+        assert!(
+            expr.ends_with("::jsonb"),
+            "must be a jsonb-cast expression: {expr}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>("{\"seed\": 1}").is_ok(),
+            "sanity: the woven shape is valid JSON"
+        );
     }
 
     #[test]
