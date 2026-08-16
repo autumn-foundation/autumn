@@ -296,6 +296,62 @@ impl PeerTransport for RetainSpy {
     }
 }
 
+/// A [`PeerTransport`] that records every address the node reported an
+/// **unauthenticated** frame for, and delegates everything else.
+///
+/// Exists because the deterministic suite's loopback transport inherits the
+/// trait's no-op `note_unauthenticated_frame`: the transport-level test drives
+/// that back-channel by hand, so deleting the *node's* call to it — the thing
+/// that makes the inbound connection budget contingent on authentication —
+/// would leave every other test in the workspace green.
+struct RejectionSpy {
+    inner: Arc<dyn PeerTransport>,
+    reported: std::sync::Mutex<Vec<String>>,
+}
+
+impl RejectionSpy {
+    fn new(inner: Arc<dyn PeerTransport>) -> Self {
+        Self {
+            inner,
+            reported: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Every address reported so far, in order.
+    fn reported(&self) -> Vec<String> {
+        self.reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl PeerTransport for RejectionSpy {
+    fn send(&self, to: &str, frame: Vec<u8>) {
+        self.inner.send(to, frame);
+    }
+
+    fn take_incoming(&self) -> Option<IncomingFrames> {
+        self.inner.take_incoming()
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.inner.local_addr()
+    }
+
+    fn start(&self, shutdown: &CancellationToken, entropy: &Arc<dyn Entropy>) {
+        self.inner.start(shutdown, entropy);
+    }
+
+    fn note_unauthenticated_frame(&self, from: &str) {
+        self.reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(from.to_owned());
+        self.inner.note_unauthenticated_frame(from);
+    }
+}
+
 /// A one-line description of a node's view, for failure messages.
 fn view_of(node: &TestNode) -> String {
     format!(
@@ -1068,6 +1124,85 @@ async fn push_round_retires_writers_for_addresses_that_left_the_target_set() {
     );
 
     token.cancel();
+}
+
+/// The production wiring of the connection budget's back-channel: a frame that
+/// never proved the shared secret must be reported **to the transport**, and a
+/// peer that did prove it must never be.
+///
+/// Verification lives here, in the receive loop, while the sockets live in the
+/// transport — so this call is the only thing that can make an inbound
+/// connection's slot contingent on authentication. Delete it and the transport
+/// keeps every abusive connection open until it goes quiet: one well-framed
+/// garbage frame per idle window holds a slot indefinitely, and
+/// `MAX_INBOUND_CONNECTIONS` of them lock real peers out at the cap. Nothing
+/// else in the suite can see that, because the loopback transport's
+/// implementation of the back-channel is a no-op.
+///
+/// The negative half is the other half of the security property: a peer whose
+/// MAC verified has earned its descriptor, and reporting *its* address would
+/// mean a real peer could be evicted for a frame a newer version of it was
+/// entitled to send (`self_origin`, `replay`, an unknown `payload`).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn receive_loop_reports_only_unauthenticated_frames_to_the_transport() {
+    let router = LoopbackRouter::new();
+    let clock = test_clock();
+    let spy = Arc::new(RejectionSpy::new(router.endpoint()));
+    let addr = spy.local_addr().to_string();
+    let token = CancellationToken::new();
+
+    let handle = ClusterNode::start(
+        ClusterRuntimeConfig {
+            cluster_name: CLUSTER.to_owned(),
+            secret: SECRET.to_vec(),
+            node_id: Some("node-a".to_owned()),
+            advertise_addr: None,
+            seed_peers: Vec::new(),
+            push_interval: PUSH,
+            suspicion_timeout: SUSPICION,
+        },
+        Arc::new(SeededEntropy::new(11)),
+        Arc::new(clock.clone()),
+        token.clone(),
+        Arc::clone(&spy) as Arc<dyn PeerTransport>,
+    )
+    .expect("a cluster node must start on a spying transport");
+
+    // A real peer, and a stranger signing with the wrong secret — both aimed at
+    // the node above.
+    let peer = start_node(&router, &clock, SECRET, "node-b", 2, vec![addr.clone()]);
+    let intruder = start_node(
+        &router,
+        &clock,
+        OTHER_SECRET,
+        "node-intruder",
+        3,
+        vec![addr.clone()],
+    );
+    settle(&clock, 8).await;
+
+    assert!(
+        handle.frames_rejected_total() > 0,
+        "sanity: the intruder's frames must actually have arrived and been \
+         refused, or this test proves nothing"
+    );
+    let reported = spy.reported();
+    assert!(
+        reported.contains(&intruder.addr),
+        "a frame that failed the MAC must be reported to the transport, which \
+         is the only way the connection holding a slot can be closed; the node \
+         reported {reported:?}"
+    );
+    assert!(
+        !reported.contains(&peer.addr),
+        "a peer whose frames verify must NEVER be reported: its connection has \
+         been earned, and charging it for a `replay` or an unknown `payload` \
+         would close a healthy peer's socket; the node reported {reported:?}"
+    );
+
+    token.cancel();
+    peer.token.cancel();
+    intruder.token.cancel();
 }
 
 /// `Suspect` must be visible on the surface the guide documents: two missed
