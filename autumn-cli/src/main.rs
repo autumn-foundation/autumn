@@ -37,6 +37,7 @@ mod plugin_check;
 mod process;
 mod release;
 mod replay;
+mod retention;
 mod routes;
 mod routes_audit;
 mod scaling_driver;
@@ -652,6 +653,35 @@ enum Commands {
             allow_hyphen_values = true
         )]
         args: Vec<String>,
+    },
+    /// Report what declared `#[repository(..., retention(...))]` policies
+    /// would sweep, without deleting anything.
+    ///
+    /// Validates a policy before it runs for real: every recurring sweep a
+    /// declared policy registers is otherwise fully automatic (issue #1342).
+    ///
+    /// # Examples
+    ///
+    ///   autumn retention --dry-run
+    ///   autumn retention --dry-run --model Session
+    #[command(verbatim_doc_comment)]
+    Retention {
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Report what would be swept without deleting anything. Currently
+        /// required — there is no separate command to trigger a real sweep.
+        #[arg(long)]
+        dry_run: bool,
+        /// Narrow the report to a single model's policy.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
     },
     /// Scaffold models, migrations, and CRUD code for a new resource.
     ///
@@ -3253,6 +3283,19 @@ fn run_command(command: Commands) {
             name.as_deref(),
             &args,
         ),
+        Commands::Retention {
+            package,
+            bin,
+            profile,
+            dry_run,
+            model,
+        } => retention::run(&retention::RetentionOptions {
+            package: package.as_deref(),
+            bin: bin.as_deref(),
+            profile: &profile,
+            dry_run,
+            model: model.as_deref(),
+        }),
         Commands::Setup { force } => setup::run(force),
         Commands::Assets { action } => match action {
             AssetsCommands::Add { spec, url } => assets::run_add(&spec, url.as_deref()),
