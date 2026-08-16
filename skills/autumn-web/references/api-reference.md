@@ -721,6 +721,31 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   / `Timeout` map to `503`.
 - Non-goals: not fair, not a lease, not row-level (`with_lock`), Postgres only.
 
+## Embedded clustering (unreleased — trunk-dev, #1762)
+
+- `autumn_web::cluster` — zero-dependency two-node clustering: authenticated
+  TCP gossip membership plus one shared primitive, an eventually consistent
+  cluster-wide grow-only counter. Always compiled (no cargo feature); inert
+  unless `[cluster] enabled = true`. Not leader election, not mutual
+  exclusion, not durable — for run-once work use `Lock` above.
+- Handle: `state.extension::<ClusterHandle>() -> Option<Arc<ClusterHandle>>`
+  (`None` when disabled). `ClusterHandle::{node_id() -> &str, local_addr() ->
+  SocketAddr, members() -> Vec<ClusterMemberInfo>, counter(name) ->
+  ClusterCounter}`; `ClusterMemberInfo { id, addr, status: Alive|Suspect,
+  incarnation }` is the **local** view including this node.
+- Counter: `ClusterCounter::increment()` / `increment_by(n)` (sync, local,
+  never fails; replicated on the next push) and `get() -> u64` (saturating
+  sum of every merged cell; may jump upward on a peer merge, never moves
+  down — a lower bound, not an enforceable limit). Cells are keyed by
+  `(node id, boot incarnation)`; counters live for the process lifetime only.
+- Surfacing: `cluster:membership` health indicator (HealthOnly — one member is
+  `UP`; details need `health.detailed = true`) and `autumn_cluster_*` metric
+  families (members gauge, pushes sent/received, merges, frames
+  rejected-by-reason, frames dropped).
+- Guide: [docs/guide/clustering.md](../../../docs/guide/clustering.md) — wire
+  format, failure semantics (eventually consistent; authenticated HMAC-SHA256,
+  unencrypted — trusted networks only), and a two-terminal walkthrough.
+
 ## Auth additions
 
 - Published 0.5.0: `autumn generate auth` session management (`{user}_sessions`
@@ -1116,6 +1141,28 @@ Frequently used env keys:
 | `AUTUMN_STORAGE__BACKEND` | `storage.backend` |
 | `AUTUMN_CACHE__BACKEND` | `cache.backend` |
 | `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (unreleased — trunk-dev) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
+
+### `[cluster]` — embedded clustering (unreleased — trunk-dev, #1762)
+
+Opt-in, zero-dependency two-node clustering (see "Embedded clustering" above).
+Off by default; when enabled a secret of ≥16 bytes is required (fail-fast
+validation, no unauthenticated mode).
+
+```toml
+[cluster]
+enabled = true
+secret = "…"                      # required, ≥16 bytes; prefer AUTUMN_CLUSTER__SECRET
+cluster_name = "autumn"           # MAC-covered; two clusters cannot mix
+bind_addr = "127.0.0.1:0"         # port 0 = ephemeral (resolved port is advertised)
+advertise_addr = "10.0.1.7:7946"  # required for wildcard binds; port 0 rejected
+seed_peers = ["10.0.1.8:7946"]    # dial list; CSV in env form; port 0 rejected
+node_id = "web-1"                 # default: per-boot random id; no '#' allowed
+push_interval_ms = 500            # ±20% per-node jitter
+suspicion_timeout_ms = 2500       # ≥ 3× push_interval_ms enforced
+```
+
+Env form `AUTUMN_CLUSTER__<KEY>`; addresses are IP literals (no hostname
+resolution).
 
 ### `[failure_capture]` — failure capsules (unreleased — trunk-dev, #1598)
 

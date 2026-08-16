@@ -218,6 +218,14 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_encrypted.rs");
 
+    // A HOOKS-enabled repository over an encrypted model (requires db feature).
+    // `hooks = ...` / `broadcasts = true` route updates through the hooks-aware
+    // `update_many` path, which must bind an OWNED proposed row to `.set(..)`:
+    // diesel implements `AsChangeset` only for the owned model once a field
+    // uses `serialize_as`, as every `#[encrypted]` field does (#1340).
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_encrypted_hooks.rs");
+
     // Sharding extractors + repository with_pool over a shard (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/sharded_handlers.rs");

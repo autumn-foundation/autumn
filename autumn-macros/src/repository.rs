@@ -6885,8 +6885,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let mut offset = 0;
                         for chunk in proposed_rows.chunks(1000) {
                             let mut chunk_updated = Vec::new();
+                            // Owned (`.clone()`, not the borrowed `proposed`): an
+                            // `#[encrypted]` column routes through diesel
+                            // `serialize_as`, which CONSUMES the value, so diesel
+                            // implements `AsChangeset` only for the owned model —
+                            // never `&Model`. Borrowing here failed to compile any
+                            // hooks-enabled (or `broadcasts = true`) repository over
+                            // a model with an encrypted column. The single-record
+                            // hooks paths above already clone for the same reason;
+                            // cloning also works for every plain model.
                             for proposed in chunk {
                                 let update_target = #table_ident::table.find(proposed.id);
+                                let proposed = ::core::clone::Clone::clone(proposed);
                                 let updated = #update_expr
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 chunk_updated.push(updated);

@@ -1822,7 +1822,7 @@ impl TestApp {
             // noted asserts through the production seam instead.
             #[cfg(all(feature = "db", feature = "reporting"))]
             db_capture_gap: None,
-            profile: self.config.profile.clone(),
+            profile: self.config.profile.as_deref().map(std::sync::Arc::from),
             role: self.config.role,
             started_at,
             health_detailed: self.config.health.detailed,
@@ -1851,7 +1851,7 @@ impl TestApp {
             forbidden_response: self
                 .forbidden_response_override
                 .unwrap_or(self.config.security.forbidden_response),
-            auth_session_key: self.config.auth.session_key.clone(),
+            auth_session_key: std::sync::Arc::from(self.config.auth.session_key.as_str()),
             shared_cache: None,
             clock,
             entropy: self

@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use super::dsl::{Field, FieldKind, IdType, parse_fields};
+use super::dsl::{
+    EncryptedMode, Field, FieldKind, IdType, parse_fields, randomized_equality_lookup_reason,
+};
 use super::emit::{Action, Plan, Revert};
 use super::model::{
     ModelOptions, augment_fields_for_soft_delete, field_by_name, parse_model_metadata,
@@ -591,7 +593,7 @@ fn plan_scaffold_with_options_impl(
             slug.name
         )));
     }
-    let queries = parse_query_specs(&fields, &options_with_key.queries)?;
+    let queries = parse_query_specs(&fields, &options_with_key.queries, for_revert)?;
     let form_fields = fields
         .iter()
         .filter(|field| !metadata.defaults().contains_key(&field.name))
@@ -1857,9 +1859,14 @@ fn validate_enum_field_names_against_routes_imports(
     Ok(())
 }
 
+/// `for_revert` skips the generation-only refusals: `autumn destroy scaffold`
+/// recomputes the plan it is about to revert, and refusing there would strand
+/// the very files the user asked to delete (same posture as the `slug`/
+/// `lock_version` gates in `plan_scaffold_with_options_impl`).
 fn parse_query_specs(
     fields: &[Field],
     queries: &[String],
+    for_revert: bool,
 ) -> Result<Vec<QuerySpec>, GenerateError> {
     let mut parsed = Vec::with_capacity(queries.len());
     for query in queries {
@@ -1903,6 +1910,21 @@ fn parse_query_specs(
             return Err(GenerateError::InvalidField {
                 token: query.clone(),
                 reason: format!("`--query` on enum field '{field_name}' is not yet supported"),
+            });
+        }
+        // Issue #1340 AC6: a derived `find_by_<col>` against a RANDOMIZED
+        // encrypted column compiles fine and then fails at runtime — the
+        // repository macro routes the bound string through the encrypted-column
+        // registry, which raises `EncryptionError::RandomizedEqualityLookup`
+        // because a fresh nonce per write means the needle's ciphertext can
+        // never equal the stored one. Refuse it where the fix is one word away.
+        if !for_revert && field.is_randomized_encrypted() {
+            return Err(GenerateError::InvalidField {
+                token: query.clone(),
+                reason: randomized_equality_lookup_reason(
+                    field_name,
+                    "has a `--query` derived equality lookup",
+                ),
             });
         }
         if parsed.iter().any(|spec: &QuerySpec| spec.method == method) {
@@ -2873,8 +2895,9 @@ fn render_routes_file(
     } else {
         format!(
             "diesel::insert_into({plural}::table)\n        \
-             .values(&new)\n        \
-             .execute(&mut *db)\n        .await?;"
+             .values({insert_record})\n        \
+             .execute(&mut *db)\n        .await?;",
+            insert_record = insert_record_expr(fields),
         )
     };
 
@@ -6574,11 +6597,12 @@ fn render_nested_section(
     // validation failure, so — exactly like the flat create (issue #1032) — it
     // is classified into an inline field error and re-rendered at 422 rather
     // than surfacing as a 500.
+    let insert_record = insert_record_expr(fields);
     let insert_block = if has_unique {
         format!(
             "    let result: AutumnResult<()> = async {{\n        \
              diesel::insert_into({plural}::table)\n            \
-             .values(&new)\n            \
+             .values({insert_record})\n            \
              .execute(&mut *db)\n            .await?;\n        \
              Ok(())\n    \
              }}.await;\n    \
@@ -6596,7 +6620,7 @@ fn render_nested_section(
     } else {
         format!(
             "    diesel::insert_into({plural}::table)\n        \
-             .values(&new)\n        \
+             .values({insert_record})\n        \
              .execute(&mut *db)\n        .await?;\n"
         )
     };
@@ -8176,9 +8200,20 @@ const CSV_TEXT_CELL_HELPER: &str = "\n\n\
 /// export, and a column that is always blank is noise in a spreadsheet.
 fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
     use std::fmt::Write as _;
+    // Issue #1340: an at-rest encrypted column is excluded from the export. The
+    // model holds PLAINTEXT in memory, so including it would stream the
+    // decrypted secret of every listed row into a file that then lives outside
+    // the app entirely — a downloaded `.csv` in a Downloads folder, an email
+    // attachment, a shared drive. That is the one place the "plaintext in Rust,
+    // ciphertext at rest" bargain stops holding, and it is exactly why
+    // `autumn-admin-plugin`'s own `AdminModel::csv_export_columns` already
+    // filters `!f.encrypted`. The scaffolded export matches that posture rather
+    // than contradicting the admin for the same column. Re-add the column here
+    // (plus a matching `to_csv_record` entry) if the export genuinely needs it.
+    let exported: Vec<&Field> = fields.iter().filter(|f| !f.is_encrypted()).collect();
     let mut headers = String::from("\"id\"");
     let mut record = String::from("            self.id.to_string(),\n");
-    for f in fields {
+    for f in &exported {
         let _ = write!(headers, ", \"{}\"", f.name);
         let _ = writeln!(record, "            {},", csv_value_expr(f));
     }
@@ -8187,7 +8222,7 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
     // The formula guard is emitted only when some column actually routes through
     // it — an unused `fn` in the generated app is a `dead_code` warning, and the
     // scaffold's contract is that generated code compiles warning-free.
-    let text_cell_helper = if fields.iter().any(|f| csv_kind_is_text(f.kind)) {
+    let text_cell_helper = if exported.iter().any(|f| csv_kind_is_text(f.kind)) {
         CSV_TEXT_CELL_HELPER
     } else {
         ""
@@ -8215,6 +8250,12 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
          /// time-bounded URL the `show` view renders — a spreadsheet cell has no\n\
          /// use for a URL that expires. Drop the column here if those keys should\n\
          /// not leave the app.\n\
+         ///\n\
+         /// An at-rest `#[encrypted]` column is OMITTED entirely (issue #1340):\n\
+         /// the model holds plaintext in memory, so exporting it would write the\n\
+         /// decrypted secret of every listed row into a file that leaves the app.\n\
+         /// The admin panel's own CSV export omits encrypted columns for the same\n\
+         /// reason. Add the column to BOTH lists below if you really need it.\n\
          impl autumn_web::data::csv::CsvSchema for {pascal_name} {{\n    \
          fn csv_columns() -> &'static [&'static str] {{\n        \
          &[{headers}]\n    \
@@ -8240,6 +8281,22 @@ const fn kind_is_sortable(kind: FieldKind) -> bool {
         kind,
         FieldKind::Bytea | FieldKind::Attachment | FieldKind::Enum
     )
+}
+
+/// Whether this *field* should render a sortable index header.
+///
+/// [`kind_is_sortable`] answers the question for the column's storage type; an
+/// at-rest encrypted column (issue #1340) fails it for a second reason the kind
+/// cannot see. `#[encrypted]` columns are `String`, so the `#[model]` macro
+/// happily puts them in its `ORDER BY` allowlist — but the database only holds
+/// base64 ciphertext, so the server would order by envelope bytes. For a
+/// randomized column that order is arbitrary and reshuffles on every write; for
+/// a deterministic one it is stable but still unrelated to the plaintext order
+/// the header link promises. Either way the control lies about what it does, so
+/// don't render it (same posture as the nested child list, which withholds
+/// `.sortable(..)` rather than stamp an `aria-sort` that never changes).
+const fn field_is_sortable(field: &Field) -> bool {
+    kind_is_sortable(field.kind) && !field.is_encrypted()
 }
 
 /// Emit the `let columns: Vec<Column<Pascal>> = vec![…];` block for the index handler.
@@ -8278,7 +8335,7 @@ fn render_columns_vec(
     // One column per field
     for f in fields {
         let header = title_case(&f.name);
-        let sortable_suffix = if sortable && kind_is_sortable(f.kind) {
+        let sortable_suffix = if sortable && field_is_sortable(f) {
             format!(".sortable(\"{}\")", f.name)
         } else {
             String::new()
@@ -8304,9 +8361,24 @@ fn render_columns_vec(
         } else {
             cell_value_expr(f)
         };
+        // Issue #1340: an at-rest encrypted column renders a redaction marker in
+        // a LIST cell, never the decrypted value. A list is a bulk-disclosure
+        // surface — one page shows every row's secret at once, to everyone the
+        // index is authorized for, and ends up in screenshots, printouts, and
+        // page caches. The single-record `show` view and the `edit` form still
+        // render the real value: the reader routed there deliberately, for one
+        // record, and a form has to show what it is editing. That split mirrors
+        // the admin panel's own `.encrypted()` / `.encrypted_visible()`. The
+        // closure binds `_row` because the cell ignores it, keeping the
+        // generated app warning-free.
+        let (binding, cell_expr) = if f.is_encrypted() {
+            ("_row", "\"••••••••\"".to_owned())
+        } else {
+            ("row", cell_expr)
+        };
         let _ = writeln!(
             out,
-            "        autumn_web::widgets::Column::new(\"{header}\", |row: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
+            "        autumn_web::widgets::Column::new(\"{header}\", |{binding}: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
         );
     }
     // Show link column. Keyed off the slug (issue #1260) when the model has
@@ -8539,14 +8611,67 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
         if i > 0 {
             out.push_str(", ");
         }
-        write!(
-            out,
-            "{plural}::{name}.eq(new.{name}.clone())",
-            name = f.name
-        )
+        // Issue #1340: this `.set((…))` tuple is a RAW diesel write — it does
+        // not go through `New{Model}`/`Update{Model}`, so it never sees the
+        // `#[diesel(serialize_as = …)]` wrapper the `#[model]` macro attaches to
+        // an `#[encrypted]` field. Binding the bare `String` here would store
+        // PLAINTEXT in a column the reader then tries to decrypt: a silent leak
+        // of exactly the data the annotation exists to protect, plus a
+        // `MalformedEnvelope` error on the very next read. Bind through the same
+        // wrapper type instead, so the update path encrypts identically to the
+        // insert path.
+        match f.encrypted_mode() {
+            Some(mode) => write!(
+                out,
+                "{plural}::{name}.eq(autumn_web::encryption::{wrapper}::from(new.{name}.clone()))",
+                name = f.name,
+                wrapper = encryption_wrapper_type(mode),
+            ),
+            None => write!(
+                out,
+                "{plural}::{name}.eq(new.{name}.clone())",
+                name = f.name
+            ),
+        }
         .unwrap();
     }
     out
+}
+
+/// How the generated raw-diesel insert passes the `New{Model}` record to
+/// `.values(…)` — `&new` normally, `new` (owned) once any column is
+/// `{encrypted}` (issue #1340).
+///
+/// `#[diesel(serialize_as = …)]`, which the `#[model]` macro attaches to every
+/// `#[encrypted]` field, *consumes* the field on the way to SQL, so diesel
+/// implements `Insertable<table>` for the owned `New{Model}` only — never for
+/// `&New{Model}`. Borrowing would fail to compile the generated app with
+/// "the trait bound `&NewX: Insertable<table>` is not satisfied". The macro's
+/// own factory and bulk-upsert codegen already pass owned records for exactly
+/// this reason.
+///
+/// The borrowed form is kept for every other scaffold so unencrypted output
+/// stays byte-for-byte identical; `new` is not read after the insert on either
+/// path, so the move is always sound.
+fn insert_record_expr(fields: &[Field]) -> &'static str {
+    if fields.iter().any(Field::is_encrypted) {
+        "new"
+    } else {
+        "&new"
+    }
+}
+
+/// The `autumn_web::encryption` diesel wrapper type that encrypts a column in
+/// `mode` on the way to the database (issue #1340).
+///
+/// Mirrors `autumn-macros`' `encrypted_wrapper_path`, which is what the
+/// `#[model]` macro splices into `#[diesel(serialize_as = …)]` — the raw-diesel
+/// update path has to name the same type by hand to encrypt identically.
+const fn encryption_wrapper_type(mode: EncryptedMode) -> &'static str {
+    match mode {
+        EncryptedMode::Randomized => "RandomizedText",
+        EncryptedMode::Deterministic => "DeterministicText",
+    }
 }
 
 /// Render one `db.execute_sql("...").await;` call per statement in `sql`,
@@ -20921,5 +21046,391 @@ exempt_paths = [
                 "an --api scaffold must not mount `{entry}`:\n{main}"
             );
         }
+    }
+
+    // ── `{encrypted}` at-rest column encryption (issue #1340) ───────────────
+
+    /// AC3/AC5 end-to-end: a scaffolded `{encrypted}` column lands as
+    /// `#[encrypted]` on the model, `TEXT` in the migration, and a plain
+    /// `String` on the struct — with the non-encrypted sibling untouched.
+    #[test]
+    fn scaffold_encrypted_field_emits_attribute_and_text_column() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+                "email:String{encrypted:deterministic}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/account.rs")).unwrap();
+        assert!(
+            model.contains("#[encrypted]\n    pub api_token: String,"),
+            "model: {model}"
+        );
+        assert!(
+            model.contains("#[encrypted(deterministic)]\n    pub email: String,"),
+            "model: {model}"
+        );
+        assert!(model.contains("pub username: String,"), "model: {model}");
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_accounts/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("api_token TEXT NOT NULL"), "up.sql: {up}");
+        assert!(up.contains("email TEXT NOT NULL"), "up.sql: {up}");
+    }
+
+    /// AC6 (`--query` half): a derived equality lookup on a RANDOMIZED
+    /// encrypted column compiles but fails at runtime with
+    /// `EncryptionError::RandomizedEqualityLookup`. Refuse at generate time.
+    #[test]
+    fn scaffold_query_on_randomized_encrypted_field_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Account",
+            &["api_token:String{encrypted}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                queries: vec!["find_by_api_token:api_token".into()],
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("api_token"), "must name the field: {msg}");
+        assert!(
+            msg.contains("deterministic"),
+            "must point at the fix: {msg}"
+        );
+    }
+
+    /// The deterministic mode is exactly what makes the lookup legal — the
+    /// repository macro encodes the bound parameter through the encrypted-column
+    /// registry at runtime, so `find_by_email` matches stored ciphertext.
+    #[test]
+    fn scaffold_query_on_deterministic_encrypted_field_is_allowed() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Account",
+            &["email:String{encrypted:deterministic}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                queries: vec!["find_by_email:email".into()],
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/account.rs")).unwrap();
+        assert!(
+            repo.contains("fn find_by_email(email: String) -> Vec<Account>;"),
+            "repo: {repo}"
+        );
+    }
+
+    /// A `:unique` deterministic encrypted column still gets its free
+    /// `find_by_<col>` and its `CREATE UNIQUE INDEX` (the index enforces real
+    /// plaintext uniqueness because equal plaintext yields equal ciphertext).
+    #[test]
+    fn scaffold_unique_deterministic_encrypted_field_keeps_find_by_and_index() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &["email:String{encrypted:deterministic}:unique".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/account.rs")).unwrap();
+        assert!(
+            repo.contains("fn find_by_email(email: String) -> Vec<Account>;"),
+            "repo: {repo}"
+        );
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_accounts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("CREATE UNIQUE INDEX idx_accounts_email_unique ON accounts (email);"),
+            "up.sql: {up}"
+        );
+    }
+
+    /// R11: the index table must not advertise a sortable header for an
+    /// encrypted column — the server would order by base64 ciphertext, which
+    /// bears no relation to the plaintext order the header link promises.
+    #[test]
+    fn scaffold_encrypted_column_is_not_sortable_in_the_index() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+                "email:String{encrypted:deterministic}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+        assert!(
+            routes.contains(r#".sortable("username")"#),
+            "a plain column stays sortable: {routes}"
+        );
+        assert!(
+            !routes.contains(r#".sortable("api_token")"#),
+            "a randomized encrypted column must not render a sort link: {routes}"
+        );
+        assert!(
+            !routes.contains(r#".sortable("email")"#),
+            "a deterministic encrypted column must not render a sort link: {routes}"
+        );
+    }
+
+    /// R12: the scaffold's next-steps must tell the developer to provision key
+    /// material, or the first write to the new resource fails at runtime.
+    #[test]
+    fn scaffold_with_encrypted_field_warns_about_key_material() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &["api_token:String{encrypted}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("autumn credentials edit")
+                    && w.contains("active_record_encryption.primary_key")),
+            "warnings: {:?}",
+            plan.warnings
+        );
+    }
+
+    /// The scaffold's standard (raw-diesel) `update` handler writes a `.set((…))`
+    /// tuple built from the submitted form. For an encrypted column that tuple
+    /// must bind the value through the encrypting diesel wrapper — a bare
+    /// `col.eq(new.col)` would store the **plaintext** in a column the reader
+    /// then tries to decrypt, which is both a silent data leak and a guaranteed
+    /// `MalformedEnvelope` on the next read. This is the single most important
+    /// assertion in the slice: the whole point of `{encrypted}` is that no
+    /// scaffolded path ever writes plaintext.
+    #[test]
+    fn scaffold_update_binds_encrypted_columns_through_the_encrypting_wrapper() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+                "email:String{encrypted:deterministic}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+
+        assert!(
+            routes.contains(
+                "accounts::api_token.eq(autumn_web::encryption::RandomizedText::from(new.api_token.clone()))"
+            ),
+            "a randomized column must bind through `RandomizedText`:\n{routes}"
+        );
+        assert!(
+            routes.contains(
+                "accounts::email.eq(autumn_web::encryption::DeterministicText::from(new.email.clone()))"
+            ),
+            "a deterministic column must bind through `DeterministicText`:\n{routes}"
+        );
+        // The bare, plaintext-writing form must appear nowhere for either column.
+        assert!(
+            !routes.contains("accounts::api_token.eq(new.api_token.clone())"),
+            "the plaintext bind must not survive anywhere:\n{routes}"
+        );
+        assert!(
+            !routes.contains("accounts::email.eq(new.email.clone())"),
+            "the plaintext bind must not survive anywhere:\n{routes}"
+        );
+        // A plaintext column keeps the ordinary bind, byte-for-byte.
+        assert!(
+            routes.contains("accounts::username.eq(new.username.clone())"),
+            "a plaintext column must be unaffected:\n{routes}"
+        );
+    }
+
+    /// `#[diesel(serialize_as = …)]` consumes the value, so diesel implements
+    /// `Insertable` only for the OWNED `New{Model}` — never `&New{Model}`. The
+    /// scaffold's insert must therefore pass the record by value when the model
+    /// has an encrypted column, or the generated app does not compile.
+    #[test]
+    fn scaffold_insert_passes_owned_record_when_a_column_is_encrypted() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &["api_token:String{encrypted}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+        assert!(
+            routes.contains(".values(new)"),
+            "an encrypted scaffold must insert the owned record:\n{routes}"
+        );
+        assert!(
+            !routes.contains(".values(&new)"),
+            "`&New` is not `Insertable` once a column uses `serialize_as`:\n{routes}"
+        );
+    }
+
+    /// …and a scaffold with no encrypted column keeps the borrowed insert it has
+    /// always emitted, byte-for-byte.
+    #[test]
+    fn unencrypted_scaffold_keeps_the_borrowed_insert() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(routes.contains(".values(&new)"), "routes:\n{routes}");
+    }
+
+    /// The nested (`--belongs-to`) create handler writes through the same raw
+    /// diesel insert, so it needs the same owned record.
+    #[test]
+    fn nested_scaffold_insert_passes_owned_record_when_a_column_is_encrypted() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Token",
+            &["post:references".into(), "secret:String{encrypted}".into()],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/tokens.rs");
+        assert!(
+            !routes.contains(".values(&new)"),
+            "the nested create must not borrow an encrypted record:\n{routes}"
+        );
+        assert!(routes.contains(".values(new)"), "routes:\n{routes}");
+    }
+
+    /// Review finding: the scaffolded `GET /{plural}/export.csv` streamed the
+    /// DECRYPTED value of every encrypted column into a file that then leaves
+    /// the app entirely. `autumn-admin-plugin`'s own `csv_export_columns`
+    /// already filters `!f.encrypted`; the scaffold now matches it.
+    #[test]
+    fn scaffold_csv_export_omits_encrypted_columns() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+                "email:String{encrypted:deterministic}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+
+        assert!(
+            routes.contains(r#"&["id", "username", "created_at"]"#),
+            "the CSV header row must omit both encrypted columns:\n{routes}"
+        );
+        for leaked in ["self.api_token", "self.email"] {
+            assert!(
+                !routes.contains(leaked),
+                "an encrypted column must not reach `to_csv_record`: `{leaked}`\n{routes}"
+            );
+        }
+        // The plaintext column still exports, still through the formula guard.
+        assert!(
+            routes.contains("csv_text_cell(self.username.clone())"),
+            "routes:\n{routes}"
+        );
+    }
+
+    /// …and a scaffold whose ONLY text column is encrypted must not emit the
+    /// now-unused `csv_text_cell` helper: an unused `fn` is a `dead_code`
+    /// warning, and the scaffold's contract is warning-free generated code.
+    #[test]
+    fn scaffold_csv_export_drops_the_formula_guard_when_only_encrypted_text_remains() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &["views:i64".into(), "api_token:String{encrypted}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+        assert!(
+            !routes.contains("fn csv_text_cell"),
+            "no exported column is text-backed, so the guard must not be emitted:\n{routes}"
+        );
+    }
+
+    /// Review finding: the index table rendered every row's decrypted secret.
+    /// A list is a bulk-disclosure surface, so the cell is redacted; the
+    /// single-record `show` view still renders the real value.
+    #[test]
+    fn scaffold_index_redacts_encrypted_cells_but_show_does_not() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+
+        // Index column: redacted, and the closure binds `_row` so the generated
+        // app stays warning-free.
+        assert!(
+            routes.contains(
+                "Column::new(\"Api Token\", |_row: &Account| maud::html! { (\"••••••••\") })"
+            ),
+            "the index cell must be redacted:\n{routes}"
+        );
+        // Show view: the real value, because the reader routed to one record.
+        assert!(
+            routes.contains("(\"Api token\", maud::html! { (&row.api_token) })"),
+            "the show view must still render the value:\n{routes}"
+        );
+        // The plaintext sibling is untouched in both.
+        assert!(
+            routes.contains(
+                "Column::new(\"Username\", |row: &Account| maud::html! { (&row.username) })"
+            ),
+            "routes:\n{routes}"
+        );
     }
 }

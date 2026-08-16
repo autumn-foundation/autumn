@@ -249,6 +249,22 @@ impl MetricsSourceRegistry {
             .sources
             .is_empty()
     }
+
+    /// Whether `name` is already registered.
+    ///
+    /// For subsystems that register into more than one registry and must not
+    /// leave half of themselves behind: check every name first, then register.
+    /// Registration has no undo, so a caller that registers one name and then
+    /// collides on the second would strand the first.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sources
+            .iter()
+            .any(|(registered, _)| registered == name)
+    }
 }
 
 /// Trait to abstract the state requirements for actuator handlers.
@@ -2058,6 +2074,22 @@ impl HealthIndicatorRegistry {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty()
+    }
+
+    /// Whether `name` is already registered.
+    ///
+    /// For subsystems that register into more than one registry and must not
+    /// leave half of themselves behind: check every name first, then register.
+    /// Registration has no undo, so a caller that registers its indicator and
+    /// then collides on its metrics source would strand an indicator nothing
+    /// owns — permanently `UP`, and blocking the retry that would fix it.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(registered, _, _)| registered == name)
     }
 
     /// Run all registered indicators (both groups) with per-indicator timeouts.

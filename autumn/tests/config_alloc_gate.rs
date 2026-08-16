@@ -81,6 +81,50 @@ fn config_arc_allocates_nothing_in_the_no_config_fallback() {
     );
 }
 
+/// `AppState::clone()` allocation gate.
+///
+/// `AppState` is `Clone` and gets cloned on every hop of the ingress tower
+/// stack (`Route::call` deep-clones the boxed service beneath it, per
+/// #2193/#2198), so anything owned directly on the struct — as opposed to
+/// shared behind an `Arc` or living in the `extensions` map — is paid once
+/// per traversal, not once per request. `profile: Option<String>` and
+/// `auth_session_key: String` were the two fields still doing that: measured
+/// with a `TestApp`-built state (`profile = "test"`, `auth_session_key =
+/// "user_id"`, the same shape `per_request_allocations_stay_under_the_ceiling`
+/// below exercises), 100 clones allocate exactly 200 blocks / 1100 bytes — 2
+/// blocks per clone, one per field, deterministic across runs. Neither field
+/// is ever mutated on a live `AppState` outside the builder methods that
+/// construct one, so sharing them behind an `Arc<str>` costs nothing a
+/// request-scoped clone needs back.
+#[test]
+fn appstate_clone_allocates_nothing_for_profile_and_auth_session_key() {
+    use autumn_web::routes;
+    use autumn_web::test::TestApp;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime should build");
+    let client = runtime.block_on(async { TestApp::new().routes(routes![ping]).build() });
+    let state = client.state();
+    // Warm-up outside the measured window, matching the sibling tests.
+    drop(state.clone());
+
+    let info = allocation_counter::measure(|| {
+        for _ in 0..CALLS {
+            let cloned = state.clone();
+            std::hint::black_box(&cloned);
+        }
+    });
+
+    assert_eq!(
+        info.count_total, 0,
+        "AppState::clone() must not deep-clone its profile/auth_session_key \
+         fields; {CALLS} clones allocated {} blocks ({} bytes)",
+        info.count_total, info.bytes_total
+    );
+}
+
 /// Executable documentation of what `config_arc` buys: `config` hands back an
 /// owned snapshot, so it allocates by contract. This assertion is expected to
 /// keep holding after `config_arc` is made allocation-free — `config` stays a
@@ -125,19 +169,35 @@ async fn ping() -> &'static str {
 /// | tree | blocks/request | bytes/request |
 /// | --- | ---: | ---: |
 /// | before #2198's `config_arc` work | 320 | — |
-/// | after #2198 (the tree #2214 branched from) | 220 | 38,683 |
-/// | after #2214 | **204** | **34,477** |
+/// | after #2198 | 220 | — |
+/// | after #2205 (`AppState` strings behind `Arc<str>`) | 172 | 37,819 |
+/// | after #2214 (two `from_fn` layers onto `GateLayer`) | **160** | **33,667** |
 ///
-/// #2214 moved two ingress layers — the method-override rejection filter and
-/// the trusted-host check — off `axum::middleware::from_fn` and onto
-/// `GateLayer`. Each removal is worth ~8 blocks rather than the 1 you would
-/// expect from deleting a single `Box::pin`, because a `from_fn`-generated
-/// service *also* clones its inner service on every call, and the ingress
-/// stack is a tower of `BoxCloneSyncService`s: one clone-on-call site removed
-/// deletes a whole deep-clone traversal of everything beneath it. The bytes
-/// column falls faster than the block column (-10.9% vs -7.3%) because the
-/// boxed `from_fn` futures are individually large — they hold the whole
-/// downstream continuation across their single `.await`.
+/// #2205 moved `AppState::profile` and `AppState::auth_session_key` from owned
+/// `String`/`Option<String>` to `Arc<str>`
+/// (`appstate_clone_allocates_nothing_for_profile_and_auth_session_key` above
+/// pins that clone at zero), a 48-block drop, since `AppState` is cloned on
+/// every hop of the ingress tower stack and each of those two fields used to
+/// be deep-copied on every one of those clones.
+///
+/// #2214 then moved two ingress layers — the method-override rejection filter
+/// and the trusted-host check — off `axum::middleware::from_fn` and onto
+/// `GateLayer`. Each removal is worth several blocks rather than the 1 you
+/// would expect from deleting a single `Box::pin`, because a
+/// `from_fn`-generated service *also* clones its inner service on every call,
+/// and the ingress stack is a tower of `BoxCloneSyncService`s: one
+/// clone-on-call site removed deletes a whole deep-clone traversal of
+/// everything beneath it. The bytes column falls faster than the block column
+/// (-11.0% vs -7.0%) because the boxed `from_fn` futures are individually
+/// large — they hold the whole downstream continuation across their single
+/// `.await`.
+///
+/// The two fixes are independent and compose: #2205 removed `String` deep
+/// clones from `AppState::clone`, #2214 removed boxed futures and
+/// clone-on-call sites from the layer stack, and #2214's margin measured the
+/// same (-7% blocks / -11% bytes) against the pre-#2205 and post-#2205 trees.
+///
+/// The ceiling sits above the current 160 with about a tenth of headroom.
 ///
 /// A ceiling this close to the measured value is a deliberate trade: it can
 /// only stay honest while the number stays deterministic. If this ever fails
@@ -148,7 +208,7 @@ fn per_request_allocations_stay_under_the_ceiling() {
     use autumn_web::routes;
     use autumn_web::test::TestApp;
 
-    const CEILING: u64 = 225;
+    const CEILING: u64 = 176;
     const WARMUP: usize = 3;
     const MEASURED: u64 = 10;
 

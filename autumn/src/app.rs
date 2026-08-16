@@ -3881,6 +3881,32 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
+        // Embedded cluster control plane (issue #1762). Mirrors the
+        // `crate::alerts::install_from_config` precedent — a no-op when
+        // `[cluster]` is disabled — but installed here rather than next to
+        // alerts because it owns a listener and two loops. A cluster that
+        // cannot bind or start is a hard boot failure: a node that silently
+        // never joins would serve its own private view of a counter it claims
+        // is cluster-wide.
+        //
+        // Its token is deliberately NOT a child of `server_shutdown`. That
+        // token fires at phase 5, when the listener stops accepting — while
+        // in-flight requests still drain for up to `shutdown_timeout_secs`. A
+        // request served during that drain can still increment a cluster
+        // counter, and with the push loop already departed the increment would
+        // land in a document nothing replicates and die with the process. The
+        // cluster is therefore cancelled *after* the drain completes (see the
+        // `cluster_shutdown.cancel()` below), inside the same budget.
+        let cluster_shutdown = tokio_util::sync::CancellationToken::new();
+        if let Err(error) =
+            crate::cluster::install_from_config(&state, &config.cluster, &cluster_shutdown)
+        {
+            tracing::error!(error = %error, "cluster installation failed");
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+
         #[cfg(feature = "db")]
         {
             #[cfg(feature = "ws")]
@@ -4406,17 +4432,47 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
+        // How much of `shutdown_timeout_secs` the drain has spent so far,
+        // measured on the injected clock from the instant phase 5 recorded.
+        // Read twice below — once for the departure wait, once for the hook
+        // budget — because everything after the drain shares that one budget.
+        let elapsed_since_drain_start = || {
+            drain_started_at
+                .get()
+                .map_or(std::time::Duration::ZERO, |started| {
+                    drain_clock.monotonic().saturating_duration_since(*started)
+                })
+        };
+        let shutdown_budget = std::time::Duration::from_secs(shutdown_timeout);
+
+        // Phase 6b: the cluster departs only now, once no request can still be
+        // running — an increment accepted during the drain must have a push
+        // loop left to replicate it. Ordering, all inside the one
+        // `shutdown_timeout_secs` budget: drain → departure → hooks. The
+        // departure itself is bounded by `LEAVE_BUDGET` inside the node, and
+        // this waits for it — but only for what the drain left of the budget
+        // (`cluster_departure_wait`), because a supervisor times the process
+        // out on `shutdown_timeout_secs` and an unconditional wait after a slow
+        // drain would push past it. The hook budget below subtracts this wait
+        // with the same clock reading, so the three phases add up to the budget
+        // rather than to budget + `LEAVE_BUDGET`. A departure that is budgeted
+        // away leaves the peer to converge on the suspicion timeout, which is
+        // the actual contract.
+        if config.cluster.enabled {
+            cluster_shutdown.cancel();
+            let departure_wait =
+                cluster_departure_wait(shutdown_budget, elapsed_since_drain_start());
+            if !departure_wait.is_zero() {
+                tokio::time::sleep(departure_wait).await;
+            }
+        }
+
         // Phase 7: run on_shutdown hooks within the *remaining* portion of
-        // shutdown_timeout_secs (drain + hooks share one budget, not two).
+        // shutdown_timeout_secs (drain + departure + hooks share one budget,
+        // not three).
         // Plugin ordering: plugins register during build() before app hooks,
         // so app hooks run before plugin hooks (LIFO = last-registered first).
-        let drain_elapsed = drain_started_at
-            .get()
-            .map_or(std::time::Duration::ZERO, |started| {
-                drain_clock.monotonic().saturating_duration_since(*started)
-            });
-        let hook_budget =
-            std::time::Duration::from_secs(shutdown_timeout).saturating_sub(drain_elapsed);
+        let hook_budget = shutdown_budget.saturating_sub(elapsed_since_drain_start());
         run_shutdown_hooks_with_timeout(&shutdown_hooks, hook_budget, hook_budget).await;
         // If request drain consumed the whole `shutdown_timeout_secs`, the
         // managed-Postgres `on_shutdown` hook may have been budgeted away above.
@@ -6094,7 +6150,17 @@ fn replay_database_topology(
     divergences: &std::sync::Arc<crate::capsule::DivergenceLog>,
     capsule_path: &std::path::Path,
 ) -> Option<crate::db::DatabaseTopology> {
-    capsule.db.as_ref()?;
+    // "This request issued no queries" and "this application has no database"
+    // are different facts, and only the capsule can tell them apart: a handler
+    // or state initializer that checks `state.pool()` — or replica
+    // availability — *before* querying would otherwise meet `None` during a
+    // replay of an application that had a pool in production, take a branch it
+    // never took, and report a mismatch nothing in the code caused. A capsule
+    // recorded before `db_roles` existed carries none, and falls back to the
+    // old tape-only behaviour.
+    if capsule.db.is_none() && capsule.db_roles.is_empty() {
+        return None;
+    }
     let pool = crate::capsule::pool_from_capsule(capsule, std::sync::Arc::clone(divergences))
         .unwrap_or_else(|error| {
             std::process::exit(crate::capsule::print_refusal(
@@ -7298,6 +7364,26 @@ fn prepare_unix_socket_path(path: &std::path::Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// How long to wait for the cluster's departure notice, given how much of the
+/// shutdown budget the request drain already spent.
+///
+/// The departure itself is bounded by `LEAVE_BUDGET` inside the node; this
+/// clamps the *wait* to what is left of `shutdown_timeout_secs`, so the leave
+/// notice is a slice of the shutdown budget rather than an extension of it.
+/// Without the clamp a drain that ran to its deadline would still be followed
+/// by a full `LEAVE_BUDGET` sleep, and a supervisor timing the process out at
+/// `shutdown_timeout_secs` could `SIGKILL` it mid-hook.
+///
+/// Returns zero when the drain has already consumed the budget: the departure
+/// is skipped and the peer converges on the suspicion timeout, which is the
+/// documented contract for a shutdown that overran.
+fn cluster_departure_wait(
+    shutdown_budget: std::time::Duration,
+    drain_elapsed: std::time::Duration,
+) -> std::time::Duration {
+    crate::cluster::LEAVE_BUDGET.min(shutdown_budget.saturating_sub(drain_elapsed))
 }
 
 async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
@@ -9775,7 +9861,7 @@ fn build_state(
         #[cfg(all(feature = "db", feature = "reporting"))]
         db_capture_gap: database_topology
             .and_then(|topology| topology.capture_gap().map(std::sync::Arc::from)),
-        profile: config.profile.clone(),
+        profile: config.profile.as_deref().map(Arc::from),
         role: config.role,
         started_at: crate::time::monotonic_now(),
         health_detailed: config.health.detailed,
@@ -9795,7 +9881,7 @@ fn build_state(
         shutdown,
         policy_registry: crate::authorization::PolicyRegistry::default(),
         forbidden_response: config.security.forbidden_response,
-        auth_session_key: config.auth.session_key.clone(),
+        auth_session_key: Arc::from(config.auth.session_key.as_str()),
         shared_cache: None,
         clock: std::sync::Arc::new(crate::time::SystemClock),
         entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
@@ -10398,7 +10484,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
@@ -10904,6 +10990,111 @@ mod tests {
             source.contains(shard_gate),
             "shard commit-hook workers must be gated on role.runs_workers()"
         );
+    }
+
+    /// The cluster must outlive the in-flight request drain.
+    ///
+    /// `server_shutdown` fires at phase 5, when the listener stops accepting —
+    /// requests keep draining after it for up to `shutdown_timeout_secs`, and a
+    /// request served in that window can still increment a cluster counter. If
+    /// the cluster's loops were children of that token they would already have
+    /// departed, so the increment would land in a document with nothing left to
+    /// replicate it and die with the process: a write accepted and silently
+    /// thrown away. Source-order test in the house style, because the ordering
+    /// is a property of this function and nothing smaller.
+    #[test]
+    fn cluster_departs_after_the_request_drain() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        // Bounded at the next path so the search cannot match this test's own
+        // source, which necessarily quotes the strings it is looking for.
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let server_source = &source[server_start..build_mode_start];
+
+        let install = server_source
+            .find("crate::cluster::install_from_config(&state, &config.cluster, &cluster_shutdown)")
+            .expect("the cluster must be installed on its own token, not on server_shutdown");
+        let drain = server_source
+            .find("let server_result = server_task.await")
+            .expect("the normal server path should await the drain");
+        let depart = server_source
+            .find("cluster_shutdown.cancel();")
+            .expect("the cluster token should be cancelled explicitly");
+
+        assert!(
+            install < drain && drain < depart,
+            "the cluster must be installed before the drain and cancelled only \
+             after it completes, so an increment accepted while requests drain \
+             still has a push loop to replicate it"
+        );
+        assert!(
+            !server_source.contains("&config.cluster, &server_shutdown"),
+            "the cluster must not ride server_shutdown: that token fires when \
+             the listener closes, with the request drain still ahead of it"
+        );
+    }
+
+    /// …and it must depart *inside* the shutdown budget, not after it.
+    ///
+    /// Drain, departure and `on_shutdown` hooks share one
+    /// `shutdown_timeout_secs`: a supervisor that times the process out at that
+    /// deadline `SIGKILL`s whatever is still running. An unconditional
+    /// `LEAVE_BUDGET` sleep between the drain and the hooks would make the
+    /// worst case `shutdown_timeout_secs + LEAVE_BUDGET`, so the wait is
+    /// clamped to the budget the drain left over.
+    #[test]
+    fn the_cluster_departure_wait_fits_inside_the_shutdown_budget() {
+        use std::time::Duration;
+
+        let budget = Duration::from_secs(30);
+
+        // A fast drain: the departure gets its whole budget…
+        let quick = Duration::from_secs(1);
+        assert_eq!(
+            cluster_departure_wait(budget, quick),
+            crate::cluster::LEAVE_BUDGET,
+            "a drain that finished early must leave room for the full departure"
+        );
+
+        // …but never more than the node itself will spend on it.
+        assert!(
+            cluster_departure_wait(budget, Duration::ZERO) <= crate::cluster::LEAVE_BUDGET,
+            "waiting longer than LEAVE_BUDGET would idle past the node's own bound"
+        );
+
+        // A drain that ran to the deadline gets no departure at all: the peer
+        // converges on the suspicion timeout instead.
+        assert_eq!(
+            cluster_departure_wait(budget, budget),
+            Duration::ZERO,
+            "a drain that consumed the budget must not buy extra shutdown time"
+        );
+        assert_eq!(
+            cluster_departure_wait(budget, budget.saturating_add(Duration::from_secs(5))),
+            Duration::ZERO,
+            "an overrun drain must saturate, not wrap into a fresh wait"
+        );
+
+        // The property the finding is about: drain, departure and hooks are one
+        // budget. `hook_budget` is `budget - elapsed` measured *after* the
+        // departure wait, so whatever the drain leaves over has to cover both
+        // of the phases that follow it — never budget + LEAVE_BUDGET.
+        for elapsed_ms in [0_u64, 250, 29_800, 29_999, 30_000, 45_000] {
+            let drained = Duration::from_millis(elapsed_ms);
+            let departure = cluster_departure_wait(budget, drained);
+            let hooks = budget.saturating_sub(drained.saturating_add(departure));
+            let left_by_the_drain = budget.saturating_sub(drained);
+            assert!(
+                departure.saturating_add(hooks) <= left_by_the_drain,
+                "after a {drained:?} drain only {left_by_the_drain:?} of the \
+                 {budget:?} budget is left, but the departure ({departure:?}) \
+                 and hooks ({hooks:?}) would spend more"
+            );
+        }
     }
 
     #[test]
@@ -12361,7 +12552,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
@@ -12479,7 +12670,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
@@ -12838,7 +13029,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
@@ -13164,7 +13355,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
@@ -13322,7 +13513,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
@@ -13378,7 +13569,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
@@ -13640,7 +13831,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
@@ -13720,7 +13911,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),

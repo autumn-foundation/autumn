@@ -56,6 +56,7 @@ use crate::capsule::redact::RedactedValues;
 use crate::capsule::schema::{
     AppInfo, CAPSULE_FORMAT_VERSION, Capsule, CapsuleError, CapsuleOutcome,
 };
+use crate::log::filter::ParameterFilter;
 
 /// How long a capsule is protected from retention pruning after it was
 /// written — for a *bounded number* of files (see [`grace_allowance`]).
@@ -67,6 +68,11 @@ use crate::capsule::schema::{
 /// memory, and pruning a file that process wrote a second ago would break the
 /// path its reporters are about to follow.
 const PRUNE_GRACE: TimeDelta = TimeDelta::minutes(1);
+
+/// Why a capsule is refused after the parameter filter removed a resolved
+/// client-identity field the request actually had.
+const IDENTITY_FILTERED_NOTE: &str = "the resolved client identity was suppressed because a header it derives from is in \
+     `[log] filter_parameters`: this capsule cannot reproduce the identity the handler saw";
 
 /// How many over-cap files [`PRUNE_GRACE`] may spare in one prune pass.
 ///
@@ -226,19 +232,84 @@ pub(crate) fn persist_pinned(
 fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     let raw = scope.raw_request()?;
     // The head was snapshotted when the request arrived; the body was copied
-    // as the handler read it, so it is only final now. A body the handler
-    // never finished reading is kept, with a note saying so.
+    // as the handler read it, so it is only final now.
     let raw_body = scope.captured_body();
     if let Some(note) = scope.body_note() {
+        // A body the handler did not read to its end — a prefix, or nothing at
+        // all — is *not* the body the failing request carried. Replaying it
+        // would drive the handler with shorter input than production had, and
+        // code that reads the remainder would hit EOF and answer differently:
+        // a `mismatch`, which the guide tells operators to read as "the bug is
+        // gone". Mark the capsule incomplete so replay refuses it instead,
+        // through the same path a skipped body already takes. The note says
+        // which case this was.
         scope.note(note);
+        scope.mark_truncated();
     }
+    // The scheme the URI already carries, captured before the request record
+    // is built: a resolved scheme equal to it did not come from a header.
+    let uri_scheme = raw.uri.scheme_str().map(ToOwned::to_owned);
     let (mut request, redacted, body_notes) =
         crate::capsule::redact::redact_request(raw, &raw_body, scope.filter());
     request.peer_addr = scope.peer_addr();
     if let Some(identity) = scope.client_identity() {
-        request.client_addr = identity.addr;
-        request.client_host.clone_from(&identity.host);
-        request.client_scheme.clone_from(&identity.scheme);
+        // The resolved identity is *derived from* headers, so it must obey the
+        // same filter those headers do. An operator who adds
+        // `x-forwarded-host` to `[log] filter_parameters` sees it masked in
+        // `headers` — and would otherwise find the very same
+        // `private-tenant.example` sitting in cleartext in `client_host`,
+        // which defeats the filter through a side door rather than honoring
+        // it. Each field is dropped when *any* header it could have been
+        // resolved from is filtered: which one the resolver actually used
+        // depends on the trust configuration and the request, and recording
+        // the value only when it happened to come from an unfiltered header
+        // would leak on exactly the requests where the filtered one won.
+        //
+        // The lists are exactly what `ProxyResolver` reads — `x-forwarded-*`,
+        // `x-real-ip`, `Host` — and nothing else. `Forwarded` is *not* among
+        // them, and naming it here suppressed all three fields, and refused
+        // the capsule, over a header the resolver never looks at.
+        //
+        // A value that did not come from a header at all is exempt, and not as
+        // a courtesy: the address then came from the peer socket and the
+        // scheme from the request URI, both of which this capsule records
+        // unfiltered a few lines either side. Suppressing a copy of a value
+        // that is already written down in the clear protects nothing and
+        // costs a refusal.
+        let filter = scope.filter();
+        let mut suppressed = false;
+        let addr_from_peer =
+            identity.addr.is_some() && identity.addr == scope.peer_addr().map(|peer| peer.ip());
+        if !addr_from_peer && identity_source_is_filtered(filter, &["x-forwarded-for", "x-real-ip"])
+        {
+            suppressed |= identity.addr.is_some();
+        } else {
+            request.client_addr = identity.addr;
+        }
+        if identity_source_is_filtered(filter, &["x-forwarded-host", "host"]) {
+            suppressed |= identity.host.is_some();
+        } else {
+            request.client_host.clone_from(&identity.host);
+        }
+        let scheme_from_uri = identity.scheme.is_some() && identity.scheme == uri_scheme;
+        if !scheme_from_uri && identity_source_is_filtered(filter, &["x-forwarded-proto"]) {
+            suppressed |= identity.scheme.is_some();
+        } else {
+            request.client_scheme.clone_from(&identity.scheme);
+        }
+        // Suppression protects the operator's filter, but it does not leave a
+        // *faithful* capsule: replay pre-inserts the recorded identity whole
+        // whenever any field survives, and `TrustedProxiesLayer` honors it
+        // rather than re-resolving — so a handler reading `ClientHost` would
+        // meet a `None` production never gave it and answer differently. That
+        // is a `mismatch` the guide tells operators to read as "the bug is
+        // gone". Refusing is the honest outcome, and it fires only when a
+        // filtered source actually supplied a value: filtering a header the
+        // request never carried costs nothing.
+        if suppressed {
+            scope.note(IDENTITY_FILTERED_NOTE);
+            scope.mark_truncated();
+        }
     }
     for note in body_notes {
         scope.note(note);
@@ -293,6 +364,7 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
             .map(|offset| u64::try_from(offset.as_micros()).unwrap_or(u64::MAX))
             .collect(),
         db,
+        db_roles: settings.db_roles.clone(),
         truncated: scope.is_truncated(),
         notes: scope.notes(),
     })
@@ -489,6 +561,18 @@ fn written_within_grace(path: &Path, now: DateTime<Utc>) -> bool {
         .is_some_and(|written| now.signed_duration_since(written.and_utc()) < PRUNE_GRACE)
 }
 
+/// Whether any header a resolved-identity field could come from is filtered.
+///
+/// The resolver's choice among these depends on the trust configuration and on
+/// what the request actually carried, and none of that is knowable here — so
+/// *any* filtered source suppresses the derived field. Recording it whenever
+/// the value happened to arrive through an unfiltered header would leak on
+/// precisely the requests where the filtered one won, which is the case the
+/// operator was guarding against.
+fn identity_source_is_filtered(filter: &ParameterFilter, sources: &[&str]) -> bool {
+    sources.iter().any(|source| filter.matches_key(source))
+}
+
 /// The timestamp a [`file_name`]-shaped name carries, or `None` for any other
 /// file.
 ///
@@ -611,6 +695,166 @@ mod tests {
             keep + grace_allowance(keep),
             "the directory must settle at the cap plus the bounded grace \
              allowance, not at whatever the storm produced"
+        );
+    }
+
+    /// The resolved identity is derived from headers, so filtering one of
+    /// those headers must suppress it. Masking `x-forwarded-host` in `headers`
+    /// while writing the same value to `client_host` honors the filter in
+    /// letter and defeats it in fact.
+    #[test]
+    fn a_filtered_identity_header_suppresses_the_derived_field() {
+        use std::sync::Arc;
+
+        use crate::capsule::CaptureSettings;
+        use crate::capsule::CapturedClientIdentity;
+        use crate::capsule::capture::CaptureScope;
+        use crate::capsule::redact::RawRequest;
+        use crate::log::filter::ParameterFilter;
+
+        let build = |filtered: &[String]| {
+            let scope = CaptureScope::new(
+                "req-identity".to_owned(),
+                Arc::new(CaptureSettings::default()),
+                Arc::new(ParameterFilter::new(filtered, &[])),
+            );
+            scope.set_request(RawRequest {
+                method: "GET".to_owned(),
+                uri: "/boom".parse().expect("uri parses"),
+                version: axum::http::Version::HTTP_11,
+                headers: axum::http::HeaderMap::new(),
+                route: None,
+            });
+            scope.set_client_identity(CapturedClientIdentity {
+                addr: Some("203.0.113.7".parse().expect("addr parses")),
+                host: Some("private-tenant.example".to_owned()),
+                scheme: Some("https".to_owned()),
+            });
+            assemble(
+                &scope,
+                CapsuleOutcome::Status {
+                    code: 500,
+                    message: "boom".to_owned(),
+                    problem_type: None,
+                },
+            )
+            .expect("capsule assembles")
+        };
+
+        let unfiltered = build(&[]);
+        assert_eq!(
+            unfiltered.request.client_host.as_deref(),
+            Some("private-tenant.example"),
+            "with nothing filtered the identity is recorded as before"
+        );
+
+        assert!(
+            !unfiltered.truncated,
+            "nothing suppressed, nothing to refuse"
+        );
+
+        let filtered = build(&["x-forwarded-host".to_owned()]);
+        assert_eq!(
+            filtered.request.client_host, None,
+            "a filtered identity header must not reappear as `client_host`"
+        );
+        // Replay pre-inserts the recorded identity whole whenever any field
+        // survives, so a suppressed host reaches the handler as `None` rather
+        // than not at all. That is not a faithful capsule, and claiming it is
+        // would report a false `mismatch`.
+        assert!(
+            filtered.truncated,
+            "a capsule that cannot reproduce the identity must be refused, not replayed"
+        );
+        assert_eq!(
+            filtered.request.client_addr,
+            Some("203.0.113.7".parse().expect("addr parses")),
+            "filtering one source must not suppress fields it cannot feed"
+        );
+        assert_eq!(
+            filtered.request.client_scheme.as_deref(),
+            Some("https"),
+            "nor the scheme, which `x-forwarded-host` cannot resolve"
+        );
+
+        // `Forwarded` is not a source: `ProxyResolver` never reads it, so
+        // filtering it must suppress nothing and refuse nothing.
+        let forwarded = build(&["forwarded".to_owned()]);
+        assert_eq!(
+            forwarded.request.client_host.as_deref(),
+            Some("private-tenant.example")
+        );
+        assert_eq!(
+            forwarded.request.client_addr,
+            Some("203.0.113.7".parse().expect("addr parses"))
+        );
+        assert_eq!(forwarded.request.client_scheme.as_deref(), Some("https"));
+        assert!(
+            !forwarded.truncated,
+            "a header the resolver never reads must not refuse the capsule"
+        );
+
+        // `X-Real-IP` is a fallback source for the address, so filtering it
+        // suppresses the address too.
+        let real_ip = build(&["x-real-ip".to_owned()]);
+        assert_eq!(real_ip.request.client_addr, None);
+        assert_eq!(
+            real_ip.request.client_host.as_deref(),
+            Some("private-tenant.example"),
+            "and only the address — it feeds nothing else"
+        );
+    }
+
+    /// Refusal is the price of suppressing a value that existed. Filtering a
+    /// header the request resolved nothing from suppresses nothing, so it must
+    /// cost nothing — otherwise a broad `filter_parameters` would refuse every
+    /// capsule an application ever writes.
+    #[test]
+    fn filtering_a_source_that_supplied_nothing_does_not_refuse_the_capsule() {
+        use std::sync::Arc;
+
+        use crate::capsule::CaptureSettings;
+        use crate::capsule::CapturedClientIdentity;
+        use crate::capsule::capture::CaptureScope;
+        use crate::capsule::redact::RawRequest;
+        use crate::log::filter::ParameterFilter;
+
+        let scope = CaptureScope::new(
+            "req-identity".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&["x-real-ip".to_owned()], &[])),
+        );
+        scope.set_request(RawRequest {
+            method: "GET".to_owned(),
+            uri: "/boom".parse().expect("uri parses"),
+            version: axum::http::Version::HTTP_11,
+            headers: axum::http::HeaderMap::new(),
+            route: None,
+        });
+        scope.set_client_identity(CapturedClientIdentity {
+            addr: None,
+            host: Some("private-tenant.example".to_owned()),
+            scheme: None,
+        });
+
+        let capsule = assemble(
+            &scope,
+            CapsuleOutcome::Status {
+                code: 500,
+                message: "boom".to_owned(),
+                problem_type: None,
+            },
+        )
+        .expect("capsule assembles");
+
+        assert!(
+            !capsule.truncated,
+            "filtering a source that supplied nothing must not refuse the capsule"
+        );
+        assert_eq!(
+            capsule.request.client_host.as_deref(),
+            Some("private-tenant.example"),
+            "and the fields it does not feed are still recorded"
         );
     }
 

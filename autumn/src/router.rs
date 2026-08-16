@@ -4224,10 +4224,30 @@ fn apply_middleware(
             &capture_filter_parameters,
             &config.log.unfilter_parameters,
         ));
-        crate::capsule::CaptureLayer::new(
-            crate::capsule::settings_from_config(config),
-            capture_filter,
-        )
+        // `mut` only on builds that fill in the roles below; a sqlite (or
+        // no-`db`) build compiles that block out and records none.
+        #[cfg_attr(
+            any(not(feature = "db"), feature = "sqlite"),
+            allow(
+                unused_mut,
+                reason = "the role assignment below is compiled out on these builds"
+            )
+        )]
+        let mut capture_settings = crate::capsule::settings_from_config(config);
+        // The roles come from the pools the application actually built, not
+        // from the configured URLs: a custom `DatabasePoolProvider` may return
+        // no pool despite a `primary_url`, or ignore a configured replica (the
+        // managed-Postgres provider does exactly that). Recording a role the
+        // app does not have would have replay rebuild a shape production never
+        // ran. PostgreSQL-only, because that is all replay can reconstruct.
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
+        {
+            capture_settings.db_roles = crate::capsule::observed_db_roles(
+                state.pool().is_some(),
+                state.replica_pool().is_some(),
+            );
+        }
+        crate::capsule::CaptureLayer::new(capture_settings, capture_filter)
     }));
     #[cfg(not(feature = "reporting"))]
     let capture_layer = tower::layer::util::Identity::new();
@@ -5661,7 +5681,7 @@ mod tests {
             shards: None,
             #[cfg(all(feature = "db", feature = "reporting"))]
             db_capture_gap: None,
-            profile: Some("test".to_owned()),
+            profile: Some("test".into()),
             role: crate::config::ProcessRole::Combined,
             started_at: crate::time::monotonic_now(),
             health_detailed: false,
@@ -5681,7 +5701,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),

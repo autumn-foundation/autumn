@@ -1011,6 +1011,7 @@ mod tests {
             clock: Vec::new(),
             clock_monotonic_us: Vec::new(),
             db: None,
+            db_roles: Vec::new(),
             truncated: false,
             notes: Vec::new(),
         }

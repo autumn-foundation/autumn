@@ -35,7 +35,16 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bumped whenever the schema changes in a way a previous reader cannot
 /// tolerate. Replay refuses any capsule whose `format_version` differs.
-pub const CAPSULE_FORMAT_VERSION: u32 = 1;
+///
+/// A *semantic* field counts as such a change even though `serde` would
+/// happily ignore it. [`Capsule::db_roles`] is the case that made this
+/// concrete: a v1 reader skips the unknown field, rebuilds no database
+/// topology for a capsule whose `db` is `null`, and a handler that checks
+/// pool availability before querying takes a branch the recording never took
+/// — a `mismatch` the guide tells operators to read as "the bug is gone".
+/// Tolerating the document silently is precisely what the version gate exists
+/// to prevent, so adding the field bumps the version.
+pub const CAPSULE_FORMAT_VERSION: u32 = 2;
 
 /// Errors surfaced when reading a capsule back from disk.
 #[derive(Debug)]
@@ -99,6 +108,16 @@ pub struct Capsule {
     /// Database traffic recorded for the request, when DB capture was active.
     #[serde(default)]
     pub db: Option<CapsuleDb>,
+    /// Database roles the recording application had configured, whatever
+    /// traffic the request produced.
+    ///
+    /// `db` is `None` when the request issued no wire traffic at all, which is
+    /// a different fact from "this application has no database": a handler or
+    /// state initializer that checks `state.pool()` or replica availability
+    /// *before* querying would otherwise see a shape production never had.
+    /// Absent in capsules recorded before this field existed.
+    #[serde(default)]
+    pub db_roles: Vec<String>,
     /// Set when a size cap stopped recording partway through; such a capsule
     /// is not replayable.
     #[serde(default)]
@@ -441,6 +460,7 @@ pub mod test_support {
             clock: Vec::new(),
             clock_monotonic_us: Vec::new(),
             db: None,
+            db_roles: Vec::new(),
             truncated: false,
             notes: Vec::new(),
         }

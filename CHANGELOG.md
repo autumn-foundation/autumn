@@ -9,6 +9,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`generate admin` over an `#[encrypted]` model:** the generated admin adapter
+  did not compile — it bound `&new_row` to `.values(…)` and `&diesel_changeset`
+  to `.set(…)`, and diesel implements `Insertable`/`AsChangeset` only for the
+  owned value once a column uses `#[diesel(serialize_as = …)]`, as every
+  encrypted field does. Both now pass owned records when the model has an
+  encrypted column; plaintext models keep the borrowed form byte-for-byte.
+  Separately, **every admin edit of such a model failed**: the plugin renders an
+  encrypted column's edit control disabled and with no `name` (it is managed
+  outside the admin), so the form submits no key for it, while the handler
+  deserialized the submitted map into `New{Model}`, where the encrypted `String`
+  is required — so `serde_json::from_value` returned a "missing field" error even
+  when only a plaintext column was edited. Encrypted columns are now excluded
+  from the update entirely (matching what the form can actually submit), and the
+  handler back-fills a placeholder purely to satisfy that deserialization. That
+  exclusion also closes a plaintext write: the `lock_version` update path emits a
+  raw `col.eq(value)` tuple that never builds an `Update{Model}` changeset, so it
+  would have bypassed the encrypting wrapper and stored **plaintext** in the
+  encrypted column.
+
+- **`#[repository]` with hooks over an `#[encrypted]` model:** a repository
+  declared `broadcasts = true` (or with an explicit `hooks = …` type) over a
+  model carrying any `#[encrypted]` column failed to compile —
+  `the trait bound `&Model: AsChangeset` is not satisfied`. The hooks-aware
+  bulk-update path bound a *borrowed* proposed row to `.set(…)`, and diesel
+  implements `AsChangeset` only for the owned model once a field uses
+  `#[diesel(serialize_as = …)]`, as every encrypted field does. It now passes
+  the owned record, matching the single-record hooks paths. Reachable from
+  `autumn generate scaffold --live` with an encrypted column.
+
+- **failure capsules:** the resolved client identity now obeys
+  `[log] filter_parameters`. `client_addr`/`client_host`/`client_scheme` are
+  derived from `Forwarded`, `X-Forwarded-*` and `Host`, and were copied into
+  the capsule *after* header redaction ran — so an operator who filtered
+  `x-forwarded-host` saw it masked under `headers` and sitting in cleartext one
+  key away under `client_host`. Each field is now dropped when any header it
+  could have been resolved from is filtered — including `X-Real-IP`, a
+  fallback source for the address. Where a filtered source actually supplied a
+  value the capsule is additionally **refused** by replay: replay pre-inserts
+  the recorded identity whole whenever any field survives, so a suppressed
+  host would reach the handler as `None` rather than not at all, and a handler
+  that branches on it would report a `mismatch` the guide tells operators to
+  read as "the bug is gone".
+- **failure capsules:** the capsule format version is now `2`. The new
+  `db_roles` field changes what a capsule *means* — a reader that skips it
+  rebuilds no database topology and replays a shape the recording never had —
+  and `serde` would otherwise let an older reader ignore it silently, which is
+  exactly what the version gate exists to prevent. Version 1 never appeared in
+  a release, so no capsule anyone holds is affected; a capsule written by an
+  unreleased build off `trunk-dev` is refused with the usual
+  re-record-the-capsule message.
+- **failure capsules:** six fidelity and redaction gaps found in review of
+  #1598 (#2202). A capsule whose request body the handler read only *partly* —
+  or never got to at all — is now marked incomplete and **refused** by replay
+  rather than replayed with a shorter body: the handler would otherwise be
+  judged on input the failing request never carried, and the resulting
+  `mismatch` is exactly what the guide tells operators means "the bug is gone".
+  The client identity is recorded again for capsules written by the real
+  server: `App::run` wraps the finished router in an *outer*
+  `TrustedProxiesLayer` that resolves before the capture scope exists, so the
+  inner instance found the extension already present and skipped recording,
+  leaving `client_addr`/`client_host`/`client_scheme` empty on every
+  production capsule while the test harness (which has no outer layer) recorded
+  them. A second cause sat behind the first: the capture layer passed
+  `inner.call(req)` to `CAPSULE_SCOPE.scope` as an *argument*, which Rust
+  evaluates before the call, so every inner layer's synchronous `call` — where
+  a hand-written Tower middleware does its work — ran before the task-local
+  existed and saw no scope. The inner call is now made from inside the scoped
+  future, which fixes the class rather than the one layer.
+  Replay now rebuilds the database *shape* the recording had even when
+  the request issued no wire traffic at all — "this request ran no queries" and
+  "this application has no database" were the same `None`, so a handler or
+  state initializer that checks `state.pool()` or replica availability before
+  querying took a branch production never took. Redaction reaches two things it
+  used to miss: the credential *inside* a masked header (the token after
+  `Bearer`, what a `Basic` credential decodes to, each value of an auth-param
+  list such as SigV4's `Signature=`, each cookie value — the form
+  a handler actually extracts and may echo into an error message or a SQL bind,
+  where the whole header value never
+  matched), and values shorter than four characters, which are now masked where
+  they stand as a whole token, so a three-digit CVV quoted back by a failure no
+  longer reaches disk while timestamps and identifiers stay readable. Finally,
+  `SET LOCAL ...` is no longer treated as framework housekeeping: `Db::checkout`
+  issues a plain session-level `SET statement_timeout`, so a transaction-scoped
+  setting is application code and belongs on the ordered tape, where changing or
+  removing it shows up as a divergence instead of being synthesized away.
 - **duplicate Markdown heading anchors:** `markdown::render` now hands out
   document-unique heading `id`s. A page that repeated a heading — and real docs
   repeat "Example", "Usage", and "Notes" constantly — emitted the same `id`
@@ -25,6 +110,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   all and stay out of the anchor namespace.
 
 ### Added
+
+- **`{encrypted}` field-DSL modifier:** `autumn generate scaffold`/`model` can
+  now declare an at-rest encrypted column in one token —
+  `'api_token:String{encrypted}'` emits `#[encrypted]` on the generated model
+  field, and `'email:String{encrypted:deterministic}'` emits
+  `#[encrypted(deterministic)]` so the column still supports
+  `find_by`/`exists_by` equality lookups and a real `UNIQUE` index. The
+  migration column is unbounded `TEXT` — sized for the base64 ciphertext
+  envelope, not the plaintext — with a comment saying so, and the admin
+  generator's existing auto-detection picks the attribute up end to end, so a
+  scaffolded encrypted column is redacted in the admin with no extra flags.
+  Previously the only way to encrypt a scaffolded column was to remember to
+  hand-edit the generated model, and forgetting shipped plaintext silently.
+  Because randomized ciphertext can never satisfy an equality predicate, the
+  generator now refuses at generate time — pointing at
+  `{encrypted:deterministic}` as the fix — the combinations that would
+  otherwise fail at runtime with `EncryptionError::RandomizedEqualityLookup`:
+  `:unique`/`--unique`, `--query`, and `--index`. A second set of combinations
+  is refused in *both* modes, because no mode makes them work: `--searchable`
+  (full-text search indexes the stored ciphertext), `--default` (a defaulted
+  column bypasses the encrypting insert), `--shard-key` (the shard is chosen by
+  hashing the stored value), `Option<…>` and non-text field kinds (the v1
+  attribute is non-null `String` only), a `:states(…)` state machine (the
+  transition handler's raw write would bypass encryption), and deriving a
+  `slug{from:…}` from an encrypted column (a slug is stored in its own
+  plaintext column *and* used as the record's URL). `generate admin` refuses a
+  `{encrypted}` token the on-disk model does not back with the attribute:
+  redacting a column the model stores in plaintext would manufacture a false
+  at-rest guarantee rather than provide one.
+
+  The generated app's own surfaces follow suit: the index table renders
+  `••••••••` with no sort link, the CSV export omits the column entirely (as
+  the admin panel's export already did), and the admin no longer offers to sort
+  by it. The `show` view and `edit` form still render the value — you routed to
+  one record deliberately, and a form has to show what it is editing.
+  `generate` also prints the `autumn credentials edit` next step naming the
+  exact key material the new column needs.
 
 - **`MarkdownRegistry::static_params_for(param)`:** derive SSG params for a
   `#[static_get]` route whose path parameter is not named `slug` — e.g.
@@ -48,9 +170,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   future is a two-variant enum (ready response, or the inner future) and whose
   `call` forwards without cloning. Measured with the debug-profile
   `allocation-counter` gate (`autumn/tests/config_alloc_gate.rs`), a
-  `TestClient` request drops from 220 to 204 allocation blocks (-7.3%) and
-  from 38,683 to 34,477 bytes (-10.9%), identical across repeated runs; the
-  ingress-traversal gate falls from 13 to 11. No behavior changed — both
+  `TestClient` request drops from 172 to 160 allocation blocks (-7.0%) and
+  from 37,819 to 33,667 bytes (-11.0%), identical across repeated runs; the
+  ingress-traversal gate falls from 13 to 11. Independent of and composing
+  with the `AppState`/`Arc<str>` fix above: the same -7%/-11% margin was
+  measured against the tree both before and after that change landed. No behavior changed — both
   middlewares keep their `async fn` form for existing `from_fn` callers and
   tests, and each shares one decision function with its gate so the two paths
   cannot diverge.
@@ -107,6 +231,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   buffers, a 99.15% reduction. No index or migration changes — see
   `docs/reports/2026-08-14-ledger-job-claim-single-queue/`.
 
+- **state:** `AppState::profile` and `AppState::auth_session_key` no longer
+  deep-clone a `String` on every `AppState::clone()`. `AppState` is cloned
+  once per hop of the ingress tower stack (`Route::call` deep-clones the
+  boxed service beneath it, per #2193/#2198), so the two fields still held
+  as an owned `Option<String>`/`String` — rather than shared behind an
+  `Arc` like the rest of the struct — paid a fresh heap allocation on every
+  one of those clones instead of once per request. Both now live behind an
+  `Arc<str>`; `profile()` and `auth_session_key()` are unchanged (`&str`
+  via `Deref`), and `with_profile`/`with_auth_session_key` still take
+  `impl Into<String>`. Measured with the debug-profile allocation-counter
+  gate already used for #2198's `config_arc` work (`autumn/tests/config_alloc_gate.rs`):
+  a `TestClient` request drops from 220 to 172 allocation blocks (-22%),
+  identical across repeated runs.
 - **mail:** list-mail sends (`Mailer::send` with `list_unsubscribe` set) now
   resolve suppression for the whole recipient batch in one query instead of
   one `SELECT` per recipient. The `SuppressionStore` trait gained a batched
@@ -129,6 +266,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cluster:** an embedded, zero-dependency self-clustering substrate (#1762).
+  Two instances of the same binary, started with a shared secret and no
+  external coordination service — no Redis, no Postgres, no etcd — discover
+  each other over authenticated TCP gossip, report a converged two-member
+  view, and expose the first shared distributed primitive: a cluster-wide
+  grow-only CRDT counter (`ClusterHandle::counter(name)`, `increment()` /
+  `get()`) whose cells are keyed by `(node id, boot incarnation)` and merged
+  by per-cell maximum, so an increment on one node is observable on the other
+  within a push interval and a restarted node can never undercount. One
+  periodic signed state push doubles as the heartbeat: membership is itself a
+  CRDT (`Alive`/`Left` records with SWIM-style incarnation refutation), while
+  `Suspect`/`Down` live in a purely local liveness overlay — a clean shutdown
+  sends a bounded best-effort departure (the node's final document, so an
+  increment accepted while requests were still draining is not lost, plus the
+  leave notice), and a kill converges by suspicion timeout, after which the
+  surviving node keeps serving the counter and reports a one-member view that
+  is `UP`, never `DOWN`. Frames are
+  HMAC-SHA256-authenticated (cluster name, sender, incarnation, and sequence
+  are MAC-covered; constant-time verify before any payload parse; per-sender
+  replay watermarks) but not encrypted — deploy the cluster port on a trusted
+  network. What an *unauthenticated* socket can cost is bounded too: inbound
+  connections are capped, one that delivers no complete frame within its idle
+  deadline is closed, and one whose frames keep being refused before they
+  authenticate is closed on the third — so the connection cap is a budget only
+  peers that prove the secret can hold. A handler that increments on every
+  request has its prompt pushes rate-limited to a fraction of the push interval
+  rather than gossiping the whole document per write. Opt-in via the new `[cluster]` config
+  section
+  (`AUTUMN_CLUSTER__*` env forms, fail-fast validation, secret required),
+  surfaced through the `cluster:membership` health indicator and
+  `autumn_cluster_*` metric families, and implemented with zero new crate
+  dependencies. See `docs/guide/clustering.md` for the wire format, failure
+  semantics, and a two-terminal walkthrough.
+- **actuator:** `HealthIndicatorRegistry::contains` and
+  `MetricsSourceRegistry::contains` report whether a component name is already
+  taken (#1762). Neither registry can unregister, so a subsystem that claims a
+  name in both — as the cluster does — can now check first and fail without
+  stranding half of itself behind an error.
 - **generate scaffold:** `--soft-delete` now also generates the recover-from-
   trash UI its data layer has been waiting for (#1332), finishing #689's AC6. A
   standard HTML scaffold gains a `#[secured] GET /<plural>/trash` page that lists

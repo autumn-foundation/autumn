@@ -72,6 +72,30 @@ pub fn plan_migration_with_options(
     super::model::validate_resource_name(name)?;
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, uniques)?;
+    // Issue #1340: `generate migration` emits SQL and nothing else — it never
+    // writes a model file, so there is nowhere for the `#[encrypted(...)]`
+    // attribute to land. Accepting `{encrypted}` here would add an ordinary
+    // plaintext column while the author believes they declared encryption:
+    // precisely the silent failure this DSL token exists to eliminate. Point at
+    // the two generators that do wire the attribute, and at the existing
+    // `Encrypt<Column>On<Table>` shape for converting a column that already
+    // exists.
+    if let Some(field) = fields.iter().find(|f| f.is_encrypted()) {
+        return Err(GenerateError::InvalidField {
+            token: field.name.clone(),
+            reason: format!(
+                "the `encrypted` modifier is not supported by `generate migration`: this \
+                 command emits SQL only, so the `#[encrypted]` attribute would never reach a \
+                 model and the column would silently be plaintext. Declare the column with \
+                 `autumn generate model`/`autumn generate scaffold` \
+                 (`{}:String{{encrypted}}`), or convert an existing plaintext column with \
+                 `autumn generate migration Encrypt{}On<Table>`, which emits the documented \
+                 offline backfill.",
+                field.name,
+                super::naming::pascal(&field.name),
+            ),
+        });
+    }
     // Determine the target app's database backend so the emitted ALTER TABLE
     // DDL is backend-aware (SQLite foundation, issue #1614).
     let backend = detect_backend(project_root);
@@ -1264,5 +1288,56 @@ pub struct Post {
             down.contains("ADD COLUMN lock_version TEXT"),
             "the rollback must restore the caller's original type:\n{down}"
         );
+    }
+
+    // ── `{encrypted}` is not a `generate migration` token (issue #1340) ─────
+
+    /// R8: `generate migration` emits SQL only — it never touches a model
+    /// file — so accepting `{encrypted}` here would add a plaintext column
+    /// while the developer believes they declared encryption. That is exactly
+    /// the silent failure issue #1340 exists to close, so refuse and name the
+    /// two commands that really do wire the attribute.
+    #[test]
+    fn add_columns_migration_rejects_the_encrypted_modifier() {
+        let tmp = project();
+        let err = plan_migration(
+            tmp.path(),
+            "AddApiTokenToAccounts",
+            &["api_token:String{encrypted}".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("encrypted"), "must name the modifier: {msg}");
+        assert!(
+            msg.contains("generate model") || msg.contains("generate scaffold"),
+            "must point at the commands that emit the attribute: {msg}"
+        );
+        assert!(
+            msg.contains("EncryptApiTokenOnAccounts") || msg.contains("Encrypt"),
+            "must point at the existing encrypt-columns migration shape: {msg}"
+        );
+    }
+
+    /// The pre-existing `Encrypt<Column>On<Table>` shape is unaffected — it
+    /// takes no field tokens and stays the supported way to convert an
+    /// existing plaintext column.
+    #[test]
+    fn encrypt_columns_migration_shape_still_works() {
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "EncryptApiTokenOnAccounts",
+            &[],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_encrypt_api_token_on_accounts/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("api_token"), "up.sql: {up}");
     }
 }
