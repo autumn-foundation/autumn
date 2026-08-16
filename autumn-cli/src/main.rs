@@ -674,9 +674,22 @@ enum Commands {
     ///   decimal{precision,scale}     (NUMERIC, default {12,2})
     ///   Option<...>                  (any of the above, nullable)
     ///
+    /// # Field modifiers
+    ///
+    ///   String{encrypted}                    at-rest encrypted column
+    ///   String{encrypted:deterministic}      ...and equality-queryable
+    ///
+    /// `{encrypted}` emits `#[encrypted]` on the generated model field, so the
+    /// column is stored as an opaque base64 ciphertext envelope (unbounded
+    /// TEXT) and is redacted in the generated admin. Use
+    /// `{encrypted:deterministic}` when the column still needs
+    /// `find_by`/`exists_by` lookups or a UNIQUE index. Requires key material
+    /// under `[active_record_encryption]` — run `autumn credentials edit`.
+    ///
     /// # Example
     ///
     ///   autumn generate scaffold Post title:String body:Text published:bool
+    ///   autumn generate scaffold Account `api_token:String{encrypted}`
     #[command(subcommand, verbatim_doc_comment)]
     Generate(GenerateCommands),
 

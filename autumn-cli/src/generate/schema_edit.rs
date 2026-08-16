@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use autumn_web::config::DatabaseBackend;
 
 use super::GenerateError;
-use super::dsl::{Field, FieldConstraints, FieldKind, IdType};
+use super::dsl::{EncryptedMode, Field, FieldConstraints, FieldKind, IdType};
 
 /// Append a `pub mod <name>;` line to a `mod.rs` file, returning the new
 /// contents. Idempotent: a second call with the same name is a no-op.
@@ -296,6 +296,9 @@ pub fn create_table_sql_with_metadata_and_id_for(
         sql.push_str(comment);
         sql.push('\n');
     }
+    if let Some(comment) = encrypted_columns_comment(fields) {
+        sql.push_str(&comment);
+    }
     let _ = writeln!(sql, "CREATE TABLE {table} (");
     let _ = write!(sql, "    id {}", id_type.pk_sql_for(backend));
     for f in fields {
@@ -360,6 +363,61 @@ pub fn create_table_sql_with_metadata_and_id_for(
         sql.push_str(&unique_index_sql(table, field_name, fields));
     }
     sql
+}
+
+/// A leading comment block naming this table's `{encrypted}` columns (issue
+/// #1340), or `None` when the model declares none — so an unencrypted
+/// migration stays byte-for-byte identical.
+///
+/// The columns are already `TEXT` (every DSL kind that accepts `{encrypted}` is
+/// a text column), which is exactly the point worth writing down: the stored
+/// value is a base64 AES-256-GCM envelope, always larger than the plaintext, so
+/// the column must stay **unbounded**. Anyone later tempted to "tighten" it to
+/// a `VARCHAR(n)` sized for the plaintext would silently break writes once the
+/// envelope overflows — the same trap the `Encrypt<Col>On<Table>` migration
+/// warns about from the other direction (see
+/// [`write_widen_bounded_columns_note`]).
+fn encrypted_columns_comment(fields: &[Field]) -> Option<String> {
+    let encrypted: Vec<&Field> = fields.iter().filter(|f| f.is_encrypted()).collect();
+    if encrypted.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(encrypted.len() * 80 + 320);
+    let _ = writeln!(
+        out,
+        "-- At-rest encrypted column(s) (#805). The value stored here is a base64"
+    );
+    let _ = writeln!(
+        out,
+        "-- AES-256-GCM envelope (20-byte header + 16-byte tag, then base64 at ~1.37x),"
+    );
+    let _ = writeln!(
+        out,
+        "-- never the plaintext — so the column is unbounded TEXT, sized for the"
+    );
+    let _ = writeln!(
+        out,
+        "-- envelope rather than the plaintext. Do NOT narrow it to a bounded"
+    );
+    let _ = writeln!(
+        out,
+        "-- VARCHAR(n): the envelope will overflow a plaintext-sized limit."
+    );
+    for f in encrypted {
+        let mode = match f.encrypted_mode() {
+            Some(EncryptedMode::Deterministic) => {
+                "deterministic (stable ciphertext; equality lookups work, equality leaks)"
+            }
+            _ => "randomized (fresh nonce per write; no equality lookups)",
+        };
+        let _ = writeln!(out, "--   {}: {mode}", f.name);
+    }
+    let _ = writeln!(
+        out,
+        "-- Key material lives in the credentials store; see \
+         docs/guide/attribute-encryption.md."
+    );
+    Some(out)
 }
 
 /// `down.sql` companion to [`create_table_sql_with_metadata_and_id`].

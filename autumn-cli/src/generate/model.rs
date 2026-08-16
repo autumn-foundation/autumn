@@ -182,6 +182,11 @@ fn plan_model_with_options_impl(
     let mut fields = parse_fields(field_tokens)?;
     apply_unique_flags(&mut fields, &options.uniques)?;
     validate_field_names(&fields)?;
+    // Issue #1340: the flag spellings of "make this encrypted column
+    // equality-queryable"/"give it a default" only become visible once
+    // `--unique`/`--default` have been folded in, so this runs after
+    // `apply_unique_flags` and before anything is emitted.
+    validate_encrypted_fields(&fields, options)?;
     let pascal_name = pascal(name);
     validate_enum_field_collisions(&pascal_name, &fields)?;
     let metadata = parse_model_metadata(&fields, options)?;
@@ -279,6 +284,14 @@ fn plan_model_with_options_impl(
              a scaffolded form carries it in a hidden field rather than an editable control. \
              Rename the column if you wanted an ordinary integer you set yourself."
         ));
+    }
+    // Issue #1340: an encrypted column is inert without key material — the app
+    // boots, but the first read or write of the column fails. Say so with the
+    // exact command and credential paths rather than leaving it to a runtime
+    // error. (Emitted for the `generate scaffold` path too, which delegates
+    // its model plan here.)
+    if let Some(warning) = encryption_key_material_warning(&fields) {
+        plan.warn(warning);
     }
     check_reference_targets(
         &mut plan,
@@ -1796,6 +1809,20 @@ pub fn parse_model_metadata(
                 field.rust_type()
             )));
         }
+        // Issue #1340: full-text search builds the stored `search_vector` from
+        // the DATABASE column value, which for an encrypted column is
+        // ciphertext — so a plaintext search would never match. The `#[model]`
+        // macro rejects `#[searchable]` + `#[encrypted]` outright; mirror that
+        // here so the failure names the field at generate time instead of
+        // surfacing as a macro error in the generated app.
+        if field.is_encrypted() {
+            return Err(GenerateError::Config(format!(
+                "--searchable field '{field_name}' is `{{encrypted}}`: full-text search indexes \
+                 the stored column, which holds ciphertext, so plaintext searches would never \
+                 match (the `#[model]` macro rejects `#[searchable]` on an encrypted field). \
+                 Drop it from --searchable, or keep a separate non-encrypted column to search."
+            )));
+        }
         let weight = b"ABCD"[i.min(3)] as char;
         metadata.searchable.push((field_name.to_owned(), weight));
     }
@@ -1806,6 +1833,105 @@ pub fn parse_model_metadata(
     }
 
     Ok(metadata)
+}
+
+/// Reject every `{encrypted}` combination the encryption runtime or the
+/// `#[model]` macro cannot honour (issue #1340), after `--unique` flags have
+/// been folded into the fields so both spellings of "make this column
+/// equality-queryable" are covered by one check.
+///
+/// The DSL parser already refuses the per-token combinations it can see
+/// (non-`String` kinds, `Option<…>`, `:unique`, `:states(…)`). What is left are
+/// the *flag* spellings, which only exist once the caller's options are known.
+///
+/// # Errors
+/// [`GenerateError::InvalidField`] naming the offending field and the fix.
+pub fn validate_encrypted_fields(
+    fields: &[Field],
+    options: &ModelOptions,
+) -> Result<(), GenerateError> {
+    for field in fields {
+        if !field.is_encrypted() {
+            continue;
+        }
+        // AC6, flag spelling: `--unique <col>` reaches the same broken state as
+        // the DSL's `:unique`, so it gets the same refusal and the same fix.
+        if field.is_randomized_encrypted() && field.unique {
+            return Err(GenerateError::InvalidField {
+                token: field.name.clone(),
+                reason: super::dsl::randomized_equality_lookup_reason(&field.name, "is `unique`"),
+            });
+        }
+        // `#[encrypted]` columns must flow through the encrypting `serialize_as`
+        // wrapper on insert; a `#[default]` column is excluded from the insert
+        // entirely, so the row would hold a raw value the decrypting reader then
+        // rejects as a malformed envelope. The `#[model]` macro refuses the
+        // pair — surface it here, where the field name is still in hand.
+        if options
+            .defaults
+            .iter()
+            .filter_map(|d| d.split_once('=').map(|(name, _)| name.trim()))
+            .any(|name| name == field.name)
+        {
+            return Err(GenerateError::InvalidField {
+                token: field.name.clone(),
+                reason: format!(
+                    "field '{}' is `{{encrypted}}` and cannot also have a `--default`: a \
+                     defaulted column bypasses the insert path that encrypts the value, so the \
+                     column would store unencrypted data the decrypting reader then rejects \
+                     (the `#[model]` macro refuses `#[default]` + `#[encrypted]`). Set the \
+                     value explicitly on insert instead.",
+                    field.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The "you still need key material" next step for a model that declares at
+/// least one `{encrypted}` column (issue #1340), or `None` when it declares
+/// none.
+///
+/// The generated app boots either way — a missing key ring is a warning in
+/// dev/test and a hard failure only in production (see
+/// `autumn_web::app`'s `fail_fast_on_missing_encryption_keys`) — but every read
+/// and write of the new column fails until the credentials exist. Naming the
+/// command and the exact credential paths here is the difference between a
+/// working on-ramp and a confusing first request.
+#[must_use]
+pub fn encryption_key_material_warning(fields: &[Field]) -> Option<String> {
+    if !fields.iter().any(Field::is_encrypted) {
+        return None;
+    }
+    let deterministic = fields
+        .iter()
+        .any(|f| f.encrypted_mode() == Some(super::dsl::EncryptedMode::Deterministic));
+    // Name the credentials as dotted paths, matching the runtime's own
+    // "Attribute encryption misconfiguration" diagnostic, so the two are
+    // greppable against each other.
+    let mut warning = String::from(
+        "This model has at-rest encrypted column(s). Reads and writes will fail until key \
+         material exists: set `active_record_encryption.primary_key` and \
+         `active_record_encryption.key_derivation_salt`",
+    );
+    if deterministic {
+        warning.push_str(
+            " (plus `active_record_encryption.deterministic_key`, required by the \
+             deterministic column(s) declared here)",
+        );
+    }
+    warning.push_str(
+        ". Run `autumn credentials edit` and add:\n    \
+         [active_record_encryption]\n    \
+         primary_key         = \"<openssl rand -hex 32>\"\n    \
+         key_derivation_salt = \"<openssl rand -hex 16>\"",
+    );
+    if deterministic {
+        warning.push_str("\n    deterministic_key   = \"<openssl rand -hex 32>\"");
+    }
+    warning.push_str("\n  See docs/guide/attribute-encryption.md.");
+    Some(warning)
 }
 
 fn split_key_value(token: &str, sep: char) -> Result<(&str, &str), GenerateError> {
@@ -2416,6 +2542,17 @@ fn render_model_file(
             }
             let _ = writeln!(out, "    #[state_machine(transitions({inner}))]");
         }
+        // Issue #1340: a `{encrypted}` / `{encrypted:deterministic}` DSL
+        // modifier re-emits as the `#[encrypted(...)]` attribute the `#[model]`
+        // macro parses, so the column is stored as an opaque base64 ciphertext
+        // envelope while staying a plain `String` in Rust. This is also what
+        // the admin generator's `detect_encrypted_fields` reads back off the
+        // model source to redact the column, so the spelling here is a
+        // contract, not cosmetics. Absent for a plaintext column — that no-op
+        // path is what keeps unencrypted output byte-identical.
+        if let Some(attribute) = f.encrypted_attribute() {
+            let _ = writeln!(out, "    {attribute}");
+        }
         // Issue #1255: a `richtext` column renders as a bare `String`, exactly
         // like `String`/`Text`, so nothing in the emitted source would otherwise
         // distinguish it. Emit a marker doc comment that (a) tells a human
@@ -2456,6 +2593,10 @@ fn render_model_file(
 }
 
 #[cfg(test)]
+// Test inputs like `"email:String{encrypted:deterministic}"` are literal DSL
+// tokens passed to the generators, not format strings — the `{…}` is the
+// scaffold's own constraint-modifier syntax under test.
+#[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
     use crate::generate::Flags;
@@ -2838,6 +2979,321 @@ mod tests {
             "got:\n{model}"
         );
         assert!(model.contains("pub status: String,"), "got:\n{model}");
+    }
+
+    // ── `{encrypted}` at-rest column encryption (issue #1340) ───────────────
+
+    /// AC3 (negative half): a model with no `{encrypted}` field must render
+    /// exactly as before this feature — no `#[encrypted]` attribute leaks into
+    /// the ordinary path.
+    #[test]
+    fn model_file_without_encrypted_field_emits_no_attribute() {
+        let fields = crate::generate::dsl::parse_fields(&[
+            "title:String".into(),
+            "body:Text".into(),
+            "published:bool".into(),
+        ])
+        .unwrap();
+        let model = render_model_file_for_test("Post", "posts", &fields);
+        assert!(
+            !model.contains("#[encrypted"),
+            "no encryption declared, so no attribute should render; got:\n{model}"
+        );
+    }
+
+    /// AC7: `{encrypted}` emits a bare `#[encrypted]` and
+    /// `{encrypted:deterministic}` emits `#[encrypted(deterministic)]`, on a
+    /// plain `String` model field (the macro's v1 requirement).
+    #[test]
+    fn model_file_emits_encrypted_attributes_for_both_modes() {
+        let fields = crate::generate::dsl::parse_fields(&[
+            "api_token:String{encrypted}".into(),
+            "email:String{encrypted:deterministic}".into(),
+            "username:String".into(),
+        ])
+        .unwrap();
+        let model = render_model_file_for_test("Account", "accounts", &fields);
+        assert!(
+            model.contains("    #[encrypted]\n    pub api_token: String,"),
+            "randomized column must carry a bare `#[encrypted]`; got:\n{model}"
+        );
+        assert!(
+            model.contains("    #[encrypted(deterministic)]\n    pub email: String,"),
+            "deterministic column must carry the mode; got:\n{model}"
+        );
+        // AC3: a non-encrypted DSL field in the SAME model is unaffected.
+        assert!(
+            model.contains("    pub username: String,"),
+            "plain column must be untouched; got:\n{model}"
+        );
+        assert!(
+            !model.contains("#[encrypted]\n    pub username"),
+            "plain column must not pick up the attribute; got:\n{model}"
+        );
+    }
+
+    /// The attribute composes with the `{…}` validation fan-out: both land on
+    /// the same field, and the field stays a plain `String`.
+    #[test]
+    fn model_file_emits_encrypted_alongside_validation_attributes() {
+        // Goes through the real plan (not `render_model_file_for_test`) because
+        // the `{…}` validation fan-out is applied by `parse_model_metadata`.
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Account",
+            &["email:String{encrypted:deterministic,max=254,email}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/account.rs")).unwrap();
+        assert!(
+            model.contains("#[validate(length(max = 254))]"),
+            "got:\n{model}"
+        );
+        assert!(model.contains("#[validate(email)]"), "got:\n{model}");
+        assert!(
+            model.contains("#[encrypted(deterministic)]"),
+            "got:\n{model}"
+        );
+        assert!(model.contains("pub email: String,"), "got:\n{model}");
+    }
+
+    /// AC4: the generated migration column is unbounded `TEXT` — sized for the
+    /// base64 ciphertext envelope, never a plaintext-width type — and the
+    /// migration says so, so whoever reads the SQL later knows why.
+    #[test]
+    fn encrypted_column_migration_is_text_with_envelope_comment() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_accounts/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("api_token TEXT NOT NULL"), "up.sql: {up}");
+        // The comment is SQL-comment-only: nothing but comments precede
+        // `CREATE TABLE`, so the DDL itself is unchanged.
+        let (head, _) = up
+            .split_once("CREATE TABLE")
+            .unwrap_or_else(|| panic!("up.sql: {up}"));
+        assert!(
+            head.lines()
+                .all(|l| l.trim().is_empty() || l.trim_start().starts_with("--")),
+            "only comments may precede CREATE TABLE: {up}"
+        );
+        assert!(
+            head.contains("api_token"),
+            "migration must name the encrypted column in a comment: {up}"
+        );
+        assert!(
+            head.contains("base64") && head.contains("envelope"),
+            "migration comment must explain the ciphertext envelope sizing: {up}"
+        );
+        assert!(
+            head.contains("VARCHAR"),
+            "migration comment must warn against narrowing to a bounded type: {up}"
+        );
+    }
+
+    /// A model with no encrypted column keeps a byte-identical migration —
+    /// no stray comment block leaks into the ordinary path.
+    #[test]
+    fn unencrypted_model_migration_has_no_encryption_comment() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(!up.contains("envelope"), "up.sql: {up}");
+        assert!(up.starts_with("CREATE TABLE posts ("), "up.sql: {up}");
+    }
+
+    /// AC6 (flag half): `--unique` reaches the same broken state as `:unique`,
+    /// so the guard must run after `apply_unique_flags`.
+    #[test]
+    fn unique_flag_on_randomized_encrypted_field_is_rejected() {
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Account",
+            &["api_token:String{encrypted}".into()],
+            "20260427000000",
+            &ModelOptions {
+                uniques: vec!["api_token".into()],
+                ..ModelOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("api_token"), "must name the field: {msg}");
+        assert!(
+            msg.contains("deterministic"),
+            "must point at the fix: {msg}"
+        );
+    }
+
+    /// `--unique` on a DETERMINISTIC encrypted column is the supported path.
+    #[test]
+    fn unique_flag_on_deterministic_encrypted_field_is_allowed() {
+        let tmp = project();
+        let plan = plan_model_with_options(
+            tmp.path(),
+            "Account",
+            &["email:String{encrypted:deterministic}".into()],
+            "20260427000000",
+            &ModelOptions {
+                uniques: vec!["email".into()],
+                ..ModelOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_accounts/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("CREATE UNIQUE INDEX"), "up.sql: {up}");
+    }
+
+    /// R6: `#[searchable]` + `#[encrypted]` is a hard `#[model]` macro error
+    /// (full-text search would index ciphertext). Reject at generate time with
+    /// the same explanation instead of emitting uncompilable code.
+    #[test]
+    fn searchable_flag_on_encrypted_field_is_rejected() {
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Account",
+            &["notes:Text{encrypted}".into()],
+            "20260427000000",
+            &ModelOptions {
+                searchable: vec!["notes".into()],
+                ..ModelOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("notes"), "must name the field: {msg}");
+        assert!(
+            msg.contains("encrypted") && msg.contains("searchable"),
+            "must name both sides of the conflict: {msg}"
+        );
+    }
+
+    /// R7: `#[default]` + `#[encrypted]` is a hard `#[model]` macro error (a
+    /// defaulted column bypasses the encrypting insert path, so the column
+    /// would hold an unencrypted value the decrypting reader then rejects).
+    #[test]
+    fn default_flag_on_encrypted_field_is_rejected() {
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Account",
+            &["api_token:String{encrypted}".into()],
+            "20260427000000",
+            &ModelOptions {
+                defaults: vec!["api_token=none".into()],
+                ..ModelOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("api_token"), "must name the field: {msg}");
+        assert!(msg.contains("encrypted"), "must name the conflict: {msg}");
+    }
+
+    /// R12: the generated app boots but every encrypted read/write fails until
+    /// key material exists, so the generator must say so — naming the command
+    /// and the exact credential paths, and only mentioning `deterministic_key`
+    /// when a deterministic column was actually declared.
+    #[test]
+    fn encrypted_model_warns_about_missing_key_material() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Account",
+            &["api_token:String{encrypted}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("encrypt"))
+            .unwrap_or_else(|| panic!("expected an encryption warning; got {:?}", plan.warnings));
+        assert!(
+            warning.contains("autumn credentials edit"),
+            "warning must name the command: {warning}"
+        );
+        assert!(
+            warning.contains("active_record_encryption.primary_key"),
+            "warning must name the credential: {warning}"
+        );
+        assert!(
+            !warning.contains("deterministic_key"),
+            "a randomized-only model needs no deterministic key: {warning}"
+        );
+    }
+
+    #[test]
+    fn deterministic_encrypted_model_warns_about_the_deterministic_key() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Account",
+            &["email:String{encrypted:deterministic}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("encrypt"))
+            .unwrap_or_else(|| panic!("expected an encryption warning; got {:?}", plan.warnings));
+        assert!(
+            warning.contains("deterministic_key"),
+            "a deterministic column needs the deterministic key: {warning}"
+        );
+    }
+
+    #[test]
+    fn unencrypted_model_emits_no_encryption_warning() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("encrypt")),
+            "got: {:?}",
+            plan.warnings
+        );
     }
 
     #[test]

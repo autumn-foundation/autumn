@@ -26,6 +26,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`{encrypted}` field-DSL modifier:** `autumn generate scaffold`/`model` can
+  now declare an at-rest encrypted column in one token —
+  `'api_token:String{encrypted}'` emits `#[encrypted]` on the generated model
+  field, and `'email:String{encrypted:deterministic}'` emits
+  `#[encrypted(deterministic)]` so the column still supports
+  `find_by`/`exists_by` equality lookups and a real `UNIQUE` index. The
+  migration column is unbounded `TEXT` — sized for the base64 ciphertext
+  envelope, not the plaintext — with a comment saying so, and the admin
+  generator's existing auto-detection picks the attribute up end to end, so a
+  scaffolded encrypted column is redacted in the admin with no extra flags.
+  Previously the only way to encrypt a scaffolded column was to remember to
+  hand-edit the generated model, and forgetting shipped plaintext silently.
+  Because randomized ciphertext can never satisfy an equality predicate, the
+  generator now refuses — at generate time, pointing at
+  `{encrypted:deterministic}` — the combinations that would otherwise fail at
+  runtime with `EncryptionError::RandomizedEqualityLookup` or fail to compile:
+  `:unique`/`--unique`, `--query`, `--searchable`, `--default`, `Option<…>`,
+  non-text field kinds, and `:states(…)`. Encrypted columns are also left out
+  of the scaffolded index view's sortable headers (the database would order by
+  envelope bytes), and `generate` prints the `autumn credentials edit` next
+  step naming the exact key material the column needs.
+
 - **`MarkdownRegistry::static_params_for(param)`:** derive SSG params for a
   `#[static_get]` route whose path parameter is not named `slug` — e.g.
   `#[static_get("/docs/{page}", params = …)]` needs

@@ -138,6 +138,9 @@ autumn generate scaffold Post \
 | `{email}`                       | `String`/`Text`   | `email`                 | `type="email"`            |
 | `{url}`                         | `String`/`Text`   | `url`                   | `type="url"`              |
 
+(The `{encrypted}` modifier below shares this block but is not a validator —
+see [Encrypted columns](#encrypted-columns-with-encrypted).)
+
 The generated model field carries the `#[validate(...)]` attribute (so a bad
 submission is rejected through the existing changeset path as a **422 with
 inline per-field errors**, never a 500 or a silent store), and the generated
@@ -147,6 +150,68 @@ column is preserved, and a rejected submission re-renders keeping the entered
 values. A misspelled modifier (e.g. `{maxx=5}`) fails the scaffold with an
 error naming the offending token. Quote the whole token in bash/zsh so the
 shell doesn't brace-expand the comma.
+
+### Encrypted columns with `{encrypted}`
+
+Declare a column encrypted at rest in one token — no hand-edit of the generated
+model, no forgetting:
+
+```bash
+autumn generate scaffold Account \
+  username:String \
+  'api_token:String{encrypted}' \
+  'email:String{encrypted:deterministic}'
+```
+
+`{encrypted}` puts `#[encrypted]` on the generated model field, so the column is
+stored as an opaque base64 AES-256-GCM envelope while staying a plain `String`
+in your Rust code. The migration column is unbounded `TEXT` — sized for the
+envelope, never the plaintext — and the generated admin **redacts** the column
+automatically, because the admin generator reads the very attribute this token
+emits. See [attribute encryption](attribute-encryption.md) for the envelope
+format, key rotation, and the randomized/deterministic tradeoff.
+
+| Modifier                    | Emits                          | Equality lookups |
+| --------------------------- | ------------------------------ | ---------------- |
+| `{encrypted}`               | `#[encrypted]`                 | ✗ (fresh nonce per write) |
+| `{encrypted:deterministic}` | `#[encrypted(deterministic)]`  | ✓ (`find_by`/`exists_by`, `UNIQUE`) |
+
+Randomized is the default and the safe choice. Reach for `deterministic` only
+when the column genuinely needs lookups, and never on a low-entropy column —
+stable ciphertext lets an observer of the database tell which rows share a
+value.
+
+Because randomized ciphertext can never match an equality predicate, the
+generator **refuses** to pair `{encrypted}` with anything that would perform
+one, rather than emitting code that fails at runtime with
+`EncryptionError::RandomizedEqualityLookup`:
+
+```bash
+autumn generate scaffold Account 'api_token:String{encrypted}:unique'
+# ✗ field 'api_token' is `unique`, but `{encrypted}` is randomized: … Declare it
+#   `{encrypted:deterministic}` to support `find_by`/`exists_by` equality lookups …
+```
+
+The same refusal covers `--unique`, `--query find_by_x:x`, `--searchable` (FTS
+would index ciphertext) and `--default` (a defaulted column bypasses the
+encrypting insert). Encrypted columns are also left out of the index view's
+sortable headers, since the database would order by envelope bytes.
+
+One requirement remains yours: key material. `autumn generate` prints the exact
+next step, and the app fails fast in production without it:
+
+```bash
+autumn credentials edit
+# [active_record_encryption]
+# primary_key         = "<openssl rand -hex 32>"
+# key_derivation_salt = "<openssl rand -hex 16>"
+# deterministic_key   = "<openssl rand -hex 32>"   # only for {encrypted:deterministic}
+```
+
+`{encrypted}` applies to `String`/`Text` columns only, and never to a nullable
+one — `#[encrypted]` supports non-null `String` columns in v1. To encrypt a
+column that **already exists** (with data in it), use the backfill migration
+instead: `autumn generate migration EncryptApiTokenOnAccounts`.
 
 Every generated table also includes:
 

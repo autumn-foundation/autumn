@@ -152,9 +152,23 @@ pub fn plan_admin_with_options(
     let mut options = options.clone();
     options.encrypted.extend(det_encrypted);
     options.encrypted_visible.extend(det_visible);
-    let options = &options;
 
     let fields = parse_fields(field_tokens)?;
+    // Issue #1340: a `{encrypted}` field-DSL token is a second, independent
+    // declaration that the column is sensitive. Fold it in so the admin redacts
+    // it even if the on-disk model was hand-edited (or generated before the
+    // attribute existed) — the safe direction to disagree in is "hide it".
+    // Redundant with the AST detection above in the normal case; deduped
+    // because `AdminOptions::encrypted` is a plain list the renderer scans.
+    for field in &fields {
+        if field.is_encrypted()
+            && !options.encrypted.contains(&field.name)
+            && !options.encrypted_visible.contains(&field.name)
+        {
+            options.encrypted.push(field.name.clone());
+        }
+    }
+    let options = &options;
     let plural = pluralize(&snake_name);
     let plural_pascal = pascal(&plural);
 
@@ -1166,6 +1180,10 @@ fn render_admin_smoke_test(
 }
 
 #[cfg(test)]
+// Test inputs like `"email:String{encrypted:deterministic}"` are literal DSL
+// tokens, not format strings — the `{…}` is the scaffold's own
+// constraint-modifier syntax under test.
+#[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
     use crate::generate::Flags;
@@ -2178,6 +2196,108 @@ pub struct Account {
         assert!(
             matches!(err, GenerateError::InvalidName(..)),
             "expected InvalidName, got {err:?}"
+        );
+    }
+
+    /// The generated `src/admin/<snake>.rs` body from an admin plan.
+    fn admin_adapter_contents(plan: &Plan) -> String {
+        plan.actions
+            .iter()
+            .find(|a| {
+                a.path()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with("src/admin/account.rs")
+            })
+            .map(|a| match a {
+                crate::generate::emit::Action::Create { contents, .. }
+                | crate::generate::emit::Action::Modify { contents, .. } => contents.clone(),
+                _ => String::new(),
+            })
+            .expect("admin adapter action")
+    }
+
+    // ── `{encrypted}` DSL → admin redaction, end-to-end (issue #1340) ───────
+
+    /// AC5: the model text the *generator* emits for a `{encrypted}` DSL token
+    /// must be picked up by the admin's existing `detect_encrypted_fields`,
+    /// with no extra flags — closing the loop the issue is about.
+    ///
+    /// The model source here is not hand-written: it is exactly what
+    /// `render_model_file_for_test` produces for those tokens, so a drift in
+    /// the emitted attribute spelling fails this test rather than silently
+    /// un-redacting a scaffolded PII column.
+    #[test]
+    fn generator_emitted_encrypted_attribute_is_detected_by_the_admin() {
+        let tokens = [
+            "username:String".to_owned(),
+            "api_token:String{encrypted}".to_owned(),
+            "email:String{encrypted:deterministic}".to_owned(),
+        ];
+        let fields = crate::generate::dsl::parse_fields(&tokens).unwrap();
+        let model_source =
+            crate::generate::model::render_model_file_for_test("Account", "accounts", &fields);
+        // Sanity: the source under test really carries the attributes.
+        assert!(model_source.contains("#[encrypted]"), "{model_source}");
+        assert!(
+            model_source.contains("#[encrypted(deterministic)]"),
+            "{model_source}"
+        );
+
+        let tmp = project_with_model_source("account", &model_source);
+        let plan = plan_admin(tmp.path(), "Account", &tokens).unwrap();
+        let admin = admin_adapter_contents(&plan);
+
+        // Both encrypted columns are redacted; neither opted into visibility.
+        assert!(
+            admin.contains(".encrypted()"),
+            "the admin must redact the generator-emitted encrypted columns:\n{admin}"
+        );
+        assert!(
+            !admin.contains(".encrypted_visible()"),
+            "no column opted into admin visibility:\n{admin}"
+        );
+        // Redaction is per-field: the plaintext sibling stays fully editable
+        // and searchable.
+        assert!(
+            admin.contains("AdminField::new(\"username\""),
+            "admin: {admin}"
+        );
+        assert_eq!(
+            admin.matches(".encrypted()").count(),
+            2,
+            "exactly the two encrypted columns must be redacted:\n{admin}"
+        );
+        // Ciphertext can never match a plaintext ILIKE, so an encrypted column
+        // must not feed the admin's search filter.
+        assert!(
+            !admin.contains("api_token.ilike") && !admin.contains("email.ilike"),
+            "admin: {admin}"
+        );
+    }
+
+    /// Fail-closed: a `{encrypted}` DSL token passed to `generate admin`
+    /// redacts the column even if the on-disk model file does not (yet) carry
+    /// the attribute — erring toward hiding sensitive data, never revealing it.
+    #[test]
+    fn encrypted_dsl_token_redacts_even_when_the_model_file_lacks_the_attribute() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Account {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   pub api_token: String,\n\
+            }\n";
+        let tmp = project_with_model_source("account", model_source);
+        let plan = plan_admin(
+            tmp.path(),
+            "Account",
+            &["api_token:String{encrypted}".to_owned()],
+        )
+        .unwrap();
+        let admin = admin_adapter_contents(&plan);
+        assert!(
+            admin.contains(".encrypted()"),
+            "a DSL-declared encrypted column must be redacted:\n{admin}"
         );
     }
 }

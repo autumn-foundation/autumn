@@ -28,6 +28,30 @@ pub struct Account {
 }
 ```
 
+## Declaring an encrypted column from `autumn generate`
+
+You do not have to hand-write the attribute. The scaffold/model field DSL takes
+an `{encrypted}` modifier, so a new resource ships encrypted from the first
+command:
+
+```bash
+autumn generate scaffold Account username:String \
+  'api_token:String{encrypted}' 'email:String{encrypted:deterministic}'
+```
+
+That emits the `#[encrypted]` / `#[encrypted(deterministic)]` attributes shown
+above, an unbounded `TEXT` column sized for the ciphertext envelope, and an
+admin that redacts the column — no hand-editing. `{encrypted}` is `String`/`Text`
+and non-null only (matching the v1 attribute), and the generator refuses to pair
+randomized encryption with `:unique`, `--query`, `--searchable`, or `--default`,
+so you find out at generate time rather than at runtime. See the
+[generators guide](./generators.md#encrypted-columns-with-encrypted).
+
+To encrypt a column that already exists, use the backfill migration instead —
+`autumn generate migration EncryptApiTokenOnAccounts` — and read
+[Backfilling an existing plaintext column](#backfilling-an-existing-plaintext-column)
+first: the backfill must run **before** the attribute is added.
+
 ## When to use this vs. the credentials store vs. log scrubbing
 
 | Concern | Use |

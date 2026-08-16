@@ -39,6 +39,11 @@ pub struct FieldConstraints {
     /// `slug:slug{from:title}`. `slug` only; never a `#[validate]`/HTML5
     /// constraint.
     pub from: Option<String>,
+    /// `encrypted` / `encrypted:deterministic` — at-rest attribute encryption
+    /// (issue #1340), re-emitted as an `#[encrypted(…)]` attribute on the
+    /// generated model field. `String`/`Text` only, and never nullable — see
+    /// [`EncryptedMode`]. `None` for an ordinary plaintext column.
+    pub encrypted: Option<EncryptedMode>,
 }
 
 impl FieldConstraints {
@@ -51,6 +56,64 @@ impl FieldConstraints {
             && !self.url
             && self.label.is_none()
             && self.from.is_none()
+            && self.encrypted.is_none()
+    }
+}
+
+/// The at-rest encryption mode a field's `{encrypted}` modifier declares
+/// (issue #1340). Mirrors `autumn_web::encryption::Mode` and the
+/// `#[encrypted(...)]` attribute the `#[model]` macro parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptedMode {
+    /// `{encrypted}` (or the explicit `{encrypted:randomized}`) — randomized
+    /// AEAD, a fresh nonce per write. The safe default: equal plaintexts
+    /// produce different ciphertext, so nothing leaks through the column — at
+    /// the cost of making equality lookups (`WHERE col = ?`, `find_by_<col>`,
+    /// a `UNIQUE` index) impossible.
+    Randomized,
+    /// `{encrypted:deterministic}` — the nonce is derived from the plaintext,
+    /// so equal plaintexts produce equal ciphertext. Equality lookups and
+    /// `UNIQUE` indexes work; the tradeoff is that an observer of the database
+    /// can tell which rows share a value. An explicit opt-in by design.
+    Deterministic,
+}
+
+impl EncryptedMode {
+    /// The exact `#[encrypted(...)]` attribute line the model generator emits
+    /// for this mode, in the spelling the `#[model]` macro parses (a bare path
+    /// for randomized, a `deterministic` option otherwise).
+    #[must_use]
+    pub const fn attribute(self) -> &'static str {
+        match self {
+            Self::Randomized => "#[encrypted]",
+            Self::Deterministic => "#[encrypted(deterministic)]",
+        }
+    }
+
+    /// Parse the value half of an `encrypted:<mode>` modifier.
+    ///
+    /// `admin_visible` and `versioned_ciphertext` are real `#[encrypted(...)]`
+    /// options but deliberately not DSL-expressible: the point of generator
+    /// wiring is that a scaffolded encrypted column is redacted in the admin
+    /// and kept out of version history by default, so opting back out is a
+    /// deliberate hand-edit. They get their own message rather than being
+    /// lumped in with a typo.
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "deterministic" => Ok(Self::Deterministic),
+            "randomized" => Ok(Self::Randomized),
+            opt @ ("admin_visible" | "versioned_ciphertext") => Err(format!(
+                "the `{opt}` encryption option is not expressible in the field DSL — a \
+                 generated encrypted column is redacted in the admin and kept out of version \
+                 history by default. Declare `{{encrypted}}` here and add \
+                 `#[encrypted({opt})]` to the generated model field by hand if you need it."
+            )),
+            other => Err(format!(
+                "unknown encryption mode '{other}'; supported: deterministic, randomized \
+                 (the default). Use `{{encrypted:deterministic}}` when the column needs \
+                 `find_by`/`exists_by` equality lookups or a UNIQUE index."
+            )),
+        }
     }
 }
 
@@ -256,6 +319,41 @@ impl Field {
             _ => {}
         }
         out
+    }
+
+    /// The at-rest encryption mode declared via a `{encrypted}` /
+    /// `{encrypted:deterministic}` modifier (issue #1340), or `None` for an
+    /// ordinary plaintext column.
+    #[must_use]
+    pub const fn encrypted_mode(&self) -> Option<EncryptedMode> {
+        self.constraints.encrypted
+    }
+
+    /// Whether this column is stored encrypted at rest, in either mode.
+    #[must_use]
+    pub const fn is_encrypted(&self) -> bool {
+        self.constraints.encrypted.is_some()
+    }
+
+    /// Whether this column is *randomized*-encrypted — the mode that makes
+    /// equality lookups (`find_by_<col>`, `WHERE col = ?`, a `UNIQUE` index)
+    /// impossible, because a fresh nonce per write means equal plaintexts never
+    /// produce equal ciphertext. The generators refuse to emit those lookups
+    /// for such a column (issue #1340 AC6), mirroring the runtime's
+    /// `EncryptionError::RandomizedEqualityLookup`.
+    #[must_use]
+    pub const fn is_randomized_encrypted(&self) -> bool {
+        matches!(self.constraints.encrypted, Some(EncryptedMode::Randomized))
+    }
+
+    /// The `#[encrypted(...)]` attribute line the model generator emits for
+    /// this field, or `None` when the column is not encrypted.
+    #[must_use]
+    pub const fn encrypted_attribute(&self) -> Option<&'static str> {
+        match self.constraints.encrypted {
+            Some(mode) => Some(mode.attribute()),
+            None => None,
+        }
     }
 
     /// For a [`FieldKind::References`] field, the referenced table name —
@@ -767,7 +865,8 @@ impl IdType {
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, \
-    enum{a,b,…}, decimal{precision,scale}, slug{from:col}, Option<…>, :unique";
+    enum{a,b,…}, decimal{precision,scale}, slug{from:col}, Option<…>, :unique, \
+    String{encrypted}, String{encrypted:deterministic}";
 
 /// The DSL field kinds that map to a working diesel `SQLite` conversion
 /// (issue #1614 AC #4; #1924) — the complement of the kinds
@@ -1042,6 +1141,51 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     // machinery (issue #1032) for free, whether or not `:unique` was typed.
     let unique = unique || kind == FieldKind::Slug;
 
+    // ── `{encrypted}` cross-checks (issue #1340) ────────────────────────────
+    // The kind allowlist already ran in `set_encrypted_constraint`; what's left
+    // are the checks that need the *whole* parsed field.
+    if let Some(mode) = constraints.encrypted {
+        // `#[encrypted]` supports non-null `String` columns in v1 — the diesel
+        // `serialize_as`/`deserialize_as` wrappers are not threaded through
+        // `Option<String>`. Reject here rather than emit a model the macro
+        // refuses to compile.
+        if nullable {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "an `encrypted` field cannot be nullable — `#[encrypted]` supports \
+                         non-null `String` columns in v1. Drop the `Option<…>` (store an \
+                         empty string for \"unset\")."
+                    .into(),
+            });
+        }
+        // A `:states(…)` column is a low-entropy closed set. Randomized mode
+        // makes every state query impossible; deterministic mode leaks each
+        // row's state through ciphertext equality — the exact case the
+        // encryption guide warns never to use deterministic mode for. Neither
+        // is what the author meant, so refuse the pair.
+        if state_machine.is_some() {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "an `encrypted` field cannot also declare a `states(…)` state machine: \
+                         a state column is a low-entropy closed set, so randomized encryption \
+                         would make state queries impossible and deterministic encryption would \
+                         leak every row's state through ciphertext equality."
+                    .into(),
+            });
+        }
+        // AC6: a randomized column can never satisfy an equality lookup, so a
+        // `UNIQUE` index over it enforces nothing and the free `find_by_<col>`
+        // the generators derive from `unique` fails at runtime with
+        // `EncryptionError::RandomizedEqualityLookup`. Fail here, where the fix
+        // is one word away.
+        if unique && mode == EncryptedMode::Randomized {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: randomized_equality_lookup_reason(&name, "is `unique`"),
+            });
+        }
+    }
+
     Ok(Field {
         name,
         kind,
@@ -1051,6 +1195,26 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         constraints,
         state_machine,
     })
+}
+
+/// The shared explanation for every generate-time refusal of an equality
+/// lookup against a **randomized**-encrypted column (issue #1340 AC6).
+///
+/// `what` is a short verb phrase naming the thing that would perform the
+/// lookup — "is `unique`", "has a `--query` derived equality lookup" — so each
+/// call site reads naturally while the diagnosis and the fix stay identical.
+/// The wording deliberately mirrors the runtime's
+/// `EncryptionError::RandomizedEqualityLookup`, so a developer who has met one
+/// recognises the other.
+#[must_use]
+pub(super) fn randomized_equality_lookup_reason(field: &str, what: &str) -> String {
+    format!(
+        "field '{field}' {what}, but `{{encrypted}}` is randomized: a fresh nonce per write \
+         means equal plaintexts never produce equal ciphertext, so the lookup can never match \
+         (the runtime raises `EncryptionError::RandomizedEqualityLookup`) and a UNIQUE index \
+         over it would enforce nothing. Declare it `{{encrypted:deterministic}}` to support \
+         `find_by`/`exists_by` equality lookups and real uniqueness, or drop the lookup."
+    )
 }
 
 /// Split a scalar/`references` type token into its base type and the body of a
@@ -1250,6 +1414,9 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
             match key.trim() {
                 "label" => set_label_constraint(&mut c, value.trim(), is_reference)?,
                 "from" => set_from_constraint(&mut c, value.trim(), is_slug)?,
+                "encrypted" => {
+                    set_encrypted_constraint(&mut c, EncryptedMode::parse(value.trim())?, kind)?;
+                }
                 other => return Err(unknown_constraint_message(other, kind)),
             }
         } else {
@@ -1266,6 +1433,9 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
                         c.url = true;
                     }
                 }
+                // A bare `{encrypted}` is the safe default mode, exactly like a
+                // bare `#[encrypted]` attribute.
+                "encrypted" => set_encrypted_constraint(&mut c, EncryptedMode::Randomized, kind)?,
                 _ => return Err(unknown_constraint_message(tok, kind)),
             }
         }
@@ -1455,11 +1625,44 @@ fn set_from_constraint(c: &mut FieldConstraints, value: &str, is_slug: bool) -> 
     Ok(())
 }
 
+/// Record a `{encrypted}` / `{encrypted:<mode>}` modifier (issue #1340),
+/// rejecting it on any field kind the `#[encrypted]` attribute macro does not
+/// support.
+///
+/// v1 of the encryption runtime accepts **non-null `String` columns only**
+/// (`autumn-macros`' `validate_encrypted_field`): the plaintext is held in
+/// memory as a `String` and round-trips through the `RandomizedText` /
+/// `DeterministicText` diesel wrappers. So `Bytea`, numerics, `enum{…}`,
+/// `decimal{…}`, `references`, `richtext`, `slug` and friends are refused here
+/// rather than emitted as a model the macro would then refuse to compile.
+/// (The issue's AC text mentions `bytea`; the runtime does not support it, so
+/// the DSL says so plainly instead of generating broken code.) The nullability
+/// half of that rule is enforced in [`parse_field`], which is where the
+/// `Option<…>` wrapper has already been peeled off.
+fn set_encrypted_constraint(
+    c: &mut FieldConstraints,
+    mode: EncryptedMode,
+    kind: FieldKind,
+) -> Result<(), String> {
+    if !matches!(kind, FieldKind::String | FieldKind::Text) {
+        return Err(format!(
+            "the `encrypted` modifier only applies to `String`/`Text` fields; \
+             `#[encrypted]` supports non-null `String` columns in v1 (encrypt structured \
+             data before storing it). Got a `{}` field.",
+            kind.rust_type()
+        ));
+    }
+    c.encrypted = Some(mode);
+    Ok(())
+}
+
 /// A per-kind "unknown constraint" message that names the offending token and
 /// lists what the kind *does* accept (issue #1388 AC5).
 fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
     let accepted = match kind {
-        FieldKind::String | FieldKind::Text => "min=N, max=N, email, url",
+        FieldKind::String | FieldKind::Text => {
+            "min=N, max=N, email, url, encrypted, encrypted:deterministic"
+        }
         // `RichText` shares the numeric arm's accepted set, not `String`'s: it
         // takes the `min`/`max` length bounds but NOT the `email`/`url` format
         // validators, which a Markdown body could never satisfy (issue #1255).
@@ -3004,6 +3207,217 @@ mod tests {
         let f = parse_field("email:String:unique").unwrap();
         assert!(f.unique);
         assert!(f.constraints.is_empty());
+    }
+
+    // ── `{encrypted}` at-rest column encryption (issue #1340) ───────────────
+
+    #[test]
+    fn parse_encrypted_modifier_defaults_to_randomized() {
+        // AC1: a bare `{encrypted}` marks the column at-rest encrypted in the
+        // safe default mode — randomized AEAD, matching bare `#[encrypted]`.
+        let f = parse_field("token:String{encrypted}").unwrap();
+        assert_eq!(f.name, "token");
+        assert_eq!(f.kind, FieldKind::String);
+        assert_eq!(f.encrypted_mode(), Some(EncryptedMode::Randomized));
+        assert!(f.is_encrypted());
+        assert!(f.is_randomized_encrypted());
+        assert_eq!(f.encrypted_attribute(), Some("#[encrypted]"));
+    }
+
+    #[test]
+    fn parse_encrypted_deterministic_modifier() {
+        // AC2: the deterministic variant is expressible and maps to the
+        // `#[encrypted(deterministic)]` attribute, which keeps `find_by`/
+        // `exists_by` equality lookups working.
+        let f = parse_field("email:String{encrypted:deterministic}").unwrap();
+        assert_eq!(f.encrypted_mode(), Some(EncryptedMode::Deterministic));
+        assert!(f.is_encrypted());
+        assert!(!f.is_randomized_encrypted());
+        assert_eq!(f.encrypted_attribute(), Some("#[encrypted(deterministic)]"));
+    }
+
+    #[test]
+    fn parse_encrypted_randomized_modifier_is_explicit_default() {
+        // The `#[encrypted]` attribute macro accepts an explicit `randomized`
+        // option; the DSL mirrors it so a reader can spell out the choice.
+        let f = parse_field("token:String{encrypted:randomized}").unwrap();
+        assert_eq!(f.encrypted_mode(), Some(EncryptedMode::Randomized));
+        assert_eq!(f.encrypted_attribute(), Some("#[encrypted]"));
+    }
+
+    #[test]
+    fn encrypted_modifier_accepts_the_text_alias() {
+        let f = parse_field("notes:Text{encrypted}").unwrap();
+        assert_eq!(f.kind, FieldKind::Text);
+        assert!(f.is_encrypted());
+    }
+
+    #[test]
+    fn encrypted_modifier_composes_with_validation_constraints() {
+        // Validation runs on the in-memory PLAINTEXT (the model field is a
+        // plain `String`), so length/format rules compose normally.
+        let f = parse_field("email:String{encrypted:deterministic,max=254,email}").unwrap();
+        assert_eq!(f.encrypted_mode(), Some(EncryptedMode::Deterministic));
+        assert_eq!(
+            f.validation_attrs(),
+            vec!["length(max = 254)".to_owned(), "email".to_owned()]
+        );
+    }
+
+    #[test]
+    fn unencrypted_field_reports_no_encryption() {
+        let f = parse_field("title:String").unwrap();
+        assert_eq!(f.encrypted_mode(), None);
+        assert!(!f.is_encrypted());
+        assert!(!f.is_randomized_encrypted());
+        assert_eq!(f.encrypted_attribute(), None);
+    }
+
+    #[test]
+    fn encrypted_only_block_is_not_an_empty_constraint_set() {
+        // `is_empty()` means "no constraint modifier was declared"; a field
+        // carrying only `{encrypted}` has one.
+        let f = parse_field("token:String{encrypted}").unwrap();
+        assert!(!f.constraints.is_empty());
+        // …but it contributes no `#[validate(...)]` rule.
+        assert!(f.validation_attrs().is_empty());
+    }
+
+    #[test]
+    fn encrypted_modifier_on_nullable_field_is_rejected() {
+        // R1 / macro limit: `#[encrypted]` is only supported on non-null
+        // `String` columns in v1, so reject rather than emit a model the
+        // `#[model]` macro refuses to compile.
+        let err = parse_field("token:Option<String>{encrypted}").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("encrypted"), "must name the modifier: {msg}");
+        assert!(msg.contains("nullable"), "must explain the limit: {msg}");
+    }
+
+    #[test]
+    fn encrypted_modifier_on_non_string_kinds_is_rejected() {
+        // R2: every non-`String`/`Text` kind is rejected at parse time with a
+        // message naming the v1 limitation — including `Bytea`, which the
+        // issue's AC text mentions but the runtime does not support.
+        for token in [
+            "payload:Bytea{encrypted}",
+            "count:i64{encrypted}",
+            "ratio:f64{encrypted}",
+            "flag:bool{encrypted}",
+            "at:DateTime{encrypted}",
+            "body:richtext{encrypted}",
+            "post:references{encrypted}",
+            "slug:slug{from:title,encrypted}",
+        ] {
+            let err = parse_field(token).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("encrypted"),
+                "`{token}` must be rejected naming the modifier: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_modifier_on_enum_field_is_rejected() {
+        // `enum{…}`'s braces are part of the TYPE, so the modifier can only be
+        // spelled as a trailing block; either spelling must be refused.
+        let err = parse_field("status:enum{draft,published}{encrypted}").unwrap_err();
+        assert!(
+            err.to_string().contains("encrypted") || err.to_string().contains("enum"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn encrypted_modifier_rejects_unknown_mode() {
+        // R16: a typo must not silently degrade to the randomized default.
+        let err = parse_field("token:String{encrypted:determinstic}").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("determinstic"), "must name the token: {msg}");
+        assert!(
+            msg.contains("deterministic") && msg.contains("randomized"),
+            "must list the accepted modes: {msg}"
+        );
+    }
+
+    #[test]
+    fn encrypted_modifier_rejects_attribute_only_options() {
+        // `admin_visible` / `versioned_ciphertext` are real `#[encrypted(...)]`
+        // options but deliberately outside the DSL: the whole point of the
+        // generator wiring is that a scaffolded encrypted column is redacted in
+        // the admin by default. Point at the hand-edit instead of silently
+        // accepting or silently dropping them.
+        for opt in ["admin_visible", "versioned_ciphertext"] {
+            let err = parse_field(&format!("token:String{{encrypted:{opt}}}")).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(opt), "must name the option: {msg}");
+            assert!(
+                msg.contains("#[encrypted"),
+                "must point at the attribute to hand-edit: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_modifier_with_state_machine_is_rejected() {
+        // R10: a `:states(…)` column is a low-entropy closed set. Randomized
+        // encryption makes state queries impossible; deterministic encryption
+        // leaks the state of every row through ciphertext equality. Neither is
+        // what the author meant.
+        let err = parse_field("status:String{encrypted}:states(draft -> published)").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("encrypted"), "must name the modifier: {msg}");
+        assert!(msg.contains("states"), "must name the conflict: {msg}");
+    }
+
+    #[test]
+    fn randomized_encrypted_unique_field_is_rejected() {
+        // AC6: `{encrypted}` + `:unique` would emit a `CREATE UNIQUE INDEX`
+        // over randomized ciphertext (which can never collide, so it enforces
+        // nothing) and a `find_by_<col>` that fails at RUNTIME with
+        // `EncryptionError::RandomizedEqualityLookup`. Fail at generate time
+        // instead, pointing at the deterministic mode.
+        let err = parse_field("token:String{encrypted}:unique").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("token"), "must name the field: {msg}");
+        assert!(
+            msg.contains("deterministic"),
+            "must point at the fix: {msg}"
+        );
+    }
+
+    #[test]
+    fn deterministic_encrypted_unique_field_is_allowed() {
+        // Deterministic ciphertext is stable, so a UNIQUE index over it really
+        // does enforce plaintext uniqueness and `find_by_<col>` works.
+        let f = parse_field("email:String{encrypted:deterministic}:unique").unwrap();
+        assert!(f.unique);
+        assert_eq!(f.encrypted_mode(), Some(EncryptedMode::Deterministic));
+    }
+
+    #[test]
+    fn encrypted_column_sql_type_is_unbounded_text() {
+        // AC4: the stored value is a base64 ciphertext envelope, always longer
+        // than the plaintext. `TEXT` is unbounded on both backends, so the
+        // envelope always fits.
+        let f = parse_field("token:String{encrypted}").unwrap();
+        assert_eq!(f.sql_column_type(), "TEXT");
+        assert_eq!(
+            f.sql_column_type_for(autumn_web::config::DatabaseBackend::Sqlite),
+            "TEXT"
+        );
+        assert_eq!(f.schema_type(), "Text");
+        assert_eq!(f.rust_type(), "String");
+    }
+
+    #[test]
+    fn supported_types_help_mentions_the_encrypted_modifier() {
+        // AC7 (docs): the `--help`/error-message surface advertises the token.
+        assert!(
+            SUPPORTED_TYPES.contains("encrypted"),
+            "supported-type help must advertise the encrypted modifier: {SUPPORTED_TYPES}"
+        );
     }
 
     #[test]
