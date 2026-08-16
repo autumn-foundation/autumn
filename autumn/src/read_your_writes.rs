@@ -276,10 +276,11 @@ pub const RYW_COOKIE_NAME: &str = "autumn.ryw";
 /// Axum middleware function that installs the RYWW task-local for every
 /// request and, in `session` mode, handles the signed cookie lifecycle.
 ///
-/// The framework itself installs [`ReadYourWritesLayer`] (the same logic as a
-/// `tower::Service` with a named future — see issue #2214) rather than this
-/// function; it is retained as public API for callers wiring the middleware
-/// into an `axum::middleware::from_fn` of their own.
+/// The framework itself installs `ReadYourWritesLayer` — the same logic as a
+/// `tower::Service` with a named future, so the ingress path pays no `Box::pin`
+/// per request (issue #2214) — rather than this function, which is retained as
+/// public API for callers wiring the middleware into an
+/// `axum::middleware::from_fn` of their own.
 pub async fn middleware(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
