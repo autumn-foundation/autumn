@@ -2070,13 +2070,29 @@ fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
                 placeholder="Leave blank to keep current"
                 autocomplete="new-password";
         },
-        AdminFieldKind::Json => html! {
-            textarea class="form-input" name=(field.name) id=(field.name)
-                style="font-family: monospace; min-height: 150px;"
-                required[field.required] {
-                (str_val)
+        AdminFieldKind::Json => {
+            // `str_val` above unwraps a `Value::String` to its raw text (right
+            // for Text/TextArea, where the stored value *is* plain text), but a
+            // JSON textarea round-trips through `coerce_form_value`'s
+            // `serde_json::from_str`, which needs JSON syntax back — a stored
+            // top-level string like `"hello"` must render WITH its quotes, or a
+            // pure no-op resave either fails to parse (`hello` isn't valid JSON)
+            // or silently changes type (a stored string `"true"`/`"42"` reparses
+            // as a bool/number). `Value::Null` still renders blank, matching the
+            // existing "blank means no value" convention (Codex review finding
+            // on #1341).
+            let json_val = match &current_value {
+                Value::Null => String::new(),
+                v => v.to_string(),
+            };
+            html! {
+                textarea class="form-input" name=(field.name) id=(field.name)
+                    style="font-family: monospace; min-height: 150px;"
+                    required[field.required] {
+                    (json_val)
+                }
             }
-        },
+        }
     }
 }
 
@@ -2394,6 +2410,49 @@ mod tests {
         assert!(
             !form.contains("••••••••"),
             "create control is an empty input, not the redaction mask: {form}"
+        );
+    }
+
+    #[test]
+    fn json_edit_form_prefills_a_stored_string_scalar_with_its_quotes() {
+        // Issue #1341 review: a stored top-level JSON string like `"hello"`
+        // must render WITH its quotes in the edit textarea. Without them, a
+        // pure no-op resave either fails `coerce_form_value`'s JSON parse
+        // (`hello` isn't valid JSON) or, worse, silently changes the value's
+        // type (a stored `"true"`/`"42"` string would reparse as a bool/number).
+        let field = AdminField::new("config", AdminFieldKind::Json);
+
+        let record = serde_json::json!({ "config": "hello" });
+        let form = render_form_widget(&field, Some(&record)).into_string();
+        assert!(
+            form.contains("&quot;hello&quot;") || form.contains("\"hello\""),
+            "stored JSON string must render with its quotes intact: {form}"
+        );
+
+        // A string that looks like another JSON literal must round-trip as
+        // the SAME string, not silently become that other type.
+        let record = serde_json::json!({ "config": "true" });
+        let form = render_form_widget(&field, Some(&record)).into_string();
+        assert!(
+            form.contains("&quot;true&quot;") || form.contains("\"true\""),
+            "a stored JSON string \"true\" must not render as the bare word true: {form}"
+        );
+
+        // Object/array values were already correct — no regression.
+        let record = serde_json::json!({ "config": {"a": 1} });
+        let form = render_form_widget(&field, Some(&record)).into_string();
+        assert!(
+            form.contains("{&quot;a&quot;:1}") || form.contains(r#"{"a":1}"#),
+            "object values still render as JSON: {form}"
+        );
+
+        // A NULL value still renders as a blank textarea, matching the
+        // existing "blank means no value" convention.
+        let record = serde_json::json!({ "config": null });
+        let form = render_form_widget(&field, Some(&record)).into_string();
+        assert!(
+            !form.contains("null"),
+            "a NULL json value should render blank, not the literal word null: {form}"
         );
     }
 
