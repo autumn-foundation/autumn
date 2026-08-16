@@ -176,6 +176,26 @@ impl RejectReason {
     pub const fn closes_connection(self) -> bool {
         matches!(self, Self::Oversize)
     }
+
+    /// Whether the frame had already proved knowledge of the shared secret when
+    /// this verdict was reached.
+    ///
+    /// The MAC check (step 4) is the line. Everything at or before it refuses
+    /// *unauthenticated* bytes — anyone who can reach the port can produce
+    /// them — while steps 5-7 refuse a frame that carried a valid MAC and so
+    /// came from a holder of the secret.
+    ///
+    /// The transport spends that distinction on its connection budget: an
+    /// unauthenticated rejection counts against the connection it arrived on
+    /// (see
+    /// [`MAX_UNAUTHENTICATED_FRAMES`](super::transport::MAX_UNAUTHENTICATED_FRAMES)),
+    /// an authenticated one never does. Both halves matter — the first is what
+    /// stops a stranger from holding every inbound slot, and the second is what
+    /// keeps a real peer's connection safe from a frame a newer version of it
+    /// was entitled to send.
+    pub const fn authenticated(self) -> bool {
+        matches!(self, Self::SelfOrigin | Self::Replay | Self::Payload)
+    }
 }
 
 /// The exact bytes the MAC covers: a length-delimited concatenation, so no
@@ -982,6 +1002,45 @@ mod tests {
             RejectReason::Oversize.closes_connection(),
             "a bad length prefix desynchronizes the framing, so the connection must close"
         );
+    }
+
+    /// The transport spends `authenticated()` on its inbound connection
+    /// budget, so the line it draws has to be the MAC and nothing near it.
+    ///
+    /// A reason mis-filed as authenticated is a free inbound slot for a host
+    /// that cannot produce a valid MAC — the whole point of the budget — and
+    /// one mis-filed the other way closes a real peer's connection over a
+    /// frame a newer version of it was entitled to send. Neither shows up in
+    /// any other assertion in this suite.
+    #[test]
+    fn only_post_mac_verdicts_count_as_authenticated() {
+        for reason in [
+            RejectReason::Oversize,
+            RejectReason::Malformed,
+            RejectReason::Version,
+            RejectReason::KeyId,
+            RejectReason::Cluster,
+            RejectReason::Mac,
+        ] {
+            assert!(
+                !reason.authenticated(),
+                "{} is reached at or before the MAC check, so it refuses bytes \
+                 anyone who can reach the port could have sent",
+                reason.label()
+            );
+        }
+        for reason in [
+            RejectReason::SelfOrigin,
+            RejectReason::Replay,
+            RejectReason::Payload,
+        ] {
+            assert!(
+                reason.authenticated(),
+                "{} is only reachable past a verified MAC, so the frame came \
+                 from a holder of the secret",
+                reason.label()
+            );
+        }
     }
 
     #[test]

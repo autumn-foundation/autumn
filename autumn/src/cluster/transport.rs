@@ -118,6 +118,26 @@ pub const MAX_INBOUND_CONNECTIONS: usize = 128;
 /// a cluster whose push interval is slower than this.
 pub const DEFAULT_INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many frames one inbound connection may have refused *before proving
+/// knowledge of the shared secret* before it is closed.
+///
+/// The idle deadline alone bounds a **silent** socket, not a talkative one: a
+/// host that cannot produce a valid MAC could otherwise hold its slot forever
+/// by sending one well-framed garbage frame per idle window, and hold every
+/// slot in [`MAX_INBOUND_CONNECTIONS`] the same way — at which point real peers
+/// are refused at the cap. Counting those refusals is what makes the connection
+/// budget contingent on authentication rather than on reachability.
+///
+/// Three rather than one, and it is a real trade: a misconfigured or
+/// mid-rotation peer gets a couple of frames on the wire (so
+/// `frames_rejected_total{reason="mac"}` and the rejection log line can name
+/// what is wrong) before its socket is taken away, and the counter never
+/// decays, so a connection cannot buy itself more budget by behaving in
+/// between. Only *unauthenticated* verdicts count
+/// ([`RejectReason::authenticated`]) — a peer that holds the secret has earned
+/// its descriptor and is never closed by this bound.
+pub const MAX_UNAUTHENTICATED_FRAMES: u32 = 3;
+
 /// How long per-peer writers outlive the app's shutdown token.
 ///
 /// The departure `Leave` is queued *by* the cancellation arm of the node's push
@@ -185,6 +205,24 @@ pub trait PeerTransport: Send + Sync + 'static {
         0
     }
 
+    /// Report that the frame delivered from `from` was refused **before** it
+    /// proved knowledge of the shared secret
+    /// ([`RejectReason::authenticated`] is `false`).
+    ///
+    /// The consumer has to be the one to say so: verification lives in the
+    /// node's receive loop, the transport holds no secret, and from down here a
+    /// port scanner and a peer are the same stream of bytes. This is the
+    /// back-channel that lets a verdict reach the socket that frame arrived on,
+    /// so a connection which never authenticates can be closed after
+    /// [`MAX_UNAUTHENTICATED_FRAMES`] instead of holding its slot for as long
+    /// as it keeps sending.
+    ///
+    /// A no-op by default: an in-process transport has no descriptor to
+    /// reclaim, so there is nothing to spend the report on.
+    fn note_unauthenticated_frame(&self, from: &str) {
+        let _ = from;
+    }
+
     /// Retire the per-peer state of every address **not** in `live`.
     ///
     /// Called with each push round's target set. A node id that returns at a
@@ -222,6 +260,108 @@ struct InboundLimits {
     /// Framing-layer rejections, surfaced by
     /// [`PeerTransport::framing_rejections`].
     framing_rejections: Arc<AtomicU64>,
+    /// The live connections, so a verdict the node reaches about a frame can
+    /// find the socket that frame arrived on.
+    connections: Arc<InboundConnections>,
+}
+
+/// One tracked inbound connection: how much of its
+/// [`MAX_UNAUTHENTICATED_FRAMES`] budget it has spent, and the handle that
+/// closes it.
+struct TrackedConnection {
+    /// Which registration owns this entry — see [`InboundRegistration::drop`].
+    id: u64,
+    /// Frames from this connection the node refused before they authenticated.
+    /// Never decays: a connection cannot earn budget back by going quiet.
+    unauthenticated: u32,
+    /// Cancelling this returns the connection reader from whichever `select!`
+    /// arm it is parked in, which drops the stream and its slot.
+    close: CancellationToken,
+}
+
+/// Every inbound connection currently being read, keyed by remote endpoint.
+///
+/// The key is the address the inbound stream carries and the node reports back
+/// (`ip:port`); the TCP 4-tuple makes it unique among *live* connections, since
+/// the local half is this one listener. An entry also remembers the
+/// registration that created it, so a connection closing late can never retire
+/// the entry of a later one that reused its ephemeral port.
+#[derive(Default)]
+struct InboundConnections {
+    live: Mutex<BTreeMap<PeerAddr, TrackedConnection>>,
+    /// Hands out the registration ids above.
+    next_id: AtomicU64,
+}
+
+impl InboundConnections {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<PeerAddr, TrackedConnection>> {
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Track one accepted connection until the returned guard is dropped.
+    fn register(self: &Arc<Self>, peer: &str, close: CancellationToken) -> InboundRegistration {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.lock().insert(
+            peer.to_owned(),
+            TrackedConnection {
+                id,
+                unauthenticated: 0,
+                close,
+            },
+        );
+        InboundRegistration {
+            connections: Arc::clone(self),
+            peer: peer.to_owned(),
+            id,
+        }
+    }
+
+    /// Charge one unauthenticated frame to `peer`, closing that connection once
+    /// it has spent its budget.
+    ///
+    /// An address with no live entry is ignored: the connection already ended,
+    /// and the node's verdict about its last frame has nothing left to close.
+    fn note_unauthenticated(&self, peer: &str) {
+        let mut live = self.lock();
+        let Some(tracked) = live.get_mut(peer) else {
+            return;
+        };
+        tracked.unauthenticated = tracked.unauthenticated.saturating_add(1);
+        if tracked.unauthenticated < MAX_UNAUTHENTICATED_FRAMES {
+            return;
+        }
+        tracked.close.cancel();
+        drop(live);
+        tracing::warn!(
+            peer = %peer,
+            budget = MAX_UNAUTHENTICATED_FRAMES,
+            "cluster: inbound connection spent its unauthenticated-frame budget \
+             without ever proving the shared secret; closing it"
+        );
+    }
+}
+
+/// One connection's entry in [`InboundConnections`], removed on drop so an
+/// error, an EOF, and a cancellation all retire it on the same path.
+struct InboundRegistration {
+    connections: Arc<InboundConnections>,
+    peer: PeerAddr,
+    id: u64,
+}
+
+impl Drop for InboundRegistration {
+    fn drop(&mut self) {
+        let mut live = self.connections.lock();
+        // Only if it is still *ours*: an ephemeral port can be reused the
+        // moment this connection closes, and removing by key alone would let a
+        // dying connection retire the successor that took its address.
+        if live
+            .get(&self.peer)
+            .is_some_and(|tracked| tracked.id == self.id)
+        {
+            live.remove(&self.peer);
+        }
+    }
 }
 
 /// One accepted connection's slot in the [`MAX_INBOUND_CONNECTIONS`] budget,
@@ -303,6 +443,7 @@ impl TcpPeerTransport {
                 idle_timeout: DEFAULT_INBOUND_IDLE_TIMEOUT,
                 live: Arc::new(AtomicUsize::new(0)),
                 framing_rejections: Arc::new(AtomicU64::new(0)),
+                connections: Arc::new(InboundConnections::default()),
             },
         })
     }
@@ -491,6 +632,10 @@ impl PeerTransport for TcpPeerTransport {
         self.limits.framing_rejections.load(Ordering::Relaxed)
     }
 
+    fn note_unauthenticated_frame(&self, from: &str) {
+        self.limits.connections.note_unauthenticated(from);
+    }
+
     fn retain_peers(&self, live: &BTreeSet<String>) {
         // Dropping the queue's sender is the retirement: the writer's `recv`
         // then yields `None` once it has drained whatever was queued, so a
@@ -545,13 +690,21 @@ async fn accept_loop(
                     );
                     continue;
                 };
+                let peer = peer.to_string();
+                // A child of the accept loop's token, so this connection can be
+                // closed on its own — by the unauthenticated-frame budget —
+                // without touching the listener or any other connection, while
+                // shutdown still closes all of them at once.
+                let close = shutdown.child_token();
+                let registration = limits.connections.register(&peer, close.clone());
                 let reader = connection_reader(
                     stream,
-                    peer.to_string(),
+                    peer,
                     inbound.clone(),
-                    shutdown.child_token(),
+                    close,
                     limits.clone(),
                     slot,
+                    registration,
                 );
                 tokio::spawn(reader);
             }
@@ -587,6 +740,13 @@ fn claim_inbound_slot(live: &Arc<AtomicUsize>) -> Option<InboundSlot> {
 /// a frame must not be able to hold a descriptor open indefinitely — the
 /// deadline is the difference between "somebody can make me hold a socket" and
 /// "somebody can make me hold every socket".
+///
+/// The deadline bounds a *silent* connection; a talkative one is bounded by the
+/// node reporting back. `shutdown` here is this connection's own token, so
+/// [`InboundConnections::note_unauthenticated`] closing it after
+/// [`MAX_UNAUTHENTICATED_FRAMES`] wakes whichever `select!` arm this task is
+/// parked in — the read, the body read, or the hand-up — and every one of them
+/// returns, dropping the stream, the slot and the registration together.
 async fn connection_reader(
     mut stream: tokio::net::TcpStream,
     peer: PeerAddr,
@@ -594,10 +754,13 @@ async fn connection_reader(
     shutdown: CancellationToken,
     limits: InboundLimits,
     slot: InboundSlot,
+    registration: InboundRegistration,
 ) {
-    // Held for the whole connection: dropping it gives the budget back on every
-    // exit path below, including cancellation.
+    // Held for the whole connection: dropping them gives the budget back and
+    // retires the tracking entry on every exit path below, cancellation
+    // included.
     let _slot = slot;
+    let _registration = registration;
     loop {
         let mut prefix = [0u8; LENGTH_PREFIX_BYTES];
         let read = tokio::select! {
@@ -784,10 +947,13 @@ async fn peer_writer(
 
 #[cfg(test)]
 mod tcp_tests {
-    use super::{MAX_INBOUND_CONNECTIONS, PeerTransport as _, TcpPeerTransport};
+    use super::{
+        MAX_INBOUND_CONNECTIONS, MAX_UNAUTHENTICATED_FRAMES, PeerTransport as _, TcpPeerTransport,
+    };
     use crate::entropy::SeededEntropy;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_util::sync::CancellationToken;
@@ -817,6 +983,204 @@ mod tcp_tests {
         let entropy: Arc<dyn crate::entropy::Entropy> = Arc::new(SeededEntropy::new(7));
         transport.start(&token, &entropy);
         (transport, token)
+    }
+
+    /// A frame the *framing* layer accepts and no verifier ever could: a legal
+    /// length prefix over a body that is not an envelope at all.
+    ///
+    /// This is exactly the cheap shape the connection budget exists for — a
+    /// few bytes to send, a whole descriptor to hold.
+    fn unauthenticated_frame() -> Vec<u8> {
+        let body = b"not-an-envelope";
+        let mut frame = u32::try_from(body.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes()
+            .to_vec();
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    /// Stand in for the node's receive loop: drain the inbound stream and
+    /// report every frame as never having authenticated, which is what a MAC
+    /// failure does. Returns the number of frames reported so far, so a test
+    /// can wait for its own writes to have been judged.
+    ///
+    /// The transport cannot make this call itself — it holds no secret, and a
+    /// port scanner and a peer look identical from down here — so a test that
+    /// skipped the consumer would be testing nothing.
+    fn spawn_rejecting_consumer(transport: &Arc<TcpPeerTransport>) -> Arc<AtomicU32> {
+        let mut incoming = transport
+            .take_incoming()
+            .expect("the inbound stream must still be available");
+        let transport = Arc::clone(transport);
+        let reported = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&reported);
+        tokio::spawn(async move {
+            while let Some((from, _frame)) = incoming.recv().await {
+                transport.note_unauthenticated_frame(&from);
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        reported
+    }
+
+    /// A connection that keeps talking without ever authenticating must lose
+    /// its slot.
+    ///
+    /// The idle deadline bounds a *silent* socket only, so without this bound a
+    /// stranger holds a descriptor for as long as it likes at the cost of one
+    /// well-framed garbage frame per idle window — and holds all
+    /// [`MAX_INBOUND_CONNECTIONS`] of them the same way, at which point real
+    /// peers are refused at the cap. Reaching the port must not buy more than a
+    /// few frames' worth of resources.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inbound_connection_is_closed_once_it_spends_its_unauthenticated_budget() {
+        // Far longer than this test runs: the close under test must be the
+        // budget, never the idle deadline.
+        let (transport, token) = started(Duration::from_secs(30));
+        let reported = spawn_rejecting_consumer(&transport);
+        let mut client = tokio::net::TcpStream::connect(transport.local_addr())
+            .await
+            .expect("the cluster listener must accept a connection");
+
+        // One frame short of the budget…
+        for _ in 1..MAX_UNAUTHENTICATED_FRAMES {
+            client
+                .write_all(&unauthenticated_frame())
+                .await
+                .expect("writing a well-framed garbage frame must reach the node");
+        }
+        let under_budget = MAX_UNAUTHENTICATED_FRAMES.saturating_sub(1);
+        poll_until(|| reported.load(Ordering::Relaxed) >= under_budget).await;
+
+        let mut sink = [0_u8; 1];
+        let still_open =
+            tokio::time::timeout(Duration::from_millis(200), client.read(&mut sink)).await;
+        assert!(
+            still_open.is_err(),
+            "a connection that has not yet spent its budget of \
+             {MAX_UNAUTHENTICATED_FRAMES} must stay open — a bound that fires \
+             early would cut off a peer mid-secret-rotation before its bad MAC \
+             could even be diagnosed; observed {still_open:?}"
+        );
+
+        // …and now the frame that spends it.
+        client
+            .write_all(&unauthenticated_frame())
+            .await
+            .expect("writing a well-framed garbage frame must reach the node");
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.read(&mut sink)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0))),
+            "after {MAX_UNAUTHENTICATED_FRAMES} frames that never proved the \
+             shared secret the node must close the connection, or the inbound \
+             cap is a budget anyone who can reach the port can hold forever; \
+             observed {closed:?}"
+        );
+        poll_until(|| transport.live_inbound() == 0).await;
+        assert_eq!(
+            transport.live_inbound(),
+            0,
+            "closing the connection must give its slot back"
+        );
+
+        // And the listener itself is untouched: one abuser's socket is closed,
+        // not the port.
+        let mut fresh = tokio::net::TcpStream::connect(transport.local_addr())
+            .await
+            .expect("the listener must still accept connections after closing an abuser");
+        fresh
+            .write_all(&unauthenticated_frame())
+            .await
+            .expect("a fresh connection must still be able to deliver a frame");
+        let delivered = MAX_UNAUTHENTICATED_FRAMES.saturating_add(1);
+        poll_until(|| reported.load(Ordering::Relaxed) >= delivered).await;
+        assert_eq!(
+            reported.load(Ordering::Relaxed),
+            delivered,
+            "the listener must keep accepting and delivering frames; a bound \
+             that took the whole accept loop down with the connection would be \
+             a worse denial of service than the one it fixes"
+        );
+        token.cancel();
+    }
+
+    /// The point of the bound: the connection budget is spent on peers again
+    /// once the abusers holding it are closed.
+    ///
+    /// This is the finding in full — a stranger who fills every slot makes the
+    /// node unreachable to the one peer that matters, and the fix is only worth
+    /// anything if the cap actually frees up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inbound_cap_becomes_available_again_once_abusers_are_closed() {
+        let (transport, token) = started(Duration::from_secs(30));
+        let reported = spawn_rejecting_consumer(&transport);
+
+        let mut abusers = Vec::with_capacity(MAX_INBOUND_CONNECTIONS);
+        for _ in 0..MAX_INBOUND_CONNECTIONS {
+            abusers.push(
+                tokio::net::TcpStream::connect(transport.local_addr())
+                    .await
+                    .expect("the cluster listener must accept a connection"),
+            );
+        }
+        poll_until(|| transport.live_inbound() == MAX_INBOUND_CONNECTIONS).await;
+        assert_eq!(
+            transport.live_inbound(),
+            MAX_INBOUND_CONNECTIONS,
+            "sanity: the budget must actually be full, or the refusal below \
+             proves nothing"
+        );
+
+        // At the cap, even a legitimate peer is turned away — which is why
+        // holding the cap indefinitely is a denial of service and not just
+        // untidiness.
+        let mut refused = tokio::net::TcpStream::connect(transport.local_addr())
+            .await
+            .expect("a connection at the cap is accepted and then closed");
+        let mut sink = [0_u8; 1];
+        let at_cap = tokio::time::timeout(Duration::from_secs(5), refused.read(&mut sink)).await;
+        assert!(
+            matches!(at_cap, Ok(Ok(0))),
+            "sanity: at the cap a new connection must be closed immediately; \
+             observed {at_cap:?}"
+        );
+
+        // Every abuser now spends its budget without ever authenticating.
+        for abuser in &mut abusers {
+            for _ in 0..MAX_UNAUTHENTICATED_FRAMES {
+                abuser
+                    .write_all(&unauthenticated_frame())
+                    .await
+                    .expect("writing a well-framed garbage frame must reach the node");
+            }
+        }
+
+        poll_until(|| transport.live_inbound() == 0).await;
+        assert_eq!(
+            transport.live_inbound(),
+            0,
+            "every connection that spent its budget must be closed, or a host \
+             that cannot produce a valid MAC keeps the port to itself"
+        );
+
+        // …and the freed budget is really usable: a peer connects and its frame
+        // reaches the node.
+        let before = reported.load(Ordering::Relaxed);
+        let mut peer = tokio::net::TcpStream::connect(transport.local_addr())
+            .await
+            .expect("the freed budget must accept a new connection");
+        peer.write_all(&unauthenticated_frame())
+            .await
+            .expect("the new connection must be able to deliver a frame");
+        poll_until(|| reported.load(Ordering::Relaxed) > before).await;
+        assert!(
+            reported.load(Ordering::Relaxed) > before,
+            "a connection accepted after the abusers were closed must be read \
+             from, not merely accepted"
+        );
+        drop(abusers);
+        token.cancel();
     }
 
     /// An inbound connection that never says anything must not be able to hold

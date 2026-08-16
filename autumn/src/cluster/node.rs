@@ -698,6 +698,17 @@ async fn receive_loop(
                 // secret, which is a different alert from a replay or a
                 // truncated frame.
                 inner.metrics.record_rejection(reason);
+                if !reason.authenticated() {
+                    // Reported back to the transport, which owns the socket and
+                    // cannot make this judgement itself: the frame never proved
+                    // knowledge of the secret, so the connection it arrived on
+                    // has not earned the inbound slot it is holding. Without
+                    // this the cap is a budget anyone who can reach the port
+                    // can exhaust — one well-framed garbage frame per idle
+                    // window holds a slot for as long as the sender likes, and
+                    // real peers are refused at the cap.
+                    inner.transport.note_unauthenticated_frame(&from);
+                }
                 tracing::debug!(
                     peer = %from,
                     reason = reason.label(),

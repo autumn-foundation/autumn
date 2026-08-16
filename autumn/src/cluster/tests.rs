@@ -283,6 +283,10 @@ impl PeerTransport for RetainSpy {
         self.inner.framing_rejections()
     }
 
+    fn note_unauthenticated_frame(&self, from: &str) {
+        self.inner.note_unauthenticated_frame(from);
+    }
+
     fn retain_peers(&self, live: &BTreeSet<String>) {
         self.retained
             .lock()
