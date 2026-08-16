@@ -64,6 +64,7 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 | `encrypted_api_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--api` → `cargo check --tests` |
 | `encrypted_live_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--live` → `cargo check --tests` |
 | `encrypted_nested_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--belongs-to` → `cargo check --tests` |
+| `encrypted_admin_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `generate admin` (wired in) → `cargo check --tests` |
 
 The `console.rs` and `scaffold_encrypted.rs` entries compile into the
 consolidated `cli_tests` binary, whose only other CI `--ignored` invocation

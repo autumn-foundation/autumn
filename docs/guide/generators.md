@@ -214,7 +214,10 @@ scaffold makes these:
   one record deliberately, and a form has to show what it is editing;
 - the **CSV export** omits the column entirely, matching the admin panel's own
   export — a downloaded file leaves the app;
-- the **admin** redacts it (`••••••••`) and will not sort by it;
+- the **admin** redacts it (`••••••••`) and will not sort by it — and
+  `autumn generate admin` refuses a `{encrypted}` token whose model field has no
+  `#[encrypted]` attribute, since redacting a column the model stores in
+  plaintext would only hide that fact;
 - an `--api` scaffold **omits it from JSON responses** — `#[encrypted]` implies
   `#[serde(skip_serializing)]` unless the field opts in with
   `#[encrypted(admin_visible)]`. The column can still be *written* over the API.

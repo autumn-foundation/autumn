@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`generate admin` over an `#[encrypted]` model:** the generated admin adapter
+  did not compile — it bound `&new_row` to `.values(…)` and `&diesel_changeset`
+  to `.set(…)`, and diesel implements `Insertable`/`AsChangeset` only for the
+  owned value once a column uses `#[diesel(serialize_as = …)]`, as every
+  encrypted field does. Both now pass owned records when the model has an
+  encrypted column; plaintext models keep the borrowed form byte-for-byte.
+  Separately, the `lock_version` update path writes a raw `col.eq(value)` tuple
+  that never builds an `Update{Model}` changeset, so it bypassed the encrypting
+  wrapper entirely and stored **plaintext** in the encrypted column; it now
+  binds through `RandomizedText`/`DeterministicText` like every other write.
+
 - **`#[repository]` with hooks over an `#[encrypted]` model:** a repository
   declared `broadcasts = true` (or with an explicit `hooks = …` type) over a
   model carrying any `#[encrypted]` column failed to compile —
@@ -116,7 +127,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attribute is non-null `String` only), a `:states(…)` state machine (the
   transition handler's raw write would bypass encryption), and deriving a
   `slug{from:…}` from an encrypted column (a slug is stored in its own
-  plaintext column *and* used as the record's URL).
+  plaintext column *and* used as the record's URL). `generate admin` refuses a
+  `{encrypted}` token the on-disk model does not back with the attribute:
+  redacting a column the model stores in plaintext would manufacture a false
+  at-rest guarantee rather than provide one.
 
   The generated app's own surfaces follow suit: the index table renders
   `••••••••` with no sort link, the CSV export omits the column entirely (as

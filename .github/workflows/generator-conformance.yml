@@ -270,6 +270,12 @@ jobs:
             integration::scaffold_encrypted::encrypted_nested_scaffold_cargo_checks \
             -- --ignored --exact
 
+      - name: encrypted_admin_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_encrypted::encrypted_admin_scaffold_cargo_checks \
+            -- --ignored --exact
+
   # ── Generated-app variant conformance matrix ────────────────────────────────
   #
   # One matrixed job that scaffolds a fresh project in a specific "variant"

@@ -81,6 +81,47 @@ pub struct AdminOptions {
     /// `.encrypted_visible()` so the admin shows plaintext in read views but still
     /// never pre-fills the edit form. Auto-detected from the model source.
     pub encrypted_visible: Vec<String>,
+    /// The subset of the encrypted columns above declared
+    /// `#[encrypted(deterministic)]`. Auto-detected from the model source.
+    ///
+    /// Needed only by the `lock_version` update path, which writes a raw
+    /// `col.eq(value)` tuple rather than the `Update{Model}` changeset — so it
+    /// has to name the encrypting diesel wrapper itself, and the wrapper differs
+    /// per mode. Every other path routes through `serialize_as` and never needs
+    /// to know (issue #1340).
+    pub encrypted_deterministic: Vec<String>,
+}
+
+/// The expression that binds `field`'s submitted value in a raw
+/// `col.eq(…)` update tuple (issue #1340).
+///
+/// A plaintext column binds `new_row.<field>` unchanged. An at-rest encrypted
+/// one is wrapped in the same `autumn_web::encryption` type the `#[model]`
+/// macro puts behind `serialize_as`, so the raw write encrypts identically to
+/// every other path instead of storing plaintext.
+fn encrypted_bind_expr(field: &str, options: &AdminOptions) -> String {
+    let owned = format!("new_row.{field}");
+    if !admin_field_is_encrypted(options, field) {
+        return owned;
+    }
+    let wrapper = if options.encrypted_deterministic.iter().any(|c| c == field) {
+        "DeterministicText"
+    } else {
+        "RandomizedText"
+    };
+    format!("autumn_web::encryption::{wrapper}::from({owned})")
+}
+
+/// Whether the backing model carries any at-rest encrypted column.
+///
+/// `AdminOptions::encrypted`/`encrypted_visible` are populated exclusively by
+/// [`detect_encrypted_fields`] reading the model's own AST — there is no
+/// `--encrypted` CLI flag — so this is exactly "does the `#[model]` struct have
+/// a `#[diesel(serialize_as = …)]` field", which is what decides whether diesel
+/// implements `Insertable`/`AsChangeset` for the borrowed or only the owned
+/// form (issue #1340).
+const fn model_has_encrypted_columns(options: &AdminOptions) -> bool {
+    !options.encrypted.is_empty() || !options.encrypted_visible.is_empty()
 }
 
 /// Compute the file actions for `autumn generate admin` with default options.
@@ -148,29 +189,44 @@ pub fn plan_admin_with_options(
 
     // Auto-detect at-rest encrypted columns from the model so the generated admin
     // redacts/disables exactly those fields (#805), merged with any explicit opts.
-    let (det_encrypted, det_visible) = detect_encrypted_fields(&model_source, &pascal_name);
+    let (det_encrypted, det_visible, det_deterministic) =
+        detect_encrypted_fields(&model_source, &pascal_name);
     let mut options = options.clone();
     options.encrypted.extend(det_encrypted);
     options.encrypted_visible.extend(det_visible);
+    options.encrypted_deterministic.extend(det_deterministic);
 
     let fields = parse_fields(field_tokens)?;
-    // Issue #1340: a `{encrypted}` field-DSL token is a second, independent
-    // declaration that the column is sensitive. Fold it in so the admin redacts
-    // it even if the on-disk model was hand-edited (or generated before the
-    // attribute existed) — when the two sources disagree by omission, hide it.
+    // Issue #1340: the MODEL is the only source of truth for whether a column is
+    // encrypted at rest — `#[encrypted]` is what puts the `serialize_as` wrapper
+    // on the insert/update path. A `{encrypted}` DSL token here declares the same
+    // thing, so the two must agree.
     //
-    // An explicit `#[encrypted(admin_visible)]` on the model is NOT overridden:
-    // that is a deliberate, hand-written opt-in to showing decrypted plaintext
-    // in the (authorization-gated) admin, and the DSL has no way to spell it,
-    // so a bare `{encrypted}` token must not silently revoke it. Redundant with
-    // the AST detection above in the normal case; deduped because
-    // `AdminOptions::encrypted` is a plain list the renderer scans.
+    // When they don't, refuse rather than trusting the token. Marking the admin
+    // field `.encrypted()` only changes the UI: it redacts the value and skips it
+    // in search. The model still has no wrapper, so the admin's own create form
+    // would write the submitted value straight to the column as PLAINTEXT — and
+    // then display `••••••••` over it. That is strictly worse than not redacting,
+    // because it manufactures a false at-rest-encryption guarantee over a column
+    // anyone with database access can read.
     for field in &fields {
         if field.is_encrypted()
             && !options.encrypted.contains(&field.name)
             && !options.encrypted_visible.contains(&field.name)
         {
-            options.encrypted.push(field.name.clone());
+            return Err(GenerateError::InvalidField {
+                token: field.name.clone(),
+                reason: format!(
+                    "field '{}' is declared `{{encrypted}}` here, but `{}` in \
+                     src/models/{snake_name}.rs has no `#[encrypted]` attribute on it. The \
+                     model is what encrypts: without the attribute the column stores \
+                     plaintext, and redacting it in the admin would only hide that. Add \
+                     `#[encrypted]` to the model field (or regenerate it with \
+                     `autumn generate model {pascal_name} '{}:String{{encrypted}}' --force`), \
+                     then re-run this command.",
+                    field.name, pascal_name, field.name
+                ),
+            });
         }
     }
     let options = &options;
@@ -339,12 +395,19 @@ fn detect_lock_version_field(model_source: &str, pascal_name: &str) -> Option<St
 /// the encrypted columns (#805) — a per-field flag, not a global name lookup, so
 /// an unrelated same-named plaintext column on another model stays editable.
 ///
-/// Returns `(encrypted_redacted, encrypted_visible)` field-name lists.
-fn detect_encrypted_fields(model_source: &str, pascal_name: &str) -> (Vec<String>, Vec<String>) {
+/// Returns `(encrypted_redacted, encrypted_visible, deterministic)` field-name
+/// lists. The third is the subset of the first two declared
+/// `#[encrypted(deterministic)]`, which the `lock_version` update path needs to
+/// pick the right encrypting wrapper (issue #1340).
+fn detect_encrypted_fields(
+    model_source: &str,
+    pascal_name: &str,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut redacted = Vec::new();
     let mut visible = Vec::new();
+    let mut deterministic = Vec::new();
     let Ok(parsed) = syn::parse_file(model_source) else {
-        return (redacted, visible);
+        return (redacted, visible, deterministic);
     };
     for item in parsed.items {
         let syn::Item::Struct(item_struct) = item else {
@@ -368,18 +431,24 @@ fn detect_encrypted_fields(model_source: &str, pascal_name: &str) -> (Vec<String
             let Some(name) = field.ident.as_ref().map(ToString::to_string) else {
                 continue;
             };
-            // `admin_visible` opt-in appears in the attribute's token list, e.g.
-            // `#[encrypted(deterministic, admin_visible)]`.
-            let admin_visible = matches!(&attr.meta, syn::Meta::List(list)
-                if list.tokens.to_string().contains("admin_visible"));
-            if admin_visible {
+            // `admin_visible` / `deterministic` opt-ins appear in the
+            // attribute's token list, e.g. `#[encrypted(deterministic, admin_visible)]`.
+            let opts = match &attr.meta {
+                syn::Meta::List(list) => list.tokens.to_string(),
+                // A bare `#[encrypted]` is randomized and redacted.
+                _ => String::new(),
+            };
+            if opts.contains("deterministic") {
+                deterministic.push(name.clone());
+            }
+            if opts.contains("admin_visible") {
                 visible.push(name);
             } else {
                 redacted.push(name);
             }
         }
     }
-    (redacted, visible)
+    (redacted, visible, deterministic)
 }
 
 // ── Field metadata derivation ────────────────────────────────────────────────
@@ -485,6 +554,17 @@ fn render_admin_file(
     options: &AdminOptions,
     lock_version_field: Option<&str>,
 ) -> String {
+    // Issue #1340: an `#[encrypted]` column routes through diesel
+    // `serialize_as`, which CONSUMES the value — so diesel implements
+    // `Insertable` for the owned `New{Model}` only, never `&New{Model}`.
+    // Borrowing fails to compile the generated admin with "the trait bound
+    // `&NewX: Insertable<table>` is not satisfied". Plain models keep the
+    // borrowed form so their output stays byte-for-byte identical.
+    let insert_record = if model_has_encrypted_columns(options) {
+        "new_row"
+    } else {
+        "&new_row"
+    };
     let fields_vec = render_fields_vec(fields, options, lock_version_field);
     let apply_filters = render_apply_filters(plural, fields, options, lock_version_field);
     let apply_sort = render_apply_sort(plural, fields, options, lock_version_field);
@@ -632,7 +712,7 @@ impl AdminModel for {pascal_name}Admin {{
                 serde_json::from_value(data).map_err(Self::validation_error)?;
             let mut conn = pool.get().await.map_err(Self::pool_error)?;
             let created = diesel::insert_into({plural}::table)
-                .values(&new_row)
+                .values({insert_record})
                 .returning({pascal_name}::as_returning())
                 .get_result::<{pascal_name}>(&mut conn)
                 .await
@@ -957,6 +1037,15 @@ fn render_update_body(
             name = f.name
         );
     }
+    // Issue #1340: same `serialize_as` consumption rule as the insert above —
+    // diesel implements `AsChangeset` for the owned changeset only once any
+    // column is encrypted, so borrowing fails with "the trait bound
+    // `&__XChangeset: AsChangeset` is not satisfied". Plain models keep `&`.
+    let changeset_record = if model_has_encrypted_columns(options) {
+        "diesel_changeset"
+    } else {
+        "&diesel_changeset"
+    };
 
     format!(
         "            let new_row: New{pascal_name} =\n\
@@ -968,7 +1057,7 @@ fn render_update_body(
          \t\t\tlet diesel_changeset = changes.__to_changeset();\n\
          \t\t\tlet mut conn = pool.get().await.map_err(Self::pool_error)?;\n\
          \t\t\tlet updated = diesel::update({plural}::table.find(id))\n\
-         \t\t\t\t.set(&diesel_changeset)\n\
+         \t\t\t\t.set({changeset_record})\n\
          \t\t\t\t.returning({pascal_name}::as_returning())\n\
          \t\t\t\t.get_result::<{pascal_name}>(&mut conn)\n\
          \t\t\t\t.await\n\
@@ -996,9 +1085,17 @@ fn render_lock_version_update_body(
 
     let mut set_fields = String::new();
     for f in &writable {
+        // Issue #1340: this is a RAW `col.eq(value)` tuple — unlike the ordinary
+        // update above it never builds an `Update{Model}` changeset, so it never
+        // sees the `#[diesel(serialize_as = …)]` wrapper an `#[encrypted]` column
+        // depends on. Binding the bare value would write PLAINTEXT into the
+        // encrypted column (and the next read would fail decoding the envelope),
+        // so name the wrapper explicitly, exactly as the scaffolded HTML update
+        // handler does.
+        let value = encrypted_bind_expr(&f.name, options);
         let _ = writeln!(
             set_fields,
-            "                    {plural}::{name}.eq(new_row.{name}),",
+            "                    {plural}::{name}.eq({value}),",
             name = f.name
         );
     }
@@ -2288,11 +2385,18 @@ pub struct Account {
         );
     }
 
-    /// Fail-closed: a `{encrypted}` DSL token passed to `generate admin`
-    /// redacts the column even if the on-disk model file does not (yet) carry
-    /// the attribute — erring toward hiding sensitive data, never revealing it.
+    /// The MODEL is the only source of truth for at-rest encryption: `#[encrypted]`
+    /// is what installs the `serialize_as` wrapper on the write path. A
+    /// `{encrypted}` DSL token that the model does not back must therefore be
+    /// refused, not honoured.
+    ///
+    /// Honouring it would mark the admin field `.encrypted()`, which changes the
+    /// UI only — the admin's own create form would still write the submitted
+    /// value to an unwrapped column as PLAINTEXT and then render `••••••••` over
+    /// it. That manufactures a false at-rest guarantee, which is worse than not
+    /// redacting at all.
     #[test]
-    fn encrypted_dsl_token_redacts_even_when_the_model_file_lacks_the_attribute() {
+    fn encrypted_dsl_token_without_the_model_attribute_is_refused() {
         let model_source = "#[autumn_web::model]\n\
             pub struct Account {\n\
             \x20   #[id]\n\
@@ -2300,16 +2404,121 @@ pub struct Account {
             \x20   pub api_token: String,\n\
             }\n";
         let tmp = project_with_model_source("account", model_source);
-        let plan = plan_admin(
+        let err = plan_admin(
             tmp.path(),
             "Account",
             &["api_token:String{encrypted}".to_owned()],
         )
-        .unwrap();
-        let admin = admin_adapter_contents(&plan);
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("api_token"), "must name the field: {msg}");
         assert!(
-            admin.contains(".encrypted()"),
-            "a DSL-declared encrypted column must be redacted:\n{admin}"
+            msg.contains("no `#[encrypted]` attribute"),
+            "must say the model lacks the attribute: {msg}"
+        );
+        assert!(
+            msg.contains("stores plaintext"),
+            "must explain why redacting anyway is wrong: {msg}"
+        );
+    }
+
+    /// Diesel implements `Insertable`/`AsChangeset` for the OWNED value only once
+    /// a column uses `serialize_as`, so a generated admin over an encrypted model
+    /// must not borrow — otherwise it does not compile.
+    #[test]
+    fn admin_over_an_encrypted_model_passes_owned_insert_and_changeset() {
+        let tokens = [
+            "username:String".to_owned(),
+            "api_token:String{encrypted}".to_owned(),
+        ];
+        let fields = crate::generate::dsl::parse_fields(&tokens).unwrap();
+        let model_source =
+            crate::generate::model::render_model_file_for_test("Account", "accounts", &fields);
+        let tmp = project_with_model_source("account", &model_source);
+        let admin = admin_adapter_contents(&plan_admin(tmp.path(), "Account", &tokens).unwrap());
+
+        assert!(admin.contains(".values(new_row)"), "admin: {admin}");
+        assert!(!admin.contains(".values(&new_row)"), "admin: {admin}");
+        assert!(admin.contains(".set(diesel_changeset)"), "admin: {admin}");
+        assert!(!admin.contains(".set(&diesel_changeset)"), "admin: {admin}");
+    }
+
+    /// …and a plaintext model keeps the borrowed form byte-for-byte.
+    #[test]
+    fn admin_over_a_plaintext_model_keeps_the_borrowed_insert_and_changeset() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Account {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   pub username: String,\n\
+            }\n";
+        let tmp = project_with_model_source("account", model_source);
+        let admin = admin_adapter_contents(
+            &plan_admin(tmp.path(), "Account", &["username:String".to_owned()]).unwrap(),
+        );
+        assert!(admin.contains(".values(&new_row)"), "admin: {admin}");
+        assert!(admin.contains(".set(&diesel_changeset)"), "admin: {admin}");
+    }
+
+    /// The `lock_version` update path writes a RAW `col.eq(value)` tuple that
+    /// never builds an `Update{Model}` changeset, so it never sees `serialize_as`.
+    /// Binding the bare value there would store PLAINTEXT in the encrypted
+    /// column — the same defect already fixed in the scaffolded HTML update
+    /// handler. Each mode must name its own wrapper.
+    #[test]
+    fn admin_lock_version_update_binds_encrypted_columns_through_the_wrapper() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Account {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   pub username: String,\n\
+            \x20   #[encrypted]\n\
+            \x20   pub api_token: String,\n\
+            \x20   #[encrypted(deterministic)]\n\
+            \x20   pub email: String,\n\
+            \x20   #[lock_version]\n\
+            \x20   pub lock_version: i32,\n\
+            }\n";
+        let tmp = project_with_model_source("account", model_source);
+        let admin = admin_adapter_contents(
+            &plan_admin(
+                tmp.path(),
+                "Account",
+                &[
+                    "username:String".to_owned(),
+                    "api_token:String{encrypted}".to_owned(),
+                    "email:String{encrypted:deterministic}".to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+            )
+            .unwrap(),
+        );
+
+        assert!(
+            admin.contains(
+                "accounts::api_token.eq(autumn_web::encryption::RandomizedText::from(new_row.api_token))"
+            ),
+            "randomized column must bind through its wrapper:\n{admin}"
+        );
+        assert!(
+            admin.contains(
+                "accounts::email.eq(autumn_web::encryption::DeterministicText::from(new_row.email))"
+            ),
+            "deterministic column must bind through its wrapper:\n{admin}"
+        );
+        for plaintext_bind in [
+            "accounts::api_token.eq(new_row.api_token)",
+            "accounts::email.eq(new_row.email)",
+        ] {
+            assert!(
+                !admin.contains(plaintext_bind),
+                "a plaintext bind for an encrypted column leaked: `{plaintext_bind}`\n{admin}"
+            );
+        }
+        // The plaintext sibling keeps the ordinary bind.
+        assert!(
+            admin.contains("accounts::username.eq(new_row.username)"),
+            "admin: {admin}"
         );
     }
 

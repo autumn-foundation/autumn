@@ -479,6 +479,62 @@ fn encrypted_variant_project(name: &str, extra: &[&str]) -> (tempfile::TempDir, 
     (tmp, project)
 }
 
+/// `generate admin` over an encrypted model must compile once the developer
+/// wires the plugin in, as `docs/guide/admin.md` instructs.
+///
+/// This leg exists because the admin adapter reaches the database through code
+/// the scaffold never emits — its own `.values(..)` insert, its
+/// `Update{Model}` changeset, and (with a `lock_version` column) a raw
+/// `col.eq(..)` tuple. `generate admin` also does NOT add `mod admin;` or the
+/// plugin dependency, so a bare `cargo check` on a freshly generated project
+/// silently skips the whole file: the adapter has to be wired up here or this
+/// proves nothing.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn encrypted_admin_scaffold_cargo_checks() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "encrypted-admin-check-app"]);
+    let project = tmp.path().join("encrypted-admin-check-app");
+    // `lock_version` puts the admin on its raw `col.eq(..)` update path, which
+    // is a different write path from the ordinary changeset one.
+    let fields = [
+        "username:String",
+        "api_token:String{encrypted}",
+        "email:String{encrypted:deterministic}",
+        "lock_version:i32",
+    ];
+    let mut scaffold_args = vec!["generate", "scaffold", "Account"];
+    scaffold_args.extend_from_slice(&fields);
+    run_autumn_ok(&project, &scaffold_args);
+    let mut admin_args = vec!["generate", "admin", "Account"];
+    admin_args.extend_from_slice(&fields);
+    run_autumn_ok(&project, &admin_args);
+
+    // Wire the generated adapter in, per docs/guide/admin.md — `generate admin`
+    // deliberately leaves both steps to the developer.
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let plugin = workspace_root
+        .join("autumn-admin-plugin")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let cargo_toml_path = project.join("Cargo.toml");
+    let content = fs::read_to_string(&cargo_toml_path).unwrap();
+    let content = content.replacen(
+        "[dependencies]",
+        &format!("[dependencies]\nautumn-admin-plugin = {{ path = \"{plugin}\" }}"),
+        1,
+    );
+    fs::write(&cargo_toml_path, content).unwrap();
+    let main_path = project.join("src/main.rs");
+    let main = fs::read_to_string(&main_path).unwrap();
+    fs::write(&main_path, format!("mod admin;\n{main}")).unwrap();
+
+    cargo_check_against_workspace(&project);
+}
+
 /// `cargo check --tests` a generated project against this workspace's
 /// `autumn-web` (rather than the published crate), asserting success.
 fn cargo_check_against_workspace(project: &Path) {
