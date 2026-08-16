@@ -104,6 +104,10 @@ pub struct CaptureSettings {
     pub app_name: Option<String>,
     /// Recording application's active profile.
     pub profile: Option<String>,
+    /// Database roles the application has configured (`primary`, `replica`),
+    /// recorded so a replay can rebuild the same shape even for a request
+    /// that never touched the database.
+    pub db_roles: Vec<String>,
 }
 
 impl Default for CaptureSettings {
@@ -115,6 +119,7 @@ impl Default for CaptureSettings {
             max_capsules: 50,
             app_name: None,
             profile: None,
+            db_roles: Vec::new(),
         }
     }
 }
@@ -384,6 +389,18 @@ impl CaptureScope {
             BodyTap::Teeing {
                 overflowed: true, ..
             } => Some(BODY_OVERFLOW_NOTE),
+            // A handler that read exactly `Content-Length` bytes and stopped
+            // has the whole body — it simply never polled once more for the
+            // `None` that sets `end_stream`. The captured length settles it,
+            // and treating that as partial would refuse a capsule whose body
+            // is complete (replay refuses partial bodies, so a false positive
+            // here costs a perfectly good reproduction).
+            BodyTap::Teeing {
+                declared_len: Some(declared),
+                buf,
+                end_stream: false,
+                ..
+            } if buf.len() >= *declared => None,
             BodyTap::Teeing {
                 end_stream: false, ..
             } => Some(BODY_PARTIAL_NOTE),
@@ -707,7 +724,16 @@ where
             // reporting layer marks a failing response whose body is still
             // streaming at that point as truncated (with a note), so such a
             // capsule is refused by replay rather than presented as complete.
-            CAPSULE_SCOPE.scope(scope, inner.call(req)).await
+            //
+            // `inner.call(req)` is deliberately made *inside* the scoped
+            // future rather than passed to `scope` as an argument: arguments
+            // are evaluated first, so an inner service that does its work in
+            // `call` itself — as a hand-written Tower middleware does, and as
+            // `TrustedProxiesService` does when it stamps the client identity
+            // — would run before the task-local existed and find no scope.
+            CAPSULE_SCOPE
+                .scope(scope, async move { inner.call(req).await })
+                .await
         })
     }
 }
@@ -794,6 +820,16 @@ impl http_body::Body for TeeBody {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     this.scope.tee_body_chunk(data);
+                }
+                // A body that announces its end *with* its last frame is
+                // finished here, and a handler is entitled to stop rather than
+                // poll once more for `Ready(None)`. Waiting for that extra
+                // poll called such a body partial and had replay refuse a
+                // capsule that was in fact complete — the failure mode that
+                // throws away faithful recordings rather than the one that
+                // over-trusts them, but a failure mode either way.
+                if http_body::Body::is_end_stream(&this.inner) {
+                    this.scope.mark_body_end();
                 }
             }
             // The handler read the body to its end: what was copied is whole.
@@ -939,6 +975,67 @@ mod tests {
             .clone()
             .expect("the capture layer must publish a handle in the request extensions");
         Arc::clone(handle.scope())
+    }
+
+    /// An inner service that does its work in `call` itself, the way a real
+    /// Tower middleware does — not inside the future it returns, the way
+    /// `service_fn` does.
+    #[derive(Clone)]
+    struct SyncProbe {
+        saw_scope: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl Service<Request<Body>> for SyncProbe {
+        type Response = Response<Body>;
+        type Error = std::convert::Infallible;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<Body>) -> Self::Future {
+            if let Ok(mut slot) = self.saw_scope.lock() {
+                *slot = Some(current_scope().is_some());
+            }
+            Box::pin(async { Ok(Response::new(Body::empty())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inner_service_sees_the_scope_from_call_not_only_from_its_future() {
+        // `CAPSULE_SCOPE.scope(scope, inner.call(req))` evaluates its argument
+        // *first*, so an inner service that records during `call` — which is
+        // what a hand-written Tower middleware does, and what
+        // `TrustedProxiesService` does when it stamps the client identity —
+        // ran outside the task-local and found no scope at all. Every layer
+        // inner to this one is affected, so the fix belongs here rather than
+        // in each of them.
+        //
+        // `service_fn` hides this: its closure body is the returned future, so
+        // it always runs inside the scope. Only a service that works in `call`
+        // itself can catch the regression.
+        let saw_scope = Arc::new(Mutex::new(None));
+        let probe = SyncProbe {
+            saw_scope: Arc::clone(&saw_scope),
+        };
+
+        let mut service = test_layer(CaptureSettings::default()).layer(probe);
+        let _response = service
+            .call(
+                Request::get("/x")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("probe is infallible");
+
+        assert_eq!(
+            *saw_scope.lock().expect("probe slot"),
+            Some(true),
+            "an inner service must see the capture scope from `call`, not only from its future"
+        );
     }
 
     #[tokio::test]
@@ -1151,6 +1248,124 @@ mod tests {
     /// A lock poisoned by a panic mid-record means the capsule is missing
     /// whatever was being written. Returning the degraded value alone would
     /// make that indistinguishable from "the request did none of this".
+    /// A handler that reads exactly `Content-Length` bytes and stops has the
+    /// whole body; it just never polled again for the end-of-stream that sets
+    /// the flag. Calling that partial would refuse a faithful capsule.
+    #[test]
+    fn a_body_read_to_its_declared_length_is_not_partial() {
+        let scope = CaptureScope::new(
+            "body".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        scope.arm_body(BodyTap::Teeing {
+            declared_len: Some(5),
+            buf: b"hello".to_vec(),
+            end_stream: false,
+            overflowed: false,
+        });
+        assert_eq!(
+            scope.body_note(),
+            None,
+            "a body captured up to its declared length is complete"
+        );
+
+        // One byte short is genuinely partial, and must still say so.
+        let scope = CaptureScope::new(
+            "body".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        scope.arm_body(BodyTap::Teeing {
+            declared_len: Some(5),
+            buf: b"hell".to_vec(),
+            end_stream: false,
+            overflowed: false,
+        });
+        assert_eq!(scope.body_note(), Some(BODY_PARTIAL_NOTE));
+
+        // A body of undeclared length has nothing to compare against, so the
+        // end-of-stream flag remains the only evidence.
+        let scope = CaptureScope::new(
+            "body".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        scope.arm_body(BodyTap::Teeing {
+            declared_len: None,
+            buf: b"hello".to_vec(),
+            end_stream: false,
+            overflowed: false,
+        });
+        assert_eq!(scope.body_note(), Some(BODY_PARTIAL_NOTE));
+    }
+
+    /// A body that reports end-of-stream *with* its last frame rather than on
+    /// a following poll.
+    struct EagerEndBody {
+        chunk: Option<&'static [u8]>,
+    }
+
+    impl http_body::Body for EagerEndBody {
+        type Data = Bytes;
+        type Error = axum::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            this.chunk.take().map_or(Poll::Ready(None), |chunk| {
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(chunk)))))
+            })
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.chunk.is_none()
+        }
+    }
+
+    #[test]
+    fn a_body_that_ends_with_its_last_frame_is_not_partial() {
+        // A streaming body with no `Content-Length` can announce its end
+        // alongside the final frame, and a handler is entitled to stop there
+        // rather than poll again for `Ready(None)`. There is no declared
+        // length to compare against, so the end-of-stream flag is the only
+        // evidence — and waiting for the extra poll to set it had replay
+        // refuse a capsule whose body was complete.
+        let scope = Arc::new(CaptureScope::new(
+            "body".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        ));
+        scope.arm_body(BodyTap::Teeing {
+            declared_len: None,
+            buf: Vec::new(),
+            end_stream: false,
+            overflowed: false,
+        });
+
+        let mut tee = TeeBody {
+            inner: Body::new(EagerEndBody {
+                chunk: Some(b"hello"),
+            }),
+            scope: Arc::clone(&scope),
+        };
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let polled = http_body::Body::poll_frame(Pin::new(&mut tee), &mut cx);
+
+        assert!(
+            matches!(polled, Poll::Ready(Some(Ok(_)))),
+            "the frame is passed through"
+        );
+        assert_eq!(
+            scope.body_note(),
+            None,
+            "a body that ended with its last frame is complete, not partial"
+        );
+    }
+
     #[test]
     fn a_poisoned_buffer_marks_the_capsule_truncated() {
         let scope = Arc::new(CaptureScope::new(

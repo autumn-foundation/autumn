@@ -1793,6 +1793,15 @@ mod tests {
         );
         assert!(!is_session_housekeeping("SELECT $1::text"));
         assert!(!is_session_housekeeping("SET LOCAL search_path TO app"));
+        // `SET LOCAL` is never the framework's — `Db::checkout` issues a plain
+        // session-level `SET statement_timeout` — so a transaction-scoped
+        // setting is application code and belongs on the ordered tape, where
+        // changing or removing it shows up as a divergence (#2202).
+        assert!(
+            !is_session_housekeeping("SET LOCAL statement_timeout = 5000"),
+            "an application's transaction-scoped timeout must not be synthesized away"
+        );
+        assert!(!is_session_housekeeping("set local TIME ZONE 'UTC'"));
         assert!(!is_session_housekeeping(""));
     }
 

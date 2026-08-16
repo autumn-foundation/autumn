@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **failure capsules:** the resolved client identity now obeys
+  `[log] filter_parameters`. `client_addr`/`client_host`/`client_scheme` are
+  derived from `Forwarded`, `X-Forwarded-*` and `Host`, and were copied into
+  the capsule *after* header redaction ran — so an operator who filtered
+  `x-forwarded-host` saw it masked under `headers` and sitting in cleartext one
+  key away under `client_host`. Each field is now dropped when any header it
+  could have been resolved from is filtered — including `X-Real-IP`, a
+  fallback source for the address. Where a filtered source actually supplied a
+  value the capsule is additionally **refused** by replay: replay pre-inserts
+  the recorded identity whole whenever any field survives, so a suppressed
+  host would reach the handler as `None` rather than not at all, and a handler
+  that branches on it would report a `mismatch` the guide tells operators to
+  read as "the bug is gone".
+- **failure capsules:** the capsule format version is now `2`. The new
+  `db_roles` field changes what a capsule *means* — a reader that skips it
+  rebuilds no database topology and replays a shape the recording never had —
+  and `serde` would otherwise let an older reader ignore it silently, which is
+  exactly what the version gate exists to prevent. Version 1 never appeared in
+  a release, so no capsule anyone holds is affected; a capsule written by an
+  unreleased build off `trunk-dev` is refused with the usual
+  re-record-the-capsule message.
+- **failure capsules:** six fidelity and redaction gaps found in review of
+  #1598 (#2202). A capsule whose request body the handler read only *partly* —
+  or never got to at all — is now marked incomplete and **refused** by replay
+  rather than replayed with a shorter body: the handler would otherwise be
+  judged on input the failing request never carried, and the resulting
+  `mismatch` is exactly what the guide tells operators means "the bug is gone".
+  The client identity is recorded again for capsules written by the real
+  server: `App::run` wraps the finished router in an *outer*
+  `TrustedProxiesLayer` that resolves before the capture scope exists, so the
+  inner instance found the extension already present and skipped recording,
+  leaving `client_addr`/`client_host`/`client_scheme` empty on every
+  production capsule while the test harness (which has no outer layer) recorded
+  them. A second cause sat behind the first: the capture layer passed
+  `inner.call(req)` to `CAPSULE_SCOPE.scope` as an *argument*, which Rust
+  evaluates before the call, so every inner layer's synchronous `call` — where
+  a hand-written Tower middleware does its work — ran before the task-local
+  existed and saw no scope. The inner call is now made from inside the scoped
+  future, which fixes the class rather than the one layer.
+  Replay now rebuilds the database *shape* the recording had even when
+  the request issued no wire traffic at all — "this request ran no queries" and
+  "this application has no database" were the same `None`, so a handler or
+  state initializer that checks `state.pool()` or replica availability before
+  querying took a branch production never took. Redaction reaches two things it
+  used to miss: the credential *inside* a masked header (the token after
+  `Bearer`, what a `Basic` credential decodes to, each value of an auth-param
+  list such as SigV4's `Signature=`, each cookie value — the form
+  a handler actually extracts and may echo into an error message or a SQL bind,
+  where the whole header value never
+  matched), and values shorter than four characters, which are now masked where
+  they stand as a whole token, so a three-digit CVV quoted back by a failure no
+  longer reaches disk while timestamps and identifiers stay readable. Finally,
+  `SET LOCAL ...` is no longer treated as framework housekeeping: `Db::checkout`
+  issues a plain session-level `SET statement_timeout`, so a transaction-scoped
+  setting is application code and belongs on the ordered tape, where changing or
+  removing it shows up as a divergence instead of being synthesized away.
+- **duplicate Markdown heading anchors:** `markdown::render` now hands out
+  document-unique heading `id`s. A page that repeated a heading — and real docs
+  repeat "Example", "Usage", and "Notes" constantly — emitted the same `id`
+  twice, which is invalid HTML and made every table-of-contents entry for the
+  repeated heading jump to the first occurrence. Every heading still keeps the
+  slug its own text produces, so anchors already published in URLs keep
+  resolving; only *repeats* of an already-claimed slug get a `-1`, `-2`, …
+  suffix, the convention GitHub, mdBook, and Hugo share. Because the renderer
+  reserves every heading's natural slug before handing out any suffix, a repeat
+  can never steal a slug another heading owns by name regardless of the order
+  the two appear in: `## Example` / `## Example` / `## Example 1` renders
+  `example`, `example-2`, `example-1`, leaving `#example-1` pointing at
+  "Example 1". Headings with no alphanumeric characters still emit no `id` at
+  all and stay out of the anchor namespace.
+
+### Added
+
+- **`MarkdownRegistry::static_params_for(param)`:** derive SSG params for a
+  `#[static_get]` route whose path parameter is not named `slug` — e.g.
+  `#[static_get("/docs/{page}", params = …)]` needs
+  `static_params_for("page")`, because a `StaticParams` entry keyed `"slug"`
+  leaves `{page}` unsubstituted. `static_params()` is unchanged and now
+  delegates to it with `"slug"`.
+
 ### Performance
 
 - **config reads on the request path:** generated auth handlers, the admin
@@ -67,8 +149,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gate already used for #2198's `config_arc` work (`autumn/tests/config_alloc_gate.rs`):
   a `TestClient` request drops from 220 to 172 allocation blocks (-22%),
   identical across repeated runs.
+- **mail:** list-mail sends (`Mailer::send` with `list_unsubscribe` set) now
+  resolve suppression for the whole recipient batch in one query instead of
+  one `SELECT` per recipient. The `SuppressionStore` trait gained a batched
+  `is_suppressed_many` method (default implementation loops over
+  `is_suppressed`, so existing custom stores keep working unchanged);
+  `DbSuppressionStore` overrides it with a single `WHERE list_id = $1 AND
+  subscriber = ANY($2)` query, chunked at 50,000 recipients on Postgres (a
+  backstop against an unbounded single-statement bind, not a tuning knob for
+  ordinary sends: a tighter chunk size can land statements past a planner
+  cost crossover where `= ANY(...)` stops using the index and falls back to
+  a table scan, then re-pay that scan's fixed cost once per chunk) and at
+  `repository::MAX_BIND_PARAMS - 1` on SQLite, which binds `eq_any` as one
+  parameter per element instead of Postgres's single array parameter.
+  Measured
+  (`pg_stat_statements`, production-shaped `mail_unsubscribes` fixture):
+  statement count per send drops from N to 1 at every batch size tested
+  (200/2,000/20,000 recipients); total buffers 660→604 (200), 6,600→6,004
+  (2,000), and 66,000→8,070 (20,000, −87.8%). No index or migration changes
+  — see `docs/reports/2026-08-15-ledger-mail-suppression-batch/`.
 
 ### Added
+
+- **generate scaffold:** `--soft-delete` now also generates the recover-from-
+  trash UI its data layer has been waiting for (#1332), finishing #689's AC6. A
+  standard HTML scaffold gains a `#[secured] GET /<plural>/trash` page that lists
+  deleted rows through the repository's generated `page_only_deleted` (the
+  paginated `only_deleted` scope — the list handler writes no `deleted_at`
+  filter of its own), a **Trash** link in the index's page furniture, a
+  `Deleted` column carrying each row's `deleted_at` stamp, and per row a
+  CSRF-protected **Restore** (`POST /<plural>/{id}/restore` → `restore(id)`) and
+  **Purge** (`POST /<plural>/{id}/purge` → `purge(id)`) control, the latter
+  behind `confirm_action`'s server-rendered dialog (titled per row, so a
+  page-sized trash does not stack identical headings and the person confirming
+  an irreversible delete can see which record it is) rather than an inline
+  `onclick` the default `script-src 'self'` CSP would block. The delete button's
+  flash becomes `<Model> moved to Trash` — with somewhere to recover from, the
+  flash is the only thing that says so — and a derived slug of `trash` joins
+  `new`/`search` as a reserved segment. A `--soft-delete` scaffold on one of the
+  gated-off variants warns at generation time, naming the reason, instead of
+  silently shipping no recovery UI. Both write handlers
+  load their target with `deleted_at IS NOT NULL` first, so they 404 rather than
+  hard-deleting a live row, and record-authorize it with the same `"delete"`
+  action `destroy` uses. The generated `tests/<name>.rs` gains an in-process
+  lifecycle test (create → soft delete → present in Trash and absent from the
+  index → restore → back in the index → purge → gone from both). No new
+  `autumn-web` API: the scaffold consumes the existing macro methods and the
+  shipped CSRF/flash/widget helpers. Emitted **only** under `--soft-delete` and
+  only on the standard HTML path — `--live`/`--live-validation` (a restore does
+  not broadcast), `--sharded` (`page_only_deleted` cannot fan out), an
+  owner-scoped index (no owner-filtered deleted-rows scope to read through), and
+  `--api` stay byte-identical to their prior output, as does every scaffold
+  generated without the flag. See `docs/guide/generators.md`.
 
 - **failure capsules:** a failing request can now be recorded and replayed
   offline (#1598). With `[failure_capture] enabled = true`, every caught panic
@@ -1745,6 +1877,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when to reach for which accessor.
 
 ### Changed
+
+- **docs:** rewrote the getting-started guide (`docs/guide/getting-started.md`)
+  against the current scaffold and CLI. The guide had drifted: it announced the
+  "0.4 release line" while pinning 0.6 commands, taught Tailwind v3 directives
+  (`@tailwind base;`) against a scaffold that ships v4 (`@import "tailwindcss";`),
+  showed a legacy `{"error": {...}}` body where the framework answers RFC 9457
+  Problem Details, listed a project tree and an `autumn doctor` transcript that
+  no longer matched what `autumn new` and `doctor` actually emit, put
+  `AUTUMN_PROFILE` ahead of `AUTUMN_ENV` in the profile precedence chain, and
+  pinned `diesel-async` 0.8 against the workspace's 0.9. The prerequisites were
+  wrong in a way that broke the first build: the guide said Postgres was needed
+  "only if you want database features", but `db` is a default feature, so a
+  fresh project links `libpq` at compile time whether or not a database is
+  configured — that, the Diesel CLI requirement, and a Docker one-liner for a
+  throwaway Postgres are now stated up front. Model examples moved to the
+  `BIGSERIAL`/`i64` primary-key convention the generators and `#[repository]`
+  assume, replacing `SERIAL`/`i32`.
+
+  Three sections the guide never had were added. First, `autumn generate
+  scaffold`, previously reachable only from the generators guide — and
+  documented for what it actually produces: the read paths serve immediately,
+  while every write stays locked behind both `#[secured]` and the generated
+  policy until `autumn generate auth` is run, and the JSON write handlers are
+  generated but left unregistered. The guide explains that double gate rather
+  than treating it as a caveat, and walks the signup → email-confirmation →
+  login flow that unlocks the write views. Second, a testing section built on
+  the `tests/integration_test.rs` the scaffold already writes, plus `autumn
+  test`. Third, the prebuilt-binary install path. In exchange, the ~100-line
+  route-collision-diagnostics appendix and the
+  `_method` override's same-origin bullet list were compressed to their
+  first-hour essentials and now link onward, and the production checklist moved
+  from the middle of the walkthrough to the end. The `#configuration`,
+  `#environment-variable-overrides`, and `#route-collision-diagnostics` anchors
+  are preserved, so the inbound links from `deployment.md`, `openapi.md`, and
+  `skills/autumn-web/SKILL.md` still resolve. Version pins remain on the
+  published 0.6.0 line enforced by `first_run_docs_match_current_release_line`.
+  [no-plugin]
 
 - **Router: the whole ingress stack is now applied in ONE `Router::layer`
   call.** #2193 collapsed ~26 sequential applications down to a handful; #2198
