@@ -701,7 +701,9 @@ pub fn install_from_config(
     // fails on the `register` error instead of this one.
     let health_registry = state.health_indicator_registry();
     let metrics_registry = state.metrics_source_registry();
-    if false {
+    if health_registry.contains(MEMBERSHIP_COMPONENT)
+        || metrics_registry.contains(MEMBERSHIP_COMPONENT)
+    {
         return Err(AutumnError::internal_server_error_msg(format!(
             "cluster: the {MEMBERSHIP_COMPONENT} name is reserved for the cluster's own health \
              component and metrics source, and this app has already registered it; rename the \
