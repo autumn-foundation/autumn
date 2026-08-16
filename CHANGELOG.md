@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **failure capsules:** the resolved client identity now obeys
+  `[log] filter_parameters`. `client_addr`/`client_host`/`client_scheme` are
+  derived from `Forwarded`, `X-Forwarded-*` and `Host`, and were copied into
+  the capsule *after* header redaction ran — so an operator who filtered
+  `x-forwarded-host` saw it masked under `headers` and sitting in cleartext one
+  key away under `client_host`. Each field is now dropped when any header it
+  could have been resolved from is filtered.
 - **failure capsules:** the capsule format version is now `2`. The new
   `db_roles` field changes what a capsule *means* — a reader that skips it
   rebuilds no database topology and replays a shape the recording never had —

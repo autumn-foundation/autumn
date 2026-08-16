@@ -56,6 +56,7 @@ use crate::capsule::redact::RedactedValues;
 use crate::capsule::schema::{
     AppInfo, CAPSULE_FORMAT_VERSION, Capsule, CapsuleError, CapsuleOutcome,
 };
+use crate::log::filter::ParameterFilter;
 
 /// How long a capsule is protected from retention pruning after it was
 /// written — for a *bounded number* of files (see [`grace_allowance`]).
@@ -244,9 +245,27 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
         crate::capsule::redact::redact_request(raw, &raw_body, scope.filter());
     request.peer_addr = scope.peer_addr();
     if let Some(identity) = scope.client_identity() {
-        request.client_addr = identity.addr;
-        request.client_host.clone_from(&identity.host);
-        request.client_scheme.clone_from(&identity.scheme);
+        // The resolved identity is *derived from* headers, so it must obey the
+        // same filter those headers do. An operator who adds
+        // `x-forwarded-host` to `[log] filter_parameters` sees it masked in
+        // `headers` — and would otherwise find the very same
+        // `private-tenant.example` sitting in cleartext in `client_host`,
+        // which defeats the filter through a side door rather than honoring
+        // it. Each field is dropped when *any* header it could have been
+        // resolved from is filtered: which one the resolver actually used
+        // depends on the trust configuration and the request, and recording
+        // the value only when it happened to come from an unfiltered header
+        // would leak on exactly the requests where the filtered one won.
+        let filter = scope.filter();
+        if !identity_source_is_filtered(filter, &["x-forwarded-for", "forwarded"]) {
+            request.client_addr = identity.addr;
+        }
+        if !identity_source_is_filtered(filter, &["x-forwarded-host", "forwarded", "host"]) {
+            request.client_host.clone_from(&identity.host);
+        }
+        if !identity_source_is_filtered(filter, &["x-forwarded-proto", "forwarded"]) {
+            request.client_scheme.clone_from(&identity.scheme);
+        }
     }
     for note in body_notes {
         scope.note(note);
@@ -498,6 +517,18 @@ fn written_within_grace(path: &Path, now: DateTime<Utc>) -> bool {
         .is_some_and(|written| now.signed_duration_since(written.and_utc()) < PRUNE_GRACE)
 }
 
+/// Whether any header a resolved-identity field could come from is filtered.
+///
+/// The resolver's choice among these depends on the trust configuration and on
+/// what the request actually carried, and none of that is knowable here — so
+/// *any* filtered source suppresses the derived field. Recording it whenever
+/// the value happened to arrive through an unfiltered header would leak on
+/// precisely the requests where the filtered one won, which is the case the
+/// operator was guarding against.
+fn identity_source_is_filtered(filter: &ParameterFilter, sources: &[&str]) -> bool {
+    sources.iter().any(|source| filter.matches_key(source))
+}
+
 /// The timestamp a [`file_name`]-shaped name carries, or `None` for any other
 /// file.
 ///
@@ -621,6 +652,79 @@ mod tests {
             "the directory must settle at the cap plus the bounded grace \
              allowance, not at whatever the storm produced"
         );
+    }
+
+    /// The resolved identity is derived from headers, so filtering one of
+    /// those headers must suppress it. Masking `x-forwarded-host` in `headers`
+    /// while writing the same value to `client_host` honors the filter in
+    /// letter and defeats it in fact.
+    #[test]
+    fn a_filtered_identity_header_suppresses_the_derived_field() {
+        use std::sync::Arc;
+
+        use crate::capsule::CaptureSettings;
+        use crate::capsule::CapturedClientIdentity;
+        use crate::capsule::capture::CaptureScope;
+        use crate::capsule::redact::RawRequest;
+        use crate::log::filter::ParameterFilter;
+
+        let build = |filtered: &[String]| {
+            let scope = CaptureScope::new(
+                "req-identity".to_owned(),
+                Arc::new(CaptureSettings::default()),
+                Arc::new(ParameterFilter::new(filtered, &[])),
+            );
+            scope.set_request(RawRequest {
+                method: "GET".to_owned(),
+                uri: "/boom".parse().expect("uri parses"),
+                version: axum::http::Version::HTTP_11,
+                headers: axum::http::HeaderMap::new(),
+                route: None,
+            });
+            scope.set_client_identity(CapturedClientIdentity {
+                addr: Some("203.0.113.7".parse().expect("addr parses")),
+                host: Some("private-tenant.example".to_owned()),
+                scheme: Some("https".to_owned()),
+            });
+            assemble(
+                &scope,
+                CapsuleOutcome::Status {
+                    code: 500,
+                    message: "boom".to_owned(),
+                    problem_type: None,
+                },
+            )
+            .expect("capsule assembles")
+        };
+
+        let unfiltered = build(&[]);
+        assert_eq!(
+            unfiltered.request.client_host.as_deref(),
+            Some("private-tenant.example"),
+            "with nothing filtered the identity is recorded as before"
+        );
+
+        let filtered = build(&["x-forwarded-host".to_owned()]);
+        assert_eq!(
+            filtered.request.client_host, None,
+            "a filtered identity header must not reappear as `client_host`"
+        );
+        assert_eq!(
+            filtered.request.client_addr,
+            Some("203.0.113.7".parse().expect("addr parses")),
+            "filtering one source must not suppress fields it cannot feed"
+        );
+        assert_eq!(
+            filtered.request.client_scheme.as_deref(),
+            Some("https"),
+            "nor the scheme, which `x-forwarded-host` cannot resolve"
+        );
+
+        // `Forwarded` carries all three, so filtering it suppresses all three.
+        let forwarded = build(&["forwarded".to_owned()]);
+        assert_eq!(forwarded.request.client_host, None);
+        assert_eq!(forwarded.request.client_addr, None);
+        assert_eq!(forwarded.request.client_scheme, None);
     }
 
     /// The reporting pipeline's pin is taken inside the write, before the
