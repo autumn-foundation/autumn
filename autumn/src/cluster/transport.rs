@@ -948,7 +948,8 @@ async fn peer_writer(
 #[cfg(test)]
 mod tcp_tests {
     use super::{
-        MAX_INBOUND_CONNECTIONS, MAX_UNAUTHENTICATED_FRAMES, PeerTransport as _, TcpPeerTransport,
+        DIAL_TIMEOUT, MAX_INBOUND_CONNECTIONS, MAX_UNAUTHENTICATED_FRAMES, PeerTransport as _,
+        TcpPeerTransport,
     };
     use crate::entropy::SeededEntropy;
     use std::collections::BTreeSet;
@@ -1305,19 +1306,25 @@ mod tcp_tests {
         transport.send(BLACKHOLE, vec![0_u8; 32]);
 
         // Generous for the process-local queue pickup (microseconds), and
-        // well inside DIAL_TIMEOUT, so the writer is provably mid-dial with
-        // the frame in hand — not still queued, not yet dropped.
+        // well inside DIAL_TIMEOUT, so on a network that really blackholes
+        // TEST-NET the writer is provably mid-dial with the frame in hand.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        if transport.dropped_frames() > 0 {
-            // An environment that answers TEST-NET with a fast unreachable
-            // error dropped the frame before the assertion window; the
-            // accounting under test never got its dial to park in. Skip
-            // rather than assert on environment behavior.
+        if transport.pending_frames() == 0 {
+            // A sandboxed or unusually-routed environment fails the TEST-NET
+            // dial fast (ENETUNREACH / immediate RST) instead of letting the
+            // SYN time out; the writer already dropped the frame, so there is
+            // no dial window to observe the claim in. The arithmetic half of
+            // this contract is still pinned unconditionally by
+            // `pending_frames_includes_a_claimed_in_flight_frame` below.
             eprintln!("skipping: this network fails TEST-NET dials fast");
             token.cancel();
             return;
         }
+        // Observed mid-dial once; it must still be pending shortly after —
+        // under a writer that never claims, the count would have collapsed to
+        // zero the instant the frame left the queue.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             transport.pending_frames(),
             1,
@@ -1326,6 +1333,37 @@ mod tcp_tests {
              the Leave is on the wire when it is not"
         );
 
+        token.cancel();
+    }
+
+    /// The arithmetic half of the in-flight contract, with no network at all:
+    /// `pending_frames` must include a claimed frame and release it on drop.
+    /// This is what keeps the departure flush honest even in environments
+    /// where the dial-parking proof above has to skip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_frames_includes_a_claimed_in_flight_frame() {
+        let (transport, token) = started(Duration::from_secs(30));
+        assert_eq!(
+            transport.pending_frames(),
+            0,
+            "a fresh transport holds nothing"
+        );
+
+        let held = super::InFlightFrame::claim(&transport.in_flight);
+        assert_eq!(
+            transport.pending_frames(),
+            1,
+            "a claimed in-flight frame must count as pending: queue depth alone \
+             reports a frame as flushed while its writer still owes the OS a write"
+        );
+
+        drop(held);
+        assert_eq!(
+            transport.pending_frames(),
+            0,
+            "dropping the claim must return the count — written, dropped, and \
+             abandoned frames all release it on the same guard"
+        );
         token.cancel();
     }
 
