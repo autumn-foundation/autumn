@@ -512,21 +512,23 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         FieldKind::NaiveDateTime | FieldKind::DateTime => "AdminFieldKind::DateTime",
         // Bytea and Attachment both render as hidden in the admin panel —
         // binary blobs and file metadata aren't suitable for direct inline editing.
-        //
-        // `json`/`jsonb` (issue #1341) joins them here rather than using the
-        // admin panel's existing `AdminFieldKind::Json` textarea: that kind's
-        // `coerce_form_value` (in `autumn-admin-plugin`) silently leaves
-        // malformed JSON input as a raw string on parse failure instead of
-        // rejecting it, and because `serde_json::Value` deserializes *any*
-        // JSON value — including that raw string — the bad input would be
-        // persisted verbatim rather than surfaced as a 400. That silent
-        // passthrough is pre-existing, deliberately-tested behavior for
-        // hand-written admin configs (`coerce_form_fields_keeps_blank_required_json_as_empty_string`
-        // et al.) and out of scope to change here; routing DSL-generated json
-        // columns to `Hidden` instead avoids newly exposing that gap through
-        // codegen. A future issue can revisit `coerce_form_value`'s
-        // fallibility if inline JSON editing in the admin panel is wanted.
-        FieldKind::Bytea | FieldKind::Attachment | FieldKind::Json => "AdminFieldKind::Hidden",
+        FieldKind::Bytea | FieldKind::Attachment => "AdminFieldKind::Hidden",
+        // `json`/`jsonb` (issue #1341) uses the admin panel's existing
+        // `AdminFieldKind::Json`: a monospace textarea whose submission is
+        // coerced back to a real JSON value by `coerce_form_value` before the
+        // generic `serde_json::from_value::<New{Model}>` deserialize — this
+        // kind already exists (see `AdminField`'s own `variants`/`settings`
+        // examples) and is exactly what a raw `serde_json::Value` column
+        // needs. Routing it to `Hidden` instead (an earlier revision of this
+        // fix) is NOT an option: `Hidden` values are stripped by
+        // `strip_meta_fields` before the model adapter ever sees them, so a
+        // *required* json column would permanently fail every admin
+        // create/update (the field is always missing), and a *nullable* one
+        // would silently null itself out on every edit of an unrelated field
+        // (Codex review finding on #1341). `coerce_form_value`'s JSON arm is
+        // now fallible and rejects malformed non-blank input instead of
+        // silently persisting it as a raw string (see `autumn-admin-plugin`).
+        FieldKind::Json => "AdminFieldKind::Json",
     }
 }
 
@@ -560,10 +562,9 @@ fn is_default_hide_from_list(field: &Field) -> bool {
     // TextArea bodies and binary blobs clutter the table; updated_at is redundant noise.
     // `RichText` renders as a TextArea too (see `admin_field_kind`), and a
     // Markdown body is the single worst column to inline in a list view.
-    // `Json` (issue #1341) renders as `AdminFieldKind::Hidden` (see
-    // `admin_field_kind`'s doc), but is still listed here defensively — a
-    // structured-data blob would be just as unsuitable for an inline list
-    // cell if that kind mapping ever changes.
+    // `Json` (issue #1341) renders as `AdminFieldKind::Json` — the same
+    // textarea-shaped raw-value editor — so a structured-data blob is just as
+    // unsuitable for an inline list cell.
     matches!(
         field.kind,
         FieldKind::Text | FieldKind::RichText | FieldKind::Bytea | FieldKind::Json
@@ -1396,12 +1397,15 @@ mod tests {
     }
 
     #[test]
-    fn json_column_is_hidden_in_admin_forms_and_the_list() {
-        // Issue #1341 review: `AdminFieldKind::Json`'s `coerce_form_value`
-        // silently passes through malformed JSON as a raw string instead of
-        // rejecting it, which `serde_json::Value` would then happily persist —
-        // so DSL-generated json columns route to `Hidden` (like Bytea/
-        // Attachment) rather than newly exposing that gap through codegen.
+    fn json_column_uses_the_existing_admin_json_kind_and_is_hidden_from_the_list() {
+        // Issue #1341: `AdminFieldKind::Json` already existed (monospace
+        // textarea + `coerce_form_value` round-trip) for hand-written admin
+        // configs — the DSL's new `json`/`jsonb` field just needs to reach it.
+        // (An earlier revision of this fix routed it to `Hidden` instead to
+        // dodge a malformed-JSON-passthrough bug in `coerce_form_value`, but
+        // `Hidden` values are stripped before the model adapter ever sees
+        // them — that broke admin create/update outright for json columns.
+        // The real fix is `coerce_form_value` rejecting malformed input.)
         let field = Field {
             name: "config".to_owned(),
             kind: FieldKind::Json,
@@ -1411,7 +1415,7 @@ mod tests {
             constraints: crate::generate::dsl::FieldConstraints::default(),
             state_machine: None,
         };
-        assert_eq!(admin_field_kind(&field), "AdminFieldKind::Hidden");
+        assert_eq!(admin_field_kind(&field), "AdminFieldKind::Json");
         assert!(
             is_default_hide_from_list(&field),
             "a structured-data blob must not clutter the admin list table"

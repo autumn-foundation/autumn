@@ -663,7 +663,8 @@ async fn model_create(
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
-    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields, false), &fields);
+    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields, false), &fields)
+        .map_err(AutumnError::bad_request_msg)?;
     let record = model
         .create(&pool, form_data)
         .await
@@ -905,7 +906,8 @@ async fn model_update(
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
-    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields, true), &fields);
+    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields, true), &fields)
+        .map_err(AutumnError::bad_request_msg)?;
     model
         .update(&pool, id, form_data)
         .await
@@ -1424,22 +1426,22 @@ fn strip_meta_fields(mut data: Value, fields: &[AdminField], for_update: bool) -
     data
 }
 
-fn coerce_form_fields(mut data: Value, fields: &[AdminField]) -> Value {
+fn coerce_form_fields(mut data: Value, fields: &[AdminField]) -> Result<Value, String> {
     let Some(obj) = data.as_object_mut() else {
-        return data;
+        return Ok(data);
     };
 
     for field in fields {
         let Some(value) = obj.get_mut(field.name) else {
             continue;
         };
-        coerce_form_value(value, field);
+        coerce_form_value(value, field)?;
     }
 
-    data
+    Ok(data)
 }
 
-fn coerce_form_value(value: &mut Value, field: &AdminField) {
+fn coerce_form_value(value: &mut Value, field: &AdminField) -> Result<(), String> {
     // On a nullable text-ish column (String/Uuid/Enum/Decimal all route to
     // `AdminFieldKind::Text`), as well as the numeric/date kinds, an empty
     // submission clears to NULL — matching the existing numeric/date
@@ -1449,7 +1451,7 @@ fn coerce_form_value(value: &mut Value, field: &AdminField) {
         && matches!(value, Value::String(raw) if raw.trim().is_empty())
     {
         *value = Value::Null;
-        return;
+        return Ok(());
     }
 
     match &field.kind {
@@ -1475,11 +1477,27 @@ fn coerce_form_value(value: &mut Value, field: &AdminField) {
                 *value = Value::Number(number);
             }
         }
+        // Unlike Integer/Float/Boolean above — where a value that fails to
+        // parse is simply left as a raw JSON string, and the strict target
+        // type (`i64`/`f64`/`bool`) then rejects that string during the
+        // model's own `serde_json::from_value` deserialize — a JSON column's
+        // Rust type is `serde_json::Value` itself, which happily accepts
+        // *any* JSON value, including that leftover raw string. So a
+        // malformed submission here needs its own explicit rejection: a
+        // required field would otherwise silently persist a string like
+        // `"{broken"` as the "JSON" value instead of surfacing a validation
+        // error (issue #1341 review). A blank submission is exempt — for a
+        // required column it deliberately falls through unparsed, matching
+        // the required-text convention below; for an optional column the
+        // blank-to-null short-circuit above already handled it.
         AdminFieldKind::Json => {
             if let Value::String(raw) = value
-                && let Ok(parsed) = serde_json::from_str(raw)
+                && !raw.trim().is_empty()
             {
-                *value = parsed;
+                match serde_json::from_str::<Value>(raw) {
+                    Ok(parsed) => *value = parsed,
+                    Err(err) => return Err(format!("{}: invalid JSON ({err})", field.name)),
+                }
             }
         }
         AdminFieldKind::Text
@@ -1490,6 +1508,7 @@ fn coerce_form_value(value: &mut Value, field: &AdminField) {
         | AdminFieldKind::Hidden
         | AdminFieldKind::Password => {}
     }
+    Ok(())
 }
 
 fn parse_form_bool(raw: &str) -> Option<bool> {
@@ -1614,10 +1633,10 @@ mod tests {
     #[test]
     fn coerce_form_fields_converts_boolean_strings() {
         let fields = fields(&[("published", AdminFieldKind::Boolean)]);
-        let out = coerce_form_fields(json!({"published": "true"}), &fields);
+        let out = coerce_form_fields(json!({"published": "true"}), &fields).unwrap();
         assert_eq!(out, json!({"published": true}));
 
-        let out = coerce_form_fields(json!({"published": "false"}), &fields);
+        let out = coerce_form_fields(json!({"published": "false"}), &fields).unwrap();
         assert_eq!(out, json!({"published": false}));
     }
 
@@ -1635,7 +1654,8 @@ mod tests {
                 "settings": "{\"published\":true}"
             }),
             &fields,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             out,
@@ -1653,7 +1673,7 @@ mod tests {
             AdminField::new("count", AdminFieldKind::Integer).optional(),
             AdminField::new("rating", AdminFieldKind::Float).optional(),
         ];
-        let out = coerce_form_fields(json!({"count": "", "rating": ""}), &fields);
+        let out = coerce_form_fields(json!({"count": "", "rating": ""}), &fields).unwrap();
 
         assert_eq!(out, json!({"count": null, "rating": null}));
     }
@@ -1664,7 +1684,8 @@ mod tests {
             AdminField::new("published_on", AdminFieldKind::Date).optional(),
             AdminField::new("starts_at", AdminFieldKind::DateTime).optional(),
         ];
-        let out = coerce_form_fields(json!({"published_on": "", "starts_at": "   "}), &fields);
+        let out =
+            coerce_form_fields(json!({"published_on": "", "starts_at": "   "}), &fields).unwrap();
 
         assert_eq!(out, json!({"published_on": null, "starts_at": null}));
     }
@@ -1686,7 +1707,8 @@ mod tests {
             )
             .optional(),
         ];
-        let out = coerce_form_fields(json!({"token": "", "notes": "   ", "status": ""}), &fields);
+        let out = coerce_form_fields(json!({"token": "", "notes": "   ", "status": ""}), &fields)
+            .unwrap();
 
         assert_eq!(out, json!({"token": null, "notes": null, "status": null}));
     }
@@ -1699,23 +1721,25 @@ mod tests {
         // The null-coercion short-circuit runs before the JSON parse arm.
         let fields = vec![AdminField::new("settings", AdminFieldKind::Json).optional()];
 
-        let out = coerce_form_fields(json!({"settings": ""}), &fields);
+        let out = coerce_form_fields(json!({"settings": ""}), &fields).unwrap();
         assert_eq!(out, json!({"settings": null}));
 
-        let out = coerce_form_fields(json!({"settings": "   "}), &fields);
+        let out = coerce_form_fields(json!({"settings": "   "}), &fields).unwrap();
         assert_eq!(out, json!({"settings": null}));
 
         // A non-blank optional JSON submission still parses normally.
-        let out = coerce_form_fields(json!({"settings": "{\"published\":true}"}), &fields);
+        let out = coerce_form_fields(json!({"settings": "{\"published\":true}"}), &fields).unwrap();
         assert_eq!(out, json!({"settings": {"published": true}}));
     }
 
     #[test]
     fn coerce_form_fields_keeps_blank_required_json_as_empty_string() {
         // Required columns keep the empty string rather than clearing to NULL,
-        // matching the required-text convention.
+        // matching the required-text convention. A blank submission is exempt
+        // from the malformed-JSON rejection below — it's left for the model's
+        // own required-field validation to catch.
         let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
-        let out = coerce_form_fields(json!({"settings": ""}), &fields);
+        let out = coerce_form_fields(json!({"settings": ""}), &fields).unwrap();
         assert_eq!(out, json!({"settings": ""}));
     }
 
@@ -1723,9 +1747,34 @@ mod tests {
     fn coerce_form_fields_keeps_blank_required_text_as_empty_string() {
         // Required columns keep the empty string rather than clearing to NULL.
         let fields = vec![AdminField::new("token", AdminFieldKind::Text)];
-        let out = coerce_form_fields(json!({"token": ""}), &fields);
+        let out = coerce_form_fields(json!({"token": ""}), &fields).unwrap();
 
         assert_eq!(out, json!({"token": ""}));
+    }
+
+    #[test]
+    fn coerce_form_fields_rejects_malformed_non_blank_json() {
+        // Issue #1341 review: unlike Integer/Float/Boolean, a JSON column's
+        // Rust type (`serde_json::Value`) accepts *any* JSON value — including
+        // a raw string — so a malformed, non-blank submission must be rejected
+        // here rather than silently persisted as a JSON string literal.
+        let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
+        let err = coerce_form_fields(json!({"settings": "{broken"}), &fields)
+            .expect_err("malformed non-blank JSON must be rejected, not silently stored");
+        assert!(
+            err.contains("settings"),
+            "error should name the offending field: {err}"
+        );
+
+        // Nullable columns are rejected the same way.
+        let fields = vec![AdminField::new("settings", AdminFieldKind::Json).optional()];
+        assert!(coerce_form_fields(json!({"settings": "{broken"}), &fields).is_err());
+
+        // A syntactically valid JSON string scalar (not a formula/exploit —
+        // just quoted text) is NOT malformed and must still round-trip.
+        let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
+        let out = coerce_form_fields(json!({"settings": "\"not broken\""}), &fields).unwrap();
+        assert_eq!(out, json!({"settings": "not broken"}));
     }
 
     #[test]
