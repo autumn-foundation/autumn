@@ -363,6 +363,12 @@ so the connection closes and the peer re-dials with backoff. Closing a
 connection is never an eviction; connection state carries zero liveness
 meaning.
 
+Step 4 is a second, quieter boundary: everything at or before it refuses
+*unauthenticated* bytes, and each such refusal is charged to the connection the
+frame arrived on — three of them and that connection is closed too (see
+[Failure semantics](#failure-semantics)). Rejections past step 4 are never
+charged, because the frame carried a valid MAC.
+
 1. **Length prefix** — `N == 0` or `N > 65536` closes the connection with no
    allocation (`reason="oversize"`).
 2. **Envelope parse** — malformed JSON, or an envelope missing a field, is
@@ -604,13 +610,38 @@ both nodes.
 
 **What an unauthenticated connection can cost you.** Reaching the port is
 enough to open a socket, so the listener bounds what a socket is worth before
-anyone proves they know the secret: at most **128** inbound connections are
-held open at once (past that a new one is accepted and closed immediately), and
-a connection that has not delivered a complete frame within four suspicion
-timeouts (at least 10 seconds) is closed. Neither bound can fire on a healthy
-peer — one peer needs one connection, and a peer silent past its suspicion
-timeout is already out of the view — and neither is a substitute for keeping
-the port off the public internet.
+anyone proves they know the secret. Three bounds, and the third is what makes
+the first one hold:
+
+- At most **128** inbound connections are held open at once; past that a new
+  one is accepted and closed immediately.
+- A connection that has not delivered a complete frame within four suspicion
+  timeouts (at least 10 seconds) is closed.
+- A connection whose frames keep being refused **before** they authenticate is
+  closed on the **third** such frame. The receive path's MAC check (step 4) is
+  the line: `oversize`, `malformed`, `version`, `key_id` and `mac` are refusals
+  of bytes anyone who can reach the port could have sent, and each one is
+  charged to the connection it arrived on. Verdicts past the MAC —
+  `self_origin`, `replay`, `payload` — are never charged, because the frame
+  came from a holder of the secret. The count does not decay.
+
+The idle deadline alone bounds a *silent* socket, not a talkative one: without
+the third bound a stranger holds a slot for as long as it likes by sending one
+well-framed garbage frame per idle window, and holds all 128 the same way — at
+which point your actual peer is the one being refused at the cap. Three frames
+rather than one is deliberate: a peer that is misconfigured, or caught halfway
+through a secret rotation, gets far enough onto the wire to be diagnosed from
+`frames_rejected_total{reason="mac"}` and the rejection log line before its
+socket is taken away.
+
+None of these can fire on a healthy peer — one peer needs one connection, a
+peer silent past its suspicion timeout is already out of the view, and a peer
+whose frames verify is never charged for one. Note what the third bound does
+*not* cover: frames are authenticated but not encrypted, so somebody who can
+capture a peer's frame off the wire can replay it to hold a connection open
+(`reason="replay"`) indefinitely. That is inside the trust boundary this design
+already assumes, and it is the same reason none of this is a substitute for
+keeping the port off the public internet.
 
 **Leave is advisory, suspicion is the contract.** The 250 ms departure (final
 `state_push` plus `leave`) is a latency optimization for clean shutdowns.
