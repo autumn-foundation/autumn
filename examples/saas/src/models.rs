@@ -55,3 +55,24 @@ pub struct Project {
 pub struct NewProjectForm {
     pub name: String,
 }
+
+// ── PasswordResetToken ───────────────────────────────────────────────────────
+//
+// A retention-sweeps demo (issue #1342): a reset token is only useful for
+// roughly a day, so nobody should have to hand-write a `#[scheduled]` job
+// and a batched DELETE to keep this table from growing forever. See the
+// `retention(after = "1d", basis = created_at)` on `PasswordResetTokenRepository`
+// in repositories.rs, and docs/guide/retention-sweeps.md.
+
+/// A single-use password-reset token.
+#[autumn_web::model(table = "password_reset_tokens")]
+pub struct PasswordResetToken {
+    #[id]
+    pub id: i64,
+    #[default]
+    pub tenant_id: String,
+    pub user_id: i64,
+    pub token_hash: String,
+    #[default]
+    pub created_at: chrono::NaiveDateTime,
+}
