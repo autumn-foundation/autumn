@@ -76,6 +76,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generate scaffold:** `--soft-delete` now also generates the recover-from-
+  trash UI its data layer has been waiting for (#1332), finishing #689's AC6. A
+  standard HTML scaffold gains a `#[secured] GET /<plural>/trash` page that lists
+  deleted rows through the repository's generated `page_only_deleted` (the
+  paginated `only_deleted` scope — the list handler writes no `deleted_at`
+  filter of its own), a **Trash** link in the index's page furniture, a
+  `Deleted` column carrying each row's `deleted_at` stamp, and per row a
+  CSRF-protected **Restore** (`POST /<plural>/{id}/restore` → `restore(id)`) and
+  **Purge** (`POST /<plural>/{id}/purge` → `purge(id)`) control, the latter
+  behind `confirm_action`'s server-rendered dialog (titled per row, so a
+  page-sized trash does not stack identical headings and the person confirming
+  an irreversible delete can see which record it is) rather than an inline
+  `onclick` the default `script-src 'self'` CSP would block. The delete button's
+  flash becomes `<Model> moved to Trash` — with somewhere to recover from, the
+  flash is the only thing that says so — and a derived slug of `trash` joins
+  `new`/`search` as a reserved segment. A `--soft-delete` scaffold on one of the
+  gated-off variants warns at generation time, naming the reason, instead of
+  silently shipping no recovery UI. Both write handlers
+  load their target with `deleted_at IS NOT NULL` first, so they 404 rather than
+  hard-deleting a live row, and record-authorize it with the same `"delete"`
+  action `destroy` uses. The generated `tests/<name>.rs` gains an in-process
+  lifecycle test (create → soft delete → present in Trash and absent from the
+  index → restore → back in the index → purge → gone from both). No new
+  `autumn-web` API: the scaffold consumes the existing macro methods and the
+  shipped CSRF/flash/widget helpers. Emitted **only** under `--soft-delete` and
+  only on the standard HTML path — `--live`/`--live-validation` (a restore does
+  not broadcast), `--sharded` (`page_only_deleted` cannot fan out), an
+  owner-scoped index (no owner-filtered deleted-rows scope to read through), and
+  `--api` stay byte-identical to their prior output, as does every scaffold
+  generated without the flag. See `docs/guide/generators.md`.
+
 - **failure capsules:** a failing request can now be recorded and replayed
   offline (#1598). With `[failure_capture] enabled = true`, every caught panic
   and every 5xx writes a **capsule** — one JSON file holding the redacted
