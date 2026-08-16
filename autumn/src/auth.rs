@@ -3008,7 +3008,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: auth_session_key.to_owned(),
+            auth_session_key: auth_session_key.into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
