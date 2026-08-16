@@ -411,6 +411,25 @@ pub enum FieldKind {
     /// be explicit, or leave as `Attachment` (equivalent: nullable is the default
     /// and safe choice for file fields).
     Attachment,
+    /// `json` (alias `jsonb`) — arbitrary structured data stored as a Postgres
+    /// `JSONB` column (issue #1341). Unlike [`Attachment`](Self::Attachment),
+    /// this maps directly to bare `serde_json::Value` — no wrapper struct —
+    /// because diesel itself already implements `FromSql`/`ToSql<Jsonb, Pg>`
+    /// **and** `<Json, Sqlite>` for `serde_json::Value` (diesel 2.3+, behind
+    /// the `serde_json` + `sqlite` cargo features, both already
+    /// unconditionally enabled by this workspace's `db` feature). So — unlike
+    /// `Decimal`/`Uuid`, whose Rust types are foreign to `autumn-web` and
+    /// whose `SQLite` conversion is genuinely blocked by the orphan rule — no
+    /// custom `autumn-web` conversion code is needed on either backend.
+    ///
+    /// Ordinary nullable convention applies (unlike `Attachment`, this is
+    /// **not** implicitly nullable): a bare `json` field is `NOT NULL`;
+    /// `Option<json>` is nullable. On `SQLite` the column is `TEXT` storing
+    /// plain-text JSON via diesel's `Json` sql-type — deliberately **not**
+    /// diesel's `Jsonb` sql-type on `SQLite`, which uses a proprietary binary
+    /// encoding unrelated to the human-readable "TEXT storing JSON" this
+    /// field promises.
+    Json,
     /// `references` — a foreign-key column (`i64`/`BIGINT`), matching the
     /// default `i64` primary-key convention. The DSL rewrites the declared
     /// field name to end in `_id` (`post:references` -> `post_id`) and the
@@ -477,6 +496,7 @@ impl FieldKind {
             Self::DateTime => "chrono::DateTime<chrono::Utc>",
             Self::Bytea => "Vec<u8>",
             Self::Attachment => "autumn_web::storage::Blob",
+            Self::Json => "serde_json::Value",
             Self::Decimal { .. } => "rust_decimal::Decimal",
         }
     }
@@ -495,7 +515,7 @@ impl FieldKind {
             Self::NaiveDateTime => "Timestamp",
             Self::DateTime => "Timestamptz",
             Self::Bytea => "Bytea",
-            Self::Attachment => "Jsonb",
+            Self::Attachment | Self::Json => "Jsonb",
             Self::Decimal { .. } => "Numeric",
         }
     }
@@ -514,7 +534,7 @@ impl FieldKind {
             Self::NaiveDateTime => "TIMESTAMP",
             Self::DateTime => "TIMESTAMPTZ",
             Self::Bytea => "BYTEA",
-            Self::Attachment => "JSONB",
+            Self::Attachment | Self::Json => "JSONB",
             Self::Decimal { .. } => "NUMERIC",
         }
     }
@@ -534,6 +554,9 @@ impl FieldKind {
     /// - `Bytea` -> `BLOB`.
     /// - `Attachment` -> `TEXT` (the `Blob` metadata JSON, stored as text
     ///   rather than Postgres `JSONB`).
+    /// - `json`/`jsonb` -> `TEXT` (issue #1341) — plain-text JSON, via
+    ///   diesel's own `Json` sql-type (see [`FieldKind::sqlite_schema_type`]),
+    ///   not Postgres `JSONB`.
     /// - `Decimal` -> `TEXT` (`SQLite` `NUMERIC` affinity coerces to REAL/INTEGER
     ///   and would lose exactness; `rust_decimal` round-trips losslessly through
     ///   text).
@@ -551,7 +574,7 @@ impl FieldKind {
             Self::Uuid => "TEXT",
             Self::NaiveDateTime | Self::DateTime => "TEXT",
             Self::Bytea => "BLOB",
-            Self::Attachment => "TEXT",
+            Self::Attachment | Self::Json => "TEXT",
             Self::Decimal { .. } => "TEXT",
         }
     }
@@ -594,6 +617,15 @@ impl FieldKind {
     /// `FromSql`/`ToSql<Text, Sqlite>` + `AsExpression`/`FromSqlRow<Text>` for
     /// `Blob` under its `sqlite` feature (issue #1924).
     ///
+    /// `json`/`jsonb` (issue #1341) maps to diesel's own `Json` sql-type —
+    /// deliberately distinct from both `Text` (no `serde_json::Value`
+    /// conversion) and `Jsonb` (diesel's `SQLite` `Jsonb` uses a proprietary
+    /// binary encoding, not plain text). diesel itself implements
+    /// `FromSql`/`ToSql<Json, Sqlite> for serde_json::Value` (diesel 2.3+,
+    /// `serde_json` + `sqlite` features, both already unconditionally on via
+    /// this workspace's `db` feature), storing plain-text JSON as `TEXT` — no
+    /// `autumn-web` conversion code needed, unlike `Attachment`.
+    ///
     /// `Uuid`, `Decimal`, and `Enum` still list a nominal `Text` remapping here
     /// for documentation completeness, but they are rejected at generate time
     /// (see [`FieldKind::sqlite_has_diesel_conversion`]) — their Rust types are
@@ -623,6 +655,10 @@ impl FieldKind {
             Self::DateTime => "TimestamptzSqlite",
             Self::Bytea => "Binary",
             Self::Attachment => "Text",
+            // Diesel's own `Json` sql-type — NOT `Text` (no built-in
+            // `serde_json::Value` conversion) and NOT `Jsonb` (SQLite's
+            // proprietary binary encoding). See this method's doc comment.
+            Self::Json => "Json",
             Self::Decimal { .. } => "Text",
         }
     }
@@ -641,6 +677,11 @@ impl FieldKind {
     ///   `FromSql`/`ToSql<Text, Sqlite>` + `AsExpression`/`FromSqlRow<Text>` for
     ///   `Blob` under its `sqlite` feature (`Blob` is a local type, so these
     ///   impls are orphan-rule-legal), storing the metadata JSON as `TEXT`.
+    /// - `json`/`jsonb` (issue #1341) — `serde_json::Value` is a *foreign*
+    ///   type, but diesel itself (not `autumn-web`) already implements
+    ///   `FromSql`/`ToSql<Json, Sqlite>` for it, so there is no orphan-rule
+    ///   obstacle at all — unlike `Uuid`/`Decimal` below, which are genuinely
+    ///   blocked because neither diesel nor `autumn-web` provides the impl.
     ///
     /// Still rejected (their Rust types are foreign to `autumn-web`, so the
     /// orphan rule forbids `autumn-web` from adding a `Sqlite` `FromSql`/`ToSql`
@@ -694,6 +735,7 @@ impl FieldKind {
             Self::DateTime => "DateTime",
             Self::Bytea => "Bytea",
             Self::Attachment => "Attachment",
+            Self::Json => "json",
             Self::References => "references",
             Self::Enum => "enum{…}",
             Self::Decimal { .. } => "decimal{…}",
@@ -873,7 +915,7 @@ impl IdType {
 
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
-    Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, \
+    Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
     enum{a,b,…}, decimal{precision,scale}, slug{from:col}, Option<…>, :unique, \
     String{encrypted}, String{encrypted:deterministic}";
 
@@ -883,8 +925,8 @@ pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, 
 /// `Enum`). Used in the generate-time rejection message so the user knows which
 /// field kinds a `SQLite` app supports today.
 pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
-    NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, slug{from:col}, Option<…>, \
-    :unique";
+    NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
+    slug{from:col}, Option<…>, :unique";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -922,7 +964,13 @@ pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
         // `Blob`, and introspection cannot tell them apart (both report
         // `udt_name = jsonb`). Mapping it to `Attachment` would emit a
         // `Blob` field that fails to deserialize real JSON rows, so we leave
-        // it unsupported rather than risk corrupting brownfield data.
+        // it unsupported rather than risk corrupting brownfield data. Issue
+        // #1341 deepens the same ambiguity rather than resolving it: `json`
+        // fields ALSO forward-map to `JSONB`, so a pulled `jsonb` column could
+        // now be either a `Blob` or a `serde_json::Value` — still no way to
+        // tell, so this stays unsupported on purpose (`db pull` is forward-
+        // generation tooling; reverse introspection of a JSONB column is out
+        // of this issue's scope).
         _ => None,
     }
 }
@@ -2091,6 +2139,13 @@ fn atomic_type(ty: &str) -> Option<FieldKind> {
         // slug (issue #1260): a URL-safe routing key auto-derived from
         // another field, e.g. `slug:slug{from:title}`.
         "slug" | "Slug" => Some(FieldKind::Slug),
+        // json / jsonb (issue #1341): arbitrary structured data stored as
+        // `serde_json::Value`. `jsonb` is accepted as an alias per the AC —
+        // both spellings (and their PascalCase forms, consistent with
+        // `Attachment`/`attachment` and `decimal`/`Decimal`) map to the same
+        // kind; there is no separate non-binary "json" storage distinction on
+        // the Postgres side (the column is always `JSONB`).
+        "json" | "Json" | "jsonb" | "Jsonb" => Some(FieldKind::Json),
         _ => {
             // Allow `Vec<u8>` as a synonym for `Bytea`.
             strip_wrapper(ty, "Vec").and_then(|inner| {
@@ -2743,6 +2798,152 @@ mod tests {
             SUPPORTED_TYPES.contains("Attachment"),
             "SUPPORTED_TYPES must list Attachment"
         );
+    }
+
+    // ── RED: json/jsonb field kind (issue #1341) ────────────────────────────
+
+    #[test]
+    fn parse_json_lowercase() {
+        let f = parse_field("config:json").unwrap();
+        assert_eq!(f.kind, FieldKind::Json);
+        assert_eq!(f.name, "config");
+        assert!(
+            !f.nullable,
+            "unlike Attachment, a json field is not implicitly nullable"
+        );
+    }
+
+    #[test]
+    fn parse_json_pascal_case() {
+        assert_eq!(parse_field("config:Json").unwrap().kind, FieldKind::Json);
+    }
+
+    #[test]
+    fn parse_jsonb_alias_lowercase() {
+        assert_eq!(parse_field("config:jsonb").unwrap().kind, FieldKind::Json);
+    }
+
+    #[test]
+    fn parse_jsonb_alias_pascal_case() {
+        assert_eq!(parse_field("config:Jsonb").unwrap().kind, FieldKind::Json);
+    }
+
+    #[test]
+    fn json_rust_type_is_serde_json_value() {
+        let f = parse_field("config:json").unwrap();
+        assert_eq!(f.rust_type(), "serde_json::Value");
+    }
+
+    #[test]
+    fn json_sql_type_is_jsonb() {
+        let f = parse_field("config:json").unwrap();
+        assert_eq!(f.sql_type(), "JSONB");
+    }
+
+    #[test]
+    fn json_schema_type_is_jsonb() {
+        let f = parse_field("config:json").unwrap();
+        assert_eq!(f.schema_type(), "Jsonb");
+    }
+
+    #[test]
+    fn json_sqlite_sql_type_is_text() {
+        // AC1: "SQLite dev/test backend: TEXT storing JSON".
+        let f = parse_field("config:json").unwrap();
+        assert_eq!(f.sql_column_type_for(DatabaseBackend::Sqlite), "TEXT");
+    }
+
+    #[test]
+    fn json_sqlite_schema_type_is_diesels_json_not_text_or_jsonb() {
+        // Diesel ships `FromSql`/`ToSql<Json, Sqlite> for serde_json::Value`
+        // (diesel 2.3+, `serde_json` + `sqlite` features — both already
+        // unconditionally on in this workspace). Using diesel's *bare* `Text`
+        // sql-type here would not compile (no `serde_json::Value` conversion
+        // for it), and diesel's `Jsonb` on SQLite uses a proprietary binary
+        // encoding, not the plain-text JSON the AC calls for — so this must be
+        // `Json`, distinct from both.
+        let f = parse_field("config:json").unwrap();
+        assert_eq!(f.schema_type_for(DatabaseBackend::Sqlite), "Json");
+    }
+
+    #[test]
+    fn json_sqlite_has_diesel_conversion_is_true() {
+        // Unlike `Decimal`/`Uuid`/`Enum`, `serde_json::Value`'s SQLite
+        // conversion is implemented by diesel itself, so no orphan-rule
+        // wrapper is needed and the kind is fully SQLite-supported.
+        assert!(FieldKind::Json.sqlite_has_diesel_conversion());
+    }
+
+    #[test]
+    fn optional_json_parses() {
+        let f = parse_field("config:Option<json>").unwrap();
+        assert_eq!(f.kind, FieldKind::Json);
+        assert!(f.nullable);
+        assert_eq!(f.rust_type(), "Option<serde_json::Value>");
+        assert_eq!(f.schema_type(), "Nullable<Jsonb>");
+        assert_eq!(f.schema_type_for(DatabaseBackend::Sqlite), "Nullable<Json>");
+    }
+
+    #[test]
+    fn optional_jsonb_alias_parses() {
+        let f = parse_field("config:Option<jsonb>").unwrap();
+        assert_eq!(f.kind, FieldKind::Json);
+        assert!(f.nullable);
+    }
+
+    #[test]
+    fn unique_json_field_parses() {
+        // Postgres's `jsonb` type has a default B-tree operator class, so a
+        // `UNIQUE INDEX` over a json column is legitimate — not rejected the
+        // way a randomized-encrypted column's equality lookup is.
+        let f = parse_field("config:json:unique").unwrap();
+        assert_eq!(f.kind, FieldKind::Json);
+        assert!(f.unique);
+    }
+
+    #[test]
+    fn json_in_list_of_fields() {
+        let tokens = vec![
+            "title:String".into(),
+            "config:json".into(),
+            "count:i64".into(),
+        ];
+        let fields = parse_fields(&tokens).unwrap();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[1].kind, FieldKind::Json);
+    }
+
+    #[test]
+    fn json_appears_in_supported_types_constant() {
+        assert!(
+            SUPPORTED_TYPES.contains("json"),
+            "SUPPORTED_TYPES must list json/jsonb"
+        );
+    }
+
+    #[test]
+    fn json_appears_in_sqlite_supported_kinds_constant() {
+        // Unlike Decimal/Uuid/Enum, json IS SQLite-supported.
+        assert!(
+            SQLITE_SUPPORTED_KINDS.contains("json"),
+            "SQLITE_SUPPORTED_KINDS must list json — diesel supports it natively"
+        );
+    }
+
+    #[test]
+    fn json_dsl_token_is_json() {
+        assert_eq!(FieldKind::Json.dsl_token(), "json");
+    }
+
+    #[test]
+    fn json_stays_unmapped_for_db_pull_inverse() {
+        // Same ambiguity as Attachment (both forward-map to `jsonb`): the
+        // inverse can't tell a `Blob` column from a raw `Json` column, so
+        // `db pull` introspection leaves `jsonb`/`json` unsupported rather
+        // than guessing (see `sql_type_inverse_rejects_unknown_types`, which
+        // already locks this and is unchanged by this feature).
+        assert!(sql_type_to_field_kind("jsonb").is_none());
+        assert!(sql_type_to_field_kind("json").is_none());
     }
 
     // ── Inverse mapping (db pull introspection, issue #975) ─────────────────
@@ -4272,6 +4473,7 @@ mod schema_core_parity {
             (FieldKind::DateTime, ColumnType::TimestampTz, vec![]),
             (FieldKind::Bytea, ColumnType::Bytes, vec![]),
             (FieldKind::Attachment, ColumnType::Attachment, vec![]),
+            (FieldKind::Json, ColumnType::Json, vec![]),
             (
                 FieldKind::Decimal {
                     precision: 12,

@@ -1133,11 +1133,22 @@ fn diff_table(
 /// Whether two column types are equivalent for drift purposes on `backend`.
 ///
 /// On **Postgres** this is exact [`ColumnType`] equality — `INTEGER` vs `BIGINT`
-/// (int4 vs int8) is a genuine, distinct type change that must still diff.
+/// (int4 vs int8) is a genuine, distinct type change that must still diff —
+/// with one deliberate exception: [`Attachment`](ColumnType::Attachment) and
+/// [`Json`](ColumnType::Json) both render `JSONB`, and Postgres introspection
+/// cannot tell them apart (`from_pg_introspection` always resolves a raw
+/// `jsonb` column to `Attachment` — see its doc comment, issue #1341).
+/// Comparing them by exact equality would report a permanent, spurious
+/// `Attachment -> Json` (or the reverse) type change — and a needless
+/// `ALTER COLUMN ... TYPE JSONB` — on every diff of a model that has a `json`
+/// field, even though the physical column never changed. This exception
+/// applies on both backends (checked before the backend branch below), since
+/// it is about introspection ambiguity, not `SQLite`'s declared-type
+/// collapsing.
 ///
 /// On **`SQLite`** the emitter renders several distinct IR types to the same
 /// declared type (`Int32`/`Int64`/`Bool` → `INTEGER`, `Float32`/`Float64` →
-/// `REAL`, `Text`/`Uuid`/`Timestamp`/`TimestampTz`/`Decimal`/`Attachment`/`Enum` →
+/// `REAL`, `Text`/`Uuid`/`Timestamp`/`TimestampTz`/`Decimal`/`Attachment`/`Json`/`Enum` →
 /// `TEXT`, `Bytes` → `BLOB`), and a pull cannot recover the original variant — so
 /// comparing by exact `ColumnType` would report a spurious type change (and a
 /// table-recreate) for every `bool`/`i32`/`f32`/plain-`Timestamp` column on every
@@ -1146,9 +1157,16 @@ fn diff_table(
 /// still drifts. An [`Opaque`](ColumnType::Opaque) type (a verbatim, pull-only type
 /// with no clean class) or the ambiguous [`Numeric`](SqliteAffinity::Numeric)
 /// catch-all falls back to exact equality so distinct verbatim types are never
-/// conflated. This rule is strictly `SQLite`-gated and never affects the pg lane.
+/// conflated. Beyond the `Attachment`/`Json` exception above, this rule is
+/// strictly `SQLite`-gated and never affects the pg lane.
 fn column_types_equivalent(base: &ColumnType, want: &ColumnType, backend: Backend) -> bool {
     if base == want {
+        return true;
+    }
+    if matches!(
+        (base, want),
+        (ColumnType::Attachment, ColumnType::Json) | (ColumnType::Json, ColumnType::Attachment)
+    ) {
         return true;
     }
     if backend != Backend::Sqlite {
@@ -5847,6 +5865,85 @@ mod tests {
         };
         assert!(!column_types_equivalent(&a, &b, Backend::Sqlite));
         assert!(column_types_equivalent(&a, &a.clone(), Backend::Sqlite));
+    }
+
+    #[test]
+    fn attachment_and_json_are_equivalent_on_both_backends_despite_introspection_ambiguity() {
+        // Issue #1341 (review): a model's `serde_json::Value` field parses to
+        // `ColumnType::Json`, but Postgres introspection of the SAME physical
+        // `JSONB` column always resolves to `ColumnType::Attachment`
+        // (`from_pg_introspection` cannot tell a `json` field from an
+        // `Attachment` blob apart — see its doc comment). Without this
+        // exception, every diff of a model with a `json` field would report a
+        // permanent, spurious `Attachment -> Json` type change on Postgres.
+        assert!(column_types_equivalent(
+            &ColumnType::Attachment,
+            &ColumnType::Json,
+            Backend::Postgres
+        ));
+        assert!(column_types_equivalent(
+            &ColumnType::Json,
+            &ColumnType::Attachment,
+            Backend::Postgres
+        ));
+        // Also holds on SQLite (both render TEXT there — already covered by
+        // the affinity rule, but assert it directly so this exception can't
+        // silently regress if the affinity mapping ever changes).
+        assert!(column_types_equivalent(
+            &ColumnType::Attachment,
+            &ColumnType::Json,
+            Backend::Sqlite
+        ));
+        // A genuinely different type is still NOT equivalent to either.
+        assert!(!column_types_equivalent(
+            &ColumnType::Attachment,
+            &ColumnType::Text,
+            Backend::Postgres
+        ));
+        assert!(!column_types_equivalent(
+            &ColumnType::Json,
+            &ColumnType::Text,
+            Backend::Postgres
+        ));
+    }
+
+    #[test]
+    fn pg_diff_reports_no_alter_between_attachment_and_json() {
+        // End-to-end: a `json` model field diffed against a pulled `Attachment`
+        // column (both physically `JSONB`) must not emit `AlterColumnType`.
+        let mut base = Table::new("posts", Backend::Postgres);
+        base.managed = true;
+        base.columns.push(col("meta", ColumnType::Attachment));
+        let mut want = Table::new("posts", Backend::Postgres);
+        want.managed = true;
+        want.columns.push(col("meta", ColumnType::Json));
+        let plan = diff_schema(
+            std::slice::from_ref(&base),
+            &parsed(vec![want], vec![]),
+            AUTHORITATIVE,
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::AlterColumnType { .. })),
+            "Attachment vs Json on the same JSONB column must not drift: {:?}",
+            plan.changes
+        );
+
+        // A genuine type change (Json -> Text) still drifts.
+        let mut want2 = Table::new("posts", Backend::Postgres);
+        want2.managed = true;
+        want2.columns.push(col("meta", ColumnType::Text));
+        let plan2 = diff_schema(&[base], &parsed(vec![want2], vec![]), AUTHORITATIVE);
+        assert!(
+            plan2
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::AlterColumnType { .. })),
+            "a genuine type change must still drift on Postgres: {:?}",
+            plan2.changes
+        );
     }
 
     #[test]

@@ -2323,6 +2323,19 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             // only used `f64` to reject non-numeric garbage above).
             Ok(value.to_owned())
         }
+        FieldKind::Json => {
+            serde_json::from_str::<serde_json::Value>(value)
+                .map_err(|err| format!("json default '{value}' is not valid JSON: {err}"))?;
+            // Unlike the plain `String` arm above, the raw value is NOT run
+            // through `unquote_default_value` first — JSON syntax already
+            // carries its own quoting (`"hello"` is a JSON string; `{}`/`[]`/
+            // `42`/`true` are not quoted at all), so stripping a layer here
+            // would corrupt a JSON *string* default (`note:json="hi"`) into
+            // an invalid literal. Postgres implicitly casts a single-quoted
+            // string literal to the column's declared `JSONB` type in a
+            // `DEFAULT` clause, so no explicit `::jsonb` cast is needed.
+            Ok(format!("'{}'", value.replace('\'', "''")))
+        }
         FieldKind::Uuid
         | FieldKind::NaiveDateTime
         | FieldKind::DateTime
