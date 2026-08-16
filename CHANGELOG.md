@@ -15,7 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the capsule *after* header redaction ran — so an operator who filtered
   `x-forwarded-host` saw it masked under `headers` and sitting in cleartext one
   key away under `client_host`. Each field is now dropped when any header it
-  could have been resolved from is filtered.
+  could have been resolved from is filtered — including `X-Real-IP`, a
+  fallback source for the address. Where a filtered source actually supplied a
+  value the capsule is additionally **refused** by replay: replay pre-inserts
+  the recorded identity whole whenever any field survives, so a suppressed
+  host would reach the handler as `None` rather than not at all, and a handler
+  that branches on it would report a `mismatch` the guide tells operators to
+  read as "the bug is gone".
 - **failure capsules:** the capsule format version is now `2`. The new
   `db_roles` field changes what a capsule *means* — a reader that skips it
   rebuilds no database topology and replays a shape the recording never had —
