@@ -273,8 +273,7 @@ fn rejection_response<B>(request: &Request<B>) -> Option<axum::response::Respons
 /// Signature of the synchronous rejection check handed to the crate-internal
 /// `GateLayer` by [`method_override_rejection_layer`]. A plain `fn` pointer
 /// (rather than a closure) so the layer stays `Copy` and nameable.
-pub(crate) type RejectionCheck =
-    fn(&Request<axum::body::Body>) -> Option<Response<axum::body::Body>>;
+pub type RejectionCheck = fn(&Request<axum::body::Body>) -> Option<Response<axum::body::Body>>;
 
 /// Allocation-free equivalent of
 /// `axum::middleware::from_fn(method_override_rejection_filter)`.
@@ -285,8 +284,7 @@ pub(crate) type RejectionCheck =
 /// clones the inner service per request (issue #2214). This is what
 /// `router::apply_middleware` installs.
 #[must_use]
-pub(crate) fn method_override_rejection_layer() -> crate::middleware::gate::GateLayer<RejectionCheck>
-{
+pub fn method_override_rejection_layer() -> crate::middleware::gate::GateLayer<RejectionCheck> {
     crate::middleware::gate::GateLayer::new(rejection_response as RejectionCheck)
 }
 

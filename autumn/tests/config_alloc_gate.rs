@@ -197,18 +197,33 @@ async fn ping() -> &'static str {
 /// clone-on-call sites from the layer stack, and #2214's margin measured the
 /// same (-7% blocks / -11% bytes) against the pre-#2205 and post-#2205 trees.
 ///
-/// The ceiling sits above the current 160 with about a tenth of headroom.
+/// # Why both ceilings sit BELOW the previous measurement
 ///
-/// A ceiling this close to the measured value is a deliberate trade: it can
-/// only stay honest while the number stays deterministic. If this ever fails
-/// with a count just over the line rather than a regression-sized jump,
-/// re-measure and re-derive it rather than nudging it upwards.
+/// A ceiling only protects a win if reverting the change trips it. Both
+/// constants therefore sit strictly between the new measurement and the old
+/// one, not at "new plus comfortable headroom": `BLOCK_CEILING` is under the
+/// pre-#2214 172, and `BYTE_CEILING` is under the pre-#2214 37,819, so
+/// restoring either `from_fn` layer fails this test rather than sliding
+/// underneath it.
+///
+/// The byte ceiling is not decorative duplication of the block ceiling. This
+/// change's effect is mostly on *size* rather than *count* (-11.0% bytes vs
+/// -7.0% blocks) because a boxed `from_fn` future is individually large, so a
+/// block-only gate would let most of the regression back in. Both numbers are
+/// deterministic, so both can be pinned this tightly.
+///
+/// Ceilings this close to the measured values are a deliberate trade: they can
+/// only stay honest while the numbers stay deterministic. If this ever fails
+/// just over a line rather than by a regression-sized jump, re-measure and
+/// re-derive rather than nudging the constants upwards.
 #[test]
 fn per_request_allocations_stay_under_the_ceiling() {
     use autumn_web::routes;
     use autumn_web::test::TestApp;
 
-    const CEILING: u64 = 176;
+    // Measured 160 blocks / 33,667 bytes; pre-#2214 was 172 / 37,819.
+    const BLOCK_CEILING: u64 = 166;
+    const BYTE_CEILING: u64 = 35_500;
     const WARMUP: usize = 3;
     const MEASURED: u64 = 10;
 
@@ -238,11 +253,23 @@ fn per_request_allocations_stay_under_the_ceiling() {
         });
     });
     let per_request = info.count_total / MEASURED;
+    let bytes_per_request = info.bytes_total / MEASURED;
 
     assert!(
-        per_request <= CEILING,
-        "a request allocated {per_request} blocks, over the {CEILING} ceiling \
-         ({} blocks and {} bytes across {MEASURED} requests)",
+        per_request <= BLOCK_CEILING,
+        "a request allocated {per_request} blocks, over the {BLOCK_CEILING} \
+         ceiling ({} blocks and {} bytes across {MEASURED} requests)",
+        info.count_total,
+        info.bytes_total
+    );
+
+    assert!(
+        bytes_per_request <= BYTE_CEILING,
+        "a request allocated {bytes_per_request} bytes, over the \
+         {BYTE_CEILING} ceiling ({} blocks and {} bytes across {MEASURED} \
+         requests). This gate is what keeps #2214's -11% byte win from being \
+         quietly given back — a boxed `from_fn` future is large, so a \
+         regression shows up here before it shows up in the block count.",
         info.count_total,
         info.bytes_total
     );

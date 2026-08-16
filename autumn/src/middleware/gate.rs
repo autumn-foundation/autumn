@@ -52,7 +52,9 @@
 //!    unconsumed until the next `call`.
 //!
 //! Neither is reachable with an always-ready inner service, which is why this
-//! type is `pub(crate)`: every current user sits inner to the framework's only
+//! module is crate-private (`pub(crate) mod gate` — the items below are plain
+//! `pub` only because `clippy::redundant_pub_crate` objects to restating it):
+//! every current user sits inner to the framework's only
 //! backpressuring layer (`LoadShedLayer`, applied *outside* both gates in
 //! `apply_middleware`'s inner group), and everything beneath them —
 //! `BotProtection`, `CSRF`, `SubmitToken`, `TrustedHost`, `CORS`, and
@@ -102,13 +104,13 @@ use tower::{Layer, Service};
 /// shape described in the [module docs](self) — it is behaviorally identical
 /// and allocates nothing per request.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct GateLayer<G> {
+pub struct GateLayer<G> {
     gate: G,
 }
 
 impl<G> GateLayer<G> {
     /// Wrap `gate` as a layer.
-    pub(crate) const fn new(gate: G) -> Self {
+    pub const fn new(gate: G) -> Self {
         Self { gate }
     }
 }
@@ -129,7 +131,7 @@ where
 
 /// Tower [`Service`] produced by [`GateLayer`].
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct GateService<S, G> {
+pub struct GateService<S, G> {
     inner: S,
     gate: G,
 }
@@ -166,7 +168,7 @@ pin_project! {
     /// path) or delegates to the wrapped inner service's own future. Neither
     /// variant boxes.
     #[project = GateFutureProj]
-    pub(crate) enum GateFuture<F> {
+    pub enum GateFuture<F> {
         ShortCircuit { response: Option<Response<Body>> },
         Forward { #[pin] inner: F },
     }
