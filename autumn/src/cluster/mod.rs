@@ -23,6 +23,17 @@
 //! counter's lifetime is the cluster's process lifetime — see
 //! `docs/guide/clustering.md` for the full failure-semantics contract.
 //!
+//! # Scope
+//!
+//! **Experimental, and a deliberate two-node slice.** Every push carries the
+//! whole document to every known peer and there is no quorum anywhere: that is
+//! a sound design at two nodes and an unproven one beyond. The public surface
+//! is exactly [`ClusterHandle`], [`ClusterMemberInfo`], [`ClusterMemberStatus`],
+//! [`ClusterCounter`], [`install_from_config`] and
+//! [`ClusterConfig`](crate::config::ClusterConfig); everything protocol-shaped
+//! (the wire envelope, the member records, the transport) is crate-private, so
+//! the format stays free to change while the feature is unreleased.
+//!
 //! # Naming
 //!
 //! `[cluster]` here means *app nodes clustering with each other*. It is
@@ -269,6 +280,9 @@ impl ClusterInner {
 /// Installed on [`AppState`] as an extension when `[cluster] enabled = true`;
 /// `state.extension::<ClusterHandle>()` is `None` on every node where
 /// clustering is off.
+///
+/// Cheap to clone — every clone addresses the same node. Experimental and
+/// two-node-scoped; see the [module docs](self#scope).
 #[derive(Clone)]
 pub struct ClusterHandle {
     inner: Arc<ClusterInner>,
@@ -544,11 +558,13 @@ impl crate::actuator::MetricsSource for ClusterMetricsSource {
 ///
 /// Returns an error when the section is enabled but
 ///
-/// - the shared secret is absent or shorter than 16 bytes. This installer is
-///   public and reachable with a hand-built [`ClusterConfig`] that never went
-///   through [`ClusterConfig::validate`], so a missing secret must fail closed
-///   here too: falling back to an empty HMAC key would authenticate every peer
-///   on the port;
+/// - the section violates any [`ClusterConfig::validate`] rule. The installer
+///   runs that validation itself, before it binds anything: it is public and
+///   reachable with a hand-built section that never went through the config
+///   layer;
+/// - the shared secret is absent or shorter than 16 bytes — checked again here
+///   and a third time inside the node, because falling back to an empty HMAC
+///   key would authenticate every peer on the port;
 /// - the cluster listener cannot bind `bind_addr`, or the node cannot start. A
 ///   node that cannot join must not boot pretending it did.
 pub fn install_from_config(
@@ -559,6 +575,17 @@ pub fn install_from_config(
     if !config.enabled {
         return Ok(());
     }
+
+    // The whole `[cluster]` rule set, re-checked here and before anything is
+    // bound. `AutumnConfig::validate` already runs it at boot, but this
+    // installer is public and reachable with a hand-built section that never
+    // went through the config layer — and every rule it checks (a dialable
+    // advertised address, a suspicion timeout that cannot flap, a `node_id`
+    // free of the cell-key separator) is one this node would otherwise carry
+    // into the cluster.
+    config.validate().map_err(|error| {
+        AutumnError::internal_server_error_msg(format!("cluster: invalid configuration: {error}"))
+    })?;
 
     // Deliberately not `unwrap_or_default()`: an absent secret is a
     // configuration error, never an empty key.

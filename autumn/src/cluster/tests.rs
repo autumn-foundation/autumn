@@ -106,6 +106,30 @@ fn member_ids(handle: &ClusterHandle) -> Vec<String> {
     ids
 }
 
+/// Assert that both nodes see exactly `expected`, printing BOTH views when they
+/// do not.
+///
+/// The second half is the load-bearing one: an asymmetric view — A sees the
+/// pair, B sees only itself — is a real convergence bug that an assertion on
+/// one node alone reports as a pass.
+fn assert_converged(a: &TestNode, b: &TestNode, expected: &[&str], why: &str) {
+    let expected: Vec<String> = expected.iter().map(|id| (*id).to_owned()).collect();
+    assert_eq!(
+        member_ids(&a.handle),
+        expected,
+        "{why}; {} | {}",
+        view_of(a),
+        view_of(b)
+    );
+    assert_eq!(
+        member_ids(&b.handle),
+        expected,
+        "…and both nodes must converge on the SAME view ({why}); {} | {}",
+        view_of(a),
+        view_of(b)
+    );
+}
+
 /// State pushes this node has handed to the transport since it started.
 fn pushes_sent(node: &TestNode) -> u64 {
     node.handle
@@ -136,20 +160,11 @@ async fn loopback_two_nodes_converge_to_two_member_view() {
 
     settle(&clock, 6).await;
 
-    assert_eq!(
-        member_ids(&a.handle),
-        vec!["node-a".to_owned(), "node-b".to_owned()],
-        "seeding B at A's address must give A a two-member view; {} | {}",
-        view_of(&a),
-        view_of(&b)
-    );
-    assert_eq!(
-        member_ids(&b.handle),
-        member_ids(&a.handle),
-        "both nodes must converge on the SAME view — an asymmetric view is the \
-         bug this asserts against; {} | {}",
-        view_of(&a),
-        view_of(&b)
+    assert_converged(
+        &a,
+        &b,
+        &["node-a", "node-b"],
+        "seeding B at A's address must give A a two-member view",
     );
     assert!(
         a.handle
@@ -261,17 +276,11 @@ async fn loopback_wrong_secret_peer_never_joins() {
          that stays at two because nothing arrived proves nothing; {}",
         view_of(&a)
     );
-    assert_eq!(
-        member_ids(&a.handle),
-        vec!["node-a".to_owned(), "node-b".to_owned()],
-        "a peer signing with a different secret must never enter the view; {}",
-        view_of(&a)
-    );
-    assert_eq!(
-        member_ids(&b.handle),
-        vec!["node-a".to_owned(), "node-b".to_owned()],
-        "…on either node; {}",
-        view_of(&b)
+    assert_converged(
+        &a,
+        &b,
+        &["node-a", "node-b"],
+        "a peer signing with a different secret must never enter the view",
     );
 
     a.token.cancel();
@@ -461,7 +470,11 @@ async fn metrics_source_emits_every_cluster_family() {
         .find(|family| family.name == "autumn_cluster_members")
         .expect("the members family is in the list asserted above");
     let expected = f64::from(u32::try_from(a.handle.members().len()).unwrap_or(u32::MAX));
-    assert_eq!(members.kind, MetricKind::Gauge, "the view's size is a gauge");
+    assert_eq!(
+        members.kind,
+        MetricKind::Gauge,
+        "the view's size is a gauge"
+    );
     assert_eq!(
         members.samples.iter().map(|s| s.value).collect::<Vec<_>>(),
         vec![expected],
@@ -544,13 +557,12 @@ async fn loopback_replayed_leave_is_refuted_by_live_node() {
         a.handle.incarnation(),
         view_of(&a)
     );
-    assert_eq!(
-        member_ids(&b.handle),
-        vec!["node-a".to_owned(), "node-b".to_owned()],
+    assert_converged(
+        &a,
+        &b,
+        &["node-a", "node-b"],
         "a replayed leave must not evict a live node: B's view must return to \
-         two members; {} | {}",
-        view_of(&a),
-        view_of(&b)
+         two members",
     );
 
     a.token.cancel();

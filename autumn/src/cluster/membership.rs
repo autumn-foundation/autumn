@@ -5,7 +5,7 @@
 //! [`ClusterState`] is the *only* replicated thing: a member table and the
 //! named counters, merged by a single [`ClusterState::merge`]. Membership and
 //! the counter are two lenses on one join-semilattice, which is what makes
-//! discovery, counter consistency and leave-convergence the same mechanism
+//! discovery, counter convergence and leave-convergence the same mechanism
 //! observed three ways.
 //!
 //! # Replicated status vs. local liveness
@@ -165,7 +165,7 @@ impl ClusterState {
     /// Merge a peer's document into this one, field by field.
     ///
     /// Commutative, associative and idempotent — the property the counter's
-    /// cross-node consistency reduces to.
+    /// cross-node convergence reduces to.
     pub fn merge(&mut self, other: &Self) {
         for (id, theirs) in &other.members {
             if let Some(ours) = self.members.get_mut(id) {
@@ -230,10 +230,10 @@ impl ClusterState {
     /// frame: pruning forgets that receipt, so a lagging peer that re-teaches
     /// the tombstone would re-insert a record whose age was then measured
     /// against the *sender's* receipts and never expired again — an unbounded
-    /// document under repeated departures. The stamp is instead set when this
-    /// node first observes the departure and left alone while the record stays
-    /// `Left`, so a reintroduced tombstone expires one window after it was
-    /// re-learned rather than never.
+    /// document under repeated departures. The stamp is instead written the
+    /// first time this node sees the departure and never rewritten while the
+    /// record stays `Left`, so a reintroduced tombstone expires one window
+    /// after it was re-learned rather than never.
     pub fn observe_tombstones(&self, overlay: &mut LivenessOverlay, now: MonotonicInstant) {
         for (id, record) in &self.members {
             match record.status {

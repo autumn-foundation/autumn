@@ -200,6 +200,12 @@ impl ClusterCounter {
     }
 
     /// The counter's current value as this node sees it.
+    ///
+    /// May **jump upward** between two calls with no local increment in
+    /// between — that is a peer's cells merging in — and never moves downward.
+    /// It is a lower bound on the true cluster-wide total, never a limit to
+    /// enforce: nothing here can fence anything (see
+    /// `docs/guide/clustering.md`).
     #[must_use]
     pub fn get(&self) -> u64 {
         self.inner

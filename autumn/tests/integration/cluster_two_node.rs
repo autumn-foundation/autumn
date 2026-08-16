@@ -95,6 +95,34 @@ fn member_ids(handle: &ClusterHandle) -> Vec<String> {
     ids
 }
 
+/// Poll until both nodes report a two-member view, then assert it.
+///
+/// Asserting on both is the point: an asymmetric view — A sees the pair, B sees
+/// only itself — is a real convergence bug that a one-sided assertion passes.
+async fn assert_converged(a: &ClusterHandle, b: &ClusterHandle) {
+    let (left, right) = (a.clone(), b.clone());
+    poll_until(CONVERGE_TIMEOUT, || {
+        let (left, right) = (left.clone(), right.clone());
+        async move { left.members().len() == 2 && right.members().len() == 2 }
+    })
+    .await;
+
+    assert_eq!(
+        member_ids(a).len(),
+        2,
+        "node A must converge on a two-member view; {} | {}",
+        describe("A", a),
+        describe("B", b)
+    );
+    assert_eq!(
+        member_ids(b),
+        member_ids(a),
+        "both nodes must converge on the same view; {} | {}",
+        describe("A", a),
+        describe("B", b)
+    );
+}
+
 fn describe(label: &str, handle: &ClusterHandle) -> String {
     format!(
         "{label}: members={:?} {COUNTER}={}",
@@ -189,24 +217,11 @@ async fn tcp_two_nodes_converge_and_counter_replicates() {
         .extension::<ClusterHandle>()
         .expect("an enabled [cluster] section must install a ClusterHandle on node B");
 
-    let (a, b) = (handle_a.clone(), handle_b.clone());
-    poll_until(CONVERGE_TIMEOUT, || {
-        let (a, b) = (a.clone(), b.clone());
-        async move { a.members().len() == 2 && b.members().len() == 2 }
-    })
-    .await;
-
-    assert_eq!(
-        member_ids(&handle_a).len(),
-        2,
-        "node A must converge on a two-member view (seeded at {seed}); {} | {}",
-        describe("A", &handle_a),
-        describe("B", &handle_b)
-    );
-    assert_eq!(
-        member_ids(&handle_b),
-        member_ids(&handle_a),
-        "both nodes must converge on the same view; {} | {}",
+    assert_converged(&handle_a, &handle_b).await;
+    assert!(
+        member_ids(&handle_a).contains(&handle_b.node_id().to_owned()),
+        "A's view must name B itself, not merely count two rows (seeded at \
+         {seed}); {} | {}",
         describe("A", &handle_a),
         describe("B", &handle_b)
     );
@@ -254,18 +269,8 @@ async fn tcp_survivor_converges_after_peer_cancelled() {
         .extension::<ClusterHandle>()
         .expect("node B must expose a ClusterHandle");
 
-    let (a, b) = (handle_a.clone(), handle_b.clone());
-    poll_until(CONVERGE_TIMEOUT, || {
-        let (a, b) = (a.clone(), b.clone());
-        async move { a.members().len() == 2 && b.members().len() == 2 }
-    })
-    .await;
-    assert_eq!(
-        handle_a.members().len(),
-        2,
-        "the pair must be converged before the kill, or the test proves nothing; {}",
-        describe("A", &handle_a)
-    );
+    // Converged before the kill, or the test proves nothing.
+    assert_converged(&handle_a, &handle_b).await;
 
     handle_a.counter(COUNTER).increment();
     shutdown_b.cancel();
@@ -340,18 +345,8 @@ async fn tcp_clean_leave_converges_before_the_suspicion_timeout() {
         .extension::<ClusterHandle>()
         .expect("node B must expose a ClusterHandle");
 
-    let (a, b) = (handle_a.clone(), handle_b.clone());
-    poll_until(CONVERGE_TIMEOUT, || {
-        let (a, b) = (a.clone(), b.clone());
-        async move { a.members().len() == 2 && b.members().len() == 2 }
-    })
-    .await;
-    assert_eq!(
-        handle_a.members().len(),
-        2,
-        "the pair must be converged before the leave, or this test proves nothing; {}",
-        describe("A", &handle_a)
-    );
+    // Converged before the leave, or this test proves nothing.
+    assert_converged(&handle_a, &handle_b).await;
 
     let departed_at = tokio::time::Instant::now();
     shutdown_b.cancel();
@@ -488,6 +483,51 @@ async fn full_app_two_nodes_health_and_counter_via_http() {
 
     shutdown_cluster_b.cancel();
     http_shutdown.cancel();
+}
+
+// ── Guard: the installer validates what it is handed ─────────────────────────
+
+/// `install_from_config` is public, so it is reachable with a `[cluster]`
+/// section that never went through `AutumnConfig::validate` — a hand-built
+/// struct, exactly as these tests build one. It must therefore run the same
+/// rules itself, before it binds anything, and fail closed on a missing secret
+/// instead of authenticating every peer on the port with an empty key.
+#[tokio::test]
+async fn install_rejects_an_invalid_or_secretless_section() {
+    let app = TestApp::new()
+        .config(app_config(ClusterConfig::default()))
+        .build();
+    let shutdown = CancellationToken::new();
+
+    let secretless = ClusterConfig {
+        secret: None,
+        ..cluster_config(Vec::new())
+    };
+    // A section that would flap: one delayed push evicts a healthy peer.
+    let flapping = ClusterConfig {
+        suspicion_timeout_ms: 300,
+        ..cluster_config(Vec::new())
+    };
+    // A seed peer nobody can dial.
+    let unseedable = cluster_config(vec!["127.0.0.1:0".to_owned()]);
+
+    for (label, config) in [
+        ("an enabled section with no secret", secretless),
+        ("a suspicion timeout below 3x the push interval", flapping),
+        ("a seed peer on port 0", unseedable),
+    ] {
+        let result = install_from_config(app.state(), &config, &shutdown);
+        assert!(
+            result.is_err(),
+            "{label} must be refused by the installer, not carried into the \
+             cluster; got {result:?}"
+        );
+    }
+
+    assert!(
+        app.state().extension::<ClusterHandle>().is_none(),
+        "a refused install must leave no ClusterHandle behind"
+    );
 }
 
 // ── Guard: off means off ─────────────────────────────────────────────────────

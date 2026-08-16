@@ -74,7 +74,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HMAC-SHA256-authenticated (cluster name, sender, incarnation, and sequence
   are MAC-covered; constant-time verify before any payload parse; per-sender
   replay watermarks) but not encrypted — deploy the cluster port on a trusted
-  network. Opt-in via the new `[cluster]` config section
+  network. What an *unauthenticated* socket can cost is bounded too: inbound
+  connections are capped and one that delivers no complete frame within its
+  idle deadline is closed, and a handler that increments on every request has
+  its prompt pushes rate-limited to a fraction of the push interval rather than
+  gossiping the whole document per write. Opt-in via the new `[cluster]` config
+  section
   (`AUTUMN_CLUSTER__*` env forms, fail-fast validation, secret required),
   surfaced through the `cluster:membership` health indicator and
   `autumn_cluster_*` metric families, and implemented with zero new crate

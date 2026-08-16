@@ -255,10 +255,20 @@ pub fn encode_frame(envelope: &Envelope) -> Option<Vec<u8>> {
         return None;
     }
     let len = u32::try_from(body.len()).ok()?;
+    Some(framed(len.to_be_bytes(), &body))
+}
+
+/// Join a length prefix and the body it declares into one frame buffer.
+///
+/// The single place the on-wire layout `prefix ‖ body` is spelled out: the
+/// encoder builds a frame this way and the TCP reader re-assembles one this way
+/// after reading the two halves separately, and a reader that disagreed with
+/// the encoder about the layout would be a bug nothing else could catch.
+pub fn framed(prefix: [u8; LENGTH_PREFIX_BYTES], body: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(body.len().saturating_add(LENGTH_PREFIX_BYTES));
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(&body);
-    Some(frame)
+    frame.extend_from_slice(&prefix);
+    frame.extend_from_slice(body);
+    frame
 }
 
 /// Read a length prefix, refusing `0` and anything over [`MAX_FRAME_BYTES`]

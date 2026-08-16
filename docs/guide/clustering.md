@@ -102,7 +102,10 @@ warning:
   ratio a single delayed push evicts a healthy peer and the view flaps.
 - `push_interval_ms` must be at least `10`.
 - `bind_addr`, `advertise_addr`, and every entry of `seed_peers` must parse as
-  a `SocketAddr` (`host:port`, IP literal — hostnames are not resolved).
+  a `SocketAddr` (`host:port`, IP literal — hostnames are not resolved). Only
+  `bind_addr` may carry port `0`: there it means "any free port" and the node
+  advertises the port it was actually given, while an `advertise_addr` or a
+  seed on port `0` is an address no peer can ever dial.
 - `node_id` and `cluster_name`, when set, must be non-empty, at most 64
   bytes, and must not contain `#` (reserved as the separator in counter cell
   keys). Both travel in every frame and are covered by the MAC.
@@ -273,7 +276,7 @@ alert on:
 | `autumn_cluster_pushes_sent_total` | counter | State pushes written. |
 | `autumn_cluster_pushes_received_total` | counter | Frames accepted after verification. |
 | `autumn_cluster_merges_applied_total` | counter | Merges that changed local state. |
-| `autumn_cluster_frames_rejected_total` | counter | Labelled `reason` — see the receive path below. |
+| `autumn_cluster_frames_rejected_total` | counter | Labelled `reason` — see the receive path below. Every label is published from boot, zeroes included, and `reason="oversize"` covers the connection-fatal step-1 rejections too. |
 | `autumn_cluster_frames_dropped_total` | counter | Outbound frames swallowed by a full or closed peer queue. Anti-entropy re-sends the state, so drops are lossy only to latency. |
 
 A steady `frames_rejected_total{reason="mac"}` means somebody is talking to
@@ -473,7 +476,17 @@ frame, or the peer is mid-reconnect, the peer still converges — by silence, at
 the suspicion timeout. Never build anything on a leave arriving.
 
 Records for departed members stay in the document as tombstones so `Left`
-propagates, and are pruned locally after ten suspicion timeouts.
+propagates, and are pruned locally after ten suspicion timeouts — measured from
+when *this* node first observed the departure, so a tombstone re-taught by a
+lagging peer after it was pruned ages from that re-observation and expires
+again rather than living forever.
+
+A tombstoned member also stays in the push target set until its tombstone is
+pruned. That is deliberate and costs a few frames aimed at a dead address: it
+is the only channel by which a node that restarted with a *lower* incarnation
+(a clock that stepped backwards) can hear its own `Left` record, refute it, and
+rejoin — its pushes are being replay-dropped by the peer that holds the
+tombstone, so it has to be told.
 
 ### The counter
 
@@ -491,7 +504,12 @@ network's timing:
   overtook the old one. Keying cells by boot removes that failure by
   construction — no recovery step, no readiness gate.
 - `increment()` adds 1 to this node's current cell, immediately and locally,
-  then nudges the push task. Local `get()` reflects it at once.
+  then nudges the push task. Local `get()` reflects it at once. The nudge is
+  rate-limited to one prompt push per quarter of `push_interval_ms` (never
+  under 50 ms, never longer than the interval itself): the first write after a
+  quiet gap still propagates promptly, and a handler incrementing on every
+  request propagates at that floor instead of signing and sending the whole
+  document once per request.
 - Merge is **per-entry maximum**. That is commutative, associative, and
   idempotent, so pushes may arrive out of order, be duplicated, or be dropped
   entirely, and the result is the same once any later push lands.
@@ -540,6 +558,16 @@ interface, a container network — and never expose it to the internet. Do not
 put anything sensitive in a counter name. Key rotation is not in this slice:
 `key_id` is reserved for it, and changing the secret today means restarting
 both nodes.
+
+**What an unauthenticated connection can cost you.** Reaching the port is
+enough to open a socket, so the listener bounds what a socket is worth before
+anyone proves they know the secret: at most **128** inbound connections are
+held open at once (past that a new one is accepted and closed immediately), and
+a connection that has not delivered a complete frame within four suspicion
+timeouts (at least 10 seconds) is closed. Neither bound can fire on a healthy
+peer — one peer needs one connection, and a peer silent past its suspicion
+timeout is already out of the view — and neither is a substitute for keeping
+the port off the public internet.
 
 **Leave is advisory, suspicion is the contract.** The 250 ms leave is a
 latency optimization for clean shutdowns. Correctness comes from the suspicion

@@ -62,7 +62,7 @@ use super::wire::{ClusterMessage, Envelope, FrameVerifier};
 use super::{ClusterHandle, ClusterInner, ClusterMetrics, Incarnation, jittered, wire};
 use crate::config::MIN_CLUSTER_SECRET_LEN;
 use crate::entropy::Entropy;
-use crate::time::{ClockSource, clock_unix_duration};
+use crate::time::{ClockSource, MonotonicInstant, clock_unix_duration};
 use crate::{AutumnError, AutumnResult, cluster::NodeId};
 
 /// Upper bound on the best-effort `Leave` broadcast during shutdown. Sized to
@@ -283,7 +283,7 @@ async fn push_loop(inner: Arc<ClusterInner>, shutdown: CancellationToken) {
     let mut seq: u64 = 0;
     let mut published = inner.incarnation.load(Ordering::Relaxed);
     let floor = push_floor(inner.push_interval);
-    let mut last_push: Option<crate::time::MonotonicInstant> = None;
+    let mut last_push: Option<MonotonicInstant> = None;
 
     loop {
         let interval = jittered(inner.push_interval, inner.entropy.as_ref());
@@ -410,10 +410,7 @@ fn push_targets(state: &ClusterState, inner: &ClusterInner) -> BTreeSet<String> 
         state,
         &inner.node_id,
         &inner.seed_peers,
-        &[
-            inner.advertise_addr.as_str(),
-            &inner.local_addr.to_string(),
-        ],
+        &[inner.advertise_addr.as_str(), &inner.local_addr.to_string()],
     )
 }
 

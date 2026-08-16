@@ -65,7 +65,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::wire::{LENGTH_PREFIX_BYTES, RejectReason, frame_len};
+use super::wire::{LENGTH_PREFIX_BYTES, RejectReason, frame_len, framed};
 use crate::AutumnResult;
 use crate::entropy::Entropy;
 
@@ -333,6 +333,17 @@ impl TcpPeerTransport {
                 Arc::clone(&io.entropy),
             )
         })
+    }
+
+    /// Inbound connections currently counted against
+    /// [`MAX_INBOUND_CONNECTIONS`].
+    ///
+    /// Test observability only: the number an operator sees is the cap being
+    /// hit in the log, and the number that matters is that this returns to zero
+    /// when connections close — a leaked slot would close the port for good.
+    #[cfg(test)]
+    fn live_inbound(&self) -> usize {
+        self.limits.live.load(Ordering::Relaxed)
     }
 
     /// How many peers currently have a writer task and queue.
@@ -612,12 +623,8 @@ async fn connection_reader(
             return;
         }
 
-        let mut frame = Vec::with_capacity(declared.saturating_add(LENGTH_PREFIX_BYTES));
-        frame.extend_from_slice(&prefix);
-        frame.extend_from_slice(&body);
-
         let handed_up = tokio::select! {
-            result = inbound.send((peer.clone(), frame)) => result,
+            result = inbound.send((peer.clone(), framed(prefix, &body))) => result,
             () = shutdown.cancelled() => return,
         };
         if handed_up.is_err() {
@@ -682,7 +689,7 @@ async fn peer_writer(
 
 #[cfg(test)]
 mod tcp_tests {
-    use super::{PeerTransport as _, TcpPeerTransport};
+    use super::{MAX_INBOUND_CONNECTIONS, PeerTransport as _, TcpPeerTransport};
     use crate::entropy::SeededEntropy;
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -693,6 +700,17 @@ mod tcp_tests {
     /// Short enough to keep the test quick, long enough that a local connect
     /// and write can never lose the race to it.
     const IDLE: Duration = Duration::from_millis(200);
+
+    /// Poll `condition` until it holds or a generous ceiling elapses, then
+    /// return either way — the assertion that follows produces the real
+    /// message. A ceiling, not a wait: the loop exits as soon as the
+    /// background accept/close work lands.
+    async fn poll_until(mut condition: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !condition() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 
     fn started(idle: Duration) -> (Arc<TcpPeerTransport>, CancellationToken) {
         let transport = Arc::new(
@@ -724,6 +742,43 @@ mod tcp_tests {
             matches!(closed, Ok(Ok(0))),
             "a connection that delivers no frame within its idle deadline must be \
              closed by the node, not parked forever; observed {closed:?}"
+        );
+        token.cancel();
+    }
+
+    /// The connection budget must be given back when a connection ends.
+    ///
+    /// A leaked slot is the failure mode that matters here: it would not look
+    /// like a bug at all until a long-lived node had accepted
+    /// [`MAX_INBOUND_CONNECTIONS`] connections over its lifetime and then
+    /// stopped accepting any, peer included.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inbound_connection_slots_are_released_when_connections_close() {
+        let (transport, token) = started(Duration::from_secs(30));
+
+        let mut clients = Vec::new();
+        for _ in 0_u8..4 {
+            clients.push(
+                tokio::net::TcpStream::connect(transport.local_addr())
+                    .await
+                    .expect("the cluster listener must accept a connection"),
+            );
+        }
+        poll_until(|| transport.live_inbound() == 4).await;
+        assert_eq!(
+            transport.live_inbound(),
+            4,
+            "every accepted connection must take one slot in the budget"
+        );
+
+        drop(clients);
+        poll_until(|| transport.live_inbound() == 0).await;
+        assert_eq!(
+            transport.live_inbound(),
+            0,
+            "a closed connection must give its slot back, or the node stops \
+             accepting anything once it has seen {MAX_INBOUND_CONNECTIONS} \
+             connections in its life"
         );
         token.cancel();
     }
@@ -781,7 +836,7 @@ mod tcp_tests {
         );
 
         // The membership view now knows only one of them.
-        let live: BTreeSet<String> = ["127.0.0.1:10".to_owned()].into_iter().collect();
+        let live: BTreeSet<String> = std::iter::once("127.0.0.1:10".to_owned()).collect();
         transport.retain_peers(&live);
 
         assert_eq!(
