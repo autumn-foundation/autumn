@@ -3884,14 +3884,22 @@ impl AppBuilder {
         // Embedded cluster control plane (issue #1762). Mirrors the
         // `crate::alerts::install_from_config` precedent — a no-op when
         // `[cluster]` is disabled — but installed here rather than next to
-        // alerts because it owns a listener and two loops, and therefore needs
-        // `server_shutdown` to exist so its departure notice rides the same
-        // graceful-drain token as everything else. A cluster that cannot bind
-        // or start is a hard boot failure: a node that silently never joins
-        // would serve its own private view of a counter it claims is
-        // cluster-wide.
+        // alerts because it owns a listener and two loops. A cluster that
+        // cannot bind or start is a hard boot failure: a node that silently
+        // never joins would serve its own private view of a counter it claims
+        // is cluster-wide.
+        //
+        // Its token is deliberately NOT a child of `server_shutdown`. That
+        // token fires at phase 5, when the listener stops accepting — while
+        // in-flight requests still drain for up to `shutdown_timeout_secs`. A
+        // request served during that drain can still increment a cluster
+        // counter, and with the push loop already departed the increment would
+        // land in a document nothing replicates and die with the process. The
+        // cluster is therefore cancelled *after* the drain completes (see the
+        // `cluster_shutdown.cancel()` below), inside the same budget.
+        let cluster_shutdown = tokio_util::sync::CancellationToken::new();
         if let Err(error) =
-            crate::cluster::install_from_config(&state, &config.cluster, &server_shutdown)
+            crate::cluster::install_from_config(&state, &config.cluster, &cluster_shutdown)
         {
             tracing::error!(error = %error, "cluster installation failed");
             #[cfg(feature = "managed-pg")]
@@ -4423,6 +4431,19 @@ impl AppBuilder {
             exit_stop_managed_pg();
             std::process::exit(1);
         });
+
+        // Phase 6b: the cluster departs only now, once no request can still be
+        // running — an increment accepted during the drain must have a push
+        // loop left to replicate it. The departure itself is bounded by
+        // `LEAVE_BUDGET` inside the node, and this waits exactly that long so
+        // the notice reaches the peer before the process tears down. Both fit
+        // inside the shutdown budget the hooks below share; a shutdown that
+        // overran its deadline never gets here, and the peer then converges on
+        // the suspicion timeout, which is the actual contract.
+        if config.cluster.enabled {
+            cluster_shutdown.cancel();
+            tokio::time::sleep(crate::cluster::LEAVE_BUDGET).await;
+        }
 
         // Phase 7: run on_shutdown hooks within the *remaining* portion of
         // shutdown_timeout_secs (drain + hooks share one budget, not two).
@@ -10921,6 +10942,52 @@ mod tests {
         assert!(
             source.contains(shard_gate),
             "shard commit-hook workers must be gated on role.runs_workers()"
+        );
+    }
+
+    /// The cluster must outlive the in-flight request drain.
+    ///
+    /// `server_shutdown` fires at phase 5, when the listener stops accepting —
+    /// requests keep draining after it for up to `shutdown_timeout_secs`, and a
+    /// request served in that window can still increment a cluster counter. If
+    /// the cluster's loops were children of that token they would already have
+    /// departed, so the increment would land in a document with nothing left to
+    /// replicate it and die with the process: a write accepted and silently
+    /// thrown away. Source-order test in the house style, because the ordering
+    /// is a property of this function and nothing smaller.
+    #[test]
+    fn cluster_departs_after_the_request_drain() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        // Bounded at the next path so the search cannot match this test's own
+        // source, which necessarily quotes the strings it is looking for.
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let server_source = &source[server_start..build_mode_start];
+
+        let install = server_source
+            .find("crate::cluster::install_from_config(&state, &config.cluster, &cluster_shutdown)")
+            .expect("the cluster must be installed on its own token, not on server_shutdown");
+        let drain = server_source
+            .find("let server_result = server_task.await")
+            .expect("the normal server path should await the drain");
+        let depart = server_source
+            .find("cluster_shutdown.cancel();")
+            .expect("the cluster token should be cancelled explicitly");
+
+        assert!(
+            install < drain && drain < depart,
+            "the cluster must be installed before the drain and cancelled only \
+             after it completes, so an increment accepted while requests drain \
+             still has a push loop to replicate it"
+        );
+        assert!(
+            !server_source.contains("&config.cluster, &server_shutdown"),
+            "the cluster must not ride server_shutdown: that token fires when \
+             the listener closes, with the request drain still ahead of it"
         );
     }
 

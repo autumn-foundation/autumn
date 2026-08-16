@@ -92,6 +92,15 @@ pub const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
 /// resource exhaustion (EMFILE) cannot spin the accept loop hot.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
+/// Cap on one dial attempt, aligned with [`RECONNECT_BACKOFF_MAX`] so a peer
+/// that cannot be reached is retried on the schedule the backoff describes
+/// rather than on the operating system's SYN timeout.
+const DIAL_TIMEOUT: Duration = RECONNECT_BACKOFF_MAX;
+
+/// Cap on writing one frame to a peer. A frame is worth exactly one push
+/// interval; anything slower than this is a stalled connection, not a slow one.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Cap on inbound connections held open at once.
 ///
 /// Anyone who can reach the port can open a socket; nobody can *say* anything
@@ -637,9 +646,13 @@ async fn connection_reader(
 /// Own one peer's outbound connection: dial on demand, write queued frames,
 /// re-dial with a capped, jittered backoff.
 ///
-/// The queue arm is `biased`, so a frame that is already queued always wins
-/// over cancellation. That is what flushes the departure `Leave` on shutdown:
-/// the task drains what it has and only then sees the cancelled token.
+/// Two things make the departure work, and both are load-bearing. `shutdown`
+/// here is the transport's **writer** token, retired one [`WRITER_DRAIN_GRACE`]
+/// after the app begins shutting down rather than with it — so this task is
+/// still alive when the node's cancellation arm queues its farewell. And the
+/// queue arm is `biased`, so a frame already queued always wins over
+/// cancellation: at the end of the grace the task drains what it holds and only
+/// then sees the token.
 async fn peer_writer(
     to: PeerAddr,
     mut queue: mpsc::Receiver<Vec<u8>>,
@@ -658,8 +671,17 @@ async fn peer_writer(
         let Some(frame) = queued else { return };
 
         if connection.is_none() {
+            // Bounded: a *refused* connection comes back at once, but a
+            // blackholed one — packets dropped, no RST, the ordinary shape of a
+            // firewall or a machine that vanished — pends for the OS SYN
+            // timeout, which is minutes. The backoff below cannot begin until
+            // this returns, so an unbounded dial makes the configured cap a
+            // fiction and stalls every frame behind it.
             let dialled = tokio::select! {
-                result = tokio::net::TcpStream::connect(&to) => result.ok(),
+                result = tokio::time::timeout(
+                    DIAL_TIMEOUT,
+                    tokio::net::TcpStream::connect(&to),
+                ) => result.ok().and_then(Result::ok),
                 () = shutdown.cancelled() => return,
             };
             if let Some(stream) = dialled {
@@ -677,12 +699,24 @@ async fn peer_writer(
             }
         }
 
-        if let Some(stream) = connection.as_mut()
-            && stream.write_all(&frame).await.is_err()
-        {
-            // Re-dial on the next frame rather than here: the peer may simply
-            // be gone, and there is nothing worth retrying this frame for.
-            connection = None;
+        if let Some(stream) = connection.as_mut() {
+            // Bounded and cancellable for the same reason the dial is: a peer
+            // that completed the handshake and then stopped reading fills the
+            // socket buffer, and an unbounded `write_all` would pend there
+            // until the OS TCP timeout — one stalled peer holding the only
+            // writer this node has for it, and holding shutdown too.
+            let written = tokio::select! {
+                result = tokio::time::timeout(WRITE_TIMEOUT, stream.write_all(&frame)) => result,
+                () = shutdown.cancelled() => return,
+            };
+            if !matches!(written, Ok(Ok(()))) {
+                // Dropped, not retried: a timed-out write may have left half a
+                // frame on the wire, so the stream's framing can no longer be
+                // trusted and the connection goes with it. Re-dialled on the
+                // next frame — the peer may simply be gone, and the next push
+                // carries the whole document again.
+                connection = None;
+            }
         }
     }
 }

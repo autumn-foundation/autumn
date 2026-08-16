@@ -528,6 +528,46 @@ async fn install_rejects_an_invalid_or_secretless_section() {
         app.state().extension::<ClusterHandle>().is_none(),
         "a refused install must leave no ClusterHandle behind"
     );
+
+    shutdown.cancel();
+}
+
+/// One node per app.
+///
+/// A second install on the same state binds a second listener and starts a
+/// second set of loops, while the health component and the metrics source keep
+/// the registrations of the first — so the actuator would describe node 1 while
+/// `state.extension::<ClusterHandle>()` handed application code node 2. Two
+/// nodes in one *process* stay legal (the tests above do exactly that); they
+/// have an `AppState` each.
+#[tokio::test]
+async fn install_refuses_a_second_node_on_one_state() {
+    let config = cluster_config(Vec::new());
+    let app = TestApp::new().config(app_config(config.clone())).build();
+    let shutdown = CancellationToken::new();
+
+    install_from_config(app.state(), &config, &shutdown).expect("the first install must succeed");
+    let first = app
+        .state()
+        .extension::<ClusterHandle>()
+        .expect("the first install must leave a handle")
+        .node_id()
+        .to_owned();
+
+    let second = install_from_config(app.state(), &config, &shutdown);
+    assert!(
+        second.is_err(),
+        "installing a second cluster node on one AppState must fail loudly; got {second:?}"
+    );
+    assert_eq!(
+        app.state()
+            .extension::<ClusterHandle>()
+            .map(|handle| handle.node_id().to_owned()),
+        Some(first),
+        "the refused install must not replace the running node's handle"
+    );
+
+    shutdown.cancel();
 }
 
 // ── Guard: off means off ─────────────────────────────────────────────────────

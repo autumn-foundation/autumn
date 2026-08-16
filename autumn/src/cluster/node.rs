@@ -16,9 +16,11 @@
 //!   overlay. Malformed input is dropped and counted; the loop never exits on a
 //!   bad frame.
 //! - **Departure.** Both loops select on the cancellation token. The cancel arm
-//!   sends a best-effort `Leave` over existing connections within a bounded
-//!   budget (≤ 250 ms, inside the app's drain budget) and then exits. `Leave` is
-//!   only the fast path — the suspicion timeout is the correctness path.
+//!   sends this node's final document (its own record marked `Left`, carrying
+//!   every counter cell written since the last push) followed by a `Leave`,
+//!   over existing connections and within a bounded budget (≤ 250 ms, inside
+//!   the app's drain budget), and then exits. That whole path is only the fast
+//!   one — the suspicion timeout is the correctness path.
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
@@ -483,26 +485,40 @@ fn send_signed(
     true
 }
 
-/// The cancellation arm: mark ourselves `Left`, tell the peers we already talk
-/// to, and give the transport a bounded window to flush.
+/// The cancellation arm: mark ourselves `Left`, push the final document to the
+/// peers we already talk to, say `leave`, and give the transport a bounded
+/// window to flush.
+///
+/// **The final document, not just the notice.** Increments that landed between
+/// the last push round and cancellation exist only here; a bare `leave` would
+/// tombstone this node at the survivor while those cells died with it, and a
+/// rolling restart would then re-learn a total that had gone backwards. The
+/// state push carries the same departure — our own record is `Left` in it, and
+/// `Left` beats `Alive` at equal incarnation — so the `leave` that follows is
+/// belt and braces for a peer that has never held a record for us at all.
 ///
 /// Best effort by design. If the process is killed, the network eats the frame,
 /// or the peer is mid-reconnect, the peer still converges at the suspicion
 /// timeout — which is the actual contract.
 async fn depart(inner: &Arc<ClusterInner>, mut seq: u64) {
     let incarnation = inner.incarnation.load(Ordering::Relaxed);
-    let targets = {
+    let (document, targets) = {
         let mut state = inner.lock_state();
         state.members.insert(
             inner.node_id.clone(),
             MemberRecord::left(inner.advertise_addr.clone(), incarnation),
         );
         let targets = push_targets(&state, inner);
+        let document = state.clone();
         drop(state);
-        targets
+        (document, targets)
     };
 
+    let farewell = ClusterMessage::StatePush { state: document };
     for target in &targets {
+        if send_signed(inner, target, incarnation, seq, &farewell) {
+            seq = seq.saturating_add(1);
+        }
         if send_signed(inner, target, incarnation, seq, &ClusterMessage::Leave) {
             seq = seq.saturating_add(1);
         }

@@ -68,9 +68,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   periodic signed state push doubles as the heartbeat: membership is itself a
   CRDT (`Alive`/`Left` records with SWIM-style incarnation refutation), while
   `Suspect`/`Down` live in a purely local liveness overlay — a clean shutdown
-  sends a bounded best-effort leave, and a kill converges by suspicion
-  timeout, after which the surviving node keeps serving the counter and
-  reports a one-member view that is `UP`, never `DOWN`. Frames are
+  sends a bounded best-effort departure (the node's final document, so an
+  increment accepted while requests were still draining is not lost, plus the
+  leave notice), and a kill converges by suspicion timeout, after which the
+  surviving node keeps serving the counter and reports a one-member view that
+  is `UP`, never `DOWN`. Frames are
   HMAC-SHA256-authenticated (cluster name, sender, incarnation, and sequence
   are MAC-covered; constant-time verify before any payload parse; per-sender
   replay watermarks) but not encrypted — deploy the cluster port on a trusted

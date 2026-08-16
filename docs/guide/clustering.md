@@ -118,10 +118,18 @@ differ whenever the bind is a wildcard or the node sits behind NAT:
 
 - Binding `0.0.0.0:7946` **requires** an explicit `advertise_addr` — `0.0.0.0`
   is not a dialable address, and a peer that learns it can never reach you.
-- Leaving `bind_addr` at the default ephemeral port is fine for the node that
-  dials out, but a node nobody can dial can still be reached over the
-  connection it opened. Give at least one node a fixed port so the other has
-  something to seed with.
+- **Both** nodes must be dialable at the address they advertise. Replies never
+  travel back over an accepted inbound socket: each node opens its own
+  connection to the address it learned from the pushed state, so a node its
+  peer cannot dial — behind NAT, or on a container network that only publishes
+  one port — is a node its peer can accept frames *from* and never send frames
+  *to*. That is a one-way cluster: the dialing node converges on a two-member
+  view while its peer never learns anything. `seed_peers` decides who makes
+  first contact, not who has to be reachable.
+- Leaving `bind_addr` at the default ephemeral port is therefore fine only when
+  the peer can reach the resolved port — same host, same pod network — because
+  that resolved port is what gets advertised. Give each node a fixed port and a
+  dialable `advertise_addr` on anything more complicated.
 - `seed_peers` is a dial list, not a membership list. It is used to make first
   contact; after that each node learns peers (and their advertised addresses)
   from the pushed state. Seeding one direction is enough — node B pointed at
@@ -469,9 +477,17 @@ here, and it is why the counter's correctness does not depend on the view.
 
 **Leaving** has a fast path and a correctness path, and only the second one is
 a contract. On shutdown a node marks its own record `Left` at its current
-incarnation and sends a `leave` over the connections it already has, bounded to
-**250 ms** so it always fits inside the shutdown drain budget. That is the fast
-path, and it is best-effort. If the process is killed, the network eats the
+incarnation and sends its **final document** — one last `state_push`, carrying
+both the departure and every counter cell written since the previous push —
+followed by the `leave`, together bounded to **250 ms** so they always fit
+inside the shutdown drain budget. The final push is what keeps an increment
+that arrived after the last push round from dying with the process; the `leave`
+that follows costs one frame and covers the peer that holds no record for this
+node at all. That is the fast path, and it is best-effort.
+
+The departure runs **after** in-flight HTTP requests have drained, not when the
+listener closes: a request served during shutdown can still increment a
+counter, and it must find a push loop still running. If the process is killed, the network eats the
 frame, or the peer is mid-reconnect, the peer still converges — by silence, at
 the suspicion timeout. Never build anything on a leave arriving.
 
@@ -569,10 +585,11 @@ peer — one peer needs one connection, and a peer silent past its suspicion
 timeout is already out of the view — and neither is a substitute for keeping
 the port off the public internet.
 
-**Leave is advisory, suspicion is the contract.** The 250 ms leave is a
-latency optimization for clean shutdowns. Correctness comes from the suspicion
-timeout, which handles the kill, the crash, the pulled cable, and the lost
-leave identically.
+**Leave is advisory, suspicion is the contract.** The 250 ms departure (final
+`state_push` plus `leave`) is a latency optimization for clean shutdowns.
+Correctness comes from the suspicion timeout, which handles the kill, the
+crash, the pulled cable, and the lost leave identically. A shutdown that
+overruns its drain budget is a kill as far as the peer is concerned.
 
 **Counter volatility.** Counters live in process memory for the lifetime of the
 process. There is no persistence. A restarted node starts a fresh cell (its

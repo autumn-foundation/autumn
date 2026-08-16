@@ -30,7 +30,7 @@
 //! a sound design at two nodes and an unproven one beyond. The public surface
 //! is exactly [`ClusterHandle`], [`ClusterMemberInfo`], [`ClusterMemberStatus`],
 //! [`ClusterCounter`], [`install_from_config`] and
-//! [`ClusterConfig`](crate::config::ClusterConfig); everything protocol-shaped
+//! [`ClusterConfig`]; everything protocol-shaped
 //! (the wire envelope, the member records, the transport) is crate-private, so
 //! the format stays free to change while the feature is unreleased.
 //!
@@ -89,6 +89,11 @@ use crate::time::ClockSource;
 use crate::{AutumnError, AutumnResult};
 
 pub use counter::ClusterCounter;
+/// The window a departing node gets to put its final document and its `leave`
+/// on the wire. Read by the app's shutdown sequence, which waits exactly this
+/// long after cancelling the cluster so the notice is not cut off by process
+/// exit.
+pub(crate) use node::LEAVE_BUDGET;
 
 /// Stable identity of one cluster member for the lifetime of a process.
 ///
@@ -558,6 +563,9 @@ impl crate::actuator::MetricsSource for ClusterMetricsSource {
 ///
 /// Returns an error when the section is enabled but
 ///
+/// - a [`ClusterHandle`] is already installed on `state`. One node per app: a
+///   second install would run a second set of loops behind an actuator that
+///   still reports the first;
 /// - the section violates any [`ClusterConfig::validate`] rule. The installer
 ///   runs that validation itself, before it binds anything: it is public and
 ///   reachable with a hand-built section that never went through the config
@@ -574,6 +582,20 @@ pub fn install_from_config(
 ) -> AutumnResult<()> {
     if !config.enabled {
         return Ok(());
+    }
+
+    // One node per app. A second install would bind a second listener, start a
+    // second set of loops, and replace the extension — leaving the actuator
+    // reporting the first node (its health component and metrics source are
+    // registered under a name that is now taken, and those registrations fail)
+    // while application code reads the second. Two nodes in one *process* are
+    // fine and the tests do exactly that; they have one `AppState` each.
+    if state.extension::<ClusterHandle>().is_some() {
+        return Err(AutumnError::internal_server_error_msg(
+            "cluster: a ClusterHandle is already installed on this AppState — \
+             install_from_config must be called once per app, and a second node \
+             needs its own AppState",
+        ));
     }
 
     // The whole `[cluster]` rule set, re-checked here and before anything is

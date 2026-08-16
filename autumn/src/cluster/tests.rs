@@ -372,6 +372,49 @@ async fn loopback_kill_without_leave_converges_after_suspicion_timeout() {
     a.token.cancel();
 }
 
+/// A departure must carry the departing node's FINAL document, not just the
+/// notice that it left.
+///
+/// An increment that lands between the last push round and cancellation exists
+/// only on the departing node. If the leave carries no state, that increment
+/// dies with the process while the survivor keeps a total that has silently
+/// gone backwards — and a rolling restart re-learns the smaller number.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn loopback_departure_carries_the_final_document() {
+    let router = LoopbackRouter::new();
+    let clock = test_clock();
+
+    let a = start_node(&router, &clock, SECRET, "node-a", 1, Vec::new());
+    let b = start_node(&router, &clock, SECRET, "node-b", 2, vec![a.addr.clone()]);
+    settle(&clock, 6).await;
+
+    // Written on B and cancelled in the same breath: no push round in between,
+    // so the only vehicle left for these cells is the departure itself.
+    b.handle.counter(COUNTER).increment_by(7);
+    b.token.cancel();
+
+    advance_time(&clock, Duration::from_millis(250)).await;
+    settle(&clock, 1).await;
+
+    assert_eq!(
+        a.handle.counter(COUNTER).get(),
+        7,
+        "the survivor must end up with the increments the departing node held \
+         at cancellation — a counter that reads 0 here is a write accepted and \
+         then thrown away; {} | {}",
+        view_of(&a),
+        view_of(&b)
+    );
+    assert_eq!(
+        member_ids(&a.handle),
+        vec!["node-a".to_owned()],
+        "…and the departure must still converge the view to one member; {}",
+        view_of(&a)
+    );
+
+    a.token.cancel();
+}
+
 /// A write storm must not turn the push loop into request-rate gossip.
 ///
 /// Every increment leaves a notify permit behind, so an unthrottled loop
