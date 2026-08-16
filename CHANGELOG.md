@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **duplicate Markdown heading anchors:** `markdown::render` now hands out
+  document-unique heading `id`s. A page that repeated a heading — and real docs
+  repeat "Example", "Usage", and "Notes" constantly — emitted the same `id`
+  twice, which is invalid HTML and made every table-of-contents entry for the
+  repeated heading jump to the first occurrence. Every heading still keeps the
+  slug its own text produces, so anchors already published in URLs keep
+  resolving; only *repeats* of an already-claimed slug get a `-1`, `-2`, …
+  suffix, the convention GitHub, mdBook, and Hugo share. Because the renderer
+  reserves every heading's natural slug before handing out any suffix, a repeat
+  can never steal a slug another heading owns by name regardless of the order
+  the two appear in: `## Example` / `## Example` / `## Example 1` renders
+  `example`, `example-2`, `example-1`, leaving `#example-1` pointing at
+  "Example 1". Headings with no alphanumeric characters still emit no `id` at
+  all and stay out of the anchor namespace.
+
+### Added
+
+- **`MarkdownRegistry::static_params_for(param)`:** derive SSG params for a
+  `#[static_get]` route whose path parameter is not named `slug` — e.g.
+  `#[static_get("/docs/{page}", params = …)]` needs
+  `static_params_for("page")`, because a `StaticParams` entry keyed `"slug"`
+  leaves `{page}` unsubstituted. `static_params()` is unchanged and now
+  delegates to it with `"slug"`.
+
 ### Performance
 
 - **config reads on the request path:** generated auth handlers, the admin
