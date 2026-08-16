@@ -246,6 +246,9 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
         scope.note(note);
         scope.mark_truncated();
     }
+    // The scheme the URI already carries, captured before the request record
+    // is built: a resolved scheme equal to it did not come from a header.
+    let uri_scheme = raw.uri.scheme_str().map(ToOwned::to_owned);
     let (mut request, redacted, body_notes) =
         crate::capsule::redact::redact_request(raw, &raw_body, scope.filter());
     request.peer_addr = scope.peer_addr();
@@ -261,19 +264,35 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
         // depends on the trust configuration and the request, and recording
         // the value only when it happened to come from an unfiltered header
         // would leak on exactly the requests where the filtered one won.
+        //
+        // The lists are exactly what `ProxyResolver` reads — `x-forwarded-*`,
+        // `x-real-ip`, `Host` — and nothing else. `Forwarded` is *not* among
+        // them, and naming it here suppressed all three fields, and refused
+        // the capsule, over a header the resolver never looks at.
+        //
+        // A value that did not come from a header at all is exempt, and not as
+        // a courtesy: the address then came from the peer socket and the
+        // scheme from the request URI, both of which this capsule records
+        // unfiltered a few lines either side. Suppressing a copy of a value
+        // that is already written down in the clear protects nothing and
+        // costs a refusal.
         let filter = scope.filter();
         let mut suppressed = false;
-        if identity_source_is_filtered(filter, &["x-forwarded-for", "x-real-ip", "forwarded"]) {
+        let addr_from_peer =
+            identity.addr.is_some() && identity.addr == scope.peer_addr().map(|peer| peer.ip());
+        if !addr_from_peer && identity_source_is_filtered(filter, &["x-forwarded-for", "x-real-ip"])
+        {
             suppressed |= identity.addr.is_some();
         } else {
             request.client_addr = identity.addr;
         }
-        if identity_source_is_filtered(filter, &["x-forwarded-host", "forwarded", "host"]) {
+        if identity_source_is_filtered(filter, &["x-forwarded-host", "host"]) {
             suppressed |= identity.host.is_some();
         } else {
             request.client_host.clone_from(&identity.host);
         }
-        if identity_source_is_filtered(filter, &["x-forwarded-proto", "forwarded"]) {
+        let scheme_from_uri = identity.scheme.is_some() && identity.scheme == uri_scheme;
+        if !scheme_from_uri && identity_source_is_filtered(filter, &["x-forwarded-proto"]) {
             suppressed |= identity.scheme.is_some();
         } else {
             request.client_scheme.clone_from(&identity.scheme);
@@ -758,11 +777,22 @@ mod tests {
             "nor the scheme, which `x-forwarded-host` cannot resolve"
         );
 
-        // `Forwarded` carries all three, so filtering it suppresses all three.
+        // `Forwarded` is not a source: `ProxyResolver` never reads it, so
+        // filtering it must suppress nothing and refuse nothing.
         let forwarded = build(&["forwarded".to_owned()]);
-        assert_eq!(forwarded.request.client_host, None);
-        assert_eq!(forwarded.request.client_addr, None);
-        assert_eq!(forwarded.request.client_scheme, None);
+        assert_eq!(
+            forwarded.request.client_host.as_deref(),
+            Some("private-tenant.example")
+        );
+        assert_eq!(
+            forwarded.request.client_addr,
+            Some("203.0.113.7".parse().expect("addr parses"))
+        );
+        assert_eq!(forwarded.request.client_scheme.as_deref(), Some("https"));
+        assert!(
+            !forwarded.truncated,
+            "a header the resolver never reads must not refuse the capsule"
+        );
 
         // `X-Real-IP` is a fallback source for the address, so filtering it
         // suppresses the address too.
