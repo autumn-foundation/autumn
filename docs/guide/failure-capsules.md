@@ -40,8 +40,10 @@ error page use. It cannot mask what has no name attached.
 | Query-string parameters matching the filter | `?password=…` → `[FILTERED]` |
 | Form and JSON body fields matching the filter | recursively, including `user[password]` bracket keys |
 | Encrypted-column names | every column registered by `#[encrypted]` is added to the filter |
+| The resolved client identity | `client_addr`, `client_host` and `client_scheme` are *derived from* `Forwarded` / `X-Forwarded-*` / `X-Real-IP` / `Host`, so filtering any header a field could come from drops that field too — otherwise a masked `X-Forwarded-Host` would reappear verbatim one key away. When a filtered source actually supplied a value, the capsule is also **refused by replay**: it cannot reproduce the identity the handler saw, and a handler that branches on `ClientHost` would answer differently |
 | SQL bind parameters echoing a masked value | byte-equal binds become `"masked"`, and are excluded from replay's bind comparison |
-| The outcome message, panic payload and backtrace | any masked value quoted back inside them is substring-replaced |
+| The outcome message, panic payload and backtrace | any masked value quoted back inside them is substring-replaced. Values shorter than four characters (a CVV, a PIN) are masked only where they stand as a whole token, so a short secret is removed without shredding timestamps and identifiers |
+| Credentials *inside* a masked header | the token after an auth scheme (`Bearer …`), what a `Basic` credential decodes to (the `user:password` pair and the password alone), each value of an auth-param list (`Signature=…`), and each cookie value join the echo set on their own, because that is the form a handler extracts and may echo. Auth-param values are masked only where they stand as whole tokens, since the list mixes secrets with metadata (`qop=auth`) that would otherwise shred prose. Usernames and cookie *names* are not recorded at all — they are ordinary words |
 | Bodies that declare structure but do not parse as it | dropped entirely (`skipped`, with a note) — with no keys, there is nothing to match on. Their raw text and string-literal values still seed the echo set, so an outcome quoting the malformed body is scrubbed |
 
 | **Not** masked | Why |
@@ -158,9 +160,10 @@ max_capsules = 50                 # default: 50
 - **`max_body_bytes`** caps how much request body is copied. A body that
   *declares* more than this is never copied at all (the handler still receives
   it in full); one that grows past it mid-stream has its partial copy dropped.
-  A capsule whose body went uncopied is **refused** by replay rather than
-  replayed with an empty one: the handler would be judged on input the failing
-  request never had, and the resulting `mismatch` reads as "the bug is gone".
+  A capsule whose body went uncopied — or which the handler stopped reading
+  partway through — is **refused** by replay rather than replayed with a
+  shorter one: the handler would be judged on input the failing request never
+  had, and the resulting `mismatch` reads as "the bug is gone".
 - **`max_capsule_bytes`** caps recorded database traffic. Blowing it marks the
   capsule `truncated`, and a truncated capsule is **refused** by replay rather
   than replayed misleadingly.
@@ -189,7 +192,7 @@ has one, which is how a capsule on disk is tied back to a log line.
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "id": "01JB2K7Q8N4W",
   "captured_at": "2026-08-12T10:14:13.882104Z",
   "autumn_version": "0.6.0",
@@ -350,7 +353,7 @@ A verdict is machine-readable JSON on **stdout** and a human summary on
 | `reproduced` | Same outcome — status code, message and Problem Details type — and the database traffic matched the tape. The bug is still there. | `0` |
 | `mismatch` | The tape lined up but the outcome differs, in the code, the message or the problem type. Usually what you want after a fix. | `1` |
 | `diverged` | The code asked the database something the recording never asked, so the run was not a fair comparison. A divergence outranks a matching status. | `1` |
-| `refused` | Nothing was replayed — a truncated capsule, a capsule whose request body was never recorded (over `max_body_bytes`, or an unparseable structured body), an unknown `format_version`, an unreadable file, or a `PostgreSQL` tape handed to a `sqlite` build. | `2` |
+| `refused` | Nothing was replayed — a truncated capsule, a capsule whose request body was never recorded or only partly read (over `max_body_bytes`, an unparseable structured body, or a handler that abandoned the read), an unknown `format_version`, an unreadable file, or a `PostgreSQL` tape handed to a `sqlite` build. | `2` |
 
 A `diverged` verdict is not a failure of the tool. It is the tool telling you
 that a status matching by luck, while the queries differ, is not a

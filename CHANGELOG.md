@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **failure capsules:** the resolved client identity now obeys
+  `[log] filter_parameters`. `client_addr`/`client_host`/`client_scheme` are
+  derived from `Forwarded`, `X-Forwarded-*` and `Host`, and were copied into
+  the capsule *after* header redaction ran — so an operator who filtered
+  `x-forwarded-host` saw it masked under `headers` and sitting in cleartext one
+  key away under `client_host`. Each field is now dropped when any header it
+  could have been resolved from is filtered — including `X-Real-IP`, a
+  fallback source for the address. Where a filtered source actually supplied a
+  value the capsule is additionally **refused** by replay: replay pre-inserts
+  the recorded identity whole whenever any field survives, so a suppressed
+  host would reach the handler as `None` rather than not at all, and a handler
+  that branches on it would report a `mismatch` the guide tells operators to
+  read as "the bug is gone".
+- **failure capsules:** the capsule format version is now `2`. The new
+  `db_roles` field changes what a capsule *means* — a reader that skips it
+  rebuilds no database topology and replays a shape the recording never had —
+  and `serde` would otherwise let an older reader ignore it silently, which is
+  exactly what the version gate exists to prevent. Version 1 never appeared in
+  a release, so no capsule anyone holds is affected; a capsule written by an
+  unreleased build off `trunk-dev` is refused with the usual
+  re-record-the-capsule message.
+- **failure capsules:** six fidelity and redaction gaps found in review of
+  #1598 (#2202). A capsule whose request body the handler read only *partly* —
+  or never got to at all — is now marked incomplete and **refused** by replay
+  rather than replayed with a shorter body: the handler would otherwise be
+  judged on input the failing request never carried, and the resulting
+  `mismatch` is exactly what the guide tells operators means "the bug is gone".
+  The client identity is recorded again for capsules written by the real
+  server: `App::run` wraps the finished router in an *outer*
+  `TrustedProxiesLayer` that resolves before the capture scope exists, so the
+  inner instance found the extension already present and skipped recording,
+  leaving `client_addr`/`client_host`/`client_scheme` empty on every
+  production capsule while the test harness (which has no outer layer) recorded
+  them. A second cause sat behind the first: the capture layer passed
+  `inner.call(req)` to `CAPSULE_SCOPE.scope` as an *argument*, which Rust
+  evaluates before the call, so every inner layer's synchronous `call` — where
+  a hand-written Tower middleware does its work — ran before the task-local
+  existed and saw no scope. The inner call is now made from inside the scoped
+  future, which fixes the class rather than the one layer.
+  Replay now rebuilds the database *shape* the recording had even when
+  the request issued no wire traffic at all — "this request ran no queries" and
+  "this application has no database" were the same `None`, so a handler or
+  state initializer that checks `state.pool()` or replica availability before
+  querying took a branch production never took. Redaction reaches two things it
+  used to miss: the credential *inside* a masked header (the token after
+  `Bearer`, what a `Basic` credential decodes to, each value of an auth-param
+  list such as SigV4's `Signature=`, each cookie value — the form
+  a handler actually extracts and may echo into an error message or a SQL bind,
+  where the whole header value never
+  matched), and values shorter than four characters, which are now masked where
+  they stand as a whole token, so a three-digit CVV quoted back by a failure no
+  longer reaches disk while timestamps and identifiers stay readable. Finally,
+  `SET LOCAL ...` is no longer treated as framework housekeeping: `Db::checkout`
+  issues a plain session-level `SET statement_timeout`, so a transaction-scoped
+  setting is application code and belongs on the ordered tape, where changing or
+  removing it shows up as a divergence instead of being synthesized away.
 - **duplicate Markdown heading anchors:** `markdown::render` now hands out
   document-unique heading `id`s. A page that repeated a heading — and real docs
   repeat "Example", "Usage", and "Notes" constantly — emitted the same `id`

@@ -636,6 +636,22 @@ fn is_housekeeping_statement(statement: &str) -> bool {
         return false;
     };
     let setting = setting.trim_start();
+    // `SET LOCAL ...` is never the framework's: `Db::checkout` issues a plain
+    // session-level `SET statement_timeout`. A transaction-scoped setting is
+    // application code, and an application's settings belong on the ordered
+    // tape so that changing or removing one shows up as a divergence rather
+    // than being synthesized away.
+    if strip_keyword(setting, "LOCAL").is_some() {
+        return false;
+    }
+    // `TIME ZONE` and `CLIENT_ENCODING` stay here even though an application
+    // can issue them too: the pool sets them when a connection is established,
+    // and the replay stub answers a *replayed* connection's setup through this
+    // same classifier. Dropping them makes checkout itself look for a tape
+    // entry the recorder never wrote, and no replay connection opens at all
+    // (`a_replay_pool_never_blocks_on_itself` catches exactly that). Telling
+    // those two apart from an application's own `SET TIME ZONE` needs origin
+    // attribution on the wire rather than a better pattern — see #2202.
     [
         "TIME ZONE",
         "CLIENT_ENCODING",

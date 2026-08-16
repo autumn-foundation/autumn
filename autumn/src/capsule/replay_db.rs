@@ -761,7 +761,16 @@ pub fn replica_pool_from_capsule(
                 .collect()
         })
         .unwrap_or_default();
-    if tapes.is_empty() {
+    // A configured replica that this request never read from still has to
+    // *exist* during replay: code that checks replica availability before
+    // querying must see the shape production had. An empty stub answers no
+    // query — which is right, because the recording issued none, so any query
+    // the replay sends is a divergence rather than a silent success.
+    let replica_configured = capsule
+        .db_roles
+        .iter()
+        .any(|role| role == crate::capsule::schema::TAPE_ROLE_REPLICA);
+    if tapes.is_empty() && !replica_configured {
         return Ok(None);
     }
     pool_from_tapes(tapes, divergences).map(Some)
@@ -1112,6 +1121,41 @@ mod tests {
     /// holds two at once: the pool is sized one above the recording and waits
     /// with a timeout, so oversubscription is reported rather than deadlocked.
     /// Sized to the recording exactly, this test never returned.
+    /// "This request issued no queries" is not "this application has no
+    /// database". A configured replica the request never read from must still
+    /// exist during replay, or code that checks replica availability before
+    /// querying takes a branch production never took.
+    #[tokio::test]
+    async fn configured_roles_survive_a_capsule_with_no_tape() {
+        let mut capsule = crate::capsule::schema::test_support::capsule(
+            crate::capsule::schema::test_support::request("GET", "/boom"),
+            crate::capsule::schema::CapsuleOutcome::Status {
+                code: 500,
+                message: "boom".to_owned(),
+                problem_type: None,
+            },
+        );
+        assert!(capsule.db.is_none(), "the request issued no wire traffic");
+        capsule.db_roles = vec![
+            crate::capsule::schema::TAPE_ROLE_PRIMARY.to_owned(),
+            crate::capsule::schema::TAPE_ROLE_REPLICA.to_owned(),
+        ];
+
+        let replica =
+            replica_pool_from_capsule(&capsule, Arc::new(DivergenceLog::new())).expect("builds");
+        assert!(
+            replica.is_some(),
+            "a configured replica must exist during replay even with nothing recorded on it"
+        );
+
+        // A capsule that recorded no roles at all (written before the field
+        // existed, or an app with no database) keeps the old behaviour.
+        capsule.db_roles.clear();
+        let none =
+            replica_pool_from_capsule(&capsule, Arc::new(DivergenceLog::new())).expect("builds");
+        assert!(none.is_none());
+    }
+
     #[tokio::test]
     async fn a_replay_pool_never_blocks_on_itself() {
         let mut capsule = crate::capsule::schema::test_support::capsule(

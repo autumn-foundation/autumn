@@ -6094,7 +6094,17 @@ fn replay_database_topology(
     divergences: &std::sync::Arc<crate::capsule::DivergenceLog>,
     capsule_path: &std::path::Path,
 ) -> Option<crate::db::DatabaseTopology> {
-    capsule.db.as_ref()?;
+    // "This request issued no queries" and "this application has no database"
+    // are different facts, and only the capsule can tell them apart: a handler
+    // or state initializer that checks `state.pool()` — or replica
+    // availability — *before* querying would otherwise meet `None` during a
+    // replay of an application that had a pool in production, take a branch it
+    // never took, and report a mismatch nothing in the code caused. A capsule
+    // recorded before `db_roles` existed carries none, and falls back to the
+    // old tape-only behaviour.
+    if capsule.db.is_none() && capsule.db_roles.is_empty() {
+        return None;
+    }
     let pool = crate::capsule::pool_from_capsule(capsule, std::sync::Arc::clone(divergences))
         .unwrap_or_else(|error| {
             std::process::exit(crate::capsule::print_refusal(
