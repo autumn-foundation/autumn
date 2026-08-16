@@ -2078,19 +2078,25 @@ fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
             // top-level string like `"hello"` must render WITH its quotes, or a
             // pure no-op resave either fails to parse (`hello` isn't valid JSON)
             // or silently changes type (a stored string `"true"`/`"42"` reparses
-            // as a bool/number). `Value::Null` renders blank ONLY for an
-            // optional field, matching the "blank means no value" convention —
-            // but a REQUIRED json column can never be SQL NULL, so a stored
-            // `Value::Null` there is the legitimate JSON scalar `null`, not an
-            // absence, and must render as the literal `null` text: otherwise the
-            // browser's `required` attribute blocks saving any OTHER field on
-            // the record without the admin re-typing `null` by hand, and a
-            // programmatic blank submission would coerce into the string `""`
-            // instead of round-tripping back to `Value::Null` (Codex review
-            // finding on #1341).
-            let json_val = match &current_value {
-                Value::Null if !field.required => String::new(),
-                v => v.to_string(),
+            // as a bool/number).
+            //
+            // `current_value` collapses two different situations into the same
+            // `Value::Null` — no `record` at all (CREATE: nothing to prefill,
+            // must always render blank regardless of required-ness) and a
+            // REQUIRED column's genuinely-stored JSON scalar `null` (EDIT: a
+            // NOT NULL JSONB column can still hold `null` — it just can't be
+            // SQL NULL — so blank would be wrong: it'd let the browser's
+            // `required` attribute block saving any OTHER field without the
+            // admin re-typing `null` by hand, and a programmatic blank
+            // submission would coerce into the string `""` instead of
+            // round-tripping back to `Value::Null`). So this reads `record`
+            // directly instead of reusing `current_value`, matching only a
+            // genuinely nullable-and-null EDIT to blank (Codex review finding
+            // on #1341).
+            let json_val = match record.and_then(|r| r.get(field.name)) {
+                None => String::new(),
+                Some(Value::Null) if !field.required => String::new(),
+                Some(v) => v.to_string(),
             };
             html! {
                 textarea class="form-input" name=(field.name) id=(field.name)
@@ -2476,6 +2482,23 @@ mod tests {
         assert!(
             form.contains(">null<") || form.contains("null"),
             "a required NULL json value must render the literal `null`, not blank: {form}"
+        );
+    }
+
+    #[test]
+    fn json_create_form_starts_blank_even_when_required() {
+        // Issue #1341 review follow-up: `record: None` means CREATE — there is
+        // no stored value to prefill at all, which must NOT be conflated with
+        // a required field's genuinely-stored `Value::Null` (tested above).
+        // Both collapse to the same `current_value` if read through the
+        // shared default, so the widget must distinguish "no record" from "a
+        // null value in the record" directly.
+        let field = AdminField::new("config", AdminFieldKind::Json);
+        let form = render_form_widget(&field, None).into_string();
+        assert!(
+            !form.contains("null"),
+            "a brand-new required json field on the CREATE form must start blank, \
+             not prefilled with the literal word null: {form}"
         );
     }
 
