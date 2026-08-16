@@ -1,7 +1,7 @@
 use diesel::prelude::{Insertable, Queryable, Selectable};
 use serde::Deserialize;
 
-use crate::schema::{projects, users};
+use crate::schema::{password_reset_tokens, projects, users};
 
 // ── User ────────────────────────────────────────────────────────────────────
 //
