@@ -1285,32 +1285,39 @@ mod tcp_tests {
     /// was still inside a two-second dial or write.
     #[tokio::test(flavor = "multi_thread")]
     async fn pending_frames_counts_the_frame_a_writer_still_holds() {
-        /// Far larger than any plausible socket send+receive buffer, so
-        /// `write_all` cannot complete against a peer that never reads.
-        const UNWRITABLE_BYTES: usize = 16 * 1024 * 1024;
+        // A blocked *write* cannot be arranged portably — Windows loopback
+        // auto-grows its kernel buffers far enough to swallow tens of
+        // megabytes, completing `write_all` against a peer that never reads —
+        // so this parks the writer in its own bounded *dial* instead:
+        // 192.0.2.1 (RFC 5737 TEST-NET-1) is reserved and unrouted, so the
+        // SYN goes to the void and the dial holds for the full DIAL_TIMEOUT.
+        // The frame leaves the queue microseconds after `send`, which means
+        // the only thing keeping it visible below is the writer's in-flight
+        // claim — exactly the seam the departure flush depends on.
+        const BLACKHOLE: &str = "192.0.2.1:9";
 
         let (transport, token) = started(Duration::from_secs(30));
+        assert!(
+            DIAL_TIMEOUT >= Duration::from_secs(1),
+            "the settle window below assumes a dial parks for at least 1s"
+        );
 
-        // A peer that accepts the connection and then never reads a byte: the
-        // dial succeeds, so the frame leaves the queue, and the write then
-        // parks with the frame in the writer's hand.
-        let sink = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("binding a sink listener must succeed");
-        let sink_addr = sink.local_addr().expect("the sink must report its address");
-        let holder = tokio::spawn(async move {
-            let accepted = sink.accept().await;
-            // Never read; just keep the connection open past the assertions.
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            drop(accepted);
-        });
+        transport.send(BLACKHOLE, vec![0_u8; 32]);
 
-        transport.send(&sink_addr.to_string(), vec![0_u8; UNWRITABLE_BYTES]);
+        // Generous for the process-local queue pickup (microseconds), and
+        // well inside DIAL_TIMEOUT, so the writer is provably mid-dial with
+        // the frame in hand — not still queued, not yet dropped.
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Well past the queue pickup and the loopback dial, and well inside
-        // WRITE_TIMEOUT: by now the queue is provably empty and the writer is
-        // parked in `write_all`.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        if transport.dropped_frames() > 0 {
+            // An environment that answers TEST-NET with a fast unreachable
+            // error dropped the frame before the assertion window; the
+            // accounting under test never got its dial to park in. Skip
+            // rather than assert on environment behavior.
+            eprintln!("skipping: this network fails TEST-NET dials fast");
+            token.cancel();
+            return;
+        }
         assert_eq!(
             transport.pending_frames(),
             1,
@@ -1320,7 +1327,6 @@ mod tcp_tests {
         );
 
         token.cancel();
-        holder.abort();
     }
 
     /// A node id that comes back at a new address must not leave the old
