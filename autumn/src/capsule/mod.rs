@@ -108,5 +108,32 @@ pub fn settings_from_config(config: &crate::config::AutumnConfig) -> CaptureSett
         max_capsules: config.failure_capture.max_capsules,
         app_name: Some(config.telemetry.service_name.clone()),
         profile: config.profile.clone(),
+        db_roles: Vec::new(),
     }
+}
+
+/// The database roles the application actually built, for
+/// [`Capsule::db_roles`](crate::capsule::Capsule).
+///
+/// Taken from the pools on the live state rather than inferred from the
+/// configured URLs, because the two can disagree: a custom
+/// `DatabasePoolProvider` may return no pool despite a `primary_url`, build one
+/// without any URL, or — as the managed-Postgres provider does — ignore a
+/// configured replica entirely. Recording a role the application does not have
+/// would make replay rebuild a shape production never ran, which is the same
+/// false mismatch this field exists to prevent, only pointed the other way.
+///
+/// No roles are recorded where replay could not rebuild them: wire capture and
+/// wire replay are both PostgreSQL-only, so a `sqlite` build (and a build
+/// without `db` at all) records none — the caller decides by not calling this.
+#[must_use]
+pub fn observed_db_roles(has_primary: bool, has_replica: bool) -> Vec<String> {
+    let mut roles = Vec::new();
+    if has_primary {
+        roles.push(crate::capsule::schema::TAPE_ROLE_PRIMARY.to_owned());
+    }
+    if has_replica {
+        roles.push(crate::capsule::schema::TAPE_ROLE_REPLICA.to_owned());
+    }
+    roles
 }

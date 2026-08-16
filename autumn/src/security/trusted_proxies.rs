@@ -574,19 +574,32 @@ where
                 host: self.resolver.resolve_client_host(&req),
                 scheme: self.resolver.resolve_client_scheme(&req),
             };
-            // A failure capsule records the *resolved* client identity, so
-            // replay can restore `ClientAddr`/`ClientHost`/`ClientScheme`
-            // without re-running trust evaluation against a peer socket it
-            // does not have (issue #1598).
-            #[cfg(feature = "reporting")]
-            if let Some(scope) = crate::capsule::current_scope() {
-                scope.set_client_identity(crate::capsule::CapturedClientIdentity {
-                    addr: identity.addr,
-                    host: identity.host.clone(),
-                    scheme: identity.scheme.clone(),
-                });
-            }
             req.extensions_mut().insert(identity);
+        }
+
+        // A failure capsule records the *resolved* client identity, so replay
+        // can restore `ClientAddr`/`ClientHost`/`ClientScheme` without
+        // re-running trust evaluation against a peer socket it does not have
+        // (issue #1598).
+        //
+        // Recorded from the request's extensions rather than from the branch
+        // above, because the two are not the same instance. `App::run` wraps
+        // the finished router in an *outer* `TrustedProxiesLayer`, which
+        // resolves before the capture scope exists — so by the time this inner
+        // instance runs inside the scope, the identity is already present and
+        // the branch above is skipped. Recording only what this instance
+        // resolved would therefore leave every capsule written by the real
+        // server without a client identity, while the test harness (which has
+        // no outer layer) recorded one.
+        #[cfg(feature = "reporting")]
+        if let Some(scope) = crate::capsule::current_scope()
+            && let Some(identity) = req.extensions().get::<ResolvedClientIdentity>()
+        {
+            scope.set_client_identity(crate::capsule::CapturedClientIdentity {
+                addr: identity.addr,
+                host: identity.host.clone(),
+                scheme: identity.scheme.clone(),
+            });
         }
 
         let mut inner = self.inner.clone();

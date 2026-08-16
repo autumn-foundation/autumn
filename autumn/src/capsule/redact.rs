@@ -89,7 +89,16 @@ pub enum CapturedBody {
 /// anything else (a hash, a truncation, a re-encoding) is not. This is a
 /// best-effort echo check, not a general secret scanner.
 #[derive(Debug, Clone, Default)]
-pub struct RedactedValues(BTreeSet<Vec<u8>>);
+pub struct RedactedValues {
+    values: BTreeSet<Vec<u8>>,
+    /// Values that must only ever be masked where they stand as a whole
+    /// token, however long they are — see [`Self::insert_whole_token_only`].
+    whole_token_only: BTreeSet<Vec<u8>>,
+    /// Values the request carried in their own right, which always get full
+    /// substring masking. Tracked separately so the two classifications can
+    /// meet on the same bytes in either order and the stronger one still wins.
+    direct: BTreeSet<Vec<u8>>,
+}
 
 impl RedactedValues {
     /// Record a value that was masked out of the request.
@@ -104,19 +113,51 @@ impl RedactedValues {
         if value.is_empty() {
             return;
         }
-        self.0.insert(value.to_vec());
+        self.values.insert(value.to_vec());
+        self.direct.insert(value.to_vec());
+    }
+
+    /// Record a value that is a *field* of something structured, rather than a
+    /// value the request carried in its own right.
+    ///
+    /// Masked identically for binds — a bind carrying these bytes is still the
+    /// secret echoing back — but in free-form text only where it stands as a
+    /// whole token, regardless of length. An auth-param list mixes secrets
+    /// with metadata under names this code cannot rank (`Signature=…` next to
+    /// `qop=auth`), and a four-character metadata value substring-masked
+    /// everywhere would turn every later mention of *authentication* into a
+    /// placeholder. A field that echoes into prose or a bind arrives delimited
+    /// anyway, which is exactly what whole-token masking catches.
+    pub fn insert_whole_token_only(&mut self, value: &[u8]) {
+        if value.is_empty() {
+            return;
+        }
+        self.values.insert(value.to_vec());
+        self.whole_token_only.insert(value.to_vec());
     }
 
     /// Whether these bytes were masked out of the request.
     #[must_use]
     pub fn contains(&self, value: &[u8]) -> bool {
-        self.0.contains(value)
+        self.values.contains(value)
     }
 
     /// Whether anything was masked.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.values.is_empty()
+    }
+
+    /// Whether this value may only be masked as a whole token.
+    ///
+    /// A direct [`insert`](Self::insert) always wins: the same bytes can reach
+    /// the set both ways — a filtered body password that the client also sent
+    /// as a `Digest` parameter — and the request carried that value in its own
+    /// right, so it needs full substring masking wherever it surfaces. Asking
+    /// both sets rather than mutating either on insert makes that independent
+    /// of which arrived first.
+    fn is_whole_token_only(&self, value: &[u8]) -> bool {
+        self.whole_token_only.contains(value) && !self.direct.contains(value)
     }
 
     /// The recorded values, longest first.
@@ -124,14 +165,16 @@ impl RedactedValues {
     /// Longest-first matters for substring masking: masking `"hunter2"` before
     /// `"hunter2secret"` would leave the tail of the longer secret behind.
     fn longest_first(&self) -> Vec<&[u8]> {
-        let mut values: Vec<&[u8]> = self.0.iter().map(Vec::as_slice).collect();
+        let mut values: Vec<&[u8]> = self.values.iter().map(Vec::as_slice).collect();
         values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         values
     }
 }
 
-/// Shortest value worth looking for *inside* free-form text (see
-/// [`mask_echoes`]); whole-value bind masking has no such floor.
+/// Shortest value [`mask_echoes`] will replace *anywhere* inside free-form
+/// text. Below this length a value is still masked, but only where it stands
+/// as a whole token — see [`replace_whole_tokens`]. Whole-value bind masking
+/// has no length rule at all.
 const MIN_ECHO_LEN: usize = 4;
 
 /// Build the capsule's request record, masking every sensitive value.
@@ -197,18 +240,105 @@ pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
     if redacted.is_empty() || text.is_empty() {
         return text.to_owned();
     }
-    let mut masked = text.to_owned();
+    // Longest first, so a longer secret wins over one that is a substring of
+    // it: masking `hunter2` before `hunter2secret` would leave the longer
+    // secret's tail behind.
+    let mut needles: Vec<(&str, bool)> = Vec::new();
     for value in redacted.longest_first() {
         // Only values that were UTF-8 to begin with can appear in a message;
         // binary secrets are handled by `mask_binds`.
         let Ok(needle) = std::str::from_utf8(value) else {
             continue;
         };
-        if needle.len() >= MIN_ECHO_LEN && masked.contains(needle) {
-            masked = masked.replace(needle, FILTERED_PLACEHOLDER);
+        if needle.is_empty() {
+            continue;
+        }
+        // A short value — a three-digit CVV, a PIN — and any structural field
+        // are masked only where they stand as a whole token. Replacing them
+        // everywhere would shred timestamps, identifiers, byte counts and
+        // ordinary words that merely contain those characters, in failures
+        // that have nothing to do with the secret; leaving them alone entirely
+        // wrote the secret to disk whenever the failure quoted it back, as
+        // `CVV 123 rejected` does.
+        let whole_token_only = needle.len() < MIN_ECHO_LEN || redacted.is_whole_token_only(value);
+        needles.push((needle, whole_token_only));
+    }
+
+    // One left-to-right pass over the *original* text, emitting placeholders
+    // as it goes. Replacing each needle in turn across the accumulating output
+    // instead would let a later secret match a placeholder an earlier one had
+    // just written — with `FILTER` in the set, `[FILTERED]` became
+    // `[[FILTERED]ED]`, which replay's own scrubbing never reproduces, turning
+    // a matching failure into a `mismatch`. Text this pass has emitted is
+    // never looked at again.
+    let mut masked = String::with_capacity(text.len());
+    let mut cursor = 0_usize;
+    while let Some(rest) = text.get(cursor..).filter(|rest| !rest.is_empty()) {
+        let matched = needles.iter().find(|(needle, whole_token_only)| {
+            rest.starts_with(*needle)
+                && (!*whole_token_only || stands_alone(text, cursor, needle, rest))
+        });
+        if let Some((needle, _)) = matched {
+            masked.push_str(FILTERED_PLACEHOLDER);
+            cursor = cursor.saturating_add(needle.len());
+        } else if let Some(next) = rest.chars().next() {
+            masked.push(next);
+            cursor = cursor.saturating_add(next.len_utf8());
+        } else {
+            break;
         }
     }
     masked
+}
+
+/// Whether the occurrence of `needle` at `cursor` stands as a whole token —
+/// that is, is not part of a longer alphanumeric run.
+///
+/// Both neighbours are read from the *original* text, which is what makes
+/// back-to-back occurrences come out right: in `123123` the character after
+/// the first `123` is the `1` of the second, so neither is a whole token.
+/// Written with [`str::get`] rather than indexing so the request-path panic
+/// gate's `string_slice`/`indexing_slicing` denials hold.
+fn stands_alone(text: &str, cursor: usize, needle: &str, rest: &str) -> bool {
+    let head = text.get(..cursor).unwrap_or_default();
+    let tail = rest.get(needle.len()..).unwrap_or_default();
+
+    // A dot only joins an identifier when it has one on *both* sides:
+    // `api.v1.error` is one dotted name, but the dot in `CVV 123.` ends a
+    // sentence. Treating every dot as interior would leave a secret before a
+    // full stop unmasked, which trades a false mismatch for a real leak — so
+    // the neighbour *past* the dot decides.
+    let mut before = head.chars().rev();
+    let joined_before = match before.next() {
+        Some('.') => before.next().is_some_and(char::is_alphanumeric),
+        Some(character) => is_identifier_char(character),
+        None => false,
+    };
+
+    let mut after = tail.chars();
+    let joined_after = match after.next() {
+        Some('.') => after.next().is_some_and(char::is_alphanumeric),
+        Some(character) => is_identifier_char(character),
+        None => false,
+    };
+
+    !joined_before && !joined_after
+}
+
+/// Whether `character` can sit *inside* an identifier, and so does not end a
+/// token.
+///
+/// Hyphen and underscore count, not only alphanumerics: `auth-error` and
+/// `auth_error` are single identifiers in error strings, log keys and enum
+/// spellings, so a whole-token-only `auth` that rewrote them to
+/// `[FILTERED]-error` would shred exactly the static messages replay compares
+/// against — the false `mismatch` this classification exists to prevent.
+///
+/// The dot is deliberately *not* here: it joins only when flanked by
+/// alphanumerics, which [`stands_alone`] decides, because a trailing dot is
+/// far more often a full stop than part of a name.
+fn is_identifier_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '-' || character == '_'
 }
 
 /// Mask any bind parameter whose bytes exactly echo a redacted request value.
@@ -272,6 +402,7 @@ fn redact_headers(
         let name = name.as_str().to_owned();
         if header_is_sensitive(&name, filter) {
             values.insert(value.as_bytes());
+            record_credential_components(&name, value.as_bytes(), values);
             keys.insert(format!("header:{name}"));
             out.push((name, FILTERED_PLACEHOLDER.to_owned()));
         } else if binary_names.contains(&name) {
@@ -281,6 +412,279 @@ fn redact_headers(
         }
     }
     (out, binary)
+}
+
+/// Retain the secret *inside* a structured credential header, not just the
+/// header value as a whole.
+///
+/// A handler does not work with `Bearer hunter2` or with a whole `Cookie:`
+/// line — it extracts `hunter2`, or one cookie's value, and that is the form
+/// that reappears in an error message, a panic payload, or a SQL bind. The
+/// full value is already in the echo set; without its components,
+/// [`mask_echoes`] (a substring search) never matches what the handler
+/// actually held.
+///
+/// Deliberately narrow: the token after a standard auth scheme, and each
+/// cookie value. Cookie *names* are not retained — they are ordinary words
+/// (`session`, `theme`) that would shred unrelated prose.
+fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
+    let Ok(text) = std::str::from_utf8(value) else {
+        return;
+    };
+    let trimmed = text.trim();
+    // Only headers whose *syntax* this understands. A custom sensitive header
+    // named by `filter_parameters` carries whatever its application likes, and
+    // reading `password: not valid` as a scheme and a credential would put
+    // `valid` in the echo set — masking unrelated prose, and blanking any SQL
+    // bind that happens to equal it, which also drops that bind from replay's
+    // comparison. Guessing structure is worse here than recording nothing:
+    // the whole header value is already retained either way.
+    let name = name.to_ascii_lowercase();
+    let is_authorization = matches!(name.as_str(), "authorization" | "proxy-authorization");
+    let is_cookie = matches!(name.as_str(), "cookie" | "set-cookie");
+
+    // `Authorization: <scheme> <credential>` / `Proxy-Authorization: …`.
+    // Any syntactically valid scheme counts, not a list of the familiar ones:
+    // `Negotiate`, `AWS4-HMAC-SHA256` and every vendor scheme carry exactly
+    // the same risk, and a name this code has not heard of is precisely the
+    // case where the credential would go unmasked. A scheme is an RFC 7235
+    // token, so anything containing characters a token cannot hold — `=`, `;`,
+    // `,` — is not a scheme, which is what keeps a `Cookie:` line from being
+    // read as one. The rest of the value is kept whole, so a credential that
+    // itself contains spaces (`AWS4-HMAC-SHA256 Credential=…, Signature=…`)
+    // stays intact.
+    if is_authorization && let Some((scheme, credential)) = trimmed.split_once(' ') {
+        let credential = credential.trim();
+        if is_auth_scheme(scheme) && !credential.is_empty() {
+            values.insert(credential.as_bytes());
+            if scheme.eq_ignore_ascii_case("basic") {
+                record_basic_credentials(credential, values);
+            }
+            // A `token68` is one opaque blob, not a `name=value` list — its
+            // trailing `=` is Base64 padding. Reading `dTpwdw==` as a param
+            // would put a bare `=` in the echo set, and a lone `=` masked as a
+            // whole token rewrites `x = y` in any later failure text and
+            // blanks any bind equal to it.
+            if !is_token68(credential) {
+                record_auth_params(credential, values);
+            }
+        }
+    }
+
+    // `Cookie: a=1; b=2` carries one pair per cookie, all of them candidate
+    // secrets. `Set-Cookie: session=abc; Path=/; Max-Age=0` carries *one*
+    // cookie followed by attributes — and those attribute values are not
+    // secrets. Retaining them was actively harmful: whole-token masking
+    // matches a standalone `/` or `0`, so `failed at /` and `status 0` would
+    // be rewritten in the outcome, and a SQL bind equal to either would be
+    // blanked and dropped from replay's comparison.
+    //
+    // Cookie values are whole-token-only for the same reason auth-param
+    // values are: a cookie jar mixes a session token with `theme=dark`, and
+    // only the *name* separates them — which is the ranking this code declines
+    // to make. Substring-masking `dark` would turn a later `darkness check
+    // failed` into `[FILTERED]ness check failed`, and replay, which scrubs
+    // with the same set but produces the static message, would call that a
+    // mismatch.
+    if is_cookie && trimmed.contains('=') {
+        let pairs: Vec<&str> = if name == "set-cookie" {
+            trimmed.split(';').take(1).collect()
+        } else {
+            trimmed.split(';').collect()
+        };
+        for pair in pairs {
+            if let Some((_, cookie_value)) = pair.split_once('=') {
+                let cookie_value = cookie_value.trim().trim_matches('"');
+                if !cookie_value.is_empty() {
+                    values.insert_whole_token_only(cookie_value.as_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// Retain each value of an RFC 7235 auth-param list, not only the list.
+///
+/// A credential is either a `token68` (`Bearer hunter2`) or a comma-separated
+/// `name=value` list — `AWS4-HMAC-SHA256 Credential=…, SignedHeaders=…,
+/// Signature=…`, or a `Digest` response. A handler extracts one field from
+/// that list, and `Signature=…` alone neither equals nor is contained in the
+/// whole credential string, so the list on its own never matches what the
+/// handler held.
+///
+/// This is standardized syntax rather than a guess, which is what separates it
+/// from the custom headers this code refuses to parse. What it *cannot* do is
+/// tell a secret from metadata: `Signature` and `qop` are both auth-params,
+/// and only the names give them away — the same enumeration this code declined
+/// to make for schemes. So every value is retained, but as whole-token-only,
+/// which is what keeps `qop=auth` from masking the middle of *authentication*
+/// in every later failure.
+fn record_auth_params(credential: &str, values: &mut RedactedValues) {
+    for param in split_auth_params(credential) {
+        let Some((name, value)) = param.split_once('=') else {
+            continue;
+        };
+        // An auth-param name is a token. This rejects the `=` padding of a
+        // `token68` credential, whose tail is not a name and whose value is
+        // empty anyway.
+        if !is_auth_scheme(name.trim()) {
+            continue;
+        }
+        let value = unquote_auth_param(value.trim());
+        if !value.is_empty() {
+            values.insert_whole_token_only(value.as_bytes());
+        }
+    }
+}
+
+/// Whether `credential` is an RFC 7235 `token68` — the single-blob form of a
+/// credential, as `Bearer`, `Basic` and a JWT all use.
+///
+/// `token68` is `1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`:
+/// padding only ever trails. That is what tells it apart from an auth-param
+/// list, whose `=` signs sit between a name and a value.
+fn is_token68(credential: &str) -> bool {
+    let unpadded = credential.trim_end_matches('=');
+    !unpadded.is_empty()
+        && unpadded.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
+}
+
+/// Split an auth-param list on the commas that actually delimit it.
+///
+/// A `quoted-string` may contain the delimiter — `Digest response="abc,def"`
+/// is one param — so splitting on every comma cuts the value in half and
+/// retains a fragment the handler never holds, which is the same as retaining
+/// nothing.
+///
+/// Escapes are *tracked* but not resolved: a `\"` must not be mistaken for the
+/// end of the quoted string, yet the backslashes have to survive into
+/// [`unquote_auth_param`], which is the only place that can tell a syntactic
+/// boundary quote from a literal one. Returns owned strings because the panic
+/// gate denies the index arithmetic a borrowing split would need.
+fn split_auth_params(credential: &str) -> Vec<String> {
+    let mut params = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in credential.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+        } else if character == '\\' && quoted {
+            current.push(character);
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+            current.push(character);
+        } else if character == ',' && !quoted {
+            params.push(std::mem::take(&mut current));
+        } else {
+            current.push(character);
+        }
+    }
+    params.push(current);
+    params
+}
+
+/// Strip an auth-param value's *syntactic* quotes and resolve its
+/// quoted-pairs, in that order.
+///
+/// Order is the whole point. Unescaping first and trimming quotes afterwards
+/// turns `response="\"hunter2\""` — whose value is literally `"hunter2"` — into
+/// `hunter2`, because the trim cannot tell the delimiters it should remove
+/// from the literal quotes it must keep. Walking from the opening delimiter
+/// and stopping at the first *unescaped* quote answers that question exactly,
+/// and a bind byte-equal to what the handler extracted then matches.
+///
+/// An unquoted value (`qop=auth`) is a token and is returned as it stands.
+fn unquote_auth_param(value: &str) -> String {
+    let mut characters = value.chars();
+    if characters.next() != Some('"') {
+        return value.to_owned();
+    }
+    let mut unquoted = String::new();
+    let mut escaped = false;
+    for character in characters {
+        if escaped {
+            unquoted.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            break;
+        } else {
+            unquoted.push(character);
+        }
+    }
+    unquoted
+}
+
+/// Retain what a `Basic` credential *decodes to*, not only its Base64 text.
+///
+/// `Basic` is the one scheme whose credential has a standardized interior
+/// (RFC 7617): a handler never works with `dXNlcjpzZWNyZXQ=` — it decodes,
+/// and holds `user:secret` or the password alone. Those are the forms that
+/// reappear in an error, a panic payload or a SQL bind, and neither is a
+/// substring of the Base64, so [`mask_echoes`] would not match either one.
+///
+/// The password is retained, and the decoded `user:password` pair as a whole.
+/// The *username* is not: it is the same hazard as a cookie name — `admin`
+/// or `service` is an ordinary word, and masking it everywhere would shred
+/// unrelated prose while protecting nothing that the pair and the password do
+/// not already cover.
+///
+/// Everything here works on **bytes**, deliberately. RFC 7617 leaves the
+/// charset open and the historical default is not UTF-8, so a username
+/// carrying a legacy-encoded byte would take an ASCII password down with it if
+/// the pair had to parse as text first. A handler splits the decoded bytes and
+/// holds that password regardless; the echo set is byte-keyed, so a bind equal
+/// to it is masked either way, and only free-form text masking — which needs
+/// valid UTF-8 to search — quietly skips what it cannot represent.
+fn record_basic_credentials(credential: &str, values: &mut RedactedValues) {
+    // Not Base64: nothing to split, and the Base64 itself is already in the
+    // set.
+    let Ok(decoded) = STANDARD.decode(credential) else {
+        return;
+    };
+    // RFC 7617 splits on the *first* colon; a password may contain more.
+    let Some(colon) = decoded.iter().position(|byte| *byte == b':') else {
+        return;
+    };
+    let Some(password) = decoded.get(colon.saturating_add(1)..) else {
+        return;
+    };
+    if !password.is_empty() {
+        values.insert(password);
+    }
+    values.insert(&decoded);
+}
+
+/// Whether `word` is a syntactically valid authorization scheme — an RFC 7235
+/// token.
+fn is_auth_scheme(word: &str) -> bool {
+    !word.is_empty()
+        && word.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 /// Rewrite the request target with sensitive query parameters masked, leaving
@@ -903,6 +1307,346 @@ mod tests {
         assert!(
             values.contains(b"Basic cHJveHk6c2VjcmV0cGFzcw=="),
             "the masked value must join the echo set"
+        );
+    }
+
+    /// A handler does not hold `Bearer hunter2secret` — it holds the token.
+    /// The whole header value alone in the echo set never matches the form
+    /// that reaches an error message or a SQL bind.
+    #[test]
+    fn credential_components_join_the_echo_set() {
+        let (_request, values) = redact(
+            Request::get("/")
+                .header(header::AUTHORIZATION, "Bearer hunter2secret")
+                .header(header::COOKIE, "session=sess-abcdef; theme=dark"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        assert!(
+            values.contains(b"Bearer hunter2secret"),
+            "the whole header value is still retained"
+        );
+        assert!(
+            values.contains(b"hunter2secret"),
+            "the token after the auth scheme must be retained on its own"
+        );
+        assert!(
+            values.contains(b"sess-abcdef"),
+            "each cookie value must be retained on its own"
+        );
+        assert!(
+            !values.contains(b"session"),
+            "cookie names are ordinary words and must stay out of the echo set"
+        );
+        // A cookie jar mixes a session token with ordinary preferences, and
+        // only the name separates them — so values are whole-token-only, like
+        // auth-params.
+        assert_eq!(
+            mask_echoes("darkness check failed", &values),
+            "darkness check failed",
+            "a `theme=dark` cookie must not shred words that merely contain it"
+        );
+        assert_eq!(
+            mask_echoes("theme dark rejected", &values),
+            format!("theme {FILTERED_PLACEHOLDER} rejected"),
+            "it is still masked where it stands as a whole token"
+        );
+        // `Set-Cookie` attributes are not secrets, and retaining them is worse
+        // than useless: whole-token masking matches a standalone `/` or `0`.
+        let (_request, set_cookie) = redact(
+            Request::get("/").header("set-cookie", "session=abc-secret; Path=/; Max-Age=0"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            set_cookie.contains(b"abc-secret"),
+            "the cookie value counts"
+        );
+        assert!(!set_cookie.contains(b"/"), "`Path=/` is an attribute");
+        assert!(!set_cookie.contains(b"0"), "`Max-Age=0` is an attribute");
+        assert_eq!(
+            mask_echoes("failed at / with status 0", &set_cookie),
+            "failed at / with status 0",
+            "attribute values must not rewrite unrelated outcome text"
+        );
+
+        // `Basic` is the one scheme whose credential has a standardized
+        // interior: a handler decodes it, so the Base64 text alone never
+        // matches what the handler actually held.
+        let (_request, basic) = redact(
+            // base64("alice:hunter2:pass") — a password containing a colon.
+            Request::get("/").header(header::AUTHORIZATION, "Basic YWxpY2U6aHVudGVyMjpwYXNz"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            basic.contains(b"YWxpY2U6aHVudGVyMjpwYXNz"),
+            "the Base64 credential is still retained"
+        );
+        assert!(
+            basic.contains(b"alice:hunter2:pass"),
+            "the decoded pair must be retained"
+        );
+        assert!(
+            basic.contains(b"hunter2:pass"),
+            "the password must be retained on its own, splitting on the first colon only"
+        );
+        assert!(
+            !basic.contains(b"alice"),
+            "the username is an ordinary word, like a cookie name"
+        );
+        // RFC 7617 leaves the charset open, so a legacy-encoded username must
+        // not take an ASCII password down with it. base64(b"\xffuser:hunter2").
+        let (_request, latin1) = redact(
+            Request::get("/").header(header::AUTHORIZATION, "Basic /3VzZXI6aHVudGVyMg=="),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            latin1.contains(b"hunter2"),
+            "a valid password must survive a username that is not UTF-8"
+        );
+        assert!(
+            latin1.contains(b"\xffuser:hunter2".as_slice()),
+            "the decoded pair is retained as bytes, not as text"
+        );
+
+        // Anything that is not Base64 of `user:password` contributes nothing
+        // beyond the whole value — no panic, no half-parsed component.
+        let (_request, not_basic) = redact(
+            Request::get("/").header(header::AUTHORIZATION, "Basic not-base64!!"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            not_basic.contains(b"not-base64!!"),
+            "the token still counts"
+        );
+
+        // A scheme this code has never heard of is exactly where a credential
+        // would otherwise go unmasked.
+        assert!(is_auth_scheme("Negotiate") && is_auth_scheme("AWS4-HMAC-SHA256"));
+        assert!(
+            !is_auth_scheme("session=abc;"),
+            "a cookie line is not an auth scheme"
+        );
+        // The point of all of it: the outcome is scrubbed of what the handler
+        // actually carried.
+        let masked = mask_echoes("token hunter2secret was rejected", &values);
+        assert!(!masked.contains("hunter2secret"), "{masked}");
+    }
+
+    /// An RFC 7235 credential can be a comma-separated `name=value` list, and
+    /// a handler extracts one field from it — a field that neither equals nor
+    /// is contained in the whole credential string, so the list alone never
+    /// matches what the handler held.
+    ///
+    /// The list mixes secrets with metadata and only the *names* tell them
+    /// apart, which is the enumeration this code declines to make. Retaining
+    /// every value is safe only because they are masked as whole tokens.
+    #[test]
+    fn auth_param_values_are_masked_only_as_whole_tokens() {
+        let (_request, sigv4) = redact(
+            Request::get("/").header(
+                header::AUTHORIZATION,
+                "AWS4-HMAC-SHA256 Credential=AKIA/20260815/us-east-1/s3/aws4_request, \
+                 SignedHeaders=host;x-amz-date, Signature=abc123deadbeef",
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            sigv4.contains(b"abc123deadbeef"),
+            "the signature a handler extracts must be retained on its own"
+        );
+        assert_eq!(
+            mask_echoes("signature abc123deadbeef rejected", &sigv4),
+            format!("signature {FILTERED_PLACEHOLDER} rejected"),
+            "an auth-param value quoted back must still be masked"
+        );
+
+        let (_request, digest) = redact(
+            Request::get("/").header(
+                header::AUTHORIZATION,
+                r#"Digest username="alice", qop=auth, response="deadbeef""#,
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            digest.contains(b"deadbeef"),
+            "the digest response is retained"
+        );
+        assert_eq!(
+            mask_echoes("authentication failed during reauthorization", &digest),
+            "authentication failed during reauthorization",
+            "`qop=auth` must not shred every later word containing `auth`"
+        );
+        assert_eq!(
+            mask_echoes("scheme auth rejected", &digest),
+            format!("scheme {FILTERED_PLACEHOLDER} rejected"),
+            "it is still masked where it stands as a whole token"
+        );
+        // `-` and `_` sit *inside* identifiers, so they do not end a token:
+        // `auth-error` is one word, and rewriting it would shred the static
+        // messages replay compares against.
+        assert_eq!(
+            mask_echoes("auth-error and auth_error raised", &digest),
+            "auth-error and auth_error raised",
+            "identifier punctuation does not make a value stand alone"
+        );
+        // A dot joins only when flanked: `api.auth.error` is one dotted name,
+        // but a trailing dot is a full stop and must not shield the secret.
+        assert_eq!(
+            mask_echoes("api.auth.error raised", &digest),
+            "api.auth.error raised",
+            "a dot between alphanumerics joins the name"
+        );
+        assert_eq!(
+            mask_echoes("scheme was auth.", &digest),
+            format!("scheme was {FILTERED_PLACEHOLDER}."),
+            "a sentence-ending dot must not leave the secret unmasked"
+        );
+    }
+
+    /// A `quoted-string` may hold the very characters the list is delimited
+    /// by. Splitting on every comma keeps a fragment the handler never holds,
+    /// which protects nothing.
+    #[test]
+    fn quoted_auth_param_values_survive_commas_and_escapes() {
+        let (_request, values) = redact(
+            Request::get("/").header(
+                header::AUTHORIZATION,
+                r#"Digest response="abc,def", opaque="gh\"ij", qop=auth"#,
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        assert!(
+            values.contains(b"abc,def"),
+            "a comma inside a quoted value does not end the param"
+        );
+        assert!(
+            !values.contains(b"abc"),
+            "the fragment before the comma is not what the handler holds"
+        );
+        assert!(
+            values.contains(br#"gh"ij"#),
+            "a quoted-pair is resolved to the character the handler sees"
+        );
+        assert!(
+            values.contains(b"auth"),
+            "an unquoted param after a quoted one is still found"
+        );
+
+        // A value whose own first and last characters are escaped quotes. The
+        // handler extracts `"hunter2"`, quotes included, so that is what a
+        // bind will carry.
+        let (_request, bounded) = redact(
+            Request::get("/").header(header::AUTHORIZATION, r#"Digest response="\"hunter2\"""#),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            bounded.contains(br#""hunter2""#),
+            "literal quotes at the value's boundary are part of the value"
+        );
+    }
+
+    /// A `token68` credential is one blob whose trailing `=` is padding, not a
+    /// `name=value` list. Reading it as one invents a bare `=` secret.
+    #[test]
+    fn token68_padding_is_not_read_as_an_auth_param() {
+        let (_request, values) = redact(
+            // base64("u:pw") — two padding characters.
+            Request::get("/").header(header::AUTHORIZATION, "Basic dTpwdw=="),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        assert!(
+            values.contains(b"dTpwdw=="),
+            "the credential itself is still retained"
+        );
+        assert!(
+            !values.contains(b"="),
+            "padding must not become a secret of its own"
+        );
+        assert_eq!(
+            mask_echoes("x = y", &values),
+            "x = y",
+            "an invented `=` secret would rewrite ordinary text"
+        );
+    }
+
+    /// The same bytes can arrive both ways — a filtered body password the
+    /// client also sent as a `Digest` parameter. The request carried it in its
+    /// own right, so it needs full substring masking either way round.
+    #[test]
+    fn a_direct_insert_outranks_the_whole_token_classification() {
+        for direct_first in [true, false] {
+            let mut values = RedactedValues::default();
+            if direct_first {
+                values.insert(b"hunter2");
+                values.insert_whole_token_only(b"hunter2");
+            } else {
+                values.insert_whole_token_only(b"hunter2");
+                values.insert(b"hunter2");
+            }
+
+            assert_eq!(
+                mask_echoes("token hunter2suffix rejected", &values),
+                format!("token {FILTERED_PLACEHOLDER}suffix rejected"),
+                "a directly captured secret is masked even mid-token (direct_first: {direct_first})"
+            );
+        }
+    }
+
+    /// Each needle is matched against the original text, never against output
+    /// an earlier needle produced.
+    #[test]
+    fn masking_does_not_rewrite_the_placeholders_it_just_wrote() {
+        let mut values = RedactedValues::default();
+        values.insert(b"hunter2");
+        // A secret that happens to be a substring of the placeholder itself.
+        values.insert(b"FILTER");
+
+        let masked = mask_echoes("login hunter2 failed", &values);
+
+        assert_eq!(
+            masked,
+            format!("login {FILTERED_PLACEHOLDER} failed"),
+            "the placeholder written for one secret must not be rewritten by another"
+        );
+    }
+
+    /// A custom sensitive header carries whatever its application likes, so
+    /// reading auth or cookie syntax into it invents secrets: `password: not
+    /// valid` would put `valid` in the echo set, masking unrelated prose and
+    /// blanking any SQL bind equal to it (which drops that bind from replay's
+    /// comparison too).
+    #[test]
+    fn component_parsing_is_limited_to_headers_whose_syntax_is_known() {
+        let (_request, values) = redact(
+            Request::get("/").header("password", "not valid"),
+            CapturedBody::Absent,
+            &filter_with(&["password"]),
+        );
+
+        assert!(
+            values.contains(b"not valid"),
+            "the whole value is still retained, as for any masked header"
+        );
+        assert!(
+            !values.contains(b"valid"),
+            "a custom header's value must not be split as though it were `Authorization`"
+        );
+        assert_eq!(
+            mask_echoes("the token was invalid", &values),
+            "the token was invalid",
+            "an invented component would have shredded this"
         );
     }
 
@@ -1628,16 +2372,53 @@ mod tests {
     }
 
     #[test]
-    fn mask_echoes_prefers_the_longest_match_and_ignores_short_values() {
+    fn mask_echoes_prefers_the_longest_match() {
         let mut values = RedactedValues::default();
         values.insert(b"hunter2secret");
         values.insert(b"hunter2");
-        // Below `MIN_ECHO_LEN`: never recorded, so it cannot shred prose.
-        values.insert(b"ada");
 
-        let masked = mask_echoes("ada tried hunter2secret twice", &values);
+        let masked = mask_echoes("tried hunter2secret twice", &values);
 
-        assert_eq!(masked, format!("ada tried {FILTERED_PLACEHOLDER} twice"));
+        assert_eq!(masked, format!("tried {FILTERED_PLACEHOLDER} twice"));
+    }
+
+    /// A short secret — a CVV, a PIN — must not reach disk just because the
+    /// failure quoted it, but masking it *everywhere* would shred timestamps,
+    /// identifiers and ordinary words. It is masked exactly where it stands
+    /// as a token of its own.
+    #[test]
+    fn mask_echoes_masks_short_values_only_as_whole_tokens() {
+        let mut values = RedactedValues::default();
+        values.insert(b"123");
+
+        assert_eq!(
+            mask_echoes("CVV 123 rejected", &values),
+            format!("CVV {FILTERED_PLACEHOLDER} rejected"),
+            "a short secret quoted in the failure must be masked"
+        );
+        assert_eq!(
+            mask_echoes("cvv=123&ok=1", &values),
+            format!("cvv={FILTERED_PLACEHOLDER}&ok=1"),
+            "punctuation delimits a token just as whitespace does"
+        );
+        // Everything a naive substring replacement would have shredded.
+        assert_eq!(
+            mask_echoes("request 1234 took 5123ms at 12:31:23", &values),
+            "request 1234 took 5123ms at 12:31:23",
+            "a short value inside a longer run is not a secret occurrence"
+        );
+        // Back-to-back occurrences are a longer run, not two tokens: the
+        // neighbour of each is the needle itself.
+        assert_eq!(
+            mask_echoes("request 123123 failed", &values),
+            "request 123123 failed",
+            "adjacent occurrences form one alphanumeric run, not whole tokens"
+        );
+        assert_eq!(
+            mask_echoes("123", &values),
+            FILTERED_PLACEHOLDER,
+            "a value that is the entire text is a whole token"
+        );
     }
 
     #[test]
