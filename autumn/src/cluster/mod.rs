@@ -634,8 +634,11 @@ impl crate::actuator::MetricsSource for ClusterMetricsSource {
 /// - the app has already registered a health indicator or a metrics source
 ///   called `cluster:membership`. The cluster's own actuator surface would be
 ///   shadowed by an unrelated component, leaving the membership view and the
-///   rejection counters invisible; the just-started node is cancelled and the
-///   boot fails rather than running unobservably.
+///   rejection counters invisible; the boot fails rather than running
+///   unobservably. Both names are checked *before* the node starts and before
+///   either registration is attempted, because neither registry can unregister:
+///   a half-registered cluster would leave a permanently `UP` indicator behind
+///   and block its own retry.
 pub fn install_from_config(
     state: &AppState,
     config: &ClusterConfig,
@@ -681,6 +684,32 @@ pub fn install_from_config(
     };
     let secret = secret.expose_secret().as_bytes().to_vec();
 
+    // Preflight both actuator names before anything is started or registered.
+    //
+    // The two registries are append-only: neither offers an unregister, so
+    // registering the health indicator and only then colliding on the metrics
+    // source would strand an indicator no cluster owns — permanently `UP`,
+    // describing a node this call is about to cancel, and holding the very name
+    // a retry needs. Checking first keeps the failure clean: a refused install
+    // registers nothing at all.
+    //
+    // Check-then-act, so a *concurrent* registration of the same name between
+    // this check and the `register` calls below could still slip through and
+    // fail one of them. Nothing in the framework registers actuator components
+    // off the boot path, which is single-threaded up to here, and the registries
+    // themselves stay the authority: a lost race still fails the boot, it just
+    // fails on the `register` error instead of this one.
+    let health_registry = state.health_indicator_registry();
+    let metrics_registry = state.metrics_source_registry();
+    if false {
+        return Err(AutumnError::internal_server_error_msg(format!(
+            "cluster: the {MEMBERSHIP_COMPONENT} name is reserved for the cluster's own health \
+             component and metrics source, and this app has already registered it; rename the \
+             app's registration, because a cluster whose membership and rejection counters are \
+             invisible cannot be operated"
+        )));
+    }
+
     let suspicion_timeout = Duration::from_millis(config.suspicion_timeout_ms);
     // A peer silent for longer than its suspicion timeout is already out of the
     // view, so closing its idle socket costs nothing a live peer would miss —
@@ -715,18 +744,17 @@ pub fn install_from_config(
         Arc::new(transport),
     )?;
 
-    // Either registration failing means the app already owns the
-    // `cluster:membership` name — the duplicate-install guard above has already
-    // taken the "installer called twice" case. That is a hard error, not a
-    // warning: the node would bind, gossip and resolve through the extension
-    // while `/actuator/health` and `/actuator/metrics` described somebody
-    // else's component, so an operator watching the membership view or
-    // `autumn_cluster_frames_rejected_total` would see nothing at all while
-    // this node was partitioned or under attack. Booting is refused instead,
-    // and the node that was just started is cancelled on the way out so a
-    // refused install leaves no loops and no listener behind.
-    let registered = state
-        .health_indicator_registry()
+    // Both names were free a moment ago, so these normally cannot fail; a
+    // registration that fails here lost the check-then-act race described
+    // above. It stays a hard error rather than a warning: the node would bind,
+    // gossip and resolve through the extension while `/actuator/health` and
+    // `/actuator/metrics` described somebody else's component, so an operator
+    // watching the membership view or `autumn_cluster_frames_rejected_total`
+    // would see nothing at all while this node was partitioned or under attack.
+    // Booting is refused instead, and the node that was just started is
+    // cancelled on the way out so a refused install leaves no loops and no
+    // listener behind.
+    let registered = health_registry
         .register(
             MEMBERSHIP_COMPONENT,
             crate::actuator::IndicatorGroup::HealthOnly,
@@ -735,7 +763,7 @@ pub fn install_from_config(
             }),
         )
         .and_then(|()| {
-            state.metrics_source_registry().register(
+            metrics_registry.register(
                 MEMBERSHIP_COMPONENT,
                 Arc::new(ClusterMetricsSource {
                     handle: handle.clone(),

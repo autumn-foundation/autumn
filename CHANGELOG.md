@@ -135,6 +135,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn_cluster_*` metric families, and implemented with zero new crate
   dependencies. See `docs/guide/clustering.md` for the wire format, failure
   semantics, and a two-terminal walkthrough.
+- **actuator:** `HealthIndicatorRegistry::contains` and
+  `MetricsSourceRegistry::contains` report whether a component name is already
+  taken (#1762). Neither registry can unregister, so a subsystem that claims a
+  name in both — as the cluster does — can now check first and fail without
+  stranding half of itself behind an error.
 - **generate scaffold:** `--soft-delete` now also generates the recover-from-
   trash UI its data layer has been waiting for (#1332), finishing #689's AC6. A
   standard HTML scaffold gains a `#[secured] GET /<plural>/trash` page that lists

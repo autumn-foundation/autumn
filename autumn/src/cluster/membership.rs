@@ -73,6 +73,11 @@ use crate::time::MonotonicInstant;
 /// How many suspicion timeouts a `Left` tombstone is kept before pruning.
 pub const TOMBSTONE_TIMEOUT_MULTIPLE: u32 = 10;
 
+/// How many tombstone windows a node remembers what it pruned, in order to
+/// refuse re-adopting it. Two: long enough that every peer holding the same
+/// record has had a full window of its own to prune it.
+pub const PRUNE_MEMORY_WINDOW_MULTIPLE: u32 = 2;
+
 /// Replicated member status. Deliberately only two values: liveness is local
 /// (see [`LivenessOverlay`]) and is never gossiped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,11 +171,34 @@ impl ClusterState {
     ///
     /// Commutative, associative and idempotent — the property the counter's
     /// cross-node convergence reduces to.
-    pub fn merge(&mut self, other: &Self) {
+    ///
+    /// # The recently-pruned guard
+    ///
+    /// `overlay` is only *read*: a `Left` record for a member this node pruned
+    /// within the last [`PRUNE_MEMORY_WINDOW_MULTIPLE`] tombstone windows is
+    /// not re-adopted unless it carries a **higher** incarnation than the one
+    /// that was pruned. Without that, two peers pruning at different times
+    /// re-teach each other the same departure forever: A prunes, B's copy
+    /// arrives, A re-inserts it with a fresh local stamp and gossips it back,
+    /// B prunes and re-learns it from A a window later — so a departed id is
+    /// locally expirable at every step and still never leaves the cluster,
+    /// which is how a long-lived pair grows its document toward the 64 KiB
+    /// frame cap.
+    ///
+    /// This is a **local garbage-collection guard, not replicated state**:
+    /// nothing about it is gossiped, two nodes hold different memories of what
+    /// they collected, and all it withholds is information this node already
+    /// had and deliberately discarded. The join itself is untouched where it
+    /// carries information — a higher incarnation (a genuine rejoin, or a
+    /// refutation) is always adopted, a member still in the document merges by
+    /// the three rules as before, and the counters merge whatever the member
+    /// table decides — and the memory expires on its own window, after which
+    /// a record a peer still holds is learned normally again.
+    pub fn merge(&mut self, other: &Self, overlay: &LivenessOverlay, now: MonotonicInstant) {
         for (id, theirs) in &other.members {
             if let Some(ours) = self.members.get_mut(id) {
                 ours.merge(theirs);
-            } else {
+            } else if !overlay.refuses_readoption(id, theirs, now) {
                 // A member we have never heard of: learning it *is* discovery.
                 // Tombstones (`Left`) are learned too, so a leave keeps
                 // propagating through a node that never met the departed peer.
@@ -260,10 +288,12 @@ impl ClusterState {
     /// [`TOMBSTONE_TIMEOUT_MULTIPLE`] suspicion timeouts to hear it, keeping it
     /// only grows the document. Pruning is deliberately **local** and driven by
     /// the caller's clock reading: it removes no information any peer still
-    /// needs, and a straggling push that re-teaches the tombstone simply
-    /// re-inserts a record that is still `Left`, still out of the view, and
-    /// stamped afresh by [`observe_tombstones`](Self::observe_tombstones) so it
-    /// expires again.
+    /// needs. What it does record is what it collected — `(id, incarnation)`
+    /// into the overlay's recently-pruned memory, for
+    /// [`PRUNE_MEMORY_WINDOW_MULTIPLE`] windows — so a peer that prunes later
+    /// cannot teach the same departure straight back into this document (see
+    /// [`merge`](Self::merge)); that memory expires on its own window, so it
+    /// stays bounded by the same departure count the member table is.
     ///
     /// A `Left` record nobody has stamped yet is kept — it is younger than one
     /// observation, not older than the window.
@@ -273,7 +303,7 @@ impl ClusterState {
         now: MonotonicInstant,
     ) -> Vec<NodeId> {
         let window = overlay.tombstone_timeout();
-        let expired: Vec<NodeId> = self
+        let expired: Vec<(NodeId, Incarnation)> = self
             .members
             .iter()
             .filter_map(|(id, record)| {
@@ -281,15 +311,23 @@ impl ClusterState {
                     && overlay
                         .tombstoned_at(id)
                         .is_some_and(|seen| now.saturating_duration_since(seen) > window);
-                lapsed.then(|| id.clone())
+                lapsed.then(|| (id.clone(), record.incarnation))
             })
             .collect();
 
-        for id in &expired {
+        for (id, incarnation) in &expired {
             self.members.remove(id);
             overlay.forget(id);
+            // Forgotten as a member, remembered as a *collection*: the receipts
+            // go, the record goes, and what stays is the one fact that keeps a
+            // lagging peer from handing the whole thing back.
+            overlay.remember_pruned(id, *incarnation, now);
         }
-        expired
+        // The memory is swept on the same pass that fills it, so it is bounded
+        // by the departures of the last two windows rather than by the process
+        // lifetime.
+        overlay.expire_pruned(now);
+        expired.into_iter().map(|(id, _)| id).collect()
     }
 }
 
@@ -335,6 +373,12 @@ pub struct LivenessOverlay {
     /// apart from `last_seen` on purpose: see
     /// [`ClusterState::observe_tombstones`].
     tombstoned_at: BTreeMap<NodeId, MonotonicInstant>,
+    /// `node -> (incarnation collected, when it was collected)`. What this node
+    /// has already pruned, remembered for
+    /// [`PRUNE_MEMORY_WINDOW_MULTIPLE`] tombstone windows so a peer that prunes
+    /// later cannot teach the departure back (see [`ClusterState::merge`]).
+    /// Local garbage-collection memory: never serialized, never gossiped.
+    recently_pruned: BTreeMap<NodeId, (Incarnation, MonotonicInstant)>,
 }
 
 impl LivenessOverlay {
@@ -345,6 +389,7 @@ impl LivenessOverlay {
             suspicion_timeout,
             last_seen: BTreeMap::new(),
             tombstoned_at: BTreeMap::new(),
+            recently_pruned: BTreeMap::new(),
         }
     }
 
@@ -359,9 +404,55 @@ impl LivenessOverlay {
     }
 
     /// Drop every observation of `node` (it left cleanly, or was pruned).
+    ///
+    /// Deliberately does **not** touch the recently-pruned memory: that memory
+    /// exists precisely to outlive the record and the receipts, and pruning
+    /// writes it immediately after calling this.
     pub fn forget(&mut self, node: &str) {
         self.last_seen.remove(node);
         self.tombstoned_at.remove(node);
+    }
+
+    /// Remember that `node`'s tombstone at `incarnation` was collected at `at`.
+    ///
+    /// A later collection wins on both halves: a member that came back and left
+    /// again must not be judged against the older departure it already
+    /// outlived.
+    fn remember_pruned(&mut self, node: &str, incarnation: Incarnation, at: MonotonicInstant) {
+        let entry = self
+            .recently_pruned
+            .entry(node.to_owned())
+            .or_insert((incarnation, at));
+        if incarnation >= entry.0 {
+            *entry = (incarnation, at);
+        }
+    }
+
+    /// Drop memories older than [`PRUNE_MEMORY_WINDOW_MULTIPLE`] windows.
+    fn expire_pruned(&mut self, now: MonotonicInstant) {
+        let window = self.prune_memory_window();
+        self.recently_pruned
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) <= window);
+    }
+
+    /// Whether `record` is a tombstone this node has already collected and is
+    /// still within its window of remembering.
+    ///
+    /// `Alive` records are never refused — a returning node teaches its own
+    /// liveness, and a higher incarnation always outranks what was collected,
+    /// so the guard can only withhold a departure this node already processed.
+    /// See [`ClusterState::merge`] for why that is a garbage-collection
+    /// decision rather than a merge rule.
+    fn refuses_readoption(&self, node: &str, record: &MemberRecord, now: MonotonicInstant) -> bool {
+        if record.status != MemberStatus::Left {
+            return false;
+        }
+        let window = self.prune_memory_window();
+        self.recently_pruned
+            .get(node)
+            .is_some_and(|(collected, at)| {
+                record.incarnation <= *collected && now.saturating_duration_since(*at) <= window
+            })
     }
 
     /// Stamp `node`'s departure at `at`, unless it is already stamped: a
@@ -394,6 +485,13 @@ impl LivenessOverlay {
             .saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE)
     }
 
+    /// How long a pruned `(id, incarnation)` is remembered:
+    /// [`PRUNE_MEMORY_WINDOW_MULTIPLE`] tombstone windows.
+    const fn prune_memory_window(&self) -> Duration {
+        self.tombstone_timeout()
+            .saturating_mul(PRUNE_MEMORY_WINDOW_MULTIPLE)
+    }
+
     /// Classify `node` as of `now`. Pure: no clock read, no mutation.
     pub fn liveness(&self, node: &str, now: MonotonicInstant) -> Liveness {
         // Never heard from — `Down`, not `Alive`. Optimism here would put a peer
@@ -420,7 +518,7 @@ impl LivenessOverlay {
 mod tests {
     use super::{
         ClusterState, Liveness, LivenessOverlay, MemberRecord, MemberStatus,
-        TOMBSTONE_TIMEOUT_MULTIPLE,
+        PRUNE_MEMORY_WINDOW_MULTIPLE, TOMBSTONE_TIMEOUT_MULTIPLE,
     };
     use crate::time::MonotonicInstant;
     use std::time::Duration;
@@ -432,6 +530,23 @@ mod tests {
 
     fn at(millis: u64) -> MonotonicInstant {
         MonotonicInstant::from_origin_elapsed(Duration::from_millis(millis))
+    }
+
+    /// A node that has just collected `node-b`'s tombstone at incarnation 9,
+    /// plus the overlay memory that collection left behind.
+    fn after_collecting_node_b(pruned_at: u64) -> (ClusterState, LivenessOverlay) {
+        let mut overlay = LivenessOverlay::new(PUSH, SUSPICION);
+        let mut state = ClusterState::default();
+        state
+            .members
+            .insert("node-b".to_owned(), MemberRecord::left("127.0.0.1:7002", 9));
+        state.observe_tombstones(&mut overlay, at(0));
+        assert_eq!(
+            state.prune_tombstones(&mut overlay, at(pruned_at)),
+            vec!["node-b".to_owned()],
+            "sanity: the tombstone must prune, or nothing below is tested"
+        );
+        (state, overlay)
     }
 
     #[test]
@@ -692,6 +807,13 @@ mod tests {
     /// member's last *receipt* means a pruned-then-reintroduced record has no
     /// receipt of its own (pruning forgot it) and can never expire, so repeated
     /// departures grow the document toward the 64 KiB frame cap.
+    ///
+    /// The reintroduction happens after the recently-pruned memory has expired,
+    /// because inside that memory's window the record is not re-adopted at all
+    /// (`pruned_tombstones_are_not_re_adopted_during_the_memory_window` covers
+    /// that half). Both guards answer the same growth question from opposite
+    /// ends: nothing is re-learned while the collection is remembered, and
+    /// anything re-learned afterwards still expires on its own.
     #[test]
     fn reintroduced_tombstone_expires_again() {
         let window = SUSPICION.saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE);
@@ -710,13 +832,20 @@ mod tests {
         );
 
         // A lagging peer pushes the same departure again, long after the
-        // pruning — exactly what `merge` does with a record we no longer hold.
-        let reintroduced = at(window_ms.saturating_mul(2));
+        // pruning — exactly what `merge` does with a record we no longer hold,
+        // and late enough that the recently-pruned memory has lapsed.
+        let reintroduced =
+            at(window_ms.saturating_mul(u64::from(PRUNE_MEMORY_WINDOW_MULTIPLE).saturating_add(2)));
         let mut lagging = ClusterState::default();
         lagging
             .members
             .insert("node-b".to_owned(), MemberRecord::left("127.0.0.1:7002", 9));
-        state.merge(&lagging);
+        state.merge(&lagging, &overlay, reintroduced);
+        assert!(
+            state.members.contains_key("node-b"),
+            "sanity: past the memory window the record must be re-learned, or \
+             the expiry assertions below prove nothing; observed {state:?}"
+        );
         state.observe_tombstones(&mut overlay, reintroduced);
         // The sender of that push is a DIFFERENT node, so attributing the age
         // to receipts would restart the clock on every one of its pushes.
@@ -742,6 +871,96 @@ mod tests {
         assert!(
             !state.members.contains_key("node-b"),
             "the re-expired tombstone must leave the document; observed {state:?}"
+        );
+    }
+
+    /// Pruning must actually remove a departed id from the cluster, not just
+    /// from this node for a while.
+    ///
+    /// The bug this pins: two peers prune the same `Left` record at different
+    /// times, so each prune is followed by the other's copy arriving, being
+    /// re-inserted with a fresh local stamp and gossiped straight back. Every
+    /// copy is locally expirable and the id never leaves, which is how a
+    /// long-lived pair grows its document toward the 64 KiB frame cap on
+    /// departures alone. A node therefore remembers what it collected for
+    /// `PRUNE_MEMORY_WINDOW_MULTIPLE` windows and refuses to re-adopt it — a
+    /// local garbage-collection guard, never replicated, and never applied to a
+    /// higher incarnation, which is a genuine rejoin rather than an echo.
+    #[test]
+    fn pruned_tombstones_are_not_re_adopted_during_the_memory_window() {
+        let window = SUSPICION.saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE);
+        let window_ms = u64::try_from(window.as_millis()).expect("the window fits in a u64 of ms");
+        let pruned_at = window_ms.saturating_add(1);
+
+        // The lagging peer that has not pruned yet, pushing what it still holds.
+        let mut lagging = ClusterState::default();
+        lagging
+            .members
+            .insert("node-b".to_owned(), MemberRecord::left("127.0.0.1:7002", 9));
+
+        // 1. Inside the memory window: the departure is not re-adopted.
+        let (mut state, overlay) = after_collecting_node_b(pruned_at);
+        state.merge(&lagging, &overlay, at(pruned_at.saturating_add(1)));
+        assert!(
+            !state.members.contains_key("node-b"),
+            "a Left record this node already collected must not come back from \
+             a peer that prunes later — that exchange is the recycling loop \
+             that keeps departed ids in the document forever; observed {state:?}"
+        );
+
+        // 2. …for the whole window, not merely for an instant.
+        let inside = pruned_at
+            .saturating_add(window_ms.saturating_mul(u64::from(PRUNE_MEMORY_WINDOW_MULTIPLE)));
+        state.merge(&lagging, &overlay, at(inside));
+        assert!(
+            !state.members.contains_key("node-b"),
+            "the refusal must hold for the whole memory window — the peer keeps \
+             pushing every interval; observed {state:?}"
+        );
+
+        // 3. Past it, the guard is gone: the document is a join again, and a
+        //    record a peer still holds is learned (and re-expires — see
+        //    `reintroduced_tombstone_expires_again`).
+        state.merge(&lagging, &overlay, at(inside.saturating_add(1)));
+        assert!(
+            state.members.contains_key("node-b"),
+            "the memory is bounded: past its window a tombstone a peer still \
+             holds must merge normally, or this is a permanent local override \
+             of the join rather than garbage collection; observed {state:?}"
+        );
+
+        // 4. A HIGHER incarnation is a rejoin, not an echo — adopted at once,
+        //    inside the window, and its later departure with it.
+        let (mut rejoining, overlay) = after_collecting_node_b(pruned_at);
+        let mut returned = ClusterState::default();
+        returned.members.insert(
+            "node-b".to_owned(),
+            MemberRecord::alive("127.0.0.1:7002", 11),
+        );
+        rejoining.merge(&returned, &overlay, at(pruned_at.saturating_add(1)));
+        assert_eq!(
+            rejoining.members.get("node-b").map(|record| record.status),
+            Some(MemberStatus::Alive),
+            "a node that came back must never be held out by what this node \
+             collected about its previous life; observed {rejoining:?}"
+        );
+
+        let (mut departing_again, overlay) = after_collecting_node_b(pruned_at);
+        let mut left_higher = ClusterState::default();
+        left_higher.members.insert(
+            "node-b".to_owned(),
+            MemberRecord::left("127.0.0.1:7002", 12),
+        );
+        departing_again.merge(&left_higher, &overlay, at(pruned_at.saturating_add(1)));
+        assert_eq!(
+            departing_again
+                .members
+                .get("node-b")
+                .map(|record| record.incarnation),
+            Some(12),
+            "a LATER departure outranks the collected one and must propagate \
+             normally; refusing it would strand a real leave; observed \
+             {departing_again:?}"
         );
     }
 }

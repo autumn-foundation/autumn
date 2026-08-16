@@ -734,7 +734,15 @@ fn apply(
         let outcome = match message {
             ClusterMessage::StatePush { state: theirs } => {
                 let before = state.clone();
-                state.merge(theirs);
+                {
+                    // Document first, overlay second — the one lock ordering
+                    // rule, same as the push loop's. The merge reads (never
+                    // writes) the overlay's recently-pruned memory, so a
+                    // straggler cannot teach back a tombstone this node has
+                    // already collected: see `ClusterState::merge`.
+                    let overlay = inner.lock_overlay();
+                    state.merge(theirs, &overlay, now);
+                }
                 if *state != before {
                     inner.metrics.merges_applied.fetch_add(1, Ordering::Relaxed);
                 }
@@ -765,9 +773,9 @@ fn apply(
                 None
             }
         };
-        // Released before the overlay lock is taken, so the one ordering rule
-        // (document first, overlay second) holds without the two ever being
-        // held together.
+        // Released before the receipt is recorded, so the overlay lock is held
+        // on its own for the write — and, where the merge above needed both,
+        // only ever in the document-then-overlay order.
         drop(state);
         inner.lock_overlay().record_receipt(&envelope.sender, now);
         outcome

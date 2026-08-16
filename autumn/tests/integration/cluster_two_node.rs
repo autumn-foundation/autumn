@@ -666,13 +666,19 @@ async fn install_refuses_a_second_node_on_one_state() {
 /// The cluster's actuator surface is not optional.
 ///
 /// If the app has already claimed `cluster:membership` for a health indicator
-/// or a metrics source of its own, the cluster's registration is rejected. Warn
-/// and carry on would leave the node binding, gossiping and resolving through
-/// the extension while `/actuator/health` and `/actuator/metrics` described
-/// somebody else's component — so an operator watching the membership view or
-/// `autumn_cluster_frames_rejected_total` would see nothing at all while this
-/// node was partitioned or under attack. Boot must fail instead, and the node
-/// that was already started must not be left running behind the failure.
+/// **or** a metrics source of its own, the cluster's registration is rejected.
+/// Warn and carry on would leave the node binding, gossiping and resolving
+/// through the extension while `/actuator/health` and `/actuator/metrics`
+/// described somebody else's component — so an operator watching the membership
+/// view or `autumn_cluster_frames_rejected_total` would see nothing at all
+/// while this node was partitioned or under attack. Boot must fail instead, no
+/// node may be left running behind the failure, and — the half-install case —
+/// the registry the app did *not* claim must come out of it untouched.
+///
+/// Neither registry can unregister, so the cluster has to look before it leaps:
+/// registering the health indicator and only then colliding on the metrics
+/// source would strand an always-`UP` indicator describing a cancelled node,
+/// squatting on the very name the operator's retry needs.
 #[tokio::test]
 async fn install_refuses_a_collision_on_the_membership_component_name() {
     struct Impostor;
@@ -683,65 +689,106 @@ async fn install_refuses_a_collision_on_the_membership_component_name() {
             ))
         }
     }
+    impl autumn_web::actuator::MetricsSource for Impostor {
+        fn collect(&self) -> Vec<autumn_web::actuator::MetricFamily> {
+            Vec::new()
+        }
+    }
 
-    // A port we know is free, so a leaked node is observable as a port that
-    // never comes back.
-    let probe = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind a probe port");
-    let bind_addr = probe.local_addr().expect("probe local_addr");
-    drop(probe);
+    // `true` = the app claims the health name (the cluster collides on its
+    // first registration), `false` = it claims the metrics name (the cluster
+    // collides on its second — the case that used to leave residue behind).
+    for app_claims_health in [true, false] {
+        // A port we know is free, so a leaked node is observable as a port that
+        // never comes back.
+        let probe = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a probe port");
+        let bind_addr = probe.local_addr().expect("probe local_addr");
+        drop(probe);
 
-    let config = ClusterConfig {
-        bind_addr: bind_addr.to_string(),
-        ..cluster_config(Vec::new())
-    };
-    let app = TestApp::new().config(app_config(config.clone())).build();
-    let shutdown = CancellationToken::new();
+        let config = ClusterConfig {
+            bind_addr: bind_addr.to_string(),
+            ..cluster_config(Vec::new())
+        };
+        let app = TestApp::new().config(app_config(config.clone())).build();
+        let shutdown = CancellationToken::new();
 
-    app.state()
-        .health_indicator_registry()
-        .register(
-            "cluster:membership",
-            autumn_web::actuator::IndicatorGroup::Readiness,
-            std::sync::Arc::new(Impostor),
-        )
-        .expect("the app must be able to register its own indicator first");
+        if app_claims_health {
+            app.state()
+                .health_indicator_registry()
+                .register(
+                    "cluster:membership",
+                    autumn_web::actuator::IndicatorGroup::Readiness,
+                    std::sync::Arc::new(Impostor),
+                )
+                .expect("the app must be able to register its own indicator first");
+        } else {
+            app.state()
+                .metrics_source_registry()
+                .register("cluster:membership", std::sync::Arc::new(Impostor))
+                .expect("the app must be able to register its own source first");
+        }
 
-    let result = install_from_config(app.state(), &config, &shutdown);
-    assert!(
-        result.is_err(),
-        "installing over an app-registered cluster:membership indicator must \
-         fail the boot, not warn and run unobservably; got {result:?}"
-    );
-    let message = result
-        .err()
-        .map(|error| error.to_string())
-        .unwrap_or_default();
-    assert!(
-        message.contains("cluster:membership"),
-        "the error must name the colliding registration so an operator can \
-         rename theirs; got {message:?}"
-    );
-    assert!(
-        app.state().extension::<ClusterHandle>().is_none(),
-        "a refused install must leave no ClusterHandle behind"
-    );
+        let result = install_from_config(app.state(), &config, &shutdown);
+        assert!(
+            result.is_err(),
+            "installing over an app-registered cluster:membership component \
+             (health = {app_claims_health}) must fail the boot, not warn and \
+             run unobservably; got {result:?}"
+        );
+        let message = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(
+            message.contains("cluster:membership"),
+            "the error must name the colliding registration so an operator can \
+             rename theirs; got {message:?}"
+        );
+        assert!(
+            app.state().extension::<ClusterHandle>().is_none(),
+            "a refused install must leave no ClusterHandle behind"
+        );
 
-    // …and the node it had already started must have been shut down: its
-    // listener has to give the port back.
-    poll_until(CONVERGE_TIMEOUT, || async move {
-        TcpListener::bind(bind_addr).await.is_ok()
-    })
-    .await;
-    assert!(
-        TcpListener::bind(bind_addr).await.is_ok(),
-        "the refused install must cancel the node it started — a listener still \
-         holding {bind_addr} means a whole node is gossiping behind a boot that \
-         reported failure"
-    );
+        // No residue: after the refusal exactly the app's own registration is
+        // there and nothing of the cluster's, so the operator's retry — after
+        // renaming their component — finds the name free in both registries.
+        assert_eq!(
+            app.state()
+                .health_indicator_registry()
+                .contains("cluster:membership"),
+            app_claims_health,
+            "a refused install must leave the health registry exactly as it \
+             found it: registering the indicator and then failing on the \
+             metrics name strands an always-UP component describing a \
+             cancelled node, and blocks the retry that fixes the collision"
+        );
+        assert_eq!(
+            app.state()
+                .metrics_source_registry()
+                .contains("cluster:membership"),
+            !app_claims_health,
+            "a refused install must leave the metrics registry exactly as it \
+             found it"
+        );
 
-    shutdown.cancel();
+        // …and no node may be left running: the listener has to give the port
+        // back (it is never started at all now that both names are checked
+        // first, which is the same observation from the operator's side).
+        poll_until(CONVERGE_TIMEOUT, || async move {
+            TcpListener::bind(bind_addr).await.is_ok()
+        })
+        .await;
+        assert!(
+            TcpListener::bind(bind_addr).await.is_ok(),
+            "a refused install must leave nothing on {bind_addr} — a listener \
+             still holding it means a whole node is gossiping behind a boot \
+             that reported failure"
+        );
+
+        shutdown.cancel();
+    }
 }
 
 // ── Guard: off means off ─────────────────────────────────────────────────────

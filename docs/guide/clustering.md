@@ -664,7 +664,14 @@ incremented each counter name, and each node keeps one replay-watermark row
 per distinct sender it has accepted a frame from. Member records are pruned
 after their tombstone window, and the pruned member's watermark row goes with
 it — a member is forgotten whole, which is what lets it come back (see
-Refutation above). **Counter cells are not pruned**: dropping one would make
+Refutation above). A node does keep one small local note per pruned member —
+the `(node id, incarnation)` it collected — for twice the tombstone window, and
+refuses to re-adopt that departure at that incarnation or lower while the note
+lasts; without it two peers pruning at different times re-teach each other the
+same `Left` record indefinitely and departed ids never actually leave. The note
+is local garbage collection, never gossiped, and never applied to a higher
+incarnation, so a rejoining node is unaffected. **Counter cells are not
+pruned**: dropping one would make
 `get()` move downward. The consequence is operational: every boot that
 increments a counter leaves one `u64` cell behind, and a node with no
 configured `node_id` additionally mints a fresh member id per restart. Set an

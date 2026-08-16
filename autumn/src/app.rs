@@ -4432,30 +4432,47 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
+        // How much of `shutdown_timeout_secs` the drain has spent so far,
+        // measured on the injected clock from the instant phase 5 recorded.
+        // Read twice below — once for the departure wait, once for the hook
+        // budget — because everything after the drain shares that one budget.
+        let elapsed_since_drain_start = || {
+            drain_started_at
+                .get()
+                .map_or(std::time::Duration::ZERO, |started| {
+                    drain_clock.monotonic().saturating_duration_since(*started)
+                })
+        };
+        let shutdown_budget = std::time::Duration::from_secs(shutdown_timeout);
+
         // Phase 6b: the cluster departs only now, once no request can still be
         // running — an increment accepted during the drain must have a push
-        // loop left to replicate it. The departure itself is bounded by
-        // `LEAVE_BUDGET` inside the node, and this waits exactly that long so
-        // the notice reaches the peer before the process tears down. Both fit
-        // inside the shutdown budget the hooks below share; a shutdown that
-        // overran its deadline never gets here, and the peer then converges on
-        // the suspicion timeout, which is the actual contract.
+        // loop left to replicate it. Ordering, all inside the one
+        // `shutdown_timeout_secs` budget: drain → departure → hooks. The
+        // departure itself is bounded by `LEAVE_BUDGET` inside the node, and
+        // this waits for it — but only for what the drain left of the budget
+        // (`cluster_departure_wait`), because a supervisor times the process
+        // out on `shutdown_timeout_secs` and an unconditional wait after a slow
+        // drain would push past it. The hook budget below subtracts this wait
+        // with the same clock reading, so the three phases add up to the budget
+        // rather than to budget + `LEAVE_BUDGET`. A departure that is budgeted
+        // away leaves the peer to converge on the suspicion timeout, which is
+        // the actual contract.
         if config.cluster.enabled {
             cluster_shutdown.cancel();
-            tokio::time::sleep(crate::cluster::LEAVE_BUDGET).await;
+            let departure_wait =
+                cluster_departure_wait(shutdown_budget, elapsed_since_drain_start());
+            if !departure_wait.is_zero() {
+                tokio::time::sleep(departure_wait).await;
+            }
         }
 
         // Phase 7: run on_shutdown hooks within the *remaining* portion of
-        // shutdown_timeout_secs (drain + hooks share one budget, not two).
+        // shutdown_timeout_secs (drain + departure + hooks share one budget,
+        // not three).
         // Plugin ordering: plugins register during build() before app hooks,
         // so app hooks run before plugin hooks (LIFO = last-registered first).
-        let drain_elapsed = drain_started_at
-            .get()
-            .map_or(std::time::Duration::ZERO, |started| {
-                drain_clock.monotonic().saturating_duration_since(*started)
-            });
-        let hook_budget =
-            std::time::Duration::from_secs(shutdown_timeout).saturating_sub(drain_elapsed);
+        let hook_budget = shutdown_budget.saturating_sub(elapsed_since_drain_start());
         run_shutdown_hooks_with_timeout(&shutdown_hooks, hook_budget, hook_budget).await;
         // If request drain consumed the whole `shutdown_timeout_secs`, the
         // managed-Postgres `on_shutdown` hook may have been budgeted away above.
@@ -7337,6 +7354,26 @@ fn prepare_unix_socket_path(path: &std::path::Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// How long to wait for the cluster's departure notice, given how much of the
+/// shutdown budget the request drain already spent.
+///
+/// The departure itself is bounded by `LEAVE_BUDGET` inside the node; this
+/// clamps the *wait* to what is left of `shutdown_timeout_secs`, so the leave
+/// notice is a slice of the shutdown budget rather than an extension of it.
+/// Without the clamp a drain that ran to its deadline would still be followed
+/// by a full `LEAVE_BUDGET` sleep, and a supervisor timing the process out at
+/// `shutdown_timeout_secs` could `SIGKILL` it mid-hook.
+///
+/// Returns zero when the drain has already consumed the budget: the departure
+/// is skipped and the peer converges on the suspicion timeout, which is the
+/// documented contract for a shutdown that overran.
+fn cluster_departure_wait(
+    shutdown_budget: std::time::Duration,
+    drain_elapsed: std::time::Duration,
+) -> std::time::Duration {
+    crate::cluster::LEAVE_BUDGET.min(shutdown_budget.saturating_sub(drain_elapsed))
 }
 
 async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
@@ -10989,6 +11026,65 @@ mod tests {
             "the cluster must not ride server_shutdown: that token fires when \
              the listener closes, with the request drain still ahead of it"
         );
+    }
+
+    /// …and it must depart *inside* the shutdown budget, not after it.
+    ///
+    /// Drain, departure and `on_shutdown` hooks share one
+    /// `shutdown_timeout_secs`: a supervisor that times the process out at that
+    /// deadline `SIGKILL`s whatever is still running. An unconditional
+    /// `LEAVE_BUDGET` sleep between the drain and the hooks would make the
+    /// worst case `shutdown_timeout_secs + LEAVE_BUDGET`, so the wait is
+    /// clamped to the budget the drain left over.
+    #[test]
+    fn the_cluster_departure_wait_fits_inside_the_shutdown_budget() {
+        use std::time::Duration;
+
+        let budget = Duration::from_secs(30);
+
+        // A fast drain: the departure gets its whole budget…
+        let quick = Duration::from_secs(1);
+        assert_eq!(
+            cluster_departure_wait(budget, quick),
+            crate::cluster::LEAVE_BUDGET,
+            "a drain that finished early must leave room for the full departure"
+        );
+
+        // …but never more than the node itself will spend on it.
+        assert!(
+            cluster_departure_wait(budget, Duration::ZERO) <= crate::cluster::LEAVE_BUDGET,
+            "waiting longer than LEAVE_BUDGET would idle past the node's own bound"
+        );
+
+        // A drain that ran to the deadline gets no departure at all: the peer
+        // converges on the suspicion timeout instead.
+        assert_eq!(
+            cluster_departure_wait(budget, budget),
+            Duration::ZERO,
+            "a drain that consumed the budget must not buy extra shutdown time"
+        );
+        assert_eq!(
+            cluster_departure_wait(budget, budget.saturating_add(Duration::from_secs(5))),
+            Duration::ZERO,
+            "an overrun drain must saturate, not wrap into a fresh wait"
+        );
+
+        // The property the finding is about: drain, departure and hooks are one
+        // budget. `hook_budget` is `budget - elapsed` measured *after* the
+        // departure wait, so whatever the drain leaves over has to cover both
+        // of the phases that follow it — never budget + LEAVE_BUDGET.
+        for elapsed_ms in [0_u64, 250, 29_800, 29_999, 30_000, 45_000] {
+            let drained = Duration::from_millis(elapsed_ms);
+            let departure = cluster_departure_wait(budget, drained);
+            let hooks = budget.saturating_sub(drained.saturating_add(departure));
+            let left_by_the_drain = budget.saturating_sub(drained);
+            assert!(
+                departure.saturating_add(hooks) <= left_by_the_drain,
+                "after a {drained:?} drain only {left_by_the_drain:?} of the \
+                 {budget:?} budget is left, but the departure ({departure:?}) \
+                 and hooks ({hooks:?}) would spend more"
+            );
+        }
     }
 
     #[test]
