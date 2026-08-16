@@ -92,27 +92,57 @@ pub struct AdminOptions {
     pub encrypted_deterministic: Vec<String>,
 }
 
-/// The expression that binds `field`'s submitted value in a raw
-/// `col.eq(…)` update tuple (issue #1340).
+/// The generated statement that back-fills absent encrypted keys before the
+/// submitted form map is deserialized into `New{Model}` (issue #1340), or an
+/// empty string when the model has no encrypted column.
 ///
-/// A plaintext column binds `new_row.<field>` unchanged. An at-rest encrypted
-/// one is wrapped in the same `autumn_web::encryption` type the `#[model]`
-/// macro puts behind `serialize_as`, so the raw write encrypts identically to
-/// every other path instead of storing plaintext.
-fn encrypted_bind_expr(field: &str, options: &AdminOptions) -> String {
-    let owned = format!("new_row.{field}");
-    if !admin_field_is_encrypted(options, field) {
-        return owned;
+/// The admin edit form renders an encrypted column as a disabled control with
+/// no `name` attribute — it is managed outside the admin — so the submitted map
+/// simply has no key for it. `New{Model}` nevertheless requires one (the
+/// encrypted field is a non-null `String`), so `serde_json::from_value` failed
+/// with a "missing field" error and EVERY edit 422'd, even one touching only a
+/// plaintext column.
+///
+/// The placeholder exists purely to satisfy that deserialization. It can never
+/// reach the database: [`is_update_writable`] excludes encrypted columns, so no
+/// update path ever reads the field back off `new_row`.
+fn encrypted_placeholder_stmt(options: &AdminOptions) -> String {
+    use std::fmt::Write as _;
+    let mut encrypted: Vec<&str> = options
+        .encrypted
+        .iter()
+        .chain(options.encrypted_visible.iter())
+        .map(String::as_str)
+        .collect();
+    encrypted.sort_unstable();
+    encrypted.dedup();
+    if encrypted.is_empty() {
+        return String::new();
     }
-    let wrapper = if options.encrypted_deterministic.iter().any(|c| c == field) {
-        "DeterministicText"
-    } else {
-        "RandomizedText"
-    };
-    format!("autumn_web::encryption::{wrapper}::from({owned})")
+    let mut keys = String::new();
+    for (i, col) in encrypted.iter().enumerate() {
+        if i > 0 {
+            keys.push_str(", ");
+        }
+        let _ = write!(keys, "\"{col}\"");
+    }
+    format!(
+        "            // The edit form renders at-rest encrypted columns as a disabled\n\
+         \t\t\t// control with NO `name` (they are managed outside the admin), so the\n\
+         \t\t\t// submitted map has no key for them — but `New{{Model}}` requires one.\n\
+         \t\t\t// These placeholders only satisfy deserialization: encrypted columns are\n\
+         \t\t\t// excluded from the update below, so the value never reaches the database.\n\
+         \t\t\tlet mut data = data;\n\
+         \t\t\tif let Some(obj) = data.as_object_mut() {{\n\
+         \t\t\t\tfor col in [{keys}] {{\n\
+         \t\t\t\t\tobj.entry(col.to_string())\n\
+         \t\t\t\t\t\t.or_insert_with(|| serde_json::Value::String(String::new()));\n\
+         \t\t\t\t}}\n\
+         \t\t\t}}\n"
+    )
 }
 
-/// Whether the backing model carries any at-rest encrypted column.
+/// Whether the backing model carries any at-rest encrypted column./// Whether the backing model carries any at-rest encrypted column.
 ///
 /// `AdminOptions::encrypted`/`encrypted_visible` are populated exclusively by
 /// [`detect_encrypted_fields`] reading the model's own AST — there is no
@@ -537,6 +567,14 @@ fn is_update_writable(
         && !is_lock_version_field(field, lock_version_field)
         && !is_default_readonly(field)
         && !matches!(field.kind, FieldKind::Bytea)
+        // Issue #1340: an at-rest encrypted column is not updatable through the
+        // admin. The plugin renders its edit control disabled and WITHOUT a
+        // `name` ("Encrypted at rest — managed outside the admin"), so the form
+        // never submits one — including it in the update would write whatever
+        // placeholder stood in for the absent key. Create still accepts an
+        // initial value: there the control is a normal input and the insert
+        // encrypts it through `serialize_as`.
+        && !admin_field_is_encrypted(options, &field.name)
 }
 
 // ── Template rendering ───────────────────────────────────────────────────────
@@ -1047,8 +1085,10 @@ fn render_update_body(
         "&diesel_changeset"
     };
 
+    let encrypted_placeholders = encrypted_placeholder_stmt(options);
     format!(
-        "            let new_row: New{pascal_name} =\n\
+        "{encrypted_placeholders}\
+         \t\t\tlet new_row: New{pascal_name} =\n\
          \t\t\t\tserde_json::from_value(data).map_err(Self::validation_error)?;\n\
          \t\t\tlet changes = Update{pascal_name} {{\n\
          {changes_fields}\
@@ -1086,16 +1126,18 @@ fn render_lock_version_update_body(
     let mut set_fields = String::new();
     for f in &writable {
         // Issue #1340: this is a RAW `col.eq(value)` tuple — unlike the ordinary
-        // update above it never builds an `Update{Model}` changeset, so it never
-        // sees the `#[diesel(serialize_as = …)]` wrapper an `#[encrypted]` column
-        // depends on. Binding the bare value would write PLAINTEXT into the
-        // encrypted column (and the next read would fail decoding the envelope),
-        // so name the wrapper explicitly, exactly as the scaffolded HTML update
-        // handler does.
-        let value = encrypted_bind_expr(&f.name, options);
+        // update above it never builds an `Update{Model}` changeset, so it would
+        // bypass the `#[diesel(serialize_as = …)]` wrapper an `#[encrypted]`
+        // column depends on and write PLAINTEXT into it. `is_update_writable`
+        // keeps encrypted columns out of `writable` entirely (the edit form
+        // cannot submit them), so no such column reaches this loop.
+        debug_assert!(
+            !admin_field_is_encrypted(options, &f.name),
+            "an encrypted column must never reach the raw lock-version set tuple"
+        );
         let _ = writeln!(
             set_fields,
-            "                    {plural}::{name}.eq({value}),",
+            "                    {plural}::{name}.eq(new_row.{name}),",
             name = f.name
         );
     }
@@ -1104,8 +1146,10 @@ fn render_lock_version_update_body(
         "                    {plural}::{lock_version_field}.eq({plural}::{lock_version_field} + 1),"
     );
 
+    let encrypted_placeholders = encrypted_placeholder_stmt(options);
     format!(
-        "            let new_row: New{pascal_name} =\n\
+        "{encrypted_placeholders}\
+         \t\t\tlet new_row: New{pascal_name} =\n\
          \t\t\t\tserde_json::from_value(data).map_err(Self::validation_error)?;\n\
          \t\t\tlet mut conn = pool.get().await.map_err(Self::pool_error)?;\n\
          \t\t\tlet updated = diesel::update({plural}::table.find(id))\n\
@@ -2460,14 +2504,27 @@ pub struct Account {
         assert!(admin.contains(".set(&diesel_changeset)"), "admin: {admin}");
     }
 
-    /// The `lock_version` update path writes a RAW `col.eq(value)` tuple that
-    /// never builds an `Update{Model}` changeset, so it never sees `serialize_as`.
-    /// Binding the bare value there would store PLAINTEXT in the encrypted
-    /// column — the same defect already fixed in the scaffolded HTML update
-    /// handler. Each mode must name its own wrapper.
+    /// An at-rest encrypted column is never updatable through the admin, on
+    /// either update path.
+    ///
+    /// The plugin renders its edit control disabled and with NO `name`
+    /// ("managed outside the admin"), so the form cannot submit one. Two things
+    /// follow, and both are asserted here:
+    ///
+    /// 1. The column must be absent from the update — otherwise the handler
+    ///    would write whatever stood in for the key it never received. On the
+    ///    `lock_version` path that matters twice over: it emits a RAW
+    ///    `col.eq(value)` tuple that never builds an `Update{Model}` changeset,
+    ///    so it would bypass `serialize_as` and store PLAINTEXT in the
+    ///    encrypted column — the same defect this PR fixed in the scaffolded
+    ///    HTML update handler.
+    /// 2. `New{Model}` still requires the field, so the handler must back-fill
+    ///    a placeholder or `serde_json::from_value` fails with
+    ///    "missing field" and EVERY edit 422s, even one touching only a
+    ///    plaintext column.
     #[test]
-    fn admin_lock_version_update_binds_encrypted_columns_through_the_wrapper() {
-        let model_source = "#[autumn_web::model]\n\
+    fn admin_never_updates_encrypted_columns_on_either_path() {
+        let encrypted_model = "#[autumn_web::model]\n\
             pub struct Account {\n\
             \x20   #[id]\n\
             \x20   pub id: i64,\n\
@@ -2475,49 +2532,76 @@ pub struct Account {
             \x20   #[encrypted]\n\
             \x20   pub api_token: String,\n\
             \x20   #[encrypted(deterministic)]\n\
-            \x20   pub email: String,\n\
-            \x20   #[lock_version]\n\
-            \x20   pub lock_version: i32,\n\
+            \x20   pub email: String,\n";
+        let tokens = [
+            "username:String".to_owned(),
+            "api_token:String{encrypted}".to_owned(),
+            "email:String{encrypted:deterministic}".to_owned(),
+        ];
+
+        // Both the ordinary changeset path and the `lock_version` raw-tuple path.
+        for (suffix, extra_token) in [
+            ("}\n", None),
+            (
+                "\x20   #[lock_version]\n\x20   pub lock_version: i32,\n}\n",
+                Some("lock_version:i32".to_owned()),
+            ),
+        ] {
+            let tmp = project_with_model_source("account", &format!("{encrypted_model}{suffix}"));
+            let mut tokens = tokens.to_vec();
+            tokens.extend(extra_token);
+            let admin =
+                admin_adapter_contents(&plan_admin(tmp.path(), "Account", &tokens).unwrap());
+
+            // (1) No update path may reference an encrypted column's value.
+            for leaked in [
+                "api_token: Patch::Set",
+                "email: Patch::Set",
+                "accounts::api_token.eq(",
+                "accounts::email.eq(",
+            ] {
+                assert!(
+                    !admin.contains(leaked),
+                    "encrypted column must not be updated: `{leaked}`\n{admin}"
+                );
+            }
+            // The plaintext sibling still updates.
+            assert!(
+                admin.contains("username: Patch::Set(new_row.username)")
+                    || admin.contains("accounts::username.eq(new_row.username)"),
+                "the plaintext column must still update:\n{admin}"
+            );
+            // (2) The placeholder back-fill keeps `New{Model}` deserializable.
+            assert!(
+                admin.contains("obj.entry(col.to_string())"),
+                "the handler must back-fill absent encrypted keys:\n{admin}"
+            );
+            for col in ["\"api_token\"", "\"email\""] {
+                assert!(
+                    admin.contains(col),
+                    "the back-fill must name {col}:\n{admin}"
+                );
+            }
+        }
+    }
+
+    /// A plaintext model emits no back-fill at all — the whole block is absent,
+    /// so those admins stay byte-for-byte as before.
+    #[test]
+    fn admin_over_a_plaintext_model_emits_no_encrypted_placeholder() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Account {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   pub username: String,\n\
             }\n";
         let tmp = project_with_model_source("account", model_source);
         let admin = admin_adapter_contents(
-            &plan_admin(
-                tmp.path(),
-                "Account",
-                &[
-                    "username:String".to_owned(),
-                    "api_token:String{encrypted}".to_owned(),
-                    "email:String{encrypted:deterministic}".to_owned(),
-                    "lock_version:i32".to_owned(),
-                ],
-            )
-            .unwrap(),
+            &plan_admin(tmp.path(), "Account", &["username:String".to_owned()]).unwrap(),
         );
-
+        assert!(!admin.contains("let mut data = data;"), "admin: {admin}");
         assert!(
-            admin.contains(
-                "accounts::api_token.eq(autumn_web::encryption::RandomizedText::from(new_row.api_token))"
-            ),
-            "randomized column must bind through its wrapper:\n{admin}"
-        );
-        assert!(
-            admin.contains(
-                "accounts::email.eq(autumn_web::encryption::DeterministicText::from(new_row.email))"
-            ),
-            "deterministic column must bind through its wrapper:\n{admin}"
-        );
-        for plaintext_bind in [
-            "accounts::api_token.eq(new_row.api_token)",
-            "accounts::email.eq(new_row.email)",
-        ] {
-            assert!(
-                !admin.contains(plaintext_bind),
-                "a plaintext bind for an encrypted column leaked: `{plaintext_bind}`\n{admin}"
-            );
-        }
-        // The plaintext sibling keeps the ordinary bind.
-        assert!(
-            admin.contains("accounts::username.eq(new_row.username)"),
+            admin.contains("username: Patch::Set(new_row.username)"),
             "admin: {admin}"
         );
     }

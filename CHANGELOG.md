@@ -15,10 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   owned value once a column uses `#[diesel(serialize_as = …)]`, as every
   encrypted field does. Both now pass owned records when the model has an
   encrypted column; plaintext models keep the borrowed form byte-for-byte.
-  Separately, the `lock_version` update path writes a raw `col.eq(value)` tuple
-  that never builds an `Update{Model}` changeset, so it bypassed the encrypting
-  wrapper entirely and stored **plaintext** in the encrypted column; it now
-  binds through `RandomizedText`/`DeterministicText` like every other write.
+  Separately, **every admin edit of such a model failed**: the plugin renders an
+  encrypted column's edit control disabled and with no `name` (it is managed
+  outside the admin), so the form submits no key for it, while the handler
+  deserialized the submitted map into `New{Model}`, where the encrypted `String`
+  is required — so `serde_json::from_value` returned a "missing field" error even
+  when only a plaintext column was edited. Encrypted columns are now excluded
+  from the update entirely (matching what the form can actually submit), and the
+  handler back-fills a placeholder purely to satisfy that deserialization. That
+  exclusion also closes a plaintext write: the `lock_version` update path emits a
+  raw `col.eq(value)` tuple that never builds an `Update{Model}` changeset, so it
+  would have bypassed the encrypting wrapper and stored **plaintext** in the
+  encrypted column.
 
 - **`#[repository]` with hooks over an `#[encrypted]` model:** a repository
   declared `broadcasts = true` (or with an explicit `hooks = …` type) over a
