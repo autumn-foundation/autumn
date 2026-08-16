@@ -31,13 +31,15 @@ pub struct RetentionOptions<'a> {
 
 /// One model's dry-run report, deserialized from the app's
 /// `AUTUMN_RETENTION_DRY_RUN=1` stdout — mirrors
-/// `autumn_web::retention::RetentionSweepReport`.
+/// `autumn_web::retention::RetentionSweepReport`. Every report this command
+/// prints is a dry run by construction, so `dry_run` (present in the app's
+/// JSON) is intentionally not modeled here — `Deserialize` ignores unknown
+/// fields by default.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetentionSweepReport {
     pub model: String,
     pub rows_swept: u64,
     pub duration_ms: u64,
-    pub dry_run: bool,
 }
 
 /// Run `autumn retention`.
@@ -135,7 +137,6 @@ mod tests {
             model: "Widget".to_string(),
             rows_swept: 42,
             duration_ms: 7,
-            dry_run: true,
         }]);
 
         assert!(table.contains("Widget"));
@@ -149,13 +150,11 @@ mod tests {
                 model: "Zeta".to_string(),
                 rows_swept: 1,
                 duration_ms: 1,
-                dry_run: true,
             },
             RetentionSweepReport {
                 model: "Alpha".to_string(),
                 rows_swept: 2,
                 duration_ms: 2,
-                dry_run: true,
             },
         ]);
 
