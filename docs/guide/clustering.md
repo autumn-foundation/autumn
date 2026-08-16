@@ -693,7 +693,7 @@ lane cannot take the frame, the departure is **counted in
 `autumn_cluster_frames_dropped_total` and warned about** on the way out rather
 than being lost quietly: **a dead writer still means the suspicion path**.
 
-**Known residuals (slice 2).** Three bounded consequences of the above, none of
+**Known residuals (slice 2).** Four bounded consequences of the above, none of
 them correctness:
 
 - Pushes still queued behind a farewell are written after it and rejected by the
@@ -707,6 +707,14 @@ them correctness:
   writer gets to write it. A writer parked in a dial or a write when shutdown
   begins is cancelled at the end of the same 250 ms grace, and the peer converges
   on the suspicion timeout.
+- A stable-id node that restarts with a *backward* clock **and** a different
+  advertised address rejoins only after the tombstone and recently-pruned
+  windows expire: the incumbent's refutation pushes go to the departed boot's
+  old address, and the returning node's own pushes are dropped as replays
+  before the payload carrying its new address is read. The delay is bounded —
+  the windows expire and the node is then admitted as a fresh sender — and the
+  clean answer, an authenticated recovery exchange addressed to the frame's
+  source, is the next slice's work.
 
 **Counter volatility.** Counters live in process memory for the lifetime of the
 process. There is no persistence. A restarted node starts a fresh cell (its
