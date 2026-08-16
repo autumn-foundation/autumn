@@ -32,6 +32,18 @@
 //! sees **any** record about itself at an incarnation `>=` its own — `Left` or
 //! a stale `Alive` — adopts `observed + 1`, marks itself `Alive`, and pushes
 //! immediately. See [`ClusterState::refute`].
+//!
+//! # Every record refreshes or leaves
+//!
+//! `Left` records are pruned once their window is up, and `Alive` records are
+//! refreshed by their owner's pushes — but an `Alive` record whose owner has
+//! stopped pushing is refreshed by nothing and pruned by nothing, so it would
+//! be permanent. [`ClusterState::convert_down_members`] is that record's exit:
+//! a member this node has not heard from for a whole tombstone window — long
+//! past the suspicion timeout that took it out of the view — is written
+//! `Left` at its current incarnation and joins the ordinary tombstone
+//! lifecycle (ageing, pruning, the recently-pruned memory). The document is
+//! bounded because every record either keeps being refreshed or leaves.
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
@@ -174,16 +186,25 @@ impl ClusterState {
     ///
     /// # The recently-pruned guard
     ///
-    /// `overlay` is only *read*: a `Left` record for a member this node pruned
-    /// within the last [`PRUNE_MEMORY_WINDOW_MULTIPLE`] tombstone windows is
-    /// not re-adopted unless it carries a **higher** incarnation than the one
-    /// that was pruned. Without that, two peers pruning at different times
-    /// re-teach each other the same departure forever: A prunes, B's copy
-    /// arrives, A re-inserts it with a fresh local stamp and gossips it back,
-    /// B prunes and re-learns it from A a window later — so a departed id is
-    /// locally expirable at every step and still never leaves the cluster,
-    /// which is how a long-lived pair grows its document toward the 64 KiB
-    /// frame cap.
+    /// `overlay` is only *read*: **any** record — `Left` or `Alive` — for a
+    /// member this node pruned within the last
+    /// [`PRUNE_MEMORY_WINDOW_MULTIPLE`] tombstone windows is not re-adopted
+    /// unless it carries a **higher** incarnation than the one that was pruned.
+    /// Without that, two peers pruning at different times re-teach each other
+    /// the same departure forever: A prunes, B's copy arrives, A re-inserts it
+    /// with a fresh local stamp and gossips it back, B prunes and re-learns it
+    /// from A a window later — so a departed id is locally expirable at every
+    /// step and still never leaves the cluster, which is how a long-lived pair
+    /// grows its document toward the 64 KiB frame cap.
+    ///
+    /// `Alive` is refused on the same terms because pruning forgets a member
+    /// *whole*, replay watermark included: a frame captured off the wire before
+    /// that member departed verifies again afterwards as a fresh sender, and
+    /// re-admitting the stale `Alive` self-record it carries would put a member
+    /// back in the document that nothing can refresh and only
+    /// [`convert_down_members`](Self::convert_down_members) can ever take out
+    /// again. Refusing it during the memory window keeps a replay of a departed
+    /// id from being free of charge.
     ///
     /// This is a **local garbage-collection guard, not replicated state**:
     /// nothing about it is gossiped, two nodes hold different memories of what
@@ -249,6 +270,58 @@ impl ClusterState {
         // claimed.
         observed.addr.clone_from(&own.addr);
         Some(bumped)
+    }
+
+    /// Convert every `Alive` record whose member has been silent for a whole
+    /// tombstone window — long past the suspicion timeout that made it
+    /// [`Down`](Liveness::Down) — into a `Left` record at its current
+    /// incarnation. Returns the ids converted.
+    ///
+    /// **This is the exit path an `Alive` record would otherwise not have.**
+    /// Only `Left` records are ever pruned, so without this a record that stops
+    /// being refreshed — a peer that vanished without a leave, a member learned
+    /// from a document and never heard from, or a stale self-record re-admitted
+    /// by a replayed pre-departure frame — stays in the document for the life of
+    /// the process, and repeated arrivals of departed ids ratchet it toward the
+    /// 64 KiB frame cap. Converting restores the invariant the state-growth
+    /// bound needs: every record either keeps being refreshed or leaves.
+    ///
+    /// It is honestly a **local decision recorded in the replicated document**,
+    /// and deliberately so: it says exactly what the suspicion timeout already
+    /// says — *this node considers that member gone* — extended from the view to
+    /// the document, and only a whole tombstone window later than the view says
+    /// it. A live node converted by mistake (a long partition) has the standing
+    /// answer: tombstones stay push targets until they are pruned, so it hears
+    /// the `Left` record about itself and [`refutes`](Self::refute) at a higher
+    /// incarnation, which outranks the conversion everywhere by merge rule 1.
+    ///
+    /// The window is [`TOMBSTONE_TIMEOUT_MULTIPLE`] suspicion timeouts of
+    /// silence — deliberately the same constant a tombstone is kept for — so a
+    /// converted member has been out of the view for nine of those ten timeouts
+    /// before its record is touched. `me`, this node's own id, is never
+    /// converted: a node records no receipts from itself, so its own record is
+    /// permanently silent and would otherwise bury itself on the first round.
+    pub fn convert_down_members(
+        &mut self,
+        me: &str,
+        overlay: &mut LivenessOverlay,
+        now: MonotonicInstant,
+    ) -> Vec<NodeId> {
+        let window = overlay.tombstone_timeout();
+        let mut converted = Vec::new();
+        for (id, record) in &mut self.members {
+            if id == me || record.status == MemberStatus::Left {
+                // Ours to publish, not to bury; and a tombstone is already on
+                // the lifecycle this converts records onto.
+                continue;
+            }
+            let quiet_since = overlay.quiet_since(id, now);
+            if now.saturating_duration_since(quiet_since) > window {
+                record.status = MemberStatus::Left;
+                converted.push(id.clone());
+            }
+        }
+        converted
     }
 
     /// Stamp the local observation time of every `Left` record, and clear the
@@ -373,6 +446,11 @@ pub struct LivenessOverlay {
     /// apart from `last_seen` on purpose: see
     /// [`ClusterState::observe_tombstones`].
     tombstoned_at: BTreeMap<NodeId, MonotonicInstant>,
+    /// `node -> when this node first went looking for a receipt from that
+    /// member and found none`. Only members with no receipt at all appear here
+    /// (see [`quiet_since`](Self::quiet_since)); everyone else ages against
+    /// `last_seen`, which is better evidence and needs no bookkeeping.
+    unheard_since: BTreeMap<NodeId, MonotonicInstant>,
     /// `node -> (incarnation collected, when it was collected)`. What this node
     /// has already pruned, remembered for
     /// [`PRUNE_MEMORY_WINDOW_MULTIPLE`] tombstone windows so a peer that prunes
@@ -389,6 +467,7 @@ impl LivenessOverlay {
             suspicion_timeout,
             last_seen: BTreeMap::new(),
             tombstoned_at: BTreeMap::new(),
+            unheard_since: BTreeMap::new(),
             recently_pruned: BTreeMap::new(),
         }
     }
@@ -411,6 +490,28 @@ impl LivenessOverlay {
     pub fn forget(&mut self, node: &str) {
         self.last_seen.remove(node);
         self.tombstoned_at.remove(node);
+        self.unheard_since.remove(node);
+    }
+
+    /// The last moment this node had evidence that `node` was there — what
+    /// [`ClusterState::convert_down_members`] measures its window against.
+    ///
+    /// A receipt is that evidence whenever there is one, so a member that
+    /// answers starts its silence over on its own, with no bookkeeping to keep
+    /// in step and no cadence to depend on. A member with **no** receipt at all
+    /// — learned from a peer's document and never heard from, or re-admitted
+    /// after a prune forgot its receipts — is stamped the first time it is
+    /// asked about and never re-stamped while it stays unheard: it is precisely
+    /// the member with nothing to age against, and precisely the one this bound
+    /// exists for.
+    fn quiet_since(&mut self, node: &str, now: MonotonicInstant) -> MonotonicInstant {
+        if let Some(seen) = self.last_receipt(node) {
+            // The stamp goes with it: a member that spoke is not unheard any
+            // more, and a stale stamp would otherwise outlive its silence.
+            self.unheard_since.remove(node);
+            return seen;
+        }
+        *self.unheard_since.entry(node.to_owned()).or_insert(now)
     }
 
     /// Remember that `node`'s tombstone at `incarnation` was collected at `at`.
@@ -435,18 +536,19 @@ impl LivenessOverlay {
             .retain(|_, (_, at)| now.saturating_duration_since(*at) <= window);
     }
 
-    /// Whether `record` is a tombstone this node has already collected and is
-    /// still within its window of remembering.
+    /// Whether `record` is one this node has already collected and is still
+    /// within its window of remembering.
     ///
-    /// `Alive` records are never refused — a returning node teaches its own
-    /// liveness, and a higher incarnation always outranks what was collected,
-    /// so the guard can only withhold a departure this node already processed.
-    /// See [`ClusterState::merge`] for why that is a garbage-collection
-    /// decision rather than a merge rule.
+    /// Status does not matter: a stale `Alive` at the collected incarnation is
+    /// a replayed pre-departure frame (or a peer that has not pruned yet), and
+    /// re-adopting it is what puts a member back in the document that nothing
+    /// refreshes. What the guard *cannot* withhold is a **higher** incarnation,
+    /// which is the only thing a genuine rejoin ever argues at — boot seeding is
+    /// Unix milliseconds, and a refutation bumps past whatever it saw — so a
+    /// node that came back is never held out by what this node collected about
+    /// its previous life. See [`ClusterState::merge`] for why that is a
+    /// garbage-collection decision rather than a merge rule.
     fn refuses_readoption(&self, node: &str, record: &MemberRecord, now: MonotonicInstant) -> bool {
-        if record.status != MemberStatus::Left {
-            return false;
-        }
         let window = self.prune_memory_window();
         self.recently_pruned
             .get(node)
@@ -886,6 +988,13 @@ mod tests {
     /// `PRUNE_MEMORY_WINDOW_MULTIPLE` windows and refuses to re-adopt it — a
     /// local garbage-collection guard, never replicated, and never applied to a
     /// higher incarnation, which is a genuine rejoin rather than an echo.
+    ///
+    /// The second bug it pins (case 5): the refusal covers `Alive` records on
+    /// the same terms. Pruning forgets the departed sender's replay watermark
+    /// with its record, so a frame captured off the wire before that member
+    /// departed verifies again afterwards — and if its stale `Alive`
+    /// self-record were re-adopted, the member would be back in the document
+    /// with nothing left to refresh it, one replayed frame at a time.
     #[test]
     fn pruned_tombstones_are_not_re_adopted_during_the_memory_window() {
         let window = SUSPICION.saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE);
@@ -961,6 +1070,213 @@ mod tests {
             "a LATER departure outranks the collected one and must propagate \
              normally; refusing it would strand a real leave; observed \
              {departing_again:?}"
+        );
+
+        // 5. A stale ALIVE at the collected incarnation — a pre-departure frame
+        //    captured off the wire and replayed after pruning forgot the
+        //    sender's watermark, so it verifies and merges — is refused on the
+        //    same terms, for the whole window and no longer.
+        let replayed_alive = {
+            let mut document = ClusterState::default();
+            document.members.insert(
+                "node-b".to_owned(),
+                MemberRecord::alive("127.0.0.1:7002", 9),
+            );
+            document
+        };
+        let (mut replayed, overlay) = after_collecting_node_b(pruned_at);
+        replayed.merge(&replayed_alive, &overlay, at(pruned_at.saturating_add(1)));
+        assert!(
+            !replayed.members.contains_key("node-b"),
+            "a replayed Alive record at the collected incarnation must be \
+             refused too: re-admitting it puts a member back in the document \
+             that no push refreshes and no prune collects, so replaying one \
+             captured frame per departed id grows the document toward the \
+             frame cap without knowing the secret; observed {replayed:?}"
+        );
+        replayed.merge(&replayed_alive, &overlay, at(inside.saturating_add(1)));
+        assert!(
+            replayed.members.contains_key("node-b"),
+            "…and the guard is still only a memory: past its window the join \
+             is a join again, and what it re-learns leaves on its own (see \
+             `members_down_for_a_tombstone_window_are_recorded_as_left`); \
+             observed {replayed:?}"
+        );
+    }
+
+    /// The exit path an `Alive` record would otherwise not have: a member this
+    /// node has read as `Down` for a whole tombstone window is written `Left` at
+    /// its current incarnation, and then prunes like any other tombstone.
+    ///
+    /// The bug this pins: only `Left` records are ever pruned, so an `Alive`
+    /// record nothing refreshes — a peer that vanished without a leave, a
+    /// member learned from a document and never heard from, a stale self-record
+    /// re-admitted by a replayed pre-departure frame — stays in the document for
+    /// the life of the process. Without this conversion the state-growth bound
+    /// has no invariant to stand on.
+    #[test]
+    fn members_down_for_a_tombstone_window_are_recorded_as_left() {
+        let window = SUSPICION.saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE);
+        let window_ms = u64::try_from(window.as_millis()).expect("the window fits in a u64 of ms");
+        // Comfortably past the suspicion timeout, so the member is out of the
+        // view on the first housekeeping round below.
+        let out_of_view = 3_000;
+
+        let mut overlay = LivenessOverlay::new(PUSH, SUSPICION);
+        overlay.record_receipt("node-b", at(0));
+        let mut state = ClusterState::default();
+        state.members.insert(
+            "node-a".to_owned(),
+            MemberRecord::alive("127.0.0.1:7001", 4),
+        );
+        state.members.insert(
+            "node-b".to_owned(),
+            MemberRecord::alive("127.0.0.1:7002", 9),
+        );
+        // A member learned from a peer's document that has never sent this node
+        // a frame: no receipt to age against, and exactly the record a replayed
+        // pre-departure frame leaves behind once its watermark was forgotten.
+        state.members.insert(
+            "node-c".to_owned(),
+            MemberRecord::alive("127.0.0.1:7003", 2),
+        );
+
+        assert_eq!(
+            overlay.liveness("node-b", at(out_of_view)),
+            Liveness::Down,
+            "sanity: the member must already be Down here, or the assertions \
+             below cannot tell the view's timeout from the document's window"
+        );
+        assert_eq!(
+            state.convert_down_members("node-a", &mut overlay, at(out_of_view)),
+            Vec::<String>::new(),
+            "a member that has only just gone Down is out of the VIEW, not out \
+             of the document — converting at the suspicion timeout would \
+             tombstone a peer that missed three pushes; observed {state:?}"
+        );
+        assert_eq!(
+            state.convert_down_members("node-a", &mut overlay, at(window_ms)),
+            Vec::<String>::new(),
+            "…and it keeps its record for the whole window; observed {state:?}"
+        );
+
+        let converted_at = window_ms.saturating_add(1);
+        assert_eq!(
+            state.convert_down_members("node-a", &mut overlay, at(converted_at)),
+            vec!["node-b".to_owned()],
+            "past a whole tombstone window of silence the record must become a \
+             tombstone, or it never leaves the document at all; observed {state:?}"
+        );
+        assert_eq!(
+            state.members.get("node-b"),
+            Some(&MemberRecord::left("127.0.0.1:7002", 9)),
+            "the conversion must keep the record's incarnation and address: a \
+             live node wrongly converted refutes at incarnation + 1, which is \
+             the argument that undoes this everywhere; observed {state:?}"
+        );
+        assert_eq!(
+            state.members.get("node-a").map(|record| record.status),
+            Some(MemberStatus::Alive),
+            "this node's OWN record must never be converted — a node records no \
+             receipts from itself, so its own record is permanently silent and \
+             would bury itself on the first round; observed {state:?}"
+        );
+
+        // The never-heard member ages from the first round that looked for a
+        // receipt and found none, not from an instant it never had.
+        assert_eq!(
+            state.members.get("node-c").map(|record| record.status),
+            Some(MemberStatus::Alive),
+            "a member with no receipt at all must still get its whole window; \
+             observed {state:?}"
+        );
+        assert_eq!(
+            state.convert_down_members(
+                "node-a",
+                &mut overlay,
+                at(out_of_view.saturating_add(window_ms).saturating_add(1)),
+            ),
+            vec!["node-c".to_owned()],
+            "…and must then convert too: a record nothing has ever refreshed is \
+             precisely the record no prune can reach; observed {state:?}"
+        );
+
+        // …and from there the ordinary tombstone lifecycle takes both out.
+        state.observe_tombstones(&mut overlay, at(converted_at));
+        assert_eq!(
+            state.prune_tombstones(&mut overlay, at(converted_at.saturating_add(window_ms))),
+            Vec::<String>::new(),
+            "sanity: a converted record ages like any tombstone, from the \
+             observation; observed {state:?}"
+        );
+        assert_eq!(
+            state.prune_tombstones(
+                &mut overlay,
+                at(converted_at
+                    .saturating_add(window_ms)
+                    .saturating_add(window_ms)),
+            ),
+            vec!["node-b".to_owned(), "node-c".to_owned()],
+            "a converted record must then PRUNE like any other tombstone — \
+             conversion without pruning only renames the leak; observed {state:?}"
+        );
+        assert_eq!(
+            state.members.keys().collect::<Vec<_>>(),
+            vec!["node-a"],
+            "only this node's own record may outlive a full window of silence; \
+             observed {state:?}"
+        );
+    }
+
+    /// The other half of the conversion contract: a member that is still being
+    /// heard from is never converted, however long the cluster has been up.
+    #[test]
+    fn a_member_that_refreshes_inside_the_window_is_never_converted() {
+        let window = SUSPICION.saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE);
+        let window_ms = u64::try_from(window.as_millis()).expect("the window fits in a u64 of ms");
+        let refreshed_at = 3_500;
+
+        let mut overlay = LivenessOverlay::new(PUSH, SUSPICION);
+        overlay.record_receipt("node-b", at(0));
+        let mut state = ClusterState::default();
+        state.members.insert(
+            "node-b".to_owned(),
+            MemberRecord::alive("127.0.0.1:7002", 9),
+        );
+
+        // A gap long enough to be Down, and then a push: the member saying it
+        // is still here.
+        assert_eq!(
+            state.convert_down_members("node-a", &mut overlay, at(3_000)),
+            Vec::<String>::new(),
+            "sanity: the member must be silent here, or the refresh below \
+             proves nothing; observed {state:?}"
+        );
+        overlay.record_receipt("node-b", at(refreshed_at));
+
+        assert_eq!(
+            state.convert_down_members("node-a", &mut overlay, at(window_ms.saturating_add(1))),
+            Vec::<String>::new(),
+            "a member that answered inside the window must not be converted on \
+             the deadline its earlier silence set: the clock is the silence \
+             since this node last heard from it, not the uptime of the cluster; \
+             observed {state:?}"
+        );
+        assert_eq!(
+            state.members.get("node-b").map(|record| record.status),
+            Some(MemberStatus::Alive),
+            "…and its record must still be Alive; observed {state:?}"
+        );
+        assert_eq!(
+            state.convert_down_members(
+                "node-a",
+                &mut overlay,
+                at(refreshed_at.saturating_add(window_ms).saturating_add(1)),
+            ),
+            vec!["node-b".to_owned()],
+            "the receipt must MOVE the deadline, not remove it — a member that \
+             answers once and then vanishes still has to leave the document; \
+             observed {state:?}"
         );
     }
 }

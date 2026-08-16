@@ -476,7 +476,11 @@ provided the peer still holds a record about it at all. Once that record has
 been pruned there is nothing left to refute, which is why pruning a member
 forgets it *whole*: the peer drops the pruned node's replay watermark along
 with its tombstone, so the returning node's next frame is judged as a fresh
-sender at whatever incarnation it carries.
+sender at whatever incarnation it carries. Its *record* still waits out the
+peer's recently-pruned note when it returns at an incarnation that peer already
+collected — which only a backward clock step produces — so that rejoin is
+adopted when the note lapses instead of on the first frame. A boot with a
+working clock carries a higher incarnation and is adopted at once.
 
 **Local liveness** is *not* replicated. Each node times the silence since it
 last accepted a frame from each peer, using the injected monotonic clock:
@@ -537,6 +541,20 @@ push to, so a watermark that outlived it would replay-drop the returning node's
 every frame with no way left to argue — a permanent partition between two nodes
 that both look healthy. A member is forgotten whole or not at all.
 
+An `Alive` record needs an exit of its own, because only `Left` records are ever
+pruned. A record nothing refreshes — a peer that vanished without a leave, a
+member learned from a peer's document and never heard from, a record re-admitted
+by a replayed frame — would otherwise stay in the document for the life of the
+process. So a member this node has not heard from for a full tombstone window
+(the same ten suspicion timeouts) is recorded as `Left` at that member's current
+incarnation, and the ordinary tombstone lifecycle takes it from there. That is a
+local decision written into the replicated document, and it says exactly what
+the suspicion timeout already says — *this node considers that member gone* —
+one whole tombstone window after the view said it. A live member recorded that
+way (a partition that outlasted the window) has the standing answer: tombstones
+stay push targets, so it hears the `Left` record about itself and refutes at a
+higher incarnation, which wins everywhere by rule 1.
+
 ### The counter
 
 `ClusterCounter` is a grow-only CRDT counter, the simplest structure that makes
@@ -596,6 +614,18 @@ it was signed at. If it names a stale incarnation, it loses the merge; if it
 somehow lands, the live node refutes at a higher incarnation and re-appears.
 Frames are authenticated but not timestamped, so replay protection is
 per-sender-sequence, not clock-based.
+
+The one replay a watermark cannot catch is a frame captured before a member
+departed and replayed after that member's record was pruned: pruning forgets the
+sender whole, watermark included, so the frame verifies again as a fresh sender.
+Two bounds answer it, and neither needs the secret to have stayed secret. While
+this node still remembers collecting that id — twice the tombstone window — the
+record is refused whatever its status, `Left` or `Alive`. Once that memory
+lapses and the record is re-learned, it is a member nothing refreshes, so a full
+tombstone window of silence records it as `Left` and it prunes like any other
+tombstone. Replaying one captured frame per departed id therefore costs bounded
+churn over one window, never a document that ratchets upward toward the frame
+cap.
 
 **Authenticated (HMAC), unencrypted.** Every frame is authenticated with
 HMAC-SHA256 over the shared secret, and unauthenticated bytes never reach a
@@ -666,11 +696,19 @@ after their tombstone window, and the pruned member's watermark row goes with
 it — a member is forgotten whole, which is what lets it come back (see
 Refutation above). A node does keep one small local note per pruned member —
 the `(node id, incarnation)` it collected — for twice the tombstone window, and
-refuses to re-adopt that departure at that incarnation or lower while the note
-lasts; without it two peers pruning at different times re-teach each other the
+refuses to re-adopt any record for that member at that incarnation or lower
+while the note lasts; without it two peers pruning at different times re-teach each other the
 same `Left` record indefinitely and departed ids never actually leave. The note
 is local garbage collection, never gossiped, and never applied to a higher
-incarnation, so a rejoining node is unaffected. **Counter cells are not
+incarnation, so a rejoining node is unaffected. An `Alive` record has an exit
+too, and it is what bounds the member table: a member this node has not heard
+from for a full tombstone window is recorded `Left` at its current incarnation
+and then prunes on the ordinary schedule (see Membership above). That covers
+every record no leave will ever arrive for — a peer that vanished, a member
+learned from a document and never heard from, or one re-admitted by replaying a
+captured pre-departure frame after its watermark was forgotten — so each such
+record costs one window of churn rather than a permanent row. Every member
+record either keeps being refreshed or leaves. **Counter cells are not
 pruned**: dropping one would make
 `get()` move downward. The consequence is operational: every boot that
 increments a counter leaves one `u64` cell behind, and a node with no

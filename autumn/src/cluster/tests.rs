@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::membership::{ClusterState, MemberRecord, TOMBSTONE_TIMEOUT_MULTIPLE};
+use super::membership::{
+    ClusterState, MemberRecord, PRUNE_MEMORY_WINDOW_MULTIPLE, TOMBSTONE_TIMEOUT_MULTIPLE,
+};
 use super::node::{ClusterNode, ClusterRuntimeConfig};
 use super::transport::{IncomingFrames, LoopbackRouter, PeerTransport};
 use super::wire::{self, ClusterMessage, RejectReason};
@@ -66,6 +68,23 @@ async fn settle(clock: &TickingClock, rounds: u32) {
     }
 }
 
+/// Push intervals in one tombstone window, plus a margin for the jitter.
+///
+/// The unit every record's lifecycle is measured in: a tombstone is kept for
+/// one of these, a member with nothing refreshing it is recorded `Left` after
+/// one, and the recently-pruned memory lasts `PRUNE_MEMORY_WINDOW_MULTIPLE` of
+/// them.
+fn window_rounds() -> u32 {
+    u32::try_from(
+        SUSPICION
+            .saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE)
+            .as_millis()
+            .saturating_div(PUSH.as_millis().max(1))
+            .saturating_add(2),
+    )
+    .unwrap_or(u32::MAX)
+}
+
 fn start_node(
     router: &LoopbackRouter,
     clock: &TickingClock,
@@ -101,6 +120,40 @@ fn start_node(
         handle,
         token,
     }
+}
+
+/// This node's replicated record for `id`, if its document still holds one.
+///
+/// The view (`member_ids`) is the overlay's answer and the document is the
+/// replicated one; a record that has gone silent leaves the first long before
+/// the second, so growth questions have to be asked here.
+fn record_of(node: &TestNode, id: &str) -> Option<MemberRecord> {
+    let state = node.handle.inner.lock_state();
+    let record = state.members.get(id).cloned();
+    drop(state);
+    record
+}
+
+/// One node's own state push, signed and framed: an `Alive` record for itself
+/// at `incarnation`, which is both what a node's first push after a boot looks
+/// like and what a frame captured off the wire replays.
+fn signed_self_push(id: &str, addr: &str, incarnation: u64, seq: u64) -> Vec<u8> {
+    let mut document = ClusterState::default();
+    document.members.insert(
+        id.to_owned(),
+        MemberRecord::alive(addr.to_owned(), incarnation),
+    );
+    wire::sign_envelope(
+        SECRET,
+        CLUSTER,
+        id,
+        incarnation,
+        seq,
+        &ClusterMessage::StatePush { state: document },
+    )
+    .as_ref()
+    .and_then(wire::encode_frame)
+    .unwrap_or_default()
 }
 
 /// Member ids as this node currently sees them, sorted for comparison.
@@ -992,22 +1045,11 @@ async fn loopback_pruned_member_rejoins_at_a_lower_incarnation() {
     // timeouts after A first observed the leave, A prunes the record.
     b.token.cancel();
     advance_time(&clock, Duration::from_millis(250)).await;
-    let window_rounds = u32::try_from(
-        SUSPICION
-            .saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE)
-            .as_millis()
-            .saturating_div(PUSH.as_millis().max(1))
-            .saturating_add(2),
-    )
-    .unwrap_or(u32::MAX);
-    settle(&clock, window_rounds).await;
+    settle(&clock, window_rounds()).await;
 
-    let still_held = {
-        let state = a.handle.inner.lock_state();
-        state.members.contains_key(&b.id)
-    };
-    assert!(
-        !still_held,
+    assert_eq!(
+        record_of(&a, &b.id),
+        None,
         "sanity: A must have pruned B's tombstone after ten suspicion timeouts, \
          or the rejoin below is testing the pre-prune path instead; {}",
         view_of(&a)
@@ -1021,36 +1063,184 @@ async fn loopback_pruned_member_rejoins_at_a_lower_incarnation() {
         "the rejoin must really be lower than the watermark A recorded \
          ({departed_incarnation}), or this test asserts nothing"
     );
-    let mut returning = ClusterState::default();
-    returning.members.insert(
-        b.id.clone(),
-        MemberRecord::alive(b.addr.clone(), rejoin_incarnation),
-    );
-    let frame = wire::sign_envelope(
-        SECRET,
-        CLUSTER,
-        &b.id,
-        rejoin_incarnation,
-        0,
-        &ClusterMessage::StatePush { state: returning },
-    )
-    .as_ref()
-    .and_then(wire::encode_frame)
-    .unwrap_or_default();
+    let push_from_b = |seq: u64| signed_self_push(&b.id, &b.addr, rejoin_incarnation, seq);
     assert!(
-        router.deliver(&b.addr, &a.addr, frame),
+        router.deliver(&b.addr, &a.addr, push_from_b(0)),
         "the returning node's push must reach A to prove anything"
     );
 
     settle(&clock, 1).await;
 
+    // The contract this test exists for: the frame is ACCEPTED. Holding the
+    // watermark past the tombstone would drop every frame the returning node
+    // sends, with no record left for it to refute — a partition no timeout
+    // ends and only an operator can break.
+    let replay_drops = a
+        .handle
+        .inner
+        .metrics
+        .rejections_by_reason()
+        .into_iter()
+        .find(|(reason, _)| *reason == "replay")
+        .map_or(u64::MAX, |(_, count)| count);
+    assert_eq!(
+        replay_drops,
+        0,
+        "a pruned member is a forgotten member: its next push must be judged as \
+         a FRESH sender, whatever incarnation it carries, or the returning node \
+         is replay-dropped for good; {}",
+        view_of(&a)
+    );
+
+    // What its RECORD then has to wait out is A's local memory of collecting
+    // that id: at an incarnation this node already pruned, a returning node
+    // and a captured pre-departure frame replayed by a stranger are the same
+    // bytes, so the guard withholds both. Bounded, and self-healing — which is
+    // what the rest of this test proves.
+    assert_eq!(
+        member_ids(&a.handle),
+        vec!["node-a".to_owned()],
+        "a record at an incarnation this node has already collected must not be \
+         re-adopted while it still remembers collecting it; {}",
+        view_of(&a)
+    );
+
+    // Past that memory (twice the tombstone window), the returning node's next
+    // push is learned normally — a real node pushes every interval, so this is
+    // the frame after the ones the guard withheld.
+    settle(
+        &clock,
+        window_rounds().saturating_mul(PRUNE_MEMORY_WINDOW_MULTIPLE),
+    )
+    .await;
+    assert!(
+        router.deliver(&b.addr, &a.addr, push_from_b(1)),
+        "the returning node's later push must reach A too"
+    );
+    settle(&clock, 1).await;
+
     assert_eq!(
         member_ids(&a.handle),
         vec!["node-a".to_owned(), "node-b".to_owned()],
-        "a pruned member is a forgotten member: its next push must be judged as \
-         a FRESH sender, whatever incarnation it carries. Holding the watermark \
-         past the tombstone leaves the returning node replay-dropped with no \
-         record left to refute — a permanent partition; {}",
+        "the memory is a bounded local note, not a permanent refusal: once it \
+         lapses the returning node rejoins on its own, with no operator and no \
+         restart; {}",
+        view_of(&a)
+    );
+
+    a.token.cancel();
+}
+
+/// A record re-admitted by a replayed frame must leave the document again —
+/// through the running loops, on the node's own clock, with nobody's help.
+///
+/// The bug this pins, end to end: pruning forgets a departed sender's replay
+/// watermark (it must — see the test above), so a frame captured off the wire
+/// before that node departed verifies again afterwards without anybody knowing
+/// the secret. If its stale `Alive` self-record is re-adopted, that member is
+/// back in a document where only `Left` records are ever pruned and nothing
+/// will ever refresh it: one captured frame per departed id, and the document
+/// ratchets toward the 64 KiB frame cap that silences the node for good.
+///
+/// Two bounded answers, both exercised here: the record is refused outright
+/// while this node still remembers collecting that id, and once that memory
+/// lapses and the record IS re-learned, a whole tombstone window of silence
+/// converts it to `Left` and the ordinary lifecycle prunes it. The cost of a
+/// replay is bounded churn over one window, not growth that never comes back.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn loopback_replayed_record_of_a_departed_member_leaves_the_document_again() {
+    let router = LoopbackRouter::new();
+    let clock = test_clock();
+
+    let a = start_node(&router, &clock, SECRET, "node-a", 1, Vec::new());
+    let b = start_node(&router, &clock, SECRET, "node-b", 2, vec![a.addr.clone()]);
+    settle(&clock, 6).await;
+    assert_converged(
+        &a,
+        &b,
+        &["node-a", "node-b"],
+        "the pair must converge before B departs, or the replay below is not a \
+         replay of anything",
+    );
+    let departed_incarnation = b.handle.incarnation();
+
+    // B departs cleanly; a window later A collects the tombstone and forgets
+    // the sender whole — record, receipts and replay watermark.
+    b.token.cancel();
+    advance_time(&clock, Duration::from_millis(250)).await;
+    settle(&clock, window_rounds()).await;
+
+    assert_eq!(
+        record_of(&a, &b.id),
+        None,
+        "sanity: A must have pruned B's tombstone, or the replay below is not \
+         hitting the forgotten-watermark path at all; {}",
+        view_of(&a)
+    );
+
+    // The captured frame: B's own pre-departure state push, signed at the
+    // incarnation it really had, replayed by anybody who saw the wire.
+    let captured_push = |seq: u64| signed_self_push(&b.id, &b.addr, departed_incarnation, seq);
+
+    assert!(
+        router.deliver(&b.addr, &a.addr, captured_push(0)),
+        "the replayed frame must reach A to prove anything"
+    );
+    settle(&clock, 1).await;
+    assert_eq!(
+        record_of(&a, &b.id),
+        None,
+        "a replayed record at an incarnation this node has already collected \
+         must not put the member back in the document; {}",
+        view_of(&a)
+    );
+
+    // Past the memory window the guard is gone by design, and the replay does
+    // land. This is the half that has to converge out on its own.
+    settle(
+        &clock,
+        window_rounds().saturating_mul(PRUNE_MEMORY_WINDOW_MULTIPLE),
+    )
+    .await;
+    assert!(
+        router.deliver(&b.addr, &a.addr, captured_push(1)),
+        "the second replayed frame must reach A too"
+    );
+    settle(&clock, 1).await;
+    assert_eq!(
+        record_of(&a, &b.id),
+        Some(MemberRecord::alive(b.addr.clone(), departed_incarnation)),
+        "sanity: past its memory window A learns the replayed record — that is \
+         the join doing its job, and it is what the rest of this test has to \
+         undo; {}",
+        view_of(&a)
+    );
+
+    // A whole tombstone window of silence from a member that will never speak
+    // again: A records what it already believes — that member is gone.
+    settle(&clock, window_rounds()).await;
+    assert_eq!(
+        record_of(&a, &b.id),
+        Some(MemberRecord::left(b.addr.clone(), departed_incarnation)),
+        "a member Down for a whole tombstone window must be recorded as Left, \
+         at its own incarnation, so the tombstone lifecycle can reach it; {}",
+        view_of(&a)
+    );
+
+    // …and from there the ordinary lifecycle finishes the job.
+    settle(&clock, window_rounds()).await;
+    assert_eq!(
+        record_of(&a, &b.id),
+        None,
+        "the converted record must then prune: a replayed frame may cost one \
+         window of churn, but it must never leave a record in the document \
+         that nothing can ever take out; {}",
+        view_of(&a)
+    );
+    assert_eq!(
+        member_ids(&a.handle),
+        vec!["node-a".to_owned()],
+        "…and the survivor's view is its own again; {}",
         view_of(&a)
     );
 

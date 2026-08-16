@@ -386,12 +386,27 @@ fn push_round(inner: &Arc<ClusterInner>, seq: &mut u64, published: &mut Incarnat
         let mut state = inner.lock_state();
         // Locks are always taken state-then-overlay, never the other way round.
         let mut overlay = inner.lock_overlay();
+        // Housekeeping, in the one order that gives every record an exit:
+        // convert, stamp, prune. A member this node has not heard from for a
+        // whole tombstone window becomes a `Left` record at its current
+        // incarnation — the only way an `Alive` record ever leaves the
+        // document, since pruning collects tombstones alone (see
+        // `ClusterState::convert_down_members`). Converting first means the
+        // record is stamped on this same round and prunes one window later
+        // rather than two.
+        let converted = state.convert_down_members(&inner.node_id, &mut overlay, now);
         // Stamp before pruning: a tombstone learned since the last round ages
         // from this observation, not from the departed peer's last receipt
         // (which pruning forgets — see `ClusterState::observe_tombstones`).
         state.observe_tombstones(&mut overlay, now);
         let pruned = state.prune_tombstones(&mut overlay, now);
         drop(overlay);
+        if !converted.is_empty() {
+            tracing::debug!(
+                converted = converted.len(),
+                "cluster: members Down for a whole tombstone window recorded as Left"
+            );
+        }
         if !pruned.is_empty() {
             tracing::debug!(
                 pruned = pruned.len(),
