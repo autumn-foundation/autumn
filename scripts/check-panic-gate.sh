@@ -114,6 +114,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/middleware/maintenance.rs:default
   autumn/src/middleware/error_page_filter.rs:default
   autumn/src/middleware/load_shed.rs:default
+  autumn/src/middleware/short_circuit.rs:default
   autumn/src/capsule/capture.rs:reporting
   autumn/src/capsule/wire.rs:db
   autumn/src/capsule/record_db.rs:db

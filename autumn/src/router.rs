@@ -12,7 +12,6 @@ use crate::app::ScopedGroup;
 use crate::config::AutumnConfig;
 #[cfg(feature = "maud")]
 use crate::error_pages::{self, SharedRenderer};
-use crate::extract::State;
 use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
 use crate::middleware::RequestIdLayer;
 use crate::middleware::dev;
@@ -21,7 +20,6 @@ use crate::middleware::exception_filter::{
 };
 use crate::route::Route;
 use crate::state::AppState;
-use axum::middleware::Next;
 use axum::response::IntoResponse;
 use http::{Request, StatusCode};
 use thiserror::Error;
@@ -669,9 +667,7 @@ fn build_router_pre_state(
         let static_dir = crate::app::project_dir("static", &env);
         router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
     }
-    router = router.layer(axum::middleware::from_fn(
-        crate::assets::asset_cache_control,
-    ));
+    router = router.layer(crate::assets::AssetCacheControlLayer);
 
     router = mount_scoped_groups(
         router,
@@ -760,8 +756,7 @@ fn build_router_pre_state(
     }
 
     #[cfg(feature = "oauth2")]
-    let http_interceptor =
-        axum::middleware::from_fn_with_state(state.clone(), http_interceptor_middleware);
+    let http_interceptor = HttpInterceptorLayer::new(state.clone());
     #[cfg(not(feature = "oauth2"))]
     let http_interceptor = tower::layer::util::Identity::new();
 
@@ -774,7 +769,7 @@ fn build_router_pre_state(
     // event-bus context stays outer to the oauth2 interceptor exactly as the two
     // separate `.layer()` calls used to leave it (issue #2193).
     let router = router.layer((
-        axum::middleware::from_fn_with_state(state.clone(), event_app_context_middleware),
+        crate::events::EventAppContextLayer::new(state.clone()),
         http_interceptor,
     ));
 
@@ -3461,7 +3456,7 @@ fn build_route_timeout_table(
         // Key by (path, *effective request method*) so an override on one handler
         // never bleeds onto sibling methods that share the template, while still
         // resolving when the request reaches the handler through a method alias.
-        // `request_timeout_handler` looks up `req.method()`, which differs from
+        // `RequestTimeoutService` looks up `req.method()`, which differs from
         // the declared method in two cases:
         //   - axum serves `HEAD` through a `#[get]` handler, so a GET override
         //     must also cover HEAD.
@@ -3587,33 +3582,26 @@ fn apply_request_timeout_middleware(
     route_timeouts: RouteTimeoutTable,
     mirror_cors: bool,
 ) -> axum::Router<AppState> {
-    let Some(s) = build_request_timeout_settings(config, metrics, route_timeouts, mirror_cors)
+    let Some(settings) =
+        build_request_timeout_settings(config, metrics, route_timeouts, mirror_cors)
     else {
         return router;
     };
-    // The closure is built here rather than in a shared helper because its type
-    // (and the opaque future it returns) cannot be named across a function
-    // boundary; `apply_middleware` builds an identical one for the main ingress
-    // stack. Keep the two in sync.
-    router.layer(axum::middleware::from_fn(move |req, next| {
-        request_timeout_handler(
-            req,
-            next,
-            s.global,
-            s.route_timeouts.clone(),
-            s.metrics.clone(),
-            s.cors.clone(),
-        )
-    }))
+    // Both this envelope and `apply_middleware` install the SAME layer type now,
+    // so there is nothing left to keep in sync: before #2214 each site had to
+    // build its own `axum::middleware::from_fn` closure, because the closure's
+    // type (and the opaque future it returned) could not be named across a
+    // function boundary, and the two copies could silently drift.
+    router.layer(RequestTimeoutLayer::new(settings))
 }
 
-/// Everything [`request_timeout_handler`] needs, resolved once at
+/// Everything [`RequestTimeoutService`] needs, resolved once at
 /// router-assembly time.
 ///
-/// `Clone` is load-bearing: both call sites move this into an
-/// `axum::middleware::from_fn` closure, and `Router::layer` requires the layer
-/// (hence the closure, hence its captures) to be `Clone`.
-#[derive(Clone)]
+/// Held behind an `Arc` by [`RequestTimeoutLayer`] because the produced service
+/// is cloned on the request path: every field is individually cheap to clone
+/// (`RouteTimeoutTable` and the CORS snapshot are already `Arc`s), but one
+/// refcount bump for the whole struct beats four.
 struct RequestTimeoutSettings {
     global: Option<Duration>,
     route_timeouts: RouteTimeoutTable,
@@ -3669,99 +3657,288 @@ fn build_request_timeout_settings(
     })
 }
 
-async fn request_timeout_handler(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-    global: Option<std::time::Duration>,
-    route_timeouts: RouteTimeoutTable,
-    metrics: crate::middleware::MetricsCollector,
-    cors: Option<std::sync::Arc<crate::config::CorsConfig>>,
-) -> axum::response::Response {
-    // Internal `autumn build` / ISR regeneration renders drive a `#[static_get]`
-    // route directly via `oneshot` and tag the request with `RenderDeadlineExempt`
-    // (there is no client connection whose deadline should apply). Skip the
-    // deadline for these; live inbound requests to the same route do not carry
-    // the marker and are bounded normally below.
-    if req
-        .extensions()
-        .get::<crate::static_gen::RenderDeadlineExempt>()
-        .is_some()
-    {
-        return next.run(req).await;
-    }
+/// Tower [`Layer`](tower::Layer) applying the framework's per-request deadline.
+///
+/// Replaces the `axum::middleware::from_fn` closure both call sites used to
+/// build. `from_fn` had to `Box::pin` the async block it wrapped — one heap
+/// allocation per request, sized by the whole downstream continuation the block
+/// captured across its `.await` — and clone its inner service to move it in
+/// there. [`RequestTimeoutFuture`] holds `tokio::time::Timeout<S::Future>`
+/// (itself a named type) in place instead, so a deadline costs no allocation
+/// and an exempt route costs not even a timer (issue #2214).
+#[derive(Clone)]
+pub struct RequestTimeoutLayer {
+    settings: Arc<RequestTimeoutSettings>,
+}
 
-    // Resolve the effective deadline from the matched route template + method,
-    // using borrowed lookups so exempt/disabled routes allocate nothing.
-    let matched_path_ref = req
-        .extensions()
-        .get::<axum::extract::MatchedPath>()
-        .map(axum::extract::MatchedPath::as_str);
-    let route_timeout = matched_path_ref
-        .and_then(|p| route_timeouts.get(p))
-        .and_then(|by_method| by_method.get(req.method()))
-        .copied()
-        .unwrap_or(crate::route::RouteTimeout::Inherit);
-    let deadline = match route_timeout {
-        crate::route::RouteTimeout::Disabled => None,
-        crate::route::RouteTimeout::Override(d) => Some(d),
-        crate::route::RouteTimeout::Inherit => global,
-    };
-    let Some(duration) = deadline else {
-        // Exempt (disabled route, or global off with a non-Override route) —
-        // no allocation on this hot path.
-        return next.run(req).await;
-    };
-
-    // A deadline is active: now it's worth owning the path for the warn log.
-    let matched_path = matched_path_ref.map(ToOwned::to_owned);
-    let request_id = req
-        .extensions()
-        .get::<crate::middleware::RequestId>()
-        .cloned();
-    // Capture the request Origin before `req` is consumed so a timeout 503 can
-    // mirror the CORS headers `CorsLayer` would have added (only when mirroring
-    // is enabled — see `apply_request_timeout_middleware`).
-    let cors_origin = cors
-        .as_ref()
-        .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
-    let start = std::time::Instant::now();
-    match tokio::time::timeout(duration, next.run(req)).await {
-        Ok(response) => response,
-        Err(_elapsed) => {
-            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let route = matched_path.as_deref().unwrap_or("<unmatched>");
-            // Structured telemetry: route template + elapsed time so operators
-            // can alert on the (already-counted) timeout event.
-            tracing::warn!(
-                target: "autumn::timeout",
-                route = route,
-                elapsed_ms = elapsed_ms,
-                timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-                request_id = request_id.as_ref().map(ToString::to_string),
-                "inbound request exceeded deadline"
-            );
-            metrics.record_request_timeout();
-            // Return a 503 via the standard error type so the exception-filter
-            // and error-page stack negotiate JSON vs HTML and enrich with the
-            // request id — no manual Problem Details assembly, no raw BoxError.
-            let mut response =
-                crate::error::AutumnError::service_unavailable(RequestDeadlineExceeded {
-                    timeout_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-                })
-                .into_response();
-            // Tag the 503 so the outer session layer skips persisting any partial
-            // session mutation the cancelled handler made before the deadline.
-            response.extensions_mut().insert(RequestDeadlineCancelled);
-            // This layer is outside `CorsLayer` in the main stack, so the 503
-            // never passes back through it; mirror the CORS headers ourselves so
-            // cross-origin browser clients can read the Problem Details body
-            // instead of seeing an opaque CORS failure.
-            if let Some(cors) = cors.as_deref() {
-                mirror_cors_headers(cors, cors_origin.as_ref(), &mut response);
-            }
-            response
+impl RequestTimeoutLayer {
+    fn new(settings: RequestTimeoutSettings) -> Self {
+        Self {
+            settings: Arc::new(settings),
         }
     }
+}
+
+impl<S> tower::Layer<S> for RequestTimeoutLayer {
+    type Service = RequestTimeoutService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestTimeoutService {
+            inner,
+            settings: Arc::clone(&self.settings),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`RequestTimeoutLayer`].
+#[derive(Clone)]
+pub struct RequestTimeoutService<S> {
+    inner: S,
+    settings: Arc<RequestTimeoutSettings>,
+}
+
+impl<S> RequestTimeoutService<S> {
+    /// The deadline that applies to `req`, or `None` when it is exempt.
+    ///
+    /// Uses borrowed lookups throughout so an exempt or deadline-free route
+    /// allocates nothing.
+    fn deadline_for<B>(&self, req: &Request<B>) -> Option<Duration> {
+        // Internal `autumn build` / ISR regeneration renders drive a
+        // `#[static_get]` route directly via `oneshot` and tag the request with
+        // `RenderDeadlineExempt` (there is no client connection whose deadline
+        // should apply). Skip the deadline for these; live inbound requests to
+        // the same route do not carry the marker and are bounded normally.
+        if req
+            .extensions()
+            .get::<crate::static_gen::RenderDeadlineExempt>()
+            .is_some()
+        {
+            return None;
+        }
+
+        // Resolve the effective deadline from the matched route template +
+        // method.
+        let route_timeout = req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(axum::extract::MatchedPath::as_str)
+            .and_then(|p| self.settings.route_timeouts.get(p))
+            .and_then(|by_method| by_method.get(req.method()))
+            .copied()
+            .unwrap_or(crate::route::RouteTimeout::Inherit);
+        match route_timeout {
+            crate::route::RouteTimeout::Disabled => None,
+            crate::route::RouteTimeout::Override(d) => Some(d),
+            crate::route::RouteTimeout::Inherit => self.settings.global,
+        }
+    }
+}
+
+impl<S> tower::Service<Request<axum::body::Body>> for RequestTimeoutService<S>
+where
+    S: tower::Service<Request<axum::body::Body>, Response = axum::response::Response>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = RequestTimeoutFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<axum::body::Body>) -> Self::Future {
+        let Some(duration) = self.deadline_for(&req) else {
+            // Exempt (disabled route, or global off with a non-Override route)
+            // — no timer and no allocation on this hot path.
+            return RequestTimeoutFuture::Unbounded {
+                inner: self.inner.call(req),
+            };
+        };
+
+        // A deadline is active: now it's worth owning the path for the warn log.
+        let matched_path = req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|p| p.as_str().to_owned());
+        let request_id = req
+            .extensions()
+            .get::<crate::middleware::RequestId>()
+            .cloned();
+        // Capture the request Origin before `req` is consumed so a timeout 503
+        // can mirror the CORS headers `CorsLayer` would have added (only when
+        // mirroring is enabled — see `apply_request_timeout_middleware`).
+        let cors_origin = self
+            .settings
+            .cors
+            .as_ref()
+            .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
+
+        // Build the inner future FIRST, then start the clock, then arm the
+        // timer, so `start` and the deadline measure the same interval. The
+        // `from_fn` form armed both inside an async block, where the downstream
+        // `call` chain had not run yet; here that chain runs during
+        // `self.inner.call(req)`, so capturing `start` before it would leave
+        // `elapsed_ms` measuring a strictly longer span than `timeout_ms`.
+        //
+        // `tokio::time::timeout` needs a runtime handle, so this service's
+        // `call` must run inside a Tokio runtime. That is the same requirement
+        // `tower::timeout::Timeout::call` imposes (it builds its `Sleep` in
+        // `call` too), and every driver in this crate reaches it through
+        // `ServiceExt::oneshot`, which only calls `call` from inside a poll.
+        let inner = self.inner.call(req);
+        let start = std::time::Instant::now();
+
+        RequestTimeoutFuture::Bounded {
+            inner: tokio::time::timeout(duration, inner),
+            settings: Arc::clone(&self.settings),
+            duration,
+            matched_path,
+            request_id,
+            cors_origin,
+            start,
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Future returned by [`RequestTimeoutService`].
+    ///
+    /// `Unbounded` is the exempt path and is literally the inner service's own
+    /// future; `Bounded` wraps it in `tokio::time::Timeout`, which is a named
+    /// type, so neither variant is heap-allocated.
+    ///
+    /// `Elapsed` exists to make the deadline actually *cancel*.
+    /// `tokio::time::Timeout::poll` does not drop the future it wraps when the
+    /// timer fires — it just reports `Err(Elapsed)` — so a `Bounded` variant
+    /// that returned the `503` in place would keep the whole cancelled handler
+    /// tree (its database connection guards, its load-shed slot, its webhook
+    /// [`ReplayKeyGuard`](crate::webhook)) alive until whatever owns *this*
+    /// future is itself dropped, several response layers later. The `from_fn`
+    /// form dropped it at the deadline, because its `tokio::time::timeout(..)`
+    /// was a `match` scrutinee temporary. Transitioning to `Elapsed` restores
+    /// that: `Pin::set` drops the old variant in place, so the handler tree is
+    /// released before the `503` starts travelling back out.
+    #[project = RequestTimeoutFutureProj]
+    pub enum RequestTimeoutFuture<F> {
+        Unbounded {
+            #[pin]
+            inner: F,
+        },
+        Bounded {
+            #[pin]
+            inner: tokio::time::Timeout<F>,
+            settings: Arc<RequestTimeoutSettings>,
+            duration: Duration,
+            matched_path: Option<String>,
+            request_id: Option<crate::middleware::RequestId>,
+            cors_origin: Option<http::HeaderValue>,
+            start: std::time::Instant,
+        },
+        Elapsed {
+            response: Option<axum::response::Response>,
+        },
+    }
+}
+
+impl<F, E> std::future::Future for RequestTimeoutFuture<F>
+where
+    F: std::future::Future<Output = Result<axum::response::Response, E>>,
+{
+    type Output = Result<axum::response::Response, E>;
+
+    #[allow(
+        clippy::expect_used,
+        reason = "unreachable: future not polled after Ready"
+    )]
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        loop {
+            let elapsed = match self.as_mut().project() {
+                RequestTimeoutFutureProj::Unbounded { inner } => return inner.poll(cx),
+                RequestTimeoutFutureProj::Bounded {
+                    inner,
+                    settings,
+                    duration,
+                    matched_path,
+                    request_id,
+                    cors_origin,
+                    start,
+                } => match std::task::ready!(inner.poll(cx)) {
+                    Ok(response) => return std::task::Poll::Ready(response),
+                    Err(_elapsed) => Self::Elapsed {
+                        response: Some(deadline_exceeded_response(
+                            settings,
+                            *duration,
+                            matched_path.as_deref(),
+                            request_id.as_ref(),
+                            cors_origin.as_ref(),
+                            *start,
+                        )),
+                    },
+                },
+                RequestTimeoutFutureProj::Elapsed { response } => {
+                    return std::task::Poll::Ready(Ok(response
+                        .take()
+                        .expect("RequestTimeoutFuture polled after completion")));
+                }
+            };
+            // Drops the `Bounded` variant — and with it the cancelled handler
+            // future the elapsed `Timeout` is still holding — before the `503`
+            // leaves this layer.
+            self.as_mut().set(elapsed);
+        }
+    }
+}
+
+/// Build the `503` a request that blew its deadline receives, recording the
+/// timeout metric and emitting the structured `autumn::timeout` warn on the way.
+///
+/// Split out of [`RequestTimeoutFuture::poll`] so that hot method stays a
+/// dispatch and nothing else.
+fn deadline_exceeded_response(
+    settings: &RequestTimeoutSettings,
+    duration: Duration,
+    matched_path: Option<&str>,
+    request_id: Option<&crate::middleware::RequestId>,
+    cors_origin: Option<&http::HeaderValue>,
+    start: std::time::Instant,
+) -> axum::response::Response {
+    let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let route = matched_path.unwrap_or("<unmatched>");
+    // Structured telemetry: route template + elapsed time so operators
+    // can alert on the (already-counted) timeout event.
+    tracing::warn!(
+        target: "autumn::timeout",
+        route = route,
+        elapsed_ms = elapsed_ms,
+        timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        request_id = request_id.map(ToString::to_string),
+        "inbound request exceeded deadline"
+    );
+    settings.metrics.record_request_timeout();
+    // Return a 503 via the standard error type so the exception-filter
+    // and error-page stack negotiate JSON vs HTML and enrich with the
+    // request id — no manual Problem Details assembly, no raw BoxError.
+    let mut response = crate::error::AutumnError::service_unavailable(RequestDeadlineExceeded {
+        timeout_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+    })
+    .into_response();
+    // Tag the 503 so the outer session layer skips persisting any partial
+    // session mutation the cancelled handler made before the deadline.
+    response.extensions_mut().insert(RequestDeadlineCancelled);
+    // This layer is outside `CorsLayer` in the main stack, so the 503
+    // never passes back through it; mirror the CORS headers ourselves so
+    // cross-origin browser clients can read the Problem Details body
+    // instead of seeing an opaque CORS failure.
+    if let Some(cors) = settings.cors.as_deref() {
+        mirror_cors_headers(cors, cors_origin, &mut response);
+    }
+    response
 }
 
 struct BuiltIdempotencyLayers {
@@ -4079,7 +4256,7 @@ fn apply_middleware(
         axum::Extension(upload_config),
         // Global body-size cap covering JSON, form, raw bytes, and multipart.
         body_limit,
-        axum::middleware::from_fn(crate::webhook::webhook_replay_cleanup_middleware),
+        crate::webhook::WebhookReplayCleanupLayer,
         // Admission control / load shedding (#1006). Outer to MaintenanceLayer so
         // the cheap in-flight-count check runs before maintenance mode's
         // bypass-header/IP-allowlist evaluation. `None` (the default — no
@@ -4108,16 +4285,14 @@ fn apply_middleware(
         // them. Placed outside CSRF so a `BodyTooLarge` (empty body)
         // doesn't get masked by a `403` from CSRF's missing-token branch,
         // and a clear `400 invalid _method` outranks "missing CSRF".
-        axum::middleware::from_fn(crate::middleware::method_override_rejection_filter),
+        crate::middleware::method_override::MethodOverrideRejectionLayer,
         tower::util::option_layer(build_bot_protection_layer(config)),
         tower::util::option_layer(build_csrf_layer(config, signing_keys_opt.clone())),
         // Inner to the CSRF layer so CSRF is validated first on the request
         // path; a replayed `_submit_token` is still short-circuited even when
         // the request carries a valid `_csrf` (issue #1360, AC #4).
         tower::util::option_layer(submit_token_layer),
-        axum::middleware::from_fn(move |req, next| {
-            trusted_host_middleware(req, next, trusted_host_policy.clone())
-        }),
+        TrustedHostLayer::new(trusted_host_policy),
         tower::util::option_layer(build_ingress_cors_layer(config)),
     );
 
@@ -4142,7 +4317,7 @@ fn apply_middleware(
     // ── Middle group: outer to the user layers, inner to the session ────────
     //
     // Per-request timeout (inner to RequestId so the request ID set by that
-    // layer is available when the timeout fires — see request_timeout_handler).
+    // layer is available when the timeout fires — see RequestTimeoutService).
     //
     // Full ingress layer order (outermost → innermost):
     //   TraceContext → AccessLog-fallback (applied in apply_startup_barrier) →
@@ -4175,25 +4350,14 @@ fn apply_middleware(
     // `request_timeout_ms`. Moving the timer out there would again lose the
     // `X-Request-Id` correlation; bound this with a server/proxy read timeout
     // instead.
-    // The closure is built here rather than in a shared helper because its type
-    // (and the opaque future it returns) cannot be named across a function
-    // boundary; `apply_request_timeout_middleware` builds an identical one for
-    // the `/mcp` envelope. Keep the two in sync.
+    // `apply_request_timeout_middleware` installs the SAME layer type for the
+    // `/mcp` envelope, so the two cannot drift; before #2214 each site had to
+    // build its own `axum::middleware::from_fn` closure (whose type, and whose
+    // opaque future, could not be named across a function boundary) and a
+    // comment here asked future readers to keep the copies in sync by hand.
     let timeout_layer =
-        build_request_timeout_settings(config, state.metrics.clone(), route_timeouts, true).map(
-            |s| {
-                axum::middleware::from_fn(move |req, next| {
-                    request_timeout_handler(
-                        req,
-                        next,
-                        s.global,
-                        s.route_timeouts.clone(),
-                        s.metrics.clone(),
-                        s.cors.clone(),
-                    )
-                })
-            },
-        );
+        build_request_timeout_settings(config, state.metrics.clone(), route_timeouts, true)
+            .map(RequestTimeoutLayer::new);
 
     // Failure-capsule capture (#1598). Outer to the reporting layer, because a
     // request's capture scope has to exist before that layer snapshots its
@@ -4365,16 +4529,7 @@ fn apply_middleware(
                 );
             }
             let metrics = state.metrics().clone();
-            axum::middleware::from_fn(move |req, next| {
-                crate::read_your_writes::middleware(
-                    req,
-                    next,
-                    ryw_mode,
-                    window_secs,
-                    keys.clone(),
-                    metrics.clone(),
-                )
-            })
+            crate::read_your_writes::ReadYourWritesLayer::new(ryw_mode, window_secs, keys, metrics)
         }),
     );
     #[cfg(not(feature = "db"))]
@@ -4538,16 +4693,22 @@ fn apply_layers_in_registration_order(
     router.layer(ComposedRegisteredLayers::new(layers))
 }
 
-async fn trusted_host_middleware(
-    req: Request<axum::body::Body>,
-    next: Next,
-    policy: TrustedHostPolicy,
-) -> axum::response::Response {
+/// Decide whether `req` clears the trusted-host policy, returning the rejection
+/// response when it does not.
+///
+/// Shared by [`TrustedHostService`] and — through it — every ingress path, so
+/// the decision lives in exactly one place. Returns `None` for "let it
+/// through", which is the overwhelmingly common answer and costs no allocation
+/// at all: the host string is only owned on the branch that has to compare it.
+fn trusted_host_rejection<B>(
+    req: &Request<B>,
+    policy: &TrustedHostPolicy,
+) -> Option<axum::response::Response> {
     let path = req.uri().path();
     if (req.method() == http::Method::GET || req.method() == http::Method::HEAD)
         && policy.probe_bypass_paths.contains(path)
     {
-        return next.run(req).await;
+        return None;
     }
     let authority = req.uri().authority().map(http::uri::Authority::as_str);
     let host_header = req
@@ -4562,27 +4723,91 @@ async fn trusted_host_middleware(
         .filter(|h| !h.is_empty());
     let host_source_present = raw_host.is_some();
     if host.is_none() && !host_source_present && policy.allow_missing_host {
-        return next.run(req).await;
+        return None;
     }
     if host.as_deref().is_some_and(|host| policy.allows_host(host)) {
-        next.run(req).await
-    } else {
-        tracing::warn!(host = ?host, "trusted host rejected request");
-        let body = crate::error::problem_details_json_string(
-            StatusCode::BAD_REQUEST,
-            "Invalid Host header",
-            None,
-            None,
-            None,
-            None,
-            true,
-        );
+        return None;
+    }
+    tracing::warn!(host = ?host, "trusted host rejected request");
+    let body = crate::error::problem_details_json_string(
+        StatusCode::BAD_REQUEST,
+        "Invalid Host header",
+        None,
+        None,
+        None,
+        None,
+        true,
+    );
+    Some(
         (
             StatusCode::BAD_REQUEST,
             [(http::header::CONTENT_TYPE, "application/problem+json")],
             body,
         )
-            .into_response()
+            .into_response(),
+    )
+}
+
+/// Tower [`Layer`](tower::Layer) enforcing [`TrustedHostPolicy`] on the ingress
+/// path.
+///
+/// This used to be an `axum::middleware::from_fn` closure. It is a hand-rolled
+/// service now because `from_fn` `Box::pin`s the future of whatever it wraps —
+/// one heap allocation per request, sized by everything the wrapped async block
+/// captures across its `.await`, which for a layer this far out is the whole
+/// downstream continuation — plus a `self.inner.clone()` that deep-clones the
+/// erased stack beneath it. Neither cost depended on whether a request was
+/// actually rejected (issue #2214).
+#[derive(Clone, Debug)]
+pub struct TrustedHostLayer {
+    policy: TrustedHostPolicy,
+}
+
+impl TrustedHostLayer {
+    pub(crate) const fn new(policy: TrustedHostPolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl<S> tower::Layer<S> for TrustedHostLayer {
+    type Service = TrustedHostService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TrustedHostService {
+            inner,
+            policy: self.policy.clone(),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`TrustedHostLayer`].
+#[derive(Clone, Debug)]
+pub struct TrustedHostService<S> {
+    inner: S,
+    policy: TrustedHostPolicy,
+}
+
+impl<S, ReqBody> tower::Service<Request<ReqBody>> for TrustedHostService<S>
+where
+    S: tower::Service<Request<ReqBody>, Response = axum::response::Response>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = crate::middleware::short_circuit::ShortCircuitFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        use crate::middleware::short_circuit::ShortCircuitFuture;
+        trusted_host_rejection(&req, &self.policy).map_or_else(
+            || ShortCircuitFuture::forward(self.inner.call(req)),
+            ShortCircuitFuture::short_circuit,
+        )
     }
 }
 
@@ -4964,7 +5189,7 @@ pub fn try_build_router_with_static_inner(
 }
 
 #[derive(Clone)]
-struct StartupBarrierState {
+pub struct StartupBarrierState {
     app_state: AppState,
     // Canonical exact-match probe/health paths (`probe_bypass_paths`), the
     // single source of truth shared with `TrustedHostPolicy` and the
@@ -5065,26 +5290,88 @@ fn apply_startup_barrier(
         trace_context,
         tower::util::option_layer(server_timing_fallback),
         tower::util::option_layer(access_log_fallback),
-        axum::middleware::from_fn_with_state(barrier_state, startup_barrier),
+        StartupBarrierLayer::new(barrier_state),
     ))
 }
 
-async fn startup_barrier(
-    State(state): State<StartupBarrierState>,
-    request: axum::extract::Request,
-    next: Next,
-) -> axum::response::Response {
-    if crate::app::is_static_build_mode()
-        || state.app_state.probes().is_startup_complete()
-        || state.allows_path(request.uri().path())
-    {
-        next.run(request).await
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Service is still starting up",
-        )
-            .into_response()
+/// Tower [`Layer`](tower::Layer) for the startup readiness barrier: requests are refused with
+/// `503 Service is still starting up` until the app reports startup complete,
+/// except on the paths the barrier lets through (probes, actuator).
+///
+/// A hand-rolled service rather than an `axum::middleware::from_fn`: this is the
+/// outermost layer inside the `Router`, so `from_fn`'s per-request `Box::pin`
+/// captured the entire downstream continuation and its `self.inner.clone()`
+/// deep-cloned the whole erased stack — on every request, for a check that
+/// passes on every request after the first few seconds of process life
+/// (issue #2214).
+///
+/// The state is held behind an `Arc` because the produced service is cloned on
+/// the request path — once per traversal of the stack above it — and
+/// `StartupBarrierState` owns an `AppState` plus three `Vec<String>` path lists.
+/// Holding it by value would deep-copy all three on every one of those clones,
+/// which is the cost #2193 removed elsewhere in this stack.
+#[derive(Clone)]
+pub struct StartupBarrierLayer {
+    state: Arc<StartupBarrierState>,
+}
+
+impl StartupBarrierLayer {
+    pub(crate) fn new(state: StartupBarrierState) -> Self {
+        Self {
+            state: Arc::new(state),
+        }
+    }
+}
+
+impl<S> tower::Layer<S> for StartupBarrierLayer {
+    type Service = StartupBarrierService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StartupBarrierService {
+            inner,
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`StartupBarrierLayer`].
+#[derive(Clone)]
+pub struct StartupBarrierService<S> {
+    inner: S,
+    state: Arc<StartupBarrierState>,
+}
+
+impl<S, ReqBody> tower::Service<Request<ReqBody>> for StartupBarrierService<S>
+where
+    S: tower::Service<Request<ReqBody>, Response = axum::response::Response>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = crate::middleware::short_circuit::ShortCircuitFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        use crate::middleware::short_circuit::ShortCircuitFuture;
+        if crate::app::is_static_build_mode()
+            || self.state.app_state.probes().is_startup_complete()
+            || self.state.allows_path(req.uri().path())
+        {
+            ShortCircuitFuture::forward(self.inner.call(req))
+        } else {
+            ShortCircuitFuture::short_circuit(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service is still starting up",
+                )
+                    .into_response(),
+            )
+        }
     }
 }
 
@@ -5603,31 +5890,118 @@ fn mount_swagger_ui_routes(
     router
 }
 
-/// Scope the request's [`AppState`] as the ambient event-bus app for the
-/// duration of the request, so the free `events::publish` resolves this app.
-async fn event_app_context_middleware(
-    state: axum::extract::State<AppState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    crate::events::scope_event_app(state.0.clone(), async move { next.run(req).await }).await
+/// Tower [`Layer`](tower::Layer) installing the app's registered
+/// [`HttpInterceptor`](crate::interceptor::HttpInterceptor) as the ambient
+/// interceptor chain for outbound `reqwest` calls made during this request.
+///
+/// Hand-rolled rather than an `axum::middleware::from_fn_with_state` for the
+/// reason #2214 documents: `from_fn` `Box::pin`s the async block it generates
+/// on every request. `tokio::task_local!`'s `scope` returns a named
+/// `TaskLocalFuture`, so the scoped branch needs no box either — and an app
+/// with no interceptor registered (the common case) forwards the inner
+/// service's future completely untouched.
+///
+/// Like [`crate::events::EventAppContextLayer`], the inner future is built
+/// inside a `sync_scope` as well as polled inside a `scope`, so the synchronous
+/// `Service::call` chain beneath this layer also sees the interceptors.
+#[cfg(feature = "oauth2")]
+#[derive(Clone)]
+pub struct HttpInterceptorLayer {
+    state: AppState,
 }
 
 #[cfg(feature = "oauth2")]
-async fn http_interceptor_middleware(
-    state: axum::extract::State<AppState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor};
-    if let Some(interceptor_arc) = state.extension::<Arc<dyn HttpInterceptor>>() {
-        let interceptor = (*interceptor_arc).clone();
-        let interceptors = vec![interceptor];
-        ACTIVE_HTTP_INTERCEPTORS
-            .scope(interceptors, async move { next.run(req).await })
-            .await
-    } else {
-        next.run(req).await
+impl HttpInterceptorLayer {
+    pub(crate) const fn new(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+#[cfg(feature = "oauth2")]
+impl<S> tower::Layer<S> for HttpInterceptorLayer {
+    type Service = HttpInterceptorService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        HttpInterceptorService {
+            inner,
+            state: self.state.clone(),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`HttpInterceptorLayer`].
+#[cfg(feature = "oauth2")]
+#[derive(Clone)]
+pub struct HttpInterceptorService<S> {
+    inner: S,
+    state: AppState,
+}
+
+#[cfg(feature = "oauth2")]
+pin_project_lite::pin_project! {
+    /// Future returned by [`HttpInterceptorService`].
+    #[project = HttpInterceptorFutureProj]
+    pub enum HttpInterceptorScopeFuture<F> {
+        /// No interceptor registered: the inner service's own future.
+        Plain {
+            #[pin]
+            inner: F,
+        },
+        /// The inner future, polled inside the interceptor task-local scope.
+        Scoped {
+            #[pin]
+            inner: tokio::task::futures::TaskLocalFuture<
+                Vec<Arc<dyn crate::interceptor::HttpInterceptor>>,
+                F,
+            >,
+        },
+    }
+}
+
+#[cfg(feature = "oauth2")]
+impl<F: std::future::Future> std::future::Future for HttpInterceptorScopeFuture<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.project() {
+            HttpInterceptorFutureProj::Plain { inner } => inner.poll(cx),
+            HttpInterceptorFutureProj::Scoped { inner } => inner.poll(cx),
+        }
+    }
+}
+
+#[cfg(feature = "oauth2")]
+impl<S, ReqBody> tower::Service<Request<ReqBody>> for HttpInterceptorService<S>
+where
+    S: tower::Service<Request<ReqBody>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = HttpInterceptorScopeFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor};
+        let Some(interceptor_arc) = self.state.extension::<Arc<dyn HttpInterceptor>>() else {
+            return HttpInterceptorScopeFuture::Plain {
+                inner: self.inner.call(req),
+            };
+        };
+        let interceptors = vec![(*interceptor_arc).clone()];
+        let inner =
+            ACTIVE_HTTP_INTERCEPTORS.sync_scope(interceptors.clone(), || self.inner.call(req));
+        HttpInterceptorScopeFuture::Scoped {
+            inner: ACTIVE_HTTP_INTERCEPTORS.scope(interceptors, inner),
+        }
     }
 }
 
@@ -11192,7 +11566,8 @@ mod trusted_host_tests {
             }),
         );
 
-        // No RequestIdLayer — exercises the else branch in request_timeout_handler.
+        // No RequestIdLayer — exercises the `request_id: None` branch in
+        // `RequestTimeoutService`.
         let router = apply_request_timeout_middleware(
             router,
             &config,
@@ -11802,6 +12177,179 @@ mod trusted_host_tests {
         // An empty set requires no fail-closed behaviour.
         assert!(!super::custom_layers_require_fail_closed_idempotency(&[]));
     }
+
+    // ----------------------------------------------------------------------
+    // #2214: the ingress stack's middleware futures must stay unboxed
+    // ----------------------------------------------------------------------
+
+    /// The structural half of issue #2214's fix, in one assertion per converted
+    /// middleware.
+    ///
+    /// Each of these layers used to be an `axum::middleware::from_fn`, whose
+    /// `FromFn::call` must `Box::pin` the async block it generates — the block's
+    /// type cannot be named, so there is nowhere else for it to live. That was
+    /// one heap allocation per request per call site, 19.57% of every byte the
+    /// `request_pipeline` benchmark allocated.
+    ///
+    /// A hand-rolled `tower::Service` fixes it only if its `Future` associated
+    /// type is genuinely named all the way down. Writing one that still returns
+    /// `Pin<Box<dyn Future>>` — the shape `SessionService`, `LogContextService`
+    /// and `TrustedProxiesService` use — would satisfy every behavioural test in
+    /// the suite while allocating exactly as much as before. This test is what
+    /// makes that impossible to do by accident: the sibling allocation gate in
+    /// `tests/config_alloc_gate.rs` pins the *total*, and this pins *where* the
+    /// total comes from.
+    ///
+    /// What this pins precisely: that the associated `Future` type is not
+    /// literally a `Pin<Box<dyn Future>>`. `std::any::type_name` prints a type's
+    /// path and generic arguments, never its fields, so it cannot see a box
+    /// hidden inside a variant of an otherwise-named future — which is exactly
+    /// what `WebhookReplayCleanupFuture`'s rare `Releasing` branch is, and why
+    /// that one is pinned by the sibling test below (on size) instead of here.
+    #[test]
+    fn converted_ingress_middleware_futures_are_never_boxed() {
+        /// The inner service every layer under test is stacked on: its own
+        /// future is a named `Ready`, so any `Box` in the resulting type name
+        /// was contributed by the layer.
+        type Inner = tower::util::ServiceFn<
+            fn(
+                axum::extract::Request,
+            )
+                -> std::future::Ready<Result<axum::response::Response, std::convert::Infallible>>,
+        >;
+        type Fut<Svc> = <Svc as tower::Service<axum::extract::Request>>::Future;
+
+        fn assert_unboxed<Svc: tower::Service<axum::extract::Request>>(what: &str) {
+            let name = std::any::type_name::<Fut<Svc>>();
+            assert!(
+                !name.contains("Box"),
+                "{what} must return a named, unboxed future — an \
+                 `axum::middleware::from_fn`-shaped `Box::pin` here is one heap \
+                 allocation on every request (issue #2214). Got: {name}"
+            );
+        }
+
+        assert_unboxed::<super::TrustedHostService<Inner>>("TrustedHostService");
+        assert_unboxed::<super::StartupBarrierService<Inner>>("StartupBarrierService");
+        assert_unboxed::<super::RequestTimeoutService<Inner>>("RequestTimeoutService");
+        assert_unboxed::<crate::assets::AssetCacheControlService<Inner>>(
+            "AssetCacheControlService",
+        );
+        assert_unboxed::<crate::events::EventAppContextService<Inner>>("EventAppContextService");
+        assert_unboxed::<crate::read_your_writes::ReadYourWritesService<Inner>>(
+            "ReadYourWritesService",
+        );
+        assert_unboxed::<crate::middleware::method_override::MethodOverrideRejectionService<Inner>>(
+            "MethodOverrideRejectionService",
+        );
+        #[cfg(feature = "oauth2")]
+        assert_unboxed::<super::HttpInterceptorService<Inner>>("HttpInterceptorService");
+    }
+
+    /// `WebhookReplayCleanupFuture` is the one converted middleware that still
+    /// boxes, and that is deliberate: releasing the replay keys a failed webhook
+    /// delivery registered is genuinely async work that has to run *after* the
+    /// inner future resolves, so it cannot be folded into the inner service's
+    /// own future.
+    ///
+    /// The box lives in the `Releasing` variant, which is only ever constructed
+    /// for a `5xx` response that actually registered keys — so the happy path
+    /// (and every request that is not a webhook delivery at all) never takes it.
+    /// The sibling test above cannot pin that, because `type_name` does not
+    /// print field types; this one does, by size. `Serving` stores the scoped
+    /// inner future, the replay cell and the drop guard **inline**, so the enum
+    /// must be at least as large as all three together. Move the box to
+    /// `Serving` and the enum collapses to roughly a pointer plus the response,
+    /// and this fails.
+    #[test]
+    fn webhook_replay_cleanup_boxes_only_its_rare_release_branch() {
+        use std::mem::size_of;
+
+        type Ready = std::future::Ready<Result<axum::response::Response, std::convert::Infallible>>;
+        type Scoped = tokio::task::futures::TaskLocalFuture<crate::webhook::ReplayStoreCell, Ready>;
+
+        let serving_inline = size_of::<Scoped>()
+            + size_of::<crate::webhook::ReplayStoreCell>()
+            + size_of::<crate::webhook::ReplayKeyGuard>();
+        let whole = size_of::<crate::webhook::WebhookReplayCleanupFuture<Ready>>();
+        assert!(
+            whole >= serving_inline,
+            "WebhookReplayCleanupFuture must hold the scoped inner future, the \
+             replay cell and the drop guard inline in its `Serving` variant \
+             ({serving_inline} bytes together), but the whole future is only \
+             {whole} bytes — the inner future has been boxed, which costs an \
+             allocation on every request rather than only on a failed webhook \
+             delivery (issue #2214)"
+        );
+    }
+
+    /// The startup barrier's short-circuit branch: until the app reports startup
+    /// complete, a request to a non-exempt path is refused with `503`.
+    ///
+    /// Driven directly over a stub inner service because `apply_startup_barrier`
+    /// is production-only — `TestApp::build` deliberately mirrors just its two
+    /// response-side fallbacks (see `crate::test`), so no end-to-end test in the
+    /// suite can reach this branch.
+    #[tokio::test]
+    async fn startup_barrier_refuses_requests_until_startup_completes() {
+        use tower::{Layer, ServiceExt};
+
+        fn ok_service() -> impl tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone {
+            tower::service_fn(|_req: axum::extract::Request| async move {
+                Ok::<_, std::convert::Infallible>("handler ran".into_response())
+            })
+        }
+
+        // `#[allow(future_not_send)]`: `tower::service_fn`'s closure is not
+        // `Sync`, so this helper's future is `!Send`. It only ever runs on a
+        // `#[tokio::test]` current-thread runtime, which never moves it.
+        #[allow(clippy::future_not_send)]
+        async fn status_for(startup_complete: bool, path: &str) -> (StatusCode, String) {
+            let state = AppState::for_test().with_startup_complete(startup_complete);
+            let config = AutumnConfig::default();
+            let layer = super::StartupBarrierLayer::new(super::StartupBarrierState::from_config(
+                &config, &state,
+            ));
+            let response = layer
+                .layer(ok_service())
+                .oneshot(
+                    axum::extract::Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("infallible");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body collects");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        let (status, body) = status_for(false, "/anything").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "Service is still starting up");
+
+        // Control: the same request once startup has completed reaches the
+        // handler, so the 503 above is the barrier and not a broken stub.
+        let (status, body) = status_for(true, "/anything").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "handler ran");
+
+        // Probe/actuator paths are exempt even before startup completes, so a
+        // platform readiness check can still reach them.
+        let (status, _) = status_for(false, "/actuator/health").await;
+        assert_ne!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "probe paths must bypass the startup barrier"
+        );
+    }
 }
 #[derive(Clone, Debug)]
 pub struct TrustedHostPolicy {
@@ -11841,8 +12389,8 @@ impl TrustedHostPolicy {
     }
 
     /// Whether a request carrying no usable `Host` is allowed through. Mirrors
-    /// `trusted_host_middleware`'s missing-host branch for callers (e.g. the MCP
-    /// envelope) that enforce the policy outside that middleware.
+    /// `trusted_host_rejection`'s missing-host branch for callers (e.g. the MCP
+    /// envelope) that enforce the policy outside [`TrustedHostService`].
     ///
     /// Only the `mcp` feature consumes this today; gated so default-feature
     /// builds don't flag it as dead code.

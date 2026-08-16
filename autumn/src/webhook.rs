@@ -1019,7 +1019,7 @@ impl WebhookVerifyError {
     }
 }
 
-type ReplayStoreCell =
+pub(crate) type ReplayStoreCell =
     std::sync::Arc<std::sync::Mutex<Option<(std::sync::Arc<dyn WebhookReplayStore>, Vec<String>)>>>;
 
 tokio::task_local! {
@@ -1039,7 +1039,7 @@ tokio::task_local! {
 /// mean a handler that committed its side effect *before* failing can be invoked
 /// again on retry, which is the standard at-least-once contract handlers must
 /// tolerate.
-struct ReplayKeyGuard {
+pub(crate) struct ReplayKeyGuard {
     cell: ReplayStoreCell,
     completed: bool,
 }
@@ -1068,7 +1068,7 @@ pub async fn webhook_replay_cleanup_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cell: ReplayStoreCell = std::sync::Arc::new(std::sync::Mutex::new(None));
     let cell_cloned = cell.clone();
 
     let mut guard = ReplayKeyGuard {
@@ -1082,20 +1082,173 @@ pub async fn webhook_replay_cleanup_middleware(
 
     guard.completed = true;
 
-    if response.status().is_server_error() {
-        let to_remove = match cell_cloned.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        if let Some((store, keys)) = to_remove {
-            for key in keys {
-                tracing::debug!(key = %key, "Releasing webhook replay key due to 5xx server error");
-                let _ = store.remove(&key).await;
-            }
-        }
+    if let Some(cleanup) = release_keys_on_server_error(&cell_cloned, response.status()) {
+        cleanup.await;
     }
 
     response
+}
+
+/// Take the request's inserted replay keys back out of `cell` and return the
+/// work that removes them, when `status` says the request failed with a `5xx`.
+///
+/// Returns `None` on every other status, and on a `5xx` that inserted no keys —
+/// so the common path allocates nothing and awaits nothing. Shared by
+/// [`webhook_replay_cleanup_middleware`] and [`WebhookReplayCleanupFuture`].
+fn release_keys_on_server_error(
+    cell: &ReplayStoreCell,
+    status: axum::http::StatusCode,
+) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+    if !status.is_server_error() {
+        return None;
+    }
+    let (store, keys) = match cell.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }?;
+    Some(async move {
+        for key in keys {
+            tracing::debug!(key = %key, "Releasing webhook replay key due to 5xx server error");
+            let _ = store.remove(&key).await;
+        }
+    })
+}
+
+/// Tower [`Layer`](tower::Layer) form of [`webhook_replay_cleanup_middleware`],
+/// used by the framework's ingress stack.
+///
+/// The `axum::middleware::from_fn` it replaces `Box::pin`ned its wrapped async
+/// block on every request, and cloned the erased service beneath it to get it in
+/// there (issue #2214). Here the happy path — a request that is not a webhook
+/// delivery, or one that succeeds — is a `TaskLocalFuture` holding the inner
+/// service's own future: no boxed future, no clone of the stack below. (It
+/// still mints the per-request [`ReplayStoreCell`] it always did; that
+/// allocation is the middleware's own state, not `from_fn`'s wrapper.) Only the
+/// rare `5xx` *that actually registered replay keys* takes a box, for the
+/// removal work.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WebhookReplayCleanupLayer;
+
+impl<S> tower::Layer<S> for WebhookReplayCleanupLayer {
+    type Service = WebhookReplayCleanupService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        WebhookReplayCleanupService { inner }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`WebhookReplayCleanupLayer`].
+#[derive(Clone, Debug)]
+pub(crate) struct WebhookReplayCleanupService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody> tower::Service<axum::http::Request<ReqBody>> for WebhookReplayCleanupService<S>
+where
+    S: tower::Service<axum::http::Request<ReqBody>, Response = axum::response::Response>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = WebhookReplayCleanupFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
+        let cell: ReplayStoreCell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        // Built inside the scope, not merely polled inside it — see
+        // `crate::capsule::capture` for why the argument form would run the
+        // synchronous `Service::call` chain beneath this layer with the
+        // task-local unset.
+        let inner = WEBHOOK_REPLAY_KEY.sync_scope(cell.clone(), || self.inner.call(req));
+        WebhookReplayCleanupFuture::Serving {
+            inner: WEBHOOK_REPLAY_KEY.scope(cell.clone(), inner),
+            guard: ReplayKeyGuard {
+                cell: cell.clone(),
+                completed: false,
+            },
+            cell,
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Future returned by [`WebhookReplayCleanupService`].
+    ///
+    /// `Serving` holds the [`ReplayKeyGuard`] alongside the scoped inner
+    /// future, so dropping this future before it resolves — a handler panic, or
+    /// the request-timeout layer above cancelling it — still runs the guard's
+    /// `Drop` and releases the inserted keys, exactly as the `from_fn` form's
+    /// dropped async block did.
+    #[project = WebhookReplayCleanupFutureProj]
+    pub(crate) enum WebhookReplayCleanupFuture<F> {
+        Serving {
+            #[pin]
+            inner: tokio::task::futures::TaskLocalFuture<ReplayStoreCell, F>,
+            cell: ReplayStoreCell,
+            guard: ReplayKeyGuard,
+        },
+        /// A `5xx` that inserted replay keys: release them before handing the
+        /// response back. This is the only branch that allocates.
+        Releasing {
+            #[pin]
+            cleanup: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+            response: Option<axum::response::Response>,
+        },
+    }
+}
+
+impl<F, E> std::future::Future for WebhookReplayCleanupFuture<F>
+where
+    F: std::future::Future<Output = Result<axum::response::Response, E>>,
+{
+    type Output = Result<axum::response::Response, E>;
+
+    #[allow(
+        clippy::expect_used,
+        reason = "unreachable: future not polled after Ready"
+    )]
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        loop {
+            let next = match self.as_mut().project() {
+                WebhookReplayCleanupFutureProj::Serving { inner, cell, guard } => {
+                    let response = match std::task::ready!(inner.poll(cx)) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            // The inner service failed rather than responding.
+                            // Leave `completed` false so the guard's `Drop`
+                            // releases the keys, matching the panic/cancel path.
+                            return std::task::Poll::Ready(Err(error));
+                        }
+                    };
+                    // The handler ran to completion: the guard's drop-time
+                    // release must not fire, whatever the status was.
+                    guard.completed = true;
+                    match release_keys_on_server_error(cell, response.status()) {
+                        None => return std::task::Poll::Ready(Ok(response)),
+                        Some(cleanup) => Self::Releasing {
+                            cleanup: Box::pin(cleanup),
+                            response: Some(response),
+                        },
+                    }
+                }
+                WebhookReplayCleanupFutureProj::Releasing { cleanup, response } => {
+                    std::task::ready!(cleanup.poll(cx));
+                    return std::task::Poll::Ready(Ok(response
+                        .take()
+                        .expect("WebhookReplayCleanupFuture polled after completion")));
+                }
+            };
+            self.as_mut().set(next);
+        }
+    }
 }
 
 async fn verify_request(
@@ -1507,4 +1660,209 @@ pub(crate) fn install_registry_from_config(
     let registry = WebhookRegistry::from_config(config)?;
     state.insert_extension(registry);
     Ok(())
+}
+
+/// Direct coverage for [`WebhookReplayCleanupService`] and its future's state
+/// machine (issue #2214).
+///
+/// The framework's ingress installs the *layer*; the retained
+/// [`webhook_replay_cleanup_middleware`] `async fn` is the form the pre-existing
+/// suite exercises. The `Releasing` branch — the one piece of genuinely new
+/// async state-machine code here, and the only branch that still allocates — is
+/// reachable end-to-end only from a signed webhook delivery that registers a
+/// replay key and then fails, so it is driven directly here instead.
+#[cfg(test)]
+mod replay_cleanup_service_tests {
+    use super::{
+        ReplayStoreCell, WEBHOOK_REPLAY_KEY, WebhookReplayCleanupLayer, WebhookReplayFuture,
+        WebhookReplayStore,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime};
+
+    use axum::body::Body;
+    use axum::http::{Request, Response, StatusCode};
+    use tower::{Layer, Service, ServiceExt};
+
+    /// Replay store that records every key it is asked to remove.
+    #[derive(Debug, Default)]
+    struct RecordingStore {
+        removed: Mutex<Vec<String>>,
+        remove_calls: AtomicUsize,
+    }
+
+    impl WebhookReplayStore for RecordingStore {
+        fn check_and_insert<'a>(
+            &'a self,
+            _key: &'a str,
+            _received_at: SystemTime,
+            _window: Duration,
+        ) -> WebhookReplayFuture<'a> {
+            Box::pin(async { Ok(true) })
+        }
+
+        fn remove<'a>(&'a self, key: &'a str) -> WebhookReplayFuture<'a> {
+            self.remove_calls.fetch_add(1, Ordering::SeqCst);
+            let key = key.to_owned();
+            Box::pin(async move {
+                self.removed.lock().expect("lock").push(key);
+                Ok(true)
+            })
+        }
+    }
+
+    /// Inner service that registers `keys` into the ambient replay cell — the
+    /// way `SignedWebhook`'s extractor does — and then answers with `status`.
+    fn delivery_handler(
+        store: Arc<RecordingStore>,
+        keys: Vec<String>,
+        status: StatusCode,
+    ) -> impl Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible> + Clone
+    {
+        tower::service_fn(move |_req: Request<Body>| {
+            let store = Arc::clone(&store);
+            let keys = keys.clone();
+            async move {
+                WEBHOOK_REPLAY_KEY.with(|cell: &ReplayStoreCell| {
+                    *cell.lock().expect("lock") =
+                        Some((store as Arc<dyn WebhookReplayStore>, keys.clone()));
+                });
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .body(Body::empty())
+                        .expect("response builds"),
+                )
+            }
+        })
+    }
+
+    /// `#[allow(future_not_send)]`: `tower::service_fn`'s closure is not
+    /// `Sync`, so this helper's future is `!Send`. It only ever runs on a
+    /// `#[tokio::test]` current-thread runtime, which never moves it.
+    #[allow(clippy::future_not_send)]
+    async fn drive(store: &Arc<RecordingStore>, status: StatusCode) -> StatusCode {
+        let service = WebhookReplayCleanupLayer.layer(delivery_handler(
+            Arc::clone(store),
+            vec!["evt_1".to_owned(), "evt_2".to_owned()],
+            status,
+        ));
+        service
+            .oneshot(Request::builder().body(Body::empty()).expect("request"))
+            .await
+            .expect("infallible")
+            .status()
+    }
+
+    /// The task-local really is installed for the inner service — without it
+    /// `WEBHOOK_REPLAY_KEY.with(..)` in the handler panics.
+    #[tokio::test]
+    async fn the_replay_key_scope_is_installed_for_the_inner_service() {
+        let store = Arc::new(RecordingStore::default());
+        assert_eq!(drive(&store, StatusCode::OK).await, StatusCode::OK);
+    }
+
+    /// A successful delivery keeps its replay keys — releasing them would let
+    /// an attacker replay the signed payload inside the window.
+    #[tokio::test]
+    async fn a_2xx_never_releases_replay_keys() {
+        let store = Arc::new(RecordingStore::default());
+        drive(&store, StatusCode::OK).await;
+        assert_eq!(store.remove_calls.load(Ordering::SeqCst), 0);
+        assert!(store.removed.lock().expect("lock").is_empty());
+    }
+
+    /// The `Releasing` branch: a `5xx` that registered keys releases every one
+    /// of them, and the client still receives the original response.
+    #[tokio::test]
+    async fn a_5xx_releases_every_registered_replay_key_and_still_returns_the_response() {
+        let store = Arc::new(RecordingStore::default());
+        let status = drive(&store, StatusCode::INTERNAL_SERVER_ERROR).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the release branch must not swallow or rewrite the response"
+        );
+        let mut removed = store.removed.lock().expect("lock").clone();
+        removed.sort();
+        assert_eq!(removed, vec!["evt_1".to_owned(), "evt_2".to_owned()]);
+    }
+
+    /// A `4xx` is the client's fault, not a delivery failure: keys stay
+    /// consumed, exactly as before the conversion.
+    #[tokio::test]
+    async fn a_4xx_does_not_release_replay_keys() {
+        let store = Arc::new(RecordingStore::default());
+        drive(&store, StatusCode::BAD_REQUEST).await;
+        assert_eq!(store.remove_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A `5xx` from a request that registered no keys must not take the
+    /// allocating `Releasing` branch at all — it short-circuits to `None`.
+    #[tokio::test]
+    async fn a_5xx_with_no_registered_keys_releases_nothing() {
+        let store = Arc::new(RecordingStore::default());
+        let service =
+            WebhookReplayCleanupLayer.layer(tower::service_fn(|_req: Request<Body>| async move {
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(Body::empty())
+                        .expect("response builds"),
+                )
+            }));
+        let response = service
+            .oneshot(Request::builder().body(Body::empty()).expect("request"))
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(store.remove_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Cancellation: dropping the future before the inner service resolves must
+    /// still release the keys, via `ReplayKeyGuard`'s `Drop`. This is the path
+    /// the request-timeout layer above takes when a webhook handler blows its
+    /// deadline, and the one the `from_fn` form got for free by dropping its
+    /// boxed async block.
+    #[tokio::test]
+    async fn dropping_the_future_mid_flight_still_releases_the_keys() {
+        let store = Arc::new(RecordingStore::default());
+        let store_for_handler = Arc::clone(&store);
+        let service =
+            WebhookReplayCleanupLayer.layer(tower::service_fn(move |_req: Request<Body>| {
+                let store = Arc::clone(&store_for_handler);
+                async move {
+                    WEBHOOK_REPLAY_KEY.with(|cell: &ReplayStoreCell| {
+                        *cell.lock().expect("lock") = Some((
+                            store as Arc<dyn WebhookReplayStore>,
+                            vec!["evt_cancelled".to_owned()],
+                        ));
+                    });
+                    // Never resolves: the only way out is cancellation.
+                    std::future::pending::<Result<Response<Body>, std::convert::Infallible>>().await
+                }
+            }));
+
+        let handle = tokio::spawn(async move {
+            let _ = service
+                .oneshot(Request::builder().body(Body::empty()).expect("request"))
+                .await;
+        });
+        // Let the handler run far enough to register its key, then cancel.
+        tokio::task::yield_now().await;
+        handle.abort();
+        let _ = handle.await;
+        // The guard's Drop spawns the removals; give them a turn.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            store.removed.lock().expect("lock").as_slice(),
+            ["evt_cancelled".to_owned()],
+            "a cancelled webhook delivery must release the replay keys it \
+             registered, so the provider's redelivery is accepted"
+        );
+    }
 }

@@ -1,5 +1,13 @@
-//! Isolated integration test: allocation gate for `AppState`'s config
-//! accessors (issue #2198).
+//! Isolated integration test: the framework's per-request allocation gates —
+//! `AppState`'s config accessors (issue #2198) and the ingress stack's
+//! allocation blocks and bytes (issues #2198, #2205, #2214).
+//!
+//! Everything that has to be judged on *allocations* rather than on a
+//! structural count lives here, in one binary, for the reason the next
+//! paragraph gives. Its sibling gate
+//! `tests/integration/middleware_stack_depth.rs` counts clone-on-call
+//! traversals of the same stack; that count is a proxy, this file is the
+//! measurement.
 //!
 //! `AppState::config` deep-clones every section of `AutumnConfig` on each call,
 //! which is paid per request on the paths that read config. `config_arc` exists
@@ -148,52 +156,46 @@ fn config_allocates_because_it_deep_clones() {
     );
 }
 
-/// Trivial handler: the ceiling below is about the framework's per-request
+/// Trivial handler: the ceilings below are about the framework's per-request
 /// work, so the handler itself must contribute as close to nothing as possible.
 #[autumn_web::get("/ping")]
 async fn ping() -> &'static str {
     "pong"
 }
 
-/// Per-request allocation ceiling for a `TestClient` round trip.
+/// What one `TestClient` round trip through the production ingress costs.
+#[derive(Clone, Copy, Debug)]
+struct PerRequest {
+    /// Allocation blocks (`malloc` calls), averaged over the measured run.
+    blocks: u64,
+    /// Allocated bytes, averaged over the measured run.
+    bytes: u64,
+}
+
+/// Drive `MEASURED` requests through a `TestApp`-built production router and
+/// return the per-request allocation cost.
 ///
-/// The framework reads the whole config once per request and takes an owned
-/// deep clone to do it. That clone is worth about a fifth of everything a
-/// request allocates, which is what makes this ceiling meaningful rather than
-/// decorative.
+/// `customize` runs on the `TestApp` before it is built, so a caller can
+/// register extra layers and measure their marginal cost.
 ///
-/// Numbers behind the constant, all from the debug profile with default
-/// features, identical across three runs (the whole path is deterministic, so
-/// there is no noise budget to reserve): 320 blocks on the tree before #2198's
-/// `config_arc` work, 220 after it landed, and 172 after `AppState::profile`
-/// and `AppState::auth_session_key` moved from owned `String`/`Option<String>`
-/// to `Arc<str>` (`appstate_clone_allocates_nothing_for_profile_and_auth_session_key`
-/// above pins that clone at zero) — a 48-block drop, since `AppState` is
-/// cloned on every hop of the ingress tower stack and each of those two
-/// fields used to be deep-copied on every one of those clones. The ceiling
-/// sits above the current 172 with about a tenth of headroom to spare.
-///
-/// A ceiling this close to the measured value is a deliberate trade: it can
-/// only stay honest while the number stays deterministic. If this ever fails
-/// with a count just over the line rather than a regression-sized jump,
-/// re-measure and re-derive it rather than nudging it upwards.
-#[test]
-fn per_request_allocations_stay_under_the_ceiling() {
+/// The runtime has to be current-thread: `allocation-counter` counts
+/// thread-locally, so anything a worker thread allocated would go uncounted and
+/// every ceiling here would flatter whatever moved off this thread.
+fn measure_per_request(
+    customize: impl FnOnce(autumn_web::test::TestApp) -> autumn_web::test::TestApp,
+) -> PerRequest {
     use autumn_web::routes;
     use autumn_web::test::TestApp;
 
-    const CEILING: u64 = 190;
     const WARMUP: usize = 3;
     const MEASURED: u64 = 10;
 
-    // Counting is thread-local, so the runtime has to be current-thread:
-    // anything a worker thread allocated would go uncounted and the ceiling
-    // would flatter whatever moved off this thread.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("current-thread runtime should build");
-    let client = runtime.block_on(async { TestApp::new().routes(routes![ping]).build() });
+    let client =
+        runtime.block_on(async { customize(TestApp::new().routes(routes![ping])).build() });
 
     // First requests pay one-time setup (lazily built middleware state, caches)
     // that steady-state requests do not.
@@ -211,13 +213,245 @@ fn per_request_allocations_stay_under_the_ceiling() {
             }
         });
     });
-    let per_request = info.count_total / MEASURED;
+
+    PerRequest {
+        blocks: info.count_total / MEASURED,
+        bytes: info.bytes_total / MEASURED,
+    }
+}
+
+/// Per-request allocation-BLOCK ceiling for a `TestClient` round trip.
+///
+/// What makes it meaningful rather than decorative is that it has caught real
+/// movement three times: it is the number #2198, #2205 and #2214 each drove
+/// down, and each of those wins is one a purely structural gate could not see.
+/// (An earlier version of this comment justified the ceiling by the whole-config
+/// deep clone `AppState::config()` used to take per request — that clone left
+/// the request path in #2198, when every framework read moved to `config_arc`.)
+///
+/// Numbers behind the constant, all from the debug profile with default
+/// features, identical across three runs (the whole path is deterministic, so
+/// there is no noise budget to reserve): 320 blocks on the tree before #2198's
+/// `config_arc` work, 220 after it landed, 172 after `AppState::profile`
+/// and `AppState::auth_session_key` moved from owned `String`/`Option<String>`
+/// to `Arc<str>` (`appstate_clone_allocates_nothing_for_profile_and_auth_session_key`
+/// above pins that clone at zero) — a 48-block drop, since `AppState` is
+/// cloned on every hop of the ingress tower stack and each of those two
+/// fields used to be deep-copied on every one of those clones — and **140**
+/// after #2214 replaced the always-on ingress `axum::middleware::from_fn`
+/// layers with hand-rolled services carrying named futures. That 32-block drop
+/// is more than the one `Box::pin` per converted layer the issue title names:
+/// `FromFn::call` also opens with `self.inner.clone()`, and cloning an erased
+/// `BoxCloneSyncService` is a recursive `clone_box` down the rest of the stack,
+/// so each conversion took a whole deep-clone cascade with it (plus the
+/// `String` `asset_cache_control` used to own its path in). The ceiling sits
+/// above the current measurement with about a tenth of headroom to spare.
+///
+/// **Feature sensitivity.** CI gates with `cargo test --workspace`, which
+/// unifies far more features than the 8 defaults a local `cargo test -p
+/// autumn-web` builds — so a ceiling derived under defaults alone would be a
+/// guess. This one is not: 140 was measured under the default set AND under a
+/// 13-feature build adding `oauth2`, `mail`, `storage`, `ws` and `openapi`.
+/// Blocks did not move at all between the two (bytes did — see the sibling
+/// gate). The remaining 6 blocks of headroom are for a feature neither build
+/// covers.
+///
+/// A ceiling this close to the measured value is a deliberate trade, and here
+/// it buys something specific: at 146 a single restored `axum::middleware::from_fn`
+/// on the ingress path (7 blocks, per the control test below) fails this gate.
+/// A looser ceiling would only catch a wholesale revert. It can only stay
+/// honest while the number stays deterministic — if this ever fails with a
+/// count just over the line rather than a regression-sized jump, re-measure
+/// under both feature sets and re-derive it rather than nudging it upwards.
+#[test]
+fn per_request_allocations_stay_under_the_ceiling() {
+    const CEILING: u64 = 146;
+
+    let measured = measure_per_request(|app| app);
+    println!(
+        "per-request ingress cost: {} blocks / {} bytes",
+        measured.blocks, measured.bytes
+    );
 
     assert!(
-        per_request <= CEILING,
-        "a request allocated {per_request} blocks, over the {CEILING} ceiling \
-         ({} blocks and {} bytes across {MEASURED} requests)",
-        info.count_total,
-        info.bytes_total
+        measured.blocks <= CEILING,
+        "a request allocated {} blocks, over the {CEILING} ceiling ({} bytes \
+         per request). 172 was the pre-#2214 measurement: check whether an \
+         `axum::middleware::from_fn` is back on the always-on ingress path — \
+         each one costs a `Box::pin` per request.",
+        measured.blocks,
+        measured.bytes,
+    );
+}
+
+/// Per-request allocated-BYTES ceiling for a `TestClient` round trip.
+///
+/// Bytes, not blocks, are the quantity issue #2214 is denominated in: the
+/// `Box::pin` `axum::middleware::from_fn` wraps its future in is *one* block
+/// but a large one — DHAT measured 1088-2224 bytes at each of the seven call
+/// sites the `request_pipeline` bench traverses, because an outer layer's async
+/// block captures the whole downstream continuation across its single `.await`.
+/// Summed, that was 19.57% of every byte the benchmark allocated while being
+/// only 2.14% of the blocks. A block-count ceiling alone would barely move for
+/// the largest allocation cost in the profile, which is exactly why this
+/// sibling gate exists.
+///
+/// Derivation, debug profile, stable across three runs: **37,819 bytes** per
+/// request before #2214 and **26,030** after under the 8 default features — a
+/// 31.2% reduction, against the 19.57% DHAT attributed to the `from_fn` boxes
+/// alone, the balance being the deep clones those boxes' `self.inner.clone()`
+/// used to drag along with them.
+///
+/// Unlike the block count, bytes ARE feature-sensitive: the same measurement
+/// under a 13-feature build (defaults plus `oauth2`, `mail`, `storage`, `ws`,
+/// `openapi`) is **27,622** — 6.1% higher, because a wider `AutumnConfig` and a
+/// wider `UploadConfig` ride along in request extensions without adding a
+/// single allocation *block*. The ceiling is therefore derived from the WIDER
+/// measurement plus about a tenth, not from the default-feature one; a ceiling
+/// derived from 26,030 would have left barely 3% of room under the feature set
+/// CI actually gates with.
+///
+/// That makes this a *bulk* gate: it catches a wholesale reintroduction of the
+/// `from_fn` layers (which would put the number back near 38k), not a single
+/// one (worth ~1.9 KB). Single-layer regressions are the block ceiling's job
+/// above, and the `type_name` assertions in `src/router.rs`'s test module.
+///
+/// The same honesty rule as the block ceiling applies: a failure a hair over
+/// the line means re-measure under both feature sets and re-derive, not nudge.
+#[test]
+fn per_request_allocated_bytes_stay_under_the_ceiling() {
+    const CEILING: u64 = 30_500;
+
+    let measured = measure_per_request(|app| app);
+    println!(
+        "per-request ingress cost: {} blocks / {} bytes",
+        measured.blocks, measured.bytes
+    );
+
+    assert!(
+        measured.bytes <= CEILING,
+        "a request allocated {} bytes, over the {CEILING} ceiling ({} blocks \
+         per request). ~37.8k was the pre-#2214 measurement: check whether an \
+         `axum::middleware::from_fn` is back on the always-on ingress path — \
+         its `Box::pin` is sized by everything the wrapped async block captures \
+         across `.await`, which for an outer layer is the whole downstream \
+         continuation.",
+        measured.bytes,
+        measured.blocks,
+    );
+}
+
+/// App-wide operator layer that neither clones its inner service on call nor
+/// boxes its future, so registering it costs only the type erasure every
+/// registration pays. The control below subtracts that erasure out.
+#[derive(Clone)]
+struct PassthroughLayer;
+
+impl<S> tower::Layer<S> for PassthroughLayer {
+    type Service = PassthroughService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        PassthroughService { inner }
+    }
+}
+
+#[derive(Clone)]
+struct PassthroughService<S> {
+    inner: S,
+}
+
+impl<S> tower::Service<axum::extract::Request> for PassthroughService<S>
+where
+    S: tower::Service<axum::extract::Request>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::extract::Request) -> Self::Future {
+        self.inner.call(req)
+    }
+}
+
+/// The sensitivity control for the two ceilings above, and the executable
+/// statement of what issue #2214 is about.
+///
+/// Both registrations below wrap the same no-op behaviour around the same app
+/// and are erased identically (`AppBuilder::layer` boxes every registration
+/// through `BoxCloneSyncServiceLayer` — one `Box::pin` per request, common to
+/// both). The ONLY difference is that one is written as a `tower::Service`
+/// whose future is its inner service's future, and the other is written as an
+/// `axum::middleware::from_fn`, whose generated `FromFn::call` must
+/// `Box::pin` the async block it wraps because that block's type cannot be
+/// named. The difference between the two measurements is therefore exactly one
+/// `from_fn` box.
+///
+/// The measured difference is bigger than the single box, and deliberately so:
+/// `FromFn::call` opens with `self.inner.clone()` so it can move the inner
+/// service into the async block, and cloning an erased `BoxCloneSyncService`
+/// is a recursive `clone_box` down every remaining level of the stack — the
+/// same cascade #2193/#2198 measured. So a `from_fn` costs its own box PLUS a
+/// deep clone of everything beneath it, which is why converting one is worth
+/// more than the one allocation the issue title names. At the operator-layer
+/// position measured here (debug profile, default features) the difference is
+/// **7 blocks / ~1.9 KB** per request; a `from_fn` further out costs more,
+/// because more of the stack sits below it.
+///
+/// This test is green both before and after #2214 — that is the point. It
+/// proves the ceilings above are measured on an instrument that can see the
+/// thing they are gating, rather than being two numbers that happen to hold.
+/// The no-op the control below wraps in an `axum::middleware::from_fn`.
+async fn noop_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    next.run(req).await
+}
+
+/// A floor rather than `> 0`: the ceilings above were derived against a
+/// `from_fn` that costs 7 blocks at the position measured here, so an
+/// instrument that could only still see 1 of those 7 would leave them
+/// unmeetable while this control stayed green.
+const MIN_FROM_FN_BLOCKS: u64 = 5;
+
+#[test]
+fn a_from_fn_layer_costs_more_heap_blocks_per_request_than_a_named_future() {
+    let named = measure_per_request(|app| app.layer(PassthroughLayer));
+    let boxed = measure_per_request(|app| app.layer(axum::middleware::from_fn(noop_middleware)));
+    println!(
+        "named-future layer: {} blocks / {} bytes; from_fn layer: {} blocks / {} bytes \
+         (delta {} blocks / {} bytes)",
+        named.blocks,
+        named.bytes,
+        boxed.blocks,
+        boxed.bytes,
+        boxed.blocks.saturating_sub(named.blocks),
+        boxed.bytes.saturating_sub(named.bytes),
+    );
+
+    assert!(
+        boxed.blocks >= named.blocks + MIN_FROM_FN_BLOCKS,
+        "an `axum::middleware::from_fn` must cost at least {MIN_FROM_FN_BLOCKS} \
+         heap blocks per request more than the same no-op written as a \
+         `tower::Service` with a named future (named = {} blocks, from_fn = {} \
+         blocks; 7 was the measurement the ceilings above were derived against). \
+         If the gap has shrunk, `from_fn` changed and those ceilings need \
+         re-deriving, not this assertion loosening.",
+        named.blocks,
+        boxed.blocks,
+    );
+    assert!(
+        boxed.bytes > named.bytes,
+        "the `from_fn` box has to be visible in bytes too, but the named-future \
+         layer measured {} bytes and the `from_fn` one {} bytes",
+        named.bytes,
+        boxed.bytes,
     );
 }
