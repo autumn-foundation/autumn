@@ -177,7 +177,8 @@ pub async fn run_retention_dry_run(
 
 /// Resolve `model_filter` to the descriptors [`run_retention_dry_run`] would
 /// query, without touching a database — every check here reads only the
-/// `inventory`-collected registry.
+/// `inventory`-collected registry (and each matched descriptor's own
+/// `task_info()`, itself DB-independent).
 ///
 /// `None` resolves to every registered descriptor (possibly empty, if the
 /// binary declares no `retention(...)` policy at all). This is what lets
@@ -185,33 +186,66 @@ pub async fn run_retention_dry_run(
 /// --dry-run` needs a database connection at all *before* opening one — see
 /// `docs/guide/retention-sweeps.md`.
 ///
+/// Also runs each matched descriptor's `task_info()` — the same
+/// duration-parsing, model-dependents, and bind-limit validation real boot
+/// runs via `collect_retention_tasks()` — so a dry run is a faithful
+/// preview: a policy that would panic at boot panics here too, rather than
+/// reporting a misleadingly clean dry run (#1342 review round 14).
+///
 /// # Errors
 ///
 /// A not-found error when `model_filter` names nothing registered, or a
 /// bad-request error when it matches more than one policy.
+///
+/// # Panics
+///
+/// Panics if any matched descriptor's declared `after`, `purge_deleted_after`,
+/// or `every` is not a valid duration string, if its model declares a
+/// model-side `dependent = ...` association, or if its `batch_size` doesn't
+/// fit this backend's bind-parameter limit — the same conditions
+/// `collect_retention_tasks()` panics on at boot.
 #[doc(hidden)]
 pub fn resolve_retention_descriptors(
     model_filter: Option<&str>,
 ) -> AutumnResult<Vec<&'static RetentionSweepDescriptor>> {
-    let Some(filter) = model_filter else {
-        return Ok(inventory::iter::<RetentionSweepDescriptor>().collect());
+    let matches: Vec<&RetentionSweepDescriptor> = match model_filter {
+        None => inventory::iter::<RetentionSweepDescriptor>().collect(),
+        Some(filter) => {
+            let found: Vec<&RetentionSweepDescriptor> = inventory::iter::<RetentionSweepDescriptor>
+                .into_iter()
+                .filter(|descriptor| {
+                    descriptor.model_name == filter || descriptor.table_name == filter
+                })
+                .collect();
+            if found.is_empty() {
+                return Err(crate::AutumnError::not_found_msg(format!(
+                    "no #[repository(..., retention(...))] policy is registered for model \
+                     {filter:?}"
+                )));
+            }
+            if found.len() > 1 {
+                let table_names: Vec<&str> = found.iter().map(|d| d.table_name).collect();
+                return Err(crate::AutumnError::bad_request_msg(format!(
+                    "{filter:?} matches more than one retention policy ({table_names:?}); pass \
+                     the table name instead of the model name to disambiguate, e.g. --model {}",
+                    table_names[0]
+                )));
+            }
+            found
+        }
     };
-    let matches: Vec<&RetentionSweepDescriptor> = inventory::iter::<RetentionSweepDescriptor>
-        .into_iter()
-        .filter(|descriptor| descriptor.model_name == filter || descriptor.table_name == filter)
-        .collect();
-    if matches.is_empty() {
-        return Err(crate::AutumnError::not_found_msg(format!(
-            "no #[repository(..., retention(...))] policy is registered for model {filter:?}"
-        )));
-    }
-    if matches.len() > 1 {
-        let table_names: Vec<&str> = matches.iter().map(|d| d.table_name).collect();
-        return Err(crate::AutumnError::bad_request_msg(format!(
-            "{filter:?} matches more than one retention policy ({table_names:?}); pass the \
-             table name instead of the model name to disambiguate, e.g. --model {}",
-            table_names[0]
-        )));
+    // Regression (#1342 review round 14): resolving descriptors alone
+    // doesn't validate them — the `every`/`after`/`purge_deleted_after`
+    // duration parsing, the model-dependents boot assert, and the
+    // backend-bind-limit assert all live inside `task_info()`, which this
+    // function never called. A policy with a bad `every` (e.g. "bogus")
+    // used to pass a dry run silently even though it panics the moment real
+    // boot calls `collect_retention_tasks()` (which does call `task_info()`
+    // on every descriptor). Run the exact same validation boot relies on —
+    // it's pure and DB-independent, so calling it here doesn't cost the
+    // "resolve before connecting" property this function exists for.
+    for descriptor in &matches {
+        let _: TaskInfo = (descriptor.task_info)();
     }
     Ok(matches)
 }
@@ -452,5 +486,55 @@ mod tests {
             .expect_err("an unregistered model filter must error");
 
         assert!(error.to_string().contains("__NoSuchRetentionModel"));
+    }
+
+    // Regression (#1342 review round 14): `resolve_retention_descriptors`
+    // used to return matched descriptors without ever calling their
+    // `task_info()` — the one place `every`/`after`/`purge_deleted_after`
+    // duration parsing, the model-dependents assert, and the bind-limit
+    // assert all live. A policy with a bad `every` therefore passed a dry
+    // run silently even though real boot (`collect_retention_tasks()`,
+    // which DOES call `task_info()` on every descriptor) would panic on it.
+    //
+    // Can't test this with a genuinely panicking fixture: `inventory`'s
+    // registry is process-global and every other test in this binary that
+    // calls `collect_retention_tasks()` also invokes every registered
+    // descriptor's `task_info()`, so a permanently-panicking fixture here
+    // would break those tests too. Count calls instead — proving
+    // `resolve_retention_descriptors` invokes `task_info()` is exactly what
+    // proves it would propagate a real panic without needing to trigger one.
+    static COUNTING_TASK_INFO_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn counting_task_info() -> TaskInfo {
+        COUNTING_TASK_INFO_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        task_info_named("retention-sweep-__retention_runtime_test_counting")
+    }
+
+    #[test]
+    fn resolve_retention_descriptors_invokes_task_info_validation() {
+        struct Fixture;
+        inventory::submit! {
+            RetentionSweepDescriptor {
+                model_name: "__RetentionRuntimeTestCounting",
+                table_name: "__retention_runtime_test_counting",
+                task_info: counting_task_info,
+                dry_run: sample_dry_run,
+            }
+        }
+        let _ = Fixture;
+
+        let before = COUNTING_TASK_INFO_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let descriptors = resolve_retention_descriptors(Some("__RetentionRuntimeTestCounting"))
+            .expect("resolving a registered model must succeed");
+        let after = COUNTING_TASK_INFO_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(descriptors.len(), 1);
+        assert!(
+            after > before,
+            "resolve_retention_descriptors must call task_info() on every matched descriptor \
+             to run the same validation collect_retention_tasks() runs at boot, so a dry run \
+             cannot report success for a policy real boot would panic on"
+        );
     }
 }
