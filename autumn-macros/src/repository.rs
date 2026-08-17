@@ -623,6 +623,18 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                  Remove `sharded`, or sweep each shard's table by hand for now",
             ));
         }
+        if !dependents.is_empty() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support dependent(...) yet: the sweep mutates rows \
+                 directly and does not run the cascade-aware delete path dependent(...) \
+                 generates, so a hard-delete sweep could orphan children (or silently ignore \
+                 an on_delete = restrict rule) and a soft-delete sweep would leave active \
+                 children attached to a swept parent. Remove `dependent(...)`, or call \
+                 delete_many(ids)/delete_by_id(id) yourself from a hand-written #[scheduled] \
+                 sweep for now",
+            ));
+        }
         if spec.batch_size == Some(0) {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
@@ -11222,9 +11234,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // Yields the number of rows the statement actually
                     // touched (not the SELECT's candidate count) so a row
                     // that changed state between the SELECT and this
-                    // statement — e.g. a concurrent `restore()` — is
+                    // statement — e.g. a concurrent `restore()`, or (when
+                    // `basis` is a mutable column like `last_seen_at`) a
+                    // concurrent update that un-stales the row — is
                     // reflected correctly in `rows_swept` rather than
-                    // over-reported.
+                    // over-reported. Re-checking `basis < __cutoff` here,
+                    // not just `id`, is what makes the second case safe.
                     let apply_stmt = if config.soft_delete {
                         quote! {
                             let __applied: u64 = if dry_run {
@@ -11234,6 +11249,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 ::autumn_web::reexports::diesel::update(
                                     #table_ident::table
                                         .filter(#table_ident::id.eq_any(ids))
+                                        .filter(#table_ident::#basis_ident.lt(__cutoff))
                                         .filter(#table_ident::deleted_at.is_null())
                                 )
                                 .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
@@ -11248,7 +11264,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 __n
                             } else {
                                 ::autumn_web::reexports::diesel::delete(
-                                    #table_ident::table.filter(#table_ident::id.eq_any(ids))
+                                    #table_ident::table
+                                        .filter(#table_ident::id.eq_any(ids))
+                                        .filter(#table_ident::#basis_ident.lt(__cutoff))
                                 )
                                 .execute(&mut conn)
                                 .await
@@ -11274,9 +11292,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .expect("retention `after` duration out of range");
                             let __cutoff =
                                 ::autumn_web::time::ClockSource::now(state.clock()).naive_utc() - __after_chrono;
-                            let mut __last_id: i64 = 0;
-                            let mut __batches: u32 = 0;
+                            // Not 0: a table can legitimately hold id <= 0
+                            // rows (e.g. after a manual import), and this
+                            // repository's PK convention doesn't forbid
+                            // them — starting below every possible id keeps
+                            // the very first page from silently skipping
+                            // them.
+                            let mut __last_id: i64 = i64::MIN;
                             loop {
+                                if __batches >= #max_batches {
+                                    break;
+                                }
                                 let ids: ::std::vec::Vec<i64> = #table_ident::table
                                     .filter(#table_ident::#basis_ident.lt(__cutoff))
                                     .filter(#table_ident::id.gt(__last_id))
@@ -11323,9 +11349,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .expect("retention `purge_deleted_after` duration out of range");
                             let __cutoff =
                                 ::autumn_web::time::ClockSource::now(state.clock()).naive_utc() - __purge_chrono;
-                            let mut __last_id: i64 = 0;
-                            let mut __batches: u32 = 0;
+                            let mut __last_id: i64 = i64::MIN;
                             loop {
+                                if __batches >= #max_batches {
+                                    break;
+                                }
                                 let ids: ::std::vec::Vec<i64> = #table_ident::table
                                     .filter(#table_ident::deleted_at.lt(__cutoff))
                                     .filter(#table_ident::id.gt(__last_id))
@@ -11454,6 +11482,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let repo = Self::with_pool_untracked(pool);
                 let mut conn = repo.__autumn_acquire_conn().await?;
                 let mut rows_swept: u64 = 0;
+                // Shared across both branches: a soft-delete policy
+                // declaring both `after` and `purge_deleted_after` must
+                // still cap the WHOLE run at `max_batches`, not
+                // `max_batches` per branch (issue #1342 review).
+                let mut __batches: u32 = 0;
 
                 #age_block
                 #purge_block
@@ -22004,6 +22037,26 @@ mod tests {
         assert!(
             error.to_string().contains("sharded"),
             "retention + sharded must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_dependent() {
+        // Regression (#1342 review): the sweep mutates rows directly and
+        // does not run the cascade-aware delete path dependent(...)
+        // generates, so it must be rejected rather than silently orphaning
+        // (or leaving active) children.
+        let tokens: proc_macro2::TokenStream =
+            "Post, dependent(PgCommentRepository, fk = \"post_id\", on_delete = destroy), \
+             retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + dependent(...) must be rejected");
+        };
+        assert!(
+            error.to_string().contains("dependent"),
+            "retention + dependent(...) must be rejected: {error}"
         );
     }
 

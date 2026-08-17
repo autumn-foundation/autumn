@@ -68,7 +68,10 @@ Duration strings accept the same syntax as `#[scheduled(every = ...)]`:
 
 At least one of `after` (with `basis`) or `purge_deleted_after` must be
 given; `sharded` repositories are not supported yet (a sweep would only
-reach the shard it happens to be handed, silently skipping the rest).
+reach the shard it happens to be handed, silently skipping the rest), and
+neither is `dependent(...)` (a sweep mutates rows directly rather than
+through the cascade-aware delete path `dependent(...)` generates, so it
+could orphan children or ignore an `on_delete = restrict` rule).
 
 ## `tenant_scoped` Repositories: Sweeps Are Cross-Tenant By Design
 
