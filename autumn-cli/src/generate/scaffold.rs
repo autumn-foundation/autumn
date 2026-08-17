@@ -1218,8 +1218,9 @@ fn plan_scaffold_with_options_impl(
             // resource's own freshly rendered routes are what count for it,
             // not the superseded file still on disk.
             let pending = super::emit::pending_contents(&plan);
+            let surviving_scan = super::emit::scan_surviving_sources(project_root, &[], &pending);
             let still_referenced =
-                super::emit::keys_still_referenced(&existing_ftl, project_root, &[], &pending);
+                super::emit::keys_still_referenced_in(&surviving_scan, &existing_ftl);
             let merged = scaffold_i18n::merge_en_ftl_keeping(
                 &existing_ftl,
                 &pascal_name,
@@ -1274,8 +1275,22 @@ fn plan_scaffold_with_options_impl(
                         )));
                     }
                 };
-                let merged =
-                    scaffold_i18n::merge_en_ftl(&base, &pascal_name, &snake_name, &referenced_keys);
+                // The SAME preserving merge the runtime bundle gets, against
+                // this file's own definitions. Reconciling the validator block
+                // against only the newly generated keys undoes the protection:
+                // a key held back from the runtime prune because hand-written
+                // code still calls it would be dropped from the very bundle
+                // that call is validated against, so the build fails anyway —
+                // just from the other file.
+                let still_referenced_here =
+                    super::emit::keys_still_referenced_in(&surviving_scan, &base);
+                let merged = scaffold_i18n::merge_en_ftl_keeping(
+                    &base,
+                    &pascal_name,
+                    &snake_name,
+                    &referenced_keys,
+                    &still_referenced_here,
+                );
                 if merged != base {
                     plan.modify(validator_path.clone(), merged);
                 }

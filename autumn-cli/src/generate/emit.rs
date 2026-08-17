@@ -439,6 +439,18 @@ pub(super) fn keys_still_referenced(
     overrides: &HashMap<PathBuf, String>,
 ) -> HashSet<String> {
     let scan = scan_surviving_sources(project_root, excluding, overrides);
+    keys_still_referenced_in(&scan, bundle)
+}
+
+/// [`keys_still_referenced`] against a scan already taken.
+///
+/// One scan, several bundles: a project whose `t!` validator reads a different
+/// file from the one the app loads has BOTH kept in step, and re-walking the
+/// source tree per bundle would only give the two a chance to disagree.
+pub(super) fn keys_still_referenced_in(
+    scan: &crate::i18n::ScanResult,
+    bundle: &str,
+) -> HashSet<String> {
     // Every key the surviving tree references, NOT just the `common.*` ones.
     // The resource's own keys are ordinary Fluent keys too, and hand-written
     // code reaches for them: a dashboard card or a nav link labelled
@@ -515,7 +527,7 @@ pub(super) fn pending_contents(plan: &Plan) -> HashMap<PathBuf, String> {
 /// generator must read the files it is ABOUT to change from the plan rather
 /// than from disk: `overrides` supplies pending content, and `excluding` drops
 /// the module being destroyed.
-fn scan_surviving_sources(
+pub(super) fn scan_surviving_sources(
     project_root: &Path,
     excluding: &[PathBuf],
     overrides: &HashMap<PathBuf, String>,

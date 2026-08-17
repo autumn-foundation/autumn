@@ -775,6 +775,107 @@ fn regenerating_keeps_a_dropped_field_key_hand_written_code_still_calls() {
 }
 
 #[test]
+fn the_extensionless_cargo_config_wins_as_cargo_says_it_does() {
+    // With both present cargo warns "both `…/config` and `…/config.toml`
+    // exist. Using `…/config`" and applies the extensionless one. Reading the
+    // other takes a locale cargo never applies, and the scaffold then keeps the
+    // wrong bundle in step.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "dual-config-app"]);
+    let project = tmp.path().join("dual-config-app");
+    fs::create_dir_all(project.join(".cargo")).unwrap();
+    fs::write(
+        project.join(".cargo/config"),
+        "[env]\nAUTUMN_I18N_DEFAULT_LOCALE = \"de\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join(".cargo/config.toml"),
+        "[env]\nAUTUMN_I18N_DEFAULT_LOCALE = \"es\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(project.join("i18n")).unwrap();
+    fs::write(project.join("i18n/de.ftl"), "welcome.title = Willkommen\n").unwrap();
+    fs::write(project.join("i18n/es.ftl"), "welcome.title = Bienvenido\n").unwrap();
+    let autumn_toml = project.join("autumn.toml");
+    let config = fs::read_to_string(&autumn_toml).unwrap();
+    fs::write(
+        &autumn_toml,
+        format!("{config}\n[i18n]\ndefault_locale = \"fr\"\nsupported_locales = [\"fr\"]\n"),
+    )
+    .unwrap();
+
+    run_autumn_ok(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "--i18n"],
+    );
+
+    let de = fs::read_to_string(project.join("i18n/de.ftl")).unwrap();
+    let es = fs::read_to_string(project.join("i18n/es.ftl")).unwrap();
+    assert!(
+        de.contains("post.new = New Post"),
+        "the extensionless config selects the validator bundle:\n{de}"
+    );
+    assert!(
+        !es.contains("post.new"),
+        "`config.toml` is the one cargo ignores here:\n{es}"
+    );
+}
+
+#[test]
+fn regeneration_keeps_a_live_key_in_the_validator_bundle_too() {
+    // Holding a key back from the runtime prune is no use if the bundle `t!`
+    // validates against loses it: the surviving call fails to compile anyway,
+    // just from the other file. Both merges get the same protection.
+    let (_tmp, project) = i18n_project(&[]);
+    // `default_locale = "fr"` moves the runtime bundle to `i18n/fr.ftl` while
+    // `i18n/en.ftl` stays the validator's — two different files.
+    let autumn_toml = project.join("autumn.toml");
+    let config = fs::read_to_string(&autumn_toml).unwrap();
+    fs::write(
+        &autumn_toml,
+        config.replace("default_locale = \"en\"", "default_locale = \"fr\""),
+    )
+    .unwrap();
+    fs::create_dir_all(project.join("src/components")).unwrap();
+    fs::write(
+        project.join("src/components/nav.rs"),
+        "fn card(locale: &Locale) -> Markup { html! { (t!(locale, \"post.field.views\")) } }\n",
+    )
+    .unwrap();
+
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "--i18n",
+            "--force",
+        ],
+    );
+
+    let en = fs::read_to_string(project.join("i18n/en.ftl")).unwrap();
+    let fr = fs::read_to_string(project.join("i18n/fr.ftl")).unwrap();
+    // `en.ftl` is the one the original scaffold wrote and the one `t!` now
+    // validates against, so it is where the dropped-but-still-called key lives.
+    assert!(
+        en.contains("post.field.views"),
+        "the bundle `t!` validates against keeps the live key:\n{en}"
+    );
+    assert!(
+        !en.contains("post.field.author_name"),
+        "keys nothing calls are still pruned from it:\n{en}"
+    );
+    assert!(
+        fr.contains("post.new"),
+        "and the runtime bundle still gets this render's keys:\n{fr}"
+    );
+}
+
+#[test]
 fn the_validator_bundle_a_cargo_config_selects_is_kept_in_step() {
     // `t!` reads `AUTUMN_I18N_DEFAULT_LOCALE` to pick the bundle it validates
     // against, and a setting the macro needs on every build lives in

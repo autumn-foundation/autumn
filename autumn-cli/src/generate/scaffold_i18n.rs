@@ -251,6 +251,13 @@ pub(super) fn defined_keys(src: &str) -> BTreeMap<String, String> {
 ///
 /// Returns `existing` unchanged when every key is already defined, so the
 /// generator can skip the write and leave the file out of the plan.
+///
+/// TEST-ONLY. Every production path reaches [`merge_en_ftl_keeping`] with a set
+/// scanned from the project, because reconciliation prunes and pruning a key a
+/// live call site still names breaks the build at COMPILE time. A convenience
+/// entry point that quietly passes no such set is exactly how one of the two
+/// merge sites came to be missing it.
+#[cfg(test)]
 pub(super) fn merge_en_ftl(
     existing: &str,
     pascal_name: &str,
@@ -1077,7 +1084,13 @@ impl MacroEnv {
     /// `$CARGO_HOME` can also carry one, but those are outside the tree being
     /// generated into and nothing here can see which of them cargo would pick.
     pub(super) fn resolve(project_root: &Path) -> Self {
-        let config = ["config.toml", "config"]
+        // EXTENSIONLESS FIRST. With both present cargo warns "both `…/config`
+        // and `…/config.toml` exist. Using `…/config`" and applies the
+        // extensionless one, for backwards compatibility. Reading the other
+        // would take a `default_locale` cargo never applies, and the scaffold
+        // would then keep the wrong bundle in step — leaving the one `t!`
+        // actually opens without the generated keys.
+        let config = ["config", "config.toml"]
             .into_iter()
             .find_map(|name| std::fs::read_to_string(project_root.join(".cargo").join(name)).ok())
             .unwrap_or_default();
