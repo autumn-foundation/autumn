@@ -1189,12 +1189,18 @@ fn i18n_scaffold_cargo_checks() {
     // (issue #1349), which rebinds the `unique_violation_field` destructuring in
     // both the create and update handlers. Nothing but a real compile proves
     // those two still typecheck.
+    // `archived:bool?` earns its place for the same reason: a nullable bool is
+    // the one field whose CONTROL the scaffold overrides under `--i18n`, to
+    // replace the derive's hardcoded `— Unset —`/`Yes`/`No`. The emitted
+    // `vec![(String, String)]` has to typecheck against `FieldControl::Select`
+    // with `t!` calls in it, which only a real compile proves.
     let (_tmp, project) = i18n_scaffold(
         "i18n-check",
         &[
             "title:String:unique",
             "body:Text",
             "published:bool",
+            "archived:Option<bool>",
             "views:i64",
             "author_name:String",
         ],

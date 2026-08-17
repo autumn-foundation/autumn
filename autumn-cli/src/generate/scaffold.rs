@@ -8352,6 +8352,38 @@ fn render_form_for_helper(
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: {name}_select }})"
                 );
             }
+            // A nullable `bool` renders as a tri-state `<select>` so `NULL`
+            // stays reachable, and the derive fills it with hardcoded
+            // `— Unset —` / `Yes` / `No` (`autumn-macros/src/model.rs`'s
+            // `form_control_tokens`). Those are user-facing strings this flag
+            // is supposed to have claimed: without the override they survive
+            // untranslated in every create and edit form, next to a field
+            // label that IS translated. The same `override_field` escape hatch
+            // the enum arm uses replaces them, keeping the derive's `""` /
+            // `"true"` / `"false"` values so form parsing is unaffected.
+            //
+            // Only under `--i18n`: with the flag off the derived control is
+            // already right, and emitting an override would change output the
+            // rest of this module keeps byte-identical.
+            FieldKind::Bool if f.nullable && labels.enabled() => {
+                let mut options = format!(
+                    "(\"\".into(), {}.into())",
+                    labels.lit("common.select.unset", "— Unset —")
+                );
+                for (value, key, english) in
+                    [("true", "common.yes", "Yes"), ("false", "common.no", "No")]
+                {
+                    let _ = write!(
+                        options,
+                        ", (\"{value}\".into(), {}.into())",
+                        labels.lit(key, english)
+                    );
+                }
+                let _ = write!(
+                    builder_calls,
+                    "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: vec![{options}] }})"
+                );
+            }
             // A `String`/`Text`/numeric field carrying DSL constraint
             // modifiers (issue #1388) needs HTML5 attributes the derived
             // `FieldControl` can't express (`minlength`/`maxlength`,
@@ -15594,6 +15626,10 @@ async fn main() {
             !routes.contains("autumn_web::form::select_input(&changeset"),
             "{routes}"
         );
+        // …with the flag off. Under `--i18n` the derive's hardcoded
+        // `— Unset —`/`Yes`/`No` are user-facing English that has to be
+        // claimed, so an override IS emitted — see
+        // `a_nullable_bool_translates_its_own_options`.
         assert!(
             !routes.contains(".override_field(\"archived\""),
             "nullable bool fields need no form_for override: {routes}"
@@ -23076,6 +23112,52 @@ exempt_paths = [
     /// [`ViewLabels`](super::super::scaffold_i18n::ViewLabels) returns the
     /// caller's own expression verbatim when the flag is off, so there is no
     /// second code path that could drift in the first place.
+    /// A nullable `bool` renders a tri-state select whose three options the
+    /// DERIVE fills with hardcoded English (`autumn-macros/src/model.rs`'s
+    /// `form_control_tokens`). Translating the field label and leaving
+    /// `— Unset —`/`Yes`/`No` beside it is exactly the half-done state this
+    /// flag exists to remove, so the scaffold overrides the control.
+    #[test]
+    fn a_nullable_bool_translates_its_own_options() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "archived:Option<bool>".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(".override_field(\"archived\", autumn_web::form::FieldControl::Select"),
+            "the derived control's English options must be replaced:\n{routes}"
+        );
+        for key in ["common.select.unset", "common.yes", "common.no"] {
+            assert!(
+                routes.contains(&format!("t!(locale, \"{key}\")")),
+                "{key} must be looked up:\n{routes}"
+            );
+        }
+        // The derive's own submitted values are kept, so form parsing is
+        // untouched: only the labels beside them change.
+        for value in ["(\"\".into()", "(\"true\".into()", "(\"false\".into()"] {
+            assert!(routes.contains(value), "{value} missing:\n{routes}");
+        }
+        // And no English leaks alongside.
+        assert!(
+            !routes.contains("\"— Unset —\".into()") && !routes.contains("\"Yes\".into()"),
+            "{routes}"
+        );
+
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert!(ftl.contains("common.yes = Yes"), "{ftl}");
+        assert!(ftl.contains("common.no = No"), "{ftl}");
+    }
+
     #[test]
     fn i18n_omitted_is_byte_identical_to_default() {
         let fields = i18n_fields();

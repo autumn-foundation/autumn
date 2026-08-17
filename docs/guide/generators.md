@@ -1243,7 +1243,11 @@ autumn generate scaffold Post title:String body:Text published:bool --i18n
   notices — is emitted as a `t!(locale, "key")` lookup instead of a
   literal. That includes the labels the shared widgets supply by default:
   the pager's Previous/Next, the bulk-delete button, the purge dialog's
-  Cancel. An `Attachment` column's meta line beside the download link is one
+  Cancel. A nullable `bool` is covered too — the form derive fills its
+  tri-state select with a hardcoded `— Unset —`/`Yes`/`No`, and the
+  generated `override_field` replaces those with `common.select.unset` /
+  `common.yes` / `common.no` while keeping the submitted values. An
+  `Attachment` column's meta line beside the download link is one
   pattern rather than a stray translated word — `common.attachment.meta =
   ({ $media }, { $size } bytes)` — so the media type and byte count
   interpolate as arguments and a translator owns the parentheses, the comma
@@ -1281,8 +1285,9 @@ Keys are split so a translator sees each string exactly once:
 | This resource's strings | `post.new`, `post.name.plural`, `post.index.title`, `post.index.empty`, `post.show.title`, `post.edit.title`, `post.delete.confirm`, `post.field.<column>`, `post.flash.*` | Once per resource, under a marked comment block. |
 
 **What interpolates and what does not.** A row key or a count travels as a
-Fluent argument, so a translation can position it: `post.show.title =
-Post #{ $id }`, `post.flash.bulk_deleted = Deleted { $count } posts`. The
+Fluent argument, so a translation can *position* it: `post.show.title =
+Post #{ $id }`, `post.flash.bulk_deleted = Deleted { $count } posts`.
+Positioning is all it can do — see the pluralization limit below. The
 model's **name** never does. `New { $resource }` would look like tidy
 reuse, but it hands the translator a sentence whose article and adjective
 must agree with a noun they cannot see — French *Nouveau*/*Nouvelle*,
@@ -1298,6 +1303,18 @@ Notes and limits:
   Title Case the form derive already uses, which means a **multi-word**
   column's show-page label normalizes from "Author name" to "Author Name"
   under `--i18n`. Single-word columns are unaffected.
+- **`{ $count }` positions a number; it does not pluralize.** The bundle
+  loader substitutes `{ $name }` placeables and nothing else — Fluent
+  selectors (`{ $count -> [one] … *[other] … }`), terms and `NUMBER()` are
+  carried through as literal text, not evaluated (`autumn/src/i18n.rs`).
+  So `post.flash.bulk_deleted` can put the count wherever a language needs
+  it, but a translator cannot vary the noun with it, and a language with
+  more than two plural categories — Russian, Polish, Arabic — has no form
+  that is right for every value. Write the value so it reads acceptably for
+  any count ("Deleted: { $count }"), or handle the plural in application
+  code and pass the finished string. Lifting this needs selector support in
+  the loader, which is framework work rather than something the generator
+  can emit around.
 - **Re-running never clobbers a translation.** An existing value is left
   exactly as edited, and a new key from a later run lands inside its
   resource's block rather than at the end of the file. A `--force`
