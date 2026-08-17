@@ -170,6 +170,8 @@ mod offline_sync_engine;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_pg;
 #[cfg(feature = "offline-sync")]
+mod offline_sync_push_batching_perf;
+#[cfg(feature = "offline-sync")]
 mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
