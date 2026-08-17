@@ -1310,6 +1310,20 @@ fn plan_scaffold_with_options_impl(
             let dockerfile_path = project_root.join("Dockerfile");
             if dockerfile_path.exists() {
                 let base = read_or_empty(&dockerfile_path);
+                // A `dir` that moved since an earlier `--i18n` run leaves the old
+                // pair behind, and the new pair is added beside it. `COPY` fails
+                // the build outright when its source is gone from the context, so
+                // the stale line is the difference between an image that builds
+                // and one that does not.
+                if let Some(stale) = scaffold_i18n::stale_dockerfile_i18n_dir(&base, &i18n_dir) {
+                    plan.warn(format!(
+                        "Dockerfile still copies `{stale}/` — the locale directory an earlier \
+                         scaffold wired in — while `[i18n] dir` now resolves to `{i18n_dir}/`. \
+                         Both stages have been given `{i18n_dir}/`; remove the `{stale}/` lines \
+                         by hand. Left in place they fail the image build outright once \
+                         `{stale}/` is gone from the build context."
+                    ));
+                }
                 match scaffold_i18n::ensure_dockerfile_i18n_copy(&base, &i18n_dir) {
                     Some(updated) if updated != base => {
                         plan.modify(dockerfile_path, updated);

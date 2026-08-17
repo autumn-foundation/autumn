@@ -627,20 +627,85 @@ fn toml_table_name(line: &str) -> Option<&str> {
 /// `default_locale = "fr" # our default` into the locale tag
 /// `fr" # our default` — and the generator would then cheerfully create a file
 /// named after it. Returns `None` for an empty or unparseable value.
-fn toml_scalar_value(raw: &str) -> Option<&str> {
+fn toml_scalar_value(raw: &str) -> Option<String> {
     let trimmed = raw.trim_start();
     let quote = trimmed.chars().next()?;
     let value = if quote == '"' || quote == '\'' {
         let rest = &trimmed[quote.len_utf8()..];
-        &rest[..rest.find(quote)?]
+        let slice = &rest[..rest.find(quote)?];
+        // A BASIC string (double quotes) processes escapes; a LITERAL string
+        // (single quotes) does not, by TOML's definition. Both of these values
+        // become filesystem paths, so the raw source text is the wrong thing to
+        // build them from: the app's loader reads the DECODED value, and
+        // `dir = "i18n\\bundles"` on Windows would otherwise have the generator
+        // writing to a directory with a literal double backslash in its name
+        // while the runtime reads the single-backslash one.
+        if quote == '"' {
+            decode_toml_escapes(slice)
+        } else {
+            slice.to_owned()
+        }
     } else {
         // A bare value runs to the first comment marker or end of line.
         trimmed
             .split_once('#')
             .map_or(trimmed, |(before, _)| before)
             .trim_end()
+            .to_owned()
     };
     (!value.is_empty()).then_some(value)
+}
+
+/// Decode the escape sequences TOML defines for a basic string.
+///
+/// An unknown or malformed escape is passed through verbatim rather than
+/// rejected: this is a best-effort read of a file the app's own loader
+/// validates properly, and a generator that refused to run over a `dir` it
+/// could not decode would be worse than one that used the text as written.
+fn decode_toml_escapes(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(esc) = chars.next() else {
+            out.push('\\');
+            break;
+        };
+        match esc {
+            'b' => out.push('\u{8}'),
+            't' => out.push('\t'),
+            'n' => out.push('\n'),
+            'f' => out.push('\u{c}'),
+            'r' => out.push('\r'),
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            'u' | 'U' => {
+                let width = if esc == 'u' { 4 } else { 8 };
+                let digits: String = chars.clone().take(width).collect();
+                if let Some(decoded) = u32::from_str_radix(&digits, 16)
+                    .ok()
+                    .filter(|_| digits.len() == width)
+                    .and_then(char::from_u32)
+                {
+                    out.push(decoded);
+                    for _ in 0..width {
+                        chars.next();
+                    }
+                } else {
+                    out.push('\\');
+                    out.push(esc);
+                }
+            }
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    out
 }
 
 /// Whether `autumn.toml` already defines i18n configuration **in any of TOML's
@@ -736,8 +801,8 @@ pub(super) fn configured_i18n(autumn_toml: &str) -> (Option<String>, Option<Stri
                             continue;
                         };
                         match k.trim() {
-                            "default_locale" => locale = Some(v.to_owned()),
-                            "dir" => dir = Some(v.to_owned()),
+                            "default_locale" => locale = Some(v.clone()),
+                            "dir" => dir = Some(v.clone()),
                             _ => {}
                         }
                     }
@@ -752,8 +817,8 @@ pub(super) fn configured_i18n(autumn_toml: &str) -> (Option<String>, Option<Stri
             continue;
         };
         match key.trim() {
-            "default_locale" => locale = Some(value.to_owned()),
-            "dir" => dir = Some(value.to_owned()),
+            "default_locale" => locale = Some(value.clone()),
+            "dir" => dir = Some(value.clone()),
             _ => {}
         }
     }
@@ -867,6 +932,58 @@ pub(super) fn ensure_dockerfile_i18n_copy(dockerfile: &str, dir: &str) -> Option
     ))
 }
 
+/// The directory an earlier `--i18n` run pointed the Dockerfile's locale
+/// `COPY` lines at, when that is no longer the configured `dir`.
+///
+/// A project that changes `[i18n] dir` after its first `--i18n` scaffold keeps
+/// the old pair, and `ensure_dockerfile_i18n_copy` adds a second one for the
+/// new directory. That is worth saying out loud: `COPY` fails the build when
+/// its source is missing from the context, so a rename that MOVED the old
+/// directory stops the image building at all, and one that merely copied it
+/// ships a bundle the app never reads.
+///
+/// Reported rather than rewritten. These lines carry no marker, so "the
+/// generator wrote this" can only ever be inferred — and the inference is a
+/// shape (`COPY <x> ./<x>`) that an ordinary hand-written `COPY static
+/// ./static` matches exactly. A warning that occasionally names the wrong
+/// directory costs the reader a second; an edit that silently rewrites
+/// someone's asset `COPY` into a locale one costs them their image. So the
+/// position is used as corroboration (this generator inserts immediately after
+/// the `migrations` anchors) and the result is still only ever advice.
+pub(super) fn stale_dockerfile_i18n_dir(dockerfile: &str, dir: &str) -> Option<String> {
+    /// The directory in `COPY <x> ./<x>`, when the line has that exact shape.
+    fn builder_copy_dir(line: &str) -> Option<&str> {
+        match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["COPY", src, dest] if dest.strip_prefix("./") == Some(*src) => Some(src),
+            _ => None,
+        }
+    }
+    /// The same for `COPY --from=builder /app/<x> /app/<x>`.
+    fn runtime_copy_dir(line: &str) -> Option<&str> {
+        match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["COPY", "--from=builder", src, dest] if src == dest => {
+                src.strip_prefix("/app/").filter(|d| !d.contains('/'))
+            }
+            _ => None,
+        }
+    }
+
+    let after = |anchor: &str, extract: fn(&str) -> Option<&str>| -> Option<String> {
+        let mut lines = dockerfile.lines().skip_while(|l| l.trim() != anchor);
+        lines.next()?;
+        extract(lines.next()?).map(str::to_owned)
+    };
+
+    let builder = after("COPY migrations ./migrations", builder_copy_dir)?;
+    let runtime = after(
+        "COPY --from=builder /app/migrations /app/migrations",
+        runtime_copy_dir,
+    )?;
+    // Both stages naming the same non-configured directory is what makes this a
+    // moved bundle rather than a coincidence.
+    (builder == runtime && builder != dir).then_some(builder)
+}
+
 /// Profile overlays that point i18n somewhere other than the base config.
 ///
 /// `[profile.prod.i18n]` (and the sibling `autumn-<env>.toml` files) can
@@ -923,8 +1040,8 @@ pub(super) fn profile_i18n_overrides(
             continue;
         };
         match key.trim() {
-            "default_locale" => locale = Some(value.to_owned()),
-            "dir" => dir = Some(value.to_owned()),
+            "default_locale" => locale = Some(value.clone()),
+            "dir" => dir = Some(value.clone()),
             _ => {}
         }
     }
@@ -1841,6 +1958,77 @@ mod tests {
         let out = remove_en_ftl_keys(legacy, "Post", "post", &chrome(&["common.create"]));
         assert!(!out.contains("post.new"), "{out}");
         assert!(out.contains("post.email.subject = Welcome"), "{out}");
+    }
+
+    /// A `dir` that moved since an earlier run leaves that run's `COPY` pair
+    /// behind. `COPY` fails the build when its source is gone from the context,
+    /// so this has to be surfaced rather than quietly doubled up.
+    #[test]
+    fn a_moved_locale_dir_is_reported_against_the_dockerfile() {
+        let dockerfile = concat!(
+            "FROM rust AS builder\n",
+            "COPY migrations ./migrations\n",
+            "COPY i18n ./i18n\n",
+            "\n",
+            "FROM debian AS runtime\n",
+            "COPY --from=builder /app/migrations /app/migrations\n",
+            "COPY --from=builder /app/i18n /app/i18n\n",
+        );
+        assert_eq!(
+            stale_dockerfile_i18n_dir(dockerfile, "translations").as_deref(),
+            Some("i18n")
+        );
+        // The configured directory is not stale, and neither is a Dockerfile
+        // this generator has never touched.
+        assert_eq!(stale_dockerfile_i18n_dir(dockerfile, "i18n"), None);
+        assert_eq!(
+            stale_dockerfile_i18n_dir(
+                "FROM rust AS builder\nCOPY migrations ./migrations\n",
+                "i18n"
+            ),
+            None
+        );
+    }
+
+    /// The shape it matches (`COPY <x> ./<x>`) is also an ordinary asset copy,
+    /// so agreement across BOTH stages is what promotes it from coincidence —
+    /// and even then the caller only warns.
+    #[test]
+    fn an_unrelated_copy_in_one_stage_is_not_read_as_a_moved_bundle() {
+        let dockerfile = concat!(
+            "FROM rust AS builder\n",
+            "COPY migrations ./migrations\n",
+            "COPY static ./static\n",
+            "\n",
+            "FROM debian AS runtime\n",
+            "COPY --from=builder /app/migrations /app/migrations\n",
+            "COPY --from=builder /app/assets /app/assets\n",
+        );
+        assert_eq!(stale_dockerfile_i18n_dir(dockerfile, "i18n"), None);
+    }
+
+    #[test]
+    fn toml_values_are_decoded_before_they_become_paths() {
+        // A basic string processes escapes; the app's loader reads the DECODED
+        // value, so the generator has to write to the same place.
+        assert_eq!(
+            toml_scalar_value(r#" "fr" "#).as_deref(),
+            Some("fr"),
+            "a `\\u` escape must resolve"
+        );
+        assert_eq!(
+            toml_scalar_value(r#" "i18n\\bundles" "#).as_deref(),
+            Some(r"i18n\bundles"),
+            "an escaped backslash is one backslash"
+        );
+        // A literal string does NOT process escapes, by TOML's definition.
+        assert_eq!(
+            toml_scalar_value(r" 'i18n\\bundles' ").as_deref(),
+            Some(r"i18n\\bundles")
+        );
+        // An unknown escape survives rather than failing generation.
+        assert_eq!(toml_scalar_value(r#" "a\qb" "#).as_deref(), Some(r"a\qb"));
+        assert_eq!(toml_scalar_value(r#" "plain" "#).as_deref(), Some("plain"));
     }
 
     #[test]

@@ -431,7 +431,6 @@ fn referenced_common_keys(
     excluding: &[PathBuf],
     overrides: &HashMap<PathBuf, String>,
 ) -> HashSet<String> {
-    const NEEDLE: &str = "t!(locale, \"";
     let mut found = HashSet::new();
     let Ok(entries) = fs::read_dir(dir) else {
         return found;
@@ -453,18 +452,76 @@ fn referenced_common_keys(
             }
         });
         let Some(content) = content else { continue };
-        let mut rest = content.as_str();
-        while let Some(at) = rest.find(NEEDLE) {
-            let after = &rest[at + NEEDLE.len()..];
-            let Some(end) = after.find('"') else { break };
-            let key = &after[..end];
+        for key in t_macro_keys(&content) {
             if key.starts_with("common.") {
-                found.insert(key.to_owned());
+                found.insert(key);
             }
-            rest = &after[end..];
         }
     }
     found
+}
+
+/// Every key looked up by a `t!(locale, "…")` in `src`.
+///
+/// Whitespace-tolerant on purpose. These are the USER's files, so they have
+/// been through `cargo fmt` — and rustfmt breaks a call that outgrows the line
+/// width across several of them:
+///
+/// ```text
+/// t!(
+///     locale,
+///     "common.attachment.meta",
+///     media = &blob.content_type,
+///     size = &blob.byte_size.to_string()
+/// )
+/// ```
+///
+/// A fixed `t!(locale, "` needle misses that, and a miss here is not a cosmetic
+/// bug: this set is what keeps a surviving route's chrome alive through a
+/// sibling's `destroy`, and `t!` validates key existence at COMPILE time, so a
+/// wrongly-pruned key breaks the user's build. Parameterized chrome lookups are
+/// the long ones, which makes them exactly the ones rustfmt wraps.
+fn t_macro_keys(src: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while let Some(at) = src[i..].find("t!") {
+        let mut cursor = i + at + 2;
+        i = cursor;
+        // `t!` must be its own token — `format!`/`assert!` never match, but a
+        // hand-written `emit!` or an identifier ending in `t` would.
+        let preceded_by_ident = (i - 2) > 0 && {
+            let prev = bytes[i - 3];
+            prev.is_ascii_alphanumeric() || prev == b'_'
+        };
+        if preceded_by_ident {
+            continue;
+        }
+        let expect = |lit: &str, cursor: &mut usize| {
+            while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+                *cursor += 1;
+            }
+            if src[*cursor..].starts_with(lit) {
+                *cursor += lit.len();
+                true
+            } else {
+                false
+            }
+        };
+        if !expect("(", &mut cursor)
+            || !expect("locale", &mut cursor)
+            || !expect(",", &mut cursor)
+            || !expect("\"", &mut cursor)
+        {
+            continue;
+        }
+        let Some(end) = src[cursor..].find('"') else {
+            break;
+        };
+        keys.push(src[cursor..cursor + end].to_owned());
+        i = cursor + end;
+    }
+    keys
 }
 
 /// A complete generator plan — a sequence of actions plus the project root
@@ -1718,6 +1775,50 @@ mod tests {
     fn new_plan_has_no_warnings() {
         let (_tmp, plan) = fixture();
         assert!(plan.warnings.is_empty());
+    }
+
+    /// Issue #1349: the chrome scan reads the USER's routes, which have been
+    /// through `cargo fmt`. rustfmt wraps a `t!` call that outgrows the line
+    /// width, and a missed key here is not cosmetic — the sibling `destroy`
+    /// prunes it from the shared block and the surviving route stops compiling,
+    /// because `t!` validates key existence at compile time.
+    #[test]
+    fn chrome_scan_finds_keys_through_rustfmt_line_breaks() {
+        let src = r#"
+            let a = t!(locale, "common.save");
+            let b = t!(
+                locale,
+                "common.attachment.meta",
+                media = &blob.content_type,
+                size = &blob.byte_size.to_string()
+            );
+            let c = t!(locale , "common.spaced");
+            let d = autumn_web::t!(locale, "common.qualified");
+        "#;
+        let keys = t_macro_keys(src);
+        for expected in [
+            "common.save",
+            "common.attachment.meta",
+            "common.spaced",
+            "common.qualified",
+        ] {
+            assert!(
+                keys.iter().any(|k| k == expected),
+                "{expected} not found in {keys:?}"
+            );
+        }
+    }
+
+    /// The scan must not treat a longer identifier ending in `t` as the macro,
+    /// nor a `t!` whose first argument is something else.
+    #[test]
+    fn chrome_scan_ignores_lookalikes() {
+        let src = r#"
+            format!(locale, "common.not-a-lookup");
+            let e = fmt!(locale, "common.also-not");
+            let f = t!(other_locale, "common.nope");
+        "#;
+        assert!(t_macro_keys(src).is_empty(), "{:?}", t_macro_keys(src));
     }
 
     #[test]
