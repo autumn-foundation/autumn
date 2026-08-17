@@ -351,15 +351,29 @@ fn block_end(existing: &str, header: &str) -> Option<usize> {
 /// resources reuse it, and it is what keeps the file non-empty. That matters —
 /// the generated app calls `.i18n_auto()`, which panics at startup if the
 /// default locale's file is missing, so destroy must never empty or delete it.
-pub(super) fn remove_en_ftl_keys(existing: &str, pascal_name: &str, resource: &str) -> String {
+pub(super) fn remove_en_ftl_keys(
+    existing: &str,
+    pascal_name: &str,
+    resource: &str,
+    // Whether a surviving route module still looks a `common.*` key up. The
+    // caller decides this by scanning the project, because the bundle itself
+    // cannot answer it: a resource whose keys were all hand-authored before it
+    // was scaffolded leaves no marker comment behind, so "no other marker" does
+    // NOT mean "no other user".
+    chrome_still_in_use: bool,
+) -> String {
     let stripped = remove_resource_block(existing, pascal_name, resource);
-    // Chrome exists to be shared. Once the last generated resource block is
-    // gone, every `common.*` key is referenced by nothing — which is exactly
-    // what `autumn i18n check --strict` fails on, so destroying the only
-    // `--i18n` resource would leave the project's own lint red. Take the chrome
-    // with it, but never the FILE: `.i18n_auto()` panics at startup when the
+    // Chrome exists to be shared. Once nothing references it, every `common.*`
+    // key is dead weight — which is exactly what `autumn i18n check --strict`
+    // fails on, so destroying the only `--i18n` resource would otherwise leave
+    // the project's own lint red. But the asymmetry matters: an orphan key is a
+    // lint warning, while removing one a surviving resource still calls is a
+    // COMPILE error (`t!` validates key existence at compile time). So this errs
+    // toward keeping.
+    //
+    // Never the FILE, either way: `.i18n_auto()` panics at startup when the
     // default locale's bundle is missing, and a comment-only bundle still loads.
-    if stripped.contains(RESOURCE_HEADER_SUFFIX) {
+    if chrome_still_in_use {
         return stripped;
     }
     remove_chrome_block(&stripped)
@@ -470,6 +484,47 @@ fn toml_scalar_value(raw: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Whether `autumn.toml` already defines i18n configuration **in any of TOML's
+/// spellings**, so a second definition must not be appended.
+///
+/// TOML expresses the same table three ways, and all three collide with an
+/// appended `[i18n]`:
+///
+/// ```toml
+/// [i18n]                                       # a table header
+/// i18n = { default_locale = "fr" }             # an inline table
+/// i18n.default_locale = "fr"                   # a dotted key
+/// ```
+///
+/// Missing any of them is not cosmetic: the generator appends `[i18n]`, TOML
+/// rejects the duplicate definition, and the application can no longer load its
+/// configuration at all. A dotted `i18n.x` under some other table
+/// (`[server]\ni18n.x = …`) is a different key entirely, so only top-level ones
+/// count.
+fn defines_i18n(autumn_toml: &str) -> bool {
+    let mut at_top_level = true;
+    for line in autumn_toml.lines() {
+        if let Some(name) = toml_table_name(line) {
+            if name == "i18n" {
+                return true;
+            }
+            at_top_level = false;
+            continue;
+        }
+        if !at_top_level {
+            continue;
+        }
+        let trimmed = line.trim();
+        if let Some((key, _)) = trimmed.split_once('=') {
+            let key = key.trim();
+            if key == "i18n" || key.starts_with("i18n.") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// What an existing `autumn.toml` configures for i18n: the default locale, and
 /// the directory its bundles live in.
 ///
@@ -488,17 +543,50 @@ fn toml_scalar_value(raw: &str) -> Option<&str> {
 /// the generator writes the base bundle, which every profile inherits.
 pub(super) fn configured_i18n(autumn_toml: &str) -> (Option<String>, Option<String>) {
     let mut in_i18n = false;
+    let mut at_top_level = true;
     let (mut locale, mut dir) = (None, None);
     for line in autumn_toml.lines() {
         if let Some(name) = toml_table_name(line) {
             in_i18n = name == "i18n";
-            continue;
-        }
-        if !in_i18n {
+            at_top_level = false;
             continue;
         }
         let trimmed = line.trim();
-        let Some((key, value)) = trimmed.split_once('=') else {
+        let Some((raw_key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        // Dotted keys (`i18n.default_locale = "fr"`) carry the table in the key
+        // itself, so they are read at top level rather than inside `[i18n]`.
+        let (key, value) = if in_i18n {
+            (raw_key, value)
+        } else if at_top_level {
+            match raw_key.trim().strip_prefix("i18n.") {
+                Some(rest) => (rest, value),
+                // An inline `i18n = { default_locale = "fr", … }`: read the
+                // members out of the braces.
+                None if raw_key.trim() == "i18n" => {
+                    for member in value
+                        .trim()
+                        .trim_matches(|c| c == '{' || c == '}')
+                        .split(',')
+                    {
+                        let Some((k, v)) = member.split_once('=') else {
+                            continue;
+                        };
+                        let Some(v) = toml_scalar_value(v) else {
+                            continue;
+                        };
+                        match k.trim() {
+                            "default_locale" => locale = Some(v.to_owned()),
+                            "dir" => dir = Some(v.to_owned()),
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
+                None => continue,
+            }
+        } else {
             continue;
         };
         let Some(value) = toml_scalar_value(value) else {
@@ -561,11 +649,8 @@ pub(super) fn ensure_dockerfile_i18n_copy(dockerfile: &str, dir: &str) -> Option
 /// its `default_locale` may not be `en`, and rewriting it would silently
 /// repoint the bundle the app loads.
 pub(super) fn ensure_i18n_config_block(existing: &str) -> String {
-    // Match the SECTION, not the literal text — see `toml_table_name`.
-    if existing
-        .lines()
-        .any(|line| toml_table_name(line) == Some("i18n"))
-    {
+    // Match the CONFIGURATION, not the literal text — see `defines_i18n`.
+    if defines_i18n(existing) {
         return existing.to_owned();
     }
     let mut out = existing.to_owned();
@@ -641,19 +726,19 @@ fn real_offsets(src: &str, needle: &str) -> Vec<usize> {
     out
 }
 
-/// Whether the app builder in `main_rs` already installs an i18n bundle.
-///
-/// Checked lexically for the same reason the anchor is: an `.i18n_auto()`
-/// mentioned only in a doc comment must not make the wiring a silent no-op.
-fn installs_i18n_bundle(main_rs: &str) -> bool {
-    !real_offsets(main_rs, ".i18n_auto()").is_empty() || !real_offsets(main_rs, ".i18n(").is_empty()
-}
-
 /// The outcome of trying to wire `.i18n_auto()` into `main.rs`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum I18nAutoWiring {
     /// The builder chain now calls `.i18n_auto()` (or already did).
     Wired(String),
+    /// The app installs its own `Bundle` with `.i18n(...)` — from embedded
+    /// files, a translation-management service, memory. That bundle takes
+    /// precedence over any filesystem load, so the keys this generator wrote to
+    /// disk will never reach it, and every generated label renders as a
+    /// placeholder even though generation and `t!`'s compile-time check both
+    /// succeeded. `main.rs` is left alone (swapping someone's bundle for a
+    /// filesystem load would be worse) and the caller warns.
+    CustomBundle,
     /// No real `.routes(` call was found, so there is nowhere safe to insert.
     /// The caller surfaces this as a plan warning rather than writing the call
     /// into a comment, where it would silently never run.
@@ -671,8 +756,11 @@ pub(super) enum I18nAutoWiring {
 /// translation-management service must not have it swapped for a filesystem
 /// load.
 pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
-    if installs_i18n_bundle(main_rs) {
+    if !real_offsets(main_rs, ".i18n_auto()").is_empty() {
         return I18nAutoWiring::Wired(main_rs.to_owned());
+    }
+    if !real_offsets(main_rs, ".i18n(").is_empty() {
+        return I18nAutoWiring::CustomBundle;
     }
     let Some(&anchor) = real_offsets(main_rs, ".routes(").first() else {
         return I18nAutoWiring::NoAnchor;
@@ -828,13 +916,14 @@ mod tests {
             "comment",
             &keys(&[("common.create", "Create"), ("comment.name", "Comment")]),
         );
-        let out = remove_en_ftl_keys(&ftl, "Post", "post");
+        // `true`: the surviving `Comment` routes still look chrome keys up.
+        let out = remove_en_ftl_keys(&ftl, "Post", "post", true);
         assert!(out.contains("common.create = Create"), "{out}");
         assert!(!out.contains("post.name"), "{out}");
         assert!(!out.contains("Post — generated by"), "{out}");
         assert!(out.contains("comment.name = Comment"), "{out}");
         // Idempotent: destroying twice is a no-op.
-        assert_eq!(remove_en_ftl_keys(&out, "Post", "post"), out);
+        assert_eq!(remove_en_ftl_keys(&out, "Post", "post", true), out);
     }
 
     #[test]
@@ -845,7 +934,7 @@ mod tests {
             "comment",
             &keys(&[("comment.name", "Comment")]),
         );
-        let out = remove_en_ftl_keys(&ftl, "Post", "post");
+        let out = remove_en_ftl_keys(&ftl, "Post", "post", false);
         assert!(out.contains("comment.name = Comment"), "{out}");
         assert!(!out.contains("post.name"), "{out}");
     }
@@ -881,13 +970,12 @@ mod tests {
         );
     }
 
+    /// An app that builds its own `Bundle` keeps it — but the caller has to be
+    /// told, because the keys written to disk will never reach it.
     #[test]
-    fn i18n_auto_respects_a_hand_installed_bundle() {
+    fn i18n_auto_reports_a_hand_installed_bundle_rather_than_claiming_success() {
         let main_rs = "fn main() {\n    autumn_web::app()\n        .i18n(my_bundle())\n        .routes(routes![index]);\n}\n";
-        assert_eq!(
-            ensure_i18n_auto(main_rs),
-            I18nAutoWiring::Wired(main_rs.to_owned())
-        );
+        assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::CustomBundle);
     }
 
     /// `autumn new`'s own template mentions `.routes(routes![...])` in a comment
@@ -974,6 +1062,38 @@ mod tests {
     }
 
     #[test]
+    fn config_block_detects_the_inline_and_dotted_spellings() {
+        // TOML expresses one table three ways, and appending `[i18n]` beside any
+        // of them is a duplicate definition that makes the file unparseable —
+        // taking the whole application config down with it.
+        for existing in [
+            "i18n = { default_locale = \"fr\", supported_locales = [\"fr\"] }\n",
+            "i18n.default_locale = \"fr\"\n",
+            "[i18n]\ndefault_locale = \"fr\"\n",
+        ] {
+            assert_eq!(
+                ensure_i18n_config_block(existing),
+                existing,
+                "must not append a second definition to: {existing}"
+            );
+        }
+        // A dotted key under some OTHER table is a different key entirely.
+        let scoped = "[server]\ni18n.enabled = true\n";
+        assert!(ensure_i18n_config_block(scoped).contains("[i18n]"));
+    }
+
+    #[test]
+    fn the_configured_values_are_read_from_the_inline_and_dotted_spellings() {
+        let (locale, dir) =
+            configured_i18n("i18n = { default_locale = \"fr\", dir = \"translations\" }\n");
+        assert_eq!(locale.as_deref(), Some("fr"));
+        assert_eq!(dir.as_deref(), Some("translations"));
+        let (locale, dir) = configured_i18n("i18n.default_locale = \"pt-BR\"\ni18n.dir = 'tr'\n");
+        assert_eq!(locale.as_deref(), Some("pt-BR"));
+        assert_eq!(dir.as_deref(), Some("tr"));
+    }
+
+    #[test]
     fn config_block_detects_a_header_with_a_trailing_comment() {
         // `[i18n] # locale settings` is one table, not none — appending a second
         // `[i18n]` beside it makes the file unparseable and takes the whole
@@ -988,7 +1108,7 @@ mod tests {
         // to delete just because it starts with the resource's name.
         let generated = merge_en_ftl("", "Post", "post", &keys(&[("post.new", "New Post")]));
         let with_hand_authored = format!("{generated}\n# App copy\npost.email.subject = Welcome\n");
-        let out = remove_en_ftl_keys(&with_hand_authored, "Post", "post");
+        let out = remove_en_ftl_keys(&with_hand_authored, "Post", "post", false);
         assert!(
             out.contains("post.email.subject = Welcome"),
             "a hand-authored key must survive destroy:\n{out}"
@@ -1013,7 +1133,7 @@ mod tests {
             "    continued here\n",
             "post.new = New Post\n",
         );
-        let out = remove_en_ftl_keys(ftl, "Post", "post");
+        let out = remove_en_ftl_keys(ftl, "Post", "post", true);
         assert!(
             !out.contains("continued here"),
             "an orphaned continuation either fails the loader — and `.i18n_auto()` \
@@ -1034,7 +1154,7 @@ mod tests {
             "post",
             &keys(&[("common.create", "Create"), ("post.new", "New Post")]),
         );
-        let out = remove_en_ftl_keys(&ftl, "Post", "post");
+        let out = remove_en_ftl_keys(&ftl, "Post", "post", false);
         assert!(
             !out.contains("common.create"),
             "chrome nothing references any more fails `i18n check --strict`:\n{out}"
@@ -1046,7 +1166,7 @@ mod tests {
             "comment",
             &keys(&[("common.create", "Create"), ("comment.new", "New Comment")]),
         );
-        let still = remove_en_ftl_keys(&two, "Post", "post");
+        let still = remove_en_ftl_keys(&two, "Post", "post", true);
         assert!(still.contains("common.create = Create"), "{still}");
         assert!(still.contains("comment.new = New Comment"), "{still}");
     }

@@ -386,10 +386,38 @@ impl Revert {
                 super::nested::remove_nested_child_section(content, child_plural)
             }
             Self::I18nFtlKeys { pascal, snake, .. } => {
-                super::scaffold_i18n::remove_en_ftl_keys(content, pascal, snake)
+                remove_i18n_keys(content, pascal, snake, project_root, excluding, overrides)
             }
         }
     }
+}
+
+/// Apply [`Revert::I18nFtlKeys`] to one `.ftl` bundle.
+///
+/// Split out of [`Revert::apply`] only to keep that match arm short; the
+/// interesting part is the second argument to `remove_en_ftl_keys`. Whether any
+/// OTHER generated resource still looks chrome keys up is decided by scanning
+/// the surviving route modules, NOT by whether they happen to carry a `.ftl`
+/// marker comment: a resource whose keys were all hand-authored before it was
+/// scaffolded gets no marker (the merge had nothing to add), and taking the
+/// shared chrome out from under it would break its build — `t!` validates key
+/// existence at COMPILE time. Erring the other way only leaves an unused key,
+/// which is a lint warning.
+fn remove_i18n_keys(
+    content: &str,
+    pascal: &str,
+    snake: &str,
+    project_root: &Path,
+    excluding: &[PathBuf],
+    overrides: &HashMap<PathBuf, String>,
+) -> String {
+    let chrome_in_use = rs_tree_contains_marker(
+        &project_root.join("src").join("routes"),
+        &["t!(locale, \"common.".to_owned()],
+        excluding,
+        overrides,
+    );
+    super::scaffold_i18n::remove_en_ftl_keys(content, pascal, snake, chrome_in_use)
 }
 
 /// A complete generator plan — a sequence of actions plus the project root

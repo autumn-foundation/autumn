@@ -1290,8 +1290,13 @@ Notes and limits:
 - **Keys go to the bundle the app actually reads.** A project whose
   `autumn.toml` says `default_locale = "fr"` and `dir = "translations"`
   gets `translations/fr.ftl`, because that is what its lookups resolve
-  through. Only a project with no `[i18n]` section gets one written for it
-  (`default_locale = "en"`, `i18n/`).
+  through — in any of TOML's spellings (`[i18n]`, `i18n = { … }`, or
+  `i18n.default_locale = …`). Only a project that configures no i18n at all
+  gets a block written for it (`default_locale = "en"`, `i18n/`).
+- **An app that installs its own bundle keeps it.** A `main.rs` calling
+  `.i18n(my_bundle())` — embedded files, a translation-management service,
+  memory — is left alone, and the generator warns that the keys it just
+  wrote to disk will not reach that bundle.
 - **The Docker image gets the bundle.** `.i18n_auto()` reads the default
   locale's file at startup and *panics* if it is missing, so the generator
   adds a `COPY` for the configured bundle directory to both stages of a

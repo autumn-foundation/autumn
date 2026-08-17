@@ -1575,12 +1575,35 @@ fn plan_scaffold_with_options_impl(
     // `--i18n` resource, and removing it while a sibling still emits `t!` calls
     // would leave that resource rendering raw keys. Leaving it is inert.
     let updated = if options_with_key.i18n && !options_with_key.api {
+        // Recomputed rather than threaded down from the bundle-writing block
+        // above: it is one small read, and it keeps this warning's wording
+        // honest about the path the keys actually went to.
+        let (locale, dir) =
+            scaffold_i18n::configured_i18n(&read_or_empty(&project_root.join("autumn.toml")));
+        let ftl_display_path = format!(
+            "{}/{}.ftl",
+            dir.unwrap_or_else(|| "i18n".to_owned()),
+            locale.unwrap_or_else(|| "en".to_owned())
+        );
         match scaffold_i18n::ensure_i18n_auto(&updated) {
             scaffold_i18n::I18nAutoWiring::Wired(wired) => wired,
             // No real `.routes(` call to anchor on. Writing the call anywhere
             // else risks landing it in a comment, where it would silently never
             // run and the app would render raw keys forever — so say so instead
             // and leave `main.rs` alone.
+            // The app installs its own bundle. Leave it be — swapping somebody's
+            // embedded or TMS-backed `Bundle` for a filesystem load would be a
+            // far bigger change than this generator is entitled to make — but
+            // say so, because the keys just written to disk will not reach it.
+            scaffold_i18n::I18nAutoWiring::CustomBundle => {
+                plan.warn(format!(
+                    "src/main.rs installs its own translation bundle with `.i18n(...)`, which \
+                     takes precedence over loading `{ftl_display_path}` from disk. The keys this scaffold just \
+                     wrote there will NOT reach that bundle — add them to whatever source it is \
+                     built from, or switch to `.i18n_auto()` to load from the filesystem."
+                ));
+                updated
+            }
             scaffold_i18n::I18nAutoWiring::NoAnchor => {
                 plan.warn(
                     "src/main.rs has no `.routes(...)` call to anchor on, so `.i18n_auto()` was \
