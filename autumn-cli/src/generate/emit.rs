@@ -419,35 +419,48 @@ fn remove_i18n_keys(
     // destroyed, prune it, and break the surviving call at COMPILE time, which
     // is the one failure mode this set exists to prevent. `autumn i18n check`
     // reads the whole tree for the same reason.
-    let surviving_chrome = referenced_common_keys(&project_root.join("src"), excluding, overrides);
+    let surviving_chrome = referenced_common_keys(project_root, excluding, overrides);
     super::scaffold_i18n::remove_en_ftl_keys(content, pascal, snake, &surviving_chrome)
 }
 
-/// Every `common.*` key still looked up by surviving source in `dir`.
+/// Every `common.*` key still referenced by surviving project source.
 ///
 /// The SET, not a yes/no: chrome keys are per-surface, so a resource can be the
 /// only user of some of them. Destroying a `--soft-delete` resource while a
 /// plain one survives leaves `common.trash`/`restore`/`purge` referenced by
 /// nothing, and `autumn i18n check --strict` fails on exactly that — while
 /// `common.create`/`save`/… are still very much in use and must stay.
+///
+/// Parsing is delegated to [`crate::i18n::scan_source`], the `syn`-based
+/// scanner behind `autumn i18n check`. That is the authority this set has to
+/// agree with — a key it counts and this does not gets pruned out from under a
+/// live call, and `t!` rejects that at COMPILE time — and agreement is not
+/// something two independently hand-written scanners converge on. The one here
+/// had been extended, round after round, for rustfmt line breaks, comments,
+/// string literals, arbitrary locale expressions, raw-string keys, and comments
+/// before the key; it still recognised only `t!(…)`, never the equally
+/// supported `locale.t(…)` / `Locale::t_with(…)`, and its walk started at
+/// `src/` while the checker reads the whole project. Both were bugs of the same
+/// shape, and neither can recur now.
+///
+/// The traversal stays here rather than calling `scan_project`, because the
+/// generator must read the files it is ABOUT to change from the plan rather
+/// than from disk: `overrides` supplies pending content, and `excluding` drops
+/// the module being destroyed.
 fn referenced_common_keys(
-    dir: &Path,
+    project_root: &Path,
     excluding: &[PathBuf],
     overrides: &HashMap<PathBuf, String>,
 ) -> HashSet<String> {
-    let mut found = HashSet::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return found;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.is_dir() {
-            found.extend(referenced_common_keys(&path, excluding, overrides));
-            continue;
-        }
-        if path.extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
+    let mut files = Vec::new();
+    crate::i18n::collect_rs_files(project_root, &mut files);
+    // A pending file that does not exist on disk yet still counts.
+    files.extend(overrides.keys().cloned());
+    files.sort();
+    files.dedup();
+
+    let mut scan = crate::i18n::ScanResult::default();
+    for path in files {
         let content = overrides.get(&path).cloned().or_else(|| {
             if excluding.contains(&path) {
                 None
@@ -456,155 +469,12 @@ fn referenced_common_keys(
             }
         });
         let Some(content) = content else { continue };
-        for key in t_macro_keys(&content) {
-            if key.starts_with("common.") {
-                found.insert(key);
-            }
-        }
+        crate::i18n::scan_source(&content, &path.to_string_lossy(), &mut scan);
     }
-    found
-}
-
-/// Every key looked up by a `t!(locale, "…")` in `src`.
-///
-/// Whitespace-tolerant on purpose. These are the USER's files, so they have
-/// been through `cargo fmt` — and rustfmt breaks a call that outgrows the line
-/// width across several of them:
-///
-/// ```text
-/// t!(
-///     locale,
-///     "common.attachment.meta",
-///     media = &blob.content_type,
-///     size = &blob.byte_size.to_string()
-/// )
-/// ```
-///
-/// A fixed `t!(locale, "` needle misses that, and a miss here is not a cosmetic
-/// bug: this set is what keeps a surviving route's chrome alive through a
-/// sibling's `destroy`, and `t!` validates key existence at COMPILE time, so a
-/// wrongly-pruned key breaks the user's build. Parameterized chrome lookups are
-/// the long ones, which makes them exactly the ones rustfmt wraps.
-fn t_macro_keys(src: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    let bytes = src.as_bytes();
-    // Only occurrences that are REAL CODE. A commented-out `// t!(locale,
-    // "common.trash")` left in a surviving route would otherwise read as a live
-    // lookup and keep a key alive that nothing calls — and `autumn i18n check
-    // --strict` fails on unused keys, so erring this way is not free either.
-    // Same lexical defence the `.i18n_auto()` anchor already uses, rather than
-    // a second scanner with its own blind spots.
-    for at in super::scaffold_i18n::real_offsets(src, "t!") {
-        let mut cursor = at + 2;
-        // `t!` must be its own token — `format!`/`assert!` never match, but a
-        // hand-written `emit!` or an identifier ending in `t` would.
-        let preceded_by_ident = at > 0 && {
-            let prev = bytes[at - 1];
-            prev.is_ascii_alphanumeric() || prev == b'_'
-        };
-        if preceded_by_ident {
-            continue;
-        }
-        let expect = |lit: &str, cursor: &mut usize| {
-            while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
-                *cursor += 1;
-            }
-            if src[*cursor..].starts_with(lit) {
-                *cursor += lit.len();
-                true
-            } else {
-                false
-            }
-        };
-        if !expect("(", &mut cursor) {
-            continue;
-        }
-        // The first argument is ANY Rust expression — `t!` parses it as one, so
-        // application code reusing a generated key is free to write
-        // `t!(lang, …)` or `t!(ctx.locale, …)`. Requiring the spelling the
-        // generator happens to emit would drop those from the surviving set and
-        // prune a key that is still called, which `t!` then rejects at compile
-        // time. That matters more since the scan widened to the whole source
-        // tree: outside `src/routes` is exactly where another binding name
-        // lives. So skip to the top-level comma instead of matching a name.
-        let Some(comma) = top_level_comma(src, cursor) else {
-            continue;
-        };
-        cursor = comma + 1;
-        // Whitespace AND comments — `t!(locale, /* shared action */ "common.save")`
-        // is a valid call, and stopping at the `/` drops a live lookup, which
-        // prunes a key the call still needs.
-        cursor += super::scaffold_i18n::ignorable_prefix_len(&src[cursor..]);
-        // `t!` takes a `LitStr`, and a RAW string is one: `r"common.save"` and
-        // `r#"…"#` are as valid as `"…"`. Requiring the plain form drops such a
-        // lookup from the surviving set and prunes a key that is still called.
-        let Some(key) = string_literal_at(src, cursor) else {
-            continue;
-        };
-        keys.push(key);
-    }
-    keys
-}
-
-/// The contents of the Rust string literal starting at `at`, in any of the
-/// forms `t!` accepts for its key: `"…"`, `r"…"`, `r#"…"#`, and so on.
-///
-/// The key is read verbatim. An escape inside a plain literal would make the
-/// source text differ from the value `t!` sees, but a Fluent key is
-/// `[A-Za-z0-9._-]`, so no key that resolves can contain one.
-fn string_literal_at(src: &str, at: usize) -> Option<String> {
-    let bytes = src.as_bytes();
-    let mut i = at;
-    let mut hashes = 0usize;
-    if bytes.get(i) == Some(&b'r') {
-        i += 1;
-        while bytes.get(i) == Some(&b'#') {
-            hashes += 1;
-            i += 1;
-        }
-    }
-    if bytes.get(i) != Some(&b'"') {
-        return None;
-    }
-    i += 1;
-    let start = i;
-    let closing = format!("\"{}", "#".repeat(hashes));
-    let end = src[start..].find(&closing)? + start;
-    Some(src[start..end].to_owned())
-}
-
-/// Byte offset of the comma separating `t!`'s first argument from its second,
-/// starting from just after the opening paren.
-///
-/// Depth- and string-aware: `t!(fmt(a, b), "key")` separates at the comma after
-/// `)`, not the one inside it, and a comma inside a string literal is text.
-/// `None` when the argument list ends first (`t!(locale)`) or is unterminated.
-fn top_level_comma(src: &str, from: usize) -> Option<usize> {
-    let bytes = src.as_bytes();
-    let mut depth = 0i32;
-    let mut i = from;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => {
-                if depth == 0 {
-                    // The call closed without a second argument.
-                    return None;
-                }
-                depth -= 1;
-            }
-            b',' if depth == 0 => return Some(i),
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    i += usize::from(bytes[i] == b'\\') + 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+    scan.referenced
+        .into_iter()
+        .filter(|key| key.starts_with("common."))
+        .collect()
 }
 
 /// A complete generator plan — a sequence of actions plus the project root
@@ -1848,6 +1718,16 @@ fn relative_display(path: &Path, root: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// `common.*` keys the project scanner finds in one source string.
+    fn common_keys_in(src: &str) -> Vec<String> {
+        let mut scan = crate::i18n::ScanResult::default();
+        crate::i18n::scan_source(src, "test.rs", &mut scan);
+        scan.referenced
+            .into_iter()
+            .filter(|k| k.starts_with("common."))
+            .collect()
+    }
+
     fn fixture() -> (tempfile::TempDir, Plan) {
         let tmp = tempfile::TempDir::new().unwrap();
         let plan = Plan::new(tmp.path());
@@ -1860,52 +1740,109 @@ mod tests {
         assert!(plan.warnings.is_empty());
     }
 
-    /// Issue #1349: the chrome scan reads the USER's routes, which have been
-    /// through `cargo fmt`. rustfmt wraps a `t!` call that outgrows the line
-    /// width, and a missed key here is not cosmetic — the sibling `destroy`
-    /// prunes it from the shared block and the surviving route stops compiling,
-    /// because `t!` validates key existence at compile time.
+    /// `t!` compiles in `tests/` and `examples/` too, and `autumn i18n check`
+    /// reads the whole project. A scan rooted at `src/` calls such a key unused
+    /// and prunes it, breaking that target's build.
     #[test]
-    fn chrome_scan_finds_keys_through_rustfmt_line_breaks() {
-        let src = r#"
-            let a = t!(locale, "common.save");
-            let b = t!(
-                locale,
-                "common.attachment.meta",
-                media = &blob.content_type,
-                size = &blob.byte_size.to_string()
-            );
-            let c = t!(locale , "common.spaced");
-            let d = autumn_web::t!(locale, "common.qualified");
-        "#;
-        let keys = t_macro_keys(src);
-        for expected in [
-            "common.save",
-            "common.attachment.meta",
-            "common.spaced",
-            "common.qualified",
-        ] {
-            assert!(
-                keys.iter().any(|k| k == expected),
-                "{expected} not found in {keys:?}"
-            );
+    fn chrome_survives_when_only_a_non_src_target_uses_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/routes")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::create_dir_all(root.join("examples")).unwrap();
+        std::fs::write(
+            root.join("tests").join("views.rs"),
+            "fn t() { let _ = t!(locale, \"common.save\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("examples").join("demo.rs"),
+            "fn main() { let _ = locale.t(\"common.back\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/routes").join("posts.rs"),
+            "fn show() { let _ = t!(locale, \"post.new\"); }\n",
+        )
+        .unwrap();
+
+        let found = referenced_common_keys(root, &[], &HashMap::new());
+        assert!(found.contains("common.save"), "tests/ counts: {found:?}");
+        assert!(found.contains("common.back"), "examples/ counts: {found:?}");
+    }
+
+    /// The forms a surviving `common.*` lookup can take.
+    ///
+    /// Every row here was once a bug: the scan this replaced was a hand-rolled
+    /// text search, extended a round at a time as reviews found the next token
+    /// class it could not read. Parsing now goes through the same `syn` scanner
+    /// as `autumn i18n check`, so these are no longer separate features to
+    /// implement — but they stay as the regression contract, because pruning a
+    /// key one of them still references breaks the user's build at COMPILE
+    /// time, and that is the failure this whole set exists to prevent.
+    #[test]
+    fn chrome_scan_reads_every_supported_lookup_form() {
+        let cases: &[(&str, &str)] = &[
+            ("plain", r#"let a = t!(locale, "common.plain");"#),
+            (
+                "rustfmt-wrapped",
+                "let b = t!(\n    locale,\n    \"common.wrapped\",\n    n = &c.to_string()\n);",
+            ),
+            (
+                "comment before key",
+                r#"let c = t!(locale, /* shared */ "common.commented");"#,
+            ),
+            ("raw string key", r#"let d = t!(locale, r"common.raw");"#),
+            (
+                "hashed raw key",
+                r##"let e = t!(locale, r#"common.hashed"#);"##,
+            ),
+            (
+                "other locale binding",
+                r#"let f = t!(lang, "common.lang");"#,
+            ),
+            ("field locale", r#"let g = t!(ctx.locale, "common.field");"#),
+            ("spaced call", r#"let h = t! (locale, "common.spaced");"#),
+            // Not a macro at all — the `Locale` methods are equally supported,
+            // and were invisible to the text scanner.
+            ("method call", r#"let i = locale.t("common.method");"#),
+            (
+                "method with args",
+                r#"let j = locale.t_with("common.method_args", &[]);"#,
+            ),
+            (
+                "associated call",
+                r#"let k = Locale::t(&locale, "common.assoc");"#,
+            ),
+            // Inside `html!`, where view translations actually live.
+            (
+                "inside a macro body",
+                r#"let l = html! { span { (t!(locale, "common.nested")) } };"#,
+            ),
+        ];
+        for (what, src) in cases {
+            let found = common_keys_in(src);
+            assert!(!found.is_empty(), "no key found for the {what} form: {src}");
         }
     }
 
-    /// The scan must not treat a longer identifier ending in `t` as the macro.
-    ///
-    /// It deliberately says nothing about the first ARGUMENT's spelling — see
-    /// [`chrome_scan_accepts_any_locale_expression`]. Erring toward matching
-    /// costs an unused key; erring the other way prunes a live one and breaks
-    /// the build.
+    /// Not every `t` is a translation, and a key that is not code is not a
+    /// reference. Over-counting only strands an unused key; both directions are
+    /// still worth pinning.
     #[test]
-    fn chrome_scan_ignores_lookalikes() {
-        let src = r#"
-            format!(locale, "common.not-a-lookup");
-            let e = fmt!(locale, "common.also-not");
-            let f = emit!(locale, "common.still-not");
-        "#;
-        assert!(t_macro_keys(src).is_empty(), "{:?}", t_macro_keys(src));
+    fn chrome_scan_ignores_non_lookups() {
+        for src in [
+            r#"let a = "common.just-a-string";"#,
+            r#"// t!(locale, "common.commented-out")"#,
+            r#"/* t!(locale, "common.blocked") */"#,
+            // A bare `t(...)` is not the `Locale` API.
+            r#"let b = t("common.bare-fn");"#,
+        ] {
+            assert!(
+                common_keys_in(src).is_empty(),
+                "unexpectedly counted a reference in: {src}"
+            );
+        }
     }
 
     /// Chrome keys are ordinary keys once written, and application code outside
@@ -1935,101 +1872,6 @@ mod tests {
             found.contains("common.save"),
             "a non-route caller keeps the key alive: {found:?}"
         );
-    }
-
-    /// `t!` parses its first argument as an expression, so application code
-    /// reusing a generated key need not spell it `locale`. Missing those drops
-    /// a live lookup from the surviving set and prunes a key the call still
-    /// needs — rejected at compile time, not at runtime.
-    #[test]
-    fn chrome_scan_accepts_any_locale_expression() {
-        let src = r#"
-            let a = t!(lang, "common.one");
-            let b = t!(ctx.locale, "common.two");
-            let c = t!(&self.locale, "common.three");
-            let d = t!(pick(a, b), "common.four");
-            let e = t!(
-                locale,
-                "common.five",
-                n = &count.to_string()
-            );
-        "#;
-        let keys = t_macro_keys(src);
-        for expected in [
-            "common.one",
-            "common.two",
-            "common.three",
-            "common.four",
-            "common.five",
-        ] {
-            assert!(
-                keys.iter().any(|k| k == expected),
-                "{expected} not found in {keys:?}"
-            );
-        }
-    }
-
-    /// `t!` takes a `LitStr`, and a raw string is one.
-    #[test]
-    fn chrome_scan_accepts_raw_string_keys() {
-        let src = r##"
-            let a = t!(locale, r"common.raw");
-            let b = t!(locale, r#"common.hashed"#);
-            let c = t!(locale, "common.plain");
-        "##;
-        let keys = t_macro_keys(src);
-        for expected in ["common.raw", "common.hashed", "common.plain"] {
-            assert!(
-                keys.iter().any(|k| k == expected),
-                "{expected} not found in {keys:?}"
-            );
-        }
-    }
-
-    /// A comment may sit anywhere whitespace may, including between the comma
-    /// and the key.
-    #[test]
-    fn chrome_scan_reads_past_a_comment_before_the_key() {
-        let src = r#"
-            let a = t!(locale, /* shared action */ "common.save");
-            let b = t!(
-                locale,
-                // the pager's own label
-                "common.next"
-            );
-        "#;
-        let keys = t_macro_keys(src);
-        for expected in ["common.save", "common.next"] {
-            assert!(
-                keys.iter().any(|k| k == expected),
-                "{expected} not found in {keys:?}"
-            );
-        }
-    }
-
-    /// A `t!` with no second argument must not swallow whatever follows the
-    /// call.
-    #[test]
-    fn chrome_scan_skips_a_call_with_no_key() {
-        let src = r#"
-            let a = t!(locale);
-            let b = "common.not-a-key";
-        "#;
-        assert!(t_macro_keys(src).is_empty(), "{:?}", t_macro_keys(src));
-    }
-
-    /// A lookup that is not CODE is not a lookup. Counting one keeps a key
-    /// alive that nothing calls, and `autumn i18n check --strict` fails on
-    /// unused keys — so over-counting is not the safe direction it looks like.
-    #[test]
-    fn chrome_scan_ignores_commented_out_and_quoted_lookups() {
-        let src = r#"
-            // t!(locale, "common.commented")
-            /* t!(locale, "common.blocked") */
-            let doc = "t!(locale, \"common.quoted\")";
-            let real = t!(locale, "common.live");
-        "#;
-        assert_eq!(t_macro_keys(src), vec!["common.live".to_owned()]);
     }
 
     #[test]
