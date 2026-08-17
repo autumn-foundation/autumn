@@ -2224,8 +2224,7 @@ fn method_called_before(src: &str, at: usize, method: &str) -> bool {
     // for `.i18n_auto` that is silent: the caller reports success and
     // production renders raw keys.
     let statement = &src[start..at];
-    let Some(mut name) = value_root(let_parts(statement).map_or(statement, |(_, init)| init))
-    else {
+    let Some(mut name) = value_root(binds(statement).map_or(statement, |(_, init)| init)) else {
         return false;
     };
     let mut before = start;
@@ -2238,7 +2237,7 @@ fn method_called_before(src: &str, at: usize, method: &str) -> bool {
             return false;
         };
         let statement = &src[bind_start..bind_end];
-        let initialiser = let_parts(statement).map_or(statement, |(_, init)| init);
+        let initialiser = binds(statement).map_or(statement, |(_, init)| init);
         if calls_at_own_depth(initialiser, method) {
             return true;
         }
@@ -2251,8 +2250,8 @@ fn method_called_before(src: &str, at: usize, method: &str) -> bool {
     false
 }
 
-/// The nearest `let <name> = …;` before `before`, searching this block level
-/// and then outward.
+/// The nearest statement before `before` that gives `name` a value, searching
+/// this block level and then outward.
 ///
 /// Outward matters and nested does not: a binding made in an enclosing block is
 /// what a conditional branch continues from, while one made inside a sibling
@@ -2264,7 +2263,7 @@ fn binding_of(src: &str, before: usize, name: &str) -> Option<(usize, usize)> {
         if let Some(found) = statements_in(src, level, end)
             .into_iter()
             .rev()
-            .find(|&(s, e)| let_parts(&src[s..e]).is_some_and(|(bound, _)| bound == name))
+            .find(|&(s, e)| binds(&src[s..e]).is_some_and(|(bound, _)| bound == name))
         {
             return Some(found);
         }
@@ -2299,6 +2298,44 @@ fn statements_in(src: &str, start: usize, end: usize) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+/// `(name, expression)` for a statement that gives a name a value, in either
+/// form Rust spells it.
+///
+/// A `let` and a plain reassignment are the same step to a builder: `let mut
+/// app = build(); app = app.i18n(bundle); app = app.routes(…);` is the
+/// mutable spelling of the same chain, and reading only `let` skipped straight
+/// past the bundle and cleared it.
+fn binds(statement: &str) -> Option<(&str, &str)> {
+    let_parts(statement).or_else(|| assignment_parts(statement))
+}
+
+/// `(assigned name, expression)` for a bare `<ident> = <expr>` statement.
+///
+/// Whole-value assignment only. `app.field = x` and `app += x` change
+/// something about the value rather than replacing it, and neither carries the
+/// builder forward; nothing between the name and the `=` but whitespace and
+/// comments is what tells them apart.
+fn assignment_parts(statement: &str) -> Option<(&str, &str)> {
+    let rest = &statement[ignorable_prefix_len(statement)..];
+    let len = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let (name, after) = rest.split_at(len);
+    if name.is_empty()
+        || name.starts_with(|c: char| c.is_ascii_digit())
+        || matches!(
+            name,
+            "let" | "if" | "match" | "while" | "for" | "loop" | "return" | "unsafe" | "async"
+        )
+    {
+        return None;
+    }
+    let after = &after[ignorable_prefix_len(after)..];
+    let value = after.strip_prefix('=')?;
+    // `==` is a comparison and `=>` a match arm; neither assigns.
+    (!value.starts_with(['=', '>'])).then_some((name, value))
 }
 
 /// `(bound name, initialiser)` for a `let <ident> = <expr>` statement.
@@ -2355,6 +2392,7 @@ fn value_root(expr: &str) -> Option<&str> {
     let after = &after[ignorable_prefix_len(after)..];
     if after.starts_with("::")
         || after.starts_with('!')
+        || after.starts_with('(')
         || matches!(
             ident,
             "if" | "match"
@@ -3989,6 +4027,42 @@ mod tests {
         let bundled = wired.replace(".i18n_auto()", ".i18n(tms_bundle())");
         let I18nAutoWiring::Wired(out) = ensure_i18n_auto(&bundled) else {
             panic!("the preview's bundle is not production's either");
+        };
+        assert!(out.contains(".i18n_auto()"), "{out}");
+    }
+
+    /// `let mut app = …; app = app.i18n(b); app = app.routes(…);` is the
+    /// mutable spelling of the same builder. Reading only `let` skipped the
+    /// assignment that installs the bundle, and `.i18n_auto()` went in and
+    /// CLEARED it.
+    #[test]
+    fn a_bundle_installed_by_a_mutable_reassignment_is_still_found() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let mut app = build_app();\n",
+            "    app = app.i18n(tms_bundle());\n",
+            "    app = app.routes(routes![index]);\n",
+            "    app.serve();\n",
+            "}\n",
+        );
+        assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::CustomBundle);
+    }
+
+    /// And an assignment to a DIFFERENT name still says nothing about this
+    /// app — following assignments must not cost the receiver check.
+    #[test]
+    fn an_assignment_to_another_name_does_not_speak_for_this_app() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let mut preview = build_app();\n",
+            "    preview = preview.i18n(tms_bundle());\n",
+            "    let mut app = build_app();\n",
+            "    app = app.routes(routes![index]);\n",
+            "    app.serve();\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("the preview's bundle is not production's");
         };
         assert!(out.contains(".i18n_auto()"), "{out}");
     }
