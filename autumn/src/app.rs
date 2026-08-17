@@ -2971,6 +2971,19 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         tasks.extend(crate::retention::collect_retention_tasks());
 
+        // Regression (#1342 review round 12): `collect_retention_tasks()`
+        // only catches collisions *among* retention-generated names — it
+        // has no visibility into hand-declared `tasks![...]` entries merged
+        // in above. An operator's own `#[scheduled]` task that happens to
+        // share a name with a generated `retention-sweep-<table>` task (or
+        // with another hand-declared task) would otherwise silently spawn
+        // two competing scheduler loops. Validate the fully merged list,
+        // now that every name is visible, rather than requiring operators
+        // to avoid the generated namespace by convention.
+        if let Err(error) = crate::task::validate_unique_scheduled_task_names(&tasks) {
+            panic!("{error}");
+        }
+
         let all_routes = routes;
 
         // 1 & 2. Load configuration and initialize logging/telemetry
