@@ -1284,26 +1284,52 @@ fn plan_scaffold_with_options_impl(
             // there and rebuilds its Cargo.toml action from DISK, so an edit
             // made at this point would be silently dropped.)
 
-            // `rich_text_area` renders its own chrome — the toolbar's
-            // "Markdown formatting" group label and per-control names, the
-            // "Markdown supported…" hint, and the preview pane's "Preview" —
-            // from consts inside autumn-web (`autumn/src/form.rs`). The
-            // generator translates the FIELD label it passes in and can reach no
-            // further: those strings have no parameter to route a `t!` through,
-            // and giving them one is a public API change to the framework's form
-            // helpers (a label per toolbar control, so a slice rather than a
-            // setter), not a scaffold change. Refusing `richtext` under `--i18n`
-            // would cost more than it buys — the rest of the form does
-            // translate — so the flag does what it can and says what it cannot.
-            let rich_text = rich_text_fields(&fields);
-            if !rich_text.is_empty() {
+            // Two shared autumn-web widgets build user-facing text INSIDE
+            // themselves, from consts and `format!`s with no parameter to route
+            // a `t!` through. The generator translates every label it passes in
+            // and can reach no further:
+            //
+            //   * `form::rich_text_area` — the toolbar's "Markdown formatting"
+            //     group label and per-control names, the "Markdown supported…"
+            //     hint, and the preview pane's "Preview".
+            //   * `widgets::transition_controls` — each button's `Mark as {to}`
+            //     and the group's `{field} transitions` aria-label.
+            //
+            // Both are free functions with positional parameters, so unlike the
+            // pager and bulk-delete widgets there is no label setter to call:
+            // reaching them means new public API on autumn-web (a label PER
+            // transition edge, and per toolbar control), which is a framework
+            // design decision rather than a scaffold change. Refusing these
+            // columns under `--i18n` would cost more than it buys when the rest
+            // of the view does translate — so the flag does what it can and
+            // names what it could not.
+            let untranslated: Vec<(&str, &str, Vec<&Field>)> = vec![
+                (
+                    "Markdown editor",
+                    "the toolbar labels, the \"Markdown supported…\" hint, and the preview \
+                     heading come from `rich_text_area`",
+                    rich_text_fields(&fields),
+                ),
+                (
+                    "state-transition controls",
+                    "the `Mark as …` buttons and the transitions group label come from \
+                     `widgets::transition_controls`",
+                    fields
+                        .iter()
+                        .filter(|f| f.state_machine.is_some())
+                        .collect(),
+                ),
+            ];
+            for (widget, detail, affected) in untranslated {
+                if affected.is_empty() {
+                    continue;
+                }
                 plan.warn(format!(
-                    "`--i18n` translated this form's labels, but the Markdown editor on {} \
-                     keeps autumn-web's own chrome in English — the toolbar labels, the \
-                     \"Markdown supported…\" hint, and the preview heading come from \
-                     `rich_text_area`, which takes no label overrides yet. Everything else in \
-                     the generated views goes through the bundle.",
-                    rich_text
+                    "`--i18n` translated this view's labels, but the {widget} on {} keeps \
+                     autumn-web's own chrome in English — {detail}, which takes no label \
+                     overrides yet. Everything else in the generated views goes through the \
+                     bundle.",
+                    affected
                         .iter()
                         .map(|f| format!("`{}`", f.name))
                         .collect::<Vec<_>>()
@@ -23072,6 +23098,48 @@ exempt_paths = [
                 .any(|w| w.contains("Markdown editor")),
             "{:?}",
             without_rich_text.warnings
+        );
+        assert!(
+            !without_rich_text
+                .warnings
+                .iter()
+                .any(|w| w.contains("state-transition controls")),
+            "{:?}",
+            without_rich_text.warnings
+        );
+    }
+
+    /// `transition_controls` builds `Mark as {to}` and the `{field} transitions`
+    /// group label inside autumn-web, from positional arguments that carry no
+    /// label seam — the same shape as the Markdown editor, and named the same
+    /// way rather than left for the reader to find in the browser.
+    #[test]
+    fn i18n_says_so_when_the_transition_controls_keep_english_chrome() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Order",
+            &[
+                "title:String".into(),
+                "status:String:states(draft -> published, published -> archived)".into(),
+            ],
+            "20260502000000",
+            &i18n_options(),
+        )
+        .unwrap();
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("state-transition controls"))
+            .unwrap_or_else(|| panic!("no transition warning in {:?}", plan.warnings));
+        assert!(
+            warning.contains("`status`"),
+            "must name the column: {warning}"
+        );
+        assert!(
+            warning.contains("transition_controls"),
+            "must name the widget the author has to look at: {warning}"
         );
     }
 
