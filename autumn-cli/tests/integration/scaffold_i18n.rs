@@ -605,6 +605,75 @@ fn a_non_default_locale_project_still_compiles_against_the_t_validator() {
 }
 
 #[test]
+fn destroying_a_featureful_resource_prunes_only_the_chrome_it_alone_used() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "chrome-app"]);
+    let project = tmp.path().join("chrome-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--i18n",
+            "--soft-delete",
+            "--no-policy",
+        ],
+    );
+    run_autumn_ok(
+        &project,
+        &["generate", "scaffold", "Comment", "body:Text", "--i18n"],
+    );
+    run_autumn_ok(
+        &project,
+        &[
+            "destroy",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--i18n",
+            "--soft-delete",
+            "--no-policy",
+        ],
+    );
+
+    let ftl = fs::read_to_string(project.join("i18n/en.ftl")).unwrap();
+    // Only Post had a Trash view, so its chrome goes…
+    for gone in ["common.trash", "common.restore", "common.purge"] {
+        assert!(
+            !ftl.contains(gone),
+            "`{gone}` has no call site left, so `--strict` fails on it:\n{ftl}"
+        );
+    }
+    // …while the chrome the surviving Comment still uses stays.
+    for kept in ["common.create", "common.save", "common.back"] {
+        assert!(ftl.contains(kept), "`{kept}` is still in use:\n{ftl}");
+    }
+    assert!(ftl.contains("comment.new = New Comment"), "{ftl}");
+    run_autumn_ok(&project, &["i18n", "check", "--strict"]);
+}
+
+#[test]
+fn the_flag_changes_nothing_at_all_about_an_api_scaffold() {
+    // Documented as a pure no-op for `--api`, which has to include the
+    // compatibility refusals: otherwise a flag that changes nothing about the
+    // output still changes whether it may exist.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "api-gate-app"]);
+    let project = tmp.path().join("api-gate-app");
+    for flags in [vec!["--api", "--i18n"], vec!["--api", "--i18n", "--live"]] {
+        let mut args = vec!["generate", "scaffold", "Common", "title:String", "--force"];
+        args.extend_from_slice(&flags);
+        run_autumn_ok(&project, &args);
+    }
+    assert!(
+        !project.join("i18n").exists(),
+        "no bundle for an api scaffold"
+    );
+}
+
+#[test]
 fn an_embed_build_carries_the_bundle_too() {
     // `.i18n_auto()` loads from DISK. An `autumn build --embed` binary is meant
     // to be self-contained, and the release image ships no sidecar for it — so

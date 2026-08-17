@@ -492,7 +492,12 @@ fn plan_scaffold_with_options_impl(
     //
     // `for_revert` skips the gate so `autumn destroy scaffold` can still clean
     // up a resource generated before a refusal existed (issue #1834).
-    if !for_revert && options.i18n {
+    // `--api` renders no labels, so `--i18n` is documented as a pure no-op
+    // there — which has to include these refusals. Otherwise
+    // `generate scaffold Common --api --i18n` fails while the identical
+    // `--api` scaffold succeeds, and a flag that changes nothing about the
+    // output would still change whether it is allowed to exist.
+    if !for_revert && options.i18n && !options.api {
         let unsupported = if options.live {
             Some((
                 "--live",
@@ -1199,7 +1204,23 @@ fn plan_scaffold_with_options_impl(
             // deliberately does not have.
             let validator_path = project_root.join("i18n").join("en.ftl");
             if validator_path != ftl_path && validator_path.exists() {
-                let base = read_or_empty(&validator_path);
+                // Same fallible read as the runtime bundle above, for the same
+                // reason: `read_or_empty` would turn an unreadable or non-UTF-8
+                // file into `""`, and the `Modify` below would then write a
+                // fresh English bundle straight over whatever it holds.
+                let base = match std::fs::read_to_string(&validator_path) {
+                    Ok(contents) => contents,
+                    Err(e) => {
+                        return Err(GenerateError::Config(format!(
+                            "cannot read the i18n bundle at {}: {e}. Refusing to continue — it \
+                             is the file `t!`'s compile-time key check reads, so it has to be \
+                             kept in step, and merging would replace it with a freshly \
+                             generated file and lose whatever translations it holds. Fix the \
+                             file (it must be UTF-8 and readable) and re-run.",
+                            validator_path.display()
+                        )));
+                    }
+                };
                 let merged =
                     scaffold_i18n::merge_en_ftl(&base, &pascal_name, &snake_name, &referenced_keys);
                 if merged != base {

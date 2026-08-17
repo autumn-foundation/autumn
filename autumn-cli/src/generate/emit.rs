@@ -5,7 +5,7 @@
 //! collision detection, `--force` / `--dry-run`, and the human-readable
 //! "Created/Modified" output that mirrors `autumn new`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -411,13 +411,60 @@ fn remove_i18n_keys(
     excluding: &[PathBuf],
     overrides: &HashMap<PathBuf, String>,
 ) -> String {
-    let chrome_in_use = rs_tree_contains_marker(
+    let surviving_chrome = referenced_common_keys(
         &project_root.join("src").join("routes"),
-        &["t!(locale, \"common.".to_owned()],
         excluding,
         overrides,
     );
-    super::scaffold_i18n::remove_en_ftl_keys(content, pascal, snake, chrome_in_use)
+    super::scaffold_i18n::remove_en_ftl_keys(content, pascal, snake, &surviving_chrome)
+}
+
+/// Every `common.*` key still looked up by a surviving route module.
+///
+/// The SET, not a yes/no: chrome keys are per-surface, so a resource can be the
+/// only user of some of them. Destroying a `--soft-delete` resource while a
+/// plain one survives leaves `common.trash`/`restore`/`purge` referenced by
+/// nothing, and `autumn i18n check --strict` fails on exactly that — while
+/// `common.create`/`save`/… are still very much in use and must stay.
+fn referenced_common_keys(
+    dir: &Path,
+    excluding: &[PathBuf],
+    overrides: &HashMap<PathBuf, String>,
+) -> HashSet<String> {
+    const NEEDLE: &str = "t!(locale, \"";
+    let mut found = HashSet::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(referenced_common_keys(&path, excluding, overrides));
+            continue;
+        }
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let content = overrides.get(&path).cloned().or_else(|| {
+            if excluding.contains(&path) {
+                None
+            } else {
+                fs::read_to_string(&path).ok()
+            }
+        });
+        let Some(content) = content else { continue };
+        let mut rest = content.as_str();
+        while let Some(at) = rest.find(NEEDLE) {
+            let after = &rest[at + NEEDLE.len()..];
+            let Some(end) = after.find('"') else { break };
+            let key = &after[..end];
+            if key.starts_with("common.") {
+                found.insert(key.to_owned());
+            }
+            rest = &after[end..];
+        }
+    }
+    found
 }
 
 /// A complete generator plan — a sequence of actions plus the project root
