@@ -7350,6 +7350,22 @@ pub async fn show(
                     &format!("{snake_name}.flash.{field}_updated"),
                     &format!("{pascal_name} {field} updated"),
                 );
+                // Issue #1349: the REJECTION is user-facing too, and it is the
+                // one an ordinary reader is most likely to hit. `err` here is
+                // the model method's error, whose Display is built in
+                // autumn-macros as a hardcoded English "Cannot transition …" —
+                // a string this generator cannot route a `t!` through. So under
+                // `--i18n` the flash carries a translated message instead of
+                // the error's own text. One shared key: the sentence does not
+                // vary by field, and the specifics it drops (which edge was
+                // refused) are developer detail rather than something an author
+                // clicking a button can act on.
+                let flash_rejected = labels.expr(
+                    "common.transition.rejected",
+                    "That change is not allowed from the current state.",
+                    "err.to_string()",
+                    &[],
+                );
                 let handler = format!(
                     r#"/// `POST /{plural}/{{id}}/transitions/{field}` — apply a `{field}` state
 /// transition (issue #1326). A legal edge persists the new `{field}` value and
@@ -7385,7 +7401,7 @@ pub async fn transition_{field}(
             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())
         }}
         Err(err) => {{
-            flash.error(err.to_string()).await;
+            flash.error({flash_rejected}).await;
             let view = show_view(
                 {show_view_locale_arg_multiline}db,
                 &row,
@@ -23264,6 +23280,60 @@ exempt_paths = [
             warning.contains("translations/fr.ftl"),
             "must name the bundle the deploy actually loads: {warning}"
         );
+    }
+
+    /// AC7: a refused transition is user-facing, and the error's own Display is
+    /// built in autumn-macros as hardcoded English — so the flash carries a
+    /// translated message instead of the error text.
+    #[test]
+    fn i18n_translates_the_rejected_transition_flash() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Order",
+            &[
+                "title:String".into(),
+                "status:String:states(draft -> published, published -> archived)".into(),
+            ],
+            "20260506000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/orders.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        assert!(
+            routes.contains("flash.error(t!(locale, \"common.transition.rejected\"))"),
+            "the rejection must come from the bundle:\n{routes}"
+        );
+        assert!(
+            !routes.contains("flash.error(err.to_string())"),
+            "the English error text must not reach the flash:\n{routes}"
+        );
+        assert!(ftl.contains("common.transition.rejected = "), "{ftl}");
+    }
+
+    /// Without the flag the flash is the error's own text, as before.
+    #[test]
+    fn without_i18n_the_rejected_transition_flash_is_the_error() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Order",
+            &[
+                "title:String".into(),
+                "status:String:states(draft -> published, published -> archived)".into(),
+            ],
+            "20260506000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/orders.rs")).unwrap();
+        assert!(routes.contains("flash.error(err.to_string())"), "{routes}");
     }
 
     /// AC7: the conflict banner is what an author reads at the moment their

@@ -1647,16 +1647,6 @@ fn in_cfg_test(src: &str, at: usize) -> bool {
         .any(|(open, close)| open < at && at < close)
 }
 
-/// The body braces of the innermost `fn` containing `at`.
-fn enclosing_body(src: &str, at: usize) -> Option<(usize, usize)> {
-    real_offsets(src, "fn ")
-        .into_iter()
-        .filter(|&fn_at| fn_at < at)
-        .filter_map(|fn_at| brace_block(src, fn_at))
-        .filter(|&(open, close)| open < at && at < close)
-        .max_by_key(|&(open, _)| open)
-}
-
 /// Insert `.i18n_auto()` into the `AppBuilder` chain in `main.rs` so the
 /// generated `t!` lookups actually resolve (AC4's "zero further config").
 ///
@@ -1675,33 +1665,38 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
     // in a fixture reported the whole app as custom-bundled and left production
     // unwired, and an `.i18n_auto()` on the fixture reported it as already done.
     let anchors = production_routes_anchors(main_rs);
-    let Some(&first) = anchors.first() else {
+    if anchors.is_empty() {
         return I18nAutoWiring::NoAnchor;
-    };
-    let scope = enclosing_body(main_rs, first).unwrap_or((0, main_rs.len()));
-    let within = |offsets: Vec<usize>| offsets.into_iter().any(|o| o > scope.0 && o < scope.1);
-
-    // A custom bundle anywhere in the production body is a stop: `.i18n_auto()`
-    // CLEARS a preloaded bundle and switches to filesystem loading, so wiring it
-    // beside a hand-installed embedded or TMS-backed bundle replaces the app's
-    // own and can panic when nothing is on disk. Whitespace and comments between
-    // the method and its paren are valid Rust, hence the token-wise match.
-    if within(method_call_offsets(main_rs, ".i18n").collect()) {
-        return I18nAutoWiring::CustomBundle;
     }
-
-    // EVERY production branch, not just the first. `main` may build the app
-    // conditionally — one `.routes(` per configuration branch — and wiring only
-    // the first leaves the other rendering raw keys, unrepairably: the
-    // idempotency check would then see the call that was inserted into the
-    // first. Each chain is considered on its own so a partly-wired file gets
-    // completed rather than skipped.
-    let pending: Vec<usize> = anchors
-        .into_iter()
-        .filter(|&at| !chain_already_wired(main_rs, at))
-        .collect();
+    // EVERY production branch, not just the first, and each judged ON ITS OWN.
+    // `main` may build the app conditionally — one `.routes(` per configuration
+    // branch — and the per-branch questions are genuinely independent: one
+    // branch carrying `.i18n_auto()` says nothing about its sibling, and
+    // neither does one carrying a hand-installed `.i18n(...)`.
+    //
+    // A chain with its own bundle is LEFT ALONE rather than blocking the rest.
+    // `.i18n_auto()` CLEARS a preloaded bundle and switches to filesystem
+    // loading, so wiring it into that chain would replace the app's embedded or
+    // TMS-backed bundle and can panic when nothing is on disk — but that is a
+    // reason to skip THAT chain, not to abandon its siblings to raw keys.
+    let mut custom = false;
+    let mut pending = Vec::new();
+    for at in anchors {
+        if chain_has_custom_bundle(main_rs, at) {
+            custom = true;
+        } else if !chain_already_wired(main_rs, at) {
+            pending.push(at);
+        }
+    }
     if pending.is_empty() {
-        return I18nAutoWiring::Wired(main_rs.to_owned());
+        // Nothing to add. Say WHY: a file whose only production chain installs
+        // its own bundle is reported, so the caller warns rather than claiming
+        // success.
+        return if custom {
+            I18nAutoWiring::CustomBundle
+        } else {
+            I18nAutoWiring::Wired(main_rs.to_owned())
+        };
     }
 
     // Applied back-to-front so each insertion leaves the earlier offsets valid.
@@ -1736,8 +1731,19 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
 /// statement this call belongs to — so one branch being wired says nothing
 /// about its sibling.
 fn chain_already_wired(src: &str, at: usize) -> bool {
-    let start = src[..at].rfind([';', '{']).map_or(0, |i| i + 1);
-    !real_offsets(&src[start..at], ".i18n_auto()").is_empty()
+    !real_offsets(&src[chain_start(src, at)..at], ".i18n_auto()").is_empty()
+}
+
+/// Whether the builder chain ending at `at` installs its own bundle.
+fn chain_has_custom_bundle(src: &str, at: usize) -> bool {
+    method_call_offsets(&src[chain_start(src, at)..at], ".i18n")
+        .next()
+        .is_some()
+}
+
+/// Start of the statement the call at `at` belongs to.
+fn chain_start(src: &str, at: usize) -> usize {
+    src[..at].rfind([';', '{']).map_or(0, |i| i + 1)
 }
 
 #[cfg(test)]
@@ -2446,6 +2452,52 @@ mod tests {
 
         // And a re-run is a no-op rather than a second insertion.
         assert_eq!(ensure_i18n_auto(&out), I18nAutoWiring::Wired(out.clone()));
+    }
+
+    /// One branch installing its own bundle says nothing about its sibling.
+    /// Blocking on it left the other branch rendering raw keys.
+    #[test]
+    fn a_custom_bundle_in_one_branch_does_not_block_the_other() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = if flag {\n",
+            "        App::new()\n",
+            "            .i18n(tms_bundle())\n",
+            "            .routes(routes![admin]);\n",
+            "    } else {\n",
+            "        App::new()\n",
+            "            .routes(routes![index]);\n",
+            "    };\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("the plain branch must still be wired");
+        };
+        assert_eq!(
+            out.matches(".i18n_auto()").count(),
+            1,
+            "exactly the unconfigured chain gets it:\n{out}"
+        );
+        // The hand-installed bundle is untouched, and `.i18n_auto()` did not
+        // land in its chain — that would clear it.
+        assert!(out.contains(".i18n(tms_bundle())"), "{out}");
+        let custom_at = out.find(".i18n(tms_bundle())").unwrap();
+        let auto_at = out.find(".i18n_auto()").unwrap();
+        assert!(auto_at > custom_at, "wired the wrong chain:\n{out}");
+    }
+
+    /// When the ONLY production chain carries its own bundle, that is still
+    /// reported rather than silently called wired.
+    #[test]
+    fn a_sole_custom_bundled_chain_is_still_reported() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = App::new()\n",
+            "        .i18n(my_bundle())\n",
+            "        .routes(routes![index]);\n",
+            "}\n",
+        );
+        assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::CustomBundle);
     }
 
     /// A partly-wired file gets completed, not skipped: one branch already
