@@ -11271,10 +11271,57 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // reflected correctly in `rows_swept` rather than
                     // over-reported. Re-checking `basis < __cutoff` here,
                     // not just `id`, is what makes the second case safe.
+                    // Regression (#1342 review round 3): a counter-cached
+                    // model swept by `retention(...)` must move its parent's
+                    // counter exactly like every other delete path does, or
+                    // every swept live child leaves its parent's stored count
+                    // permanently inflated. `counter_cache_before_delete_many`
+                    // has to run on still-present, still-live rows BEFORE the
+                    // mutation, so the `#cc_has` arm locks (`FOR UPDATE`) the
+                    // subset of `ids` still eligible under the recheck filter
+                    // first — a candidate can have dropped out since the
+                    // batch SELECT, e.g. a concurrent update that un-staled
+                    // `basis` — then decrements against exactly that locked
+                    // set before mutating it. A model with no counter cache
+                    // keeps the original single-statement path.
                     let apply_stmt = if config.soft_delete {
                         quote! {
                             let __applied: u64 = if dry_run {
                                 __n
+                            } else if #cc_has {
+                                #[allow(unused_imports)]
+                                use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
+                                #[allow(unused_imports)]
+                                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                                let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
+                                ::autumn_web::__private::scoped_transaction::<u64, ::autumn_web::AutumnError, _, _>(
+                                    &mut *conn,
+                                    |conn| async move {
+                                        let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
+                                            #table_ident::table
+                                                .filter(#table_ident::id.eq_any(ids))
+                                                .filter(#table_ident::#basis_ident.lt(__cutoff))
+                                                .filter(#table_ident::deleted_at.is_null())
+                                                .select(#table_ident::id)
+                                        )
+                                        .load::<i64>(conn)
+                                        .await
+                                        .map_err(::autumn_web::AutumnError::from)?;
+                                        ::autumn_web::repository::counter_cache_before_delete_many(
+                                            conn, #cc_specs, &__locked_ids,
+                                        ).await?;
+                                        let __n2 = ::autumn_web::reexports::diesel::update(
+                                            #table_ident::table.filter(#table_ident::id.eq_any(&__locked_ids))
+                                        )
+                                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                        .execute(conn)
+                                        .await
+                                        .map_err(::autumn_web::AutumnError::from)?;
+                                        ::core::result::Result::Ok(__n2 as u64)
+                                    }
+                                    .scope_boxed(),
+                                )
+                                .await?
                             } else {
                                 let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
                                 ::autumn_web::reexports::diesel::update(
@@ -11293,6 +11340,37 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         quote! {
                             let __applied: u64 = if dry_run {
                                 __n
+                            } else if #cc_has {
+                                #[allow(unused_imports)]
+                                use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
+                                #[allow(unused_imports)]
+                                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                                ::autumn_web::__private::scoped_transaction::<u64, ::autumn_web::AutumnError, _, _>(
+                                    &mut *conn,
+                                    |conn| async move {
+                                        let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
+                                            #table_ident::table
+                                                .filter(#table_ident::id.eq_any(ids))
+                                                .filter(#table_ident::#basis_ident.lt(__cutoff))
+                                                .select(#table_ident::id)
+                                        )
+                                        .load::<i64>(conn)
+                                        .await
+                                        .map_err(::autumn_web::AutumnError::from)?;
+                                        ::autumn_web::repository::counter_cache_before_delete_many(
+                                            conn, #cc_specs, &__locked_ids,
+                                        ).await?;
+                                        let __n2 = ::autumn_web::reexports::diesel::delete(
+                                            #table_ident::table.filter(#table_ident::id.eq_any(&__locked_ids))
+                                        )
+                                        .execute(conn)
+                                        .await
+                                        .map_err(::autumn_web::AutumnError::from)?;
+                                        ::core::result::Result::Ok(__n2 as u64)
+                                    }
+                                    .scope_boxed(),
+                                )
+                                .await?
                             } else {
                                 ::autumn_web::reexports::diesel::delete(
                                     #table_ident::table
@@ -11420,9 +11498,47 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 // time, not just `id`: a row concurrently
                                 // `restore()`d between the SELECT above and
                                 // this DELETE must survive, not be purged
-                                // out from under the restore.
+                                // out from under the restore. The `#cc_has`
+                                // arm additionally locks the still-eligible
+                                // subset and runs `counter_cache_before_delete_many`
+                                // on it before purging — normally a no-op here
+                                // (the row's counter already moved when it was
+                                // soft-deleted), but keeps the purge path
+                                // symmetric with the age branch and correct
+                                // if that invariant ever changes.
                                 let __applied: u64 = if dry_run {
                                     __n
+                                } else if #cc_has {
+                                    #[allow(unused_imports)]
+                                    use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
+                                    #[allow(unused_imports)]
+                                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                                    ::autumn_web::__private::scoped_transaction::<u64, ::autumn_web::AutumnError, _, _>(
+                                        &mut *conn,
+                                        |conn| async move {
+                                            let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
+                                                #table_ident::table
+                                                    .filter(#table_ident::id.eq_any(ids))
+                                                    .filter(#table_ident::deleted_at.lt(__cutoff))
+                                                    .select(#table_ident::id)
+                                            )
+                                            .load::<i64>(conn)
+                                            .await
+                                            .map_err(::autumn_web::AutumnError::from)?;
+                                            ::autumn_web::repository::counter_cache_before_delete_many(
+                                                conn, #cc_specs, &__locked_ids,
+                                            ).await?;
+                                            let __n2 = ::autumn_web::reexports::diesel::delete(
+                                                #table_ident::table.filter(#table_ident::id.eq_any(&__locked_ids))
+                                            )
+                                            .execute(conn)
+                                            .await
+                                            .map_err(::autumn_web::AutumnError::from)?;
+                                            ::core::result::Result::Ok(__n2 as u64)
+                                        }
+                                        .scope_boxed(),
+                                    )
+                                    .await?
                                 } else {
                                     ::autumn_web::reexports::diesel::delete(
                                         #table_ident::table
@@ -22212,6 +22328,37 @@ mod tests {
         assert!(
             !generated.contains("i64 :: MIN"),
             "sweep must not use an i64::MIN sentinel cursor: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_maintains_counter_cache_before_mutating() {
+        // Regression (#1342 review round 3): a counter-cached model swept by
+        // retention(...) must move its parent's counter, mirroring
+        // delete_many's cc_before_delete_chunk. Every mutation site — the
+        // age branch's soft-delete UPDATE and the purge branch's hard
+        // DELETE — must call counter_cache_before_delete_many before
+        // applying the mutation. Scoped to the retention_run section (via
+        // `generated_fn`, the same helper the #1325 counter-cache tests
+        // use) so this doesn't just count the base CRUD trait's unrelated
+        // `delete_many` occurrences of the same function name.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
+        assert_eq!(
+            retention_run
+                .matches("counter_cache_before_delete_many")
+                .count(),
+            2,
+            "both the age (soft-delete) and purge (hard-delete) branches must \
+             call counter_cache_before_delete_many: {retention_run}"
         );
     }
 

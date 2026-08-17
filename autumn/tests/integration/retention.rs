@@ -14,6 +14,7 @@
 //! | `RtSession` | `retention(after = "30d", basis = created_at, batch_size = 2)` | hard-delete, batched |
 //! | `RtPost` | `soft_delete, retention(after = "30d", basis = created_at, purge_deleted_after = "90d")` | soft-delete-aware age sweep + hard purge |
 //! | `RtPlain` | none | opt-in: behaves exactly as today |
+//! | `RtCcChild` | `retention(after = "30d", basis = created_at)`, `#[belongs_to(RtCcParent, counter_cache)]` | sweep decrements the parent's counter cache exactly like every other delete path (#1342 review round 3) |
 
 #![cfg(feature = "db")]
 #![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
@@ -97,6 +98,55 @@ pub struct RtPlain {
 #[autumn_web::repository(RtPlain, table = "rt_plains")]
 pub trait RtPlainRepository {}
 
+diesel::table! {
+    rt_cc_parents (id) {
+        id -> Int8,
+        name -> Text,
+        child_count -> Int8,
+    }
+}
+
+#[autumn_web::model(table = "rt_cc_parents")]
+pub struct RtCcParent {
+    #[id]
+    pub id: i64,
+    pub name: String,
+    #[default]
+    pub child_count: i64,
+}
+
+#[autumn_web::repository(RtCcParent, table = "rt_cc_parents")]
+pub trait RtCcParentRepository {}
+
+diesel::table! {
+    rt_cc_children (id) {
+        id -> Int8,
+        parent_id -> Int8,
+        created_at -> Timestamp,
+    }
+}
+
+// Regression (#1342 review round 3): a retained model that is also the
+// counter-cached child of a `belongs_to(...)` relationship must move its
+// parent's counter when the sweep deletes it, exactly like `delete_many`
+// already does. No `soft_delete` here on purpose — this exercises the
+// hard-delete counter-cache arm of the age branch.
+#[autumn_web::model(table = "rt_cc_children")]
+#[belongs_to(RtCcParent, fk = parent_id, counter_cache = "child_count")]
+pub struct RtCcChild {
+    #[id]
+    pub id: i64,
+    pub parent_id: i64,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+#[autumn_web::repository(
+    RtCcChild,
+    table = "rt_cc_children",
+    retention(after = "30d", basis = created_at)
+)]
+pub trait RtCcChildRepository {}
+
 const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS rt_sessions \
      (id BIGSERIAL PRIMARY KEY, token TEXT NOT NULL, created_at TIMESTAMP NOT NULL)",
@@ -105,6 +155,10 @@ const DDL: &[&str] = &[
       deleted_at TIMESTAMP NULL)",
     "CREATE TABLE IF NOT EXISTS rt_plains \
      (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, created_at TIMESTAMP NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS rt_cc_parents \
+     (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, child_count BIGINT NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS rt_cc_children \
+     (id BIGSERIAL PRIMARY KEY, parent_id BIGINT NOT NULL, created_at TIMESTAMP NOT NULL)",
 ];
 
 async fn setup_pool() -> (
@@ -202,6 +256,43 @@ async fn count_deleted_rows(conn: &mut AsyncPgConnection) -> i64 {
         .await
         .expect("count deleted rows")
         .count
+}
+
+async fn seed_cc_parent(conn: &mut AsyncPgConnection, name: &str, child_count: i64) -> i64 {
+    diesel::sql_query("INSERT INTO rt_cc_parents (name, child_count) VALUES ($1, $2) RETURNING id")
+        .bind::<diesel::sql_types::Text, _>(name)
+        .bind::<diesel::sql_types::BigInt, _>(child_count)
+        .get_result::<IdRow>(conn)
+        .await
+        .expect("seed cc parent")
+        .id
+}
+
+async fn seed_cc_child(conn: &mut AsyncPgConnection, parent_id: i64, age_days: i64) -> i64 {
+    diesel::sql_query(
+        "INSERT INTO rt_cc_children (parent_id, created_at) \
+         VALUES ($1, NOW() - ($2 || ' days')::interval) RETURNING id",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(parent_id)
+    .bind::<diesel::sql_types::BigInt, _>(age_days)
+    .get_result::<IdRow>(conn)
+    .await
+    .expect("seed cc child")
+    .id
+}
+
+async fn fetch_cc_parent_child_count(conn: &mut AsyncPgConnection, parent_id: i64) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct ChildCountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        child_count: i64,
+    }
+    diesel::sql_query("SELECT child_count FROM rt_cc_parents WHERE id = $1")
+        .bind::<diesel::sql_types::BigInt, _>(parent_id)
+        .get_result::<ChildCountRow>(conn)
+        .await
+        .expect("fetch cc parent child_count")
+        .child_count
 }
 
 // ── Non-Docker: generated surface + auto-registration ────────────────────
@@ -404,4 +495,40 @@ async fn retention_run_dry_run_registry_walk_matches_direct_call() {
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].model, "RtSession");
     assert_eq!(reports[0].rows_swept, 2);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn retention_sweep_maintains_belongs_to_counter_cache() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    let parent_id = seed_cc_parent(&mut conn, "team", 5).await;
+    for _ in 0..3 {
+        seed_cc_child(&mut conn, parent_id, 40).await;
+    }
+    for _ in 0..2 {
+        seed_cc_child(&mut conn, parent_id, 5).await;
+    }
+    drop(conn);
+
+    let state = state_with_pool(pool.clone());
+    let report = PgRtCcChildRepository::__autumn_retention_sweep(&state)
+        .await
+        .expect("sweep should succeed");
+
+    assert_eq!(report.rows_swept, 3, "3 stale children are hard-deleted");
+
+    let mut conn = pool.get().await.expect("conn");
+    assert_eq!(
+        count_rows(&mut conn, "rt_cc_children").await,
+        2,
+        "only the 2 fresh children should remain"
+    );
+    assert_eq!(
+        fetch_cc_parent_child_count(&mut conn, parent_id).await,
+        2,
+        "the parent's counter cache must drop by exactly the 3 swept children, \
+         matching what delete_many would have done"
+    );
 }

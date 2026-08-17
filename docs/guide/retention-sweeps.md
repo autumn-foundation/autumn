@@ -114,6 +114,14 @@ explicitly naming a hand-written task `retention-sweep-<table>` for the same
 table, or the two will compete for the same coordination lock and clobber
 each other's status in `/actuator/tasks`.
 
+## Counter Caches
+
+A retained model that is also a `#[belongs_to(Parent, counter_cache)]` child
+gets the same treatment `delete_many` gives it: every row the sweep deletes
+or soft-deletes decrements the parent's cached counter, in the same
+transaction as the mutation. You don't do anything to opt in — declaring
+both attributes on the same model is enough.
+
 ## Validate Before Enabling: Dry Run
 
 Before deploying a new policy, see what it *would* delete without deleting

@@ -24,10 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interval. `autumn retention --dry-run [--model NAME]` reports per-model
   rows-that-would-be-swept without deleting anything. Each real run emits a
   structured log line and bumps `retention_sweep_rows_total` /
-  `retention_sweep_duration_seconds`, both labeled by `model`. Opt-in: a
-  repository with no `retention(...)` behaves exactly as before. See
-  `docs/guide/retention-sweeps.md` and the `examples/saas` `PasswordResetToken`
-  demo.
+  `retention_sweep_duration_seconds`, both labeled by `model`. A
+  counter-cached model (`#[belongs_to(..., counter_cache)]`) moves its
+  parent's counter on every sweep, exactly like `delete_many` — the sweep
+  locks the still-eligible rows before mutating them, so a counter-cache
+  decrement and the corresponding delete/soft-delete always agree on the
+  same set. Opt-in: a repository with no `retention(...)` behaves exactly as
+  before. See `docs/guide/retention-sweeps.md` and the `examples/saas`
+  `PasswordResetToken` demo.
 
 ### Fixed
 
