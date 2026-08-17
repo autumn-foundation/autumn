@@ -1189,7 +1189,7 @@ fn plan_scaffold_with_options_impl(
             // resources reuse the chrome, and `.i18n_auto()` panics at startup
             // if the default locale's file is missing.
             plan.push_revert(Revert::I18nFtlKeys {
-                path: ftl_path,
+                path: ftl_path.clone(),
                 pascal: pascal_name.clone(),
                 snake: snake_name.clone(),
             });
@@ -1198,6 +1198,26 @@ fn plan_scaffold_with_options_impl(
             // `maud`/`csv`/`htmx` — `plan_cargo_deps` runs between here and
             // there and rebuilds its Cargo.toml action from DISK, so an edit
             // made at this point would be silently dropped.)
+
+            // A profile overlay can repoint i18n somewhere else entirely, and
+            // the runtime resolves the fully layered config — so the base
+            // bundle this generator just wrote (and the `COPY` it is about to
+            // add) can be the wrong one for the deploy that matters. Writing
+            // English into a `fr` production bundle would be a worse answer, so
+            // name the paths and let the author decide.
+            for (profile, path) in scaffold_i18n::profile_i18n_overrides(
+                &read_or_empty(&autumn_toml_path_for_i18n),
+                &i18n_dir,
+                &default_locale,
+            ) {
+                plan.warn(format!(
+                    "`[profile.{profile}.i18n]` points at `{path}`, not the `{}` this scaffold \
+                     wrote. Add the same keys there (or an `{profile}` fallback chain that \
+                     reaches the base bundle) — the app loads the layered config at startup, and \
+                     `.i18n_auto()` PANICS when the resolved default locale's file is missing.",
+                    ftl_path.display()
+                ));
+            }
 
             // The image has to carry the bundle: `.i18n_auto()` panics at
             // startup when the default locale's file is missing, and the plain

@@ -1293,6 +1293,12 @@ Notes and limits:
   through — in any of TOML's spellings (`[i18n]`, `i18n = { … }`, or
   `i18n.default_locale = …`). Only a project that configures no i18n at all
   gets a block written for it (`default_locale = "en"`, `i18n/`).
+- **Profile overlays are reported, not guessed at.** `[profile.prod.i18n]`
+  can repoint `dir`/`default_locale`, and the app resolves the layered
+  config at startup — so the generator writes the *base* bundle and warns
+  which other path a deploy will actually read. Writing English into a
+  profile that exists precisely because it serves another locale would be
+  its own bug.
 - **An app that installs its own bundle keeps it.** A `main.rs` calling
   `.i18n(my_bundle())` — embedded files, a translation-management service,
   memory — is left alone, and the generator warns that the keys it just
@@ -1302,8 +1308,9 @@ Notes and limits:
   adds a `COPY` for the configured bundle directory to both stages of a
   generated `Dockerfile`.
 - **`autumn destroy scaffold … --i18n`** removes that resource's marked key
-  block — including any continuation lines a translator wrapped a value
-  over, and nothing outside the block, so a hand-authored
+  block — the header, everything down to its `# — end <Model> —` marker
+  (so a blank line or a note you leave among the keys does not move the
+  boundary), and nothing outside it, so a hand-authored
   `post.email.subject` of your own survives —
   and leaves the file, the `i18n` feature, `[i18n]`, and `.i18n_auto()` in
   place, since those are project-level and shared. The `common.*` chrome
