@@ -509,14 +509,14 @@ pub(super) fn remove_en_ftl_keys(
     existing: &str,
     pascal_name: &str,
     resource: &str,
-    // The `common.*` keys a surviving route module still looks up. The caller
-    // scans the project for these, because the bundle itself cannot answer it:
-    // a resource whose keys were all hand-authored before it was scaffolded
-    // leaves no marker comment behind, so "no other marker" does NOT mean "no
-    // other user".
-    surviving_chrome: &std::collections::HashSet<String>,
+    // Every key surviving project source still looks up — the resource's own as
+    // much as the shared chrome. The caller scans the project for these,
+    // because the bundle itself cannot answer it: a resource whose keys were
+    // all hand-authored before it was scaffolded leaves no marker comment
+    // behind, so "no other marker" does NOT mean "no other user".
+    surviving: &std::collections::HashSet<String>,
 ) -> String {
-    let stripped = remove_resource_block(existing, pascal_name, resource);
+    let stripped = prune_resource_block(existing, pascal_name, resource, surviving);
     // Chrome exists to be shared. Once nothing references it, every `common.*`
     // key is dead weight — which is exactly what `autumn i18n check --strict`
     // fails on, so destroying the only `--i18n` resource would otherwise leave
@@ -527,7 +527,7 @@ pub(super) fn remove_en_ftl_keys(
     //
     // Never the FILE, either way: `.i18n_auto()` panics at startup when the
     // default locale's bundle is missing, and a comment-only bundle still loads.
-    prune_chrome_block(&stripped, surviving_chrome)
+    prune_chrome_block(&stripped, surviving)
 }
 
 /// Narrow the shared chrome block to the keys `surviving` still names, dropping
@@ -543,23 +543,61 @@ pub(super) fn remove_en_ftl_keys(
 /// Marker-bounded like [`remove_marked_block`], so a hand-authored `common.*`
 /// key outside the block is never touched.
 fn prune_chrome_block(existing: &str, surviving: &std::collections::HashSet<String>) -> String {
-    if surviving.is_empty() {
-        return remove_marked_block(existing, COMMON_HEADER);
-    }
-    let kept: BTreeMap<String, String> = surviving
-        .iter()
-        .map(|k| (k.clone(), String::new()))
-        .collect();
-    // `reconcile_block` keeps each surviving key's own value and drops the
-    // rest — the empty values above are never written, since every key it keeps
-    // is already present in the block.
-    reconcile_block(existing, COMMON_HEADER, "common.", &kept)
-        .unwrap_or_else(|| existing.to_owned())
+    prune_block(existing, COMMON_HEADER, "common.", surviving)
 }
 
-fn remove_resource_block(existing: &str, pascal_name: &str, _resource: &str) -> String {
+/// Narrow one resource's block to the keys `surviving` still names, dropping
+/// the block entirely when nothing is left.
+///
+/// Per KEY for the same reason the chrome block is, and it is the same failure:
+/// hand-written code outside the generated module can reference a generated
+/// key — `t!(locale, "post.index.title")` on a dashboard card or a nav link is
+/// an ordinary thing for an app to do — and taking the whole `post.*` block out
+/// from under it breaks the build, because `t!` validates key existence at
+/// COMPILE time. Restricting preservation to `common.*` drew the line in the
+/// wrong place: nothing about a `post.` prefix makes a live call site less
+/// live. Keys nothing references still go, so `autumn i18n check --strict` does
+/// not go red on the leftovers.
+fn prune_resource_block(
+    existing: &str,
+    pascal_name: &str,
+    resource: &str,
+    surviving: &std::collections::HashSet<String>,
+) -> String {
     let header = format!("{RESOURCE_HEADER_PREFIX}{pascal_name}{RESOURCE_HEADER_SUFFIX}");
-    remove_marked_block(existing, &header)
+    prune_block(existing, &header, &format!("{resource}."), surviving)
+}
+
+/// Shared body of [`prune_chrome_block`] and [`prune_resource_block`]: keep the
+/// block's keys that `surviving` names under `prefix`, drop the rest, and take
+/// the whole marked block out when that leaves nothing.
+///
+/// Marker-bounded like [`remove_marked_block`], so a hand-authored key outside
+/// the block is never touched.
+fn prune_block(
+    existing: &str,
+    header: &str,
+    prefix: &str,
+    surviving: &std::collections::HashSet<String>,
+) -> String {
+    // Only keys the bundle actually DEFINES. `surviving` is a scan of source,
+    // so it can name a key no `.ftl` carries — a call site that was already
+    // failing `t!` before any of this ran — and `reconcile_block` appends keys
+    // it does not find defined. Destroy inventing an empty message for one is
+    // strictly worse than leaving the pre-existing breakage alone.
+    let defined = defined_keys(existing);
+    let kept: BTreeMap<String, String> = surviving
+        .iter()
+        .filter(|key| key.starts_with(prefix) && defined.contains_key(*key))
+        .map(|key| (key.clone(), String::new()))
+        .collect();
+    if kept.is_empty() {
+        return remove_marked_block(existing, header);
+    }
+    // `reconcile_block` keeps each surviving key's own value and drops the
+    // rest — the empty values above are never written, since every key it keeps
+    // is already defined.
+    reconcile_block(existing, header, prefix, &kept).unwrap_or_else(|| existing.to_owned())
 }
 
 /// Remove the marked comment `header` and the run of key lines it introduces.
@@ -972,6 +1010,13 @@ fn configured_i18n_by_scan(autumn_toml: &str) -> (Option<String>, Option<String>
     (locale, dir)
 }
 
+/// The `static` item `autumn new` emits for embedded assets — where the locale
+/// static is written next to.
+const STATIC_ANCHOR: &str =
+    "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();";
+/// The builder line that installs those assets — where the locale install goes.
+const INSTALL_ANCHOR: &str = "    let app = app.embedded_static(&EMBEDDED_STATIC);\n";
+
 /// Embed the locale bundle into the binary for `autumn build --embed`,
 /// matching what `autumn new --with-i18n` wires into a fresh app.
 ///
@@ -988,9 +1033,6 @@ fn configured_i18n_by_scan(autumn_toml: &str) -> (Option<String>, Option<String>
 /// hand-rolled `main.rs`), so the caller can leave it alone; returns the input
 /// unchanged when the locales are already embedded.
 pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String> {
-    const STATIC_ANCHOR: &str =
-        "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();";
-    const INSTALL_ANCHOR: &str = "    let app = app.embedded_static(&EMBEDDED_STATIC);\n";
     // `embed_locales!()` defaults to `i18n/`; a configured directory is passed
     // through as the macro's literal argument — escaped, because this is the one
     // place a `dir` read out of `autumn.toml` becomes Rust source.
@@ -1024,21 +1066,9 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
     // about the chain the binary runs: treating it as done leaves production
     // falling through to `.i18n_auto()`, so an `--embed` deployment without the
     // sidecar directory panics with the static sitting unused in the binary.
-    let production_scopes: Vec<(usize, usize)> = production_routes_anchors(main_rs)
-        .into_iter()
-        .filter_map(|at| enclosing_body(main_rs, at))
-        .collect();
-    let installed_in_production = method_call_offsets(main_rs, ".embedded_locales").any(|at| {
-        if production_scopes.is_empty() {
-            // No identifiable production builder — fall back to the coarser
-            // question rather than claiming nothing is installed.
-            !in_cfg_test(main_rs, at)
-        } else {
-            production_scopes
-                .iter()
-                .any(|&(open, close)| open < at && at < close)
-        }
-    });
+    let scopes = production_scopes(main_rs);
+    let installed_in_production = method_call_offsets(main_rs, ".embedded_locales")
+        .any(|at| in_production(main_rs, &scopes, at));
 
     if embedded_in_production {
         // Already embedded — but not necessarily from the right place. A
@@ -1061,19 +1091,12 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
         } else {
             main_rs.to_owned()
         };
-        if !installed_in_production && out.contains(INSTALL_ANCHOR) {
-            out = out.replacen(
-                INSTALL_ANCHOR,
-                &format!(
-                    "{INSTALL_ANCHOR}    #[cfg(feature = \"embed-assets\")]\n\
-                     \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n"
-                ),
-                1,
-            );
+        if !installed_in_production {
+            out = insert_locale_install(&out)?;
         }
         return Some(out);
     }
-    if !main_rs.contains(STATIC_ANCHOR) || !main_rs.contains(INSTALL_ANCHOR) {
+    if !main_rs.contains(STATIC_ANCHOR) {
         return None;
     }
     let with_static = main_rs.replacen(
@@ -1084,14 +1107,55 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
         ),
         1,
     );
-    Some(with_static.replacen(
-        INSTALL_ANCHOR,
-        &format!(
-            "{INSTALL_ANCHOR}    #[cfg(feature = \"embed-assets\")]\n\
-             \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n"
-        ),
-        1,
+    insert_locale_install(&with_static)
+}
+
+/// Splice `.embedded_locales(&EMBEDDED_LOCALES)` in after the PRODUCTION
+/// `embedded_static` install, or `None` when there is no such line.
+///
+/// The anchor is picked with the same production test that decided the install
+/// was missing in the first place, because the two questions have to be asked
+/// about the same code. A file-wide "first occurrence" replacement answered
+/// them at different granularities: with a preview or helper builder above
+/// `main` carrying the ordinary `let app = app.embedded_static(&EMBEDDED_STATIC);`
+/// line, the detection correctly reported production as missing the call and
+/// the insertion then wrote it into the HELPER — leaving the production
+/// `--embed` binary still falling through to a disk load, which panics when the
+/// deployment has no sidecar locale directory. Recomputed against the text
+/// passed in, since an earlier edit may have shifted every offset.
+fn insert_locale_install(src: &str) -> Option<String> {
+    let scopes = production_scopes(src);
+    let at = real_offsets(src, INSTALL_ANCHOR)
+        .into_iter()
+        .find(|&at| in_production(src, &scopes, at))?;
+    let end = at + INSTALL_ANCHOR.len();
+    Some(format!(
+        "{}{INSTALL_ANCHOR}    #[cfg(feature = \"embed-assets\")]\n\
+         \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n{}",
+        &src[..at],
+        &src[end..]
     ))
+}
+
+/// The function bodies holding the builders the binary runs.
+fn production_scopes(src: &str) -> Vec<(usize, usize)> {
+    production_routes_anchors(src)
+        .into_iter()
+        .filter_map(|at| enclosing_body(src, at))
+        .collect()
+}
+
+/// Whether `at` sits in one of `scopes` — or, when no production builder could
+/// be identified at all, merely outside `#[cfg(test)]`.
+///
+/// The fallback is the coarser question, taken deliberately: with nothing to
+/// scope to, "anything non-test" is a better read than "nothing counts".
+fn in_production(src: &str, scopes: &[(usize, usize)], at: usize) -> bool {
+    if scopes.is_empty() {
+        !in_cfg_test(src, at)
+    } else {
+        scopes.iter().any(|&(open, close)| open < at && at < close)
+    }
 }
 
 /// Ship the `i18n/` sidecar into a generated `Dockerfile`, in both stages.
@@ -1750,9 +1814,10 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
     }
     // EVERY production branch, not just the first, and each judged ON ITS OWN.
     // `main` may build the app conditionally — one `.routes(` per configuration
-    // branch — and the per-branch questions are genuinely independent: one
-    // branch carrying `.i18n_auto()` says nothing about its sibling, and
-    // neither does one carrying a hand-installed `.i18n(...)`.
+    // branch — and one branch carrying `.i18n_auto()` says nothing about its
+    // sibling. A hand-installed `.i18n(...)` is asked about the enclosing
+    // function instead of the chain; [`custom_bundle_before`] carries the
+    // reasoning for the difference.
     //
     // A chain with its own bundle is LEFT ALONE rather than blocking the rest.
     // `.i18n_auto()` CLEARS a preloaded bundle and switches to filesystem
@@ -1762,7 +1827,7 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
     let mut custom = false;
     let mut pending = Vec::new();
     for at in anchors {
-        if chain_has_custom_bundle(main_rs, at) {
+        if custom_bundle_before(main_rs, at) {
             custom = true;
         } else if !chain_already_wired(main_rs, at) {
             pending.push(at);
@@ -1816,24 +1881,67 @@ fn chain_already_wired(src: &str, at: usize) -> bool {
         .is_some()
 }
 
-/// Whether the builder chain ending at `at` installs its own bundle.
-fn chain_has_custom_bundle(src: &str, at: usize) -> bool {
-    method_call_offsets(&src[chain_start(src, at)..at], ".i18n")
+/// Whether a bundle is already installed on the app the chain at `at` builds.
+///
+/// Scoped to the enclosing FUNCTION BODY up to `at`, not to the chain — and
+/// deliberately at a different granularity from [`chain_already_wired`] next to
+/// it, because the two fail in opposite directions:
+///
+///   * Missing a custom bundle inserts `.i18n_auto()`, which CLEARS the
+///     preloaded bundle and switches to a filesystem load — the app silently
+///     loses its embedded or TMS-backed translations, and panics at startup
+///     when nothing is on disk.
+///   * Seeing one that is not there skips the chain, and the caller warns.
+///
+/// So this one errs toward finding it. `let app = app.i18n(custom_bundle());`
+/// followed by `let app = app.routes(…);` is the ordinary builder rebinding —
+/// one app, two statements — and a chain-scoped search sees only the second and
+/// calls the app unbundled.
+///
+/// The BLOCK, though, not the whole function: a `main` that builds the app
+/// conditionally puts each branch in a block of its own, and one branch's
+/// hand-installed bundle genuinely says nothing about its sibling. Widening
+/// this to the enclosing `fn` would leave that sibling unwired and rendering
+/// raw keys. A block is exactly the scope a rebinding can cross and a branch
+/// cannot.
+///
+/// Stopping at `at` keeps a bundle installed AFTER the routes chain out of it:
+/// that one runs later and overrides `.i18n_auto()` rather than being clobbered
+/// by it, so there is nothing to protect.
+fn custom_bundle_before(src: &str, at: usize) -> bool {
+    let start = enclosing_block_start(src, at);
+    method_call_offsets(&src[start..at], ".i18n")
         .next()
         .is_some()
 }
 
-/// Start of the statement the call at `at` belongs to.
+/// Just inside the innermost block or delimiter pair containing `at`, or 0 at
+/// file scope.
 ///
-/// Balanced-delimiter aware, and reading only REAL code. A raw `rfind` for the
-/// previous `;` or `{` stops inside anything nested between the chain's start
-/// and this call — `.layer(from_fn(|req, next| async move { … }))` is ordinary
-/// middleware, and its closing brace looked like the statement boundary. That
-/// truncated chain hid an earlier `.i18n(...)`, so `.i18n_auto()` was inserted
-/// into a chain that already had a bundle and CLEARED it.
-fn chain_start(src: &str, at: usize) -> usize {
-    // Real-code delimiter positions, so a `;` or brace inside a string or
-    // comment is not mistaken for structure.
+/// [`chain_start`] without its statement rule — the same balanced backward scan
+/// over real code, stopping one level out instead of at the previous `;`.
+fn enclosing_block_start(src: &str, at: usize) -> usize {
+    let mut depth = 0usize;
+    for &(offset, byte) in delimiter_marks(src, at).iter().rev() {
+        match byte {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return offset + 1;
+                };
+                depth = next;
+            }
+            // A `;` is a statement boundary, which is exactly what this scan
+            // is meant to cross.
+            _ => {}
+        }
+    }
+    0
+}
+
+/// Real-code delimiter positions before `at`, in source order, so a `;` or
+/// brace inside a string or comment is never mistaken for structure.
+fn delimiter_marks(src: &str, at: usize) -> Vec<(usize, u8)> {
     let mut marks: Vec<(usize, u8)> = Vec::new();
     for (needle, byte) in [
         (";", b';'),
@@ -1851,9 +1959,20 @@ fn chain_start(src: &str, at: usize) -> usize {
         );
     }
     marks.sort_unstable();
+    marks
+}
 
+/// Start of the statement the call at `at` belongs to.
+///
+/// Balanced-delimiter aware, and reading only REAL code. A raw `rfind` for the
+/// previous `;` or `{` stops inside anything nested between the chain's start
+/// and this call — `.layer(from_fn(|req, next| async move { … }))` is ordinary
+/// middleware, and its closing brace looked like the statement boundary. That
+/// truncated chain hid an earlier `.i18n(...)`, so `.i18n_auto()` was inserted
+/// into a chain that already had a bundle and CLEARED it.
+fn chain_start(src: &str, at: usize) -> usize {
     let mut depth = 0usize;
-    for &(offset, byte) in marks.iter().rev() {
+    for &(offset, byte) in delimiter_marks(src, at).iter().rev() {
         match byte {
             b')' | b']' | b'}' => depth += 1,
             b'(' | b'[' => {
@@ -2897,6 +3016,44 @@ mod tests {
         );
     }
 
+    /// Detection and insertion have to be asked about the SAME code. Scoping
+    /// only the detection left the insertion taking the file's FIRST
+    /// `embedded_static` line, which with a preview helper above `main` is the
+    /// helper's: the tool then reported the embed as configured while the
+    /// production binary still fell through to a disk load — and panicked on a
+    /// deployment with no sidecar locale directory.
+    #[test]
+    fn the_install_is_written_into_the_production_builder() {
+        let main_rs = concat!(
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "\n",
+            "fn preview() -> App {\n",
+            "    let app = App::new().routes(routes![preview]);\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "    app\n",
+            "}\n",
+            "\n",
+            "fn main() {\n",
+            "    let app = App::new().routes(routes![index]);\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "}\n",
+        );
+        let out = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
+        let main_at = out.find("fn main").expect("`fn main` survives");
+        let install_at = out
+            .find(".embedded_locales(&EMBEDDED_LOCALES)")
+            .expect("the install is written");
+        assert!(
+            install_at > main_at,
+            "the install belongs to the production builder, not the helper:\n{out}"
+        );
+        assert_eq!(
+            out.matches(".embedded_locales(&EMBEDDED_LOCALES)").count(),
+            1,
+            "exactly one install:\n{out}"
+        );
+    }
+
     /// `embed_locales!` bakes the files in; `.embedded_locales(&…)` is what
     /// makes the app read them. With the static present and the install
     /// missing, an `--embed` build carries the bundle and never loads it — and
@@ -2942,6 +3099,52 @@ mod tests {
             I18nAutoWiring::CustomBundle,
             "the earlier `.i18n(...)` must still be visible past the closure"
         );
+    }
+
+    /// `let app = app.i18n(bundle);` followed by `let app = app.routes(…);` is
+    /// the ordinary builder rebinding — one app, two statements. Scoping the
+    /// custom-bundle question to the CHAIN saw only the second and called the
+    /// app unbundled, so `.i18n_auto()` went in and CLEARED the bundle.
+    #[test]
+    fn a_bundle_installed_by_an_earlier_rebinding_is_still_found() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = App::new();\n",
+            "    let app = app.i18n(tms_bundle());\n",
+            "    let app = app.routes(routes![index]);\n",
+            "    app.serve();\n",
+            "}\n",
+        );
+        assert_eq!(
+            ensure_i18n_auto(main_rs),
+            I18nAutoWiring::CustomBundle,
+            "rebinding the same `app` is one builder, not two unrelated chains"
+        );
+    }
+
+    /// And the widening stops at the function: a `#[cfg(test)]` fixture's own
+    /// bundle is not production's, and reading it as one leaves the real app
+    /// rendering raw keys.
+    #[test]
+    fn a_test_fixtures_bundle_does_not_speak_for_production() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = App::new();\n",
+            "    let app = app.routes(routes![index]);\n",
+            "    app.serve();\n",
+            "}\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn test_app() -> App {\n",
+            "        App::new().i18n(fixture_bundle()).routes(routes![index])\n",
+            "    }\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("production must still be wired");
+        };
+        assert!(out.contains(".i18n_auto()"), "{out}");
     }
 
     /// A `dir` with whitespace is a legal path, and the shell `COPY` form
@@ -3118,6 +3321,62 @@ mod tests {
             "chrome nothing references any more fails `--strict`:\n{out}"
         );
         assert!(!out.contains("post.new"), "{out}");
+    }
+
+    /// The resource's own block is pruned per key for the same reason the
+    /// chrome block is. Hand-written code outside the generated module can
+    /// render a generated key — a dashboard card or a nav link labelled
+    /// `t!(locale, "post.index.title")` — and `t!` validates key existence at
+    /// COMPILE time, so removing the whole block out from under it breaks the
+    /// build. Keeping preservation to `common.*` drew the line in the wrong
+    /// place.
+    #[test]
+    fn a_resource_key_something_still_references_survives_its_block() {
+        let ftl = merge_en_ftl(
+            "",
+            "Post",
+            "post",
+            &keys(&[
+                ("common.create", "Create"),
+                ("post.index.title", "Posts"),
+                ("post.new.title", "New Post"),
+            ]),
+        );
+        let out = remove_en_ftl_keys(
+            &ftl,
+            "Post",
+            "post",
+            &chrome(&["common.create", "post.index.title"]),
+        );
+        assert!(
+            out.contains("post.index.title = Posts"),
+            "a live call site keeps its key:\n{out}"
+        );
+        assert!(
+            !out.contains("post.new.title"),
+            "keys nothing references still go — `--strict` fails on them:\n{out}"
+        );
+        assert!(out.contains("common.create = Create"), "{out}");
+    }
+
+    /// The other half: preservation follows what is DEFINED, so a scan that
+    /// names a key the bundle never carried — a call site already failing `t!`
+    /// before destroy ran — must not have an empty message invented for it.
+    #[test]
+    fn a_referenced_key_the_bundle_never_defined_is_not_invented() {
+        let ftl = merge_en_ftl(
+            "",
+            "Post",
+            "post",
+            &keys(&[("common.create", "Create"), ("post.index.title", "Posts")]),
+        );
+        let out = remove_en_ftl_keys(
+            &ftl,
+            "Post",
+            "post",
+            &chrome(&["common.create", "post.index.title", "post.never.defined"]),
+        );
+        assert!(!out.contains("post.never.defined"), "{out}");
     }
 
     #[test]

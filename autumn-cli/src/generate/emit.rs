@@ -420,12 +420,14 @@ fn remove_i18n_keys(
     // is the one failure mode this set exists to prevent. `autumn i18n check`
     // reads the whole tree for the same reason.
     let scan = scan_surviving_sources(project_root, excluding, overrides);
-    let mut surviving_chrome: HashSet<String> = scan
-        .referenced
-        .iter()
-        .filter(|key| key.starts_with("common."))
-        .cloned()
-        .collect();
+    // Every key the surviving tree references, NOT just the `common.*` ones.
+    // The resource's own keys are ordinary Fluent keys too, and hand-written
+    // code reaches for them: a dashboard card or a nav link labelled
+    // `t!(locale, "post.index.title")` outlives `src/routes/post.rs`. Deleting
+    // the whole marked `post.*` block out from under it breaks the build at
+    // COMPILE time — the exact failure this set exists to prevent — and the
+    // `common.` prefix was never what made a call site live.
+    let mut surviving: HashSet<String> = scan.referenced.iter().cloned().collect();
 
     // A key built at runtime — `locale.t(&format!("common.{action}"))`, or a
     // bare `locale.t(key)` — names no key a static scan can record, so
@@ -437,10 +439,9 @@ fn remove_i18n_keys(
     // complain about. `key_prefix` is the leading literal, empty meaning "could
     // be any key", so `starts_with` covers both.
     if !scan.dynamic.is_empty() {
-        surviving_chrome.extend(
+        surviving.extend(
             super::scaffold_i18n::defined_keys(content)
                 .into_keys()
-                .filter(|key| key.starts_with("common."))
                 .filter(|key| {
                     scan.dynamic
                         .iter()
@@ -448,16 +449,18 @@ fn remove_i18n_keys(
                 }),
         );
     }
-    super::scaffold_i18n::remove_en_ftl_keys(content, pascal, snake, &surviving_chrome)
+    super::scaffold_i18n::remove_en_ftl_keys(content, pascal, snake, &surviving)
 }
 
-/// Every `common.*` key still referenced by surviving project source.
+/// Every key still referenced by surviving project source.
 ///
-/// The SET, not a yes/no: chrome keys are per-surface, so a resource can be the
-/// only user of some of them. Destroying a `--soft-delete` resource while a
-/// plain one survives leaves `common.trash`/`restore`/`purge` referenced by
-/// nothing, and `autumn i18n check --strict` fails on exactly that — while
-/// `common.create`/`save`/… are still very much in use and must stay.
+/// The SET, not a yes/no, and per KEY rather than per block: chrome keys are
+/// per-surface, so a resource can be the only user of some of them. Destroying
+/// a `--soft-delete` resource while a plain one survives leaves
+/// `common.trash`/`restore`/`purge` referenced by nothing, and `autumn i18n
+/// check --strict` fails on exactly that — while `common.create`/`save`/… are
+/// still very much in use and must stay. A resource's own keys work the same
+/// way once hand-written code outside the module reaches for one.
 ///
 /// Parsing is delegated to [`crate::i18n::scan_source`], the `syn`-based
 /// scanner behind `autumn i18n check`. That is the authority this set has to
@@ -1939,6 +1942,46 @@ mod tests {
         assert!(
             found.contains("common.save"),
             "a non-route caller keeps the key alive: {found:?}"
+        );
+    }
+
+    /// The same protection the chrome set gives `common.*`, for the resource's
+    /// own keys. A nav link or dashboard card outside the generated module can
+    /// render `t!(locale, "post.index.title")`; destroying the marked `post.*`
+    /// block out from under it breaks the build, because `t!` validates key
+    /// existence at COMPILE time.
+    #[test]
+    fn a_resource_key_a_surviving_source_still_uses_is_not_destroyed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("components")).unwrap();
+        std::fs::write(
+            src.join("components").join("nav.rs"),
+            "fn nav(locale: &Locale) -> Markup { html! { (t!(locale, \"post.index.title\")) } }\n",
+        )
+        .unwrap();
+
+        let ftl = super::super::scaffold_i18n::merge_en_ftl(
+            "",
+            "Post",
+            "post",
+            &[
+                ("post.index.title", "Posts"),
+                ("post.new.title", "New Post"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        );
+
+        let out = remove_i18n_keys(&ftl, "Post", "post", &src, &[], &HashMap::new());
+        assert!(
+            out.contains("post.index.title = Posts"),
+            "the surviving call site keeps its key:\n{out}"
+        );
+        assert!(
+            !out.contains("post.new.title"),
+            "keys nothing references still go:\n{out}"
         );
     }
 
