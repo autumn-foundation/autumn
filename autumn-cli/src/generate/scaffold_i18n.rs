@@ -1011,31 +1011,49 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
     let embedded_in_production = real_offsets(main_rs, "EMBEDDED_LOCALES")
         .into_iter()
         .any(|at| !in_cfg_test(main_rs, at));
+    // The static ALONE is not the setup. `embed_locales!` bakes the files into
+    // the binary; `.embedded_locales(&EMBEDDED_LOCALES)` is what makes the app
+    // read them. With the first present and the second missing, an
+    // `autumn build --embed` carries the bundle and never loads it — so a
+    // deployment without the sidecar directory falls through to `.i18n_auto()`
+    // and panics, having been told embedding was configured. Both halves are
+    // required before this is treated as done, and a missing half is added.
+    let installed_in_production = real_offsets(main_rs, ".embedded_locales(&EMBEDDED_LOCALES)")
+        .into_iter()
+        .any(|at| !in_cfg_test(main_rs, at));
+
     if embedded_in_production {
         // Already embedded — but not necessarily from the right place. A
         // project that changed `[i18n] dir` after its first `--i18n` scaffold
         // keeps embedding the OLD directory while the keys, the Docker `COPY`,
         // and the runtime load all move to the new one, so an `--embed` build
         // ships a bundle the app never reads. Repoint it.
-        if real_offsets(main_rs, &macro_call)
+        let pointed_at_the_right_dir = real_offsets(main_rs, &macro_call)
             .into_iter()
-            .any(|at| !in_cfg_test(main_rs, at))
+            .any(|at| !in_cfg_test(main_rs, at));
+        // No `embed_locales!` at all: someone hand-rolled the static. The macro
+        // is left alone in that case — but the install below is still checked.
+        let mut out = if !pointed_at_the_right_dir
+            && let Some(call_at) = real_offsets(main_rs, "autumn_web::embed_locales!")
+                .into_iter()
+                .find(|&at| !in_cfg_test(main_rs, at))
         {
-            return Some(main_rs.to_owned());
-        }
-        let Some(call_at) = real_offsets(main_rs, "autumn_web::embed_locales!")
-            .into_iter()
-            .find(|&at| !in_cfg_test(main_rs, at))
-        else {
-            // Someone hand-rolled the static; leave it entirely alone.
-            return Some(main_rs.to_owned());
+            let end = main_rs[call_at..].find(';')? + call_at;
+            format!("{}{macro_call}{}", &main_rs[..call_at], &main_rs[end..])
+        } else {
+            main_rs.to_owned()
         };
-        let end = main_rs[call_at..].find(';')? + call_at;
-        return Some(format!(
-            "{}{macro_call}{}",
-            &main_rs[..call_at],
-            &main_rs[end..]
-        ));
+        if !installed_in_production && out.contains(INSTALL_ANCHOR) {
+            out = out.replacen(
+                INSTALL_ANCHOR,
+                &format!(
+                    "{INSTALL_ANCHOR}    #[cfg(feature = \"embed-assets\")]\n\
+                     \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n"
+                ),
+                1,
+            );
+        }
+        return Some(out);
     }
     if !main_rs.contains(STATIC_ANCHOR) || !main_rs.contains(INSTALL_ANCHOR) {
         return None;
@@ -1742,8 +1760,57 @@ fn chain_has_custom_bundle(src: &str, at: usize) -> bool {
 }
 
 /// Start of the statement the call at `at` belongs to.
+///
+/// Balanced-delimiter aware, and reading only REAL code. A raw `rfind` for the
+/// previous `;` or `{` stops inside anything nested between the chain's start
+/// and this call — `.layer(from_fn(|req, next| async move { … }))` is ordinary
+/// middleware, and its closing brace looked like the statement boundary. That
+/// truncated chain hid an earlier `.i18n(...)`, so `.i18n_auto()` was inserted
+/// into a chain that already had a bundle and CLEARED it.
 fn chain_start(src: &str, at: usize) -> usize {
-    src[..at].rfind([';', '{']).map_or(0, |i| i + 1)
+    // Real-code delimiter positions, so a `;` or brace inside a string or
+    // comment is not mistaken for structure.
+    let mut marks: Vec<(usize, u8)> = Vec::new();
+    for (needle, byte) in [
+        (";", b';'),
+        ("{", b'{'),
+        ("}", b'}'),
+        ("(", b'('),
+        (")", b')'),
+        ("[", b'['),
+        ("]", b']'),
+    ] {
+        marks.extend(
+            real_offsets(&src[..at], needle)
+                .into_iter()
+                .map(|o| (o, byte)),
+        );
+    }
+    marks.sort_unstable();
+
+    let mut depth = 0usize;
+    for &(offset, byte) in marks.iter().rev() {
+        match byte {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' => {
+                // An unmatched opener encloses this call: the chain begins just
+                // inside it (an argument position, e.g. `foo(App::new()…)`).
+                let Some(next) = depth.checked_sub(1) else {
+                    return offset + 1;
+                };
+                depth = next;
+            }
+            b'{' => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return offset + 1;
+                };
+                depth = next;
+            }
+            b';' if depth == 0 => return offset + 1,
+            _ => {}
+        }
+    }
+    0
 }
 
 #[cfg(test)]
@@ -2650,6 +2717,53 @@ mod tests {
         // and must still read as already-wired rather than as a custom bundle.
         let wired = "fn main() {\n    let app = App::new()\n        .i18n_auto()\n        .routes(routes![index]);\n}\n";
         assert!(matches!(ensure_i18n_auto(wired), I18nAutoWiring::Wired(_)));
+    }
+
+    /// `embed_locales!` bakes the files in; `.embedded_locales(&…)` is what
+    /// makes the app read them. With the static present and the install
+    /// missing, an `--embed` build carries the bundle and never loads it — and
+    /// then panics on a host with no sidecar directory, having reported the
+    /// setup as complete.
+    #[test]
+    fn a_static_without_its_install_is_not_complete() {
+        let main_rs = concat!(
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "#[cfg(feature = \"embed-assets\")]\n",
+            "static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+        );
+        let out = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
+        assert!(
+            out.contains(".embedded_locales(&EMBEDDED_LOCALES)"),
+            "the missing install must be added:\n{out}"
+        );
+        // And a complete setup is left exactly as it is.
+        assert_eq!(
+            ensure_embedded_locales(&out, "i18n").as_deref(),
+            Some(out.as_str()),
+            "must be idempotent"
+        );
+    }
+
+    /// A nested block between `.i18n(...)` and `.routes(...)` is ordinary
+    /// middleware. Reading its closing brace as the statement boundary hid the
+    /// custom bundle, and `.i18n_auto()` was then inserted into that chain —
+    /// which CLEARS the bundle it was hiding.
+    #[test]
+    fn a_nested_block_does_not_truncate_the_chain() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = App::new()\n",
+            "        .i18n(tms_bundle())\n",
+            "        .layer(from_fn(|req, next| async move { next.run(req).await }))\n",
+            "        .routes(routes![index]);\n",
+            "}\n",
+        );
+        assert_eq!(
+            ensure_i18n_auto(main_rs),
+            I18nAutoWiring::CustomBundle,
+            "the earlier `.i18n(...)` must still be visible past the closure"
+        );
     }
 
     /// A `dir` with whitespace is a legal path, and the shell `COPY` form
