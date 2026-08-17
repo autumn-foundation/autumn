@@ -2010,7 +2010,7 @@ mod tests {
         )
         .unwrap();
 
-        let ftl = super::super::scaffold_i18n::merge_en_ftl(
+        let ftl = super::super::scaffold_i18n::merge_en_ftl_keeping(
             "",
             "Post",
             "post",
@@ -2021,6 +2021,7 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect(),
+            &HashSet::new(),
         );
 
         let out = remove_i18n_keys(&ftl, "Post", "post", &src, &[], &HashMap::new());

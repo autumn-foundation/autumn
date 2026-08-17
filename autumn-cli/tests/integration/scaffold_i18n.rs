@@ -775,6 +775,51 @@ fn regenerating_keeps_a_dropped_field_key_hand_written_code_still_calls() {
 }
 
 #[test]
+fn a_workspace_parents_cargo_config_selects_the_validator_bundle() {
+    // Cargo reads `.cargo/config[.toml]` from the directory and every ancestor.
+    // A generated app nested in a workspace usually carries no `.cargo` of its
+    // own and inherits the root's, so reading only the app's directory takes a
+    // locale cargo never applies and keeps the wrong bundle in step.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace = tmp.path();
+    fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        "[env]\nAUTUMN_I18N_DEFAULT_LOCALE = \"de\"\n",
+    )
+    .unwrap();
+
+    run_autumn_ok(workspace, &["new", "nested-app"]);
+    let project = workspace.join("nested-app");
+    fs::create_dir_all(project.join("i18n")).unwrap();
+    fs::write(project.join("i18n/de.ftl"), "welcome.title = Willkommen\n").unwrap();
+    fs::write(project.join("i18n/en.ftl"), "welcome.title = Welcome\n").unwrap();
+    let autumn_toml = project.join("autumn.toml");
+    let config = fs::read_to_string(&autumn_toml).unwrap();
+    fs::write(
+        &autumn_toml,
+        format!("{config}\n[i18n]\ndefault_locale = \"fr\"\nsupported_locales = [\"fr\"]\n"),
+    )
+    .unwrap();
+
+    run_autumn_ok(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "--i18n"],
+    );
+
+    let de = fs::read_to_string(project.join("i18n/de.ftl")).unwrap();
+    let en = fs::read_to_string(project.join("i18n/en.ftl")).unwrap();
+    assert!(
+        de.contains("post.new = New Post"),
+        "the workspace config selects the validator bundle:\n{de}"
+    );
+    assert!(
+        !en.contains("post.new"),
+        "`en.ftl` is not what this build validates against:\n{en}"
+    );
+}
+
+#[test]
 fn the_extensionless_cargo_config_wins_as_cargo_says_it_does() {
     // With both present cargo warns "both `…/config` and `…/config.toml`
     // exist. Using `…/config`" and applies the extensionless one. Reading the

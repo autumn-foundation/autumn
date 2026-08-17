@@ -16,7 +16,7 @@
 //!   not a property some test has to keep re-checking: with the flag off this
 //!   type is a `str -> str` identity function.
 //! * **`--i18n` on** — a `t!(locale, "key")` lookup, and the key/English pair is
-//!   recorded so [`merge_en_ftl`] can back-fill `i18n/en.ftl` with exactly the
+//!   recorded so [`merge_en_ftl_keeping`] can back-fill `i18n/en.ftl` with exactly the
 //!   keys the views reference. That matters beyond tidiness: `t!` validates key
 //!   existence *at compile time*, so a key the generator references but does not
 //!   define is a `compile_error!` in the user's app, not a runtime miss.
@@ -251,29 +251,13 @@ pub(super) fn defined_keys(src: &str) -> BTreeMap<String, String> {
 ///
 /// Returns `existing` unchanged when every key is already defined, so the
 /// generator can skip the write and leave the file out of the plan.
+/// Back-fill a bundle with the keys a render referenced, reconciling the
+/// resource's block against them.
 ///
-/// TEST-ONLY. Every production path reaches [`merge_en_ftl_keeping`] with a set
-/// scanned from the project, because reconciliation prunes and pruning a key a
-/// live call site still names breaks the build at COMPILE time. A convenience
-/// entry point that quietly passes no such set is exactly how one of the two
-/// merge sites came to be missing it.
-#[cfg(test)]
-pub(super) fn merge_en_ftl(
-    existing: &str,
-    pascal_name: &str,
-    resource: &str,
-    keys: &BTreeMap<String, String>,
-) -> String {
-    merge_en_ftl_keeping(
-        existing,
-        pascal_name,
-        resource,
-        keys,
-        &std::collections::HashSet::new(),
-    )
-}
-
-/// [`merge_en_ftl`] with a set of keys the reconciliation must not prune.
+/// Takes the set of keys a live call site still names, ALWAYS. Reconciliation
+/// prunes, and pruning a key some surviving code still looks up breaks the
+/// build at COMPILE time; a convenience entry point that quietly passed no
+/// such set is exactly how one of the two merge sites came to be missing it.
 ///
 /// Regeneration reconciles the resource block against the keys the NEW render
 /// emits, which is how a dropped field or flag stops leaving orphans behind.
@@ -517,7 +501,7 @@ fn reconcile_block(
 /// chrome block and a resource's own.
 ///
 /// The block runs from its header to the first blank line or foreign comment —
-/// the same shape [`merge_en_ftl`] writes.
+/// the same shape [`merge_en_ftl_keeping`] writes.
 fn block_end(existing: &str, header: &str) -> Option<usize> {
     let start = existing.find(header)?;
     let mut cursor = start + header.len();
@@ -545,7 +529,7 @@ fn block_end(existing: &str, header: &str) -> Option<usize> {
     Some(end)
 }
 
-/// Inverse of [`merge_en_ftl`] for `autumn destroy scaffold` — remove one
+/// Inverse of [`merge_en_ftl_keeping`] for `autumn destroy scaffold` — remove one
 /// resource's block (its marked comment plus every `<resource>.` key) from
 /// `existing`.
 ///
@@ -1080,27 +1064,78 @@ impl MacroEnv {
     /// needs on EVERY build realistically lives, and which this process does
     /// not otherwise inherit.
     ///
-    /// Only the project's own config is read. Ancestor directories and
-    /// `$CARGO_HOME` can also carry one, but those are outside the tree being
-    /// generated into and nothing here can see which of them cargo would pick.
+    /// The WHOLE hierarchy cargo reads, not just the project's own file: an app
+    /// generated inside a workspace usually inherits its build settings from
+    /// the workspace root, and reading only `<project>/.cargo` there takes a
+    /// locale cargo never applies and keeps the wrong bundle in step.
     pub(super) fn resolve(project_root: &Path) -> Self {
-        // EXTENSIONLESS FIRST. With both present cargo warns "both `…/config`
-        // and `…/config.toml` exist. Using `…/config`" and applies the
-        // extensionless one, for backwards compatibility. Reading the other
-        // would take a `default_locale` cargo never applies, and the scaffold
-        // would then keep the wrong bundle in step — leaving the one `t!`
-        // actually opens without the generated keys.
-        let config = ["config", "config.toml"]
-            .into_iter()
-            .find_map(|name| std::fs::read_to_string(project_root.join(".cargo").join(name)).ok())
-            .unwrap_or_default();
-        let configured = cargo_config_env(&config, project_root);
+        let mut configured: BTreeMap<String, (String, bool)> = BTreeMap::new();
+        for (base, path) in cargo_config_files(project_root) {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // NEAREST FIRST, so an entry already seen keeps its value: cargo
+            // merges the chain with the closer file winning.
+            for (name, entry) in cargo_config_env(&text, &base) {
+                configured.entry(name).or_insert(entry);
+            }
+        }
         let read = |name: &str| layer_cargo_env(configured.get(name), std::env::var(name).ok());
         Self {
             file: read("AUTUMN_I18N_FILE"),
             default_locale: read("AUTUMN_I18N_DEFAULT_LOCALE"),
         }
     }
+}
+
+/// The cargo config files that apply to a build run in `project_root`, nearest
+/// first, as `(base directory for `relative` entries, file)`.
+///
+/// Cargo's hierarchical structure: `.cargo/config[.toml]` in the directory and
+/// each ancestor, then `$CARGO_HOME`'s own. Walking it is the point — a
+/// generated app nested in a workspace typically carries no `.cargo` of its
+/// own and inherits the root's.
+fn cargo_config_files(project_root: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let mut out: Vec<(PathBuf, PathBuf)> = project_root
+        .ancestors()
+        .filter_map(|dir| {
+            cargo_config_in(&dir.join(".cargo")).map(|path| (dir.to_path_buf(), path))
+        })
+        .collect();
+    // `$CARGO_HOME/config[.toml]` is consulted last, so it loses to every file
+    // above. Its own `relative` entries resolve against the directory holding
+    // it, the same rule the rest of the chain follows.
+    if let Some(home) = cargo_home()
+        && let Some(path) = cargo_config_in(&home)
+    {
+        let base = home.parent().unwrap_or(&home).to_path_buf();
+        if !out.iter().any(|(_, existing)| *existing == path) {
+            out.push((base, path));
+        }
+    }
+    out
+}
+
+/// The config file in one `.cargo` directory, if any.
+///
+/// EXTENSIONLESS FIRST. With both present cargo warns "both `…/config` and
+/// `…/config.toml` exist. Using `…/config`" and applies the extensionless one
+/// for backwards compatibility.
+fn cargo_config_in(dir: &Path) -> Option<PathBuf> {
+    ["config", "config.toml"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+}
+
+/// `$CARGO_HOME`, or the conventional `~/.cargo` when it is unset.
+fn cargo_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("CARGO_HOME") {
+        return Some(PathBuf::from(home));
+    }
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| PathBuf::from(home).join(".cargo"))
 }
 
 /// One variable's value as cargo would set it: a config entry applies only when
@@ -1116,13 +1151,14 @@ fn layer_cargo_env(
     }
 }
 
-/// The `[env]` table of a `.cargo/config.toml`, as `name -> (value, force)`.
+/// The `[env]` table of one cargo config file, as `name -> (value, force)`.
 ///
 /// An entry is either a bare string or a table carrying `value` plus the
 /// optional `force` and `relative` flags; `relative` makes the value a path
-/// resolved against the directory holding `.cargo`, which is what cargo itself
-/// does.
-fn cargo_config_env(config: &str, project_root: &Path) -> BTreeMap<String, (String, bool)> {
+/// resolved against `base` — the directory holding this file's `.cargo`, which
+/// is the rule cargo itself follows, and which differs per file once the whole
+/// ancestor chain is read.
+fn cargo_config_env(config: &str, base: &Path) -> BTreeMap<String, (String, bool)> {
     let Ok(table) = config.parse::<toml::Table>() else {
         return BTreeMap::new();
     };
@@ -1141,7 +1177,7 @@ fn cargo_config_env(config: &str, project_root: &Path) -> BTreeMap<String, (Stri
                 _ => return None,
             };
             let value = if relative {
-                project_root.join(value).to_string_lossy().into_owned()
+                base.join(value).to_string_lossy().into_owned()
             } else {
                 value
             };
@@ -2440,6 +2476,17 @@ mod tests {
 
     use super::*;
 
+    /// [`merge_en_ftl_keeping`] with nothing held back — the shape most of
+    /// these tests want, where no surviving source is in play.
+    fn merge_en_ftl(
+        existing: &str,
+        pascal_name: &str,
+        resource: &str,
+        keys: &BTreeMap<String, String>,
+    ) -> String {
+        merge_en_ftl_keeping(existing, pascal_name, resource, keys, &HashSet::new())
+    }
+
     fn chrome(keys: &[&str]) -> HashSet<String> {
         keys.iter().map(|k| (*k).to_owned()).collect()
     }
@@ -3557,6 +3604,64 @@ mod tests {
         // An unparseable or table-less config is simply nothing to layer.
         assert!(cargo_config_env("not = [toml", root).is_empty());
         assert!(cargo_config_env("[build]\njobs = 2\n", root).is_empty());
+    }
+
+    /// Cargo reads `.cargo/config[.toml]` from the directory and every
+    /// ancestor, merging with the nearer file winning. A generated app nested
+    /// in a workspace usually has no `.cargo` of its own and inherits the
+    /// root's, so reading only its own directory takes a locale cargo never
+    /// applies.
+    #[test]
+    fn the_cargo_config_chain_is_walked_nearest_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let app = workspace.join("apps").join("web");
+        std::fs::create_dir_all(app.join(".cargo")).unwrap();
+        std::fs::create_dir_all(workspace.join(".cargo")).unwrap();
+        std::fs::write(
+            workspace.join(".cargo").join("config.toml"),
+            "[env]\nAUTUMN_I18N_DEFAULT_LOCALE = \"de\"\n\
+             AUTUMN_I18N_FILE = { value = \"root.ftl\", relative = true }\n",
+        )
+        .unwrap();
+
+        // Inherited from the workspace root when the app carries nothing.
+        let files = cargo_config_files(&app);
+        assert!(
+            files.iter().any(|(base, path)| base == workspace
+                && path == &workspace.join(".cargo").join("config.toml")),
+            "the workspace config applies to the app: {files:?}"
+        );
+
+        // And the nearer file wins where both name the same variable.
+        std::fs::write(
+            app.join(".cargo").join("config.toml"),
+            "[env]\nAUTUMN_I18N_DEFAULT_LOCALE = \"es\"\n",
+        )
+        .unwrap();
+        let mut merged: BTreeMap<String, (String, bool)> = BTreeMap::new();
+        for (base, path) in cargo_config_files(&app) {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (name, entry) in cargo_config_env(&text, &base) {
+                merged.entry(name).or_insert(entry);
+            }
+        }
+        assert_eq!(
+            merged.get("AUTUMN_I18N_DEFAULT_LOCALE"),
+            Some(&("es".to_owned(), false)),
+            "nearest wins"
+        );
+        assert_eq!(
+            merged.get("AUTUMN_I18N_FILE"),
+            Some(&(
+                workspace.join("root.ftl").to_string_lossy().into_owned(),
+                false
+            )),
+            "an unshadowed entry still comes through, and a `relative` one \
+             resolves against ITS OWN base — the workspace, not the app"
+        );
     }
 
     /// Cargo's precedence: the process wins unless the entry says `force`.
