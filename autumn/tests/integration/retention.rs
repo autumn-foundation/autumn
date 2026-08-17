@@ -361,6 +361,7 @@ async fn retention_age_based_hard_delete_sweeps_stale_rows_in_batches() {
         .expect("sweep should succeed");
 
     assert_eq!(report.model, "RtSession");
+    assert_eq!(report.table, "rt_sessions");
     assert_eq!(report.rows_swept, 5);
     assert!(!report.dry_run);
 

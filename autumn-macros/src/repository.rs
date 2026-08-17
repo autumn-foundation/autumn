@@ -660,6 +660,18 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                  yourself from a hand-written #[scheduled] sweep for now",
             ));
         }
+        if hooks_type.is_some() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support hooks = Type yet: the sweep mutates rows \
+                 directly and does not run the hook-aware delete path delete_by_id/delete_many \
+                 use, so a before_delete hook that rejects deletion (e.g. a published-record \
+                 guard) cannot protect a row from the scheduled sweep, and post-delete side \
+                 effects never run. Remove `hooks = Type`, or call \
+                 delete_many(ids)/delete_by_id(id) yourself from a hand-written #[scheduled] \
+                 sweep for now",
+            ));
+        }
     }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
     let generated_internal_hooks = false;
@@ -11665,6 +11677,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     state.monotonic().saturating_duration_since(__started).as_millis() as u64;
                 Ok(::autumn_web::retention::RetentionSweepReport {
                     model: #model_name_str.to_string(),
+                    table: #table_name.to_string(),
                     rows_swept,
                     duration_ms,
                     dry_run,
@@ -22230,6 +22243,27 @@ mod tests {
     }
 
     #[test]
+    fn retention_rejects_hooks() {
+        // Regression (#1342 review round 5): the sweep mutates rows
+        // directly and does not run the hook-aware delete path
+        // delete_by_id/delete_many use, so a before_delete hook that
+        // rejects deletion (e.g. a published-record guard) cannot protect
+        // a row from the scheduled sweep, and post-delete side effects
+        // never run. Reject rather than silently skip hooks.
+        let tokens: proc_macro2::TokenStream =
+            "Post, hooks = PostHooks, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + hooks = Type must be rejected");
+        };
+        assert!(
+            error.to_string().contains("hooks"),
+            "retention + hooks = Type must be rejected: {error}"
+        );
+    }
+
+    #[test]
     fn retention_rejects_dependent() {
         // Regression (#1342 review): the sweep mutates rows directly and
         // does not run the cascade-aware delete path dependent(...)
@@ -22397,6 +22431,25 @@ mod tests {
         let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
         let config = parse_repo_args(tokens).unwrap();
         assert!(config.retention.is_none());
+    }
+
+    #[test]
+    fn repository_macro_retention_report_carries_table_identity() {
+        // Regression (#1342 review round 5): descriptor filtering was
+        // disambiguated by table (round 4), but the generated report still
+        // only carried `model` — an unfiltered dry run on two same-named
+        // models would print indistinguishable rows and merge their
+        // metrics. The report (and the metrics label) must carry `table`
+        // too.
+        let generated = repository_macro(
+            quote! { Post, table = "custom_posts_table", retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("table : \"custom_posts_table\" . to_string ()"),
+            "generated RetentionSweepReport must carry the table name: {generated}"
+        );
     }
 
     #[test]

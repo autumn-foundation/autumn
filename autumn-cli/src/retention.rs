@@ -38,6 +38,10 @@ pub struct RetentionOptions<'a> {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetentionSweepReport {
     pub model: String,
+    /// Schema-unique, unlike `model` — two modules can declare same-named
+    /// models, each with its own policy, so this is what tells their rows
+    /// apart in an unfiltered report.
+    pub table: String,
     pub rows_swept: u64,
     pub duration_ms: u64,
 }
@@ -94,16 +98,19 @@ pub fn run(opts: &RetentionOptions<'_>) {
     print!("{}", format_retention_report(&reports));
 }
 
-/// Render a dry-run report as a fixed-width table, sorted by model name (the
-/// app already sorts its JSON, but formatting is defensive against a future
-/// caller feeding in unsorted data).
+/// Render a dry-run report as a fixed-width table, sorted by model name then
+/// table name (the app already sorts its JSON, but formatting is defensive
+/// against a future caller feeding in unsorted data). The table-name column
+/// is what keeps two same-named models in different modules distinguishable
+/// in an unfiltered report — see `--model`'s help for disambiguating a
+/// filtered one.
 pub fn format_retention_report(reports: &[RetentionSweepReport]) -> String {
     if reports.is_empty() {
         return "No retention(...) policies are registered.\n".to_string();
     }
 
     let mut sorted: Vec<&RetentionSweepReport> = reports.iter().collect();
-    sorted.sort_by(|a, b| a.model.cmp(&b.model));
+    sorted.sort_by(|a, b| a.model.cmp(&b.model).then_with(|| a.table.cmp(&b.table)));
 
     let model_width = sorted
         .iter()
@@ -111,22 +118,28 @@ pub fn format_retention_report(reports: &[RetentionSweepReport]) -> String {
         .max()
         .unwrap_or("Model".len())
         .max("Model".len());
+    let table_width = sorted
+        .iter()
+        .map(|r| r.table.len())
+        .max()
+        .unwrap_or("Table".len())
+        .max("Table".len());
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<model_width$}  Rows that would be swept  Duration (ms)",
-        "Model"
+        "{:<model_width$}  {:<table_width$}  Rows that would be swept  Duration (ms)",
+        "Model", "Table"
     );
     let _ = writeln!(
         out,
-        "{:-<model_width$}  ------------------------  -------------",
-        ""
+        "{:-<model_width$}  {:-<table_width$}  ------------------------  -------------",
+        "", ""
     );
     for report in &sorted {
         let _ = writeln!(
             out,
-            "{:<model_width$}  {:<24}  {}",
-            report.model, report.rows_swept, report.duration_ms
+            "{:<model_width$}  {:<table_width$}  {:<24}  {}",
+            report.model, report.table, report.rows_swept, report.duration_ms
         );
     }
     out
@@ -140,11 +153,13 @@ mod tests {
     fn format_retention_report_includes_model_and_row_count() {
         let table = format_retention_report(&[RetentionSweepReport {
             model: "Widget".to_string(),
+            table: "widgets".to_string(),
             rows_swept: 42,
             duration_ms: 7,
         }]);
 
         assert!(table.contains("Widget"));
+        assert!(table.contains("widgets"));
         assert!(table.contains("42"));
     }
 
@@ -153,11 +168,13 @@ mod tests {
         let table = format_retention_report(&[
             RetentionSweepReport {
                 model: "Zeta".to_string(),
+                table: "zetas".to_string(),
                 rows_swept: 1,
                 duration_ms: 1,
             },
             RetentionSweepReport {
                 model: "Alpha".to_string(),
+                table: "alphas".to_string(),
                 rows_swept: 2,
                 duration_ms: 2,
             },
@@ -166,6 +183,30 @@ mod tests {
         let alpha_pos = table.find("Alpha").expect("Alpha present");
         let zeta_pos = table.find("Zeta").expect("Zeta present");
         assert!(alpha_pos < zeta_pos, "Alpha must sort before Zeta: {table}");
+    }
+
+    #[test]
+    fn format_retention_report_disambiguates_same_model_name_by_table() {
+        // Regression (#1342 review round 5): two policies can share a model
+        // name (same-named model in different modules); the table column is
+        // what keeps their rows distinguishable in an unfiltered report.
+        let table = format_retention_report(&[
+            RetentionSweepReport {
+                model: "Session".to_string(),
+                table: "admin_sessions".to_string(),
+                rows_swept: 1,
+                duration_ms: 1,
+            },
+            RetentionSweepReport {
+                model: "Session".to_string(),
+                table: "auth_sessions".to_string(),
+                rows_swept: 2,
+                duration_ms: 2,
+            },
+        ]);
+
+        assert!(table.contains("admin_sessions"));
+        assert!(table.contains("auth_sessions"));
     }
 
     #[test]

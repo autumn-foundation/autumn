@@ -25,7 +25,15 @@ use crate::task::TaskInfo;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RetentionSweepReport {
     /// The model name the policy is declared on.
+    ///
+    /// Not globally unique — see [`table`](Self::table), which is.
     pub model: String,
+    /// The table the policy's model is backed by. Schema-unique, unlike
+    /// `model`, so two same-named models in different modules
+    /// (`auth::Session`, `admin::Session`) still print as distinguishable
+    /// rows in an unfiltered `autumn retention --dry-run` and label distinct
+    /// `retention_sweep_*` metric series instead of merging into one.
+    pub table: String,
     /// Rows deleted (or, for a dry run, rows that *would* be deleted).
     pub rows_swept: u64,
     /// Wall-clock time the sweep took, in milliseconds.
@@ -104,8 +112,9 @@ pub fn has_retention_descriptors() -> bool {
 /// task name, `retention-sweep-<table_name>`) to disambiguate; an ambiguous
 /// `model_name` filter errors rather than silently running every match.
 ///
-/// Reports are sorted by model name so `autumn retention --dry-run` prints a
-/// stable order.
+/// Reports are sorted by model name, then table name, so `autumn retention
+/// --dry-run` prints a stable order even when two policies share a model
+/// name.
 ///
 /// # Errors
 ///
@@ -141,21 +150,26 @@ pub async fn run_retention_dry_run(
             reports.push((descriptor.dry_run)(state.clone()).await?);
         }
     }
-    reports.sort_by(|a, b| a.model.cmp(&b.model));
+    reports.sort_by(|a, b| a.model.cmp(&b.model).then_with(|| a.table.cmp(&b.table)));
     Ok(reports)
 }
 
-/// Emit the structured `{model, rows_swept, duration_ms}` log line for a run.
+/// Emit the structured `{model, table, rows_swept, duration_ms}` log line for
+/// a run.
 ///
 /// For real (non-dry-run) sweeps, also bumps the `retention_sweep_rows_total`
 /// counter and `retention_sweep_duration_seconds` timer, both labeled by
-/// `model`. The timer is named `*_seconds` and records seconds — the
-/// framework's own Prometheus convention (see `autumn_web::metrics`) — even
-/// though the log line and [`RetentionSweepReport`] use milliseconds, which
-/// is what AC7 (issue #1342) names.
+/// `model` *and* `table` — the table label is what keeps two same-named
+/// models in different modules (`auth::Session`, `admin::Session`) from
+/// merging into one metric series. The timer is named `*_seconds` and
+/// records seconds — the framework's own Prometheus convention (see
+/// `autumn_web::metrics`) — even though the log line and
+/// [`RetentionSweepReport`] use milliseconds, which is what AC7 (issue
+/// #1342) names.
 pub fn log_retention_sweep(report: &RetentionSweepReport) {
     tracing::info!(
         model = %report.model,
+        table = %report.table,
         rows_swept = report.rows_swept,
         duration_ms = report.duration_ms,
         dry_run = report.dry_run,
@@ -164,9 +178,11 @@ pub fn log_retention_sweep(report: &RetentionSweepReport) {
     if !report.dry_run {
         crate::metrics::counter("retention_sweep_rows_total")
             .with_label("model", report.model.clone())
+            .with_label("table", report.table.clone())
             .increment(report.rows_swept);
         crate::metrics::timer("retention_sweep_duration_seconds")
             .with_label("model", report.model.clone())
+            .with_label("table", report.table.clone())
             .record(std::time::Duration::from_millis(report.duration_ms));
     }
 }
@@ -181,6 +197,7 @@ mod tests {
         Box::pin(async {
             Ok(RetentionSweepReport {
                 model: "Widget".to_string(),
+                table: "widgets".to_string(),
                 rows_swept: 3,
                 duration_ms: 5,
                 dry_run: true,
@@ -201,6 +218,7 @@ mod tests {
     fn report_serializes_with_expected_fields() {
         let report = RetentionSweepReport {
             model: "Widget".to_string(),
+            table: "widgets".to_string(),
             rows_swept: 42,
             duration_ms: 7,
             dry_run: false,
@@ -208,6 +226,7 @@ mod tests {
 
         let json = serde_json::to_value(&report).expect("report should serialize");
         assert_eq!(json["model"], "Widget");
+        assert_eq!(json["table"], "widgets");
         assert_eq!(json["rows_swept"], 42);
         assert_eq!(json["duration_ms"], 7);
         assert_eq!(json["dry_run"], false);
