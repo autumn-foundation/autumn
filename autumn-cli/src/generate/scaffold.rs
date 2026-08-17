@@ -200,7 +200,7 @@ fn layout_param_counts(main_src: &str) -> Vec<usize> {
 }
 
 /// Whether a raw string literal begins at `start` (`r"`, `r#"`, `br"`, …).
-fn is_raw_string_start(bytes: &[u8], start: usize) -> bool {
+pub(super) fn is_raw_string_start(bytes: &[u8], start: usize) -> bool {
     let mut i = start;
     if bytes.get(i) == Some(&b'b') {
         i += 1;
@@ -218,7 +218,7 @@ fn is_raw_string_start(bytes: &[u8], start: usize) -> bool {
 /// Advance past a raw string literal beginning at `start`, matching the opening
 /// hash count. Returns the index just past the closing delimiter (or the end of
 /// input if the literal is unterminated).
-fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
+pub(super) fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
     if bytes.get(i) == Some(&b'b') {
         i += 1;
@@ -521,6 +521,22 @@ fn plan_scaffold_with_options_impl(
                  `{variant}` to get translatable views, or drop `--i18n` to keep the \
                  English-only scaffold."
             )));
+        }
+        // A resource named `Common` would key its labels under `common.*` — the
+        // same namespace the shared chrome block owns. Its keys would be written
+        // into both blocks, and `destroy`ing it would strip the chrome every
+        // OTHER resource is still referencing, so those resources stop
+        // compiling (`t!` validates key existence at compile time). Refuse the
+        // name rather than emit a bundle that breaks its neighbours.
+        if snake(name) == "common" {
+            return Err(GenerateError::Config(
+                "`--i18n` cannot scaffold a resource named `Common`: its translation keys would \
+                 land under `common.*`, the namespace reserved for the shared chrome every \
+                 scaffolded resource reuses — destroying it later would take that chrome down \
+                 with it and break every other `--i18n` resource. Rename the resource (e.g. \
+                 `CommonSetting`), or drop `--i18n`."
+                    .to_owned(),
+            ));
         }
     }
     // Gate (issue #1318): a `lock_version` column rewrites the HTML `update`
@@ -1117,10 +1133,39 @@ fn plan_scaffold_with_options_impl(
         // user's app rather than a runtime miss. `labels.used_keys()` is the
         // exact set the render emitted — no more (which `autumn i18n check`
         // would flag as unused) and no fewer.
+        let autumn_toml_path_for_i18n = project_root.join("autumn.toml");
         let referenced_keys = labels.used_keys();
         if labels.enabled() && !referenced_keys.is_empty() {
-            let ftl_path = project_root.join("i18n").join("en.ftl");
-            let existing_ftl = read_or_empty(&ftl_path);
+            // Write to the locale the app actually treats as default, not
+            // literally `en`. A project already configured with
+            // `default_locale = "fr"` resolves every lookup through `fr.ftl`
+            // and its fallback chain: keys parked in `en.ftl` would render as
+            // `{$post.index.title}` placeholders at runtime and read as
+            // "missing from the default locale" to `autumn i18n check`.
+            let default_locale = scaffold_i18n::configured_default_locale(&read_or_empty(
+                &autumn_toml_path_for_i18n,
+            ))
+            .unwrap_or_else(|| "en".to_owned());
+            let ftl_path = project_root
+                .join("i18n")
+                .join(format!("{default_locale}.ftl"));
+            // NOT `read_or_empty`: that maps an unreadable or non-UTF-8 file to
+            // `""`, and the merge would then write a fresh English file straight
+            // over somebody's translations. An existing bundle we cannot read is
+            // a hard error, not an empty one.
+            let existing_ftl = match std::fs::read_to_string(&ftl_path) {
+                Ok(contents) => contents,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    return Err(GenerateError::Config(format!(
+                        "cannot read the existing i18n bundle at {}: {e}. Refusing to continue \
+                         — merging would replace it with a freshly generated file and lose \
+                         whatever translations it holds. Fix the file (it must be UTF-8 and \
+                         readable) and re-run.",
+                        ftl_path.display()
+                    )));
+                }
+            };
             let merged = scaffold_i18n::merge_en_ftl(
                 &existing_ftl,
                 &pascal_name,
@@ -1152,11 +1197,31 @@ fn plan_scaffold_with_options_impl(
             // there and rebuilds its Cargo.toml action from DISK, so an edit
             // made at this point would be silently dropped.)
 
+            // The image has to carry the bundle: `.i18n_auto()` panics at
+            // startup when the default locale's file is missing, and the plain
+            // `autumn new` Dockerfile copies no `i18n/` directory.
+            let dockerfile_path = project_root.join("Dockerfile");
+            if dockerfile_path.exists() {
+                let base = read_or_empty(&dockerfile_path);
+                match scaffold_i18n::ensure_dockerfile_i18n_copy(&base, "i18n") {
+                    Some(updated) if updated != base => {
+                        plan.modify(dockerfile_path, updated);
+                    }
+                    Some(_) => {}
+                    None => plan.warn(
+                        "Dockerfile has no `COPY migrations` line to anchor on, so the `i18n/` \
+                         directory was not added to it. Copy `i18n/` into both the builder and \
+                         runtime stages by hand — the app calls `.i18n_auto()`, which PANICS at \
+                         startup if the default locale's `.ftl` is missing from the image.",
+                    ),
+                }
+            }
+
             // `[i18n]` in `autumn.toml` names the default locale the bundle
             // loads. Only touched when the project actually has an
             // `autumn.toml` to edit and does not already configure i18n — a
             // project on a non-`en` default must keep it.
-            let autumn_toml_path = project_root.join("autumn.toml");
+            let autumn_toml_path = autumn_toml_path_for_i18n;
             if autumn_toml_path.exists() {
                 let base = plan
                     .actions
@@ -1507,7 +1572,22 @@ fn plan_scaffold_with_options_impl(
     // `--i18n` resource, and removing it while a sibling still emits `t!` calls
     // would leave that resource rendering raw keys. Leaving it is inert.
     let updated = if options_with_key.i18n && !options_with_key.api {
-        scaffold_i18n::ensure_i18n_auto(&updated)
+        match scaffold_i18n::ensure_i18n_auto(&updated) {
+            scaffold_i18n::I18nAutoWiring::Wired(wired) => wired,
+            // No real `.routes(` call to anchor on. Writing the call anywhere
+            // else risks landing it in a comment, where it would silently never
+            // run and the app would render raw keys forever — so say so instead
+            // and leave `main.rs` alone.
+            scaffold_i18n::I18nAutoWiring::NoAnchor => {
+                plan.warn(
+                    "src/main.rs has no `.routes(...)` call to anchor on, so `.i18n_auto()` was \
+                     not wired in. Add it to your `autumn_web::app()` builder chain by hand — \
+                     without it the generated `t!(locale, ...)` lookups render their KEYS \
+                     instead of the English in i18n/en.ftl.",
+                );
+                updated
+            }
+        }
     } else {
         updated
     };
@@ -2808,24 +2888,11 @@ fn render_routes_file(
     } else {
         ""
     };
-    // The display name of the resource, bound once per handler that needs it as
-    // a Fluent argument (`common.new = New { $resource }`). A nested `t!` inside
-    // another `t!`'s argument list would borrow a temporary that the macro's
-    // expansion drops before the lookup runs, so this has to be a real binding.
-    let resource_bind = if labels.enabled() {
-        format!(
-            "    let l_resource = {};\n",
-            labels.lit(&format!("{snake_name}.name"), pascal_name)
-        )
-    } else {
-        String::new()
-    };
-    // The same binding at the indentation the create/edit form bodies use.
-    let resource_bind_form = if resource_bind.is_empty() {
-        String::new()
-    } else {
-        format!("    {resource_bind}")
-    };
+    // (Kept as empty strings so the handler/form templates below can splice a
+    // per-handler label prelude without a second set of conditionals.)
+    // Issue #1349: no `l_resource` binding any more — see `new_link_text`.
+    let resource_bind = String::new();
+    let resource_bind_form = String::new();
     // The three page-furniture strings every HTML index variant renders, and the
     // create/edit chrome shared by the form views. Computed once so the six
     // index templates and both search templates below stay literal-free without
@@ -2838,36 +2905,26 @@ fn render_routes_file(
         &format!("{snake_name}.name.plural"),
         &format!("{pascal_name}s"),
     );
-    let new_link_text = labels.expr(
-        "common.new",
-        "New { $resource }",
-        &format!("\"New {pascal_name}\""),
-        &[("resource", "&l_resource")],
-    );
-    let new_link_markup = labels.markup_expr(
-        "common.new",
-        "New { $resource }",
-        &format!("\"New {pascal_name}\""),
-        &[("resource", "&l_resource")],
-    );
+    // "New {Model}" is a per-resource key, NOT chrome with the noun passed in as
+    // a Fluent argument. Interpolating a noun into a sentence pattern is the
+    // classic i18n trap: French needs *Nouveau*/*Nouvelle* by gender, German
+    // *Neuer*/*Neue*/*Neues*, and Slavic languages inflect the noun itself — a
+    // translator handed `New { $resource }` cannot get any of that right from
+    // the bundle alone. One key per resource costs one extra line in `en.ftl`
+    // and is translatable. (The same reasoning the sibling `{snake}.delete.confirm`
+    // and `{snake}.trash.heading` keys already follow. `{ $id }` is fine to
+    // interpolate — a number carries no grammatical gender.)
+    let new_link_text = labels.lit(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
+    let new_link_markup =
+        labels.markup(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
     let back_to_list = labels.lit("common.back", "Back to list");
     let back_to_list_markup = labels.markup("common.back", "Back to list");
     let edit_link_text = labels.lit("common.edit", "Edit");
     // Create/edit form chrome. `common.new` carries the pattern and the resource
     // display name arrives as a Fluent argument, so a translation controls word
     // order instead of having "New" concatenated in front of a noun.
-    let new_title = labels.expr_ref(
-        "common.new",
-        "New { $resource }",
-        &format!("\"New {pascal_name}\""),
-        &[("resource", "&l_resource")],
-    );
-    let new_heading = labels.markup_expr(
-        "common.new",
-        "New { $resource }",
-        &format!("\"New {pascal_name}\""),
-        &[("resource", "&l_resource")],
-    );
+    let new_title = labels.lit_ref(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
+    let new_heading = labels.markup(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
     let create_button = labels.lit("common.create", "Create");
     let create_button_ref = labels.lit_ref("common.create", "Create");
     let save_button = labels.lit("common.save", "Save");
@@ -2899,17 +2956,13 @@ fn render_routes_file(
     // The strings only the flag-gated surfaces render. Registered lazily so a
     // scaffold without the flag never defines a key nothing references — which
     // is exactly what `autumn i18n check` reports as unused.
-    let (search_empty, search_box_label, search_box_placeholder) = if searchable.is_empty() {
-        (String::new(), String::new(), String::new())
+    let (search_empty, search_box_placeholder) = if searchable.is_empty() {
+        (String::new(), String::new())
     } else {
         (
             labels.lit_ref(
                 &format!("{snake_name}.search.empty"),
                 &format!("No {plural} found."),
-            ),
-            labels.lit_ref(
-                &format!("{snake_name}.search.title"),
-                &format!("Search {pascal_name}s"),
             ),
             labels.lit_ref(
                 &format!("{snake_name}.search.placeholder"),
@@ -2918,17 +2971,26 @@ fn render_routes_file(
         )
     };
     // The destructive button keeps its `window.confirm` guard, so the prompt has
-    // to travel through a JS string literal. Maud escapes the attribute value for
-    // HTML, but not for JavaScript — a translation containing an apostrophe
-    // ("Supprimer cet article ?" is fine, "Voulez-vous l'effacer ?" is not) would
-    // otherwise terminate the literal early and break the handler. Escaping it at
-    // render time is the only place that knows the translated text.
+    // to travel through a JavaScript string literal — and a translation is not
+    // trusted input: it can come from a translator, a TMS, or a crowdsourced
+    // `.ftl`. Maud escapes the attribute value for HTML, but nothing escapes it
+    // for JS, so the encoding has to be exact.
+    //
+    // `serde_json::to_string` is that encoder: JSON string syntax is a subset of
+    // JavaScript's, and it escapes the quote, the BACKSLASH, and every control
+    // character. Hand-rolling `.replace('\'', "\\'")` is not enough — it leaves
+    // backslashes alone, so `C:\temp` smuggles in a tab and a trailing `\` before
+    // an apostrophe escapes the generator's own escape and closes the string
+    // early, turning the rest of the translation into executable code. The
+    // emitted double quotes are HTML-escaped by Maud and un-escaped by the
+    // parser before JS ever sees them. (`serde_json` is already imported by the
+    // generated module.)
     let delete_confirm_key = format!("{snake_name}.delete.confirm");
     let delete_confirm_ftl = format!("Delete this {pascal_name}?");
     let (delete_confirm_bind, delete_confirm_attr) = if labels.enabled() {
         (
             format!(
-                r#"@let delete_confirm_js = format!("return confirm('{{}}')", {}.replace('\'', "\\'"));
+                r#"@let delete_confirm_js = format!("return confirm({{}})", serde_json::to_string(&{}).unwrap_or_else(|_| "\"\"".into()));
             "#,
                 labels.lit(&delete_confirm_key, &delete_confirm_ftl)
             ),
@@ -2942,9 +3004,11 @@ fn render_routes_file(
     };
     // `--searchable` only. Registered lazily so a non-searchable scaffold never
     // writes these keys into `en.ftl` (an unreferenced key is exactly what
-    // `autumn i18n check` reports as unused).
-    let (search_title, search_heading) = if searchable.is_empty() {
-        (String::new(), String::new())
+    // `autumn i18n check` reports as unused). `{snake}.search.title` serves the
+    // page `<h1>`, the `<title>`, and the search input's visible label — they
+    // are the same words naming the same thing, so one key keeps them in step.
+    let (search_title, search_heading, search_box_label) = if searchable.is_empty() {
+        (String::new(), String::new(), String::new())
     } else {
         (
             labels.lit_ref(
@@ -2952,6 +3016,10 @@ fn render_routes_file(
                 &format!("Search {pascal_name}s"),
             ),
             labels.markup(
+                &format!("{snake_name}.search.title"),
+                &format!("Search {pascal_name}s"),
+            ),
+            labels.lit_ref(
                 &format!("{snake_name}.search.title"),
                 &format!("Search {pascal_name}s"),
             ),
@@ -3172,6 +3240,38 @@ fn render_routes_file(
     let export_enabled = owner_scoped_standard || (!owner_scoped_index && !live && !sharded);
     // Issue #1349: the export link's text, registered only where the export is
     // actually emitted so a non-exporting scaffold defines no unused key.
+    // Issue #1349: strings the shared widgets supply by DEFAULT rather than the
+    // templates above — the pager's `aria-label`/Previous/Next, the bulk-delete
+    // submit button and its per-row checkbox `aria-label`. They render in the
+    // generated views like any other button or link, so a scaffold that leaves
+    // them at their English defaults is only partly translated. Each widget
+    // already exposes a setter; the generator just never called them.
+    //
+    // The pager's are inline: `PagerOptions` is built and consumed inside one
+    // statement, so a `&t!(…)` temporary lives long enough. `BulkActionsConfig`
+    // is bound to a `let` that outlives its statement, so its two take bindings.
+    let pager_labels = if labels.enabled() {
+        format!(
+            ".aria_label(&{}).prev_label(&{}).next_label(&{})",
+            labels.lit("common.pagination", "Pagination"),
+            labels.lit("common.previous", "Previous"),
+            labels.lit("common.next", "Next"),
+        )
+    } else {
+        String::new()
+    };
+    let (bulk_label_binds, bulk_labels) = if labels.enabled() && bulk_delete_enabled {
+        (
+            format!(
+                "let l_bulk_submit = {};\n    let l_bulk_select = {};\n    ",
+                labels.lit("common.delete.selected", "Delete selected"),
+                labels.lit("common.select.row", "Select row"),
+            ),
+            ".submit_label(&l_bulk_submit).select_label(&l_bulk_select)".to_owned(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     let export_csv_text = if export_enabled {
         labels.lit("common.export.csv", "Export CSV")
     } else {
@@ -3214,6 +3314,88 @@ fn render_routes_file(
     } else {
         format!("{pascal_name} deleted")
     };
+    // Issue #1349: the one-shot notices. They are rendered by the layout's
+    // `flash_messages(...)` on the very next page, so a French app that still
+    // toasts "Post created" is not translated — the whole promise of the flag is
+    // that adding a locale means editing a `.ftl`, not Rust.
+    //
+    // Per-resource keys, like the other strings that carry the model's name: a
+    // shared `common.created = { $resource } created` would hand the translator
+    // a sentence whose verb has to agree with a noun they cannot see (French
+    // "créé"/"créée", German word order), which is the same trap `{snake}.new`
+    // avoids. `Flash::success` takes `impl Into<String>`, so a `t!` `String`
+    // drops straight in where the literal was.
+    let flash_created = labels.lit(
+        &format!("{snake_name}.flash.created"),
+        &format!("{pascal_name} created"),
+    );
+    let flash_updated = labels.lit(
+        &format!("{snake_name}.flash.updated"),
+        &format!("{pascal_name} updated"),
+    );
+    let flash_destroyed = labels.lit(&format!("{snake_name}.flash.deleted"), &destroy_flash);
+    // The bulk-delete pair. `Deleted {n} posts` interpolates a COUNT, which is
+    // safe to pass as a Fluent argument (a number carries no gender), unlike the
+    // model noun. A translator wanting real plural rules can turn the value into
+    // a Fluent selector on `$count` without touching Rust.
+    let flash_bulk_cap = if bulk_delete_enabled {
+        labels.expr(
+            &format!("{snake_name}.flash.bulk_cap"),
+            &format!("Select at most {{ $max }} {plural} at once"),
+            &format!("format!(\"Select at most {{MAX_BULK_IDS}} {plural} at once\")"),
+            &[("max", "&MAX_BULK_IDS.to_string()")],
+        )
+    } else {
+        String::new()
+    };
+    let (flash_none_selected, flash_bulk_deleted) = if bulk_delete_enabled {
+        (
+            labels.lit(
+                &format!("{snake_name}.flash.none_selected"),
+                &format!("No {plural} selected"),
+            ),
+            labels.expr(
+                &format!("{snake_name}.flash.bulk_deleted"),
+                &format!("Deleted {{ $count }} {plural}"),
+                &format!("format!(\"Deleted {{}} {plural}\", allowed.len())"),
+                &[("count", "&allowed.len().to_string()")],
+            ),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    let (flash_restored, flash_purged) = if trash_enabled {
+        (
+            labels.lit(
+                &format!("{snake_name}.flash.restored"),
+                &format!("{pascal_name} restored — it is back in the list"),
+            ),
+            labels.lit(
+                &format!("{snake_name}.flash.purged"),
+                &format!("{pascal_name} permanently deleted"),
+            ),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    // Registered only where the surface using it is actually emitted: a key
+    // nothing references is exactly what `autumn i18n check --strict` fails on.
+    // The stale-write notice lives in the state-machine transition handler's
+    // 409 branch only, so it needs BOTH a lock column and a `:states(...)`
+    // column — a plain `lock_version` scaffold re-renders the edit form with an
+    // inline banner instead and never flashes.
+    let flash_stale =
+        if lock_version.is_some() && all_fields.iter().any(|f| f.state_machine.is_some()) {
+            labels.lit(
+                &format!("{snake_name}.flash.stale"),
+                &format!(
+                    "This {snake_name} was changed by someone else since this page was loaded. \
+                 Reload and try again."
+                ),
+            )
+        } else {
+            String::new()
+        };
     // The full extractor pair the authorize wiring needs on handlers that do not
     // already carry a `state:` wrapper. No trailing comma — each insertion site
     // supplies its own delimiter.
@@ -3901,6 +4083,16 @@ fn render_routes_file(
     for f in &attachment_fields {
         let name = &f.name;
         let label = humanize_label(name);
+        // Issue #1349: "Current Cover:" names the file already stored, so it is
+        // a view label like any other. Per FIELD, not a shared pattern with the
+        // column name interpolated — same grammatical-agreement reasoning as
+        // `{snake}.new`. The `attachment_link` argument beside it stays the raw
+        // column name on purpose: it is the DOWNLOAD FILENAME stem, not a label,
+        // and localizing a filename is a bug, not a feature.
+        let current_label = labels.markup(
+            &format!("{snake_name}.attachment.{name}.current"),
+            &format!("Current {label}: "),
+        );
         let _ = writeln!(
             edit_attachment_url_binds,
             "        let {name}_url = attachment_url(&state, current.{name}.as_ref()).await;"
@@ -3908,7 +4100,7 @@ fn render_routes_file(
         let _ = write!(
             edit_current_attachment_markup,
             "@if let Some(blob) = current.{name}.as_ref() {{\n            \
-             p class=\"autumn-field__current\" {{ \"Current {label}: \" (attachment_link(Some(blob), {name}_url.as_deref(), \"{name}\")) }}\n        \
+             p class=\"autumn-field__current\" {{ {current_label} (attachment_link(Some(blob), {name}_url.as_deref(), \"{name}\")) }}\n        \
              }}\n        "
         );
     }
@@ -4576,7 +4768,7 @@ mod attachment_read_back_tests {
              }}\n        \
              {blob_cleanup}return Err(err);\n    \
              }}\n    \
-             flash.success(\"{pascal_name} created\").await;\n    \
+             flash.success({flash_created}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     } else if has_attachments {
@@ -4590,13 +4782,13 @@ mod attachment_read_back_tests {
              if let Err(err) = result {{\n        \
              {blob_cleanup}return Err(err);\n    \
              }}\n    \
-             flash.success(\"{pascal_name} created\").await;\n    \
+             flash.success({flash_created}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     } else {
         format!(
             "{create_stmt}\n    \
-             flash.success(\"{pascal_name} created\").await;\n    \
+             flash.success({flash_created}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     };
@@ -4717,7 +4909,7 @@ mod attachment_read_back_tests {
              if updated == 0 {{\n        \
              {zero_rows}\n    \
              }}\n    \
-             flash.success(\"{pascal_name} updated\").await;\n    \
+             flash.success({flash_updated}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::show({update_redirect_expr})).into_response())",
             zero_rows = update_zero_rows_block(blob_cleanup, &id_value_expr),
         )
@@ -4738,7 +4930,7 @@ mod attachment_read_back_tests {
              if updated == 0 {{\n        \
              {zero_rows}\n    \
              }}\n    \
-             flash.success(\"{pascal_name} updated\").await;\n    \
+             flash.success({flash_updated}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())",
             zero_rows = update_zero_rows_block(blob_cleanup, "*id"),
         )
@@ -4748,7 +4940,7 @@ mod attachment_read_back_tests {
              if updated == 0 {{\n        \
              {zero_rows}\n    \
              }}\n    \
-             flash.success(\"{pascal_name} updated\").await;\n    \
+             flash.success({flash_updated}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())",
             zero_rows = update_zero_rows_block("", "*id"),
         )
@@ -4965,14 +5157,14 @@ mod attachment_read_back_tests {
              #[secured]\n\
              #[post(\"/{plural}/bulk_delete\")]\n\
              pub async fn bulk_delete(\n    \
-             flash: Flash,{authz_params}\n    \
+             {locale_param}flash: Flash,{authz_params}\n    \
              repo: Pg{pascal_name}Repository,\n    \
              mut db: {db_ty},\n    \
              body: Bytes,\n\
              ) -> AutumnResult<autumn_web::Redirect> {{\n    \
              let ids = parse_bulk_ids(&body);\n    \
              if ids.is_empty() {{\n        \
-             flash.info(\"No {plural} selected\").await;\n        \
+             flash.info({flash_none_selected}).await;\n        \
              return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
              }}\n    \
              // Refuse an oversized selection outright rather than truncating it: a\n    \
@@ -4980,7 +5172,7 @@ mod attachment_read_back_tests {
              // the empty case this redirects with a flash instead of 400ing.\n    \
              if ids.len() > MAX_BULK_IDS {{\n        \
              flash\n            \
-             .error(format!(\"Select at most {{MAX_BULK_IDS}} {plural} at once\"))\n            \
+             .error({flash_bulk_cap})\n            \
              .await;\n        \
              return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
              }}\n    \
@@ -5013,7 +5205,7 @@ mod attachment_read_back_tests {
              drop(db);\n\
              {allowed_block}    \
              repo.delete_many(&allowed).await?;\n    \
-             flash.success(format!(\"Deleted {{}} {plural}\", allowed.len())).await;\n    \
+             flash.success({flash_bulk_deleted}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::index()))\n\
              }}"
         )
@@ -5335,13 +5527,35 @@ mod attachment_read_back_tests {
         // other index column header is (`title_case`), so the trash table reads
         // like the list it mirrors.
         let deleted_at_header = title_case("deleted_at");
-        // Issue #1349: the trash view's own strings. `confirm_action`'s title is
-        // built per row, so the localized pattern interpolates the row key the
-        // same way the detail page's title does; the `ConfirmActionConfig` and
-        // the two `Column`s all borrow for the length of one statement, so these
-        // can stay inline rather than needing `let` bindings.
-        let deleted_at_header_expr = labels.lit_ref("common.field.deleted_at", &deleted_at_header);
-        let actions_header_expr = labels.lit_ref("common.actions", "Actions");
+        // Issue #1349: the trash view's own strings.
+        //
+        // The two extra `Column`s take `let` bindings, exactly like the
+        // `l_col_*` headers `render_columns_vec` emits: `Column<'a, T>` holds
+        // its header as `&'a str` and both are pushed into a `columns` vec that
+        // outlives the statement, so an inline `&t!(…)` would be a temporary
+        // dropped at the end of the `insert`/`push` (E0716). `confirm_action`'s
+        // per-row title and its config, by contrast, are consumed inside a
+        // single statement and can stay inline. The bindings are spliced BEFORE
+        // the `columns` vec, not after: locals drop in reverse declaration
+        // order, so a label declared after the vec it is borrowed into would be
+        // dropped first (E0597).
+        let (deleted_at_header_expr, actions_header_expr, trash_label_binds) = if labels.enabled() {
+            (
+                "&l_trash_deleted_at".to_owned(),
+                "&l_trash_actions".to_owned(),
+                format!(
+                    "    let l_trash_deleted_at = {};\n    let l_trash_actions = {};\n",
+                    labels.lit("common.field.deleted_at", &deleted_at_header),
+                    labels.lit("common.actions", "Actions"),
+                ),
+            )
+        } else {
+            (
+                format!("\"{deleted_at_header}\""),
+                "\"Actions\"".to_owned(),
+                String::new(),
+            )
+        };
         let purge_title_expr = labels.expr(
             &format!("{snake_name}.purge.confirm"),
             &format!("Permanently delete {snake_name} {{ $id }}?"),
@@ -5354,6 +5568,17 @@ mod attachment_read_back_tests {
             "common.purge.warning",
             "This action cannot be undone. Restore it instead if you might need it later.",
         );
+        let (purge_cancel_bind, purge_cancel) = if labels.enabled() {
+            (
+                format!(
+                    "let purge_cancel = {};\n        ",
+                    labels.lit("common.cancel", "Cancel")
+                ),
+                "\n            .cancel_label(&purge_cancel)".to_owned(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
         let restore_button = labels.lit("common.restore", "Restore");
         let purge_button = labels.lit_ref("common.purge", "Purge");
         let trash_title = labels.lit_ref(
@@ -5395,7 +5620,7 @@ pub async fn trash(
     // loads, plus a `<noscript>` fallback so the action stays reachable without
     // JavaScript.
     let purge_csrf = csrf.as_ref().map(|token| token.token()).unwrap_or_default();
-{trash_columns}    // The `{deleted_at_header}` stamp goes BEFORE the trailing "Show" link column that
+{trash_label_binds}{trash_columns}    // The `{deleted_at_header}` stamp goes BEFORE the trailing "Show" link column that
     // `columns` ends with, so the data columns stay together and the two link
     // columns stay at the end of the row.
     columns.insert(
@@ -5409,8 +5634,8 @@ pub async fn trash(
         // the person confirming an irreversible delete with nothing on screen
         // saying WHICH {snake_name} they are about to destroy.
         let purge_title = {purge_title_expr};
-        let purge_confirm = autumn_web::widgets::ConfirmActionConfig::new()
-            .title(&purge_title)
+        {purge_cancel_bind}let purge_confirm = autumn_web::widgets::ConfirmActionConfig::new()
+            .title(&purge_title){purge_cancel}
             .message(maud::html! {{ p {{ {purge_warning} }} }});
         let purge_confirm = match csrf_field.as_ref() {{
             Some(field) => purge_confirm.csrf_field(field.0.as_str()),
@@ -5435,7 +5660,7 @@ pub async fn trash(
         h1 {{ {trash_heading} }}
         (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
         (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({trash_empty}).base_path(&paths::trash())))
-        (pagination_nav(&page_data, &PagerOptions::new(&paths::trash())))
+        (pagination_nav(&page_data, &PagerOptions::new(&paths::trash()){pager_labels}))
     }}))
 }}
 
@@ -5447,7 +5672,7 @@ pub async fn trash(
 #[secured]
 #[post("/{plural}/{{{id_url_segment}}}/restore")]
 pub async fn restore(
-    {id_param_decl},
+    {locale_param}{id_param_decl},
     mut db: {db_ty},
     repo: Pg{pascal_name}Repository,
     flash: Flash,{trash_authz_params}
@@ -5456,7 +5681,7 @@ pub async fn restore(
     repo.restore(row.id).await?;
     // The redirect lands back on the Trash page (the row is gone from it), so
     // the flash has to say where the {snake_name} actually went.
-    flash.success("{pascal_name} restored — it is back in the list").await;
+    flash.success({flash_restored}).await;
     Ok(autumn_web::Redirect::to(&paths::trash()))
 }}
 
@@ -5482,14 +5707,14 @@ pub async fn restore(
 #[secured]
 #[post("/{plural}/{{{id_url_segment}}}/purge")]
 pub async fn purge(
-    {id_param_decl},
+    {locale_param}{id_param_decl},
     mut db: {db_ty},
     repo: Pg{pascal_name}Repository,
     flash: Flash,{trash_authz_params}
 ) -> AutumnResult<autumn_web::Redirect> {{
 {trash_guard_load}{trash_authz_call}    drop(db);
     repo.purge(row.id).await?;
-    flash.success("{pascal_name} permanently deleted").await;
+    flash.success({flash_purged}).await;
     Ok(autumn_web::Redirect::to(&paths::trash()))
 }}
 "#
@@ -5571,7 +5796,7 @@ pub async fn purge(
             index_columns_labeled.replacen("    let columns:", "    let mut columns:", 1);
         format!(
             "    let bulk_action = paths::bulk_delete();\n    \
-             let bulk_cfg = autumn_web::widgets::BulkActionsConfig::new(&bulk_action);\n\
+             {bulk_label_binds}let bulk_cfg = autumn_web::widgets::BulkActionsConfig::new(&bulk_action){bulk_labels};\n\
              {with_mut}    \
              columns.insert(0, autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ (autumn_web::widgets::bulk_select_checkbox(row.id, &bulk_cfg)) }}));\n"
         )
@@ -5586,11 +5811,24 @@ pub async fn purge(
     // tokenless request straight through, so without it a double-clicked
     // "Delete selected" runs the whole destructive path — hooks and dependent
     // deletes included — twice instead of replaying the first response.
-    let bulk_csrf_params = if bulk_delete_enabled {
+    // Issue #1349: under `--i18n` the four token extractors collapse into ONE
+    // tuple parameter. axum implements `FromRequestParts` for tuples, and its
+    // `Handler` impls stop at 16 arguments — the owner-scoped `search` handler
+    // already declares 13, and `#[secured]`/`#[get]` inject three more, so
+    // adding `locale: Locale` on top would push it to 17 and fail to compile
+    // with an unreadable elided-tuple trait error. Destructuring in the pattern
+    // keeps every use site in the body spelled exactly as before. Only under
+    // the flag: the plain scaffold's signature stays byte-identical.
+    let bulk_csrf_params = if !bulk_delete_enabled {
+        String::new()
+    } else if labels.enabled() {
+        "\n    (csrf, csrf_field, submit_token, submit_field): (Option<CsrfToken>, \
+         Option<CsrfFormField>, Option<SubmitToken>, Option<SubmitFormField>),"
+            .to_owned()
+    } else {
         "\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    \
          submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,"
-    } else {
-        ""
+            .to_owned()
     };
     // The `Option<&str>` conversions `bulk_actions_form` takes for its hidden
     // CSRF and submit-token inputs, matching the `csrf_input` /
@@ -5638,10 +5876,11 @@ pub async fn purge(
     // handler from the raw query string). The `--live` variants call `repo.page`
     // and extract no `RawQuery`, so they keep the plain pager.
     let pager_line = if live {
-        r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index())))".to_string()
+        format!("(pagination_nav(&page_data, &PagerOptions::new(&paths::index()){pager_labels}))")
     } else {
-        r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index()).query(pager_query)))"
-            .to_string()
+        format!(
+            "(pagination_nav(&page_data, &PagerOptions::new(&paths::index()).query(pager_query){pager_labels}))"
+        )
     };
     // Issue #1315: the index's "Export CSV" link, and the `let` that builds its
     // href. The link carries the index's CURRENT query string, so "filter →
@@ -5875,7 +6114,7 @@ pub async fn index(
         h1 {{ {index_heading} }}
         (autumn_web::a11y::Link::new("/{plural}/new", {new_link_text}))
         {list_render}
-        (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
+        (pagination_nav(&page_data, &PagerOptions::new("/{plural}"){pager_labels}))
     }}))
 }}"#
         )
@@ -6271,7 +6510,7 @@ pub async fn index(
         r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({search_empty}).base_path("/{plural}/search")))"#
     );
     let search_results_pager = format!(
-        r#"(pagination_nav(&page_data, &PagerOptions::new("/{plural}/search").query(pager_query)))"#
+        r#"(pagination_nav(&page_data, &PagerOptions::new("/{plural}/search").query(pager_query){pager_labels}))"#
     );
     let search_results_body = if bulk_delete_enabled {
         format!(
@@ -6730,7 +6969,7 @@ pub async fn show(
                      )));\n                \
                      }};\n\
                      {transition_conflict_reauthz}                \
-                     flash.error(\"This {snake_name} was changed by someone else since this page was loaded. Reload and try again.\").await;\n                \
+                     flash.error({flash_stale}).await;\n                \
                      // Render the row as it NOW stands, not the snapshot this\n                \
                      // request loaded: the reader is deciding again, and the legal\n                \
                      // transitions may well be different from the ones they saw.\n                \
@@ -6749,6 +6988,13 @@ pub async fn show(
             let mut transition_handlers = String::new();
             for f in &sm_fields {
                 let field = &f.name;
+                // Per FIELD as well as per resource: "Post status updated" and
+                // "Post visibility updated" are different sentences, and a
+                // model can carry more than one state-machine column.
+                let flash_transitioned = labels.lit(
+                    &format!("{snake_name}.flash.{field}_updated"),
+                    &format!("{pascal_name} {field} updated"),
+                );
                 let handler = format!(
                     r#"/// `POST /{plural}/{{id}}/transitions/{field}` — apply a `{field}` state
 /// transition (issue #1326). A legal edge persists the new `{field}` value and
@@ -6757,7 +7003,7 @@ pub async fn show(
 #[secured]
 #[post("/{plural}/{{id}}/transitions/{field}")]
 pub async fn transition_{field}(
-    id: Path<{id_rust}>,
+    {locale_param}id: Path<{id_rust}>,
     mut db: {db_ty},
     flash: Flash,
     csrf: Option<CsrfToken>,
@@ -6780,7 +7026,7 @@ pub async fn transition_{field}(
                 .set({transition_set_open}{plural}::{field}.eq(new_state){transition_lock_bump}{transition_set_close})
                 .execute(&mut *db)
                 .await?;
-{transition_conflict_block}            flash.success("{pascal_name} {field} updated").await;
+{transition_conflict_block}            flash.success({flash_transitioned}).await;
             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())
         }}
         Err(err) => {{
@@ -6906,7 +7152,7 @@ pub async fn edit_form(
 #[secured]
 #[post("/{plural}/{{{id_url_segment}}}/delete", name = "delete")]
 pub async fn destroy(
-    {id_param_decl},
+    {locale_param}{id_param_decl},
     {destroy_signature_arg},
     flash: Flash,
 ) -> AutumnResult<autumn_web::Redirect> {{
@@ -6916,7 +7162,7 @@ pub async fn destroy(
             "{pascal_name} with id {{}} not found", {id_value_expr}
         )));
     }}
-    flash.success("{destroy_flash}").await;
+    flash.success({flash_destroyed}).await;
     Ok(autumn_web::Redirect::to(&paths::index()))
 }}
 
@@ -8961,7 +9207,6 @@ fn render_columns_vec(
     let mut out = String::with_capacity(fields.len() * 150 + 300);
     // Header bindings first: `Column::new` takes `&'a str`, so a translated
     // header has to outlive the `vec![…]` it is built into.
-    let id_header = labels.lit_ref("common.field.id", "Id");
     if labels.enabled() {
         let _ = writeln!(
             out,
@@ -8986,7 +9231,7 @@ fn render_columns_vec(
     let id_header = if labels.enabled() {
         "&l_col_id".to_owned()
     } else {
-        id_header
+        format!("\"{}\"", title_case("id"))
     };
     let _ = writeln!(
         out,
@@ -9170,7 +9415,7 @@ fn render_show_property_label_binds(
     let _ = writeln!(
         out,
         "    let l_prop_created_at = {};",
-        labels.lit("common.field.created_at", "Created at")
+        labels.lit("common.field.created_at", &title_case("created_at"))
     );
     out
 }
@@ -22393,6 +22638,20 @@ exempt_paths = [
     }
 
     /// AC6: without `--i18n`, scaffold output is byte-for-byte unchanged.
+    ///
+    /// What this proves on its own is narrow — both sides run the post-#1349
+    /// generator, so it pins `ScaffoldOptions::default().i18n == false` and the
+    /// absence of any i18n artifact, not equality with the pre-#1349 output.
+    /// The real guard against drift is threefold and lives elsewhere: the
+    /// several hundred existing tests in this module assert the plain path's
+    /// exact strings (`Column::new("Id"`, `("Created at", maud::html!`,
+    /// `confirm('Delete this Post?')`, …) and would fail on any change;
+    /// `integration::scaffold_i18n::views_look_up_every_user_facing_string_through_the_t_macro`
+    /// re-generates without the flag and asserts each of those literals is
+    /// still there; and structurally,
+    /// [`ViewLabels`](super::super::scaffold_i18n::ViewLabels) returns the
+    /// caller's own expression verbatim when the flag is off, so there is no
+    /// second code path that could drift in the first place.
     #[test]
     fn i18n_omitted_is_byte_identical_to_default() {
         let fields = i18n_fields();
@@ -22462,12 +22721,13 @@ exempt_paths = [
             "common.save",
             "common.back",
             "common.edit",
-            "common.new",
             "common.delete",
-            "post.name",
+            "common.show",
+            "post.new",
             "post.name.plural",
             "post.field.title",
             "post.field.author_name",
+            "post.flash.created",
         ] {
             assert!(
                 keys.contains(expected),
@@ -22560,7 +22820,7 @@ exempt_paths = [
         assert!(ftl.contains("common.create = Create"), "{ftl}");
         assert!(ftl.contains("common.save = Save"), "{ftl}");
         assert!(ftl.contains("common.back = Back to list"), "{ftl}");
-        assert!(ftl.contains("post.name = Post"), "{ftl}");
+        assert!(ftl.contains("post.new = New Post"), "{ftl}");
         assert!(ftl.contains("post.field.title = Title"), "{ftl}");
         assert!(
             ftl.contains("post.field.author_name = Author Name"),

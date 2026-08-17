@@ -11,6 +11,7 @@
 //! against the generated app.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -109,33 +110,79 @@ fn views_look_up_every_user_facing_string_through_the_t_macro() {
         "common.save",
         "common.back",
         "common.edit",
-        "common.new",
         "common.delete",
-        // This resource's nouns.
-        "post.name",
+        "common.show",
+        // Widget-supplied defaults the generator now overrides.
+        "common.pagination",
+        "common.previous",
+        "common.next",
+        // This resource's own strings.
+        "post.new",
         "post.name.plural",
         "post.index.title",
+        "post.index.empty",
+        "post.show.title",
+        "post.edit.title",
+        "post.delete.confirm",
         "post.field.title",
         "post.field.author_name",
+        // One-shot notices render into these same views.
+        "post.flash.created",
+        "post.flash.updated",
+        "post.flash.deleted",
     ] {
         assert!(
             keys.contains(expected),
             "missing key `{expected}`: {keys:?}"
         );
     }
-    // …and none of the English survives in the markup.
-    for literal in [
+    // …and none of the English survives.
+    //
+    // Every literal here is one the PLAIN scaffold really does contain — the
+    // control below re-generates without the flag and asserts exactly that, so
+    // these can never quietly decay into assertions about a string that was
+    // never emitted in the first place.
+    let hardcoded = [
         "\"New Post\"",
         "\"Post index\"",
-        "\"Back to list\"",
-        "\"Author Name\"",
-        "Button::new(\"Create\")",
-        "Button::new(\"Save\")",
+        "h1 { \"Posts\" }",
         "Column::new(\"Title\"",
-    ] {
+        "(\"Created at\", maud::html!",
+        "DataTableConfig::new(\"No posts yet.\")",
+        "flash.success(\"Post created\")",
+        "confirm('Delete this Post?')",
+        "Link::new(paths::index(), \"Back to list\")",
+        "Link::new(paths::edit(row.id), \"Edit\")",
+    ];
+    for literal in hardcoded {
         assert!(
             !routes.contains(literal),
             "hardcoded label {literal} survived:\n{routes}"
+        );
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "control-app"]);
+    let control = tmp.path().join("control-app");
+    run_autumn_ok(
+        &control,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "published:bool",
+            "views:i64",
+            "author_name:String",
+        ],
+    );
+    let plain = fs::read_to_string(control.join("src/routes/posts.rs")).unwrap();
+    for literal in hardcoded {
+        assert!(
+            plain.contains(literal),
+            "the non-i18n control must contain {literal}, or the assertion above \
+             proves nothing:\n{plain}"
         );
     }
 }
@@ -150,15 +197,27 @@ fn every_referenced_key_is_defined_in_the_generated_en_ftl() {
     let defined = ftl_keys(&ftl);
     let missing: Vec<_> = referenced.difference(&defined).collect();
     assert!(missing.is_empty(), "undefined keys {missing:?}:\n{ftl}");
+    // Nothing is defined that nothing references, either — that is what
+    // `autumn i18n check --strict` fails on, and a translator should never be
+    // handed a key the app can never show them.
+    let unused: Vec<_> = defined.difference(&referenced).collect();
+    assert!(unused.is_empty(), "unused keys {unused:?}:\n{routes}");
     // The English values are the exact strings the plain scaffold renders, so an
     // `en` app is visually identical to a non-`--i18n` one.
     assert!(ftl.contains("common.create = Create"), "{ftl}");
-    assert!(ftl.contains("common.new = New { $resource }"), "{ftl}");
-    assert!(ftl.contains("post.name = Post"), "{ftl}");
+    assert!(ftl.contains("common.back = Back to list"), "{ftl}");
+    assert!(ftl.contains("post.new = New Post"), "{ftl}");
+    assert!(ftl.contains("post.name.plural = Posts"), "{ftl}");
     assert!(
         ftl.contains("post.field.author_name = Author Name"),
         "{ftl}"
     );
+    // Row keys and counts interpolate as Fluent arguments so a translation can
+    // position them; the model's NAME never does — a noun dropped into a
+    // sentence pattern cannot be made to agree in gender or case from the
+    // bundle alone, which is why "New Post" is a per-resource key.
+    assert!(ftl.contains("post.show.title = Post #{ $id }"), "{ftl}");
+    assert!(!ftl.contains("$resource"), "no noun interpolation:\n{ftl}");
 }
 
 #[test]
@@ -269,16 +328,29 @@ fn the_flag_composes_with_searchable_and_soft_delete() {
             "--searchable",
             "title,body",
             "--soft-delete",
+            // Without this the index is owner-scoped and the Trash view is gated
+            // off entirely — the assertions below would then pass against a file
+            // that simply has no trash markup in it.
+            "--no-policy",
         ],
     );
 
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("pub async fn trash(") && routes.contains("pub async fn search("),
+        "both surfaces must actually be emitted for this test to mean anything"
+    );
     // The strings those two flags add are translated too, not just the base CRUD.
     for literal in [
         "\"Search Posts\"",
         "\"Trash is empty.\"",
         "Button::new(\"Restore\")",
         "\"Deleted Posts\"",
+        "Link::new(export_href, \"Export CSV\")",
+        "Column::new(\"Actions\"",
+        "Column::new(\"Deleted At\"",
+        "\"Post restored",
+        "\"Delete selected\"",
     ] {
         assert!(
             !routes.contains(literal),
@@ -391,4 +463,235 @@ fn destroy_takes_back_the_resource_keys_and_leaves_the_shared_chrome() {
     // file itself must always survive a destroy.
     assert!(project.join("i18n/en.ftl").exists());
     run_autumn_ok(&project, &["i18n", "check", "--strict"]);
+}
+
+#[test]
+fn keys_land_in_the_locale_the_app_actually_treats_as_default() {
+    // A project configured on `fr` resolves every lookup through `fr.ftl` and
+    // its fallback chain, which need not include `en`. Keys parked in `en.ftl`
+    // would render as visible `{$key}` placeholders at runtime while `t!`'s
+    // compile-time check (which defaults to `en`) passed — a miss that only
+    // shows up in production.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "fr-app"]);
+    let project = tmp.path().join("fr-app");
+    let autumn_toml = project.join("autumn.toml");
+    let mut config = fs::read_to_string(&autumn_toml).unwrap();
+    config.push_str("\n[i18n]\ndefault_locale = \"fr\"\nsupported_locales = [\"fr\"]\n");
+    fs::write(&autumn_toml, config).unwrap();
+
+    run_autumn_ok(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "--i18n"],
+    );
+    assert!(
+        project.join("i18n/fr.ftl").exists(),
+        "keys must be written to the configured default locale"
+    );
+    assert!(!project.join("i18n/en.ftl").exists());
+    // The existing configuration is left exactly as the project set it.
+    let after = fs::read_to_string(&autumn_toml).unwrap();
+    assert!(after.contains("default_locale = \"fr\""), "{after}");
+    assert_eq!(after.matches("[i18n]").count(), 1, "{after}");
+    run_autumn_ok(&project, &["i18n", "check", "--strict"]);
+}
+
+#[test]
+fn the_image_carries_the_bundle_it_panics_without() {
+    // `.i18n_auto()` reads the default locale's `.ftl` at startup and PANICS
+    // when it is missing, and the plain `autumn new` Dockerfile copies no
+    // `i18n/` directory — so without this the container builds clean and then
+    // crash-loops on deploy.
+    let (_tmp, project) = i18n_project(&[]);
+    let dockerfile = fs::read_to_string(project.join("Dockerfile")).unwrap();
+    assert!(
+        dockerfile.contains("COPY i18n ./i18n"),
+        "the builder stage must see the bundle:\n{dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("COPY --from=builder /app/i18n /app/i18n"),
+        "the runtime stage must ship the bundle:\n{dockerfile}"
+    );
+}
+
+#[test]
+fn a_resource_that_would_collide_with_the_shared_chrome_is_refused() {
+    // `Common`'s keys would land under `common.*` — the chrome namespace every
+    // other resource references — so destroying it later would break them all.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "chrome-app"]);
+    let project = tmp.path().join("chrome-app");
+    let stderr = run_autumn_expect_fail(
+        &project,
+        &["generate", "scaffold", "Common", "title:String", "--i18n"],
+    );
+    assert!(
+        stderr.contains("Common") && stderr.contains("common."),
+        "the error must explain the namespace clash: {stderr}"
+    );
+    // Without `--i18n` the name is perfectly fine.
+    run_autumn_ok(
+        &project,
+        &["generate", "scaffold", "Common", "title:String"],
+    );
+}
+
+#[test]
+fn the_delete_prompt_survives_a_translation_containing_a_quote_or_backslash() {
+    // The prompt travels through a JavaScript string literal, and a translation
+    // is not trusted input — it can come from a translator, a TMS, or a
+    // crowdsourced `.ftl`. Escaping only apostrophes would leave a backslash to
+    // close the literal early and turn the rest of the value into code.
+    let (_tmp, project) = i18n_project(&[]);
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("serde_json::to_string(&t!(locale, \"post.delete.confirm\"))"),
+        "the prompt must be encoded as a JS string literal, not hand-escaped:\n{routes}"
+    );
+    assert!(
+        !routes.contains(".replace('\\'',"),
+        "a single-character escape is not a JS string encoder:\n{routes}"
+    );
+}
+
+// ── Compile conformance ──────────────────────────────────────────────────
+//
+// The string assertions above prove the generator EMITTED a `t!` lookup; only a
+// real `cargo check` proves the result is Rust that compiles. Both of the bugs
+// this feature shipped with — a `&t!(…)` temporary borrowed into a `columns`
+// vec that outlives it (E0716, `--soft-delete`), and a `transition_<field>`
+// handler calling `show_view(locale.clone(), …)` without a `locale` parameter
+// (E0425, `:states(...)`) — were invisible to grep and instant under `cargo
+// check`. Adding the locale extractor also moves handlers toward axum's
+// 16-argument `Handler` ceiling, which no amount of string matching can see.
+//
+// `#[ignore]`d (each compiles a fresh project) and therefore named explicitly
+// in `.github/workflows/generator-conformance.yml` — an ignored test in
+// `cli_tests` that the workflow does not name never runs anywhere.
+
+/// Point the generated project's `autumn-web`/`autumn-macros` at this checkout,
+/// so the compile proves the emitted code against the code in this PR rather
+/// than the last published release.
+fn patch_autumn_web_path(project: &Path) {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let mut cargo_toml = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let web = workspace_root.join("autumn").display().to_string();
+    let macros = workspace_root.join("autumn-macros").display().to_string();
+    write!(
+        cargo_toml,
+        "\n[patch.crates-io]\nautumn-web = {{ path = \"{}\" }}\nautumn-macros = {{ path = \"{}\" }}\n",
+        web.replace('\\', "/"),
+        macros.replace('\\', "/"),
+    )
+    .expect("write to String is infallible");
+    fs::write(project.join("Cargo.toml"), cargo_toml).unwrap();
+}
+
+fn assert_project_cargo_checks(project: &Path, what: &str) {
+    patch_autumn_web_path(project);
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(project)
+        .output()
+        .expect("failed to run cargo check");
+    assert!(
+        check.status.success(),
+        "cargo check on the {what} --i18n scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Generate one `--i18n` scaffold in a fresh app and return its project root.
+fn i18n_scaffold(name: &str, fields: &[&str], flags: &[&str]) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", name]);
+    let project = tmp.path().join(name);
+    let mut args = vec!["generate", "scaffold", "Post"];
+    args.extend_from_slice(fields);
+    args.push("--i18n");
+    args.extend_from_slice(flags);
+    run_autumn_ok(&project, &args);
+    (tmp, project)
+}
+
+#[test]
+#[ignore = "slow: compiles a generated project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn i18n_scaffold_cargo_checks() {
+    let (_tmp, project) = i18n_scaffold(
+        "i18n-check",
+        &[
+            "title:String",
+            "body:Text",
+            "published:bool",
+            "views:i64",
+            "author_name:String",
+        ],
+        &[],
+    );
+    assert_project_cargo_checks(&project, "flat");
+}
+
+#[test]
+#[ignore = "slow: compiles a generated project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn i18n_scaffold_with_trash_and_search_cargo_checks() {
+    // `--soft-delete` with `--no-policy` is the combination that actually emits
+    // the Trash view: an owner-scoped index gates it off, which is precisely how
+    // the E0716 in its two extra `Column`s escaped the string-only tests.
+    let (_tmp, project) = i18n_scaffold(
+        "i18n-check-trash",
+        &["title:String", "body:Text"],
+        &["--soft-delete", "--searchable", "title,body", "--no-policy"],
+    );
+    assert_project_cargo_checks(&project, "soft-delete + searchable");
+}
+
+#[test]
+#[ignore = "slow: compiles a generated project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn i18n_scaffold_with_owner_scoped_search_cargo_checks() {
+    // An owner column puts the `search` handler within one argument of axum's
+    // 16-extractor `Handler` ceiling; adding `locale: Locale` went over it and
+    // failed with an unreadable elided-tuple trait error.
+    let (_tmp, project) = i18n_scaffold(
+        "i18n-check-owner",
+        &["title:String", "body:Text", "user_id:i64"],
+        &["--searchable", "title,body"],
+    );
+    assert_project_cargo_checks(&project, "owner-scoped searchable");
+}
+
+#[test]
+#[ignore = "slow: compiles a generated project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn i18n_scaffold_with_state_machine_and_attachment_cargo_checks() {
+    // A `:states(...)` column emits `transition_<field>` handlers that render
+    // the shared `show_view`, and an `Attachment` column adds the "Current
+    // <Field>:" label plus the multipart create/update path — two more places
+    // the locale has to reach.
+    let (_tmp, project) = i18n_scaffold(
+        "i18n-check-states",
+        &[
+            "title:String",
+            "status:String:states(draft -> published, published -> archived)",
+            "cover:Attachment",
+        ],
+        &[],
+    );
+    assert_project_cargo_checks(&project, "state machine + attachment");
+
+    // A lock column adds the transition handler's 409 branch, which re-renders
+    // the shared `show_view` a second time and flashes a stale-write notice.
+    // (Kept separate: `lock_version` alongside an `Attachment` column is refused
+    // for reasons that predate this flag.)
+    let (_tmp_lock, project_lock) = i18n_scaffold(
+        "i18n-check-lock",
+        &[
+            "title:String",
+            "status:String:states(draft -> published, published -> archived)",
+            "lock_version:i32",
+        ],
+        &[],
+    );
+    assert_project_cargo_checks(&project_lock, "state machine + optimistic lock");
 }

@@ -119,27 +119,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-replacing roughly a dozen strings and hand-authoring the matching keys,
   per resource. With the new flag: every user-facing string in the generated
   views (page titles, `h1` headings, buttons, links, index column headers,
-  show-page property labels, and form control labels) is emitted as a `t!`
-  lookup; each view-rendering handler takes the `Locale` extractor as its first
-  parameter; and `i18n/en.ftl` is created — or merged into, preserving values
-  you have already translated — with every key the views reference, valued with
-  the English the plain scaffold renders. The project is wired so those lookups
-  resolve with no further config: autumn-web's `i18n` feature is enabled,
-  `[i18n] default_locale = "en"` is added to `autumn.toml` when it has no
-  `[i18n]` block, and `.i18n_auto()` goes into the `AppBuilder` chain. Shared
-  chrome (`common.create`/`save`/`back`/`edit`/`new`/`delete`) is written once
-  per project and reused across resources rather than duplicated per model;
-  patterns that wrap a noun or a row key take a Fluent argument
-  (`common.new = New { $resource }`) so translations control word order.
-  Composes with `--searchable`, `--soft-delete`, `--sharded`, and the CSV
-  export, whose added strings are translated too; `--api` renders no labels, so
-  the flag is a no-op there and writes no `.ftl`. Refused with `--live`,
-  `--live-validation`, and `--belongs-to`, whose views render outside a request
-  or inside the parent resource's handler. **Without `--i18n`, scaffold output
-  is byte-for-byte unchanged.** One caveat: with the flag on, a single key per
-  field labels the index header, the show row, and the form control alike, so a
-  *multi-word* column's show-page label normalizes from "Author name" to
-  "Author Name" (single-word columns are unaffected).
+  show-page property labels, form control labels, enum options, empty-state
+  copy, the delete-confirm prompt, the one-shot flash notices, and the labels
+  the shared pager/bulk-delete/confirm widgets supply by default) is emitted as
+  a `t!` lookup; each view-rendering handler takes the `Locale` extractor as its
+  first parameter; and the default locale's bundle is created — or merged into,
+  preserving values you have already translated — with every key the views
+  reference and only those, so `autumn i18n check --strict` passes on the
+  result. Keys land in the locale the app actually treats as default, so a
+  project already on `default_locale = "fr"` gets `i18n/fr.ftl`. The project is
+  wired so those lookups resolve with no further config: autumn-web's `i18n`
+  feature is enabled, `[i18n] default_locale = "en"` is added to `autumn.toml`
+  when it has no `[i18n]` section, `.i18n_auto()` goes into the `AppBuilder`
+  chain (found with a comment- and string-aware scan, so it can never be written
+  into a comment), and the generated `Dockerfile` copies `i18n/` into both
+  stages — without it `.i18n_auto()` panics at startup in the container. Shared
+  chrome (`common.create`/`save`/`back`/`edit`/`delete`/`show`, plus the widget
+  defaults) is written once per project and reused across resources rather than
+  duplicated per model. Row keys and counts interpolate as Fluent arguments so a
+  translation can position them; the model's **name** never does — "New Post" is
+  a per-resource key, because a noun dropped into a sentence pattern cannot be
+  made to agree in gender or case from the bundle alone. Composes with
+  `--searchable`, `--soft-delete`, `--sharded`, and the CSV export, whose added
+  strings are translated too; `--api` renders no labels, so the flag is a no-op
+  there and writes no `.ftl`. Refused with `--live`, `--live-validation`, and
+  `--belongs-to`, whose views render outside a request or inside the parent
+  resource's handler, and for a resource named `Common`, whose keys would
+  collide with the shared chrome namespace. `autumn destroy scaffold … --i18n`
+  takes back that resource's keys (including continuation lines a translator
+  wrapped a value over) and drops the shared chrome once the last `--i18n`
+  resource is gone. **Without `--i18n`, scaffold output is byte-for-byte
+  unchanged.** One caveat: with the flag on, a single key per field labels the
+  index header, the show row, and the form control alike, so a *multi-word*
+  column's show-page label normalizes from "Author name" to "Author Name"
+  (single-word columns are unaffected). Validation messages — the
+  `UNIQUE_CONSTRAINTS` table's "has already been taken" — stay English, matching
+  the issue's out-of-scope list.
 
 - **`json`/`jsonb` scaffold field type (#1341):** `autumn generate scaffold Setting config:json` (or `config:jsonb`, `Json`, `Jsonb` — like `Attachment`/`attachment`, both the lowercase and PascalCase spelling of each alias are accepted) adds a `config` field whose model type is bare `serde_json::Value` — no wrapper struct — mapped to a Postgres `JSONB` column (`Nullable<Jsonb>` for `Option<json>`), matching loco's `... data:jsonb` in a single command. Unlike the existing JSONB-backed `Attachment` field (`autumn_web::storage::Blob`), which needed hand-written `FromSql`/`ToSql` because `Blob` is a local type, `json`/`jsonb` needs **zero** new `autumn-web` conversion code: diesel itself already implements `FromSql`/`ToSql<Jsonb, Pg>` for `serde_json::Value`, and — on the `SQLite` dev/test backend — `FromSql`/`ToSql<Json, Sqlite>` too (diesel 2.3+, behind the `serde_json`/`sqlite` cargo features this workspace already turns on unconditionally). The `SQLite` column is `TEXT` via diesel's `Json` sql-type specifically, not its `Jsonb` sql-type, which uses a proprietary binary encoding rather than plain-text JSON.
 
