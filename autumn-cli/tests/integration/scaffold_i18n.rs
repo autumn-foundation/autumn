@@ -84,6 +84,51 @@ fn t_macro_keys(src: &str) -> BTreeSet<String> {
     keys
 }
 
+/// String literals in Maud **body** position — `{ "text" }` — which is where
+/// user-facing prose ends up, as opposed to attribute values and class lists.
+///
+/// Deliberately generic. The older sweep below names the literals it expects to
+/// be gone, which only ever covers the surfaces someone remembered to list; the
+/// strings that survived longest into review were all behind a flag that sweep
+/// never turned on (the lock banner, the duplicate-value error, the attachment
+/// meta). This finds prose the flag has not claimed, without being told about
+/// it in advance.
+fn maud_body_prose(src: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < bytes.len() && bytes[j] != b'"' {
+            j += usize::from(bytes[j] == b'\\') + 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        let literal = &src[start..j];
+        // Body position: the literal follows `{` (with only whitespace between)
+        // or another body literal / splice. Attribute values follow `=`.
+        let before = src[..i].trim_end();
+        let is_body = before.ends_with('{') || before.ends_with(')');
+        // Prose, not markup: more than one word, and no CSS/class/path shape.
+        let is_prose = literal.contains(' ')
+            && literal.chars().any(|c| c.is_ascii_alphabetic())
+            && !literal.contains("autumn-")
+            && !literal.contains('<')
+            && !literal.starts_with('/');
+        if is_body && is_prose {
+            out.insert(literal.to_owned());
+        }
+        i = j + 1;
+    }
+    out
+}
+
 /// Every top-level key defined in an `.ftl` source.
 fn ftl_keys(src: &str) -> BTreeSet<String> {
     src.lines()
@@ -96,6 +141,91 @@ fn ftl_keys(src: &str) -> BTreeSet<String> {
         .filter_map(|l| l.split_once('='))
         .map(|(k, _)| k.trim().to_owned())
         .collect()
+}
+
+/// The sweep the named-literal test below cannot do: turn on every flag
+/// `--i18n` composes with and assert no PROSE survives in view body position.
+///
+/// Each of the last several English strings to reach review was behind a flag
+/// the basic fixture never set — the optimistic-lock conflict banner, the
+/// duplicate-value error, the attachment meta line. An allowlist finds those
+/// only once someone has already found them.
+#[test]
+fn no_prose_survives_in_a_maximally_flagged_scaffold() {
+    // Two scaffolds, because `lock_version` and `Attachment` are a refused
+    // combination for reasons that predate this flag (the multipart handler
+    // saves the blob before the row write). Between them every surface `--i18n`
+    // composes with is turned on.
+    let sweep = |name: &str, columns: &[&str]| -> BTreeSet<String> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_autumn_ok(tmp.path(), &["new", name]);
+        let project = tmp.path().join(name);
+        let mut args = vec!["generate", "scaffold", "Post"];
+        args.extend_from_slice(columns);
+        args.extend_from_slice(&["--i18n", "--soft-delete", "--searchable", "title,body"]);
+        run_autumn_ok(&project, &args);
+        maud_body_prose(&fs::read_to_string(project.join("src/routes/posts.rs")).unwrap())
+    };
+
+    let mut leaked = sweep(
+        "i18n-sweep-attach",
+        &[
+            "title:String:unique",
+            "body:Text",
+            "author_name:String",
+            "cover:Attachment",
+            "status:String:states(draft -> published, published -> archived)",
+        ],
+    );
+    leaked.extend(sweep(
+        "i18n-sweep-lock",
+        &[
+            "title:String:unique",
+            "body:Text",
+            "author_name:String",
+            "lock_version:i32",
+        ],
+    ));
+
+    // Anything left is either prose the flag forgot, or a widget's own chrome
+    // this scaffold cannot reach — and the latter is warned about by name, not
+    // emitted here.
+    assert!(
+        leaked.is_empty(),
+        "user-facing prose survived `--i18n` in view body position: {leaked:#?}\n\
+         Either route it through `ViewLabels`, or — if it comes from an \
+         autumn-web widget this scaffold only calls — warn about it and add it \
+         to the documented gaps."
+    );
+
+    // CONTROL. An empty result would otherwise prove only that the detector
+    // found nothing anywhere — so run it over the same scaffold generated
+    // WITHOUT the flag, where the prose is known to be present. This is what
+    // keeps the assertion above from silently decaying into a no-op.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "plain-sweep"]);
+    let plain = tmp.path().join("plain-sweep");
+    run_autumn_ok(
+        &plain,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String:unique",
+            "body:Text",
+            "author_name:String",
+            "lock_version:i32",
+            "--soft-delete",
+            "--searchable",
+            "title,body",
+        ],
+    );
+    let control = maud_body_prose(&fs::read_to_string(plain.join("src/routes/posts.rs")).unwrap());
+    assert!(
+        !control.is_empty(),
+        "the prose detector found nothing even in a scaffold with no `--i18n` \
+         at all, so the assertion above proves nothing — fix the detector"
+    );
 }
 
 #[test]

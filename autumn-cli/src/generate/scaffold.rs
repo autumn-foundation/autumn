@@ -1357,6 +1357,37 @@ fn plan_scaffold_with_options_impl(
                 ));
             }
 
+            // The same hazard through the OTHER spelling. A standalone
+            // `autumn-<profile>.toml` is merged LAST — after `autumn.toml` and
+            // its inline `[profile.…]` sections — so a project that keeps its
+            // production config in one has no `[profile.prod.i18n]` for the scan
+            // above to find, and the loudest case reports nothing at all.
+            let profile_files: Vec<(String, String)> = std::fs::read_dir(project_root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let name = path.file_name()?.to_str()?;
+                    let profile = name.strip_prefix("autumn-")?.strip_suffix(".toml")?;
+                    Some((profile.to_owned(), read_or_empty(&path)))
+                })
+                .collect();
+            for (profile, path) in scaffold_i18n::profile_file_i18n_overrides(
+                &profile_files,
+                &i18n_dir,
+                &default_locale,
+            ) {
+                plan.warn(format!(
+                    "`autumn-{profile}.toml` points i18n at `{path}`, not the `{}` this scaffold \
+                     wrote — and that file is layered LAST, so it wins over `autumn.toml`. Add \
+                     the same keys there (or a fallback chain that reaches the base bundle) — \
+                     `.i18n_auto()` PANICS at startup when the resolved default locale's file is \
+                     missing.",
+                    ftl_path.display()
+                ));
+            }
+
             // The image has to carry the bundle: `.i18n_auto()` panics at
             // startup when the default locale's file is missing, and the plain
             // `autumn new` Dockerfile copies no `i18n/` directory.
@@ -4799,15 +4830,25 @@ mod attachment_read_back_tests {{
     // their own edits with an explanation, never on a dead-end error page. The
     // wording states what happened and what to do, because a bare "409
     // Conflict" tells a non-technical author nothing.
+    // Issue #1349: the banner is the one thing an author reads at the moment
+    // their save is rejected, so it is the LAST place to fall back to English.
+    // Recorded only when the scaffold has a lock column — an `en.ftl` key no
+    // view references fails `autumn i18n check --strict`.
     let lock_conflict_banner = if lock_version.is_some() {
-        "@if lock_conflict {\n            \
-         p class=\"autumn-flash autumn-flash--error\" role=\"alert\" {\n                \
-         \"This record was changed by someone else since you opened it. \
-         Your changes are shown below — review them and save again to apply them.\"\n            \
-         }\n        \
-         }\n        "
+        format!(
+            "@if lock_conflict {{\n            \
+             p class=\"autumn-flash autumn-flash--error\" role=\"alert\" {{\n                \
+             {}\n            \
+             }}\n        \
+             }}\n        ",
+            labels.markup(
+                "common.lock.conflict",
+                "This record was changed by someone else since you opened it. \
+                 Your changes are shown below — review them and save again to apply them.",
+            )
+        )
     } else {
-        ""
+        String::new()
     };
     // The `--live-validation` form is raw markup rather than a `form_for` call,
     // so its hidden version input is spliced straight into the `<form>` body.
@@ -23169,6 +23210,71 @@ exempt_paths = [
         assert!(
             warning.contains("transition_controls"),
             "must name the widget the author has to look at: {warning}"
+        );
+    }
+
+    /// A standalone `autumn-<profile>.toml` is layered LAST, so it wins over
+    /// `autumn.toml` — and a project that keeps production config in one has no
+    /// `[profile.prod.i18n]` for the inline scan to find. Silence there is the
+    /// loudest failure: `.i18n_auto()` panics at startup on the missing bundle.
+    #[test]
+    fn i18n_warns_about_a_standalone_profile_override_file() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn-prod.toml"),
+            "[i18n]\ndir = \"translations\"\ndefault_locale = \"fr\"\n",
+        )
+        .unwrap();
+
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260504000000",
+            &i18n_options(),
+        )
+        .unwrap();
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("autumn-prod.toml"))
+            .unwrap_or_else(|| panic!("no profile-file warning in {:?}", plan.warnings));
+        assert!(
+            warning.contains("translations/fr.ftl"),
+            "must name the bundle the deploy actually loads: {warning}"
+        );
+    }
+
+    /// AC7: the conflict banner is what an author reads at the moment their
+    /// save is rejected — the last place to fall back to English.
+    #[test]
+    fn i18n_translates_the_lock_conflict_banner() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260505000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        assert!(
+            routes.contains("t!(locale, \"common.lock.conflict\")"),
+            "the banner must come from the bundle:\n{routes}"
+        );
+        assert!(
+            !routes.contains("\"This record was changed by someone else"),
+            "the English literal must be gone:\n{routes}"
+        );
+        assert!(
+            ftl.contains("common.lock.conflict = This record was changed"),
+            "{ftl}"
         );
     }
 

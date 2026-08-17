@@ -1093,6 +1093,44 @@ pub(super) fn stale_dockerfile_i18n_dir(dockerfile: &str, dir: &str) -> Option<S
 /// be its own bug, and there is no way to know which profile a given deploy
 /// uses — so this reports the overlays instead, and the caller warns. Returns
 /// the `(profile, dir/locale summary)` pairs that differ from the base.
+/// The same report for a STANDALONE `autumn-<profile>.toml`, whose `[i18n]`
+/// sits at top level rather than under `[profile.<env>.i18n]`.
+///
+/// These are a separate layer, not a spelling variant: the runtime merges
+/// `autumn-{profile}.toml` LAST, after both `autumn.toml` and its inline
+/// `[profile.…]` sections (`autumn/src/config.rs`). A project keeping its
+/// production config in one of these gets no `[profile.prod.i18n]` for
+/// [`profile_i18n_overrides`] to find, so scanning only the base file reports
+/// nothing at all — and the deploy that matters is exactly the one pointed
+/// somewhere this scaffold never wrote.
+///
+/// `files` is `(profile name, file contents)`; returns `(profile, path)` for
+/// those whose i18n differs from the base.
+pub(super) fn profile_file_i18n_overrides(
+    files: &[(String, String)],
+    base_dir: &str,
+    base_locale: &str,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (profile, contents) in files {
+        let (locale, dir) = configured_i18n(contents);
+        let differs = dir.as_deref().is_some_and(|d| d != base_dir)
+            || locale.as_deref().is_some_and(|l| l != base_locale);
+        if !differs {
+            continue;
+        }
+        out.push((
+            profile.clone(),
+            format!(
+                "{}/{}.ftl",
+                dir.as_deref().unwrap_or(base_dir),
+                locale.as_deref().unwrap_or(base_locale)
+            ),
+        ));
+    }
+    out
+}
+
 pub(super) fn profile_i18n_overrides(
     autumn_toml: &str,
     base_dir: &str,
@@ -1230,6 +1268,39 @@ pub(super) fn real_offsets(src: &str, needle: &str) -> Vec<usize> {
     out
 }
 
+/// The `(open, close)` byte offsets of the first brace-delimited block at or
+/// after `from` — the body of the item declared there.
+///
+/// Brace-matched, and blind to braces inside comments and string literals for
+/// the same reason [`real_offsets`] is: a `//` line mentioning `}` would
+/// otherwise close the body early and shrink the window this bounds a search
+/// to. `None` when there is no `{`, or when it is never closed.
+fn brace_block(src: &str, from: usize) -> Option<(usize, usize)> {
+    // `real_offsets` gives brace positions that are real code; the first one at
+    // or after `from` opens the body.
+    let open = real_offsets(&src[from..], "{").first().copied()? + from;
+    let tail = &src[open..];
+    let mut braces: Vec<(usize, bool)> = real_offsets(tail, "{")
+        .into_iter()
+        .map(|o| (o, true))
+        .chain(real_offsets(tail, "}").into_iter().map(|o| (o, false)))
+        .collect();
+    braces.sort_unstable();
+
+    let mut depth = 0usize;
+    for (at, is_open) in braces {
+        if is_open {
+            depth += 1;
+        } else {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some((open, open + at));
+            }
+        }
+    }
+    None
+}
+
 /// The outcome of trying to wire `.i18n_auto()` into `main.rs`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum I18nAutoWiring {
@@ -1284,8 +1355,21 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
             .next()
             .is_none_or(|c| !c.is_alphanumeric() && c != '_')
     });
-    let anchor = main_fn_at
-        .and_then(|at| offsets.iter().find(|&&o| o > at).copied())
+    // Bounded to `fn main`'s BODY, not merely "after where main starts". The
+    // layout that breaks the looser test is ordinary, not exotic:
+    //
+    //     fn build_app() -> App { App::new().routes(routes![...]) }   // before
+    //     fn main() { build_app().serve().await }                     // no `.routes(`
+    //     #[cfg(test)] fn test_app() -> App { ...routes(routes![...]) } // after
+    //
+    // "first `.routes(` after `fn main`" picks the TEST builder there, so the
+    // production app gets no bundle and renders raw keys — and the idempotency
+    // guard stops a later run from correcting it. If `main` has no builder of
+    // its own, falling back to the first overall is right: that is the
+    // `main` -> `build_app()` shape, where the only builder is the real one.
+    let main_body = main_fn_at.and_then(|at| brace_block(main_rs, at));
+    let anchor = main_body
+        .and_then(|(open, close)| offsets.iter().find(|&&o| o > open && o < close).copied())
         .or_else(|| offsets.first().copied());
     let Some(anchor) = anchor else {
         return I18nAutoWiring::NoAnchor;
@@ -1844,6 +1928,66 @@ mod tests {
     /// `fn main_preview()` is a different function that happens to share a
     /// prefix; anchoring on it wires the wrong builder, silently and (thanks to
     /// the idempotency guard) unrepairably.
+    /// "First `.routes(` after `fn main`" is not the same as "inside `main`".
+    /// The layout that separates them is ordinary: a builder helper above
+    /// `main`, and a `#[cfg(test)]` builder below it.
+    #[test]
+    fn the_anchor_stays_inside_mains_body() {
+        let main_rs = concat!(
+            "fn build_app() -> App {\n",
+            "    App::new()\n",
+            "        .routes(routes![index])\n",
+            "}\n",
+            "\n",
+            "fn main() {\n",
+            "    build_app().serve();\n",
+            "}\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "fn test_app() -> App {\n",
+            "    App::new()\n",
+            "        .routes(routes![fixture])\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("expected a wiring");
+        };
+        let real_at = out.find("routes![index]").unwrap();
+        let test_at = out.find("routes![fixture]").unwrap();
+        let call_at = out.find(".i18n_auto()").expect("inserted");
+        assert!(
+            call_at < real_at,
+            "`main` has no builder of its own, so the only real one wins — \
+             never the `#[cfg(test)]` one:\n{out}"
+        );
+        assert!(call_at < test_at, "{out}");
+    }
+
+    /// A builder INSIDE `main` still wins over one that merely precedes it.
+    #[test]
+    fn a_builder_inside_main_is_preferred_to_an_earlier_one() {
+        let main_rs = concat!(
+            "fn preview() -> App {\n",
+            "    App::new()\n",
+            "        .routes(routes![preview])\n",
+            "}\n",
+            "\n",
+            "fn main() {\n",
+            "    let app = App::new()\n",
+            "        .routes(routes![index]);\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("expected a wiring");
+        };
+        let preview_at = out.find("routes![preview]").unwrap();
+        let call_at = out.find(".i18n_auto()").expect("inserted");
+        assert!(
+            call_at > preview_at,
+            "the builder in `main` is the one that runs:\n{out}"
+        );
+    }
+
     #[test]
     fn the_main_anchor_matches_on_an_identifier_boundary() {
         let main_rs = concat!(
