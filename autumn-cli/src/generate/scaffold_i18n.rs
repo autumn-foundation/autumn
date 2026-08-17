@@ -1574,6 +1574,67 @@ pub(super) enum I18nAutoWiring {
     NoAnchor,
 }
 
+/// The `.routes(` call belonging to the builder the BINARY runs, or `None` when
+/// that cannot be told apart from a helper's.
+///
+/// A builder inside `fn main`'s body is unambiguous. Otherwise `main` delegates
+/// (`fn main() { build_app().serve() }`), and the only safe read is when the
+/// file holds exactly one builder. Picking the first of several was a guess
+/// dressed as a default: with a preview helper above `build_app()` it wires the
+/// preview, production renders raw keys, and the idempotency guard stops any
+/// later run from correcting it. A refusal the caller can warn about is worth
+/// more than a coin flip that cannot be retried.
+fn production_routes_anchor(main_rs: &str) -> Option<usize> {
+    let offsets = real_offsets(main_rs, ".routes(");
+    // On an IDENTIFIER boundary: `fn main_preview()` is a different function
+    // that happens to start with the same letters.
+    let main_fn_at = real_offsets(main_rs, "fn main").into_iter().find(|&at| {
+        main_rs[at + "fn main".len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+    });
+    if let Some((open, close)) = main_fn_at.and_then(|at| brace_block(main_rs, at))
+        && let Some(inside) = offsets.iter().find(|&&o| o > open && o < close)
+    {
+        return Some(*inside);
+    }
+    // `main` delegates. A `#[cfg(test)]` builder is not a candidate at all —
+    // it cannot be the one the binary runs — and excluding it keeps the very
+    // common `build_app()` + `#[cfg(test)] test_app()` shape working. What is
+    // left must be unambiguous: two ordinary builders (a preview helper beside
+    // the real one) is a coin flip, and a wrong flip cannot be retried, since
+    // the inserted call makes every later run a no-op.
+    let candidates: Vec<usize> = offsets
+        .iter()
+        .copied()
+        .filter(|&o| !in_cfg_test(main_rs, o))
+        .collect();
+    match candidates.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
+}
+
+/// Whether `at` sits inside a `#[cfg(test)]` item — the fixture module or
+/// function, whose builder is never the one the binary runs.
+fn in_cfg_test(src: &str, at: usize) -> bool {
+    real_offsets(src, "#[cfg(test)]")
+        .into_iter()
+        .filter_map(|attr| brace_block(src, attr))
+        .any(|(open, close)| open < at && at < close)
+}
+
+/// The body braces of the innermost `fn` containing `at`.
+fn enclosing_body(src: &str, at: usize) -> Option<(usize, usize)> {
+    real_offsets(src, "fn ")
+        .into_iter()
+        .filter(|&fn_at| fn_at < at)
+        .filter_map(|fn_at| brace_block(src, fn_at))
+        .filter(|&(open, close)| open < at && at < close)
+        .max_by_key(|&(open, _)| open)
+}
+
 /// Insert `.i18n_auto()` into the `AppBuilder` chain in `main.rs` so the
 /// generated `t!` lookups actually resolve (AC4's "zero further config").
 ///
@@ -1585,7 +1646,21 @@ pub(super) enum I18nAutoWiring {
 /// translation-management service must not have it swapped for a filesystem
 /// load.
 pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
-    if !real_offsets(main_rs, ".i18n_auto()").is_empty() {
+    // WHICH builder is the production one is decided first, and everything else
+    // is asked about that builder rather than about the file. A `main.rs` can
+    // hold several — a preview helper, a `#[cfg(test)]` fixture — and the
+    // earlier file-wide questions gave wrong answers on ordinary layouts: a
+    // `.i18n(test_bundle())` in a test fixture reported the whole app as
+    // custom-bundled and left production unwired, and an `.i18n_auto()` on the
+    // fixture reported it as already done.
+    let Some(anchor) = production_routes_anchor(main_rs) else {
+        return I18nAutoWiring::NoAnchor;
+    };
+    // The chain lives in one function body; that is the scope to ask about.
+    let scope = enclosing_body(main_rs, anchor).unwrap_or((0, main_rs.len()));
+    let within = |offsets: Vec<usize>| offsets.into_iter().any(|o| o > scope.0 && o < scope.1);
+
+    if within(real_offsets(main_rs, ".i18n_auto()")) {
         return I18nAutoWiring::Wired(main_rs.to_owned());
     }
     // Whitespace between the method and its paren is valid Rust — `.i18n
@@ -1595,46 +1670,9 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
     // switches to filesystem loading, so a missed detection silently replaces
     // an app's embedded or TMS-backed bundle and can panic when no bundle is
     // on disk.
-    if method_call_offsets(main_rs, ".i18n").next().is_some() {
+    if within(method_call_offsets(main_rs, ".i18n").collect()) {
         return I18nAutoWiring::CustomBundle;
     }
-    // Prefer a builder inside `fn main`. A `main.rs` can hold more than one —
-    // a preview or test-only router next to the one the binary runs — and
-    // wiring the wrong one is silent: the production app gets no bundle and
-    // renders raw keys, while the idempotency guard above stops any later run
-    // from correcting it. Falling back to the first overall keeps the common
-    // `fn main` -> `build_app()` shape working, where there is only one anyway.
-    let offsets = real_offsets(main_rs, ".routes(");
-    // On an IDENTIFIER boundary: `fn main_preview()` is a different function
-    // that happens to start with the same letters, and preferring it would
-    // anchor the insert inside a helper's builder — leaving the binary that
-    // actually runs without a bundle, silently and unrepairably (the
-    // idempotency guard above stops a later run from correcting it).
-    let main_fn_at = real_offsets(main_rs, "fn main").into_iter().find(|&at| {
-        main_rs[at + "fn main".len()..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
-    });
-    // Bounded to `fn main`'s BODY, not merely "after where main starts". The
-    // layout that breaks the looser test is ordinary, not exotic:
-    //
-    //     fn build_app() -> App { App::new().routes(routes![...]) }   // before
-    //     fn main() { build_app().serve().await }                     // no `.routes(`
-    //     #[cfg(test)] fn test_app() -> App { ...routes(routes![...]) } // after
-    //
-    // "first `.routes(` after `fn main`" picks the TEST builder there, so the
-    // production app gets no bundle and renders raw keys — and the idempotency
-    // guard stops a later run from correcting it. If `main` has no builder of
-    // its own, falling back to the first overall is right: that is the
-    // `main` -> `build_app()` shape, where the only builder is the real one.
-    let main_body = main_fn_at.and_then(|at| brace_block(main_rs, at));
-    let anchor = main_body
-        .and_then(|(open, close)| offsets.iter().find(|&&o| o > open && o < close).copied())
-        .or_else(|| offsets.first().copied());
-    let Some(anchor) = anchor else {
-        return I18nAutoWiring::NoAnchor;
-    };
     // Reuse the anchor line's own indentation so the inserted call sits in the
     // builder chain rather than at some arbitrary column.
     let line_start = main_rs[..anchor].rfind('\n').map_or(0, |i| i + 1);
@@ -2335,6 +2373,81 @@ mod tests {
             stale_dockerfile_i18n_dir(dockerfile, "translations v2"),
             None
         );
+    }
+
+    /// Two ordinary builders and no builder in `main` is a coin flip. Wiring
+    /// the wrong one leaves production rendering raw keys, and the inserted
+    /// call makes every later run a no-op, so the flip cannot be retried — a
+    /// refusal the caller warns about is worth more.
+    #[test]
+    fn an_ambiguous_delegating_main_is_refused_rather_than_guessed() {
+        let main_rs = concat!(
+            "fn preview() -> App {\n",
+            "    App::new().routes(routes![preview])\n",
+            "}\n",
+            "\n",
+            "fn build_app() -> App {\n",
+            "    App::new().routes(routes![index])\n",
+            "}\n",
+            "\n",
+            "fn main() {\n",
+            "    build_app().serve();\n",
+            "}\n",
+        );
+        assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::NoAnchor);
+    }
+
+    /// A `#[cfg(test)]` builder is not a candidate — it cannot be the one the
+    /// binary runs — so the very common `build_app()` + fixture shape stays
+    /// unambiguous rather than being refused.
+    #[test]
+    fn a_cfg_test_builder_is_not_a_candidate() {
+        let main_rs = concat!(
+            "fn build_app() -> App {\n",
+            "    App::new().routes(routes![index])\n",
+            "}\n",
+            "\n",
+            "fn main() {\n",
+            "    build_app().serve();\n",
+            "}\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn test_app() -> App {\n",
+            "        App::new().routes(routes![fixture])\n",
+            "    }\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("expected a wiring");
+        };
+        let real_at = out.find("routes![index]").unwrap();
+        let fixture_at = out.find("routes![fixture]").unwrap();
+        let call_at = out.find(".i18n_auto()").expect("inserted");
+        assert!(call_at < real_at && call_at < fixture_at, "{out}");
+    }
+
+    /// A custom bundle installed on a TEST builder says nothing about the
+    /// production one — reporting it file-wide left production unwired.
+    #[test]
+    fn a_custom_bundle_on_a_test_builder_does_not_block_production() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = App::new()\n",
+            "        .routes(routes![index]);\n",
+            "}\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn test_app() -> App {\n",
+            "        App::new().i18n(test_bundle()).routes(routes![fixture])\n",
+            "    }\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("expected production to be wired, not reported as custom-bundled");
+        };
+        assert!(out.contains(".i18n_auto()"), "{out}");
     }
 
     /// `.i18n_auto()` CLEARS a preloaded bundle and switches to filesystem
