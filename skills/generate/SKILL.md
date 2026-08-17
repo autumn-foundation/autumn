@@ -279,6 +279,16 @@ restore → purge. Not emitted for `--live`, `--live-validation`, `--sharded`, a
 owner-scoped index, `--api`, or any scaffold without `--soft-delete`
 (issue #1332).
 
+**Scaffold i18n views (trunk-dev)**: `--i18n` makes a generated resource
+translatable the moment it exists — `t!(locale, "key")` lookups in place of
+every English literal in the views, the `Locale` extractor on each view
+handler, and an `i18n/en.ftl` back-filled with exactly the keys referenced (no
+more — an unreferenced key is what `autumn i18n check` reports as unused). The
+generated app passes `autumn i18n check --strict`. Reach for it whenever the
+user mentions localization, translation, multiple languages, or a non-English
+audience; otherwise leave it off, since the default scaffold stays
+zero-i18n-config (issue #1349).
+
 **Scaffold no-JS uploads (trunk-dev)**: `Attachment` fields produce working
 `multipart/form-data` uploads without JS — the create/update handlers take a
 `Multipart` extractor and stream to the blob store via `save_to_blob_store`
@@ -539,6 +549,7 @@ Next steps:
 - `--no-policy` **(trunk-dev)**: For `scaffold` — skip the default-generated record-level `Policy`/`Scope`. Ignored under `--api` (issue #1125)
 - `--belongs-to <Parent>` **(trunk-dev)**: For `scaffold` — bind this resource to a parent as its child (issue #1323). Needs a matching `references` column (`--belongs-to Post` + `post:references`) and a parent that is **already scaffolded**. Emits `GET`/`POST /<parents>/{<fk>}/<children>` (the create takes the FK from the path, never the body), a `pub children_section(…)` helper, an injected children list + inline "add" form on the **parent's** generated `show` view, a back-link on the child's show view, and a cross-parent-isolation test. Marker-delimited, so re-runs are idempotent and `autumn destroy` reverses it. If the child has an owner column, the nested list inherits the flat index's `#[secured]` + owner scoping. Refused with `--api`/`--live`/`--live-validation`/`--sharded`, an `Attachment` column, a nullable or self-referential parent reference, or a parent that isn't scaffolded / is `slug`-keyed / carries a `:states(…)` column / has a hand-rewritten `show`. Single-level only
 - `--searchable <field,field>` **(trunk-dev)**: For `scaffold` — make the named text fields Postgres full-text searchable. Emits `#[searchable]` attrs, a `search_vector` generated column + GIN index migration, and a search box wired to `GET /<plural>/search`. Rejected for non-text/unknown fields, uuid-PK models, and owner-scoped models; gated off under `--live`/`--live-validation` (issue #1319)
+- `--i18n` **(trunk-dev)**: For `scaffold` — emit translatable views. Every user-facing string in the generated HTML (page titles, `h1`s, buttons, links, index column headers, show-page property labels, form control labels, enum options, empty states, the delete-confirm prompt) becomes a `t!(locale, "key")` lookup; each view handler takes the `Locale` extractor as its **first** parameter (`FromRequestParts`, so it must precede the single body extractor); and `i18n/en.ftl` is created — or merged into, never rewriting a value already translated — with exactly the keys the views reference, valued with the English the plain scaffold renders. Also enables autumn-web's `i18n` feature, adds `[i18n] default_locale = "en"` to `autumn.toml` when it has none, and wires `.i18n_auto()` into the `AppBuilder` chain, so an `en` app renders identically with zero further config. Shared chrome (`common.create`/`save`/`back`/`edit`/`new`/`delete`/`show`) is written once per project and reused across resources; each resource adds only its nouns (`post.name`, `post.name.plural`, `post.field.<column>`, `post.index.title`, …). Patterns that wrap a noun or row key take a Fluent argument (`common.new = New { $resource }`) rather than concatenating. Composes with `--searchable`, `--soft-delete`, `--sharded`, and the CSV export (their strings are translated too); a no-op under `--api` (no labels, no `.ftl`). Refused with `--live`/`--live-validation` (rows render outside a request, so no `Locale` in scope) and `--belongs-to` (the nested section splices into the parent's own `show` handler). Without the flag, scaffold output is byte-for-byte unchanged. One behaviour note: one key per field serves the index header, show row, and form label alike, so a *multi-word* column's show label normalizes from "Author name" to "Author Name" (issue #1349)
 
 ## Wizard name constraints
 
