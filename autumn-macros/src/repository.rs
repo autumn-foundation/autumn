@@ -615,6 +615,24 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                  hard-delete policy instead",
             ));
         }
+        if soft_delete
+            && spec.after.is_some()
+            && spec
+                .basis
+                .as_ref()
+                .is_some_and(|basis| basis == "deleted_at")
+        {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(after = \"...\", basis = deleted_at) on a soft_delete repository \
+                 silently sweeps nothing forever: the age branch's query always combines \
+                 `basis < cutoff` with the generated `deleted_at IS NULL` filter, and SQL's \
+                 NULL semantics mean no row ever satisfies both at once. Use a different \
+                 column for `basis` (e.g. created_at, updated_at, or last_seen_at) — \
+                 `purge_deleted_after` is what ages out already-soft-deleted rows by \
+                 `deleted_at`",
+            ));
+        }
         if sharded {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
@@ -22645,6 +22663,44 @@ mod tests {
         assert!(
             error.to_string().contains("batch_size"),
             "batch_size = 0 must error mentioning batch_size: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_deleted_at_as_soft_delete_age_basis() {
+        // Regression (#1342 review round 17): on a soft_delete repository,
+        // the age branch's query always combines `basis < cutoff` with the
+        // generated `deleted_at IS NULL` filter. If `basis = deleted_at`,
+        // SQL's NULL semantics mean no live row (deleted_at IS NULL) can
+        // ever also satisfy `deleted_at < cutoff` — the age sweep silently
+        // sweeps nothing forever, with no error signal.
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, retention(after = \"30d\", basis = deleted_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("basis = deleted_at on a soft_delete repository must be rejected");
+        };
+        assert!(
+            error.to_string().contains("deleted_at"),
+            "the error must mention deleted_at: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_accepts_deleted_at_basis_without_soft_delete() {
+        // `basis = deleted_at` is only a trap on a soft_delete repository —
+        // without soft_delete there is no generated `deleted_at IS NULL`
+        // filter to collide with, and a plain hard-delete table happening
+        // to have its own `deleted_at` column (e.g. from an external
+        // system) is a legitimate age basis.
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(after = \"30d\", basis = deleted_at)"
+                .parse()
+                .unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "basis = deleted_at without soft_delete must be accepted"
         );
     }
 
