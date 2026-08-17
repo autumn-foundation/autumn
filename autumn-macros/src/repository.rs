@@ -22091,7 +22091,8 @@ mod tests {
         let task_info_start = generated
             .find("fn __autumn_retention_task_info")
             .expect("task_info builder present");
-        let task_info_region = &generated[task_info_start..(task_info_start + 3000).min(generated.len())];
+        let task_info_region =
+            &generated[task_info_start..(task_info_start + 3000).min(generated.len())];
 
         assert!(
             task_info_region.matches("parse_duration").count() >= 3,
