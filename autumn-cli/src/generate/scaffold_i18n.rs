@@ -632,7 +632,6 @@ fn toml_scalar_value(raw: &str) -> Option<String> {
     let quote = trimmed.chars().next()?;
     let value = if quote == '"' || quote == '\'' {
         let rest = &trimmed[quote.len_utf8()..];
-        let slice = &rest[..rest.find(quote)?];
         // A BASIC string (double quotes) processes escapes; a LITERAL string
         // (single quotes) does not, by TOML's definition. Both of these values
         // become filesystem paths, so the raw source text is the wrong thing to
@@ -640,10 +639,25 @@ fn toml_scalar_value(raw: &str) -> Option<String> {
         // `dir = "i18n\\bundles"` on Windows would otherwise have the generator
         // writing to a directory with a literal double backslash in its name
         // while the runtime reads the single-backslash one.
+        //
+        // The terminator has to respect escapes for the same reason: a `\"` is
+        // part of the value, so stopping at it would truncate the path.
         if quote == '"' {
-            decode_toml_escapes(slice)
+            let mut end = None;
+            let mut escaped = false;
+            for (i, c) in rest.char_indices() {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    end = Some(i);
+                    break;
+                }
+            }
+            decode_toml_escapes(&rest[..end?])
         } else {
-            slice.to_owned()
+            rest[..rest.find(quote)?].to_owned()
         }
     } else {
         // A bare value runs to the first comment marker or end of line.
@@ -654,6 +668,56 @@ fn toml_scalar_value(raw: &str) -> Option<String> {
             .to_owned()
     };
     (!value.is_empty()).then_some(value)
+}
+
+/// Split an inline table's body on the commas that separate its members.
+///
+/// Quote-aware: a comma inside a value belongs to the value. `dir =
+/// "translations,v2"` is a legal directory name, and splitting through it
+/// leaves `toml_scalar_value` with an unterminated string, which it discards —
+/// so the generator would silently fall back to `i18n/` and write its keys
+/// where the runtime never looks.
+///
+/// Escapes are honoured while scanning so a `\"` inside a basic string does not
+/// end it. Literal (single-quoted) strings process no escapes, per TOML.
+fn split_inline_members(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in body.chars() {
+        match quote {
+            Some(q) => {
+                current.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' && q == '"' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                current.push(c);
+            }
+            None if c == ',' => out.push(std::mem::take(&mut current)),
+            None => current.push(c),
+        }
+    }
+    out.push(current);
+    out
+}
+
+/// Render `value` as the contents of a Rust double-quoted string literal.
+///
+/// A configured `dir` is interpolated into generated Rust (`embed_locales!`),
+/// and TOML happily carries characters that Rust's lexer reads as escapes: the
+/// Windows-shaped `dir = 'translations\bundles'` would emit `\b`, which is not
+/// a Rust escape at all, so the generated `main.rs` stops parsing — before any
+/// embed build, and for a project that merely configured a directory.
+fn rust_string_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Decode the escape sequences TOML defines for a basic string.
@@ -789,11 +853,10 @@ pub(super) fn configured_i18n(autumn_toml: &str) -> (Option<String>, Option<Stri
                 // An inline `i18n = { default_locale = "fr", … }`: read the
                 // members out of the braces.
                 None if raw_key.trim() == "i18n" => {
-                    for member in value
-                        .trim()
-                        .trim_matches(|c| c == '{' || c == '}')
-                        .split(',')
+                    for member in
+                        split_inline_members(value.trim().trim_matches(|c| c == '{' || c == '}'))
                     {
+                        let member = member.as_str();
                         let Some((k, v)) = member.split_once('=') else {
                             continue;
                         };
@@ -845,11 +908,15 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
         "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();";
     const INSTALL_ANCHOR: &str = "    let app = app.embedded_static(&EMBEDDED_STATIC);\n";
     // `embed_locales!()` defaults to `i18n/`; a configured directory is passed
-    // through as the macro's literal argument.
+    // through as the macro's literal argument — escaped, because this is the one
+    // place a `dir` read out of `autumn.toml` becomes Rust source.
     let macro_call = if dir == "i18n" {
         "autumn_web::embed_locales!()".to_owned()
     } else {
-        format!("autumn_web::embed_locales!(\"{dir}\")")
+        format!(
+            "autumn_web::embed_locales!(\"{}\")",
+            rust_string_escape(dir)
+        )
     };
     if main_rs.contains("EMBEDDED_LOCALES") {
         // Already embedded — but not necessarily from the right place. A
@@ -2005,6 +2072,41 @@ mod tests {
             "COPY --from=builder /app/assets /app/assets\n",
         );
         assert_eq!(stale_dockerfile_i18n_dir(dockerfile, "i18n"), None);
+    }
+
+    /// A comma inside a quoted value belongs to the value. Split through it and
+    /// `toml_scalar_value` sees an unterminated string and discards it, so the
+    /// generator falls back to `i18n/` and writes where the runtime never looks.
+    #[test]
+    fn an_inline_table_splits_on_separators_not_on_commas_in_values() {
+        let toml = r#"i18n = { dir = "translations,v2", default_locale = "fr" }"#;
+        assert_eq!(
+            configured_i18n(toml),
+            (Some("fr".to_owned()), Some("translations,v2".to_owned()))
+        );
+        // An escaped quote inside a basic string does not end it.
+        let escaped = r#"i18n = { dir = "od\"d", default_locale = "fr" }"#;
+        assert_eq!(configured_i18n(escaped).1.as_deref(), Some(r#"od"d"#));
+    }
+
+    /// `dir` is the one config value that becomes Rust SOURCE, and TOML happily
+    /// carries characters Rust's lexer reads as escapes.
+    #[test]
+    fn the_embedded_locale_dir_is_escaped_as_a_rust_literal() {
+        let main_rs = concat!(
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+        );
+        let out = ensure_embedded_locales(main_rs, r"translations\bundles").expect("anchors");
+        assert!(
+            out.contains(r#"embed_locales!("translations\\bundles")"#),
+            "a backslash must reach Rust as an escaped backslash, not as `\\b`:\n{out}"
+        );
+        let quoted = ensure_embedded_locales(main_rs, r#"od"d"#).expect("anchors");
+        assert!(
+            quoted.contains(r#"embed_locales!("od\"d")"#),
+            "a quote must not terminate the literal:\n{quoted}"
+        );
     }
 
     #[test]

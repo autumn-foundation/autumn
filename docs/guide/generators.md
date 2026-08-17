@@ -1248,6 +1248,13 @@ autumn generate scaffold Post title:String body:Text published:bool --i18n
   ({ $media }, { $size } bytes)` — so the media type and byte count
   interpolate as arguments and a translator owns the parentheses, the comma
   and the unit noun.
+- **One widget is not covered yet: the Markdown editor.** A `richtext`
+  column's field label translates, but `rich_text_area`'s own chrome — the
+  toolbar's group label and per-control names, the "Markdown supported…"
+  hint, and the preview heading — is rendered from consts inside autumn-web
+  and takes no label overrides, so it stays English in every locale.
+  Scaffolding a `richtext` column with `--i18n` warns and names the column,
+  rather than leaving you to find it in the browser.
 - Each view-rendering handler takes the `Locale` extractor as its **first**
   parameter (`Locale` is a `FromRequestParts` extractor, and axum requires
   the one body-consuming argument to stay last).

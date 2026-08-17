@@ -1284,6 +1284,33 @@ fn plan_scaffold_with_options_impl(
             // there and rebuilds its Cargo.toml action from DISK, so an edit
             // made at this point would be silently dropped.)
 
+            // `rich_text_area` renders its own chrome — the toolbar's
+            // "Markdown formatting" group label and per-control names, the
+            // "Markdown supported…" hint, and the preview pane's "Preview" —
+            // from consts inside autumn-web (`autumn/src/form.rs`). The
+            // generator translates the FIELD label it passes in and can reach no
+            // further: those strings have no parameter to route a `t!` through,
+            // and giving them one is a public API change to the framework's form
+            // helpers (a label per toolbar control, so a slice rather than a
+            // setter), not a scaffold change. Refusing `richtext` under `--i18n`
+            // would cost more than it buys — the rest of the form does
+            // translate — so the flag does what it can and says what it cannot.
+            let rich_text = rich_text_fields(&fields);
+            if !rich_text.is_empty() {
+                plan.warn(format!(
+                    "`--i18n` translated this form's labels, but the Markdown editor on {} \
+                     keeps autumn-web's own chrome in English — the toolbar labels, the \
+                     \"Markdown supported…\" hint, and the preview heading come from \
+                     `rich_text_area`, which takes no label overrides yet. Everything else in \
+                     the generated views goes through the bundle.",
+                    rich_text
+                        .iter()
+                        .map(|f| format!("`{}`", f.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+
             // A profile overlay can repoint i18n somewhere else entirely, and
             // the runtime resolves the fully layered config — so the base
             // bundle this generator just wrote (and the `COPY` it is about to
@@ -22999,6 +23026,52 @@ exempt_paths = [
         assert!(
             !routes.contains("(\"Created at\", maud::html!"),
             "show property labels must be translated:\n{routes}"
+        );
+    }
+
+    /// The Markdown editor's own chrome lives in autumn-web, behind no
+    /// parameter this generator can route a `t!` through, so an `--i18n`
+    /// scaffold with a `richtext` column translates everything EXCEPT that
+    /// widget. Silence would be the bug — the flag promises the whole view.
+    #[test]
+    fn i18n_says_so_when_the_rich_text_editor_keeps_english_chrome() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:richtext".into()],
+            "20260501000000",
+            &i18n_options(),
+        )
+        .unwrap();
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("Markdown editor"))
+            .unwrap_or_else(|| panic!("no rich-text warning in {:?}", plan.warnings));
+        assert!(
+            warning.contains("`body`"),
+            "must name the column: {warning}"
+        );
+
+        // A scaffold without one says nothing.
+        let tmp2 = project_with_main(default_main());
+        let without_rich_text = plan_scaffold_with_options(
+            tmp2.path(),
+            "Post",
+            &["title:String".into()],
+            "20260501000000",
+            &i18n_options(),
+        )
+        .unwrap();
+        assert!(
+            !without_rich_text
+                .warnings
+                .iter()
+                .any(|w| w.contains("Markdown editor")),
+            "{:?}",
+            without_rich_text.warnings
         );
     }
 
