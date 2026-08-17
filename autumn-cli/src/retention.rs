@@ -79,9 +79,7 @@ pub fn run(opts: &RetentionOptions<'_>) {
         .env("AUTUMN_PROFILE", opts.profile)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    if let Some(model) = opts.model {
-        command.env("AUTUMN_RETENTION_MODEL", model);
-    }
+    apply_model_env(&mut command, opts.model);
     crate::task::apply_managed_pg_env(&mut command, opts.package);
 
     let output = command.output().unwrap_or_else(|error| {
@@ -114,6 +112,27 @@ pub fn run(opts: &RetentionOptions<'_>) {
     );
 
     print!("{}", format_retention_report(&reports));
+}
+
+/// Set or clear `AUTUMN_RETENTION_MODEL` on `command` from `model`.
+///
+/// `Command` inherits the parent process's environment by default, so
+/// without an explicit removal when `model` is `None`, a
+/// `AUTUMN_RETENTION_MODEL` the CLI's own environment already happens to
+/// carry (e.g. exported by a wrapping script, or left over from a previous
+/// invocation) would silently leak into a filter-less `--dry-run` —
+/// reporting just that one model, or failing as not-found, despite
+/// `--model` never being passed on this invocation (#1342 review round 20).
+///
+/// A free function (rather than inlined into [`run`]) so this is
+/// unit-testable via [`Command::get_envs`] without actually spawning a
+/// process.
+fn apply_model_env(command: &mut Command, model: Option<&str>) {
+    if let Some(model) = model {
+        command.env("AUTUMN_RETENTION_MODEL", model);
+    } else {
+        command.env_remove("AUTUMN_RETENTION_MODEL");
+    }
 }
 
 /// Find the dry-run report line in the child's captured stdout and return
@@ -210,6 +229,49 @@ mod tests {
     fn extract_dry_run_json_returns_none_without_a_framed_line() {
         let stdout = "some unrelated log output\nno report line here\n";
         assert_eq!(extract_dry_run_json(stdout), None);
+    }
+
+    #[test]
+    fn apply_model_env_removes_an_inherited_var_when_no_model_given() {
+        // Regression (#1342 review round 20): without an explicit removal,
+        // an AUTUMN_RETENTION_MODEL already present in the CLI's own
+        // environment (e.g. exported by a wrapping script) would otherwise
+        // leak into a filter-less --dry-run via Command's default
+        // environment inheritance.
+        let mut command = std::process::Command::new("true");
+        // Simulate the var already being set, as it would be if inherited
+        // from the parent process's environment.
+        command.env("AUTUMN_RETENTION_MODEL", "LeftoverFromParentEnv");
+
+        apply_model_env(&mut command, None);
+
+        let value = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("AUTUMN_RETENTION_MODEL"));
+        assert_eq!(
+            value,
+            Some((std::ffi::OsStr::new("AUTUMN_RETENTION_MODEL"), None)),
+            "the variable must be explicitly removed (None value), not merely absent from \
+             overrides, or it would still be inherited from the parent environment: {value:?}"
+        );
+    }
+
+    #[test]
+    fn apply_model_env_sets_the_requested_model() {
+        let mut command = std::process::Command::new("true");
+
+        apply_model_env(&mut command, Some("Widget"));
+
+        let value = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("AUTUMN_RETENTION_MODEL"));
+        assert_eq!(
+            value,
+            Some((
+                std::ffi::OsStr::new("AUTUMN_RETENTION_MODEL"),
+                Some(std::ffi::OsStr::new("Widget"))
+            ))
+        );
     }
 
     #[test]
