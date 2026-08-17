@@ -11727,16 +11727,33 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // "30dd") compiles and boots cleanly and only panics on the sweep's
         // first scheduled tick, which can be well after an operator was
         // watching the deploy.
+        //
+        // Also validates the `chrono::Duration` conversion, not just
+        // `parse_duration`'s `std::time::Duration` (#1342 review round 15):
+        // a value that parses fine as a `std::time::Duration` — e.g. a huge
+        // second count like `"18446744073709551615s"` — can still overflow
+        // `chrono::Duration`'s range, which the sweep loop converts to in
+        // order to compute the cutoff. Without this, that class of error
+        // still only surfaced on the first scheduled tick rather than here.
         let after_boot_validation = spec.after.as_ref().map_or_else(
             || quote! {},
             |after| {
                 quote! {
-                    ::autumn_web::task::parse_duration(#after)
-                        .expect(concat!(
-                            "invalid duration in #[repository(..., retention(after = \"",
-                            #after,
-                            "\"))]"
-                        ));
+                    {
+                        let __duration = ::autumn_web::task::parse_duration(#after)
+                            .expect(concat!(
+                                "invalid duration in #[repository(..., retention(after = \"",
+                                #after,
+                                "\"))]"
+                            ));
+                        ::autumn_web::reexports::chrono::Duration::from_std(__duration)
+                            .expect(concat!(
+                                "retention `after` duration out of range in \
+                                 #[repository(..., retention(after = \"",
+                                #after,
+                                "\"))]"
+                            ));
+                    }
                 }
             },
         );
@@ -11744,12 +11761,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             || quote! {},
             |purge_after| {
                 quote! {
-                    ::autumn_web::task::parse_duration(#purge_after)
-                        .expect(concat!(
-                            "invalid duration in #[repository(..., retention(purge_deleted_after = \"",
-                            #purge_after,
-                            "\"))]"
-                        ));
+                    {
+                        let __duration = ::autumn_web::task::parse_duration(#purge_after)
+                            .expect(concat!(
+                                "invalid duration in #[repository(..., retention(purge_deleted_after = \"",
+                                #purge_after,
+                                "\"))]"
+                            ));
+                        ::autumn_web::reexports::chrono::Duration::from_std(__duration)
+                            .expect(concat!(
+                                "retention `purge_deleted_after` duration out of range in \
+                                 #[repository(..., retention(purge_deleted_after = \"",
+                                #purge_after,
+                                "\"))]"
+                            ));
+                    }
                 }
             },
         );
@@ -22809,6 +22835,42 @@ mod tests {
         assert!(
             task_info_region.contains("\"90d\""),
             "task_info builder must validate the `purge_deleted_after` duration string: {task_info_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_validates_chrono_cutoff_range_at_boot() {
+        // Regression (#1342 review round 15): `parse_duration` only
+        // validates that a duration string parses to a `std::time::Duration`
+        // — a value that parses fine there (e.g. a huge second count like
+        // "18446744073709551615s") can still overflow `chrono::Duration`'s
+        // range, which the sweep loop converts to in order to compute the
+        // cutoff. Before this fix, that class of error only panicked on the
+        // sweep's first scheduled tick; the task_info builder must also run
+        // the `chrono::Duration::from_std` conversion up front.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let task_info_start = generated
+            .find("fn __autumn_retention_task_info")
+            .expect("task_info builder present");
+        let task_info_region =
+            &generated[task_info_start..(task_info_start + 3000).min(generated.len())];
+
+        assert!(
+            task_info_region
+                .matches("chrono :: Duration :: from_std")
+                .count()
+                >= 2,
+            "task_info builder must validate both `after` and `purge_deleted_after` convert to \
+             a chrono::Duration up front (two from_std calls): {task_info_region}"
         );
     }
 
