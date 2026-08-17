@@ -1125,27 +1125,57 @@ pub(super) fn ensure_dockerfile_i18n_copy(dockerfile: &str, dir: &str) -> Option
 /// position is used as corroboration (this generator inserts immediately after
 /// the `migrations` anchors) and the result is still only ever advice.
 pub(super) fn stale_dockerfile_i18n_dir(dockerfile: &str, dir: &str) -> Option<String> {
-    /// The directory in `COPY <x> ./<x>`, when the line has that exact shape.
-    fn builder_copy_dir(line: &str) -> Option<&str> {
-        match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-            ["COPY", src, dest] if dest.strip_prefix("./") == Some(*src) => Some(src),
+    /// The `[src, dest]` of a `COPY`, in EITHER form.
+    ///
+    /// The JSON form is not optional to support: this generator emits it itself
+    /// for a `dir` containing whitespace, so a detector that only splits on
+    /// spaces cannot see the very lines it wrote — leaving the stale pair
+    /// unreported for exactly the paths that most need quoting.
+    fn copy_operands(line: &str, from_builder: bool) -> Option<(String, String)> {
+        let rest = line.trim().strip_prefix("COPY ")?.trim_start();
+        let rest = if from_builder {
+            rest.strip_prefix("--from=builder")?.trim_start()
+        } else {
+            if rest.starts_with("--") {
+                return None;
+            }
+            rest
+        };
+        if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            let mut parts = inner.split(',').map(|p| {
+                p.trim()
+                    .trim_matches('"')
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\")
+            });
+            return Some((parts.next()?, parts.next()?));
+        }
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        match parts.as_slice() {
+            [src, dest] => Some(((*src).to_owned(), (*dest).to_owned())),
             _ => None,
         }
+    }
+    /// The directory in `COPY <x> ./<x>`, in either form.
+    fn builder_copy_dir(line: &str) -> Option<String> {
+        let (src, dest) = copy_operands(line, false)?;
+        (dest.strip_prefix("./") == Some(src.as_str())).then_some(src)
     }
     /// The same for `COPY --from=builder /app/<x> /app/<x>`.
-    fn runtime_copy_dir(line: &str) -> Option<&str> {
-        match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-            ["COPY", "--from=builder", src, dest] if src == dest => {
-                src.strip_prefix("/app/").filter(|d| !d.contains('/'))
-            }
-            _ => None,
+    fn runtime_copy_dir(line: &str) -> Option<String> {
+        let (src, dest) = copy_operands(line, true)?;
+        if src != dest {
+            return None;
         }
+        src.strip_prefix("/app/")
+            .filter(|d| !d.contains('/'))
+            .map(str::to_owned)
     }
 
-    let after = |anchor: &str, extract: fn(&str) -> Option<&str>| -> Option<String> {
+    let after = |anchor: &str, extract: fn(&str) -> Option<String>| -> Option<String> {
         let mut lines = dockerfile.lines().skip_while(|l| l.trim() != anchor);
         lines.next()?;
-        extract(lines.next()?).map(str::to_owned)
+        extract(lines.next()?)
     };
 
     let builder = after("COPY migrations ./migrations", builder_copy_dir)?;
@@ -1210,6 +1240,48 @@ pub(super) fn profile_file_i18n_overrides(
 }
 
 pub(super) fn profile_i18n_overrides(
+    autumn_toml: &str,
+    base_dir: &str,
+    base_locale: &str,
+) -> Vec<(String, String)> {
+    // Structural when the file parses, for the same reason `configured_i18n` is
+    // — and this is the half of that change I left undone last round, which
+    // produced a finding immediately. `[profile.prod.i18n]` is only ONE of the
+    // spellings the runtime merges: `[profile.prod]` with `i18n = { … }`, a
+    // dotted `profile.prod.i18n.dir`, and any of them quoted all reach the same
+    // table, and a scan keyed on a header ending in `.i18n` sees none of them.
+    // Missing one means no warning for a production deploy pointed at a bundle
+    // this scaffold never wrote — which is a startup panic, not a cosmetic gap.
+    if let Ok(table) = autumn_toml.parse::<toml::Table>() {
+        let mut out = Vec::new();
+        let profiles = table.get("profile").and_then(toml::Value::as_table);
+        for (profile, value) in profiles.into_iter().flatten() {
+            let Some(i18n) = value.get("i18n") else {
+                continue;
+            };
+            let member = |key: &str| i18n.get(key).and_then(toml::Value::as_str);
+            let (dir, locale) = (member("dir"), member("default_locale"));
+            let differs =
+                dir.is_some_and(|d| d != base_dir) || locale.is_some_and(|l| l != base_locale);
+            if !differs {
+                continue;
+            }
+            out.push((
+                profile.clone(),
+                format!(
+                    "{}/{}.ftl",
+                    dir.unwrap_or(base_dir),
+                    locale.unwrap_or(base_locale)
+                ),
+            ));
+        }
+        out.sort();
+        return out;
+    }
+    profile_i18n_overrides_by_scan(autumn_toml, base_dir, base_locale)
+}
+
+fn profile_i18n_overrides_by_scan(
     autumn_toml: &str,
     base_dir: &str,
     base_locale: &str,
@@ -1383,12 +1455,12 @@ fn method_call_offsets<'a>(src: &'a str, method: &'a str) -> impl Iterator<Item 
         }
         // Only whitespace and comments may sit before the paren. `real_offsets`
         // over the remainder is the cheapest way to say "the next real token".
-        real_offsets(rest, "(").first() == Some(&byte_len_of_ignorable_prefix(rest))
+        real_offsets(rest, "(").first() == Some(&ignorable_prefix_len(rest))
     })
 }
 
 /// Length of the run of whitespace and comments at the start of `src`.
-fn byte_len_of_ignorable_prefix(src: &str) -> usize {
+pub(super) fn ignorable_prefix_len(src: &str) -> usize {
     let mut i = 0;
     loop {
         let rest = &src[i..];
@@ -2212,6 +2284,57 @@ mod tests {
                 "char_literal_end({src:?})"
             );
         }
+    }
+
+    /// The runtime merges `[profile.<env>]`'s `i18n` however it is spelled, so
+    /// a warning keyed on a header ending in `.i18n` misses most of them —
+    /// and a missed profile override is a production startup panic.
+    #[test]
+    fn every_spelling_of_a_profile_override_is_reported() {
+        for src in [
+            "[profile.prod.i18n]\ndir = \"translations\"\ndefault_locale = \"fr\"\n",
+            "[profile.prod]\ni18n = { dir = \"translations\", default_locale = \"fr\" }\n",
+            "[profile.prod]\ni18n.dir = \"translations\"\ni18n.default_locale = \"fr\"\n",
+            "profile.prod.i18n.dir = \"translations\"\nprofile.prod.i18n.default_locale = \"fr\"\n",
+            "[\"profile\".\"prod\".\"i18n\"]\ndir = \"translations\"\ndefault_locale = \"fr\"\n",
+        ] {
+            assert_eq!(
+                profile_i18n_overrides(src, "i18n", "en"),
+                vec![("prod".to_owned(), "translations/fr.ftl".to_owned())],
+                "for {src:?}"
+            );
+        }
+        // A profile that agrees with the base is not an override.
+        assert!(
+            profile_i18n_overrides("[profile.prod.i18n]\ndir = \"i18n\"\n", "i18n", "en")
+                .is_empty()
+        );
+    }
+
+    /// The generator emits the JSON `COPY` form itself for a `dir` with
+    /// whitespace, so a stale-pair detector that only splits on spaces cannot
+    /// see the lines it wrote — the paths that most need quoting would be the
+    /// ones that never get warned about.
+    #[test]
+    fn a_stale_json_form_copy_is_still_recognised() {
+        let dockerfile = concat!(
+            "FROM rust AS builder\n",
+            "COPY migrations ./migrations\n",
+            "COPY [\"translations v2\", \"./translations v2\"]\n",
+            "\n",
+            "FROM debian AS runtime\n",
+            "COPY --from=builder /app/migrations /app/migrations\n",
+            "COPY --from=builder [\"/app/translations v2\", \"/app/translations v2\"]\n",
+        );
+        assert_eq!(
+            stale_dockerfile_i18n_dir(dockerfile, "i18n").as_deref(),
+            Some("translations v2")
+        );
+        // The same directory, configured, is not stale.
+        assert_eq!(
+            stale_dockerfile_i18n_dir(dockerfile, "translations v2"),
+            None
+        );
     }
 
     /// `.i18n_auto()` CLEARS a preloaded bundle and switches to filesystem

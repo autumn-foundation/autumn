@@ -531,9 +531,10 @@ fn t_macro_keys(src: &str) -> Vec<String> {
             continue;
         };
         cursor = comma + 1;
-        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor += 1;
-        }
+        // Whitespace AND comments — `t!(locale, /* shared action */ "common.save")`
+        // is a valid call, and stopping at the `/` drops a live lookup, which
+        // prunes a key the call still needs.
+        cursor += super::scaffold_i18n::ignorable_prefix_len(&src[cursor..]);
         // `t!` takes a `LitStr`, and a RAW string is one: `r"common.save"` and
         // `r#"…"#` are as valid as `"…"`. Requiring the plain form drops such a
         // lookup from the surviving set and prunes a key that is still called.
@@ -1978,6 +1979,27 @@ mod tests {
         "##;
         let keys = t_macro_keys(src);
         for expected in ["common.raw", "common.hashed", "common.plain"] {
+            assert!(
+                keys.iter().any(|k| k == expected),
+                "{expected} not found in {keys:?}"
+            );
+        }
+    }
+
+    /// A comment may sit anywhere whitespace may, including between the comma
+    /// and the key.
+    #[test]
+    fn chrome_scan_reads_past_a_comment_before_the_key() {
+        let src = r#"
+            let a = t!(locale, /* shared action */ "common.save");
+            let b = t!(
+                locale,
+                // the pager's own label
+                "common.next"
+            );
+        "#;
+        let keys = t_macro_keys(src);
+        for expected in ["common.save", "common.next"] {
             assert!(
                 keys.iter().any(|k| k == expected),
                 "{expected} not found in {keys:?}"
