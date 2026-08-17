@@ -1287,15 +1287,19 @@ Notes and limits:
   keys that are missing; an existing value is left exactly as edited, and
   a new key added by a later run lands inside its resource's block rather
   than at the end of the file.
-- **Keys go to the configured default locale.** A project whose
-  `autumn.toml` already says `default_locale = "fr"` gets `i18n/fr.ftl`,
-  because that is the bundle its lookups resolve through. Only a project
-  with no `[i18n]` block gets one written for it (`default_locale = "en"`).
+- **Keys go to the bundle the app actually reads.** A project whose
+  `autumn.toml` says `default_locale = "fr"` and `dir = "translations"`
+  gets `translations/fr.ftl`, because that is what its lookups resolve
+  through. Only a project with no `[i18n]` section gets one written for it
+  (`default_locale = "en"`, `i18n/`).
 - **The Docker image gets the bundle.** `.i18n_auto()` reads the default
   locale's file at startup and *panics* if it is missing, so the generator
-  adds `COPY i18n ./i18n` to both stages of a generated `Dockerfile`.
-- **`autumn destroy scaffold … --i18n`** removes that resource's key block
-  — including any continuation lines a translator wrapped a value over —
+  adds a `COPY` for the configured bundle directory to both stages of a
+  generated `Dockerfile`.
+- **`autumn destroy scaffold … --i18n`** removes that resource's marked key
+  block — including any continuation lines a translator wrapped a value
+  over, and nothing outside the block, so a hand-authored
+  `post.email.subject` of your own survives —
   and leaves the file, the `i18n` feature, `[i18n]`, and `.i18n_auto()` in
   place, since those are project-level and shared. The `common.*` chrome
   survives as long as another `--i18n` resource still references it; when

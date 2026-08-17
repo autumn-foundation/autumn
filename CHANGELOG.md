@@ -126,8 +126,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first parameter; and the default locale's bundle is created — or merged into,
   preserving values you have already translated — with every key the views
   reference and only those, so `autumn i18n check --strict` passes on the
-  result. Keys land in the locale the app actually treats as default, so a
-  project already on `default_locale = "fr"` gets `i18n/fr.ftl`. The project is
+  result. Keys land in the bundle the app actually reads — a project on
+  `default_locale = "fr"` with `dir = "translations"` gets
+  `translations/fr.ftl`. The project is
   wired so those lookups resolve with no further config: autumn-web's `i18n`
   feature is enabled, `[i18n] default_locale = "en"` is added to `autumn.toml`
   when it has no `[i18n]` section, `.i18n_auto()` goes into the `AppBuilder`
@@ -146,8 +147,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--belongs-to`, whose views render outside a request or inside the parent
   resource's handler, and for a resource named `Common`, whose keys would
   collide with the shared chrome namespace. `autumn destroy scaffold … --i18n`
-  takes back that resource's keys (including continuation lines a translator
-  wrapped a value over) and drops the shared chrome once the last `--i18n`
+  takes back that resource's marked block (including continuation lines a
+  translator wrapped a value over, and nothing outside it, so hand-authored
+  keys on the same prefix survive) and drops the shared chrome once the last `--i18n`
   resource is gone. **Without `--i18n`, scaffold output is byte-for-byte
   unchanged.** One caveat: with the flag on, a single key per field labels the
   index header, the show row, and the form control alike, so a *multi-word*

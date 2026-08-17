@@ -1136,18 +1136,20 @@ fn plan_scaffold_with_options_impl(
         let autumn_toml_path_for_i18n = project_root.join("autumn.toml");
         let referenced_keys = labels.used_keys();
         if labels.enabled() && !referenced_keys.is_empty() {
-            // Write to the locale the app actually treats as default, not
-            // literally `en`. A project already configured with
-            // `default_locale = "fr"` resolves every lookup through `fr.ftl`
-            // and its fallback chain: keys parked in `en.ftl` would render as
-            // `{$post.index.title}` placeholders at runtime and read as
-            // "missing from the default locale" to `autumn i18n check`.
-            let default_locale = scaffold_i18n::configured_default_locale(&read_or_empty(
-                &autumn_toml_path_for_i18n,
-            ))
-            .unwrap_or_else(|| "en".to_owned());
+            // Write to the bundle the app actually resolves through, not a
+            // hardcoded `i18n/en.ftl`. A project configured with
+            // `default_locale = "fr"` — or `dir = "translations"` — looks its
+            // keys up somewhere else entirely, so keys parked at the default
+            // path would render as visible `{$post.index.title}` placeholders
+            // and read as "missing from the default locale" to `autumn i18n
+            // check`, while `t!`'s compile-time validation (which looks under
+            // `i18n/` for `en`) passed and hid it until runtime.
+            let (configured_locale, configured_dir) =
+                scaffold_i18n::configured_i18n(&read_or_empty(&autumn_toml_path_for_i18n));
+            let default_locale = configured_locale.unwrap_or_else(|| "en".to_owned());
+            let i18n_dir = configured_dir.unwrap_or_else(|| "i18n".to_owned());
             let ftl_path = project_root
-                .join("i18n")
+                .join(&i18n_dir)
                 .join(format!("{default_locale}.ftl"));
             // NOT `read_or_empty`: that maps an unreadable or non-UTF-8 file to
             // `""`, and the merge would then write a fresh English file straight
@@ -1203,17 +1205,18 @@ fn plan_scaffold_with_options_impl(
             let dockerfile_path = project_root.join("Dockerfile");
             if dockerfile_path.exists() {
                 let base = read_or_empty(&dockerfile_path);
-                match scaffold_i18n::ensure_dockerfile_i18n_copy(&base, "i18n") {
+                match scaffold_i18n::ensure_dockerfile_i18n_copy(&base, &i18n_dir) {
                     Some(updated) if updated != base => {
                         plan.modify(dockerfile_path, updated);
                     }
                     Some(_) => {}
-                    None => plan.warn(
-                        "Dockerfile has no `COPY migrations` line to anchor on, so the `i18n/` \
-                         directory was not added to it. Copy `i18n/` into both the builder and \
-                         runtime stages by hand — the app calls `.i18n_auto()`, which PANICS at \
-                         startup if the default locale's `.ftl` is missing from the image.",
-                    ),
+                    None => plan.warn(format!(
+                        "Dockerfile has no `COPY migrations` line to anchor on, so the \
+                         `{i18n_dir}/` directory was not added to it. Copy `{i18n_dir}/` into \
+                         both the builder and runtime stages by hand — the app calls \
+                         `.i18n_auto()`, which PANICS at startup if the default locale's \
+                         `.ftl` is missing from the image."
+                    )),
                 }
             }
 

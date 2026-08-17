@@ -365,72 +365,44 @@ pub(super) fn remove_en_ftl_keys(existing: &str, pascal_name: &str, resource: &s
     remove_chrome_block(&stripped)
 }
 
-/// Remove every `common.*` key (and the chrome header) written by this
-/// generator, leaving any hand-authored key untouched.
+/// Remove the shared chrome block this generator wrote.
+///
+/// Marker-bounded like [`remove_marked_block`], so a hand-authored `common.*`
+/// key outside the block survives.
 fn remove_chrome_block(existing: &str) -> String {
-    let mut out: Vec<&str> = Vec::with_capacity(existing.lines().count());
-    let mut dropping_continuations = false;
-    for line in existing.lines() {
-        let indented = line.starts_with(' ') || line.starts_with('\t');
-        if indented {
-            if dropping_continuations {
-                continue;
-            }
-            out.push(line);
-            continue;
-        }
-        dropping_continuations = false;
-        if line.trim_end() == COMMON_HEADER {
-            continue;
-        }
-        if line
-            .split_once('=')
-            .is_some_and(|(k, _)| k.trim().starts_with("common."))
-        {
-            dropping_continuations = true;
-            continue;
-        }
-        out.push(line);
-    }
-    collapse_blank_runs(&out)
+    remove_marked_block(existing, COMMON_HEADER)
 }
 
-fn remove_resource_block(existing: &str, pascal_name: &str, resource: &str) -> String {
+fn remove_resource_block(existing: &str, pascal_name: &str, _resource: &str) -> String {
     let header = format!("{RESOURCE_HEADER_PREFIX}{pascal_name}{RESOURCE_HEADER_SUFFIX}");
-    let prefix = format!("{resource}.");
-    let mut out: Vec<&str> = Vec::with_capacity(existing.lines().count());
-    // A Fluent value may continue over following INDENTED lines. Dropping the
-    // `key =` line alone would leave those orphaned, which the loader either
-    // rejects outright ("indented continuation has no preceding key" — and
-    // `.i18n_auto()` turns that into a startup panic) or silently glues onto
-    // whichever key precedes them, corrupting a translation that has nothing to
-    // do with the destroyed resource. So a removed key takes its continuation
-    // lines with it.
-    let mut dropping_continuations = false;
-    for line in existing.lines() {
-        let indented = line.starts_with(' ') || line.starts_with('\t');
-        if indented {
-            if dropping_continuations {
-                continue;
-            }
-            out.push(line);
-            continue;
-        }
-        dropping_continuations = false;
-        if line.trim_end() == header {
-            continue;
-        }
-        // Only top-level `key = value` lines define keys.
-        let is_resource_key = line
-            .split_once('=')
-            .is_some_and(|(k, _)| k.trim().starts_with(&prefix));
-        if is_resource_key {
-            dropping_continuations = true;
-            continue;
-        }
-        out.push(line);
-    }
-    collapse_blank_runs(&out)
+    remove_marked_block(existing, &header)
+}
+
+/// Remove the marked comment `header` and the run of key lines it introduces.
+///
+/// Bounded by the MARKER, not by key prefix. A prefix sweep would also delete a
+/// hand-authored `post.email.subject` — a translation the application owns,
+/// which this generator never wrote and has no business removing — purely
+/// because it happens to start with the resource's name. The merge path goes to
+/// some trouble never to overwrite a value somebody else authored; destroy has
+/// to be equally careful about what it takes away. So removal covers exactly
+/// the block `merge_en_ftl` writes: the header line, then every following line
+/// up to the first blank line or foreign comment.
+///
+/// That run includes any INDENTED continuation lines. Leaving those behind is
+/// how a destroy corrupts a bundle: the loader either rejects the orphan
+/// outright — and `.i18n_auto()` turns that into a startup panic — or silently
+/// glues it onto whichever key precedes it, rewriting an unrelated translation.
+fn remove_marked_block(existing: &str, header: &str) -> String {
+    let Some(end) = block_end(existing, header) else {
+        return existing.to_owned();
+    };
+    let start = existing.find(header).expect("block_end found the header");
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..start]);
+    out.push_str(&existing[end..]);
+    let lines: Vec<&str> = out.lines().collect();
+    collapse_blank_runs(&lines)
 }
 
 /// Re-join `lines`, collapsing the blank runs a removed block leaves behind and
@@ -453,44 +425,92 @@ fn collapse_blank_runs(lines: &[&str]) -> String {
     joined
 }
 
-/// The `default_locale` an existing `autumn.toml` configures, if any.
+/// The name of the TOML table `line` opens, if it opens one.
 ///
-/// The generated keys have to land in the bundle the app actually resolves
-/// through. A project on `default_locale = "fr"` looks up every key in
-/// `fr.ftl` first and falls back down its configured chain — which need not
-/// include `en` — so keys written to `en.ftl` would render as visible
-/// `{$key}` placeholders and read as missing to `autumn i18n check`.
+/// Tolerates the spacing and trailing comments TOML allows — `[ i18n ]` and
+/// `[i18n] # locale settings` are both the i18n table. Getting this wrong is not
+/// cosmetic: missing an existing table makes the generator append a SECOND
+/// `[i18n]`, and a duplicate table makes the whole file unparseable, taking the
+/// application's entire configuration down with it.
+fn toml_table_name(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    // Anything after the closing bracket must be blank or a comment — otherwise
+    // this is not a table header at all.
+    let tail = rest[close + 1..].trim();
+    if !tail.is_empty() && !tail.starts_with('#') {
+        return None;
+    }
+    Some(rest[..close].trim())
+}
+
+/// The scalar on the right of a TOML `key = value`, unquoted, with any trailing
+/// comment removed.
 ///
-/// Deliberately a line scan rather than a TOML parse: this only needs the one
-/// key, the file may carry profile overlays the generator has no business
-/// interpreting, and a malformed `autumn.toml` should not fail generation here
-/// (the app's own loader reports that far better). Returns `None` when there is
-/// no `[i18n]` section or it names no default, so the caller falls back to `en`.
-pub(super) fn configured_default_locale(autumn_toml: &str) -> Option<String> {
+/// The comment has to be stripped with the quoting in mind, not before it: `#`
+/// is an ordinary character inside a string, so cutting at the first `#` would
+/// mangle `dir = "i18n#v2"`, while ignoring comments entirely turns
+/// `default_locale = "fr" # our default` into the locale tag
+/// `fr" # our default` — and the generator would then cheerfully create a file
+/// named after it. Returns `None` for an empty or unparseable value.
+fn toml_scalar_value(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim_start();
+    let quote = trimmed.chars().next()?;
+    let value = if quote == '"' || quote == '\'' {
+        let rest = &trimmed[quote.len_utf8()..];
+        &rest[..rest.find(quote)?]
+    } else {
+        // A bare value runs to the first comment marker or end of line.
+        trimmed
+            .split_once('#')
+            .map_or(trimmed, |(before, _)| before)
+            .trim_end()
+    };
+    (!value.is_empty()).then_some(value)
+}
+
+/// What an existing `autumn.toml` configures for i18n: the default locale, and
+/// the directory its bundles live in.
+///
+/// Both matter for where the generated keys go. The runtime resolves lookups
+/// through `<dir>/<default_locale>.ftl`, so writing to a hardcoded
+/// `i18n/en.ftl` in a project configured otherwise leaves the app's real bundle
+/// without a single generated key: every label renders as a visible `{$key}`
+/// placeholder, and `autumn i18n check` reports them all missing — while `t!`'s
+/// compile-time validation (which looks under `i18n/` for `en` by default)
+/// passes, so nothing catches it until runtime.
+///
+/// Deliberately a line scan rather than a TOML parse: this needs two keys, the
+/// file may carry profile overlays the generator has no business interpreting,
+/// and a malformed `autumn.toml` should not fail generation here — the app's own
+/// loader reports that far better. `[profile.<env>.i18n]` overlays are ignored:
+/// the generator writes the base bundle, which every profile inherits.
+pub(super) fn configured_i18n(autumn_toml: &str) -> (Option<String>, Option<String>) {
     let mut in_i18n = false;
+    let (mut locale, mut dir) = (None, None);
     for line in autumn_toml.lines() {
-        let trimmed = line.trim();
-        if let Some(name) = trimmed
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            // `[profile.prod.i18n]` overlays are deliberately ignored: the
-            // generator writes the base bundle, which every profile inherits.
-            in_i18n = name.trim() == "i18n";
+        if let Some(name) = toml_table_name(line) {
+            in_i18n = name == "i18n";
             continue;
         }
         if !in_i18n {
             continue;
         }
-        if let Some(value) = trimmed.strip_prefix("default_locale") {
-            let value = value.trim_start().strip_prefix('=')?.trim();
-            let tag = value.trim_matches(|c| c == '"' || c == '\'');
-            if !tag.is_empty() {
-                return Some(tag.to_owned());
-            }
+        let trimmed = line.trim();
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let Some(value) = toml_scalar_value(value) else {
+            continue;
+        };
+        match key.trim() {
+            "default_locale" => locale = Some(value.to_owned()),
+            "dir" => dir = Some(value.to_owned()),
+            _ => {}
         }
     }
-    None
+    (locale, dir)
 }
 
 /// Ship the `i18n/` sidecar into a generated `Dockerfile`, in both stages.
@@ -541,16 +561,11 @@ pub(super) fn ensure_dockerfile_i18n_copy(dockerfile: &str, dir: &str) -> Option
 /// its `default_locale` may not be `en`, and rewriting it would silently
 /// repoint the bundle the app loads.
 pub(super) fn ensure_i18n_config_block(existing: &str) -> String {
-    // Match the SECTION, not the literal text: `[ i18n ]` is legal TOML, and
-    // appending a second `[i18n]` beside it makes the whole file unparseable
-    // ("cannot declare i18n twice"), taking the app's config down with it.
-    let already_configured = existing.lines().any(|line| {
-        let t = line.trim();
-        t.strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-            .is_some_and(|name| name.trim() == "i18n")
-    });
-    if already_configured {
+    // Match the SECTION, not the literal text — see `toml_table_name`.
+    if existing
+        .lines()
+        .any(|line| toml_table_name(line) == Some("i18n"))
+    {
         return existing.to_owned();
     }
     let mut out = existing.to_owned();
@@ -650,7 +665,7 @@ pub(super) enum I18nAutoWiring {
 ///
 /// Inserted immediately before the first REAL `.routes(` call — the same anchor
 /// `autumn new --with-i18n` uses, but found with a comment/string-aware scan
-/// (see [`real_routes_call_offsets`]). A `main.rs` that already installs a
+/// (see [`real_offsets`]). A `main.rs` that already installs a
 /// bundle — `.i18n_auto()` or an explicit `.i18n(...)` — is left untouched: an
 /// app that built its own `Bundle` from embedded files or a
 /// translation-management service must not have it swapped for a filesystem
@@ -937,21 +952,48 @@ mod tests {
     }
 
     #[test]
-    fn default_locale_is_read_from_the_config() {
-        assert_eq!(
-            configured_default_locale("[i18n]\ndefault_locale = \"fr\"\n").as_deref(),
-            Some("fr")
+    fn the_configured_locale_and_directory_are_read_from_the_config() {
+        let (locale, dir) = configured_i18n("[i18n]\ndefault_locale = \"fr\"\n");
+        assert_eq!(locale.as_deref(), Some("fr"));
+        assert_eq!(dir, None);
+        // Spacing and trailing comments are both legal TOML.
+        let (locale, dir) = configured_i18n(
+            "[ i18n ] # locale settings\ndefault_locale = 'pt-BR' # ours\ndir = \"translations\"\n",
         );
+        assert_eq!(locale.as_deref(), Some("pt-BR"));
+        assert_eq!(dir.as_deref(), Some("translations"));
+        // `#` is an ordinary character inside a quoted value.
+        let (_, dir) = configured_i18n("[i18n]\ndir = \"i18n#v2\"\n");
+        assert_eq!(dir.as_deref(), Some("i18n#v2"));
+        // Keys under some OTHER section are not ours.
         assert_eq!(
-            configured_default_locale("[ i18n ]\ndefault_locale = 'pt-BR'\n").as_deref(),
-            Some("pt-BR")
+            configured_i18n("[server]\ndefault_locale = \"fr\"\ndir = \"x\"\n"),
+            (None, None)
         );
-        // A `default_locale` under some OTHER section is not ours.
-        assert_eq!(
-            configured_default_locale("[server]\ndefault_locale = \"fr\"\n"),
-            None
+        assert_eq!(configured_i18n("[server]\nport = 3000\n"), (None, None));
+    }
+
+    #[test]
+    fn config_block_detects_a_header_with_a_trailing_comment() {
+        // `[i18n] # locale settings` is one table, not none — appending a second
+        // `[i18n]` beside it makes the file unparseable and takes the whole
+        // application config down with it.
+        let existing = "[i18n] # locale settings\ndefault_locale = \"fr\"\n";
+        assert_eq!(ensure_i18n_config_block(existing), existing);
+    }
+
+    #[test]
+    fn removal_leaves_hand_authored_keys_on_the_same_prefix_alone() {
+        // A `post.email.subject` the application owns is not this generator's
+        // to delete just because it starts with the resource's name.
+        let generated = merge_en_ftl("", "Post", "post", &keys(&[("post.new", "New Post")]));
+        let with_hand_authored = format!("{generated}\n# App copy\npost.email.subject = Welcome\n");
+        let out = remove_en_ftl_keys(&with_hand_authored, "Post", "post");
+        assert!(
+            out.contains("post.email.subject = Welcome"),
+            "a hand-authored key must survive destroy:\n{out}"
         );
-        assert_eq!(configured_default_locale("[server]\nport = 3000\n"), None);
+        assert!(!out.contains("post.new"), "{out}");
     }
 
     #[test]

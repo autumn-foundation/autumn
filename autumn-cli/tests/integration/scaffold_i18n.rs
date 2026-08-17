@@ -477,7 +477,11 @@ fn keys_land_in_the_locale_the_app_actually_treats_as_default() {
     let project = tmp.path().join("fr-app");
     let autumn_toml = project.join("autumn.toml");
     let mut config = fs::read_to_string(&autumn_toml).unwrap();
-    config.push_str("\n[i18n]\ndefault_locale = \"fr\"\nsupported_locales = [\"fr\"]\n");
+    // A trailing comment and a custom bundle directory are both legal, and both
+    // have to be honoured: the app resolves lookups through `<dir>/<tag>.ftl`.
+    config.push_str(
+        "\n[i18n] # locale settings\ndefault_locale = \"fr\" # ours\n         supported_locales = [\"fr\"]\ndir = \"translations\"\n",
+    );
     fs::write(&autumn_toml, config).unwrap();
 
     run_autumn_ok(
@@ -485,14 +489,24 @@ fn keys_land_in_the_locale_the_app_actually_treats_as_default() {
         &["generate", "scaffold", "Post", "title:String", "--i18n"],
     );
     assert!(
-        project.join("i18n/fr.ftl").exists(),
-        "keys must be written to the configured default locale"
+        project.join("translations/fr.ftl").exists(),
+        "keys must be written to the configured directory and default locale"
     );
     assert!(!project.join("i18n/en.ftl").exists());
+    // …and the image ships the directory the app actually reads.
+    let dockerfile = fs::read_to_string(project.join("Dockerfile")).unwrap();
+    assert!(
+        dockerfile.contains("COPY translations ./translations"),
+        "{dockerfile}"
+    );
     // The existing configuration is left exactly as the project set it.
     let after = fs::read_to_string(&autumn_toml).unwrap();
     assert!(after.contains("default_locale = \"fr\""), "{after}");
-    assert_eq!(after.matches("[i18n]").count(), 1, "{after}");
+    assert_eq!(
+        after.matches("[i18n]").count(),
+        1,
+        "a second `[i18n]` table makes the whole config unparseable:\n{after}"
+    );
     run_autumn_ok(&project, &["i18n", "check", "--strict"]);
 }
 
