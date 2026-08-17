@@ -484,14 +484,18 @@ fn referenced_common_keys(
 fn t_macro_keys(src: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let bytes = src.as_bytes();
-    let mut i = 0;
-    while let Some(at) = src[i..].find("t!") {
-        let mut cursor = i + at + 2;
-        i = cursor;
+    // Only occurrences that are REAL CODE. A commented-out `// t!(locale,
+    // "common.trash")` left in a surviving route would otherwise read as a live
+    // lookup and keep a key alive that nothing calls — and `autumn i18n check
+    // --strict` fails on unused keys, so erring this way is not free either.
+    // Same lexical defence the `.i18n_auto()` anchor already uses, rather than
+    // a second scanner with its own blind spots.
+    for at in super::scaffold_i18n::real_offsets(src, "t!") {
+        let mut cursor = at + 2;
         // `t!` must be its own token — `format!`/`assert!` never match, but a
         // hand-written `emit!` or an identifier ending in `t` would.
-        let preceded_by_ident = (i - 2) > 0 && {
-            let prev = bytes[i - 3];
+        let preceded_by_ident = at > 0 && {
+            let prev = bytes[at - 1];
             prev.is_ascii_alphanumeric() || prev == b'_'
         };
         if preceded_by_ident {
@@ -516,10 +520,9 @@ fn t_macro_keys(src: &str) -> Vec<String> {
             continue;
         }
         let Some(end) = src[cursor..].find('"') else {
-            break;
+            continue;
         };
         keys.push(src[cursor..cursor + end].to_owned());
-        i = cursor + end;
     }
     keys
 }
@@ -1819,6 +1822,20 @@ mod tests {
             let f = t!(other_locale, "common.nope");
         "#;
         assert!(t_macro_keys(src).is_empty(), "{:?}", t_macro_keys(src));
+    }
+
+    /// A lookup that is not CODE is not a lookup. Counting one keeps a key
+    /// alive that nothing calls, and `autumn i18n check --strict` fails on
+    /// unused keys — so over-counting is not the safe direction it looks like.
+    #[test]
+    fn chrome_scan_ignores_commented_out_and_quoted_lookups() {
+        let src = r#"
+            // t!(locale, "common.commented")
+            /* t!(locale, "common.blocked") */
+            let doc = "t!(locale, \"common.quoted\")";
+            let real = t!(locale, "common.live");
+        "#;
+        assert_eq!(t_macro_keys(src), vec!["common.live".to_owned()]);
     }
 
     #[test]

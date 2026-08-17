@@ -403,9 +403,27 @@ fn reconcile_block(
             }
             continue;
         }
+        // COMMENTS are tested before the `=` split, and do not end a value.
+        // Both halves matter, and both mirror `parse_ftl` (`autumn/src/i18n.rs`)
+        // rather than guessing:
+        //
+        //   * A comment carrying an `=` (`# use post.x = y here`) would
+        //     otherwise be read as a key line, found absent from `wanted`, and
+        //     deleted — taking a translator's note with it.
+        //   * `parse_ftl` `continue`s past a comment WITHOUT flushing the
+        //     current key, so an indented line after a mid-value comment is
+        //     still part of that value at runtime. Ending the value here would
+        //     drop the continuation and silently truncate the translation.
+        //
+        // A BLANK line does flush there, so it still ends the value here.
+        if line.trim_start().starts_with('#') {
+            body.push_str(line);
+            body.push('\n');
+            continue;
+        }
         let Some((raw_key, _)) = line.split_once('=') else {
-            // A comment or blank line at the block's own indentation — keep it
-            // where the translator put it. It ends the previous key's value.
+            // A blank line at the block's own indentation — keep it where the
+            // translator put it. It ends the previous key's value.
             keeping_continuations = false;
             body.push_str(line);
             body.push('\n');
@@ -1151,7 +1169,7 @@ pub(super) fn ensure_i18n_config_block(existing: &str) -> String {
 /// app compiles, starts, and renders raw keys forever with no error anywhere.
 /// Same class of decoy — and the same lexical defence — as
 /// [`has_shared_layout`](super::scaffold::has_shared_layout).
-fn real_offsets(src: &str, needle: &str) -> Vec<usize> {
+pub(super) fn real_offsets(src: &str, needle: &str) -> Vec<usize> {
     let bytes = src.as_bytes();
     let n = needle.as_bytes();
     let mut out = Vec::new();
@@ -1244,7 +1262,17 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
     // from correcting it. Falling back to the first overall keeps the common
     // `fn main` -> `build_app()` shape working, where there is only one anyway.
     let offsets = real_offsets(main_rs, ".routes(");
-    let main_fn_at = real_offsets(main_rs, "fn main").first().copied();
+    // On an IDENTIFIER boundary: `fn main_preview()` is a different function
+    // that happens to start with the same letters, and preferring it would
+    // anchor the insert inside a helper's builder — leaving the binary that
+    // actually runs without a bundle, silently and unrepairably (the
+    // idempotency guard above stops a later run from correcting it).
+    let main_fn_at = real_offsets(main_rs, "fn main").into_iter().find(|&at| {
+        main_rs[at + "fn main".len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+    });
     let anchor = main_fn_at
         .and_then(|at| offsets.iter().find(|&&o| o > at).copied())
         .or_else(|| offsets.first().copied());
@@ -1754,6 +1782,80 @@ mod tests {
         assert!(
             !out.contains("post.field.body = Body"),
             "the generated English must not be written at all:\n{out}"
+        );
+    }
+
+    /// `parse_ftl` does not flush the current key on a comment line, so an
+    /// indented line after a translator's mid-value note is still part of that
+    /// value at runtime. Reconciliation has to agree, or regeneration silently
+    /// truncates a translation it was told to keep.
+    #[test]
+    fn a_comment_inside_a_value_does_not_truncate_it_on_regeneration() {
+        // Built from a real generated block so the markers `block_end` looks
+        // for are exactly the ones the generator writes.
+        let wanted = keys(&[("post.help", "First"), ("post.new", "New Post")]);
+        let generated = merge_en_ftl("", "Post", "post", &wanted);
+        let with_note = generated.replace(
+            "post.help = First\n",
+            "post.help = First\n# translator note\n    second\n",
+        );
+        assert!(with_note.contains("second"), "fixture: {with_note}");
+
+        let out = merge_en_ftl(&with_note, "Post", "post", &wanted);
+        assert!(
+            out.contains("second"),
+            "the continuation belongs to `post.help` and must survive:\n{out}"
+        );
+        assert!(out.contains("# translator note"), "{out}");
+    }
+
+    /// A comment carrying an `=` is still a comment, not a key line — read as
+    /// one it is absent from `wanted` and gets deleted.
+    #[test]
+    fn a_comment_containing_an_equals_sign_is_not_pruned_as_a_key() {
+        let note = "# careful: post.legacy = Old Post is served elsewhere";
+        // Two keys so the block reconciles rather than short-circuiting.
+        let wanted = keys(&[("post.new", "New Post"), ("post.help", "First")]);
+        let generated = merge_en_ftl("", "Post", "post", &wanted);
+        let with_note = generated.replace(
+            "post.new = New Post\n",
+            &format!("post.new = New Post\n{note}\n"),
+        );
+        assert!(with_note.contains(note), "fixture: {with_note}");
+
+        let out = merge_en_ftl(&with_note, "Post", "post", &wanted);
+        assert!(
+            out.contains(note),
+            "a translator's note must survive regeneration:\n{out}"
+        );
+    }
+
+    /// `fn main_preview()` is a different function that happens to share a
+    /// prefix; anchoring on it wires the wrong builder, silently and (thanks to
+    /// the idempotency guard) unrepairably.
+    #[test]
+    fn the_main_anchor_matches_on_an_identifier_boundary() {
+        let main_rs = concat!(
+            "fn main_preview() {\n",
+            "    let app = App::new()\n",
+            "        .routes(routes![preview]);\n",
+            "}\n",
+            "\n",
+            "fn main() {\n",
+            "    let app = App::new()\n",
+            "        .routes(routes![index]);\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("expected a wiring");
+        };
+        let preview_at = out.find("routes![preview]").unwrap();
+        let real_at = out.find("routes![index]").unwrap();
+        let call_at = out.find(".i18n_auto()").expect("inserted");
+        assert!(
+            call_at > preview_at && call_at < real_at,
+            "`.i18n_auto()` must land in `fn main`'s builder, not the preview \
+             helper's:\n{out}"
         );
     }
 
