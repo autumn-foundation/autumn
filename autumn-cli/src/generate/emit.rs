@@ -531,15 +531,45 @@ fn t_macro_keys(src: &str) -> Vec<String> {
             continue;
         };
         cursor = comma + 1;
-        if !expect("\"", &mut cursor) {
-            continue;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
         }
-        let Some(end) = src[cursor..].find('"') else {
+        // `t!` takes a `LitStr`, and a RAW string is one: `r"common.save"` and
+        // `r#"…"#` are as valid as `"…"`. Requiring the plain form drops such a
+        // lookup from the surviving set and prunes a key that is still called.
+        let Some(key) = string_literal_at(src, cursor) else {
             continue;
         };
-        keys.push(src[cursor..cursor + end].to_owned());
+        keys.push(key);
     }
     keys
+}
+
+/// The contents of the Rust string literal starting at `at`, in any of the
+/// forms `t!` accepts for its key: `"…"`, `r"…"`, `r#"…"#`, and so on.
+///
+/// The key is read verbatim. An escape inside a plain literal would make the
+/// source text differ from the value `t!` sees, but a Fluent key is
+/// `[A-Za-z0-9._-]`, so no key that resolves can contain one.
+fn string_literal_at(src: &str, at: usize) -> Option<String> {
+    let bytes = src.as_bytes();
+    let mut i = at;
+    let mut hashes = 0usize;
+    if bytes.get(i) == Some(&b'r') {
+        i += 1;
+        while bytes.get(i) == Some(&b'#') {
+            hashes += 1;
+            i += 1;
+        }
+    }
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    i += 1;
+    let start = i;
+    let closing = format!("\"{}", "#".repeat(hashes));
+    let end = src[start..].find(&closing)? + start;
+    Some(src[start..end].to_owned())
 }
 
 /// Byte offset of the comma separating `t!`'s first argument from its second,
@@ -1931,6 +1961,23 @@ mod tests {
             "common.four",
             "common.five",
         ] {
+            assert!(
+                keys.iter().any(|k| k == expected),
+                "{expected} not found in {keys:?}"
+            );
+        }
+    }
+
+    /// `t!` takes a `LitStr`, and a raw string is one.
+    #[test]
+    fn chrome_scan_accepts_raw_string_keys() {
+        let src = r##"
+            let a = t!(locale, r"common.raw");
+            let b = t!(locale, r#"common.hashed"#);
+            let c = t!(locale, "common.plain");
+        "##;
+        let keys = t_macro_keys(src);
+        for expected in ["common.raw", "common.hashed", "common.plain"] {
             assert!(
                 keys.iter().any(|k| k == expected),
                 "{expected} not found in {keys:?}"

@@ -1439,7 +1439,27 @@ fn plan_scaffold_with_options_impl(
                         }
                         _ => None,
                     })
-                    .unwrap_or_else(|| read_or_empty(&autumn_toml_path));
+                    .map_or_else(
+                        || {
+                            // Read FALLIBLY. `read_or_empty` turns an unreadable
+                            // file — non-UTF-8, or unreadable under the current
+                            // ACL — into `""`, and the `Modify` planned below
+                            // would then write a fresh `[i18n]` block over
+                            // whatever was really there, destroying the project's
+                            // configuration. The bundle reads above already take
+                            // this care; this one is the same hazard with a worse
+                            // blast radius, since `autumn.toml` configures
+                            // everything. Absence stays absent.
+                            match std::fs::read_to_string(&autumn_toml_path) {
+                                Ok(src) => Ok(src),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    Ok(String::new())
+                                }
+                                Err(e) => Err(GenerateError::Io(e)),
+                            }
+                        },
+                        Ok,
+                    )?;
                 let updated = scaffold_i18n::ensure_i18n_config_block(&base);
                 if updated != base {
                     plan.actions.retain(|a| a.path() != autumn_toml_path);

@@ -647,6 +647,20 @@ fn toml_table_name(line: &str) -> Option<&str> {
     )
 }
 
+/// A TOML key with any quoting removed.
+///
+/// `"default_locale" = "fr"` is the same key as `default_locale = "fr"` — TOML
+/// lets any key be quoted, and serde's loader reads both. Compared with its
+/// quotes still on, the key never matches and the generator falls back to `en`,
+/// writing its output where the runtime does not look.
+fn toml_key_name(raw: &str) -> &str {
+    let key = raw.trim();
+    key.strip_prefix('"')
+        .and_then(|k| k.strip_suffix('"'))
+        .or_else(|| key.strip_prefix('\'').and_then(|k| k.strip_suffix('\'')))
+        .unwrap_or(key)
+}
+
 /// The scalar on the right of a TOML `key = value`, unquoted, with any trailing
 /// comment removed.
 ///
@@ -892,7 +906,7 @@ pub(super) fn configured_i18n(autumn_toml: &str) -> (Option<String>, Option<Stri
                         let Some(v) = toml_scalar_value(v) else {
                             continue;
                         };
-                        match k.trim() {
+                        match toml_key_name(k) {
                             "default_locale" => locale = Some(v.clone()),
                             "dir" => dir = Some(v.clone()),
                             _ => {}
@@ -908,7 +922,7 @@ pub(super) fn configured_i18n(autumn_toml: &str) -> (Option<String>, Option<Stri
         let Some(value) = toml_scalar_value(value) else {
             continue;
         };
-        match key.trim() {
+        match toml_key_name(key) {
             "default_locale" => locale = Some(value.clone()),
             "dir" => dir = Some(value.clone()),
             _ => {}
@@ -1173,7 +1187,7 @@ pub(super) fn profile_i18n_overrides(
         let Some(value) = toml_scalar_value(value) else {
             continue;
         };
-        match key.trim() {
+        match toml_key_name(key) {
             "default_locale" => locale = Some(value.clone()),
             "dir" => dir = Some(value.clone()),
             _ => {}
@@ -1258,6 +1272,22 @@ pub(super) fn real_offsets(src: &str, needle: &str) -> Vec<usize> {
             i += 1;
             continue;
         }
+        // A CHAR literal, which the doc above has always claimed and the code
+        // did not do. `let open = '{';` is the case that bites: its brace is
+        // counted as syntax, so `brace_block` never finds where `main` ends and
+        // the anchor search falls back to whatever builder comes first. `'"'`
+        // is worse — it opens a phantom string that swallows the rest of the
+        // file. Distinguished from a LIFETIME (`&'a str`) by looking for the
+        // closing quote: `'a` has none, `'{'` does.
+        if bytes[i] == b'\'' {
+            if let Some(end) = char_literal_end(bytes, i) {
+                i = end + 1;
+                continue;
+            }
+            // A lifetime. Step past the tick only, so `'a` does not eat ahead.
+            i += 1;
+            continue;
+        }
         if bytes[i..].starts_with(n) {
             out.push(i);
             i += n.len();
@@ -1266,6 +1296,49 @@ pub(super) fn real_offsets(src: &str, needle: &str) -> Vec<usize> {
         i += 1;
     }
     out
+}
+
+/// Byte offset of a char literal's closing `'`, when `at` opens one.
+///
+/// `None` for a lifetime (`&'a str`, `'static`), which shares the opening
+/// character and must not be treated as a literal — skipping to a later `'`
+/// would swallow real code between them.
+fn char_literal_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut i = at + 1;
+    if bytes.get(i)? == &b'\\' {
+        // An escape. Skip the ESCAPED character before looking for the closing
+        // tick — `'\''` carries a tick of its own, and stopping at it would cut
+        // the literal one byte short and leave the real closing tick to open a
+        // phantom one.
+        i += 1;
+        let selector = *bytes.get(i)?;
+        i += 1;
+        match selector {
+            // `\u{1F600}` — variable length, delimited by its own brace.
+            b'u' => {
+                while bytes.get(i).is_some_and(|b| *b != b'}') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // `\x41` — exactly two hex digits.
+            b'x' => i += 2,
+            // `\n`, `\t`, `\\`, `\'`, `\"`, `\0` — the selector was the whole
+            // escape.
+            _ => {}
+        }
+        return (bytes.get(i) == Some(&b'\'')).then_some(i);
+    }
+    // One character, which may be multi-byte UTF-8; the closing tick is the
+    // next ASCII `'` within four bytes.
+    let limit = (i + 4).min(bytes.len());
+    while i < limit {
+        if bytes[i] == b'\'' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The `(open, close)` byte offsets of the first brace-delimited block at or
@@ -1961,6 +2034,79 @@ mod tests {
              never the `#[cfg(test)]` one:\n{out}"
         );
         assert!(call_at < test_at, "{out}");
+    }
+
+    /// A char literal is not syntax. `let open = '{';` inside `main` would
+    /// otherwise leave `brace_block` unable to find where `main` ends, and the
+    /// anchor would fall back to an earlier helper's builder.
+    #[test]
+    fn a_char_literal_does_not_break_the_body_bounds() {
+        let main_rs = concat!(
+            "fn preview() -> App {\n",
+            "    App::new()\n",
+            "        .routes(routes![preview])\n",
+            "}\n",
+            "\n",
+            "fn main() {\n",
+            "    let open = '{';\n",
+            "    let quote = '\"';\n",
+            "    let tick = '\\'';\n",
+            "    let app = App::new()\n",
+            "        .routes(routes![index]);\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("expected a wiring");
+        };
+        let preview_at = out.find("routes![preview]").unwrap();
+        let call_at = out.find(".i18n_auto()").expect("inserted");
+        assert!(
+            call_at > preview_at,
+            "the builder in `main` is still the one that runs:\n{out}"
+        );
+    }
+
+    /// A lifetime shares the char literal's opening tick and must not be read
+    /// as one — skipping to a later `'` would swallow real code.
+    /// A lifetime shares the opening tick and must not be read as a literal:
+    /// scanning on to a later `'` swallows the code between them, which is how
+    /// a `fn main` or a brace goes missing.
+    ///
+    /// Tested on the helper directly. Routed through `ensure_i18n_auto` the
+    /// assertion is unreliable — ticks usually pair up harmlessly, so the
+    /// wiring comes out right whether or not lifetimes are handled, and the
+    /// test would report a guarantee it is not making.
+    #[test]
+    fn a_lifetime_is_not_read_as_a_char_literal() {
+        let cases: &[(&str, Option<usize>)] = &[
+            // Char literals: Some(offset of the closing tick).
+            ("'{'", Some(2)),
+            ("'\"'", Some(2)),
+            ("'\\''", Some(3)),
+            ("'\\n'", Some(3)),
+            ("'\\u{1F600}'", Some(10)),
+            // Lifetimes: no literal here at all.
+            ("'a>(s: &str)", None),
+            ("'static", None),
+        ];
+        for (src, expected) in cases {
+            assert_eq!(
+                char_literal_end(src.as_bytes(), 0),
+                *expected,
+                "char_literal_end({src:?})"
+            );
+        }
+    }
+
+    /// `"default_locale" = "fr"` is the same key as the bare spelling; serde
+    /// reads both, so the generator has to write where the runtime looks.
+    #[test]
+    fn quoted_member_keys_still_select_the_bundle() {
+        let toml = "[i18n]\n\"default_locale\" = \"fr\"\n'dir' = \"translations\"\n";
+        assert_eq!(
+            configured_i18n(toml),
+            (Some("fr".to_owned()), Some("translations".to_owned()))
+        );
     }
 
     /// A builder INSIDE `main` still wins over one that merely precedes it.
