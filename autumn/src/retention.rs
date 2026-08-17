@@ -201,8 +201,9 @@ pub async fn run_retention_dry_run(
 ///
 /// Panics if any matched descriptor's declared `after`, `purge_deleted_after`,
 /// or `every` is not a valid duration string, if its model declares a
-/// model-side `dependent = ...` association, or if its `batch_size` doesn't
-/// fit this backend's bind-parameter limit — the same conditions
+/// model-side `dependent = ...` association, if its `batch_size` doesn't fit
+/// this backend's bind-parameter limit, or if two matched descriptors
+/// produce the same generated task name — the same conditions
 /// `collect_retention_tasks()` panics on at boot.
 #[doc(hidden)]
 pub fn resolve_retention_descriptors(
@@ -244,10 +245,39 @@ pub fn resolve_retention_descriptors(
     // on every descriptor). Run the exact same validation boot relies on —
     // it's pure and DB-independent, so calling it here doesn't cost the
     // "resolve before connecting" property this function exists for.
-    for descriptor in &matches {
-        let _: TaskInfo = (descriptor.task_info)();
-    }
+    //
+    // Also apply the same duplicate-task-name check `collect_retention_tasks`
+    // applies (#1342 review round 15): calling `task_info()` alone catches a
+    // bad duration/dependents/bind-limit on any ONE descriptor, but not two
+    // different repositories that legitimately target the same table (see
+    // `live_broadcast.rs`) both declaring `retention(...)` — an unfiltered
+    // dry run without this would run both policies and report success,
+    // potentially double-counting the same rows, right up until real boot
+    // panics on the identical collision.
+    validate_resolved_descriptors(&matches);
     Ok(matches)
+}
+
+/// Runs each descriptor's `task_info()` — the same duration/dependents/
+/// bind-limit validation `collect_retention_tasks()` runs at boot — and
+/// checks the resulting task names for a collision, matching
+/// `collect_retention_tasks()`'s own duplicate check.
+///
+/// A free function (rather than inlined into
+/// [`resolve_retention_descriptors`]) so the collision case is
+/// unit-testable against synthetic descriptors — testing it through
+/// `resolve_retention_descriptors` itself would mean `inventory::submit!`-ing
+/// a colliding pair into the process-global registry, which every other test
+/// in the binary shares and can't un-register.
+///
+/// # Panics
+///
+/// See [`resolve_retention_descriptors`].
+fn validate_resolved_descriptors(matches: &[&RetentionSweepDescriptor]) {
+    let task_infos: Vec<TaskInfo> = matches.iter().map(|d| (d.task_info)()).collect();
+    if let Some(message) = duplicate_retention_task_name(&task_infos) {
+        panic!("{message}");
+    }
 }
 
 /// Emit the structured `{model, table, rows_swept, duration_ms}` log line for
@@ -536,5 +566,70 @@ mod tests {
              to run the same validation collect_retention_tasks() runs at boot, so a dry run \
              cannot report success for a policy real boot would panic on"
         );
+    }
+
+    #[test]
+    fn validate_resolved_descriptors_panics_on_duplicate_task_names() {
+        // Regression (#1342 review round 15): resolve_retention_descriptors
+        // used to run task_info() validation without also checking the
+        // resulting names for a collision, unlike collect_retention_tasks().
+        // Two different repositories can legitimately target the same table
+        // (see live_broadcast.rs); if both declare retention(...), an
+        // unfiltered dry run without this check would run both policies and
+        // report success, potentially double-counting the same rows, right
+        // up until real boot panics on the identical collision.
+        //
+        // Synthetic descriptors, not inventory::submit! (matching the
+        // constraint duplicate_retention_task_name's own doc comment
+        // explains): a genuinely colliding pair registered in the
+        // process-global registry would also break every other test in this
+        // binary that calls collect_retention_tasks().
+        let a = RetentionSweepDescriptor {
+            model_name: "__ValidateResolvedDescriptorsA",
+            table_name: "__validate_resolved_descriptors_dup",
+            task_info: || task_info_named("retention-sweep-__validate_resolved_descriptors_dup"),
+            dry_run: sample_dry_run,
+        };
+        let b = RetentionSweepDescriptor {
+            model_name: "__ValidateResolvedDescriptorsB",
+            table_name: "__validate_resolved_descriptors_dup",
+            task_info: || task_info_named("retention-sweep-__validate_resolved_descriptors_dup"),
+            dry_run: sample_dry_run,
+        };
+        let matches: Vec<&RetentionSweepDescriptor> = vec![&a, &b];
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_resolved_descriptors(&matches);
+        }));
+
+        assert!(
+            result.is_err(),
+            "validate_resolved_descriptors must panic when two descriptors produce the same \
+             task name"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_descriptors_accepts_unique_task_names() {
+        let a = RetentionSweepDescriptor {
+            model_name: "__ValidateResolvedDescriptorsUniqueA",
+            table_name: "__validate_resolved_descriptors_unique_a",
+            task_info: || {
+                task_info_named("retention-sweep-__validate_resolved_descriptors_unique_a")
+            },
+            dry_run: sample_dry_run,
+        };
+        let b = RetentionSweepDescriptor {
+            model_name: "__ValidateResolvedDescriptorsUniqueB",
+            table_name: "__validate_resolved_descriptors_unique_b",
+            task_info: || {
+                task_info_named("retention-sweep-__validate_resolved_descriptors_unique_b")
+            },
+            dry_run: sample_dry_run,
+        };
+        let matches: Vec<&RetentionSweepDescriptor> = vec![&a, &b];
+
+        // Must not panic.
+        validate_resolved_descriptors(&matches);
     }
 }
