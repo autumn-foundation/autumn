@@ -40,6 +40,10 @@
 //! coincidence.
 
 #![cfg(feature = "offline-sync")]
+// Fixture indices/offsets are bounded well under i64::MAX by construction
+// (SEED_ROWS = 20_000, offsets in the low thousands) — every `as i64` here
+// is a fixture-index conversion, never untrusted input.
+#![allow(clippy::cast_possible_wrap)]
 
 use autumn_web::sync::{
     Change, ChangeOutcome, LwwResolver, Op, PgSyncBackend, PushRequest, SyncBackend, SyncScope,
@@ -67,7 +71,7 @@ fn seeded_pk(i: usize) -> String {
 /// here so changes referencing an existing seeded pk use the SAME
 /// `(collection, pk)` key the fixture actually wrote, not a mismatched pair
 /// that reads back as "never existed".
-fn seeded_collection(i: usize) -> &'static str {
+const fn seeded_collection(i: usize) -> &'static str {
     match i % 100 {
         0..=39 => "notes",
         40..=59 => "contacts",
@@ -112,8 +116,10 @@ fn seed_fixture(conn: &mut PgConnection) {
     .expect("advance version sequence past seeded rows");
     // Real dead tuples: supersede 20% of rows' device_id before ANALYZE, the
     // same way a mature (not freshly bulk-loaded) table accumulates them.
-    conn.batch_execute("UPDATE autumn_sync_rows SET device_id = 'seed-device-2' WHERE right(pk, 1) IN ('0', '1')")
-        .expect("create dead tuples");
+    conn.batch_execute(
+        "UPDATE autumn_sync_rows SET device_id = 'seed-device-2' WHERE right(pk, 1) IN ('0', '1')",
+    )
+    .expect("create dead tuples");
     conn.batch_execute("ANALYZE autumn_sync_rows, autumn_sync_applied, autumn_sync_horizons")
         .expect("analyze");
 }
@@ -130,6 +136,7 @@ struct Batch {
 }
 
 #[allow(clippy::arithmetic_side_effects)] // test-only fixture arithmetic on small constants
+#[allow(clippy::too_many_lines)] // one linear fixture builder, clearest unsplit
 fn build_batch(device_id: &str, m: usize, offset: usize) -> Batch {
     // Fixed proportions per the module doc: 65/20/5/8/2, expressed as exact
     // per-size counts (computed once here rather than via integer division
@@ -165,7 +172,7 @@ fn build_batch(device_id: &str, m: usize, offset: usize) -> Batch {
     let mut next_live_idx = || loop {
         let idx = next_idx;
         next_idx += 1;
-        if idx % 20 != 0 {
+        if !idx.is_multiple_of(20) {
             return idx;
         }
     };
@@ -313,7 +320,10 @@ fn assert_clean_outcomes(request: &PushRequest, outcomes: &[ChangeOutcome]) {
                 );
             }
             ChangeOutcome::AlreadyApplied { .. } => {
-                panic!("unexpected AlreadyApplied on a first push: {}", change.change_id);
+                panic!(
+                    "unexpected AlreadyApplied on a first push: {}",
+                    change.change_id
+                );
             }
         }
     }
@@ -437,6 +447,7 @@ fn dump_scope(conn: &mut PgConnection, prefix: &str) -> Vec<RowDump> {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[allow(clippy::too_many_lines)] // one linear profiling script, clearest unsplit
 async fn offline_sync_push_batching_profile() {
     // `shared_preload_libraries` must be set at server start, so it goes on
     // the container command rather than `CREATE EXTENSION` alone — the
