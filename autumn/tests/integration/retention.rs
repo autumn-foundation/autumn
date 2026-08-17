@@ -298,7 +298,10 @@ async fn retention_age_based_soft_delete_sets_deleted_at_not_hard_delete() {
         .await
         .expect("sweep should succeed");
 
-    assert_eq!(report.rows_swept, 3, "age-based branch soft-deletes the 3 stale posts");
+    assert_eq!(
+        report.rows_swept, 3,
+        "age-based branch soft-deletes the 3 stale posts"
+    );
 
     let mut conn = pool.get().await.expect("conn");
     assert_eq!(

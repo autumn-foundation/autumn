@@ -84,11 +84,12 @@ pub fn run(opts: &RetentionOptions<'_>) {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let reports: Vec<RetentionSweepReport> = serde_json::from_str(&stdout).unwrap_or_else(|error| {
-        eprintln!("Failed to parse retention dry-run JSON: {error}");
-        eprintln!("Raw output: {stdout}");
-        std::process::exit(1);
-    });
+    let reports: Vec<RetentionSweepReport> =
+        serde_json::from_str(&stdout).unwrap_or_else(|error| {
+            eprintln!("Failed to parse retention dry-run JSON: {error}");
+            eprintln!("Raw output: {stdout}");
+            std::process::exit(1);
+        });
 
     print!("{}", format_retention_report(&reports));
 }
@@ -116,7 +117,11 @@ pub fn format_retention_report(reports: &[RetentionSweepReport]) -> String {
         "{:<model_width$}  Rows that would be swept  Duration (ms)",
         "Model"
     );
-    let _ = writeln!(out, "{:-<model_width$}  ------------------------  -------------", "");
+    let _ = writeln!(
+        out,
+        "{:-<model_width$}  ------------------------  -------------",
+        ""
+    );
     for report in &sorted {
         let _ = writeln!(
             out,
