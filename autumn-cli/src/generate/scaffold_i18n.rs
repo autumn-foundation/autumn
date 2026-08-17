@@ -1215,6 +1215,29 @@ pub(super) fn validator_bundle_path(project_root: &Path, env: &MacroEnv) -> Opti
     path.is_file().then_some(path)
 }
 
+/// Every `.ftl` bundle in the configured locale directory.
+///
+/// The generator writes only the DEFAULT locale — filling another with English
+/// would report as translated and ship English, which is worse than a warning.
+/// But destroy has to reach all of them: a translator starts a locale by
+/// copying the default bundle and translating in place, so those files carry
+/// this resource's marked block too, and leaving it behind fails `autumn i18n
+/// check --strict` as unused.
+///
+/// Sorted, so a plan's reverts and warnings come out in a stable order.
+pub(super) fn locale_bundles(project_root: &Path, dir: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(project_root.join(dir)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "ftl"))
+        .collect();
+    out.sort();
+    out
+}
+
 /// The `static` item `autumn new` emits for embedded assets — where the locale
 /// static is written next to.
 const STATIC_ANCHOR: &str =

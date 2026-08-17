@@ -1253,6 +1253,7 @@ fn plan_scaffold_with_options_impl(
             // when it already exists: an absent one means there is no
             // compile-time check to satisfy, and writing it would invent a
             // locale the project deliberately does not have.
+            let mut extra_revert_paths: Vec<std::path::PathBuf> = Vec::new();
             let macro_env = scaffold_i18n::MacroEnv::resolve(project_root);
             if let Some(validator_path) =
                 scaffold_i18n::validator_bundle_path(project_root, &macro_env)
@@ -1294,22 +1295,64 @@ fn plan_scaffold_with_options_impl(
                 if merged != base {
                     plan.modify(validator_path.clone(), merged);
                 }
-                plan.push_revert(Revert::I18nFtlKeys {
-                    path: validator_path,
-                    pascal: pascal_name.clone(),
-                    snake: snake_name.clone(),
-                });
+                extra_revert_paths.push(validator_path);
             }
 
             // Destroy takes back this resource's keys only. The shared
             // `common.*` block and the file itself always survive: sibling
             // resources reuse the chrome, and `.i18n_auto()` panics at startup
             // if the default locale's file is missing.
-            plan.push_revert(Revert::I18nFtlKeys {
-                path: ftl_path.clone(),
-                pascal: pascal_name.clone(),
-                snake: snake_name.clone(),
-            });
+            //
+            // EVERY locale bundle, not just the default one. A translator
+            // starts a locale by copying the default bundle and translating in
+            // place, so `fr.ftl` carries this resource's block — and its
+            // markers — too. Reverting only the default leaves those copies
+            // behind with nothing referencing them, which `autumn i18n check
+            // --strict` fails on as unused. The revert is marker-bounded and
+            // recomputed per file, so a hand-authored key outside the block is
+            // as safe here as it is in the default bundle.
+            let mut revert_paths: std::collections::BTreeSet<std::path::PathBuf> =
+                scaffold_i18n::locale_bundles(project_root, &i18n_dir)
+                    .into_iter()
+                    .collect();
+            // The default bundle even when this run is what creates it — the
+            // directory scan above only sees what is already on disk.
+            revert_paths.insert(ftl_path.clone());
+            revert_paths.extend(extra_revert_paths);
+            for path in revert_paths {
+                plan.push_revert(Revert::I18nFtlKeys {
+                    path,
+                    pascal: pascal_name.clone(),
+                    snake: snake_name.clone(),
+                });
+            }
+
+            // A project that already ships another locale gets those keys as
+            // UNTRANSLATED until someone writes them, and `--strict` exits
+            // non-zero on that. Say so by name rather than letting the next CI
+            // run be the messenger.
+            //
+            // Deliberately NOT written for them: filling `es.ftl` with English
+            // would report as translated and ship English, which is worse than
+            // a warning — it turns a visible gap into a silent one. The bundle
+            // header this generator writes says the same thing to translators.
+            let other_locales: Vec<String> = scaffold_i18n::locale_bundles(project_root, &i18n_dir)
+                .into_iter()
+                .filter(|path| path != &ftl_path)
+                .filter_map(|path| {
+                    path.file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                })
+                .collect();
+            if !other_locales.is_empty() {
+                plan.warn(format!(
+                    "{} new key(s) were written to {}. {} still needs them translated — \
+                     `autumn i18n check --strict` reports them as untranslated until it does.",
+                    referenced_keys.len(),
+                    ftl_path.display(),
+                    other_locales.join(", "),
+                ));
+            }
 
             // (The `i18n` Cargo feature is enabled further down, alongside
             // `maud`/`csv`/`htmx` — `plan_cargo_deps` runs between here and

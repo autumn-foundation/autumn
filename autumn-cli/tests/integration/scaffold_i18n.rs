@@ -735,6 +735,83 @@ fn a_non_default_locale_project_still_compiles_against_the_t_validator() {
 }
 
 #[test]
+fn destroy_prunes_the_block_from_every_locale_bundle() {
+    // A translator starts a locale by copying the default bundle and
+    // translating in place, so `fr.ftl` carries this resource's marked block
+    // too. Reverting only the default leaves those copies behind with nothing
+    // referencing them, which `autumn i18n check --strict` fails on as unused.
+    let (_tmp, project) = i18n_project(&[]);
+    let en = fs::read_to_string(project.join("i18n/en.ftl")).unwrap();
+    // The translated copy, with one hand-authored key of its own outside the
+    // generated blocks — that one must survive.
+    fs::write(
+        project.join("i18n/fr.ftl"),
+        format!(
+            "{}\nmarketing.tagline = Notre slogan\n",
+            en.replace("New Post", "Nouvel article")
+        ),
+    )
+    .unwrap();
+
+    // Destroy recomputes the generate plan, so it needs the same flags — and
+    // the same field list — to reach the i18n reverts at all.
+    run_autumn_ok(
+        &project,
+        &[
+            "destroy",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "published:bool",
+            "views:i64",
+            "author_name:String",
+            "--i18n",
+            "--force",
+        ],
+    );
+
+    let fr = fs::read_to_string(project.join("i18n/fr.ftl")).unwrap();
+    assert!(
+        !fr.contains("post.new"),
+        "the copied block must go with the resource:\n{fr}"
+    );
+    assert!(
+        fr.contains("marketing.tagline = Notre slogan"),
+        "a hand-authored key outside the block stays:\n{fr}"
+    );
+}
+
+#[test]
+fn scaffolding_into_a_multilingual_project_says_which_locales_need_work() {
+    // New keys land in the default bundle only — filling `es.ftl` with English
+    // would report as translated and ship English. `autumn i18n check
+    // --strict` exits non-zero on the untranslated keys until someone writes
+    // them, so the generator says so by name rather than letting CI be the
+    // messenger.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "multi-locale-app"]);
+    let project = tmp.path().join("multi-locale-app");
+    fs::create_dir_all(project.join("i18n")).unwrap();
+    fs::write(project.join("i18n/es.ftl"), "welcome.title = Bienvenido\n").unwrap();
+
+    let output = Command::new(autumn_bin())
+        .args(["generate", "scaffold", "Post", "title:String", "--i18n"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run autumn");
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("es") && stderr.contains("translated"),
+        "the untranslated locale must be named:\n{stderr}"
+    );
+    // And nothing English was written into it.
+    let es = fs::read_to_string(project.join("i18n/es.ftl")).unwrap();
+    assert!(!es.contains("post.new"), "{es}");
+}
+
+#[test]
 fn regenerating_keeps_a_dropped_field_key_hand_written_code_still_calls() {
     // The other half of `regenerating_after_dropping_a_field_prunes_its_keys`:
     // "this render no longer emits it" is not "nothing uses it". A surviving
