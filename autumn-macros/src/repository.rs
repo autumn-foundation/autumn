@@ -643,6 +643,13 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                  default, or set it to a positive number",
             ));
         }
+        if spec.batch_size.is_some_and(|n| n > i64::MAX as u64) {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(batch_size = ...) must fit in a Postgres LIMIT (at most i64::MAX); \
+                 a larger value wraps to a negative LIMIT and every sweep query fails",
+            ));
+        }
     }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
     let generated_internal_hooks = false;
@@ -11219,7 +11226,31 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .unwrap_or_else(|| DEFAULT_RETENTION_SWEEP_INTERVAL.to_string());
         let max_batches = MAX_RETENTION_BATCHES_PER_RUN;
         let model_name_str = model_name.to_string();
-        let task_name_str = format!("retention-sweep-{}", model_name_str.to_lowercase());
+        // Table-qualified, not model-qualified: two modules can declare
+        // same-named model types (`auth::Session`, `admin::Session`), which
+        // would collide on a model-derived task name — the scheduler
+        // coordinates by name, so a collision merges two policies' actuator
+        // state and can drop one under the Postgres advisory-lock backend.
+        // Table names are already a hard uniqueness requirement the schema
+        // itself enforces.
+        let task_name_str = format!("retention-sweep-{}", table_name.to_lowercase());
+        // When both `after` and `purge_deleted_after` are declared, split
+        // the per-run batch budget between them instead of sharing one
+        // counter: a shared counter starves whichever branch runs second
+        // (the purge phase) whenever the first branch's backlog alone fills
+        // the whole budget. Each branch still gets the full budget when
+        // it's the only one declared.
+        let both_branches = spec.after.is_some() && spec.purge_deleted_after.is_some();
+        let age_max_batches = if both_branches {
+            max_batches / 2
+        } else {
+            max_batches
+        };
+        let purge_max_batches = if both_branches {
+            max_batches - max_batches / 2
+        } else {
+            max_batches
+        };
 
         // Age-based branch: soft-deletes on a soft_delete repository
         // (never re-touching an already soft-deleted row), hard-deletes
@@ -11292,21 +11323,29 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .expect("retention `after` duration out of range");
                             let __cutoff =
                                 ::autumn_web::time::ClockSource::now(state.clock()).naive_utc() - __after_chrono;
-                            // Not 0: a table can legitimately hold id <= 0
-                            // rows (e.g. after a manual import), and this
-                            // repository's PK convention doesn't forbid
-                            // them — starting below every possible id keeps
-                            // the very first page from silently skipping
-                            // them.
-                            let mut __last_id: i64 = i64::MIN;
+                            // `Option<i64>`, not a sentinel `i64` floor: no
+                            // `i64` value is guaranteed below every possible
+                            // id (`i64::MIN` itself is a legal id, and
+                            // `id.gt(i64::MIN)` would exclude exactly that
+                            // row), and this repository's PK convention
+                            // doesn't forbid id <= 0 rows (e.g. after a
+                            // manual import). `None` means "first page, no
+                            // lower bound"; every later page carries a real
+                            // cursor.
+                            let mut __last_id: ::core::option::Option<i64> = ::core::option::Option::None;
+                            let mut __batches: u32 = 0;
                             loop {
-                                if __batches >= #max_batches {
+                                if __batches >= #age_max_batches {
                                     break;
                                 }
-                                let ids: ::std::vec::Vec<i64> = #table_ident::table
+                                let mut __query = #table_ident::table
+                                    .into_boxed()
                                     .filter(#table_ident::#basis_ident.lt(__cutoff))
-                                    .filter(#table_ident::id.gt(__last_id))
-                                    #not_already_deleted_filter
+                                    #not_already_deleted_filter;
+                                if let ::core::option::Option::Some(__last) = __last_id {
+                                    __query = __query.filter(#table_ident::id.gt(__last));
+                                }
+                                let ids: ::std::vec::Vec<i64> = __query
                                     .order(#table_ident::id.asc())
                                     .select(#table_ident::id)
                                     .limit(#batch_size_i64)
@@ -11317,11 +11356,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     break;
                                 }
                                 let __n = ids.len() as u64;
-                                __last_id = *ids.last().expect("ids non-empty");
+                                __last_id = ::core::option::Option::Some(
+                                    *ids.last().expect("ids non-empty"),
+                                );
                                 #apply_stmt
                                 rows_swept += __applied;
                                 __batches += 1;
-                                if __n < #batch_size_i64 as u64 || __batches >= #max_batches {
+                                if __n < #batch_size_i64 as u64 || __batches >= #age_max_batches {
                                     break;
                                 }
                             }
@@ -11349,14 +11390,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .expect("retention `purge_deleted_after` duration out of range");
                             let __cutoff =
                                 ::autumn_web::time::ClockSource::now(state.clock()).naive_utc() - __purge_chrono;
-                            let mut __last_id: i64 = i64::MIN;
+                            let mut __last_id: ::core::option::Option<i64> = ::core::option::Option::None;
+                            let mut __batches: u32 = 0;
                             loop {
-                                if __batches >= #max_batches {
+                                if __batches >= #purge_max_batches {
                                     break;
                                 }
-                                let ids: ::std::vec::Vec<i64> = #table_ident::table
-                                    .filter(#table_ident::deleted_at.lt(__cutoff))
-                                    .filter(#table_ident::id.gt(__last_id))
+                                let mut __query = #table_ident::table
+                                    .into_boxed()
+                                    .filter(#table_ident::deleted_at.lt(__cutoff));
+                                if let ::core::option::Option::Some(__last) = __last_id {
+                                    __query = __query.filter(#table_ident::id.gt(__last));
+                                }
+                                let ids: ::std::vec::Vec<i64> = __query
                                     .order(#table_ident::id.asc())
                                     .select(#table_ident::id)
                                     .limit(#batch_size_i64)
@@ -11367,7 +11413,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     break;
                                 }
                                 let __n = ids.len() as u64;
-                                __last_id = *ids.last().expect("ids non-empty");
+                                __last_id = ::core::option::Option::Some(
+                                    *ids.last().expect("ids non-empty"),
+                                );
                                 // Re-check `deleted_at < __cutoff` at delete
                                 // time, not just `id`: a row concurrently
                                 // `restore()`d between the SELECT above and
@@ -11387,7 +11435,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 };
                                 rows_swept += __applied;
                                 __batches += 1;
-                                if __n < #batch_size_i64 as u64 || __batches >= #max_batches {
+                                if __n < #batch_size_i64 as u64 || __batches >= #purge_max_batches {
                                     break;
                                 }
                             }
@@ -11482,11 +11530,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let repo = Self::with_pool_untracked(pool);
                 let mut conn = repo.__autumn_acquire_conn().await?;
                 let mut rows_swept: u64 = 0;
-                // Shared across both branches: a soft-delete policy
-                // declaring both `after` and `purge_deleted_after` must
-                // still cap the WHOLE run at `max_batches`, not
-                // `max_batches` per branch (issue #1342 review).
-                let mut __batches: u32 = 0;
 
                 #age_block
                 #purge_block
@@ -22087,6 +22130,88 @@ mod tests {
         assert!(
             error.to_string().contains("batch_size"),
             "batch_size = 0 must error mentioning batch_size: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_batch_size_too_large() {
+        // Regression (#1342 review round 2): batch_size must fit in a
+        // Postgres LIMIT (i64). A value above i64::MAX would wrap to a
+        // negative LIMIT and every sweep query would fail at runtime, with
+        // no signal until the first scheduled tick.
+        let tokens: proc_macro2::TokenStream = format!(
+            "Post, retention(after = \"30d\", basis = created_at, batch_size = {})",
+            i64::MAX as u64 + 1
+        )
+        .parse()
+        .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("batch_size > i64::MAX must be rejected");
+        };
+        assert!(
+            error.to_string().contains("batch_size"),
+            "batch_size > i64::MAX must error mentioning batch_size: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_accepts_batch_size_at_i64_max() {
+        let tokens: proc_macro2::TokenStream = format!(
+            "Post, retention(after = \"30d\", basis = created_at, batch_size = {})",
+            i64::MAX as u64
+        )
+        .parse()
+        .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(
+            config
+                .retention
+                .expect("retention should be parsed")
+                .batch_size,
+            Some(i64::MAX as u64)
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_task_name_is_table_qualified_not_model_qualified() {
+        // Regression (#1342 review round 2): two models named the same in
+        // different modules would collide on a model-derived task name.
+        // Table names are schema-unique, so the sweep task name must be
+        // derived from `table`, not from the model identifier.
+        let generated = repository_macro(
+            quote! { Post, table = "custom_posts_table", retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("retention-sweep-custom_posts_table"),
+            "task name must be derived from the table name, not the model name: {generated}"
+        );
+        assert!(
+            !generated.contains("retention-sweep-post\""),
+            "task name must not be derived from the model name: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_uses_boxed_query_with_optional_cursor() {
+        // Regression (#1342 review round 2): the sweep must page with an
+        // Option<i64> cursor (None on the first page, Some(id) afterward)
+        // rather than a sentinel floor like i64::MIN, which would silently
+        // exclude a row whose id is exactly i64::MIN. into_boxed() is what
+        // lets the cursor filter be applied conditionally.
+        let generated = repository_macro(
+            quote! { Post, retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("into_boxed"),
+            "sweep query must use into_boxed() to conditionally apply the cursor filter: {generated}"
+        );
+        assert!(
+            !generated.contains("i64 :: MIN"),
+            "sweep must not use an i64::MIN sentinel cursor: {generated}"
         );
     }
 

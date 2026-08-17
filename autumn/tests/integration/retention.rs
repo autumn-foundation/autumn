@@ -215,7 +215,9 @@ async fn count_deleted_rows(conn: &mut AsyncPgConnection) -> i64 {
 fn retention_task_info_uses_fleet_coordination_and_declared_batch_interval() {
     let info = PgRtSessionRepository::__autumn_retention_task_info();
     assert_eq!(info.coordination, TaskCoordination::Fleet);
-    assert_eq!(info.name, "retention-sweep-rtsession");
+    // Table-qualified (not model-qualified) so same-named models in
+    // different modules can't collide on the generated task name.
+    assert_eq!(info.name, "retention-sweep-rt_sessions");
     match info.schedule {
         Schedule::FixedDelay(d) => assert_eq!(d, std::time::Duration::from_secs(3600)),
         _ => panic!("retention sweeps use FixedDelay, not cron"),
@@ -231,15 +233,15 @@ fn retention_task_is_auto_collected_with_no_tasks_wiring() {
         .map(|t| t.name)
         .collect();
     assert!(
-        names.contains(&"retention-sweep-rtsession".to_string()),
+        names.contains(&"retention-sweep-rt_sessions".to_string()),
         "RtSession's retention sweep must be auto-collected: {names:?}"
     );
     assert!(
-        names.contains(&"retention-sweep-rtpost".to_string()),
+        names.contains(&"retention-sweep-rt_posts".to_string()),
         "RtPost's retention sweep must be auto-collected: {names:?}"
     );
     assert!(
-        !names.contains(&"retention-sweep-rtplain".to_string()),
+        !names.contains(&"retention-sweep-rt_plains".to_string()),
         "RtPlain declared no retention(...) and must not be collected: {names:?}"
     );
 }

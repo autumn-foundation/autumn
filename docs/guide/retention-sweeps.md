@@ -103,12 +103,16 @@ task, so it reuses the same [multi-replica coordination](scheduled-multi-replica
 guarantee: under the `postgres` scheduler backend, only one replica executes
 a given sweep per tick, no matter how many replicas are running.
 
-The generated task name is `retention-sweep-<model>` (lowercased) — e.g.
-`Session` gets `retention-sweep-session`. Task names share one namespace with
-every `#[scheduled(name = "...")]` fn in the app; avoid explicitly naming a
-hand-written task the same as a model's retention sweep, or the two will
-compete for the same coordination lock and clobber each other's status in
-`/actuator/tasks`.
+The generated task name is `retention-sweep-<table>` (lowercased) — e.g. a
+`Session` model backed by the `sessions` table gets `retention-sweep-sessions`.
+It's table-, not model-, qualified specifically so two different models
+named `Session` in different modules (`auth::Session`, `admin::Session`)
+can't collide on the same task name — the schema already guarantees table
+names are unique, which a bare model name isn't. Task names still share one
+namespace with every `#[scheduled(name = "...")]` fn in the app; avoid
+explicitly naming a hand-written task `retention-sweep-<table>` for the same
+table, or the two will compete for the same coordination lock and clobber
+each other's status in `/actuator/tasks`.
 
 ## Validate Before Enabling: Dry Run
 

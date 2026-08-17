@@ -5442,12 +5442,18 @@ impl AppBuilder {
     /// The `AUTUMN_RETENTION_DRY_RUN=1` one-shot on a build compiled WITHOUT
     /// database support: there is nothing to sweep, so report and exit 0
     /// (never starting the server).
+    ///
+    /// Still prints `[]` to stdout — `autumn retention --dry-run` always
+    /// parses the child's stdout as a JSON report array, so silently
+    /// printing nothing here would surface as a JSON-parse failure instead
+    /// of the intended "no policies" result.
     #[cfg(not(feature = "db"))]
     #[allow(clippy::unused_async)]
     async fn run_retention_dry_run_mode(self) {
         eprintln!(
             "autumn retention --dry-run: this build has no database support — nothing to report"
         );
+        println!("[]");
         std::process::exit(0);
     }
 
