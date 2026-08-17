@@ -11278,15 +11278,38 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // the whole budget. Each branch still gets the full budget when
         // it's the only one declared.
         let both_branches = spec.after.is_some() && spec.purge_deleted_after.is_some();
+        // `age_max_batches` is still a fixed per-run reservation (never more
+        // than half the budget when both branches are declared) so a huge
+        // age backlog can't starve the purge phase entirely — the round-9
+        // P1 fix. But a *fixed* reservation for purge wastes budget when the
+        // age phase doesn't need its whole half (review round 11): declaring
+        // both `after` and a single stale live row, plus a 600-batch purge
+        // backlog, used to cap purge at exactly `max_batches / 2` even
+        // though the age phase left hundreds of unused batches on the
+        // table. Purge's cap is therefore computed at *runtime*, after the
+        // age phase finishes, as the budget minus whatever the age phase
+        // actually used — never less than its guaranteed floor (age can
+        // never use more than its own fixed cap), but free to claim
+        // everything age left unused.
         let age_max_batches = if both_branches {
             max_batches / 2
         } else {
             max_batches
         };
-        let purge_max_batches = if both_branches {
-            max_batches - max_batches / 2
+        let age_batches_used_decl = if both_branches {
+            quote! { let mut __age_batches_used: u32 = 0; }
         } else {
-            max_batches
+            quote! {}
+        };
+        let age_batches_used_write = if both_branches {
+            quote! { __age_batches_used = __batches; }
+        } else {
+            quote! {}
+        };
+        let purge_max_batches_expr = if both_branches {
+            quote! { (#max_batches).saturating_sub(__age_batches_used) }
+        } else {
+            quote! { #max_batches }
         };
 
         // Age-based branch: soft-deletes on a soft_delete repository
@@ -11494,6 +11517,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     break;
                                 }
                             }
+                            #age_batches_used_write
                         }
                     }
                 },
@@ -11518,10 +11542,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .expect("retention `purge_deleted_after` duration out of range");
                             let __cutoff =
                                 ::autumn_web::time::ClockSource::now(state.clock()).naive_utc() - __purge_chrono;
+                            // Computed at runtime, not a fixed macro-time
+                            // half-share (#1342 review round 11): lets the
+                            // purge phase claim whatever budget the age
+                            // phase didn't use, while never exceeding the
+                            // total per-run cap.
+                            let __purge_max_batches: u32 = #purge_max_batches_expr;
                             let mut __last_id: ::core::option::Option<i64> = ::core::option::Option::None;
                             let mut __batches: u32 = 0;
                             loop {
-                                if __batches >= #purge_max_batches {
+                                if __batches >= __purge_max_batches {
                                     break;
                                 }
                                 let mut __query = #table_ident::table
@@ -11601,7 +11631,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 };
                                 rows_swept += __applied;
                                 __batches += 1;
-                                if __n < #batch_size_i64 as u64 || __batches >= #purge_max_batches {
+                                if __n < #batch_size_i64 as u64 || __batches >= __purge_max_batches {
                                     break;
                                 }
                             }
@@ -11672,10 +11702,40 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 );
             }
         };
+        // Regression (#1342 review round 11): `parse_repo_args` only rejects
+        // `batch_size` values that overflow `i64` (the Postgres `LIMIT`
+        // bound). It doesn't know the *bind-parameter* limit, because that's
+        // backend-specific (`MAX_BIND_PARAMS` is 32766 on SQLite, 65535 on
+        // Postgres) and which backend is active is a Cargo feature of the
+        // *consuming* crate — invisible to this proc macro, which only sees
+        // its own crate's features. Each swept batch binds one parameter per
+        // row id (`id.eq_any(ids)`) plus up to two more (the age/purge
+        // cutoff, and — for a soft-delete age sweep — the new `deleted_at`
+        // timestamp), so a `batch_size` within 2 of the backend's limit
+        // would compile and boot cleanly, then fail every real sweep with
+        // "too many SQL variables". `MAX_BIND_PARAMS` resolves per-backend
+        // correctly at the boot-time assert below because it's evaluated in
+        // the consuming crate, where the `sqlite`/postgres feature choice is
+        // actually visible.
+        let batch_size_bind_boot_validation = quote! {
+            assert!(
+                (#batch_size_i64 as u64) + 2 <= ::autumn_web::repository::MAX_BIND_PARAMS as u64,
+                "retention(batch_size = {}) leaves no headroom under this backend's \
+                 bind-parameter limit ({}): each swept batch binds one parameter per row id \
+                 plus the cutoff (and, for a soft-delete age sweep, the new deleted_at \
+                 timestamp), so a sweep this large would compile and boot cleanly but fail \
+                 every real run with \"too many SQL variables\". Lower `batch_size`, or remove \
+                 it for the default of {}",
+                #batch_size_i64,
+                ::autumn_web::repository::MAX_BIND_PARAMS,
+                #DEFAULT_RETENTION_BATCH_SIZE
+            );
+        };
         let retention_duration_boot_validation = quote! {
             #after_boot_validation
             #purge_boot_validation
             #model_dependents_boot_validation
+            #batch_size_bind_boot_validation
         };
 
         let methods = quote! {
@@ -11728,6 +11788,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let repo = Self::with_pool_untracked(pool);
                 let mut conn = repo.__autumn_acquire_conn().await?;
                 let mut rows_swept: u64 = 0;
+                #age_batches_used_decl
 
                 #age_block
                 #purge_block
@@ -22686,6 +22747,83 @@ mod tests {
             task_info_region.contains("AutumnDependents")
                 && task_info_region.contains("dependents"),
             "task_info builder must assert Model::dependents() is empty at boot: {task_info_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_rejects_oversized_batch_for_bind_limit_at_boot() {
+        // Regression (#1342 review round 11): parse_repo_args only rejects
+        // batch_size values that overflow i64 (the Postgres LIMIT bound).
+        // Whether SQLite's much lower MAX_BIND_PARAMS (32766) applies
+        // depends on the *consuming* crate's active backend feature, which
+        // this proc macro can't see — so the check has to be a boot-time
+        // assert against `autumn_web::repository::MAX_BIND_PARAMS` (a
+        // per-backend const resolved in the consuming crate), not a
+        // compile-time syn::Error here.
+        let generated = repository_macro(
+            quote! { Post, retention(after = "30d", basis = created_at, batch_size = 50000) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let task_info_start = generated
+            .find("fn __autumn_retention_task_info")
+            .expect("task_info builder present");
+        let task_info_region =
+            &generated[task_info_start..(task_info_start + 4000).min(generated.len())];
+
+        assert!(
+            task_info_region.contains("MAX_BIND_PARAMS") && task_info_region.contains("50000"),
+            "task_info builder must assert batch_size fits under MAX_BIND_PARAMS at boot: \
+             {task_info_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_purge_borrows_unused_age_batch_capacity() {
+        // Regression (#1342 review round 11): a fixed 50/50 split between
+        // the age and purge phases wasted budget whenever one phase's
+        // backlog was small — e.g. one stale live row plus a 600-batch
+        // purge backlog used to cap purge at exactly half the budget even
+        // though the age phase left hundreds of batches unused. The purge
+        // phase's cap must now be computed at runtime as the total budget
+        // minus however many batches the age phase actually used, not a
+        // macro-time literal half-share.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__age_batches_used") && generated.contains("saturating_sub"),
+            "purge phase must borrow the age phase's unused batch capacity at runtime: \
+             {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_single_branch_has_no_batch_borrowing_scaffolding() {
+        // A single-branch policy (only `after`, no `purge_deleted_after`)
+        // has nothing to borrow from or share with, so none of the
+        // borrowing plumbing (#1342 review round 11) should be generated —
+        // it would be dead code and, since it's only ever written inside an
+        // absent purge block, an unused-variable warning under
+        // `-D warnings`.
+        let generated = repository_macro(
+            quote! { Post, retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("__age_batches_used"),
+            "single-branch retention must not generate unused batch-borrowing scaffolding: \
+             {generated}"
         );
     }
 
