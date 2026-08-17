@@ -187,9 +187,11 @@ and how long you keep them:
 - **JSONL file** → each line is a self-describing JSON object, so `jq`, `grep`,
   or bulk-loading into a warehouse all work; rotate/retain the file with your
   normal log-rotation tooling.
-- **Custom DB sink** → query with SQL and enforce retention with a scheduled
-  purge of rows past your compliance window. Keep audit rows immutable: grant
-  the app `INSERT`-only, and never `UPDATE`/`DELETE` an existing event.
+- **Custom DB sink** → query with SQL and enforce retention by declaring
+  `retention(after = "...", basis = created_at)` on the audit table's
+  `#[repository(...)]` — see [Data-Retention Sweeps](retention-sweeps.md) —
+  rather than hand-writing a scheduled purge job. Keep audit rows immutable:
+  grant the app `INSERT`-only, and never `UPDATE`/`DELETE` an existing event.
 
 Audit logging answers *who did what*. It is a natural foundation for adjacent
 compliance features such as GDPR data export and right-to-erasure workflows —

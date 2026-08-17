@@ -623,6 +623,14 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                  Remove `sharded`, or sweep each shard's table by hand for now",
             ));
         }
+        if spec.batch_size == Some(0) {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(batch_size = 0) would select zero rows every run and disable the \
+                 sweep permanently while still reporting success; remove `batch_size` for the \
+                 default, or set it to a positive number",
+            ));
+        }
     }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
     let generated_internal_hooks = false;
@@ -11211,9 +11219,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .basis
                         .as_ref()
                         .expect("validated by parse_repo_args: after requires basis");
+                    // Yields the number of rows the statement actually
+                    // touched (not the SELECT's candidate count) so a row
+                    // that changed state between the SELECT and this
+                    // statement — e.g. a concurrent `restore()` — is
+                    // reflected correctly in `rows_swept` rather than
+                    // over-reported.
                     let apply_stmt = if config.soft_delete {
                         quote! {
-                            if !dry_run {
+                            let __applied: u64 = if dry_run {
+                                __n
+                            } else {
                                 let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
                                 ::autumn_web::reexports::diesel::update(
                                     #table_ident::table
@@ -11223,19 +11239,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
                                 .execute(&mut conn)
                                 .await
-                                .map_err(::autumn_web::AutumnError::from)?;
-                            }
+                                .map_err(::autumn_web::AutumnError::from)? as u64
+                            };
                         }
                     } else {
                         quote! {
-                            if !dry_run {
+                            let __applied: u64 = if dry_run {
+                                __n
+                            } else {
                                 ::autumn_web::reexports::diesel::delete(
                                     #table_ident::table.filter(#table_ident::id.eq_any(ids))
                                 )
                                 .execute(&mut conn)
                                 .await
-                                .map_err(::autumn_web::AutumnError::from)?;
-                            }
+                                .map_err(::autumn_web::AutumnError::from)? as u64
+                            };
                         }
                     };
                     let not_already_deleted_filter = if config.soft_delete {
@@ -11275,7 +11293,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 let __n = ids.len() as u64;
                                 __last_id = *ids.last().expect("ids non-empty");
                                 #apply_stmt
-                                rows_swept += __n;
+                                rows_swept += __applied;
                                 __batches += 1;
                                 if __n < #batch_size_i64 as u64 || __batches >= #max_batches {
                                     break;
@@ -11322,15 +11340,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                                 let __n = ids.len() as u64;
                                 __last_id = *ids.last().expect("ids non-empty");
-                                if !dry_run {
+                                // Re-check `deleted_at < __cutoff` at delete
+                                // time, not just `id`: a row concurrently
+                                // `restore()`d between the SELECT above and
+                                // this DELETE must survive, not be purged
+                                // out from under the restore.
+                                let __applied: u64 = if dry_run {
+                                    __n
+                                } else {
                                     ::autumn_web::reexports::diesel::delete(
-                                        #table_ident::table.filter(#table_ident::id.eq_any(ids))
+                                        #table_ident::table
+                                            .filter(#table_ident::id.eq_any(ids))
+                                            .filter(#table_ident::deleted_at.lt(__cutoff))
                                     )
                                     .execute(&mut conn)
                                     .await
-                                    .map_err(::autumn_web::AutumnError::from)?;
-                                }
-                                rows_swept += __n;
+                                    .map_err(::autumn_web::AutumnError::from)? as u64
+                                };
+                                rows_swept += __applied;
                                 __batches += 1;
                                 if __n < #batch_size_i64 as u64 || __batches >= #max_batches {
                                     break;
@@ -11340,6 +11367,42 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 },
             );
+
+        // Validate `after`/`purge_deleted_after` at task-registration time
+        // (boot), matching `every` below — otherwise a typo'd unit (e.g.
+        // "30dd") compiles and boots cleanly and only panics on the sweep's
+        // first scheduled tick, which can be well after an operator was
+        // watching the deploy.
+        let after_boot_validation = spec.after.as_ref().map_or_else(
+            || quote! {},
+            |after| {
+                quote! {
+                    ::autumn_web::task::parse_duration(#after)
+                        .expect(concat!(
+                            "invalid duration in #[repository(..., retention(after = \"",
+                            #after,
+                            "\"))]"
+                        ));
+                }
+            },
+        );
+        let purge_boot_validation = spec.purge_deleted_after.as_ref().map_or_else(
+            || quote! {},
+            |purge_after| {
+                quote! {
+                    ::autumn_web::task::parse_duration(#purge_after)
+                        .expect(concat!(
+                            "invalid duration in #[repository(..., retention(purge_deleted_after = \"",
+                            #purge_after,
+                            "\"))]"
+                        ));
+                }
+            },
+        );
+        let retention_duration_boot_validation = quote! {
+            #after_boot_validation
+            #purge_boot_validation
+        };
 
         let methods = quote! {
             /// Run this model's declared `retention(...)` policy once,
@@ -11408,8 +11471,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             /// Builds the recurring `TaskInfo` `autumn_web::retention`
             /// auto-registers with the scheduler.
+            ///
+            /// Validates every declared duration string up front — `after`,
+            /// `purge_deleted_after`, and `every` all fail loudly here, at
+            /// boot, rather than a `basis`/`purge_deleted_after` typo only
+            /// surfacing on the sweep's first scheduled tick (up to `every`
+            /// later).
             #[doc(hidden)]
             pub fn __autumn_retention_task_info() -> ::autumn_web::task::TaskInfo {
+                #retention_duration_boot_validation
                 ::autumn_web::task::TaskInfo {
                     name: #task_name_str.to_string(),
                     schedule: ::autumn_web::task::Schedule::FixedDelay(
@@ -21950,6 +22020,24 @@ mod tests {
     }
 
     #[test]
+    fn retention_rejects_zero_batch_size() {
+        // batch_size = 0 would SELECT ... LIMIT 0 every run forever: the
+        // sweep reports success with rows_swept = 0 and never deletes
+        // anything, with no error signal (issue #1342 review finding).
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(after = \"30d\", basis = created_at, batch_size = 0)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("batch_size = 0 must be rejected");
+        };
+        assert!(
+            error.to_string().contains("batch_size"),
+            "batch_size = 0 must error mentioning batch_size: {error}"
+        );
+    }
+
+    #[test]
     fn repository_without_retention_has_no_retention_spec() {
         let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
         let config = parse_repo_args(tokens).unwrap();
@@ -21979,6 +22067,90 @@ mod tests {
         assert!(
             generated.contains("TaskCoordination :: Fleet"),
             "retention sweeps must use fleet coordination for multi-replica safety: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_validates_after_duration_inside_task_info_builder() {
+        // Regression (#1342 review): `after`/`purge_deleted_after` must be
+        // validated eagerly at task-registration time (inside
+        // __autumn_retention_task_info, which collect_retention_tasks()
+        // calls at boot) — matching `every` — rather than lazily inside
+        // __autumn_retention_run, where a typo'd duration would only panic
+        // on the sweep's first scheduled tick.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let task_info_start = generated
+            .find("fn __autumn_retention_task_info")
+            .expect("task_info builder present");
+        let task_info_region = &generated[task_info_start..(task_info_start + 3000).min(generated.len())];
+
+        assert!(
+            task_info_region.matches("parse_duration").count() >= 3,
+            "task_info builder must validate `after`, `purge_deleted_after`, AND `every` \
+             up front (three parse_duration calls): {task_info_region}"
+        );
+        assert!(
+            task_info_region.contains("\"30d\""),
+            "task_info builder must validate the `after` duration string: {task_info_region}"
+        );
+        assert!(
+            task_info_region.contains("\"90d\""),
+            "task_info builder must validate the `purge_deleted_after` duration string: {task_info_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_purge_delete_rechecks_deleted_at_at_delete_time() {
+        // Regression (#1342 review): the purge branch's DELETE must
+        // re-check `deleted_at < cutoff`, not just `id`, so a row
+        // concurrently `restore()`d between the SELECT and this DELETE
+        // survives instead of being purged out from under the restore.
+        //
+        // Before the fix, `deleted_at . lt` appeared exactly once (the
+        // SELECT's WHERE clause) anywhere in the generated code. After the
+        // fix it appears twice: once in the SELECT, once again as the
+        // DELETE's second `.filter(...)`.
+        let generated = repository_macro(
+            quote! { Post, soft_delete, retention(purge_deleted_after = "90d") },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("diesel :: delete"),
+            "purge_deleted_after must generate a DELETE: {generated}"
+        );
+
+        // Isolate the sweep-runner body: a soft_delete repository also
+        // generates restore()/purge()/only_deleted() and soft-delete-aware
+        // finder filters elsewhere, which reference `deleted_at` many times
+        // and would make a whole-output count meaningless.
+        let run_start = generated
+            .find("fn __autumn_retention_run")
+            .expect("__autumn_retention_run present");
+        let run_region = &generated[run_start..(run_start + 3000).min(generated.len())];
+
+        let deleted_at_count = run_region.matches("deleted_at").count();
+        assert!(
+            deleted_at_count >= 2,
+            "the sweep body must reference deleted_at in both the SELECT and the DELETE's \
+             re-check filter (found {deleted_at_count} time(s) in the sweep body): {run_region}"
+        );
+        // `__applied` proves the DELETE's actual affected-row count (not the
+        // SELECT's candidate count) is what's added to rows_swept, so a row
+        // excluded by the re-check filter isn't over-reported as swept.
+        assert!(
+            run_region.contains("__applied"),
+            "rows_swept must be driven by the statement's actual affected-row count: {run_region}"
         );
     }
 

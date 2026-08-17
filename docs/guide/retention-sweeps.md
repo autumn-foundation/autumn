@@ -70,6 +70,23 @@ At least one of `after` (with `basis`) or `purge_deleted_after` must be
 given; `sharded` repositories are not supported yet (a sweep would only
 reach the shard it happens to be handed, silently skipping the rest).
 
+## `tenant_scoped` Repositories: Sweeps Are Cross-Tenant By Design
+
+A sweep is a maintenance operation, not a request — it runs on a plain
+background connection with no tenant context, so `retention(...)` on a
+`tenant_scoped` repository intentionally sweeps stale rows for **every**
+tenant on each run, not just one. There is no per-tenant opt-out today: if
+one tenant needs a different (or no) retention window than the rest, give
+that model its own repository, or exclude those rows with an additional
+column-based condition your `basis`/`purge_deleted_after` filters can't
+express yet.
+
+This is a deliberate exception to the framework's usual "cross-tenant
+access requires an explicit `.across_tenants()` call" rule — the same way a
+DB-level TTL or a nightly VACUUM has no notion of tenant boundaries. Declare
+`retention(...)` on a `tenant_scoped` model only when that's the behavior
+you want.
+
 ## Batching and Multi-Replica Safety
 
 A sweep never issues one giant `DELETE`. It walks the stale rows in
@@ -82,6 +99,13 @@ The sweep is registered exactly like a `#[scheduled(coordination = "fleet")]`
 task, so it reuses the same [multi-replica coordination](scheduled-multi-replica.md)
 guarantee: under the `postgres` scheduler backend, only one replica executes
 a given sweep per tick, no matter how many replicas are running.
+
+The generated task name is `retention-sweep-<model>` (lowercased) — e.g.
+`Session` gets `retention-sweep-session`. Task names share one namespace with
+every `#[scheduled(name = "...")]` fn in the app; avoid explicitly naming a
+hand-written task the same as a model's retention sweep, or the two will
+compete for the same coordination lock and clobber each other's status in
+`/actuator/tasks`.
 
 ## Validate Before Enabling: Dry Run
 
@@ -110,7 +134,7 @@ Every real sweep run emits a structured log line and, unless it's a dry run,
 bumps two metrics — both labeled by `model`:
 
 - `retention_sweep_rows_total` (counter) — cumulative rows swept.
-- `retention_sweep_duration_ms` (histogram) — how long each run took.
+- `retention_sweep_duration_seconds` (timer/histogram) — how long each run took.
 
 Both show up at `/actuator/prometheus` and `/actuator/metrics` alongside your
 own [app-defined metrics](metrics.md).

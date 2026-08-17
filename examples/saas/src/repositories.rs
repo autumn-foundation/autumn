@@ -22,6 +22,12 @@ pub trait ProjectRepository {
 /// created_at)` is the entire policy declaration — Autumn compiles it into a
 /// batched, fleet-coordinated sweep with no `#[scheduled]` fn and no SQL. See
 /// docs/guide/retention-sweeps.md.
+///
+/// Combined with `tenant_scoped` here on purpose: the sweep is a background
+/// maintenance job with no tenant context, so it purges every tenant's
+/// expired tokens on each run, not just one — the intended behavior for a
+/// cleanup job, not a tenant-isolation gap. See "tenant_scoped Repositories"
+/// in the retention-sweeps guide.
 #[autumn_web::repository(
     PasswordResetToken,
     table = "password_reset_tokens",

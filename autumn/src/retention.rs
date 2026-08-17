@@ -123,8 +123,11 @@ pub async fn run_retention_dry_run(
 /// Emit the structured `{model, rows_swept, duration_ms}` log line for a run.
 ///
 /// For real (non-dry-run) sweeps, also bumps the `retention_sweep_rows_total`
-/// counter and `retention_sweep_duration_ms` histogram, both labeled by
-/// `model`.
+/// counter and `retention_sweep_duration_seconds` timer, both labeled by
+/// `model`. The timer is named `*_seconds` and records seconds — the
+/// framework's own Prometheus convention (see `autumn_web::metrics`) — even
+/// though the log line and [`RetentionSweepReport`] use milliseconds, which
+/// is what AC7 (issue #1342) names.
 pub fn log_retention_sweep(report: &RetentionSweepReport) {
     tracing::info!(
         model = %report.model,
@@ -137,13 +140,9 @@ pub fn log_retention_sweep(report: &RetentionSweepReport) {
         crate::metrics::counter("retention_sweep_rows_total")
             .with_label("model", report.model.clone())
             .increment(report.rows_swept);
-        // Duration histograms are inherently approximate; losing precision
-        // above 2^52ms (~142,000 years) is not a real concern.
-        #[allow(clippy::cast_precision_loss)]
-        let duration_ms = report.duration_ms as f64;
-        crate::metrics::histogram("retention_sweep_duration_ms")
+        crate::metrics::timer("retention_sweep_duration_seconds")
             .with_label("model", report.model.clone())
-            .record(duration_ms);
+            .record(std::time::Duration::from_millis(report.duration_ms));
     }
 }
 

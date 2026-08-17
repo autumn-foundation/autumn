@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Declarative data-retention sweeps (#1342):** `#[repository(Model,
+  retention(after = "30d", basis = created_at))]` — and the soft-delete
+  `purge_deleted_after = "90d"` variant, composable with `after` — compiles to
+  a batched, cursor-paginated, fleet-coordinated sweep with no
+  `#[scheduled]` fn and no SQL. Age-based retention soft-deletes on a
+  `soft_delete` repository (never re-touching an already soft-deleted row)
+  and hard-deletes otherwise; `purge_deleted_after` always hard-purges,
+  re-checking `deleted_at` at delete time so a row `restore()`d between the
+  sweep's SELECT and DELETE survives. Every policy auto-registers via
+  `inventory` — no `tasks![...]` entry needed — and reuses the same
+  Postgres-advisory-lock scheduler coordination `#[scheduled(coordination =
+  "fleet")]` tasks get, so only one replica executes a given sweep per
+  interval. `autumn retention --dry-run [--model NAME]` reports per-model
+  rows-that-would-be-swept without deleting anything. Each real run emits a
+  structured log line and bumps `retention_sweep_rows_total` /
+  `retention_sweep_duration_seconds`, both labeled by `model`. Opt-in: a
+  repository with no `retention(...)` behaves exactly as before. See
+  `docs/guide/retention-sweeps.md` and the `examples/saas` `PasswordResetToken`
+  demo.
+
 ### Fixed
 
 - **`generate admin` over an `#[encrypted]` model:** the generated admin adapter
