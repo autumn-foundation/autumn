@@ -11470,8 +11470,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let __age_chrono =
                         ::autumn_web::reexports::chrono::Duration::from_std(__age_duration)
                             .expect("retention `after` duration out of range");
-                    let __age_cutoff =
-                        ::autumn_web::time::ClockSource::now(state.clock()).naive_utc() - __age_chrono;
+                    // Checked, not `-` (#1342 review round 16): `after`
+                    // fitting in `chrono::Duration`'s range doesn't mean
+                    // subtracting it from *this* clock reading stays inside
+                    // `NaiveDateTime`'s representable range — e.g. a custom
+                    // clock near `NaiveDateTime::MIN` (test clocks, or a
+                    // misconfigured system clock) can still underflow even
+                    // for a boot-validated `after`. `-` panics on overflow;
+                    // this fails with the same actionable message boot
+                    // validation already uses for the config-level version
+                    // of this check.
+                    let __age_cutoff = ::autumn_web::time::ClockSource::now(state.clock())
+                        .naive_utc()
+                        .checked_sub_signed(__age_chrono)
+                        .expect(concat!(
+                            "retention `after` duration is too large to compute a valid cutoff \
+                             from the current time in #[repository(..., retention(after = \"",
+                            #after,
+                            "\"))]"
+                        ));
                     // `Option<i64>`, not a sentinel `i64` floor: no `i64`
                     // value is guaranteed below every possible id
                     // (`i64::MIN` itself is a legal id, and
@@ -11602,8 +11619,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let __purge_chrono =
                                 ::autumn_web::reexports::chrono::Duration::from_std(__purge_duration)
                                     .expect("retention `purge_deleted_after` duration out of range");
-                            let __cutoff =
-                                ::autumn_web::time::ClockSource::now(state.clock()).naive_utc() - __purge_chrono;
+                            // Checked, not `-` (#1342 review round 16): see
+                            // the age branch's identical cutoff computation
+                            // for why a boot-validated duration can still
+                            // underflow against a particular clock reading.
+                            let __cutoff = ::autumn_web::time::ClockSource::now(state.clock())
+                                .naive_utc()
+                                .checked_sub_signed(__purge_chrono)
+                                .expect(concat!(
+                                    "retention `purge_deleted_after` duration is too large to \
+                                     compute a valid cutoff from the current time in \
+                                     #[repository(..., retention(purge_deleted_after = \"",
+                                    #purge_after,
+                                    "\"))]"
+                                ));
                             // Computed at runtime, not a fixed macro-time
                             // half-share (#1342 review round 11): lets the
                             // purge phase claim whatever budget the age
@@ -11735,6 +11764,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // `chrono::Duration`'s range, which the sweep loop converts to in
         // order to compute the cutoff. Without this, that class of error
         // still only surfaced on the first scheduled tick rather than here.
+        // Regression (#1342 review round 16): `chrono::Duration::from_std`
+        // validates that a duration fits chrono's range, but a value that
+        // fits there — e.g. `after = "100000000d"` (~274,000 years) — can
+        // still place the cutoff outside `NaiveDateTime`'s representable
+        // range once subtracted from a clock reading, panicking on the
+        // sweep's first scheduled tick. Checked against the real wall clock
+        // (not the test-mockable `ClockSource`, which `task_info()` — a
+        // plain `fn() -> TaskInfo` with no `state` parameter — has no access
+        // to) as a sanity bound: any `after`/`purge_deleted_after` this
+        // large overflows regardless of which moment "now" turns out to be.
         let after_boot_validation = spec.after.as_ref().map_or_else(
             || quote! {},
             |after| {
@@ -11746,9 +11785,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 #after,
                                 "\"))]"
                             ));
-                        ::autumn_web::reexports::chrono::Duration::from_std(__duration)
+                        let __chrono_duration =
+                            ::autumn_web::reexports::chrono::Duration::from_std(__duration)
+                                .expect(concat!(
+                                    "retention `after` duration out of range in \
+                                     #[repository(..., retention(after = \"",
+                                    #after,
+                                    "\"))]"
+                                ));
+                        ::autumn_web::reexports::chrono::Utc::now()
+                            .naive_utc()
+                            .checked_sub_signed(__chrono_duration)
                             .expect(concat!(
-                                "retention `after` duration out of range in \
+                                "retention `after` duration is too large to compute a valid \
+                                 cutoff (overflows the representable date range) in \
                                  #[repository(..., retention(after = \"",
                                 #after,
                                 "\"))]"
@@ -11768,10 +11818,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 #purge_after,
                                 "\"))]"
                             ));
-                        ::autumn_web::reexports::chrono::Duration::from_std(__duration)
+                        let __chrono_duration =
+                            ::autumn_web::reexports::chrono::Duration::from_std(__duration)
+                                .expect(concat!(
+                                    "retention `purge_deleted_after` duration out of range in \
+                                     #[repository(..., retention(purge_deleted_after = \"",
+                                    #purge_after,
+                                    "\"))]"
+                                ));
+                        ::autumn_web::reexports::chrono::Utc::now()
+                            .naive_utc()
+                            .checked_sub_signed(__chrono_duration)
                             .expect(concat!(
-                                "retention `purge_deleted_after` duration out of range in \
-                                 #[repository(..., retention(purge_deleted_after = \"",
+                                "retention `purge_deleted_after` duration is too large to \
+                                 compute a valid cutoff (overflows the representable date \
+                                 range) in #[repository(..., retention(purge_deleted_after = \"",
                                 #purge_after,
                                 "\"))]"
                             ));
@@ -11899,20 +11960,41 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #age_cutoff_and_state_decl
                 #purge_batches_used_decl
 
-                #age_block
-                #purge_block
-                #age_reclaim_block
+                // Each batch commits independently — no transaction spans
+                // the whole run — so a mid-run failure still leaves earlier
+                // batches' mutations committed. Capturing the sweep's
+                // Result here, instead of letting a bare `?` inside these
+                // blocks return straight out of this function, lets the
+                // partial `rows_swept` still reach `log_retention_sweep`
+                // below before the error propagates (#1342 review round
+                // 16) — otherwise those committed rows would be
+                // permanently missing from `retention_sweep_rows_total`
+                // and no structured report would record the partial work.
+                let __sweep_result: ::autumn_web::AutumnResult<()> = async {
+                    #age_block
+                    #purge_block
+                    #age_reclaim_block
+                    ::core::result::Result::Ok(())
+                }
+                .await;
 
                 #[allow(clippy::cast_possible_truncation)]
                 let duration_ms =
                     state.monotonic().saturating_duration_since(__started).as_millis() as u64;
-                Ok(::autumn_web::retention::RetentionSweepReport {
+                let report = ::autumn_web::retention::RetentionSweepReport {
                     model: #model_name_str.to_string(),
                     table: #table_name.to_string(),
                     rows_swept,
                     duration_ms,
                     dry_run,
-                })
+                };
+                match __sweep_result {
+                    ::core::result::Result::Ok(()) => ::core::result::Result::Ok(report),
+                    ::core::result::Result::Err(error) => {
+                        ::autumn_web::retention::log_retention_sweep(&report);
+                        ::core::result::Result::Err(error)
+                    }
+                }
             }
 
             /// Builds the recurring `TaskInfo` `autumn_web::retention`
@@ -22821,7 +22903,7 @@ mod tests {
             .find("fn __autumn_retention_task_info")
             .expect("task_info builder present");
         let task_info_region =
-            &generated[task_info_start..(task_info_start + 3000).min(generated.len())];
+            &generated[task_info_start..(task_info_start + 5000).min(generated.len())];
 
         assert!(
             task_info_region.matches("parse_duration").count() >= 3,
@@ -22862,7 +22944,7 @@ mod tests {
             .find("fn __autumn_retention_task_info")
             .expect("task_info builder present");
         let task_info_region =
-            &generated[task_info_start..(task_info_start + 3000).min(generated.len())];
+            &generated[task_info_start..(task_info_start + 5000).min(generated.len())];
 
         assert!(
             task_info_region
@@ -22871,6 +22953,108 @@ mod tests {
                 >= 2,
             "task_info builder must validate both `after` and `purge_deleted_after` convert to \
              a chrono::Duration up front (two from_std calls): {task_info_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_validates_cutoff_arithmetic_at_boot() {
+        // Regression (#1342 review round 16): fitting `chrono::Duration`'s
+        // range (round 15's fix) doesn't mean subtracting it from a clock
+        // reading stays inside `NaiveDateTime`'s representable range — e.g.
+        // `after = "100000000d"` (~274,000 years) still panics the sweep's
+        // first scheduled tick at `now - duration`. The task_info builder
+        // must also perform the checked cutoff subtraction against the real
+        // wall clock up front, for both `after` and `purge_deleted_after`.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let task_info_start = generated
+            .find("fn __autumn_retention_task_info")
+            .expect("task_info builder present");
+        let task_info_region =
+            &generated[task_info_start..(task_info_start + 5000).min(generated.len())];
+
+        assert!(
+            task_info_region.matches("checked_sub_signed").count() >= 2,
+            "task_info builder must validate checked cutoff arithmetic for both `after` and \
+             `purge_deleted_after` up front: {task_info_region}"
+        );
+        assert!(
+            task_info_region.contains("chrono :: Utc :: now"),
+            "boot-time cutoff validation must use the real wall clock, since task_info() has \
+             no state/ClockSource parameter: {task_info_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_runtime_cutoff_uses_checked_subtraction() {
+        // Regression (#1342 review round 16): the sweep loop computed the
+        // cutoff with plain `-`, which panics on overflow. A boot-validated
+        // duration doesn't guarantee this stays safe against every possible
+        // clock reading (e.g. a custom/test clock near NaiveDateTime::MIN),
+        // so the runtime computation must also use checked subtraction, not
+        // just boot-time validation against the wall clock.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
+
+        assert!(
+            retention_run.matches("checked_sub_signed").count() >= 2,
+            "the age and purge branches must both compute their cutoff with checked \
+             subtraction, not plain `-`: {retention_run}"
+        );
+        assert!(
+            !retention_run.contains(". naive_utc () - __age_chrono")
+                && !retention_run.contains(". naive_utc () - __purge_chrono"),
+            "the runtime cutoff computation must not use plain `-`, which panics on overflow: \
+             {retention_run}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_logs_partial_sweep_before_propagating_error() {
+        // Regression (#1342 review round 16): each batch commits
+        // independently (no transaction spans the whole run), so a mid-run
+        // failure still leaves earlier batches' mutations committed. Before
+        // this fix, a bare `?` inside the age/purge loops returned straight
+        // out of __autumn_retention_run, skipping the report construction
+        // entirely — so log_retention_sweep (which bumps
+        // retention_sweep_rows_total) never saw the partial rows_swept, and
+        // no structured report recorded the partial work.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
+
+        assert!(
+            retention_run.contains("__sweep_result"),
+            "the sweep's Result must be captured rather than propagated with a bare `?`, so \
+             partial progress can still be logged: {retention_run}"
+        );
+        assert!(
+            retention_run.contains("log_retention_sweep (& report)"),
+            "the error path must call log_retention_sweep with the partial report before \
+             propagating: {retention_run}"
         );
     }
 
@@ -23044,7 +23228,7 @@ mod tests {
         let run_start = generated
             .find("fn __autumn_retention_run")
             .expect("__autumn_retention_run present");
-        let run_region = &generated[run_start..(run_start + 3000).min(generated.len())];
+        let run_region = &generated[run_start..(run_start + 4000).min(generated.len())];
 
         let deleted_at_count = run_region.matches("deleted_at").count();
         assert!(
