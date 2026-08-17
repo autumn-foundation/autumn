@@ -123,6 +123,7 @@ pub fn cache_fragment_global(
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
 
     use maud::{Markup, html};
@@ -133,6 +134,15 @@ mod tests {
     fn make_cache(capacity: u64) -> MokaCache {
         MokaCache::new(capacity, None)
     }
+
+    // The process-global cache (`crate::cache::{set,clear}_global_cache`) is
+    // shared process-wide, but `cargo test` runs these tests on parallel
+    // threads in one process. Tests that mutate it hold this mutex for their
+    // duration so e.g. `global_variant_no_global_cache_renders_fallback`'s
+    // `clear_global_cache()` can't land between the two `cache_fragment_global`
+    // calls in `global_variant_hits_process_global_cache` (see issue #2218).
+    // Poison-tolerant so one panicking test doesn't cascade into the other.
+    static GLOBAL_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     // ── AC1 + AC5: miss renders+stores; closure NOT executed on a hit ──────
 
@@ -361,6 +371,10 @@ mod tests {
 
     #[test]
     fn global_variant_hits_process_global_cache() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
         clear_global_cache();
 
         let moka = Arc::new(MokaCache::new(100, None));
@@ -393,6 +407,10 @@ mod tests {
 
     #[test]
     fn global_variant_no_global_cache_renders_fallback() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
         clear_global_cache();
 
         let result = cache_fragment_global("post:fallback", "v1", None, || html! { span { "ok" } });
