@@ -516,6 +516,21 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             // `retention(after = "30d", basis = created_at)` and/or
             // `retention(purge_deleted_after = "90d")`, plus optional
             // `batch_size = N` and `every = "..."` (issue #1342).
+            //
+            // Regression (#1342 review round 22): the round-21 fix caught a
+            // repeated KEY within one retention(...) clause, but repeating
+            // the ENTIRE clause — e.g. `retention(after = "90d", basis =
+            // created_at), retention(after = "7d", basis = created_at)` —
+            // still silently overwrote `retention` with the second policy
+            // below, with no error. Since retention(...) controls
+            // irreversible deletion, this must fail loudly at compile time
+            // too, the same reason round 21 rejects a repeated key.
+            if retention.is_some() {
+                return Err(meta.error(
+                    "duplicate retention(...) clause: #[repository(...)] may declare at most \
+                     one retention(...) policy",
+                ));
+            }
             let mut after: Option<String> = None;
             let mut basis: Option<Ident> = None;
             let mut purge_deleted_after: Option<String> = None;
@@ -11399,11 +11414,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
                             &mut *conn,
                             |conn| async move {
+                                // `order(id.asc())` before the `FOR UPDATE`
+                                // lock (#1342 review round 22): on
+                                // Postgres, a sweep here can race a normal
+                                // `delete_many` locking an overlapping
+                                // batch of the same counter-cached
+                                // children. `delete_many`'s own
+                                // `counter_cache_before_delete_many` locks
+                                // ascending by id specifically to avoid a
+                                // deadlock — but that ordering only helps
+                                // if EVERY locker uses it. Without it here,
+                                // the two transactions could acquire the
+                                // same rows in opposite orders and one
+                                // gets aborted.
                                 let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
                                     #table_ident::table
                                         .filter(#table_ident::id.eq_any(ids))
                                         .filter(#table_ident::#basis_ident.lt(__age_cutoff))
                                         .filter(#table_ident::deleted_at.is_null())
+                                        .order(#table_ident::id.asc())
                                         .select(#table_ident::id)
                                 )
                                 .load::<i64>(conn)
@@ -11450,10 +11479,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
                             &mut *conn,
                             |conn| async move {
+                                // Locked ascending by id, matching the
+                                // soft-delete branch's identical fix above
+                                // (#1342 review round 22).
                                 let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
                                     #table_ident::table
                                         .filter(#table_ident::id.eq_any(ids))
                                         .filter(#table_ident::#basis_ident.lt(__age_cutoff))
+                                        .order(#table_ident::id.asc())
                                         .select(#table_ident::id)
                                 )
                                 .load::<i64>(conn)
@@ -11734,10 +11767,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
                                         &mut *conn,
                                         |conn| async move {
+                                            // Locked ascending by id, matching
+                                            // the age branches' identical fix
+                                            // above (#1342 review round 22).
                                             let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
                                                 #table_ident::table
                                                     .filter(#table_ident::id.eq_any(ids))
                                                     .filter(#table_ident::deleted_at.lt(__cutoff))
+                                                    .order(#table_ident::id.asc())
                                                     .select(#table_ident::id)
                                             )
                                             .load::<i64>(conn)
@@ -22651,6 +22688,30 @@ mod tests {
     }
 
     #[test]
+    fn retention_rejects_repeated_retention_clause() {
+        // Regression (#1342 review round 22, P1): round 21 caught a
+        // repeated KEY within one retention(...) clause, but repeating the
+        // ENTIRE clause still silently overwrote the first policy with the
+        // second, no error — e.g. retention(after = "90d", basis =
+        // created_at), retention(after = "7d", basis = created_at) would
+        // compile with the seven-day policy despite declaring 90 days
+        // first. Since retention(...) controls irreversible deletion, this
+        // must fail loudly too.
+        let tokens: proc_macro2::TokenStream = "Post, \
+             retention(after = \"90d\", basis = created_at), \
+             retention(after = \"7d\", basis = created_at)"
+            .parse()
+            .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("a repeated retention(...) clause must be rejected");
+        };
+        assert!(
+            error.to_string().contains("duplicate") && error.to_string().contains("retention"),
+            "the error must mention the duplicate retention(...) clause: {error}"
+        );
+    }
+
+    #[test]
     fn retention_rejects_sharded() {
         let tokens: proc_macro2::TokenStream =
             "Post, sharded, retention(after = \"30d\", basis = created_at)"
@@ -22993,6 +23054,44 @@ mod tests {
             !retention_run.contains("scoped_transaction ::"),
             "counter-cache sweep transactions must not use the deferred \
              scoped_transaction: {retention_run}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_counter_cache_locks_ordered_by_id() {
+        // Regression (#1342 review round 22, P2): on Postgres, a
+        // counter-cached sweep's FOR UPDATE lock query raced a concurrent
+        // delete_many locking an overlapping batch of the same children.
+        // delete_many's own counter_cache_before_delete_many locks
+        // ascending by id specifically to avoid a deadlock, but that
+        // ordering only helps if EVERY locker uses it — without an
+        // explicit order() here too, the two transactions could acquire
+        // the same rows in opposite orders and one would be aborted.
+        // Applies to all three mutation sites: age soft-delete, age
+        // hard-delete, and purge hard-delete.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
+
+        // Distinguishes the FOR UPDATE lock queries from the unrelated
+        // (and already-ordered) batch-select queries: the lock queries end
+        // `.select(id))` — the extra `)` closing `maybe_for_update!(...)`
+        // — immediately followed by `.load`, whereas the batch-select
+        // queries continue with `.limit(...)` first.
+        assert_eq!(
+            retention_run
+                .matches("id . asc ()) . select (posts :: id)) . load")
+                .count(),
+            3,
+            "each of the three FOR UPDATE lock queries (age primary pass, age reclaim pass, \
+             purge) must order by id ascending before locking: {retention_run}"
         );
     }
 
