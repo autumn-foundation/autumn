@@ -1209,11 +1209,23 @@ fn plan_scaffold_with_options_impl(
                     )));
                 }
             };
-            let merged = scaffold_i18n::merge_en_ftl(
+            // A `--force` regeneration reconciles the block against the keys
+            // the NEW render emits, which is what stops a dropped field
+            // leaving orphans behind — but a key this render no longer emits
+            // can still be called from hand-written code elsewhere, and `t!`
+            // rejects a missing key at COMPILE time. Same project scan
+            // `destroy` uses, reading the plan's PENDING contents so this
+            // resource's own freshly rendered routes are what count for it,
+            // not the superseded file still on disk.
+            let pending = super::emit::pending_contents(&plan);
+            let still_referenced =
+                super::emit::keys_still_referenced(&existing_ftl, project_root, &[], &pending);
+            let merged = scaffold_i18n::merge_en_ftl_keeping(
                 &existing_ftl,
                 &pascal_name,
                 &snake_name,
                 &referenced_keys,
+                &still_referenced,
             );
             if merged != existing_ftl {
                 // `create` rather than `modify` when the file is new: the plan's

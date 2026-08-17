@@ -735,6 +735,46 @@ fn a_non_default_locale_project_still_compiles_against_the_t_validator() {
 }
 
 #[test]
+fn regenerating_keeps_a_dropped_field_key_hand_written_code_still_calls() {
+    // The other half of `regenerating_after_dropping_a_field_prunes_its_keys`:
+    // "this render no longer emits it" is not "nothing uses it". A surviving
+    // call site outside the generated module keeps its key, because `t!`
+    // rejects a missing key at COMPILE time — the same protection `destroy`
+    // already gets from a project-wide scan.
+    let (_tmp, project) = i18n_project(&[]);
+    let ftl_path = project.join("i18n/en.ftl");
+    fs::create_dir_all(project.join("src/components")).unwrap();
+    fs::write(
+        project.join("src/components/nav.rs"),
+        "fn card(locale: &Locale) -> Markup { html! { (t!(locale, \"post.field.views\")) } }\n",
+    )
+    .unwrap();
+
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "--i18n",
+            "--force",
+        ],
+    );
+
+    let ftl = fs::read_to_string(&ftl_path).unwrap();
+    assert!(
+        ftl.contains("post.field.views"),
+        "a live call site keeps its key through regeneration:\n{ftl}"
+    );
+    assert!(
+        !ftl.contains("post.field.author_name") && !ftl.contains("post.field.published"),
+        "keys nothing calls are still pruned:\n{ftl}"
+    );
+}
+
+#[test]
 fn the_validator_bundle_a_cargo_config_selects_is_kept_in_step() {
     // `t!` reads `AUTUMN_I18N_DEFAULT_LOCALE` to pick the bundle it validates
     // against, and a setting the macro needs on every build lives in

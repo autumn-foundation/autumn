@@ -257,6 +257,31 @@ pub(super) fn merge_en_ftl(
     resource: &str,
     keys: &BTreeMap<String, String>,
 ) -> String {
+    merge_en_ftl_keeping(
+        existing,
+        pascal_name,
+        resource,
+        keys,
+        &std::collections::HashSet::new(),
+    )
+}
+
+/// [`merge_en_ftl`] with a set of keys the reconciliation must not prune.
+///
+/// Regeneration reconciles the resource block against the keys the NEW render
+/// emits, which is how a dropped field or flag stops leaving orphans behind.
+/// But "this render no longer emits it" is not "nothing uses it": hand-written
+/// code outside the generated module can call `t!(locale, "post.field.subtitle")`,
+/// and `t!` validates key existence at COMPILE time, so pruning it breaks the
+/// build — the same failure `destroy` already scans the project to avoid.
+/// Passing the same set through both paths is what keeps them agreeing.
+pub(super) fn merge_en_ftl_keeping(
+    existing: &str,
+    pascal_name: &str,
+    resource: &str,
+    keys: &BTreeMap<String, String>,
+    still_referenced: &std::collections::HashSet<String>,
+) -> String {
     use std::fmt::Write as _;
 
     let already = defined_keys(existing);
@@ -288,8 +313,23 @@ pub(super) fn merge_en_ftl(
     // The shared chrome is never pruned here: every resource writes those keys,
     // so dropping one from this resource's render would delete a key a SIBLING
     // still uses. Chrome is additive, and `destroy` is what eventually takes it.
-    if let Some(reconciled) = reconcile_block(existing, &resource_header, &resource_prefix, keys) {
-        return merge_en_ftl(&reconciled, pascal_name, resource, keys);
+    //
+    // Keys a surviving call site still names are held back from the prune. Only
+    // ones the bundle already DEFINES: a reference to a key no `.ftl` carries
+    // was already failing `t!` before this ran, and reconciliation must not
+    // invent an empty message for it.
+    let mut wanted = keys.clone();
+    for key in still_referenced {
+        if key.starts_with(&resource_prefix)
+            && !key.starts_with("common.")
+            && already.contains_key(key)
+        {
+            wanted.entry(key.clone()).or_default();
+        }
+    }
+    if let Some(reconciled) = reconcile_block(existing, &resource_header, &resource_prefix, &wanted)
+    {
+        return merge_en_ftl_keeping(&reconciled, pascal_name, resource, keys, still_referenced);
     }
     if missing_common.is_empty() && missing_resource.is_empty() {
         return existing.to_owned();
@@ -310,7 +350,7 @@ pub(super) fn merge_en_ftl(
         out.push_str(&existing[insert_at..]);
         // Whatever the resource block still needs lands on the next pass, which
         // terminates: the chrome keys are now all present.
-        return merge_en_ftl(&out, pascal_name, resource, keys);
+        return merge_en_ftl_keeping(&out, pascal_name, resource, keys, still_referenced);
     }
 
     let mut out = String::with_capacity(existing.len() + (keys.len() + 4) * 48);
@@ -2115,20 +2155,190 @@ fn custom_bundle_before(src: &str, at: usize) -> bool {
 /// one runs later and overrides `.i18n_auto()` rather than being clobbered by
 /// it, so there is nothing to protect.
 fn method_called_before(src: &str, at: usize, method: &str) -> bool {
-    let mut end = at;
-    loop {
-        let start = enclosing_block_start(src, end);
-        if calls_at_own_depth(&src[start..end], method) {
+    // The chain itself, first: `App::new().i18n(b).routes(…)` needs no
+    // bindings followed.
+    let start = statement_start(src, at);
+    if calls_at_own_depth(&src[start..at], method) {
+        return true;
+    }
+    // Otherwise the chain starts from a NAME, and only that name's value is
+    // this app. A lexical-depth scan counted every earlier call at the same
+    // level, so `let preview = preview.i18n(bundle);` above `let app =
+    // app.routes(…)` reported the production chain as already bundled — and
+    // for `.i18n_auto` that is silent: the caller reports success and
+    // production renders raw keys.
+    let statement = &src[start..at];
+    let Some(mut name) = value_root(let_parts(statement).map_or(statement, |(_, init)| init))
+    else {
+        return false;
+    };
+    let mut before = start;
+    // Each hop is a `let <name> = <initialiser>;`. Following them transitively
+    // matters: giving up after one would miss a bundle installed two
+    // rebindings back, and MISSING one is the failure that clears it.
+    // Bounded only against a pathological input; valid Rust cannot cycle.
+    for _ in 0..64 {
+        let Some((bind_start, bind_end)) = binding_of(src, before, name) else {
+            return false;
+        };
+        let statement = &src[bind_start..bind_end];
+        let initialiser = let_parts(statement).map_or(statement, |(_, init)| init);
+        if calls_at_own_depth(initialiser, method) {
             return true;
         }
-        if start == 0 {
+        let Some(next) = value_root(initialiser) else {
             return false;
-        }
-        // Step outside this level's opening delimiter and ask its parent. The
-        // delimiter itself bounds the parent's range, so the group just left is
-        // never re-read.
-        end = start - 1;
+        };
+        name = next;
+        before = bind_start;
     }
+    false
+}
+
+/// The nearest `let <name> = …;` before `before`, searching this block level
+/// and then outward.
+///
+/// Outward matters and nested does not: a binding made in an enclosing block is
+/// what a conditional branch continues from, while one made inside a sibling
+/// branch belongs to that branch alone.
+fn binding_of(src: &str, before: usize, name: &str) -> Option<(usize, usize)> {
+    let mut end = before;
+    loop {
+        let level = enclosing_block_start(src, end);
+        if let Some(found) = statements_in(src, level, end)
+            .into_iter()
+            .rev()
+            .find(|&(s, e)| let_parts(&src[s..e]).is_some_and(|(bound, _)| bound == name))
+        {
+            return Some(found);
+        }
+        if level == 0 {
+            return None;
+        }
+        end = level - 1;
+    }
+}
+
+/// Spans of the COMPLETE statements of `src[start..end]` at its own nesting
+/// level — those a `;` closes.
+///
+/// The trailing unterminated run is deliberately not one of them. Ascending out
+/// of a block lands mid-statement, and that statement is the construct being
+/// searched from: `let app = if flag {` is where this app is going, not a prior
+/// binding of it, and returning it makes the search resolve `app` to itself.
+fn statements_in(src: &str, start: usize, end: usize) -> Vec<(usize, usize)> {
+    let region = &src[start..end];
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut statement = 0usize;
+    for &(offset, byte) in &delimiter_marks(region, region.len()) {
+        match byte {
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' => depth -= 1,
+            b';' if depth <= 0 => {
+                out.push((start + statement, start + offset));
+                statement = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `(bound name, initialiser)` for a `let <ident> = <expr>` statement.
+///
+/// Only a plain identifier binds a name this can follow. A destructuring
+/// pattern binds no single value, and reporting one would attribute an app to
+/// whatever the tuple happened to hold.
+fn let_parts(statement: &str) -> Option<(&str, &str)> {
+    let rest = statement.trim_start();
+    let rest = rest.strip_prefix("let")?;
+    if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        // `letters` is not `let`.
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("mut").map_or(rest, |after| {
+        if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            rest
+        } else {
+            after
+        }
+    });
+    let rest = rest.trim_start();
+    let name_len = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let (name, after) = rest.split_at(name_len);
+    if name.is_empty() {
+        return None;
+    }
+    // A type annotation may sit between the name and the `=`; nothing else this
+    // needs to read can. `==` and `=>` cannot appear here.
+    let eq = real_offsets(after, "=")
+        .into_iter()
+        .find(|&at| !after[at + 1..].starts_with(['=', '>']))?;
+    Some((name, &after[eq + 1..]))
+}
+
+/// The identifier an expression's value starts from — `app` in
+/// `app.routes(…)` — or `None` when it starts from something this cannot
+/// follow: a path or call (`App::new()`), a block, or a keyword.
+fn value_root(expr: &str) -> Option<&str> {
+    let rest = &expr[ignorable_prefix_len(expr)..];
+    let len = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let ident = &rest[..len];
+    if ident.is_empty() || ident.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    // `App::new()` is a fresh value, and a keyword opens a construct rather
+    // than naming one. Either way there is no binding to follow.
+    let after = &rest[len..];
+    let after = &after[ignorable_prefix_len(after)..];
+    if after.starts_with("::")
+        || after.starts_with('!')
+        || matches!(
+            ident,
+            "if" | "match"
+                | "loop"
+                | "while"
+                | "for"
+                | "let"
+                | "unsafe"
+                | "async"
+                | "move"
+                | "return"
+        )
+    {
+        return None;
+    }
+    Some(ident)
+}
+
+/// Start of the statement the call at `at` belongs to — the previous `;` or
+/// opening delimiter at this level.
+///
+/// Balanced-delimiter aware and reading only REAL code, so a `;` inside a
+/// nested `.layer(from_fn(|req, next| async move { … }))` is not mistaken for
+/// the boundary.
+fn statement_start(src: &str, at: usize) -> usize {
+    let mut depth = 0usize;
+    for &(offset, byte) in delimiter_marks(src, at).iter().rev() {
+        match byte {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return offset + 1;
+                };
+                depth = next;
+            }
+            b';' if depth == 0 => return offset + 1,
+            _ => {}
+        }
+    }
+    0
 }
 
 /// Whether `region` calls `method` at its OWN nesting level, rather than inside
@@ -3625,6 +3835,52 @@ mod tests {
             I18nAutoWiring::Wired(main_rs.to_owned()),
             "the app already loads its bundle; nothing to add"
         );
+    }
+
+    /// A call on an UNRELATED value is not this app's. A lexical-depth scan
+    /// counted every earlier call at the same level, so a preview builder
+    /// beside the production one spoke for it — and for `.i18n_auto` that is
+    /// the silent failure: nothing warns, and production renders raw keys.
+    #[test]
+    fn a_call_on_another_binding_does_not_speak_for_this_app() {
+        let wired = concat!(
+            "fn main() {\n",
+            "    let preview = App::new();\n",
+            "    let preview = preview.i18n_auto();\n",
+            "    let app = App::new();\n",
+            "    let app = app.routes(routes![index]);\n",
+            "    app.serve();\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(wired) else {
+            panic!("production is not wired by the preview builder");
+        };
+        assert_eq!(
+            out.matches(".i18n_auto()").count(),
+            2,
+            "production needs its own:\n{out}"
+        );
+
+        let bundled = wired.replace(".i18n_auto()", ".i18n(tms_bundle())");
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(&bundled) else {
+            panic!("the preview's bundle is not production's either");
+        };
+        assert!(out.contains(".i18n_auto()"), "{out}");
+    }
+
+    /// And a bundle two rebindings back is still this app's — giving up after
+    /// one hop would clear it.
+    #[test]
+    fn a_bundle_reached_through_several_rebindings_is_still_found() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let base = App::new().i18n(tms_bundle());\n",
+            "    let configured = base;\n",
+            "    let app = configured;\n",
+            "    let app = app.routes(routes![index]);\n",
+            "}\n",
+        );
+        assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::CustomBundle);
     }
 
     /// A `#[cfg(test)]` fixture can declare the very same `EMBEDDED_STATIC`

@@ -419,6 +419,25 @@ fn remove_i18n_keys(
     // destroyed, prune it, and break the surviving call at COMPILE time, which
     // is the one failure mode this set exists to prevent. `autumn i18n check`
     // reads the whole tree for the same reason.
+    let surviving = keys_still_referenced(content, project_root, excluding, overrides);
+    super::scaffold_i18n::remove_en_ftl_keys(content, pascal, snake, &surviving)
+}
+
+/// The keys `bundle` defines that project source still reaches — statically, or
+/// through a runtime-built key.
+///
+/// Shared by the two paths that PRUNE a resource's keys, because they have to
+/// agree: `destroy` takes the whole block, and a `--force` regeneration that
+/// dropped a field takes the keys the new render no longer emits. A key a
+/// surviving call site names must outlive both, and `t!` rejects a missing key
+/// at COMPILE time, so a set one path honours and the other does not is just a
+/// slower way to break the same build.
+pub(super) fn keys_still_referenced(
+    bundle: &str,
+    project_root: &Path,
+    excluding: &[PathBuf],
+    overrides: &HashMap<PathBuf, String>,
+) -> HashSet<String> {
     let scan = scan_surviving_sources(project_root, excluding, overrides);
     // Every key the surviving tree references, NOT just the `common.*` ones.
     // The resource's own keys are ordinary Fluent keys too, and hand-written
@@ -435,12 +454,12 @@ fn remove_i18n_keys(
     // definitions such a call still reaches at runtime, leaving a missing-key
     // marker in a surviving view. `autumn i18n check` suppresses its unused-key
     // report for exactly these sites, so this has to be at least as
-    // conservative — otherwise destroy deletes what the checker declines to
+    // conservative — otherwise pruning deletes what the checker declines to
     // complain about. `key_prefix` is the leading literal, empty meaning "could
     // be any key", so `starts_with` covers both.
     if !scan.dynamic.is_empty() {
         surviving.extend(
-            super::scaffold_i18n::defined_keys(content)
+            super::scaffold_i18n::defined_keys(bundle)
                 .into_keys()
                 .filter(|key| {
                     scan.dynamic
@@ -449,7 +468,25 @@ fn remove_i18n_keys(
                 }),
         );
     }
-    super::scaffold_i18n::remove_en_ftl_keys(content, pascal, snake, &surviving)
+    surviving
+}
+
+/// Every file the plan is about to write, as pending content the scan must read
+/// INSTEAD of what is on disk.
+///
+/// A regeneration's own freshly rendered routes are the authority on which keys
+/// it still uses; the superseded file on disk names the keys being dropped, and
+/// reading that would protect exactly what the reconciliation exists to remove.
+pub(super) fn pending_contents(plan: &Plan) -> HashMap<PathBuf, String> {
+    plan.actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Create { path, contents }
+            | Action::Modify { path, contents }
+            | Action::CreateIfAbsent { path, contents } => Some((path.clone(), contents.clone())),
+            Action::CreateBytes { .. } => None,
+        })
+        .collect()
 }
 
 /// Every key still referenced by surviving project source.
