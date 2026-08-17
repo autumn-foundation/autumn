@@ -1814,7 +1814,22 @@ fn plan_scaffold_with_options_impl(
             // hand-rolled `main.rs`) just leave it alone: `.i18n_auto()`'s disk
             // load still works for an ordinary build.
             scaffold_i18n::I18nAutoWiring::Wired(wired) => {
-                scaffold_i18n::ensure_embedded_locales(&wired, &i18n_dir_for_embed).unwrap_or(wired)
+                scaffold_i18n::ensure_embedded_locales(&wired, &i18n_dir_for_embed).unwrap_or_else(
+                    || {
+                        // The builder chain was found and wired, but the
+                        // template's `EMBEDDED_STATIC` anchors are not there to
+                        // hang the locale embedding on. Filesystem loading still
+                        // works for an ordinary build, so this is not a refusal
+                        // — but it is not silent either: `autumn build --embed`
+                        // advertises a self-contained binary, and this one would
+                        // carry no bundle and panic wherever the sidecar
+                        // directory is absent.
+                        plan.warn(format!(
+                            "`main.rs` has no `embed_static!`/`embedded_static` anchors, so the                              `{i18n_dir_for_embed}/` bundle was NOT embedded — `.i18n_auto()`                              loads it from disk instead. That is fine for an ordinary build; an                              `autumn build --embed` binary, though, will carry no locales and                              PANICS at startup wherever `{i18n_dir_for_embed}/` is missing. Add                              `embed_locales!` and `.embedded_locales(&…)` by hand if you ship                              `--embed` builds."
+                        ));
+                        wired
+                    },
+                )
             }
             // No real `.routes(` call to anchor on. Writing the call anywhere
             // else risks landing it in a comment, where it would silently never

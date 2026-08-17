@@ -221,7 +221,7 @@ impl ViewLabels {
 /// Mirrors the minimal parser in `autumn-macros`' `t!` validation and
 /// `autumn-web`'s `Bundle` loader: a top-level `key = value` line, with `#`
 /// comments and indented continuation lines skipped.
-fn defined_keys(src: &str) -> BTreeMap<String, String> {
+pub(super) fn defined_keys(src: &str) -> BTreeMap<String, String> {
     src.lines()
         .filter(|line| {
             !line.trim_start().starts_with('#')
