@@ -11278,250 +11278,312 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // the whole budget. Each branch still gets the full budget when
         // it's the only one declared.
         let both_branches = spec.after.is_some() && spec.purge_deleted_after.is_some();
-        // `age_max_batches` is still a fixed per-run reservation (never more
-        // than half the budget when both branches are declared) so a huge
-        // age backlog can't starve the purge phase entirely — the round-9
-        // P1 fix. But a *fixed* reservation for purge wastes budget when the
-        // age phase doesn't need its whole half (review round 11): declaring
-        // both `after` and a single stale live row, plus a 600-batch purge
-        // backlog, used to cap purge at exactly `max_batches / 2` even
-        // though the age phase left hundreds of unused batches on the
-        // table. Purge's cap is therefore computed at *runtime*, after the
-        // age phase finishes, as the budget minus whatever the age phase
-        // actually used — never less than its guaranteed floor (age can
-        // never use more than its own fixed cap), but free to claim
-        // everything age left unused.
+        // `age_max_batches` is still a fixed per-run reservation for the
+        // age phase's *primary* pass (never more than half the budget when
+        // both branches are declared) so a huge age backlog can't starve
+        // the purge phase entirely — the round-9 P1 fix.
         let age_max_batches = if both_branches {
             max_batches / 2
         } else {
             max_batches
         };
-        let age_batches_used_decl = if both_branches {
-            quote! { let mut __age_batches_used: u32 = 0; }
-        } else {
-            quote! {}
-        };
-        let age_batches_used_write = if both_branches {
-            quote! { __age_batches_used = __batches; }
-        } else {
-            quote! {}
-        };
-        let purge_max_batches_expr = if both_branches {
-            quote! { (#max_batches).saturating_sub(__age_batches_used) }
-        } else {
-            quote! { #max_batches }
-        };
 
         // Age-based branch: soft-deletes on a soft_delete repository
         // (never re-touching an already soft-deleted row), hard-deletes
         // otherwise. Absent unless `after` was declared.
-        let age_block = spec.after.as_ref().map_or_else(
-                || quote! {},
-                |after| {
-                    let basis_ident = spec
-                        .basis
-                        .as_ref()
-                        .expect("validated by parse_repo_args: after requires basis");
-                    // Yields the number of rows the statement actually
-                    // touched (not the SELECT's candidate count) so a row
-                    // that changed state between the SELECT and this
-                    // statement — e.g. a concurrent `restore()`, or (when
-                    // `basis` is a mutable column like `last_seen_at`) a
-                    // concurrent update that un-stales the row — is
-                    // reflected correctly in `rows_swept` rather than
-                    // over-reported. Re-checking `basis < __cutoff` here,
-                    // not just `id`, is what makes the second case safe.
-                    // Regression (#1342 review round 3): a counter-cached
-                    // model swept by `retention(...)` must move its parent's
-                    // counter exactly like every other delete path does, or
-                    // every swept live child leaves its parent's stored count
-                    // permanently inflated. `counter_cache_before_delete_many`
-                    // has to run on still-present, still-live rows BEFORE the
-                    // mutation, so the `#cc_has` arm locks (`FOR UPDATE`) the
-                    // subset of `ids` still eligible under the recheck filter
-                    // first — a candidate can have dropped out since the
-                    // batch SELECT, e.g. a concurrent update that un-staled
-                    // `basis` — then decrements against exactly that locked
-                    // set before mutating it. A model with no counter cache
-                    // keeps the original single-statement path.
-                    //
-                    // `scoped_immediate_transaction`, not `scoped_transaction`
-                    // (#1342 review round 9): on `SQLite`, `maybe_for_update!`
-                    // degrades to a plain read (no `FOR UPDATE`), so a
-                    // deferred transaction wouldn't take a write lock until
-                    // the first write below — leaving a window for a
-                    // concurrent writer to commit between the locked-ids
-                    // SELECT and that write, which SQLite reports as
-                    // `SQLITE_BUSY_SNAPSHOT` rather than waiting on the
-                    // configured busy timeout. `scoped_immediate_transaction`
-                    // is what every other generated read-then-write mutation
-                    // path (e.g. the update-by-id counter-cache capture) uses
-                    // for exactly this reason.
-                    let apply_stmt = if config.soft_delete {
-                        quote! {
-                            let __applied: u64 = if dry_run {
-                                __n
-                            } else if #cc_has {
-                                #[allow(unused_imports)]
-                                use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
-                                #[allow(unused_imports)]
-                                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                                let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
-                                ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
-                                    &mut *conn,
-                                    |conn| async move {
-                                        let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
-                                            #table_ident::table
-                                                .filter(#table_ident::id.eq_any(ids))
-                                                .filter(#table_ident::#basis_ident.lt(__cutoff))
-                                                .filter(#table_ident::deleted_at.is_null())
-                                                .select(#table_ident::id)
-                                        )
-                                        .load::<i64>(conn)
-                                        .await
-                                        .map_err(::autumn_web::AutumnError::from)?;
-                                        ::autumn_web::repository::counter_cache_before_delete_many(
-                                            conn, #cc_specs, &__locked_ids,
-                                        ).await?;
-                                        let __n2 = ::autumn_web::reexports::diesel::update(
-                                            #table_ident::table.filter(#table_ident::id.eq_any(&__locked_ids))
-                                        )
-                                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
-                                        .execute(conn)
-                                        .await
-                                        .map_err(::autumn_web::AutumnError::from)?;
-                                        ::core::result::Result::Ok(__n2 as u64)
-                                    }
-                                    .scope_boxed(),
-                                )
-                                .await?
-                            } else {
-                                let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
-                                ::autumn_web::reexports::diesel::update(
+        //
+        // The query/mutation fragments are hoisted out into `age_fragments`
+        // (rather than built inline in a single `quote!{}` loop, as in
+        // earlier rounds) because the loop body is needed *twice*: once for
+        // the capped primary pass below, and again — after `purge_block`
+        // runs and its actual usage is known — as a reclaim pass that lets
+        // age consume whatever budget purge left unused (#1342 review round
+        // 13), symmetric with round 11's purge-borrows-from-age fix.
+        // `build_age_loop` below builds each pass's token stream from these
+        // shared fragments.
+        let age_fragments = spec.after.as_ref().map(|_after| {
+            let basis_ident = spec
+                .basis
+                .as_ref()
+                .expect("validated by parse_repo_args: after requires basis")
+                .clone();
+            // Yields the number of rows the statement actually touched (not
+            // the SELECT's candidate count) so a row that changed state
+            // between the SELECT and this statement — e.g. a concurrent
+            // `restore()`, or (when `basis` is a mutable column like
+            // `last_seen_at`) a concurrent update that un-stales the row —
+            // is reflected correctly in `rows_swept` rather than
+            // over-reported. Re-checking `basis < __age_cutoff` here, not
+            // just `id`, is what makes the second case safe. Regression
+            // (#1342 review round 3): a counter-cached model swept by
+            // `retention(...)` must move its parent's counter exactly like
+            // every other delete path does, or every swept live child
+            // leaves its parent's stored count permanently inflated.
+            // `counter_cache_before_delete_many` has to run on
+            // still-present, still-live rows BEFORE the mutation, so the
+            // `#cc_has` arm locks (`FOR UPDATE`) the subset of `ids` still
+            // eligible under the recheck filter first — a candidate can
+            // have dropped out since the batch SELECT, e.g. a concurrent
+            // update that un-staled `basis` — then decrements against
+            // exactly that locked set before mutating it. A model with no
+            // counter cache keeps the original single-statement path.
+            //
+            // `scoped_immediate_transaction`, not `scoped_transaction`
+            // (#1342 review round 9): on `SQLite`, `maybe_for_update!`
+            // degrades to a plain read (no `FOR UPDATE`), so a deferred
+            // transaction wouldn't take a write lock until the first write
+            // below — leaving a window for a concurrent writer to commit
+            // between the locked-ids SELECT and that write, which SQLite
+            // reports as `SQLITE_BUSY_SNAPSHOT` rather than waiting on the
+            // configured busy timeout. `scoped_immediate_transaction` is
+            // what every other generated read-then-write mutation path
+            // (e.g. the update-by-id counter-cache capture) uses for
+            // exactly this reason.
+            let apply_stmt = if config.soft_delete {
+                quote! {
+                    let __applied: u64 = if dry_run {
+                        __n
+                    } else if #cc_has {
+                        #[allow(unused_imports)]
+                        use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
+                        #[allow(unused_imports)]
+                        use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                        let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
+                        ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
+                            &mut *conn,
+                            |conn| async move {
+                                let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
                                     #table_ident::table
                                         .filter(#table_ident::id.eq_any(ids))
-                                        .filter(#table_ident::#basis_ident.lt(__cutoff))
+                                        .filter(#table_ident::#basis_ident.lt(__age_cutoff))
                                         .filter(#table_ident::deleted_at.is_null())
+                                        .select(#table_ident::id)
+                                )
+                                .load::<i64>(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                                ::autumn_web::repository::counter_cache_before_delete_many(
+                                    conn, #cc_specs, &__locked_ids,
+                                ).await?;
+                                let __n2 = ::autumn_web::reexports::diesel::update(
+                                    #table_ident::table.filter(#table_ident::id.eq_any(&__locked_ids))
                                 )
                                 .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
-                                .execute(&mut conn)
+                                .execute(conn)
                                 .await
-                                .map_err(::autumn_web::AutumnError::from)? as u64
-                            };
-                        }
+                                .map_err(::autumn_web::AutumnError::from)?;
+                                ::core::result::Result::Ok(__n2 as u64)
+                            }
+                            .scope_boxed(),
+                        )
+                        .await?
                     } else {
-                        quote! {
-                            let __applied: u64 = if dry_run {
-                                __n
-                            } else if #cc_has {
-                                #[allow(unused_imports)]
-                                use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
-                                #[allow(unused_imports)]
-                                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                                ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
-                                    &mut *conn,
-                                    |conn| async move {
-                                        let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
-                                            #table_ident::table
-                                                .filter(#table_ident::id.eq_any(ids))
-                                                .filter(#table_ident::#basis_ident.lt(__cutoff))
-                                                .select(#table_ident::id)
-                                        )
-                                        .load::<i64>(conn)
-                                        .await
-                                        .map_err(::autumn_web::AutumnError::from)?;
-                                        ::autumn_web::repository::counter_cache_before_delete_many(
-                                            conn, #cc_specs, &__locked_ids,
-                                        ).await?;
-                                        let __n2 = ::autumn_web::reexports::diesel::delete(
-                                            #table_ident::table.filter(#table_ident::id.eq_any(&__locked_ids))
-                                        )
-                                        .execute(conn)
-                                        .await
-                                        .map_err(::autumn_web::AutumnError::from)?;
-                                        ::core::result::Result::Ok(__n2 as u64)
-                                    }
-                                    .scope_boxed(),
-                                )
-                                .await?
-                            } else {
-                                ::autumn_web::reexports::diesel::delete(
+                        let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
+                        ::autumn_web::reexports::diesel::update(
+                            #table_ident::table
+                                .filter(#table_ident::id.eq_any(ids))
+                                .filter(#table_ident::#basis_ident.lt(__age_cutoff))
+                                .filter(#table_ident::deleted_at.is_null())
+                        )
+                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                        .execute(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)? as u64
+                    };
+                }
+            } else {
+                quote! {
+                    let __applied: u64 = if dry_run {
+                        __n
+                    } else if #cc_has {
+                        #[allow(unused_imports)]
+                        use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
+                        #[allow(unused_imports)]
+                        use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                        ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
+                            &mut *conn,
+                            |conn| async move {
+                                let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
                                     #table_ident::table
                                         .filter(#table_ident::id.eq_any(ids))
-                                        .filter(#table_ident::#basis_ident.lt(__cutoff))
+                                        .filter(#table_ident::#basis_ident.lt(__age_cutoff))
+                                        .select(#table_ident::id)
                                 )
-                                .execute(&mut conn)
+                                .load::<i64>(conn)
                                 .await
-                                .map_err(::autumn_web::AutumnError::from)? as u64
-                            };
-                        }
-                    };
-                    let not_already_deleted_filter = if config.soft_delete {
-                        quote! { .filter(#table_ident::deleted_at.is_null()) }
-                    } else {
-                        quote! {}
-                    };
-                    quote! {
-                        {
-                            let __after_duration = ::autumn_web::task::parse_duration(#after)
-                                .expect(concat!(
-                                    "invalid duration in #[repository(..., retention(after = \"",
-                                    #after,
-                                    "\"))]"
-                                ));
-                            let __after_chrono =
-                                ::autumn_web::reexports::chrono::Duration::from_std(__after_duration)
-                                    .expect("retention `after` duration out of range");
-                            let __cutoff =
-                                ::autumn_web::time::ClockSource::now(state.clock()).naive_utc() - __after_chrono;
-                            // `Option<i64>`, not a sentinel `i64` floor: no
-                            // `i64` value is guaranteed below every possible
-                            // id (`i64::MIN` itself is a legal id, and
-                            // `id.gt(i64::MIN)` would exclude exactly that
-                            // row), and this repository's PK convention
-                            // doesn't forbid id <= 0 rows (e.g. after a
-                            // manual import). `None` means "first page, no
-                            // lower bound"; every later page carries a real
-                            // cursor.
-                            let mut __last_id: ::core::option::Option<i64> = ::core::option::Option::None;
-                            let mut __batches: u32 = 0;
-                            loop {
-                                if __batches >= #age_max_batches {
-                                    break;
-                                }
-                                let mut __query = #table_ident::table
-                                    .into_boxed()
-                                    .filter(#table_ident::#basis_ident.lt(__cutoff))
-                                    #not_already_deleted_filter;
-                                if let ::core::option::Option::Some(__last) = __last_id {
-                                    __query = __query.filter(#table_ident::id.gt(__last));
-                                }
-                                let ids: ::std::vec::Vec<i64> = __query
-                                    .order(#table_ident::id.asc())
-                                    .select(#table_ident::id)
-                                    .limit(#batch_size_i64)
-                                    .load::<i64>(&mut conn)
-                                    .await
-                                    .map_err(::autumn_web::AutumnError::from)?;
-                                if ids.is_empty() {
-                                    break;
-                                }
-                                let __n = ids.len() as u64;
-                                __last_id = ::core::option::Option::Some(
-                                    *ids.last().expect("ids non-empty"),
-                                );
-                                #apply_stmt
-                                rows_swept += __applied;
-                                __batches += 1;
-                                if __n < #batch_size_i64 as u64 || __batches >= #age_max_batches {
-                                    break;
-                                }
+                                .map_err(::autumn_web::AutumnError::from)?;
+                                ::autumn_web::repository::counter_cache_before_delete_many(
+                                    conn, #cc_specs, &__locked_ids,
+                                ).await?;
+                                let __n2 = ::autumn_web::reexports::diesel::delete(
+                                    #table_ident::table.filter(#table_ident::id.eq_any(&__locked_ids))
+                                )
+                                .execute(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                                ::core::result::Result::Ok(__n2 as u64)
                             }
-                            #age_batches_used_write
+                            .scope_boxed(),
+                        )
+                        .await?
+                    } else {
+                        ::autumn_web::reexports::diesel::delete(
+                            #table_ident::table
+                                .filter(#table_ident::id.eq_any(ids))
+                                .filter(#table_ident::#basis_ident.lt(__age_cutoff))
+                        )
+                        .execute(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)? as u64
+                    };
+                }
+            };
+            let not_already_deleted_filter = if config.soft_delete {
+                quote! { .filter(#table_ident::deleted_at.is_null()) }
+            } else {
+                quote! {}
+            };
+            (basis_ident, apply_stmt, not_already_deleted_filter)
+        });
+
+        // Cutoff plus cursor/counter state shared by both the primary age
+        // pass below and the round-13 reclaim pass spliced in after
+        // `purge_block` — hoisted out of either loop so the reclaim pass
+        // resumes from the primary pass's cursor instead of rescanning.
+        // `__age_capped` is only meaningful (and only declared) when a
+        // reclaim pass could actually run.
+        let age_cutoff_and_state_decl = spec.after.as_ref().map_or_else(
+            || quote! {},
+            |after| {
+                let capped_decl = if both_branches {
+                    quote! { let mut __age_capped: bool = false; }
+                } else {
+                    quote! {}
+                };
+                quote! {
+                    let __age_duration = ::autumn_web::task::parse_duration(#after)
+                        .expect(concat!(
+                            "invalid duration in #[repository(..., retention(after = \"",
+                            #after,
+                            "\"))]"
+                        ));
+                    let __age_chrono =
+                        ::autumn_web::reexports::chrono::Duration::from_std(__age_duration)
+                            .expect("retention `after` duration out of range");
+                    let __age_cutoff =
+                        ::autumn_web::time::ClockSource::now(state.clock()).naive_utc() - __age_chrono;
+                    // `Option<i64>`, not a sentinel `i64` floor: no `i64`
+                    // value is guaranteed below every possible id
+                    // (`i64::MIN` itself is a legal id, and
+                    // `id.gt(i64::MIN)` would exclude exactly that row),
+                    // and this repository's PK convention doesn't forbid
+                    // id <= 0 rows (e.g. after a manual import). `None`
+                    // means "first page, no lower bound"; every later page
+                    // — including the reclaim pass's first page — carries a
+                    // real cursor.
+                    let mut __age_last_id: ::core::option::Option<i64> = ::core::option::Option::None;
+                    let mut __age_batches: u32 = 0;
+                    #capped_decl
+                }
+            },
+        );
+
+        let mark_capped_true = if both_branches {
+            quote! { __age_capped = true; }
+        } else {
+            quote! {}
+        };
+        let mark_capped_false = if both_branches {
+            quote! { __age_capped = false; }
+        } else {
+            quote! {}
+        };
+
+        // One bounded pass over the age loop, capped at `cap_expr` (a
+        // runtime `u32` expression). Reads/writes the outer
+        // `__age_last_id`/`__age_batches` declared above rather than
+        // re-declaring locals, so calling this twice — the primary pass
+        // below, then the round-13 reclaim pass after `purge_block` —
+        // resumes the second call from the first's cursor instead of
+        // rescanning.
+        let build_age_loop = |cap_expr: TokenStream| -> TokenStream {
+            let Some((basis_ident, apply_stmt, not_already_deleted_filter)) =
+                age_fragments.as_ref()
+            else {
+                return quote! {};
+            };
+            quote! {
+                {
+                    let __age_cap_this_pass: u32 = #cap_expr;
+                    loop {
+                        if __age_batches >= __age_cap_this_pass {
+                            #mark_capped_true
+                            break;
+                        }
+                        let mut __query = #table_ident::table
+                            .into_boxed()
+                            .filter(#table_ident::#basis_ident.lt(__age_cutoff))
+                            #not_already_deleted_filter;
+                        if let ::core::option::Option::Some(__last) = __age_last_id {
+                            __query = __query.filter(#table_ident::id.gt(__last));
+                        }
+                        let ids: ::std::vec::Vec<i64> = __query
+                            .order(#table_ident::id.asc())
+                            .select(#table_ident::id)
+                            .limit(#batch_size_i64)
+                            .load::<i64>(&mut conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        if ids.is_empty() {
+                            #mark_capped_false
+                            break;
+                        }
+                        let __n = ids.len() as u64;
+                        __age_last_id = ::core::option::Option::Some(
+                            *ids.last().expect("ids non-empty"),
+                        );
+                        #apply_stmt
+                        rows_swept += __applied;
+                        __age_batches += 1;
+                        if __n < #batch_size_i64 as u64 {
+                            #mark_capped_false
+                            break;
+                        }
+                        if __age_batches >= __age_cap_this_pass {
+                            #mark_capped_true
+                            break;
                         }
                     }
-                },
-            );
+                }
+            }
+        };
+
+        let age_block = build_age_loop(quote! { #age_max_batches });
+
+        // Purge's cap is computed at *runtime*, after the age phase's
+        // primary pass finishes, as the total budget minus whatever that
+        // pass actually used — never less than its guaranteed floor (age's
+        // primary pass can never use more than its own fixed
+        // `age_max_batches` cap), but free to claim everything age's
+        // primary pass left unused (#1342 review round 11).
+        let purge_max_batches_expr = if both_branches {
+            quote! { (#max_batches).saturating_sub(__age_batches) }
+        } else {
+            quote! { #max_batches }
+        };
+        // Read by the round-13 age reclaim pass below, to compute how much
+        // of the shared budget purge left unused after age's primary pass
+        // ceded it some (or all) of the floor purge didn't need.
+        let purge_batches_used_decl = if both_branches {
+            quote! { let mut __purge_batches_used: u32 = 0; }
+        } else {
+            quote! {}
+        };
+        let purge_batches_used_write = if both_branches {
+            quote! { __purge_batches_used = __batches; }
+        } else {
+            quote! {}
+        };
 
         // Purge branch: always a hard DELETE of rows soft-deleted longer
         // than `purge_deleted_after`. Absent unless declared (and only
@@ -11635,10 +11697,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     break;
                                 }
                             }
+                            #purge_batches_used_write
                         }
                     }
                 },
             );
+
+        // Symmetric with round 11's purge-borrows-from-age fix (#1342
+        // review round 13): if age's primary pass hit its cap — there may
+        // be more matching rows still waiting — and purge didn't use its
+        // whole share, let age reclaim whatever purge left unused instead
+        // of leaving it idle until the next scheduled tick. Resumes from
+        // the primary pass's cursor via the shared `__age_last_id`/
+        // `__age_batches` state rather than rescanning.
+        let age_reclaim_block = if both_branches {
+            let reclaim_loop =
+                build_age_loop(quote! { (#max_batches).saturating_sub(__purge_batches_used) });
+            quote! {
+                if __age_capped {
+                    #reclaim_loop
+                }
+            }
+        } else {
+            quote! {}
+        };
 
         // Validate `after`/`purge_deleted_after` at task-registration time
         // (boot), matching `every` below — otherwise a typo'd unit (e.g.
@@ -11788,10 +11870,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let repo = Self::with_pool_untracked(pool);
                 let mut conn = repo.__autumn_acquire_conn().await?;
                 let mut rows_swept: u64 = 0;
-                #age_batches_used_decl
+                #age_cutoff_and_state_decl
+                #purge_batches_used_decl
 
                 #age_block
                 #purge_block
+                #age_reclaim_block
 
                 #[allow(clippy::cast_possible_truncation)]
                 let duration_ms =
@@ -22586,9 +22670,14 @@ mod tests {
             retention_run
                 .matches("counter_cache_before_delete_many")
                 .count(),
-            2,
-            "both the age (soft-delete) and purge (hard-delete) branches must \
-             call counter_cache_before_delete_many: {retention_run}"
+            // Three call sites, not two: the age branch's mutation is
+            // spliced into both the primary pass and the round-13 reclaim
+            // pass (which shares the same apply_stmt fragment), plus the
+            // purge branch's own single call site.
+            3,
+            "the age branch's primary pass, its round-13 reclaim pass, and the purge \
+             (hard-delete) branch must all call counter_cache_before_delete_many: \
+             {retention_run}"
         );
     }
 
@@ -22617,9 +22706,13 @@ mod tests {
             retention_run
                 .matches("scoped_immediate_transaction")
                 .count(),
-            2,
-            "both the age (soft-delete) and purge (hard-delete) counter-cache \
-             branches must use scoped_immediate_transaction: {retention_run}"
+            // Three call sites, not two: the age branch's mutation is
+            // spliced into both the primary pass and the round-13 reclaim
+            // pass (which shares the same apply_stmt fragment), plus the
+            // purge branch's own single call site.
+            3,
+            "the age branch's primary pass, its round-13 reclaim pass, and the purge \
+             (hard-delete) branch must all use scoped_immediate_transaction: {retention_run}"
         );
         assert!(
             !retention_run.contains("scoped_transaction ::"),
@@ -22800,9 +22893,40 @@ mod tests {
         .to_string();
 
         assert!(
-            generated.contains("__age_batches_used") && generated.contains("saturating_sub"),
+            generated.contains("saturating_sub (__age_batches)"),
             "purge phase must borrow the age phase's unused batch capacity at runtime: \
              {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_age_reclaims_unused_purge_batch_capacity() {
+        // Regression (#1342 review round 13): round 11 only let the purge
+        // phase borrow the age phase's unused capacity. The reverse case —
+        // a large age backlog and a small (or empty) purge backlog — was
+        // still capped at a fixed half-budget for age with no way to
+        // reclaim what purge left unused. Age's reclaim pass must be
+        // generated: gated on whether the primary pass actually hit its
+        // cap (`__age_capped`), sized from the budget minus purge's actual
+        // usage (`__purge_batches_used`), and resuming via the same shared
+        // cursor/counter state the primary pass left behind.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("if __age_capped")
+                && generated.contains("saturating_sub (__purge_batches_used)")
+                && generated.contains("__age_last_id")
+                && generated.contains("__age_batches"),
+            "age phase must be able to reclaim the purge phase's unused batch capacity, \
+             resuming from its own cursor: {generated}"
         );
     }
 
@@ -22810,10 +22934,10 @@ mod tests {
     fn repository_macro_retention_single_branch_has_no_batch_borrowing_scaffolding() {
         // A single-branch policy (only `after`, no `purge_deleted_after`)
         // has nothing to borrow from or share with, so none of the
-        // borrowing plumbing (#1342 review round 11) should be generated —
-        // it would be dead code and, since it's only ever written inside an
-        // absent purge block, an unused-variable warning under
-        // `-D warnings`.
+        // bidirectional borrowing plumbing (#1342 review rounds 11 and 13)
+        // should be generated — it would be dead code and, since it's only
+        // ever written inside an absent purge block, an unused-variable
+        // warning under `-D warnings`.
         let generated = repository_macro(
             quote! { Post, retention(after = "30d", basis = created_at) },
             quote! { pub trait PostRepository {} },
@@ -22821,7 +22945,9 @@ mod tests {
         .to_string();
 
         assert!(
-            !generated.contains("__age_batches_used"),
+            !generated.contains("__age_capped")
+                && !generated.contains("__purge_batches_used")
+                && !generated.contains("saturating_sub"),
             "single-branch retention must not generate unused batch-borrowing scaffolding: \
              {generated}"
         );
