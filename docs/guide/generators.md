@@ -1283,10 +1283,20 @@ Notes and limits:
   Title Case the form derive already uses, which means a **multi-word**
   column's show-page label normalizes from "Author name" to "Author Name"
   under `--i18n`. Single-word columns are unaffected.
-- **Re-running never clobbers a translation.** The `.ftl` merge only adds
-  keys that are missing; an existing value is left exactly as edited, and
-  a new key added by a later run lands inside its resource's block rather
-  than at the end of the file.
+- **Re-running never clobbers a translation.** An existing value is left
+  exactly as edited, and a new key from a later run lands inside its
+  resource's block rather than at the end of the file. A `--force`
+  regeneration that *drops* a field or a flag also prunes the keys for
+  those surfaces — nothing references them any more, so `autumn i18n check
+  --strict` would fail on them — while carrying over the values, comments,
+  and blank lines of the keys that remain. The shared chrome is never
+  pruned this way: another resource may still be using it.
+- **A non-`en` default locale keeps `i18n/en.ftl` in step.** `t!`'s
+  compile-time key check does not read `autumn.toml` — it looks in
+  `i18n/en.ftl` and degrades to a runtime lookup only when that file is
+  absent. So if your project has one *and* a different default locale, the
+  generator writes the same English into both; otherwise `cargo check`
+  would fail with a `compile_error!` per lookup.
 - **Keys go to the bundle the app actually reads.** A project whose
   `autumn.toml` says `default_locale = "fr"` and `dir = "translations"`
   gets `translations/fr.ftl`, because that is what its lookups resolve

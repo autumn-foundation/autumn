@@ -260,6 +260,7 @@ pub(super) fn merge_en_ftl(
 
     let already = defined_keys(existing);
     let resource_prefix = format!("{resource}.");
+    let resource_header = format!("{RESOURCE_HEADER_PREFIX}{pascal_name}{RESOURCE_HEADER_SUFFIX}");
     // A resource literally named `Common` would share its prefix with the chrome
     // block. `plan_scaffold_with_options_impl` refuses that name under `--i18n`;
     // classifying chrome FIRST and taking the resource's keys from what is left
@@ -277,37 +278,37 @@ pub(super) fn merge_en_ftl(
                 && !already.contains_key(*k)
         })
         .collect();
+    // Reconciled BEFORE the nothing-to-do check below: a regeneration that
+    // dropped a field or a flag has every REMAINING key already present, so the
+    // "missing" sets are empty while the block still carries keys the rewritten
+    // routes no longer reference — exactly what `autumn i18n check --strict`
+    // fails on. Values, comments, and blank lines for surviving keys carry over.
+    //
+    // The shared chrome is never pruned here: every resource writes those keys,
+    // so dropping one from this resource's render would delete a key a SIBLING
+    // still uses. Chrome is additive, and `destroy` is what eventually takes it.
+    if let Some(reconciled) = reconcile_block(existing, &resource_header, &resource_prefix, keys) {
+        return merge_en_ftl(&reconciled, pascal_name, resource, keys);
+    }
     if missing_common.is_empty() && missing_resource.is_empty() {
         return existing.to_owned();
     }
 
-    let resource_header = format!("{RESOURCE_HEADER_PREFIX}{pascal_name}{RESOURCE_HEADER_SUFFIX}");
     // Re-running the generator — after adding a column, or with a flag that
     // brings new chrome — must extend the block that already exists rather than
     // strand the new key at EOF under no header at all. The file's whole promise
-    // to a translator is that it reads by section, and `destroy` finds a
-    // resource's keys by prefix, not by position.
-    //
-    // Insert into the LATER block first: an edit shifts every offset after it,
-    // and the resource block always follows the chrome block.
-    for (block_header, missing) in [
-        (resource_header.as_str(), &missing_resource),
-        (COMMON_HEADER, &missing_common),
-    ] {
-        if missing.is_empty() {
-            continue;
-        }
-        let Some(insert_at) = block_end(existing, block_header) else {
-            continue;
-        };
-        let mut out = String::with_capacity(existing.len() + missing.len() * 48);
+    // to a translator is that it reads by section.
+    if !missing_common.is_empty()
+        && let Some(insert_at) = block_end(existing, COMMON_HEADER)
+    {
+        let mut out = String::with_capacity(existing.len() + missing_common.len() * 48);
         out.push_str(&existing[..insert_at]);
-        for (key, value) in missing {
+        for (key, value) in &missing_common {
             let _ = writeln!(out, "{key} = {value}");
         }
         out.push_str(&existing[insert_at..]);
-        // Whatever the other block still needs lands on the next pass, which
-        // terminates: this block's keys are now all present.
+        // Whatever the resource block still needs lands on the next pass, which
+        // terminates: the chrome keys are now all present.
         return merge_en_ftl(&out, pascal_name, resource, keys);
     }
 
@@ -353,6 +354,80 @@ pub(super) fn merge_en_ftl(
         out.push('\n');
     }
     out
+}
+
+/// Rewrite the block `header` opens so its keys are exactly `keys`' entries
+/// under `prefix`, or `None` when there is no such block or it already matches.
+///
+/// Existing VALUES win — a translated `post.new = Nouvel article` stays put —
+/// and non-key lines (a translator's comment, a blank line grouping fields) are
+/// carried through in place. Only keys the current render no longer references
+/// are dropped, which is the whole point: they have no call sites left, so
+/// `autumn i18n check --strict` would fail on them.
+fn reconcile_block(
+    existing: &str,
+    header: &str,
+    prefix: &str,
+    keys: &BTreeMap<String, String>,
+) -> Option<String> {
+    use std::fmt::Write as _;
+    let end = block_end(existing, header)?;
+    let start = existing.find(header)?;
+    let body_start = start + existing[start..].find('\n').map_or(0, |i| i + 1);
+    let wanted: BTreeMap<&str, &str> = keys
+        .iter()
+        .filter(|(k, _)| k.starts_with(prefix) && !k.starts_with("common."))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let mut body = String::new();
+    let mut kept: Vec<&str> = Vec::new();
+    for line in existing[body_start..end].lines() {
+        let Some((raw_key, _)) = line.split_once('=') else {
+            // A comment or blank line inside the block — keep it where it is.
+            body.push_str(line);
+            body.push('\n');
+            continue;
+        };
+        let key = raw_key.trim();
+        if line.starts_with(' ') || line.starts_with('\t') {
+            // A continuation of the value above; it travels with its key, which
+            // was either kept (so this belongs) or dropped (so this goes too).
+            if kept.last().is_some() {
+                body.push_str(line);
+                body.push('\n');
+            }
+            continue;
+        }
+        if wanted.contains_key(key) {
+            kept.push(key);
+            body.push_str(line);
+            body.push('\n');
+        } else {
+            // Dropped: its continuation lines go with it.
+            kept.clear();
+        }
+    }
+    let present: std::collections::BTreeSet<&str> = existing[body_start..end]
+        .lines()
+        .filter(|l| !l.starts_with(' ') && !l.starts_with('\t'))
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, _)| k.trim())
+        .collect();
+    for (key, value) in &wanted {
+        if !present.contains(key) {
+            let _ = writeln!(body, "{key} = {value}");
+        }
+    }
+
+    if body == existing[body_start..end] {
+        return None;
+    }
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..body_start]);
+    out.push_str(&body);
+    out.push_str(&existing[end..]);
+    Some(out)
 }
 
 /// Byte offset just past the last key line of the block `header` introduces, or
@@ -1485,6 +1560,59 @@ mod tests {
     /// what `destroy` owns — otherwise it strands the keys below the separator
     /// with no call sites, and `autumn i18n check --strict` starts failing on
     /// keys whose owner nobody can find.
+    /// A `--force` regeneration that dropped a field or a flag must not leave
+    /// the keys for those surfaces behind: nothing references them any more, so
+    /// `autumn i18n check --strict` fails on them.
+    #[test]
+    fn regeneration_prunes_keys_whose_surfaces_are_gone() {
+        let before = merge_en_ftl(
+            "",
+            "Post",
+            "post",
+            &keys(&[
+                ("common.create", "Create"),
+                ("post.new", "New Post"),
+                ("post.field.body", "Body"),
+                ("post.search.title", "Search Posts"),
+            ]),
+        );
+        // A translated value, and a note beside a key that survives.
+        let edited = before
+            .replace("post.new = New Post", "post.new = Nouvel article")
+            .replace(
+                "post.field.body = Body\n",
+                "# on the edit form\npost.field.body = Body\n",
+            );
+        let after = merge_en_ftl(
+            &edited,
+            "Post",
+            "post",
+            &keys(&[("common.create", "Create"), ("post.new", "New Post")]),
+        );
+        assert!(!after.contains("post.field.body"), "{after}");
+        assert!(!after.contains("post.search.title"), "{after}");
+        assert!(
+            after.contains("post.new = Nouvel article"),
+            "a translated value must survive:\n{after}"
+        );
+        assert!(
+            after.contains("# on the edit form"),
+            "a translator's note must survive:\n{after}"
+        );
+        // Chrome is never pruned from here — a sibling resource writes it too.
+        assert!(after.contains("common.create = Create"), "{after}");
+        // And it settles: regenerating again changes nothing.
+        assert_eq!(
+            merge_en_ftl(
+                &after,
+                "Post",
+                "post",
+                &keys(&[("common.create", "Create"), ("post.new", "New Post")])
+            ),
+            after
+        );
+    }
+
     #[test]
     fn a_comment_or_blank_line_inside_a_block_does_not_truncate_it() {
         let ftl = merge_en_ftl(

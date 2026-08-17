@@ -1184,6 +1184,34 @@ fn plan_scaffold_with_options_impl(
                     plan.modify(ftl_path.clone(), merged);
                 }
             }
+            // `t!`'s COMPILE-TIME key check does not read `autumn.toml`. It
+            // looks in `$CARGO_MANIFEST_DIR/i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl`
+            // — hardcoded directory, locale defaulting to `en` — and degrades to
+            // a runtime lookup only when that file is ABSENT. So a project on
+            // `default_locale = "fr"` that still keeps an `i18n/en.ftl` around
+            // gets the worst case: the validator finds that bundle, it lacks
+            // every key just written to `fr.ftl`, and `cargo check` fails with a
+            // `compile_error!` per lookup.
+            //
+            // Keep it in step. English is what that file holds, so the same
+            // values belong there; it is only written when it ALREADY exists,
+            // because creating one would invent an `en` locale the project
+            // deliberately does not have.
+            let validator_path = project_root.join("i18n").join("en.ftl");
+            if validator_path != ftl_path && validator_path.exists() {
+                let base = read_or_empty(&validator_path);
+                let merged =
+                    scaffold_i18n::merge_en_ftl(&base, &pascal_name, &snake_name, &referenced_keys);
+                if merged != base {
+                    plan.modify(validator_path.clone(), merged);
+                }
+                plan.push_revert(Revert::I18nFtlKeys {
+                    path: validator_path,
+                    pascal: pascal_name.clone(),
+                    snake: snake_name.clone(),
+                });
+            }
+
             // Destroy takes back this resource's keys only. The shared
             // `common.*` block and the file itself always survive: sibling
             // resources reuse the chrome, and `.i18n_auto()` panics at startup

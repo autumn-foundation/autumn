@@ -529,6 +529,82 @@ fn the_image_carries_the_bundle_it_panics_without() {
 }
 
 #[test]
+fn regenerating_after_dropping_a_field_prunes_its_keys() {
+    let (_tmp, project) = i18n_project(&[]);
+    let ftl_path = project.join("i18n/en.ftl");
+    fs::write(
+        &ftl_path,
+        fs::read_to_string(&ftl_path)
+            .unwrap()
+            .replace("post.new = New Post", "post.new = Nouvel article"),
+    )
+    .unwrap();
+
+    // Same resource, two fewer fields.
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "--i18n",
+            "--force",
+        ],
+    );
+    let ftl = fs::read_to_string(&ftl_path).unwrap();
+    for gone in [
+        "post.field.views",
+        "post.field.author_name",
+        "post.field.published",
+    ] {
+        assert!(
+            !ftl.contains(gone),
+            "`{gone}` has no call site left, so `i18n check --strict` fails on it:\n{ftl}"
+        );
+    }
+    assert!(
+        ftl.contains("post.new = Nouvel article"),
+        "a translated value must survive regeneration:\n{ftl}"
+    );
+    run_autumn_ok(&project, &["i18n", "check", "--strict"]);
+}
+
+#[test]
+fn a_non_default_locale_project_still_compiles_against_the_t_validator() {
+    // `t!`'s compile-time check does not read `autumn.toml`: it looks in
+    // `i18n/en.ftl` and degrades to a runtime lookup only when that file is
+    // ABSENT. A project on `default_locale = "fr"` that still keeps an
+    // `i18n/en.ftl` would otherwise get a `compile_error!` per lookup.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "fr-en-app"]);
+    let project = tmp.path().join("fr-en-app");
+    fs::create_dir_all(project.join("i18n")).unwrap();
+    fs::write(project.join("i18n/en.ftl"), "welcome.title = Welcome\n").unwrap();
+    let autumn_toml = project.join("autumn.toml");
+    let mut config = fs::read_to_string(&autumn_toml).unwrap();
+    config.push_str("\n[i18n]\ndefault_locale = \"fr\"\nsupported_locales = [\"fr\"]\n");
+    fs::write(&autumn_toml, config).unwrap();
+
+    run_autumn_ok(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "--i18n"],
+    );
+    let fr = fs::read_to_string(project.join("i18n/fr.ftl")).unwrap();
+    let en = fs::read_to_string(project.join("i18n/en.ftl")).unwrap();
+    assert!(fr.contains("post.new = New Post"), "{fr}");
+    assert!(
+        en.contains("post.new = New Post"),
+        "the bundle the validator reads must be kept in step:\n{en}"
+    );
+    assert!(
+        en.contains("welcome.title = Welcome"),
+        "and its existing keys left alone:\n{en}"
+    );
+}
+
+#[test]
 fn an_embed_build_carries_the_bundle_too() {
     // `.i18n_auto()` loads from DISK. An `autumn build --embed` binary is meant
     // to be self-contained, and the release image ships no sidecar for it — so
