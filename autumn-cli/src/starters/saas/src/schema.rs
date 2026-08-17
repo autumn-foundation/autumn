@@ -20,6 +20,19 @@ diesel::table! {
 }
 
 diesel::table! {
+    // Password-reset tokens (issue #1342 retention-sweeps demo): see
+    // `PasswordResetToken` in models.rs and its `retention(...)`-tagged
+    // repository in repositories.rs.
+    password_reset_tokens (id) {
+        id -> Int8,
+        tenant_id -> Text,
+        user_id -> Int8,
+        token_hash -> Text,
+        created_at -> Timestamp,
+    }
+}
+
+diesel::table! {
     // Persistent "remember-me" login chains (issue #1397). One row per device
     // login-chain, keyed by the stable opaque `series`; `token_hash` rotates on
     // every use for theft detection. Only the SHA-256 hash of the current token

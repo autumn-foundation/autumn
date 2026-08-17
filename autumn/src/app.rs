@@ -2839,6 +2839,16 @@ impl AppBuilder {
             return;
         }
 
+        // ── Retention dry-run mode ──────────────────────────────────────
+        // When AUTUMN_RETENTION_DRY_RUN=1, count (never delete) the rows every
+        // registered `#[repository(..., retention(...))]` policy would sweep,
+        // print the report as JSON, and exit — never starting the HTTP server.
+        // Triggered by `autumn retention --dry-run` (issue #1342).
+        if is_retention_dry_run_mode() {
+            self.run_retention_dry_run_mode().await;
+            return;
+        }
+
         // ── Capsule replay mode ────────────────────────────────────────
         // When AUTUMN_REPLAY_CAPSULE=<path> is set, rebuild this application
         // offline, drive the request the capsule recorded through it, print the
@@ -2870,7 +2880,7 @@ impl AppBuilder {
             api_versions,
             route_sources: _,
             current_plugin: _,
-            tasks,
+            mut tasks,
             one_off_tasks: _,
             mut jobs,
             listeners,
@@ -2953,6 +2963,26 @@ impl AppBuilder {
             #[cfg(feature = "inbound-mail")]
             inbound_mail_router,
         } = self;
+
+        // #1342: every `#[repository(..., retention(...))]` policy compiled
+        // into this binary auto-registers here — no `tasks![...]` entry
+        // required. `inventory`-collected, so this is a no-op allocation
+        // when no model declares a policy.
+        #[cfg(feature = "db")]
+        tasks.extend(crate::retention::collect_retention_tasks());
+
+        // Regression (#1342 review round 12): `collect_retention_tasks()`
+        // only catches collisions *among* retention-generated names — it
+        // has no visibility into hand-declared `tasks![...]` entries merged
+        // in above. An operator's own `#[scheduled]` task that happens to
+        // share a name with a generated `retention-sweep-<table>` task (or
+        // with another hand-declared task) would otherwise silently spawn
+        // two competing scheduler loops. Validate the fully merged list,
+        // now that every name is visible, rather than requiring operators
+        // to avoid the generated namespace by convention.
+        if let Err(error) = crate::task::validate_unique_scheduled_task_names(&tasks) {
+            panic!("{error}");
+        }
 
         let all_routes = routes;
 
@@ -5351,6 +5381,167 @@ impl AppBuilder {
         std::process::exit(0);
     }
 
+    /// Count (never delete) the rows every registered
+    /// `#[repository(..., retention(...))]` policy would sweep right now,
+    /// print the report as JSON, and exit.
+    ///
+    /// Triggered by `AUTUMN_RETENTION_DRY_RUN=1` from `autumn retention
+    /// --dry-run` (issue #1342). Boots just enough context to query the
+    /// database — no HTTP listener, no job/mail/i18n machinery — mirroring
+    /// `run_migrate_only_mode`'s minimal footprint.
+    #[cfg(feature = "db")]
+    async fn run_retention_dry_run_mode(self) {
+        let Self {
+            tasks,
+            migrations,
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+            pool_provider_factory,
+            shard_provider_factory,
+            shard_router,
+            directory_shard_router,
+            #[cfg(feature = "ws")]
+            channels_backend,
+            ..
+        } = self;
+
+        let model_filter = retention_dry_run_model_filter_from_env();
+        // Resolve/validate the requested policy selection BEFORE connecting
+        // to the database (#1342 review round 9): an app with no
+        // retention(...) policies at all, or a --model that names nothing
+        // registered, can answer without ever opening a connection — every
+        // check here reads only the compile-time-registered descriptor set.
+        // A real database only gets touched once we know a policy actually
+        // needs to be counted.
+        let descriptors =
+            match crate::retention::resolve_retention_descriptors(model_filter.as_deref()) {
+                Ok(descriptors) => descriptors,
+                Err(error) => {
+                    eprintln!("retention dry-run: {error}");
+                    std::process::exit(1);
+                }
+            };
+
+        // Regression (#1342 review round 18): resolve_retention_descriptors
+        // only validates collisions AMONG retention-generated task names
+        // (round 15's fix) — it has no visibility into hand-declared
+        // tasks![...] entries, which real boot merges in and validates via
+        // validate_unique_scheduled_task_names (round 12's fix). Without
+        // this, a dry run could report success for a policy whose
+        // generated name collides with a hand-declared task, even though
+        // real boot panics on exactly that collision. `tasks` is carried
+        // into this mode (destructured above) instead of discarded via `..`
+        // specifically so this check can run.
+        //
+        // Merged against every registered retention descriptor, not just
+        // `descriptors` (which `--model` may have narrowed down to) (#1342
+        // review round 19): real boot has no filter concept, so a
+        // hand-declared task colliding with an UNSELECTED retention
+        // policy's generated name would still panic real boot, even though
+        // a `--model`-scoped dry run never counts that policy.
+        if let Err(error) =
+            merge_and_validate_task_names(&crate::retention::all_retention_descriptors(), tasks)
+        {
+            eprintln!("retention dry-run: {error}");
+            std::process::exit(1);
+        }
+
+        if descriptors.is_empty() {
+            println!("{RETENTION_DRY_RUN_JSON_PREFIX}[]");
+            std::process::exit(0);
+        }
+
+        let (config, _telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
+
+        // A `match`, not `.unwrap_or_else` (#1342 review round 15): a
+        // managed-Postgres provider may have already started its postmaster
+        // by the time `setup_database` fails (e.g. `pool_size = 0` failing
+        // the deadpool build in `create_pool`, after the postmaster is up).
+        // `emergency_stop_async()` is async, and `.unwrap_or_else`'s closure
+        // can't `.await` — matching the same restructuring every later exit
+        // in this function already uses (#1342 review round 6).
+        let database = match setup_database(
+            &config,
+            migrations,
+            pool_provider_factory,
+            shard_provider_factory,
+            shard_router,
+            directory_shard_router,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        {
+            Ok(database) => database,
+            Err(error) => {
+                eprintln!("{error}");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+        };
+
+        let state = build_state(
+            &config,
+            database.topology.as_ref(),
+            database.shards,
+            #[cfg(feature = "ws")]
+            channels_backend,
+        );
+
+        // `process::exit` below skips `on_shutdown` — including a managed-Postgres
+        // `stop()` — so every exit from this one-shot would otherwise leave the
+        // postmaster `setup_database` may have started running, with its data
+        // directory locked for later commands (#1342 review round 6). Stop it
+        // explicitly before every exit rather than relying on `on_shutdown`.
+        match crate::retention::run_retention_dry_run(&state, model_filter.as_deref()).await {
+            Ok(reports) => match serde_json::to_string(&reports) {
+                Ok(json) => {
+                    println!("{RETENTION_DRY_RUN_JSON_PREFIX}{json}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    eprintln!("retention dry-run: failed to serialize report: {error}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            },
+            Err(error) => {
+                eprintln!("retention dry-run: {error}");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+        }
+    }
+
+    /// The `AUTUMN_RETENTION_DRY_RUN=1` one-shot on a build compiled WITHOUT
+    /// database support: there is nothing to sweep, so report and exit 0
+    /// (never starting the server).
+    ///
+    /// Still prints `[]` to stdout (framed by
+    /// [`RETENTION_DRY_RUN_JSON_PREFIX`]) — `autumn retention --dry-run`
+    /// always looks for that framed report line, so silently printing
+    /// nothing here would surface as a parse failure instead of the
+    /// intended "no policies" result.
+    #[cfg(not(feature = "db"))]
+    #[allow(clippy::unused_async)]
+    async fn run_retention_dry_run_mode(self) {
+        eprintln!(
+            "autumn retention --dry-run: this build has no database support — nothing to report"
+        );
+        println!("{RETENTION_DRY_RUN_JSON_PREFIX}[]");
+        std::process::exit(0);
+    }
+
     /// Run a registered one-off task with full application context and exit.
     ///
     /// Triggered by `AUTUMN_RUN_TASK=<name>` from `autumn task <name>`.
@@ -6063,6 +6254,64 @@ pub(crate) fn is_list_one_off_tasks_mode() -> bool {
 /// traffic is flipped to the new release.
 pub(crate) fn is_migrate_only_mode() -> bool {
     std::env::var("AUTUMN_MIGRATE").as_deref() == Ok("1")
+}
+
+/// Whether `AUTUMN_RETENTION_DRY_RUN=1` requests the retention dry-run
+/// one-shot: count (never delete) what every declared `retention(...)`
+/// policy would sweep and exit. Set by `autumn retention --dry-run`
+/// (issue #1342).
+pub(crate) fn is_retention_dry_run_mode() -> bool {
+    std::env::var("AUTUMN_RETENTION_DRY_RUN").as_deref() == Ok("1")
+}
+
+/// Line prefix framing the retention dry-run's machine-readable JSON report
+/// on stdout, matched verbatim by `autumn-cli/src/retention.rs`.
+///
+/// Regression (#1342 review round 14): the dry-run one-shot's stdout is not
+/// otherwise guaranteed to contain nothing but the JSON report — the default
+/// `dev` profile initializes a stdout-backed tracing formatter, and Diesel's
+/// `MigrationHarness` writes pending-migration progress directly to stdout
+/// (`HarnessWithOutput::write_to_stdout`), both of which run before the
+/// report line prints whenever anything is pending. Parsing the *entire*
+/// captured stdout as one JSON blob (the original approach) then fails on
+/// any of that incidental output. Framing the report as the one line
+/// starting with this prefix lets the CLI find it regardless of what else
+/// landed on stdout, without having to redirect every one-shot's logging or
+/// Diesel's hardcoded migration-progress writer — both shared with other
+/// boot paths (e.g. `autumn migrate`) that want stdout output.
+const RETENTION_DRY_RUN_JSON_PREFIX: &str = "AUTUMN_RETENTION_DRY_RUN_REPORT=";
+
+/// `AUTUMN_RETENTION_MODEL=<name>` narrows the dry-run report to one model's
+/// policy. Set by `autumn retention --dry-run --model <name>`.
+#[cfg(feature = "db")]
+fn retention_dry_run_model_filter_from_env() -> Option<String> {
+    std::env::var("AUTUMN_RETENTION_MODEL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Combines `descriptors`' generated task names with `tasks` (hand-declared
+/// via `tasks![...]`) and checks the merged set for a collision — the same
+/// merge-then-validate step real boot performs (`tasks.extend(...)` followed
+/// by `validate_unique_scheduled_task_names`, in `AppBuilder::build`) before
+/// ever spawning a scheduler loop.
+///
+/// A free function (rather than inlined into `run_retention_dry_run_mode`)
+/// so the collision case is unit-testable against synthetic descriptors and
+/// tasks without booting an `AppBuilder` or touching the process-global
+/// `inventory` registry (#1342 review round 18).
+#[cfg(feature = "db")]
+fn merge_and_validate_task_names(
+    descriptors: &[&crate::retention::RetentionSweepDescriptor],
+    tasks: Vec<crate::task::TaskInfo>,
+) -> Result<(), String> {
+    let mut merged: Vec<crate::task::TaskInfo> = descriptors
+        .iter()
+        .map(|descriptor| (descriptor.task_info)())
+        .collect();
+    merged.extend(tasks);
+    crate::task::validate_unique_scheduled_task_names(&merged)
 }
 
 /// Whether `AUTUMN_REPLAY_CAPSULE=<path>` requests the capsule-replay one-shot:
@@ -10381,6 +10630,191 @@ mod tests {
         temp_env::with_var("AUTUMN_DUMP_JOBS", None::<&str>, || {
             assert!(!is_dump_jobs_mode(), "unset must not select the dump path");
         });
+    }
+
+    #[test]
+    fn is_retention_dry_run_mode_only_true_for_exactly_one() {
+        // `autumn retention --dry-run` sets AUTUMN_RETENTION_DRY_RUN=1 to
+        // select the dry-run path in `run()`. Any other value (or an unset
+        // var) must fall through to the normal boot path (issue #1342).
+        temp_env::with_var("AUTUMN_RETENTION_DRY_RUN", Some("1"), || {
+            assert!(
+                is_retention_dry_run_mode(),
+                "`1` must select the retention dry-run path"
+            );
+        });
+        temp_env::with_var("AUTUMN_RETENTION_DRY_RUN", Some("0"), || {
+            assert!(
+                !is_retention_dry_run_mode(),
+                "`0` must not select the dry-run path"
+            );
+        });
+        temp_env::with_var("AUTUMN_RETENTION_DRY_RUN", Some("true"), || {
+            assert!(
+                !is_retention_dry_run_mode(),
+                "only the literal `1` enables the mode"
+            );
+        });
+        temp_env::with_var("AUTUMN_RETENTION_DRY_RUN", None::<&str>, || {
+            assert!(
+                !is_retention_dry_run_mode(),
+                "unset must not select the dry-run path"
+            );
+        });
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn retention_dry_run_model_filter_from_env_trims_and_ignores_blank() {
+        temp_env::with_var("AUTUMN_RETENTION_MODEL", Some("  Widget  "), || {
+            assert_eq!(
+                retention_dry_run_model_filter_from_env().as_deref(),
+                Some("Widget")
+            );
+        });
+        temp_env::with_var("AUTUMN_RETENTION_MODEL", Some(""), || {
+            assert_eq!(retention_dry_run_model_filter_from_env(), None);
+        });
+        temp_env::with_var("AUTUMN_RETENTION_MODEL", None::<&str>, || {
+            assert_eq!(retention_dry_run_model_filter_from_env(), None);
+        });
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn merge_and_validate_task_names_rejects_collision_with_hand_declared_task() {
+        // Regression (#1342 review round 18): resolve_retention_descriptors
+        // only validates collisions among retention-generated task names —
+        // it has no visibility into hand-declared tasks![...] entries, which
+        // real boot merges in via AppBuilder::build's tasks.extend(...) +
+        // validate_unique_scheduled_task_names (round 12). Without this
+        // check, a dry run could report success for a policy whose
+        // generated name collides with a hand-declared task, even though
+        // real boot panics on the exact same collision.
+        fn dry_run_stub(
+            _state: AppState,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = crate::AutumnResult<crate::retention::RetentionSweepReport>,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::retention::RetentionSweepReport {
+                    model: "Widget".to_string(),
+                    table: "widgets".to_string(),
+                    rows_swept: 0,
+                    duration_ms: 0,
+                    dry_run: true,
+                })
+            })
+        }
+        fn task_info_stub() -> crate::task::TaskInfo {
+            crate::task::TaskInfo {
+                name: "retention-sweep-widgets".to_string(),
+                schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(3600)),
+                coordination: crate::task::TaskCoordination::Fleet,
+                handler: |_state| Box::pin(async { Ok(()) }),
+            }
+        }
+        let descriptor = crate::retention::RetentionSweepDescriptor {
+            model_name: "Widget",
+            table_name: "widgets",
+            task_info: task_info_stub,
+            dry_run: dry_run_stub,
+        };
+        let hand_declared_collision = crate::task::TaskInfo {
+            name: "retention-sweep-widgets".to_string(),
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(60)),
+            coordination: crate::task::TaskCoordination::PerReplica,
+            handler: |_state| Box::pin(async { Ok(()) }),
+        };
+
+        let error = merge_and_validate_task_names(&[&descriptor], vec![hand_declared_collision])
+            .expect_err("a hand-declared task colliding with a generated task name must error");
+
+        assert!(
+            error.contains("retention-sweep-widgets"),
+            "the error must name the colliding task: {error}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn merge_and_validate_task_names_accepts_distinct_names() {
+        fn dry_run_stub(
+            _state: AppState,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = crate::AutumnResult<crate::retention::RetentionSweepReport>,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::retention::RetentionSweepReport {
+                    model: "Widget".to_string(),
+                    table: "widgets".to_string(),
+                    rows_swept: 0,
+                    duration_ms: 0,
+                    dry_run: true,
+                })
+            })
+        }
+        fn task_info_stub() -> crate::task::TaskInfo {
+            crate::task::TaskInfo {
+                name: "retention-sweep-widgets".to_string(),
+                schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(3600)),
+                coordination: crate::task::TaskCoordination::Fleet,
+                handler: |_state| Box::pin(async { Ok(()) }),
+            }
+        }
+        let descriptor = crate::retention::RetentionSweepDescriptor {
+            model_name: "Widget",
+            table_name: "widgets",
+            task_info: task_info_stub,
+            dry_run: dry_run_stub,
+        };
+        let unrelated_task = crate::task::TaskInfo {
+            name: "nightly-report".to_string(),
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(60)),
+            coordination: crate::task::TaskCoordination::PerReplica,
+            handler: |_state| Box::pin(async { Ok(()) }),
+        };
+
+        assert!(merge_and_validate_task_names(&[&descriptor], vec![unrelated_task]).is_ok());
+    }
+
+    #[test]
+    fn retention_dry_run_one_shot_dispatches_before_server_start() {
+        // Mirrors `migrate_only_one_shot_applies_and_exits_without_serving`:
+        // AUTUMN_RETENTION_DRY_RUN=1 must be handled BEFORE the `let Self {`
+        // destructure that begins the serving path, so a dry-run never binds
+        // a port (issue #1342).
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let run_start = source.find("pub async fn run(self)").expect("run() exists");
+        let run_end = source
+            .find("async fn run_build_mode(self)")
+            .expect("build mode follows run()");
+        let run_body = &source[run_start..run_end];
+
+        let dispatch = run_body
+            .find("if is_retention_dry_run_mode() {")
+            .expect("run() dispatches the retention dry-run one-shot");
+        let server_start = run_body
+            .find("let Self {")
+            .expect("run() destructures self to start the server");
+        assert!(
+            dispatch < server_start,
+            "AUTUMN_RETENTION_DRY_RUN must be handled before the server-start path"
+        );
+        let dry_run_branch = &run_body[dispatch..server_start];
+        assert!(
+            dry_run_branch.contains("self.run_retention_dry_run_mode().await;")
+                && dry_run_branch.contains("return;"),
+            "the retention dry-run one-shot must run then return before server start"
+        );
     }
 
     #[test]

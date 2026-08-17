@@ -281,6 +281,8 @@ pub mod repository;
 pub(crate) mod repository_commit_hooks;
 #[cfg(feature = "db")]
 pub use repository::RepositoryError;
+#[cfg(feature = "db")]
+pub mod retention;
 
 /// Read-your-own-writes routing support.
 ///

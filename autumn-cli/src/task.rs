@@ -38,7 +38,12 @@ pub fn run(opts: &TaskOptions<'_>) {
 /// share its data dir and, when the cluster is live, attach to it instead of
 /// starting a second postmaster on the daemon's locked data dir. A no-op for
 /// apps that don't use managed Postgres (the env vars are simply unread).
-fn apply_managed_pg_env(cmd: &mut Command, package: Option<&str>) {
+///
+/// `pub` (the enclosing `task` module is private, so this is crate-visible
+/// only) so other DB-touching one-shot CLI commands (e.g. `autumn retention
+/// --dry-run`) can share it instead of re-deriving the same attach-vs-spawn
+/// logic.
+pub fn apply_managed_pg_env(cmd: &mut Command, package: Option<&str>) {
     // The attach URL is CLI→child plumbing, not an operator knob. Clear any
     // inherited value up front so a stale/foreign one can't override the data dir
     // (the provider checks the attach URL first) — including when an explicit

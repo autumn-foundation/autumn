@@ -222,6 +222,8 @@ mod repository_scope_meta;
 #[cfg(feature = "db")]
 mod repository_search;
 mod request_timeout;
+#[cfg(feature = "db")]
+mod retention;
 #[cfg(all(feature = "markdown", feature = "maud"))]
 mod rich_text;
 mod route_macro;
