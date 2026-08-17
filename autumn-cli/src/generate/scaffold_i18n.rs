@@ -1490,24 +1490,47 @@ pub(super) fn ensure_dockerfile_i18n_copy(dockerfile: &str, dir: &str) -> Option
             format!("COPY --from=builder /app/{dir} /app/{dir}"),
         )
     };
-    if dockerfile.contains(&builder_line) && dockerfile.contains(&runtime_line) {
+    // ACTIVE lines, not substrings. Docker strips comments before executing, so
+    // a `# COPY i18n ./i18n` left behind as an example installs nothing — and
+    // reading it as installed returns the file untouched, after which the
+    // container panics in `.i18n_auto()` with no bundle to load. The same rule
+    // governs the anchors: inserting after a commented `# COPY migrations …`
+    // would put the new line in a stage that never runs it.
+    if has_active_line(dockerfile, &builder_line) && has_active_line(dockerfile, &runtime_line) {
         return Some(dockerfile.to_owned());
     }
-    if !dockerfile.contains(builder_anchor) || !dockerfile.contains(runtime_anchor) {
-        return None;
+    let out = insert_after_active_line(dockerfile, runtime_anchor, &runtime_line)?;
+    insert_after_active_line(&out, builder_anchor, &builder_line)
+}
+
+/// Whether `dockerfile` carries `instruction` as an instruction Docker will
+/// run, rather than as a comment or a fragment of a longer line.
+fn has_active_line(dockerfile: &str, instruction: &str) -> bool {
+    dockerfile.lines().any(|line| line.trim() == instruction)
+}
+
+/// `dockerfile` with `new_line` inserted after the first ACTIVE `anchor` line,
+/// or `None` when no such line exists.
+///
+/// Line-oriented rather than a substring `replacen`, so a commented copy of the
+/// anchor cannot capture the insertion — and, since each call rebuilds the
+/// whole file, the two stages no longer have to be edited in a particular
+/// order to keep offsets valid.
+fn insert_after_active_line(dockerfile: &str, anchor: &str, new_line: &str) -> Option<String> {
+    let mut out = String::with_capacity(dockerfile.len() + new_line.len() + 1);
+    let mut inserted = false;
+    for line in dockerfile.split_inclusive('\n') {
+        out.push_str(line);
+        if !inserted && line.trim() == anchor {
+            if !line.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(new_line);
+            out.push('\n');
+            inserted = true;
+        }
     }
-    // Runtime stage first: its anchor is a superstring-free, later occurrence,
-    // and replacing the builder anchor first would shift it.
-    let out = dockerfile.replacen(
-        runtime_anchor,
-        &format!("{runtime_anchor}\n{runtime_line}"),
-        1,
-    );
-    Some(out.replacen(
-        builder_anchor,
-        &format!("{builder_anchor}\n{builder_line}"),
-        1,
-    ))
+    inserted.then_some(out)
 }
 
 /// The directory an earlier `--i18n` run pointed the Dockerfile's locale
@@ -2082,21 +2105,33 @@ fn production_routes_anchors(main_rs: &str) -> Vec<usize> {
     // the anchor makes the whole wiring a no-op — the scaffold emits translated
     // views and never installs the bundle to resolve them.
     let offsets: Vec<usize> = method_call_offsets(main_rs, ".routes").collect();
-    // On an IDENTIFIER boundary: `fn main_preview()` is a different function
-    // that happens to start with the same letters.
-    let main_fn_at = real_offsets(main_rs, "fn main").into_iter().find(|&at| {
-        main_rs[at + "fn main".len()..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
-    });
-    // EVERY builder inside `main`, not just the first: a conditionally-built
+    // EVERY `fn main`, not just the first. `#[cfg(unix)] fn main()` beside
+    // `#[cfg(windows)] fn main()` is one entry point per target, and both are
+    // production: wiring only the first leaves the other rendering raw keys,
+    // and the idempotency guard means no later run repairs it. On an
+    // IDENTIFIER boundary, so `fn main_preview()` is not one of them.
+    let main_bodies: Vec<(usize, usize)> = real_offsets(main_rs, "fn main")
+        .into_iter()
+        .filter(|&at| {
+            main_rs[at + "fn main".len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        })
+        .filter(|&at| !in_cfg_test(main_rs, at))
+        .filter_map(|at| brace_block(main_rs, at))
+        .collect();
+    // EVERY builder inside those, not just the first: a conditionally-built
     // app has one per branch, and each is production.
-    if let Some((open, close)) = main_fn_at.and_then(|at| brace_block(main_rs, at)) {
+    if !main_bodies.is_empty() {
         let inside: Vec<usize> = offsets
             .iter()
             .copied()
-            .filter(|&o| o > open && o < close)
+            .filter(|&o| {
+                main_bodies
+                    .iter()
+                    .any(|&(open, close)| o > open && o < close)
+            })
             .collect();
         if !inside.is_empty() {
             return inside;
@@ -4807,6 +4842,93 @@ mod tests {
                 "i18n"
             ),
             None
+        );
+    }
+
+    /// Docker strips comments before executing, so a `# COPY i18n ./i18n` left
+    /// in the file as an example installs nothing. Reading it as installed
+    /// returns the Dockerfile untouched and the container then panics in
+    /// `.i18n_auto()` with no bundle to load.
+    #[test]
+    fn a_commented_copy_is_not_a_wired_dockerfile() {
+        let dockerfile = concat!(
+            "FROM rust AS builder\n",
+            "# COPY i18n ./i18n\n",
+            "COPY migrations ./migrations\n",
+            "\n",
+            "FROM debian AS runtime\n",
+            "# COPY --from=builder /app/i18n /app/i18n\n",
+            "COPY --from=builder /app/migrations /app/migrations\n",
+        );
+        let out = ensure_dockerfile_i18n_copy(dockerfile, "i18n").expect("anchors present");
+        // Asserted WITHOUT `has_active_line`: a test that checks the fix
+        // through the helper the fix lives in passes with the fix reverted.
+        let active = |needle: &str| out.lines().any(|line| line.trim() == needle);
+        assert!(
+            active("COPY i18n ./i18n"),
+            "the builder stage needs a real instruction:\n{out}"
+        );
+        assert!(
+            active("COPY --from=builder /app/i18n /app/i18n"),
+            "and so does the runtime stage:\n{out}"
+        );
+        // The examples are left where they were.
+        assert_eq!(out.matches("# COPY i18n ./i18n").count(), 1, "{out}");
+    }
+
+    /// And a COMMENTED anchor cannot capture the insertion either — the new
+    /// line would land in a stage that never runs it.
+    #[test]
+    fn insertion_follows_the_active_anchor_not_a_commented_one() {
+        let dockerfile = concat!(
+            "FROM rust AS builder\n",
+            "# COPY migrations ./migrations\n",
+            "COPY migrations ./migrations\n",
+            "\n",
+            "FROM debian AS runtime\n",
+            "COPY --from=builder /app/migrations /app/migrations\n",
+        );
+        let out = ensure_dockerfile_i18n_copy(dockerfile, "i18n").expect("anchors present");
+        let commented = out.find("# COPY migrations").expect("comment kept");
+        let active = out
+            .find("\nCOPY migrations ./migrations")
+            .expect("active anchor kept");
+        let inserted = out.find("COPY i18n ./i18n").expect("line inserted");
+        assert!(
+            inserted > active && active > commented,
+            "the copy must follow the instruction, not the example:\n{out}"
+        );
+    }
+
+    /// `#[cfg(unix)] fn main()` beside `#[cfg(windows)] fn main()` is one entry
+    /// point per target and both are production. Wiring only the first leaves
+    /// the other rendering raw keys, and the idempotency guard means no later
+    /// run repairs it.
+    #[test]
+    fn every_cfg_selected_main_is_wired() {
+        let main_rs = concat!(
+            "#[cfg(unix)]\n",
+            "fn main() {\n",
+            "    App::new().routes(routes![index]).serve();\n",
+            "}\n",
+            "\n",
+            "#[cfg(windows)]\n",
+            "fn main() {\n",
+            "    App::new().routes(routes![index]).serve();\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("both entry points are production");
+        };
+        assert_eq!(
+            out.matches(".i18n_auto()").count(),
+            2,
+            "each `main` needs its own:\n{out}"
+        );
+        assert_eq!(
+            ensure_i18n_auto(&out),
+            I18nAutoWiring::Wired(out.clone()),
+            "and a re-run adds nothing"
         );
     }
 
