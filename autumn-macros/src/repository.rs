@@ -522,23 +522,52 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let mut batch_size: Option<u64> = None;
             let mut every: Option<String> = None;
             meta.parse_nested_meta(|nested| {
+                // Regression (#1342 review round 21): each arm previously
+                // just overwrote its `Option`, so a repeated key silently
+                // kept the LAST value with no error — e.g.
+                // `retention(after = "90d", after = "7d", basis =
+                // created_at)` compiled and hard-deleted rows after 7 days,
+                // not the presumably-intended 90. Since retention(...)
+                // controls irreversible deletion, a typo'd or
+                // generated-twice key must fail loudly rather than
+                // silently picking whichever assignment happened to run
+                // last.
                 if nested.path.is_ident("after") {
+                    if after.is_some() {
+                        return Err(nested.error("duplicate `after = \"...\"` in retention(...)"));
+                    }
                     let value: LitStr = nested.value()?.parse()?;
                     after = Some(value.value());
                     Ok(())
                 } else if nested.path.is_ident("basis") {
+                    if basis.is_some() {
+                        return Err(nested.error("duplicate `basis = <column>` in retention(...)"));
+                    }
                     let value: Ident = nested.value()?.parse()?;
                     basis = Some(value);
                     Ok(())
                 } else if nested.path.is_ident("purge_deleted_after") {
+                    if purge_deleted_after.is_some() {
+                        return Err(nested.error(
+                            "duplicate `purge_deleted_after = \"...\"` in retention(...)",
+                        ));
+                    }
                     let value: LitStr = nested.value()?.parse()?;
                     purge_deleted_after = Some(value.value());
                     Ok(())
                 } else if nested.path.is_ident("batch_size") {
+                    if batch_size.is_some() {
+                        return Err(
+                            nested.error("duplicate `batch_size = N` in retention(...)")
+                        );
+                    }
                     let value: syn::LitInt = nested.value()?.parse()?;
                     batch_size = Some(value.base10_parse()?);
                     Ok(())
                 } else if nested.path.is_ident("every") {
+                    if every.is_some() {
+                        return Err(nested.error("duplicate `every = \"...\"` in retention(...)"));
+                    }
                     let value: LitStr = nested.value()?.parse()?;
                     every = Some(value.value());
                     Ok(())
@@ -22536,6 +22565,88 @@ mod tests {
             error.to_string().contains("after")
                 && error.to_string().contains("purge_deleted_after"),
             "retention(...) missing both options must error naming both: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_duplicate_after() {
+        // Regression (#1342 review round 21, P1): a repeated key used to
+        // silently keep the LAST value with no error —
+        // retention(after = "90d", after = "7d", basis = created_at) would
+        // compile and hard-delete rows after 7 days, not the presumably
+        // intended 90. Since retention(...) controls irreversible
+        // deletion, this must fail loudly instead.
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(after = \"90d\", after = \"7d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("duplicate `after = ...` must be rejected");
+        };
+        assert!(
+            error.to_string().contains("duplicate") && error.to_string().contains("after"),
+            "the error must mention the duplicate `after` key: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_duplicate_basis() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(after = \"30d\", basis = created_at, basis = updated_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("duplicate `basis = ...` must be rejected");
+        };
+        assert!(
+            error.to_string().contains("duplicate") && error.to_string().contains("basis"),
+            "the error must mention the duplicate `basis` key: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_duplicate_purge_deleted_after() {
+        let tokens: proc_macro2::TokenStream = "Post, soft_delete, \
+             retention(purge_deleted_after = \"90d\", purge_deleted_after = \"7d\")"
+            .parse()
+            .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("duplicate `purge_deleted_after = ...` must be rejected");
+        };
+        assert!(
+            error.to_string().contains("duplicate")
+                && error.to_string().contains("purge_deleted_after"),
+            "the error must mention the duplicate `purge_deleted_after` key: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_duplicate_batch_size() {
+        let tokens: proc_macro2::TokenStream = "Post, \
+             retention(after = \"30d\", basis = created_at, batch_size = 10, batch_size = 20)"
+            .parse()
+            .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("duplicate `batch_size = ...` must be rejected");
+        };
+        assert!(
+            error.to_string().contains("duplicate") && error.to_string().contains("batch_size"),
+            "the error must mention the duplicate `batch_size` key: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_duplicate_every() {
+        let tokens: proc_macro2::TokenStream = "Post, \
+             retention(after = \"30d\", basis = created_at, every = \"1h\", every = \"5m\")"
+            .parse()
+            .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("duplicate `every = ...` must be rejected");
+        };
+        assert!(
+            error.to_string().contains("duplicate") && error.to_string().contains("every"),
+            "the error must mention the duplicate `every` key: {error}"
         );
     }
 
