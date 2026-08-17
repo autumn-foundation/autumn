@@ -22,7 +22,7 @@ use crate::state::AppState;
 use crate::task::TaskInfo;
 
 /// Per-run report for a single model's retention sweep.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RetentionSweepReport {
     /// The model name the policy is declared on.
     pub model: String,
@@ -101,29 +101,30 @@ pub async fn run_retention_dry_run(
     let mut reports = Vec::new();
     let mut matched = false;
     for descriptor in inventory::iter::<RetentionSweepDescriptor> {
-        if let Some(filter) = model_filter {
-            if descriptor.model_name != filter {
-                continue;
-            }
+        if let Some(filter) = model_filter
+            && descriptor.model_name != filter
+        {
+            continue;
         }
         matched = true;
         reports.push((descriptor.dry_run)(state.clone()).await?);
     }
-    if let Some(filter) = model_filter {
-        if !matched {
-            return Err(crate::AutumnError::not_found_msg(format!(
-                "no #[repository(..., retention(...))] policy is registered for model {filter:?}"
-            )));
-        }
+    if let Some(filter) = model_filter
+        && !matched
+    {
+        return Err(crate::AutumnError::not_found_msg(format!(
+            "no #[repository(..., retention(...))] policy is registered for model {filter:?}"
+        )));
     }
     reports.sort_by(|a, b| a.model.cmp(&b.model));
     Ok(reports)
 }
 
-/// Emit the structured `{model, rows_swept, duration_ms}` log line for a
-/// completed run, and — for real (non-dry-run) sweeps — bump the
-/// `retention_sweep_rows_total` counter and `retention_sweep_duration_ms`
-/// histogram, both labeled by `model`.
+/// Emit the structured `{model, rows_swept, duration_ms}` log line for a run.
+///
+/// For real (non-dry-run) sweeps, also bumps the `retention_sweep_rows_total`
+/// counter and `retention_sweep_duration_ms` histogram, both labeled by
+/// `model`.
 pub fn log_retention_sweep(report: &RetentionSweepReport) {
     tracing::info!(
         model = %report.model,
@@ -136,9 +137,13 @@ pub fn log_retention_sweep(report: &RetentionSweepReport) {
         crate::metrics::counter("retention_sweep_rows_total")
             .with_label("model", report.model.clone())
             .increment(report.rows_swept);
+        // Duration histograms are inherently approximate; losing precision
+        // above 2^52ms (~142,000 years) is not a real concern.
+        #[allow(clippy::cast_precision_loss)]
+        let duration_ms = report.duration_ms as f64;
         crate::metrics::histogram("retention_sweep_duration_ms")
             .with_label("model", report.model.clone())
-            .record(report.duration_ms as f64);
+            .record(duration_ms);
     }
 }
 
