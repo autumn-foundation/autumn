@@ -120,7 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per resource. With the new flag: every user-facing string in the generated
   views (page titles, `h1` headings, buttons, links, index column headers,
   show-page property labels, form control labels, enum options, empty-state
-  copy, the delete-confirm prompt, the one-shot flash notices, and the labels
+  copy, the delete-confirm prompt, the one-shot flash notices, the media
+  type/size line beside a stored attachment, and the labels
   the shared pager/bulk-delete/confirm widgets supply by default) is emitted as
   a `t!` lookup; each view-rendering handler takes the `Locale` extractor as its
   first parameter; and the default locale's bundle is created — or merged into,

@@ -3931,6 +3931,41 @@ fn render_routes_file(
     // presigned GET. An app with no `[storage]` backend (or a backend that
     // refuses to sign) degrades to the stored file's name without a link rather
     // than failing the whole page.
+    // Issue #1349: the meta span beside the link — `(image/png, 17 bytes)` — is
+    // user-facing text like every other string this flag claims, so the WHOLE
+    // parenthesised pattern comes from the bundle rather than just the word
+    // "bytes": a translator has to reorder it, repunctuate it, and choose the
+    // unit noun (and whether it agrees with the number). The media type and the
+    // count interpolate as Fluent arguments — they are data, not language.
+    //
+    // That means `attachment_link` needs a `Locale`, which is why it takes one
+    // under `--i18n` and not otherwise: both call sites are view handlers that
+    // already hold it, and the non-i18n helper must stay byte-for-byte as it
+    // was. `media`, not `type`, because the argument name becomes a Rust
+    // identifier in the `t!` expansion and `type` is a keyword.
+    let attachment_locale_param = if labels.enabled() {
+        "locale: &autumn_web::i18n::Locale,\n    "
+    } else {
+        ""
+    };
+    let attachment_locale_arg = if labels.enabled() { "&locale, " } else { "" };
+    // Recorded only when the helper is actually emitted: `markup_expr` adds the
+    // key to `used_keys`, and a key written to `en.ftl` that no generated view
+    // references is exactly what `autumn i18n check --strict` fails on. A
+    // scaffold with no attachment column must not carry this key.
+    let attachment_meta_markup = if has_attachments {
+        labels.markup_expr(
+            "common.attachment.meta",
+            "({ $media }, { $size } bytes)",
+            "\"(\" (blob.content_type) \", \" (blob.byte_size) \" bytes)\"",
+            &[
+                ("media", "&blob.content_type"),
+                ("size", "&blob.byte_size.to_string()"),
+            ],
+        )
+    } else {
+        String::new()
+    };
     let attachment_read_back_helpers = if has_attachments {
         format!(
             "\n/// The dot-extension to give a stored blob, derived from the browser-supplied\n\
@@ -4082,7 +4117,7 @@ fn render_routes_file(
              /// Emitted as a raw `<a>` rather than `autumn_web::a11y::Link` because that\n\
              /// primitive has no `download` builder.\n\
              fn attachment_link(\n    \
-             blob: Option<&autumn_web::storage::Blob>,\n    \
+             {attachment_locale_param}blob: Option<&autumn_web::storage::Blob>,\n    \
              url: Option<&str>,\n    \
              label: &str,\n\
              ) -> Markup {{\n    \
@@ -4100,7 +4135,7 @@ fn render_routes_file(
              span {{ (file_name) }}\n        \
              }}\n        \
              \" \"\n        \
-             span class=\"autumn-attachment__meta\" {{ \"(\" (blob.content_type) \", \" (blob.byte_size) \" bytes)\" }}\n    \
+             span class=\"autumn-attachment__meta\" {{ {attachment_meta_markup} }}\n    \
              }}\n\
              }}\n"
         )
@@ -4237,7 +4272,7 @@ fn render_routes_file(
         let _ = write!(
             edit_current_attachment_markup,
             "@if let Some(blob) = current.{name}.as_ref() {{\n            \
-             p class=\"autumn-field__current\" {{ {current_label} (attachment_link(Some(blob), {name}_url.as_deref(), \"{name}\")) }}\n        \
+             p class=\"autumn-field__current\" {{ {current_label} (attachment_link({attachment_locale_arg}Some(blob), {name}_url.as_deref(), \"{name}\")) }}\n        \
              }}\n        "
         );
     }
@@ -4248,46 +4283,72 @@ fn render_routes_file(
     // key-sanitizing rules, rather than leaving them proven only by the
     // generator's own string assertions. They live INSIDE the routes module
     // because a `tests/` integration binary cannot import a project's bin crate.
+    // Under `--i18n` the helper takes a `Locale`, so the tests build one. It
+    // carries a real one-key bundle rather than the bare `Locale::new` (whose
+    // lookups fall back to the key itself): that keeps these assertions about
+    // the RENDERED meta — the media type and byte count still have to reach the
+    // string — instead of degrading them to "some key was looked up".
+    let (attachment_test_locale_helper, attachment_test_locale_arg) = if labels.enabled() {
+        (
+            r#"
+    fn locale() -> autumn_web::i18n::Locale {
+        let mut en = std::collections::HashMap::new();
+        en.insert(
+            "common.attachment.meta".to_owned(),
+            "({ $media }, { $size } bytes)".to_owned(),
+        );
+        let mut messages = std::collections::HashMap::new();
+        messages.insert("en".to_owned(), en);
+        let config = autumn_web::i18n::I18nConfig::default();
+        let bundle = autumn_web::i18n::Bundle::from_messages(messages, &config);
+        autumn_web::i18n::Locale::new("en").with_bundle(std::sync::Arc::new(bundle))
+    }
+"#,
+            "&locale(), ",
+        )
+    } else {
+        ("", "")
+    };
     let attachment_read_back_unit_tests = if has_attachments {
-        String::from(
+        format!(
             r#"
 
 #[cfg(test)]
-mod attachment_read_back_tests {
-    use super::{LINKABLE_CONTENT_TYPES, attachment_link, upload_extension};
+mod attachment_read_back_tests {{
+    use super::{{LINKABLE_CONTENT_TYPES, attachment_link, upload_extension}};
     use autumn_web::storage::Blob;
 
-    fn blob(key: &str) -> Blob {
+    fn blob(key: &str) -> Blob {{
         Blob::new("test", key, "image/png", 17)
-    }
+    }}
+{attachment_test_locale_helper}
+    #[test]
+    fn renders_an_em_dash_when_the_column_is_null() {{
+        assert_eq!(attachment_link({attachment_test_locale_arg}None, None, "cover").into_string(), "\u{{2014}}");
+    }}
 
     #[test]
-    fn renders_an_em_dash_when_the_column_is_null() {
-        assert_eq!(attachment_link(None, None, "cover").into_string(), "\u{2014}");
-    }
-
-    #[test]
-    fn labels_the_link_from_the_column_and_the_stored_extension() {
+    fn labels_the_link_from_the_column_and_the_stored_extension() {{
         let stored = blob("posts/cover/1700000000_abc.png");
-        let html = attachment_link(Some(&stored), Some("/_blobs/x?sig=1"), "cover").into_string();
-        assert!(html.contains("href=\"/_blobs/x?sig=1\""), "{html}");
+        let html = attachment_link({attachment_test_locale_arg}Some(&stored), Some("/_blobs/x?sig=1"), "cover").into_string();
+        assert!(html.contains("href=\"/_blobs/x?sig=1\""), "{{html}}");
         // Not the opaque key: a download has to land with a usable name.
-        assert!(html.contains("download=\"cover.png\""), "{html}");
-        assert!(html.contains(">cover.png<"), "{html}");
-        assert!(html.contains("image/png"), "{html}");
-        assert!(html.contains("17 bytes"), "{html}");
-    }
+        assert!(html.contains("download=\"cover.png\""), "{{html}}");
+        assert!(html.contains(">cover.png<"), "{{html}}");
+        assert!(html.contains("image/png"), "{{html}}");
+        assert!(html.contains("17 bytes"), "{{html}}");
+    }}
 
     #[test]
-    fn drops_the_anchor_when_no_url_could_be_signed() {
+    fn drops_the_anchor_when_no_url_could_be_signed() {{
         let stored = blob("posts/cover/1700000000_abc.png");
-        let html = attachment_link(Some(&stored), None, "cover").into_string();
-        assert!(!html.contains("<a "), "{html}");
-        assert!(html.contains("cover.png"), "{html}");
-    }
+        let html = attachment_link({attachment_test_locale_arg}Some(&stored), None, "cover").into_string();
+        assert!(!html.contains("<a "), "{{html}}");
+        assert!(html.contains("cover.png"), "{{html}}");
+    }}
 
     #[test]
-    fn refuses_to_link_content_types_that_execute_as_same_origin_script() {
+    fn refuses_to_link_content_types_that_execute_as_same_origin_script() {{
         // The local backend replays the stored content type from THIS origin with
         // no `Content-Disposition`, and the default CSP allows `script-src 'self'`,
         // so navigating to a stored `.html`/`.svg` would run it as same-origin
@@ -4300,20 +4361,20 @@ mod attachment_read_back_tests {
             "application/xml",
             "text/javascript",
             "application/javascript",
-        ] {
+        ] {{
             assert!(
                 !LINKABLE_CONTENT_TYPES.contains(&dangerous),
-                "{dangerous} must never be linkable"
+                "{{dangerous}} must never be linkable"
             );
-        }
+        }}
         // The ordinary upload types a scaffold is actually used for stay linkable.
-        for safe in ["image/png", "image/jpeg", "application/pdf", "text/plain"] {
-            assert!(LINKABLE_CONTENT_TYPES.contains(&safe), "{safe} should link");
-        }
-    }
+        for safe in ["image/png", "image/jpeg", "application/pdf", "text/plain"] {{
+            assert!(LINKABLE_CONTENT_TYPES.contains(&safe), "{{safe}} should link");
+        }}
+    }}
 
     #[test]
-    fn keeps_only_a_short_safe_lowercase_extension() {
+    fn keeps_only_a_short_safe_lowercase_extension() {{
         assert_eq!(upload_extension(Some("holiday.PNG")), ".png");
         assert_eq!(upload_extension(Some("archive.tar.gz")), ".gz");
         // No extension to take, or nothing safe to take.
@@ -4326,8 +4387,8 @@ mod attachment_read_back_tests {
         assert_eq!(upload_extension(Some("sneaky.meta")), "");
         // A traversal attempt keeps nothing but the final extension.
         assert_eq!(upload_extension(Some("../../etc/passwd.png")), ".png");
-    }
-}
+    }}
+}}
 "#,
         )
     } else {
@@ -9482,7 +9543,13 @@ fn render_show_property_rows(
             // resolved into `{name}_url` — instead of the index's cheap
             // presence marker. See `attachment_link` in the generated routes.
             let name = &f.name;
-            format!("attachment_link(row.{name}.as_ref(), {name}_url.as_deref(), \"{name}\")")
+            // The locale argument matches `attachment_link`'s `--i18n` signature
+            // (see `render_routes_file`): the meta span it renders is bundle
+            // text, and this handler holds the extractor.
+            let locale_arg = if labels.enabled() { "&locale, " } else { "" };
+            format!(
+                "attachment_link({locale_arg}row.{name}.as_ref(), {name}_url.as_deref(), \"{name}\")"
+            )
         } else if f.kind.is_rich_text() {
             // Issue #1255: the column stores user-submitted Markdown SOURCE, so
             // the show page renders it through `render_user_content` — raw-HTML
@@ -22918,6 +22985,86 @@ exempt_paths = [
         assert!(
             !routes.contains("(\"Created at\", maud::html!"),
             "show property labels must be translated:\n{routes}"
+        );
+    }
+
+    /// AC7: the attachment meta span is view text like any other.
+    ///
+    /// `attachment_link` renders `(image/png, 17 bytes)` beside the download
+    /// link on both the show and edit pages. The media type and the count are
+    /// data, but the parentheses, the comma and the unit noun are language — so
+    /// the whole pattern comes from the bundle and the two values interpolate
+    /// as Fluent arguments. Left hardcoded, every non-English scaffold with an
+    /// attachment column renders a stray English "bytes".
+    #[test]
+    fn i18n_translates_the_attachment_size_meta() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "cover:Attachment".into()],
+            "20260430000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        assert!(
+            !routes.contains("\" bytes)\""),
+            "the size suffix must not stay hardcoded English:\n{routes}"
+        );
+        assert!(
+            routes.contains("t!(locale, \"common.attachment.meta\""),
+            "the meta span must come from the bundle:\n{routes}"
+        );
+        assert!(
+            ftl.contains("common.attachment.meta = ({ $media }, { $size } bytes)"),
+            "the pattern a translator reorders must be the whole span:\n{ftl}"
+        );
+        // The helper cannot reach a `Locale` it was not handed, and both call
+        // sites are handlers that hold one.
+        assert!(
+            routes.contains("locale: &autumn_web::i18n::Locale,"),
+            "`attachment_link` must take the locale under `--i18n`:\n{routes}"
+        );
+        assert!(
+            routes.contains("attachment_link(&locale, Some(blob)")
+                && routes.contains("attachment_link(&locale, row.cover.as_ref()"),
+            "both the edit and show call sites must pass it:\n{routes}"
+        );
+    }
+
+    /// The same scaffold WITHOUT the flag keeps the helper exactly as it was —
+    /// the flag's byte-for-byte promise covers this seam too.
+    #[test]
+    fn without_i18n_the_attachment_meta_stays_a_plain_literal() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "cover:Attachment".into()],
+            "20260430000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("\"(\" (blob.content_type) \", \" (blob.byte_size) \" bytes)\""),
+            "the non-i18n meta span must be untouched:\n{routes}"
+        );
+        assert!(
+            !routes.contains("autumn_web::i18n::Locale"),
+            "no locale plumbing without the flag:\n{routes}"
+        );
+        assert!(
+            routes.contains("attachment_link(Some(blob)"),
+            "the call sites must keep their original arity:\n{routes}"
         );
     }
 

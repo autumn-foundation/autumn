@@ -1243,7 +1243,11 @@ autumn generate scaffold Post title:String body:Text published:bool --i18n
   notices — is emitted as a `t!(locale, "key")` lookup instead of a
   literal. That includes the labels the shared widgets supply by default:
   the pager's Previous/Next, the bulk-delete button, the purge dialog's
-  Cancel.
+  Cancel. An `Attachment` column's meta line beside the download link is one
+  pattern rather than a stray translated word — `common.attachment.meta =
+  ({ $media }, { $size } bytes)` — so the media type and byte count
+  interpolate as arguments and a translator owns the parentheses, the comma
+  and the unit noun.
 - Each view-rendering handler takes the `Locale` extractor as its **first**
   parameter (`Locale` is a `FromRequestParts` extractor, and axum requires
   the one body-consuming argument to stay last).

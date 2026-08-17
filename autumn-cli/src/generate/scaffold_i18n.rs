@@ -420,14 +420,18 @@ fn reconcile_block(
             keeping_continuations = false;
         }
     }
-    let present: std::collections::BTreeSet<&str> = existing[body_start..end]
-        .lines()
-        .filter(|l| !l.starts_with(' ') && !l.starts_with('\t'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, _)| k.trim())
-        .collect();
+    // Scanned over the WHOLE file, not just this block. A key can be defined
+    // outside the block a translator never touched — hand-authored above it, or
+    // left behind by an older layout — and appending a second definition here
+    // would not merely duplicate it: `parse_ftl` inserts each entry into a map
+    // in file order (`autumn/src/i18n.rs`), so the LAST definition wins. The
+    // generated English would silently replace the translation above it, which
+    // is the one thing this merge promises never to do. Reconciliation itself
+    // still reads only the block: keys outside it are not the generator's to
+    // keep or drop, just its to leave alone.
+    let defined_anywhere = defined_keys(existing);
     for (key, value) in &wanted {
-        if !present.contains(key) {
+        if !defined_anywhere.contains_key(*key) {
             let _ = writeln!(body, "{key} = {value}");
         }
     }
@@ -1529,6 +1533,44 @@ mod tests {
             "a hand-authored key must survive destroy:\n{out}"
         );
         assert!(!out.contains("post.new"), "{out}");
+    }
+
+    /// A key defined ABOVE the generated block must not be redefined inside it.
+    ///
+    /// `parse_ftl` (`autumn/src/i18n.rs`) inserts each entry into a map in file
+    /// order, so the last definition wins outright — a second, generated
+    /// definition below a hand-authored one does not merely duplicate it, it
+    /// silently replaces the translation with English. Reconciliation reads
+    /// only the block, so before this it saw the key as absent and appended it.
+    #[test]
+    fn regeneration_does_not_redefine_a_key_authored_above_the_block() {
+        // Establish a block, then hand-author one of the NEXT run's keys above
+        // it — the shape you get when someone translates a string before the
+        // generator ever emits it, or hoists it out of the block by hand.
+        let generated = merge_en_ftl("", "Post", "post", &keys(&[("post.new", "New Post")]));
+        let with_hand_authored = format!("post.field.body = Corps du texte\n\n{generated}");
+
+        let out = merge_en_ftl(
+            &with_hand_authored,
+            "Post",
+            "post",
+            &keys(&[("post.new", "New Post"), ("post.field.body", "Body")]),
+        );
+
+        assert_eq!(
+            out.matches("post.field.body =").count(),
+            1,
+            "the key must be defined exactly once — a second, later definition \
+             wins in `parse_ftl` and would replace the translation:\n{out}"
+        );
+        assert!(
+            out.contains("post.field.body = Corps du texte"),
+            "the hand-authored value must survive:\n{out}"
+        );
+        assert!(
+            !out.contains("post.field.body = Body"),
+            "the generated English must not be written at all:\n{out}"
+        );
     }
 
     #[test]
