@@ -653,6 +653,56 @@ pub(super) fn configured_i18n(autumn_toml: &str) -> (Option<String>, Option<Stri
     (locale, dir)
 }
 
+/// Embed the locale bundle into the binary for `autumn build --embed`,
+/// matching what `autumn new --with-i18n` wires into a fresh app.
+///
+/// `.i18n_auto()` alone loads from DISK. An `--embed` build is supposed to be
+/// self-contained, so without this the binary still reaches for the locale
+/// directory at startup: run it from an empty deployment directory — or from
+/// the release image, whose embedded-build path deliberately ships no sidecar —
+/// and it panics on a missing default bundle, after a build that looked
+/// entirely clean.
+///
+/// Both edits sit behind the `embed-assets` feature the template already gates
+/// its static assets on, and both anchor on the `EMBEDDED_STATIC` lines that
+/// `autumn new` emits. Returns `None` when those are absent (an `--api` or
+/// hand-rolled `main.rs`), so the caller can leave it alone; returns the input
+/// unchanged when the locales are already embedded.
+pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String> {
+    const STATIC_ANCHOR: &str =
+        "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();";
+    const INSTALL_ANCHOR: &str = "    let app = app.embedded_static(&EMBEDDED_STATIC);\n";
+    if main_rs.contains("EMBEDDED_LOCALES") {
+        return Some(main_rs.to_owned());
+    }
+    if !main_rs.contains(STATIC_ANCHOR) || !main_rs.contains(INSTALL_ANCHOR) {
+        return None;
+    }
+    // `embed_locales!()` defaults to `i18n/`; a configured directory is passed
+    // through as the macro's literal argument.
+    let macro_call = if dir == "i18n" {
+        "autumn_web::embed_locales!()".to_owned()
+    } else {
+        format!("autumn_web::embed_locales!(\"{dir}\")")
+    };
+    let with_static = main_rs.replacen(
+        STATIC_ANCHOR,
+        &format!(
+            "{STATIC_ANCHOR}\n#[cfg(feature = \"embed-assets\")]\n\
+             static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = {macro_call};"
+        ),
+        1,
+    );
+    Some(with_static.replacen(
+        INSTALL_ANCHOR,
+        &format!(
+            "{INSTALL_ANCHOR}    #[cfg(feature = \"embed-assets\")]\n\
+             \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n"
+        ),
+        1,
+    ))
+}
+
 /// Ship the `i18n/` sidecar into a generated `Dockerfile`, in both stages.
 ///
 /// `.i18n_auto()` reads `i18n/<default>.ftl` from the working directory at
@@ -879,7 +929,18 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
     if !real_offsets(main_rs, ".i18n(").is_empty() {
         return I18nAutoWiring::CustomBundle;
     }
-    let Some(&anchor) = real_offsets(main_rs, ".routes(").first() else {
+    // Prefer a builder inside `fn main`. A `main.rs` can hold more than one —
+    // a preview or test-only router next to the one the binary runs — and
+    // wiring the wrong one is silent: the production app gets no bundle and
+    // renders raw keys, while the idempotency guard above stops any later run
+    // from correcting it. Falling back to the first overall keeps the common
+    // `fn main` -> `build_app()` shape working, where there is only one anyway.
+    let offsets = real_offsets(main_rs, ".routes(");
+    let main_fn_at = real_offsets(main_rs, "fn main").first().copied();
+    let anchor = main_fn_at
+        .and_then(|at| offsets.iter().find(|&&o| o > at).copied())
+        .or_else(|| offsets.first().copied());
+    let Some(anchor) = anchor else {
         return I18nAutoWiring::NoAnchor;
     };
     // Reuse the anchor line's own indentation so the inserted call sits in the
@@ -1140,6 +1201,95 @@ mod tests {
             out.contains("        .i18n_auto()\n        .routes(routes![index])"),
             "{out}"
         );
+    }
+
+    /// A `main.rs` can hold more than one builder. Wiring the wrong one is
+    /// silent — the production app gets no bundle and renders raw keys, and the
+    /// idempotency guard stops any later run from correcting it.
+    #[test]
+    fn i18n_auto_targets_the_builder_the_binary_runs() {
+        let main_rs = concat!(
+            "fn preview_app() -> App {\n",
+            "    autumn_web::app()\n",
+            "        .routes(routes![preview])\n",
+            "}\n",
+            "\n",
+            "#[autumn_web::main]\n",
+            "async fn main() {\n",
+            "    autumn_web::app()\n",
+            "        .routes(routes![index])\n",
+            "        .run()\n",
+            "        .await;\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("expected an anchor");
+        };
+        assert!(
+            out.contains(".i18n_auto()\n        .routes(routes![index])"),
+            "must wire the builder `main` runs:\n{out}"
+        );
+        assert!(
+            !out.contains(".i18n_auto()\n        .routes(routes![preview])"),
+            "must not wire the preview builder:\n{out}"
+        );
+    }
+
+    /// The common `fn main` -> `build_app()` shape has its builder BEFORE
+    /// `fn main`; with only one candidate there is nothing to disambiguate.
+    #[test]
+    fn i18n_auto_falls_back_to_the_only_builder_when_it_precedes_main() {
+        let main_rs = concat!(
+            "fn build_app() -> App {\n",
+            "    autumn_web::app()\n",
+            "        .routes(routes![index])\n",
+            "}\n",
+            "\n",
+            "#[autumn_web::main]\n",
+            "async fn main() {\n",
+            "    build_app().run().await;\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("expected an anchor");
+        };
+        assert!(out.contains(".i18n_auto()"), "{out}");
+    }
+
+    #[test]
+    fn locales_are_embedded_for_embed_builds() {
+        // `.i18n_auto()` loads from DISK; an `--embed` build is meant to be
+        // self-contained, and the release image ships no sidecar for it.
+        let main_rs = concat!(
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "fn main() {\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "}\n",
+        );
+        let out = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
+        assert!(out.contains("static EMBEDDED_LOCALES"), "{out}");
+        assert!(out.contains("autumn_web::embed_locales!()"), "{out}");
+        assert!(
+            out.contains("app.embedded_locales(&EMBEDDED_LOCALES)"),
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("#[cfg(feature = \"embed-assets\")]").count(),
+            2,
+            "both edits stay behind the feature the template already gates on:\n{out}"
+        );
+        // Idempotent, and a configured directory reaches the macro.
+        assert_eq!(
+            ensure_embedded_locales(&out, "i18n").as_deref(),
+            Some(out.as_str())
+        );
+        let custom = ensure_embedded_locales(main_rs, "translations").unwrap();
+        assert!(
+            custom.contains("embed_locales!(\"translations\")"),
+            "{custom}"
+        );
+        // An `--api` or hand-rolled `main.rs` has no anchors: reported, not guessed at.
+        assert_eq!(ensure_embedded_locales("fn main() {}\n", "i18n"), None);
     }
 
     #[test]

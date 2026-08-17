@@ -1600,13 +1600,19 @@ fn plan_scaffold_with_options_impl(
         // honest about the path the keys actually went to.
         let (locale, dir) =
             scaffold_i18n::configured_i18n(&read_or_empty(&project_root.join("autumn.toml")));
+        let i18n_dir_for_embed = dir.unwrap_or_else(|| "i18n".to_owned());
         let ftl_display_path = format!(
-            "{}/{}.ftl",
-            dir.unwrap_or_else(|| "i18n".to_owned()),
+            "{i18n_dir_for_embed}/{}.ftl",
             locale.unwrap_or_else(|| "en".to_owned())
         );
         match scaffold_i18n::ensure_i18n_auto(&updated) {
-            scaffold_i18n::I18nAutoWiring::Wired(wired) => wired,
+            // Also embed the bundle for `--embed` builds, matching what
+            // `autumn new --with-i18n` wires up. Absent anchors (an `--api` or
+            // hand-rolled `main.rs`) just leave it alone: `.i18n_auto()`'s disk
+            // load still works for an ordinary build.
+            scaffold_i18n::I18nAutoWiring::Wired(wired) => {
+                scaffold_i18n::ensure_embedded_locales(&wired, &i18n_dir_for_embed).unwrap_or(wired)
+            }
             // No real `.routes(` call to anchor on. Writing the call anywhere
             // else risks landing it in a comment, where it would silently never
             // run and the app would render raw keys forever — so say so instead

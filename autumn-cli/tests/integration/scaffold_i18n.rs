@@ -529,6 +529,43 @@ fn the_image_carries_the_bundle_it_panics_without() {
 }
 
 #[test]
+fn an_embed_build_carries_the_bundle_too() {
+    // `.i18n_auto()` loads from DISK. An `autumn build --embed` binary is meant
+    // to be self-contained, and the release image ships no sidecar for it — so
+    // converting an app to `--i18n` has to embed the bundle the same way
+    // `autumn new --with-i18n` does, or the "self-contained" binary panics on a
+    // missing default locale when run from an empty directory.
+    let (_tmp, project) = i18n_project(&[]);
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main_rs.contains("static EMBEDDED_LOCALES"), "{main_rs}");
+    assert!(
+        main_rs.contains("app.embedded_locales(&EMBEDDED_LOCALES)"),
+        "{main_rs}"
+    );
+    assert_eq!(
+        main_rs.matches("EMBEDDED_LOCALES").count(),
+        2,
+        "declared once, installed once — no duplicate wiring:\n{main_rs}"
+    );
+
+    // Byte-for-byte the same wiring `autumn new --with-i18n` produces.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "native", "--with-i18n"]);
+    let native = fs::read_to_string(tmp.path().join("native/src/main.rs")).unwrap();
+    for line in [
+        "static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();",
+        "    let app = app.embedded_locales(&EMBEDDED_LOCALES);",
+        "        .i18n_auto()",
+    ] {
+        assert!(native.contains(line), "control lacks {line}:\n{native}");
+        assert!(
+            main_rs.contains(line),
+            "converted app lacks {line}:\n{main_rs}"
+        );
+    }
+}
+
+#[test]
 fn a_resource_that_would_collide_with_the_shared_chrome_is_refused() {
     // `Common`'s keys would land under `common.*` — the chrome namespace every
     // other resource references — so destroying it later would break them all.

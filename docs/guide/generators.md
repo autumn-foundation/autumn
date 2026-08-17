@@ -1303,6 +1303,11 @@ Notes and limits:
   `.i18n(my_bundle())` — embedded files, a translation-management service,
   memory — is left alone, and the generator warns that the keys it just
   wrote to disk will not reach that bundle.
+- **`--embed` builds get the bundle too.** `.i18n_auto()` loads from disk,
+  so an `autumn build --embed` binary would not be self-contained without
+  it: the generator adds the same `EMBEDDED_LOCALES` static and
+  `.embedded_locales(...)` call (behind `embed-assets`) that `autumn new
+  --with-i18n` emits.
 - **The Docker image gets the bundle.** `.i18n_auto()` reads the default
   locale's file at startup and *panics* if it is missing, so the generator
   adds a `COPY` for the configured bundle directory to both stages of a
