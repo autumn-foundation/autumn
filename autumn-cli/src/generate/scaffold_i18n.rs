@@ -1018,9 +1018,8 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
     // deployment without the sidecar directory falls through to `.i18n_auto()`
     // and panics, having been told embedding was configured. Both halves are
     // required before this is treated as done, and a missing half is added.
-    let installed_in_production = real_offsets(main_rs, ".embedded_locales(&EMBEDDED_LOCALES)")
-        .into_iter()
-        .any(|at| !in_cfg_test(main_rs, at));
+    let installed_in_production =
+        method_call_offsets(main_rs, ".embedded_locales").any(|at| !in_cfg_test(main_rs, at));
 
     if embedded_in_production {
         // Already embedded — but not necessarily from the right place. A
@@ -1618,7 +1617,11 @@ pub(super) enum I18nAutoWiring {
 /// later run from correcting it. A refusal the caller can warn about is worth
 /// more than a coin flip that cannot be retried.
 fn production_routes_anchors(main_rs: &str) -> Vec<usize> {
-    let offsets = real_offsets(main_rs, ".routes(");
+    // Token-wise, like every other method detection here: `.routes
+    // (routes![…])` and a comment before the paren are valid Rust, and missing
+    // the anchor makes the whole wiring a no-op — the scaffold emits translated
+    // views and never installs the bundle to resolve them.
+    let offsets: Vec<usize> = method_call_offsets(main_rs, ".routes").collect();
     // On an IDENTIFIER boundary: `fn main_preview()` is a different function
     // that happens to start with the same letters.
     let main_fn_at = real_offsets(main_rs, "fn main").into_iter().find(|&at| {
@@ -1661,8 +1664,33 @@ fn production_routes_anchors(main_rs: &str) -> Vec<usize> {
 fn in_cfg_test(src: &str, at: usize) -> bool {
     real_offsets(src, "#[cfg(test)]")
         .into_iter()
-        .filter_map(|attr| brace_block(src, attr))
-        .any(|(open, close)| open < at && at < close)
+        .filter_map(|attr| cfg_item_span(src, attr))
+        .any(|(start, end)| start < at && at < end)
+}
+
+/// The span of the item an attribute at `attr` applies to.
+///
+/// An item is EITHER brace-delimited (`mod`, `fn`, `impl`) or
+/// semicolon-terminated (`static`, `const`, `use`, `type`). Taking the next
+/// brace unconditionally walks straight past a `static … ;` and lands on some
+/// unrelated later block — which both fails to recognise the test-only static
+/// AND drags whatever that later block is into the `cfg(test)` region. A
+/// `#[cfg(test)] static EMBEDDED_LOCALES` read as production is the concrete
+/// harm: the install gets added to production code referring to a symbol that
+/// does not exist there, and the `--embed` release stops compiling.
+fn cfg_item_span(src: &str, attr: usize) -> Option<(usize, usize)> {
+    const ATTR: &str = "#[cfg(test)]";
+    let after = attr + ATTR.len();
+    let rest = &src[after..];
+    let brace = real_offsets(rest, "{").first().copied();
+    let semi = real_offsets(rest, ";").first().copied();
+    match (brace, semi) {
+        // Whichever terminator comes first decides which kind of item this is.
+        (Some(b), Some(s)) if s < b => Some((attr, after + s)),
+        (None, Some(s)) => Some((attr, after + s)),
+        (Some(_), _) => brace_block(src, after).map(|(_, close)| (attr, close)),
+        (None, None) => None,
+    }
 }
 
 /// Insert `.i18n_auto()` into the `AppBuilder` chain in `main.rs` so the
@@ -1749,7 +1777,9 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
 /// statement this call belongs to — so one branch being wired says nothing
 /// about its sibling.
 fn chain_already_wired(src: &str, at: usize) -> bool {
-    !real_offsets(&src[chain_start(src, at)..at], ".i18n_auto()").is_empty()
+    method_call_offsets(&src[chain_start(src, at)..at], ".i18n_auto")
+        .next()
+        .is_some()
 }
 
 /// Whether the builder chain ending at `at` installs its own bundle.
@@ -2717,6 +2747,92 @@ mod tests {
         // and must still read as already-wired rather than as a custom bundle.
         let wired = "fn main() {\n    let app = App::new()\n        .i18n_auto()\n        .routes(routes![index]);\n}\n";
         assert!(matches!(ensure_i18n_auto(wired), I18nAutoWiring::Wired(_)));
+    }
+
+    /// A `#[cfg(test)] static …;` ends with a semicolon, not a brace. Reading
+    /// the next brace instead skipped past it onto an unrelated later item —
+    /// missing the test-only static AND pulling that later item into the
+    /// cfg(test) region.
+    #[test]
+    fn a_cfg_test_static_is_scoped_to_its_own_semicolon() {
+        let src = concat!(
+            "#[cfg(test)]\n",
+            "static EMBEDDED_LOCALES: Dir = autumn_web::embed_locales!(\"fixtures\");\n",
+            "\n",
+            "fn production() {\n",
+            "    let app = App::new().routes(routes![index]);\n",
+            "}\n",
+        );
+        let static_at = src.find("EMBEDDED_LOCALES").unwrap();
+        assert!(
+            in_cfg_test(src, static_at),
+            "the semicolon-terminated static is test-only"
+        );
+        let prod_at = src.find("routes![index]").unwrap();
+        assert!(
+            !in_cfg_test(src, prod_at),
+            "the following item must NOT be dragged into cfg(test)"
+        );
+
+        // End to end: a test-only static must not suppress production wiring,
+        // and must not have its install spliced into production either.
+        let main_rs = concat!(
+            "#[cfg(test)]\n",
+            "static EMBEDDED_LOCALES: Dir = autumn_web::embed_locales!(\"fixtures\");\n",
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+        );
+        let out = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
+        assert!(
+            out.contains("#[cfg(feature = \"embed-assets\")]"),
+            "production embedding must be added:\n{out}"
+        );
+    }
+
+    /// Whitespace and comments between a method and its paren are valid Rust,
+    /// and every method detection in this module has to tolerate them — not
+    /// just the one a review happened to name. Missing the `.routes` anchor is
+    /// the worst of them: the scaffold emits translated views and never
+    /// installs the bundle that resolves them.
+    #[test]
+    fn method_detections_all_tolerate_spacing() {
+        for call in [".routes(routes![index])", ".routes (routes![index])"] {
+            let main_rs = format!("fn main() {{\n    let app = App::new()\n        {call};\n}}\n");
+            assert!(
+                matches!(ensure_i18n_auto(&main_rs), I18nAutoWiring::Wired(out) if out.contains(".i18n_auto()")),
+                "no anchor found for {call:?}"
+            );
+        }
+
+        // An already-wired chain is recognised through spacing too, so a
+        // re-run does not insert a second call.
+        let spaced = concat!(
+            "fn main() {\n",
+            "    let app = App::new()\n",
+            "        .i18n_auto ()\n",
+            "        .routes(routes![index]);\n",
+            "}\n",
+        );
+        assert_eq!(
+            ensure_i18n_auto(spaced),
+            I18nAutoWiring::Wired(spaced.to_owned()),
+            "a spaced `.i18n_auto ()` must count as wired"
+        );
+
+        // And so is a spaced embed install.
+        let embedded = concat!(
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "#[cfg(feature = \"embed-assets\")]\n",
+            "static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "    let app = app.embedded_locales (&EMBEDDED_LOCALES);\n",
+        );
+        let out = ensure_embedded_locales(embedded, "i18n").expect("anchors present");
+        assert_eq!(
+            out.matches("embedded_locales").count(),
+            embedded.matches("embedded_locales").count(),
+            "a spaced install must not be duplicated:\n{out}"
+        );
     }
 
     /// `embed_locales!` bakes the files in; `.embedded_locales(&…)` is what
