@@ -1306,12 +1306,16 @@ Notes and limits:
   --strict` would fail on them — while carrying over the values, comments,
   and blank lines of the keys that remain. The shared chrome is never
   pruned this way: another resource may still be using it.
-- **A non-`en` default locale keeps `i18n/en.ftl` in step.** `t!`'s
-  compile-time key check does not read `autumn.toml` — it looks in
-  `i18n/en.ftl` and degrades to a runtime lookup only when that file is
-  absent. So if your project has one *and* a different default locale, the
-  generator writes the same English into both; otherwise `cargo check`
-  would fail with a `compile_error!` per lookup.
+- **The bundle `t!` validates against is kept in step.** `t!`'s
+  compile-time key check does not read `autumn.toml`. It opens
+  `AUTUMN_I18N_FILE`, or else `i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl` with
+  the locale defaulting to `en`, and degrades to a runtime lookup only when
+  that file is absent. So if your project has such a bundle *and* a
+  different default locale, the generator writes the same English into both;
+  otherwise `cargo check` would fail with a `compile_error!` per lookup. The
+  path is resolved the way the macro resolves it, including an `[env]` table
+  in the project's own `.cargo/config.toml` — which is where a setting every
+  build needs usually lives.
 - **Keys go to the bundle the app actually reads.** A project whose
   `autumn.toml` says `default_locale = "fr"` and `dir = "translations"`
   gets `translations/fr.ftl`, because that is what its lookups resolve

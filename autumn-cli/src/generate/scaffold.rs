@@ -1226,20 +1226,25 @@ fn plan_scaffold_with_options_impl(
                 }
             }
             // `t!`'s COMPILE-TIME key check does not read `autumn.toml`. It
-            // looks in `$CARGO_MANIFEST_DIR/i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl`
-            // — hardcoded directory, locale defaulting to `en` — and degrades to
-            // a runtime lookup only when that file is ABSENT. So a project on
-            // `default_locale = "fr"` that still keeps an `i18n/en.ftl` around
-            // gets the worst case: the validator finds that bundle, it lacks
+            // resolves its own bundle from `AUTUMN_I18N_FILE`, else
+            // `$CARGO_MANIFEST_DIR/i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl` with
+            // the locale defaulting to `en`, and degrades to a runtime lookup
+            // only when that file is ABSENT. So a project on
+            // `default_locale = "fr"` that still keeps the validator's bundle
+            // around gets the worst case: the validator finds it, it lacks
             // every key just written to `fr.ftl`, and `cargo check` fails with a
             // `compile_error!` per lookup.
             //
-            // Keep it in step. English is what that file holds, so the same
-            // values belong there; it is only written when it ALREADY exists,
-            // because creating one would invent an `en` locale the project
-            // deliberately does not have.
-            let validator_path = project_root.join("i18n").join("en.ftl");
-            if validator_path != ftl_path && validator_path.exists() {
+            // Keep it in step — the bundle the MACRO would pick, resolved the
+            // way the macro resolves it, not a hardcoded `i18n/en.ftl`. Only
+            // when it already exists: an absent one means there is no
+            // compile-time check to satisfy, and writing it would invent a
+            // locale the project deliberately does not have.
+            let macro_env = scaffold_i18n::MacroEnv::resolve(project_root);
+            if let Some(validator_path) =
+                scaffold_i18n::validator_bundle_path(project_root, &macro_env)
+                && validator_path != ftl_path
+            {
                 // Same fallible read as the runtime bundle above, for the same
                 // reason: `read_or_empty` would turn an unreadable or non-UTF-8
                 // file into `""`, and the `Modify` below would then write a

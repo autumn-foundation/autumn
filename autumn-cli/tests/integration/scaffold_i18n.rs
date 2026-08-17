@@ -735,6 +735,58 @@ fn a_non_default_locale_project_still_compiles_against_the_t_validator() {
 }
 
 #[test]
+fn the_validator_bundle_a_cargo_config_selects_is_kept_in_step() {
+    // `t!` reads `AUTUMN_I18N_DEFAULT_LOCALE` to pick the bundle it validates
+    // against, and a setting the macro needs on every build lives in
+    // `.cargo/config.toml`. Syncing a hardcoded `i18n/en.ftl` leaves the file
+    // the validator actually opens without the generated keys, so `cargo check`
+    // fails with a `compile_error!` per lookup. Driven through the config file
+    // rather than the process environment so the test stays hermetic.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "cfg-validator-app"]);
+    let project = tmp.path().join("cfg-validator-app");
+    fs::create_dir_all(project.join(".cargo")).unwrap();
+    fs::write(
+        project.join(".cargo/config.toml"),
+        "[env]\nAUTUMN_I18N_DEFAULT_LOCALE = \"de\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(project.join("i18n")).unwrap();
+    // Both exist, so only the one the macro would open must be updated.
+    fs::write(project.join("i18n/de.ftl"), "welcome.title = Willkommen\n").unwrap();
+    fs::write(project.join("i18n/en.ftl"), "welcome.title = Welcome\n").unwrap();
+    let autumn_toml = project.join("autumn.toml");
+    let mut config = fs::read_to_string(&autumn_toml).unwrap();
+    config.push_str("\n[i18n]\ndefault_locale = \"fr\"\nsupported_locales = [\"fr\"]\n");
+    fs::write(&autumn_toml, config).unwrap();
+
+    run_autumn_ok(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "--i18n"],
+    );
+
+    let fr = fs::read_to_string(project.join("i18n/fr.ftl")).unwrap();
+    let de = fs::read_to_string(project.join("i18n/de.ftl")).unwrap();
+    let en = fs::read_to_string(project.join("i18n/en.ftl")).unwrap();
+    assert!(
+        fr.contains("post.new = New Post"),
+        "the runtime bundle still follows `autumn.toml`:\n{fr}"
+    );
+    assert!(
+        de.contains("post.new = New Post"),
+        "the bundle the validator opens must be kept in step:\n{de}"
+    );
+    assert!(
+        de.contains("welcome.title = Willkommen"),
+        "and its existing translations left alone:\n{de}"
+    );
+    assert!(
+        !en.contains("post.new"),
+        "`en.ftl` is not what this build validates against:\n{en}"
+    );
+}
+
+#[test]
 fn destroying_a_featureful_resource_prunes_only_the_chrome_it_alone_used() {
     let tmp = tempfile::tempdir().expect("tempdir");
     run_autumn_ok(tmp.path(), &["new", "chrome-app"]);

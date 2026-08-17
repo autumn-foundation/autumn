@@ -30,6 +30,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use super::scaffold::{is_raw_string_start, skip_raw_string};
 
@@ -1008,6 +1009,112 @@ fn configured_i18n_by_scan(autumn_toml: &str) -> (Option<String>, Option<String>
         }
     }
     (locale, dir)
+}
+
+/// The two environment variables `t!`'s compile-time key check reads, as the
+/// COMPILER will see them.
+///
+/// `t!` does not read `autumn.toml`. It resolves its validation bundle from
+/// `AUTUMN_I18N_FILE`, else `$CARGO_MANIFEST_DIR/i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl`
+/// with the locale defaulting to `en` (`autumn-macros/src/i18n.rs`), and
+/// degrades to a runtime lookup when neither exists. A generator that assumes
+/// `i18n/en.ftl` keeps the wrong file in step: with the locale set to `fr` the
+/// validator reads `i18n/fr.ftl`, which then lacks every key just generated,
+/// and `cargo check` fails with a `compile_error!` per lookup.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct MacroEnv {
+    pub(super) file: Option<String>,
+    pub(super) default_locale: Option<String>,
+}
+
+impl MacroEnv {
+    /// The process environment, with the project's own `.cargo/config.toml`
+    /// `[env]` table layered underneath — which is where a setting the macro
+    /// needs on EVERY build realistically lives, and which this process does
+    /// not otherwise inherit.
+    ///
+    /// Only the project's own config is read. Ancestor directories and
+    /// `$CARGO_HOME` can also carry one, but those are outside the tree being
+    /// generated into and nothing here can see which of them cargo would pick.
+    pub(super) fn resolve(project_root: &Path) -> Self {
+        let config = ["config.toml", "config"]
+            .into_iter()
+            .find_map(|name| std::fs::read_to_string(project_root.join(".cargo").join(name)).ok())
+            .unwrap_or_default();
+        let configured = cargo_config_env(&config, project_root);
+        let read = |name: &str| layer_cargo_env(configured.get(name), std::env::var(name).ok());
+        Self {
+            file: read("AUTUMN_I18N_FILE"),
+            default_locale: read("AUTUMN_I18N_DEFAULT_LOCALE"),
+        }
+    }
+}
+
+/// One variable's value as cargo would set it: a config entry applies only when
+/// the process does not already carry the variable, unless the entry asks to
+/// `force`.
+fn layer_cargo_env(
+    configured: Option<&(String, bool)>,
+    from_process: Option<String>,
+) -> Option<String> {
+    match configured {
+        Some((value, force)) if *force || from_process.is_none() => Some(value.clone()),
+        _ => from_process,
+    }
+}
+
+/// The `[env]` table of a `.cargo/config.toml`, as `name -> (value, force)`.
+///
+/// An entry is either a bare string or a table carrying `value` plus the
+/// optional `force` and `relative` flags; `relative` makes the value a path
+/// resolved against the directory holding `.cargo`, which is what cargo itself
+/// does.
+fn cargo_config_env(config: &str, project_root: &Path) -> BTreeMap<String, (String, bool)> {
+    let Ok(table) = config.parse::<toml::Table>() else {
+        return BTreeMap::new();
+    };
+    let Some(env) = table.get("env").and_then(toml::Value::as_table) else {
+        return BTreeMap::new();
+    };
+    env.iter()
+        .filter_map(|(name, entry)| {
+            let (value, force, relative) = match entry {
+                toml::Value::String(value) => (value.clone(), false, false),
+                toml::Value::Table(fields) => (
+                    fields.get("value")?.as_str()?.to_owned(),
+                    fields.get("force").and_then(toml::Value::as_bool) == Some(true),
+                    fields.get("relative").and_then(toml::Value::as_bool) == Some(true),
+                ),
+                _ => return None,
+            };
+            let value = if relative {
+                project_root.join(value).to_string_lossy().into_owned()
+            } else {
+                value
+            };
+            Some((name.clone(), (value, force)))
+        })
+        .collect()
+}
+
+/// The bundle `t!` will validate against, or `None` when the macro would find
+/// none and fall back to a runtime lookup.
+///
+/// Mirrors `locate_default_bundle` in `autumn-macros/src/i18n.rs`, including
+/// its requirement that the file EXIST: an absent bundle means there is no
+/// compile-time check to keep in step, and writing one would invent a locale
+/// the project deliberately does not have.
+pub(super) fn validator_bundle_path(project_root: &Path, env: &MacroEnv) -> Option<PathBuf> {
+    if let Some(file) = &env.file {
+        // A relative `AUTUMN_I18N_FILE` is resolved by the compiler against its
+        // own working directory, which for a cargo build is the workspace root.
+        // The project root is that directory for a generated app.
+        let path = project_root.join(file);
+        return path.is_file().then_some(path);
+    }
+    let locale = env.default_locale.as_deref().unwrap_or("en");
+    let path = project_root.join("i18n").join(format!("{locale}.ftl"));
+    path.is_file().then_some(path)
 }
 
 /// The `static` item `autumn new` emits for embedded assets — where the locale
@@ -3096,6 +3203,109 @@ mod tests {
             out.matches(".embedded_locales(&EMBEDDED_LOCALES)").count() >= 2,
             "production must get its own install, not inherit the helper's:\n{out}"
         );
+    }
+
+    /// `t!` resolves its validation bundle from `AUTUMN_I18N_FILE`, else
+    /// `i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl`. Keeping a hardcoded
+    /// `i18n/en.ftl` in step syncs the wrong file whenever a build configures
+    /// either one, and every generated lookup then expands to a
+    /// `compile_error!` against a bundle that never received the keys.
+    #[test]
+    fn the_validator_bundle_follows_the_macros_own_environment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("i18n")).unwrap();
+
+        // Nothing configured, nothing on disk: no compile-time check to satisfy.
+        assert_eq!(validator_bundle_path(root, &MacroEnv::default()), None);
+
+        std::fs::write(root.join("i18n").join("en.ftl"), "a = A\n").unwrap();
+        assert_eq!(
+            validator_bundle_path(root, &MacroEnv::default()),
+            Some(root.join("i18n").join("en.ftl"))
+        );
+
+        // A configured locale moves the validator off `en` entirely.
+        let fr = MacroEnv {
+            file: None,
+            default_locale: Some("fr".to_owned()),
+        };
+        assert_eq!(
+            validator_bundle_path(root, &fr),
+            None,
+            "the macro degrades to a runtime lookup when its bundle is absent"
+        );
+        std::fs::write(root.join("i18n").join("fr.ftl"), "a = A\n").unwrap();
+        assert_eq!(
+            validator_bundle_path(root, &fr),
+            Some(root.join("i18n").join("fr.ftl")),
+            "not `en.ftl`, which the macro would never read here"
+        );
+
+        // An explicit file wins over the directory convention.
+        std::fs::write(root.join("custom.ftl"), "a = A\n").unwrap();
+        let explicit = MacroEnv {
+            file: Some("custom.ftl".to_owned()),
+            default_locale: Some("fr".to_owned()),
+        };
+        assert_eq!(
+            validator_bundle_path(root, &explicit),
+            Some(root.join("custom.ftl"))
+        );
+    }
+
+    /// A setting the macro needs on every build lives in `.cargo/config.toml`,
+    /// which this process does not inherit.
+    #[test]
+    fn cargo_config_env_reads_both_entry_forms() {
+        let root = Path::new("/project");
+        let config = concat!(
+            "[env]\n",
+            "AUTUMN_I18N_DEFAULT_LOCALE = \"fr\"\n",
+            "AUTUMN_I18N_FILE = { value = \"bundles/app.ftl\", relative = true }\n",
+            "FORCED = { value = \"yes\", force = true }\n",
+        );
+        let env = cargo_config_env(config, root);
+        assert_eq!(
+            env.get("AUTUMN_I18N_DEFAULT_LOCALE"),
+            Some(&("fr".to_owned(), false))
+        );
+        assert_eq!(
+            env.get("AUTUMN_I18N_FILE"),
+            Some(&(
+                root.join("bundles/app.ftl").to_string_lossy().into_owned(),
+                false
+            )),
+            "`relative` resolves against the directory holding `.cargo`"
+        );
+        assert_eq!(env.get("FORCED"), Some(&("yes".to_owned(), true)));
+        // An unparseable or table-less config is simply nothing to layer.
+        assert!(cargo_config_env("not = [toml", root).is_empty());
+        assert!(cargo_config_env("[build]\njobs = 2\n", root).is_empty());
+    }
+
+    /// Cargo's precedence: the process wins unless the entry says `force`.
+    #[test]
+    fn a_cargo_config_entry_yields_to_the_process_unless_forced() {
+        let plain = ("config".to_owned(), false);
+        let forced = ("config".to_owned(), true);
+        assert_eq!(
+            layer_cargo_env(Some(&plain), None),
+            Some("config".to_owned())
+        );
+        assert_eq!(
+            layer_cargo_env(Some(&plain), Some("process".to_owned())),
+            Some("process".to_owned())
+        );
+        assert_eq!(
+            layer_cargo_env(Some(&forced), Some("process".to_owned())),
+            Some("config".to_owned())
+        );
+        assert_eq!(
+            layer_cargo_env(None, Some("process".to_owned())),
+            Some("process".to_owned())
+        );
+        assert_eq!(layer_cargo_env(None, None), None);
     }
 
     /// `ADMIN_EMBEDDED_LOCALES` is not this static. Reading it as one reports
