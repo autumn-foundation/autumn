@@ -1002,16 +1002,31 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
             rust_string_escape(dir)
         )
     };
-    if main_rs.contains("EMBEDDED_LOCALES") {
+    // PRODUCTION occurrences only. A `#[cfg(test)]` fixture that happens to
+    // mention `EMBEDDED_LOCALES` is not the binary's embedding, and treating it
+    // as one returns "already wired" while `autumn build --embed` ships a
+    // release binary with no bundle in it — which panics on a machine that has
+    // no sidecar locale directory. Same scoping `ensure_i18n_auto` applies to
+    // its own detections; it belongs here for the same reason.
+    let embedded_in_production = real_offsets(main_rs, "EMBEDDED_LOCALES")
+        .into_iter()
+        .any(|at| !in_cfg_test(main_rs, at));
+    if embedded_in_production {
         // Already embedded — but not necessarily from the right place. A
         // project that changed `[i18n] dir` after its first `--i18n` scaffold
         // keeps embedding the OLD directory while the keys, the Docker `COPY`,
         // and the runtime load all move to the new one, so an `--embed` build
         // ships a bundle the app never reads. Repoint it.
-        if main_rs.contains(&macro_call) {
+        if real_offsets(main_rs, &macro_call)
+            .into_iter()
+            .any(|at| !in_cfg_test(main_rs, at))
+        {
             return Some(main_rs.to_owned());
         }
-        let Some(call_at) = main_rs.find("autumn_web::embed_locales!") else {
+        let Some(call_at) = real_offsets(main_rs, "autumn_web::embed_locales!")
+            .into_iter()
+            .find(|&at| !in_cfg_test(main_rs, at))
+        else {
             // Someone hand-rolled the static; leave it entirely alone.
             return Some(main_rs.to_owned());
         };
@@ -1574,7 +1589,7 @@ pub(super) enum I18nAutoWiring {
     NoAnchor,
 }
 
-/// The `.routes(` call belonging to the builder the BINARY runs, or `None` when
+/// The `.routes(` calls belonging to builders the BINARY runs, or empty when
 /// that cannot be told apart from a helper's.
 ///
 /// A builder inside `fn main`'s body is unambiguous. Otherwise `main` delegates
@@ -1584,7 +1599,7 @@ pub(super) enum I18nAutoWiring {
 /// preview, production renders raw keys, and the idempotency guard stops any
 /// later run from correcting it. A refusal the caller can warn about is worth
 /// more than a coin flip that cannot be retried.
-fn production_routes_anchor(main_rs: &str) -> Option<usize> {
+fn production_routes_anchors(main_rs: &str) -> Vec<usize> {
     let offsets = real_offsets(main_rs, ".routes(");
     // On an IDENTIFIER boundary: `fn main_preview()` is a different function
     // that happens to start with the same letters.
@@ -1594,10 +1609,17 @@ fn production_routes_anchor(main_rs: &str) -> Option<usize> {
             .next()
             .is_none_or(|c| !c.is_alphanumeric() && c != '_')
     });
-    if let Some((open, close)) = main_fn_at.and_then(|at| brace_block(main_rs, at))
-        && let Some(inside) = offsets.iter().find(|&&o| o > open && o < close)
-    {
-        return Some(*inside);
+    // EVERY builder inside `main`, not just the first: a conditionally-built
+    // app has one per branch, and each is production.
+    if let Some((open, close)) = main_fn_at.and_then(|at| brace_block(main_rs, at)) {
+        let inside: Vec<usize> = offsets
+            .iter()
+            .copied()
+            .filter(|&o| o > open && o < close)
+            .collect();
+        if !inside.is_empty() {
+            return inside;
+        }
     }
     // `main` delegates. A `#[cfg(test)]` builder is not a candidate at all —
     // it cannot be the one the binary runs — and excluding it keeps the very
@@ -1611,8 +1633,8 @@ fn production_routes_anchor(main_rs: &str) -> Option<usize> {
         .filter(|&o| !in_cfg_test(main_rs, o))
         .collect();
     match candidates.as_slice() {
-        [only] => Some(*only),
-        _ => None,
+        [only] => vec![*only],
+        _ => Vec::new(),
     }
 }
 
@@ -1646,54 +1668,76 @@ fn enclosing_body(src: &str, at: usize) -> Option<(usize, usize)> {
 /// translation-management service must not have it swapped for a filesystem
 /// load.
 pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
-    // WHICH builder is the production one is decided first, and everything else
-    // is asked about that builder rather than about the file. A `main.rs` can
-    // hold several — a preview helper, a `#[cfg(test)]` fixture — and the
-    // earlier file-wide questions gave wrong answers on ordinary layouts: a
-    // `.i18n(test_bundle())` in a test fixture reported the whole app as
-    // custom-bundled and left production unwired, and an `.i18n_auto()` on the
-    // fixture reported it as already done.
-    let Some(anchor) = production_routes_anchor(main_rs) else {
+    // WHICH builders are production is decided first, and everything else is
+    // asked about those builders rather than about the file. A `main.rs` can
+    // hold several — a preview helper, a `#[cfg(test)]` fixture — and file-wide
+    // questions gave wrong answers on ordinary layouts: a `.i18n(test_bundle())`
+    // in a fixture reported the whole app as custom-bundled and left production
+    // unwired, and an `.i18n_auto()` on the fixture reported it as already done.
+    let anchors = production_routes_anchors(main_rs);
+    let Some(&first) = anchors.first() else {
         return I18nAutoWiring::NoAnchor;
     };
-    // The chain lives in one function body; that is the scope to ask about.
-    let scope = enclosing_body(main_rs, anchor).unwrap_or((0, main_rs.len()));
+    let scope = enclosing_body(main_rs, first).unwrap_or((0, main_rs.len()));
     let within = |offsets: Vec<usize>| offsets.into_iter().any(|o| o > scope.0 && o < scope.1);
 
-    if within(real_offsets(main_rs, ".i18n_auto()")) {
-        return I18nAutoWiring::Wired(main_rs.to_owned());
-    }
-    // Whitespace between the method and its paren is valid Rust — `.i18n
-    // (my_bundle())` after a rustfmt-unfriendly hand edit, or a comment in
-    // between. Missing it is not cosmetic: this branch is what stops the
-    // generator wiring `.i18n_auto()`, which CLEARS a preloaded bundle and
-    // switches to filesystem loading, so a missed detection silently replaces
-    // an app's embedded or TMS-backed bundle and can panic when no bundle is
-    // on disk.
+    // A custom bundle anywhere in the production body is a stop: `.i18n_auto()`
+    // CLEARS a preloaded bundle and switches to filesystem loading, so wiring it
+    // beside a hand-installed embedded or TMS-backed bundle replaces the app's
+    // own and can panic when nothing is on disk. Whitespace and comments between
+    // the method and its paren are valid Rust, hence the token-wise match.
     if within(method_call_offsets(main_rs, ".i18n").collect()) {
         return I18nAutoWiring::CustomBundle;
     }
-    // Reuse the anchor line's own indentation so the inserted call sits in the
-    // builder chain rather than at some arbitrary column.
-    let line_start = main_rs[..anchor].rfind('\n').map_or(0, |i| i + 1);
-    if !main_rs[line_start..anchor].trim_start().is_empty() {
-        // `.routes(` is not the first token on its line (e.g. a single-line
-        // builder chain). Insert inline, which is still valid Rust.
-        return I18nAutoWiring::Wired(format!(
-            "{}.i18n_auto(){}",
-            &main_rs[..anchor],
-            &main_rs[anchor..]
-        ));
-    }
-    let indent: String = main_rs[line_start..anchor]
-        .chars()
-        .take_while(|c| c.is_whitespace())
+
+    // EVERY production branch, not just the first. `main` may build the app
+    // conditionally — one `.routes(` per configuration branch — and wiring only
+    // the first leaves the other rendering raw keys, unrepairably: the
+    // idempotency check would then see the call that was inserted into the
+    // first. Each chain is considered on its own so a partly-wired file gets
+    // completed rather than skipped.
+    let pending: Vec<usize> = anchors
+        .into_iter()
+        .filter(|&at| !chain_already_wired(main_rs, at))
         .collect();
-    I18nAutoWiring::Wired(format!(
-        "{}{indent}.i18n_auto()\n{}",
-        &main_rs[..line_start],
-        &main_rs[line_start..]
-    ))
+    if pending.is_empty() {
+        return I18nAutoWiring::Wired(main_rs.to_owned());
+    }
+
+    // Applied back-to-front so each insertion leaves the earlier offsets valid.
+    let mut out = main_rs.to_owned();
+    for at in pending.into_iter().rev() {
+        // Reuse the anchor line's own indentation so the inserted call sits in
+        // the builder chain rather than at some arbitrary column.
+        let line_start = out[..at].rfind('\n').map_or(0, |i| i + 1);
+        if out[line_start..at].trim_start().is_empty() {
+            let indent: String = out[line_start..at]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect();
+            out = format!(
+                "{}{indent}.i18n_auto()\n{}",
+                &out[..line_start],
+                &out[line_start..]
+            );
+        } else {
+            // `.routes(` is not the first token on its line (e.g. a single-line
+            // builder chain). Insert inline, which is still valid Rust.
+            out = format!("{}.i18n_auto(){}", &out[..at], &out[at..]);
+        }
+    }
+    I18nAutoWiring::Wired(out)
+}
+
+/// Whether the builder chain ending at `.routes(` offset `at` already calls
+/// `.i18n_auto()`.
+///
+/// The chain is delimited by the previous `;` or `{` — the start of the
+/// statement this call belongs to — so one branch being wired says nothing
+/// about its sibling.
+fn chain_already_wired(src: &str, at: usize) -> bool {
+    let start = src[..at].rfind([';', '{']).map_or(0, |i| i + 1);
+    !real_offsets(&src[start..at], ".i18n_auto()").is_empty()
 }
 
 #[cfg(test)]
@@ -2372,6 +2416,86 @@ mod tests {
         assert_eq!(
             stale_dockerfile_i18n_dir(dockerfile, "translations v2"),
             None
+        );
+    }
+
+    /// `main` may build the app conditionally. Wiring only the first branch
+    /// leaves the other rendering raw keys, and unrepairably: a later run sees
+    /// the call inserted into the first and stops.
+    #[test]
+    fn every_production_branch_inside_main_is_wired() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = if cfg!(feature = \"admin\") {\n",
+            "        App::new()\n",
+            "            .routes(routes![admin]);\n",
+            "    } else {\n",
+            "        App::new()\n",
+            "            .routes(routes![index]);\n",
+            "    };\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("expected a wiring");
+        };
+        assert_eq!(
+            out.matches(".i18n_auto()").count(),
+            2,
+            "both branches must be wired:\n{out}"
+        );
+
+        // And a re-run is a no-op rather than a second insertion.
+        assert_eq!(ensure_i18n_auto(&out), I18nAutoWiring::Wired(out.clone()));
+    }
+
+    /// A partly-wired file gets completed, not skipped: one branch already
+    /// carrying the call says nothing about its sibling.
+    #[test]
+    fn a_partly_wired_main_is_completed() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = if flag {\n",
+            "        App::new()\n",
+            "            .i18n_auto()\n",
+            "            .routes(routes![admin]);\n",
+            "    } else {\n",
+            "        App::new()\n",
+            "            .routes(routes![index]);\n",
+            "    };\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("expected a wiring");
+        };
+        assert_eq!(
+            out.matches(".i18n_auto()").count(),
+            2,
+            "the unwired branch must be completed:\n{out}"
+        );
+    }
+
+    /// `EMBEDDED_LOCALES` in a `#[cfg(test)]` fixture is not the binary's
+    /// embedding — treating it as one ships a release `--embed` binary with no
+    /// bundle, which panics without the sidecar directory.
+    #[test]
+    fn a_cfg_test_mention_does_not_count_as_embedded_locales() {
+        let main_rs = concat!(
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    static EMBEDDED_LOCALES: Dir = autumn_web::embed_locales!(\"fixtures\");\n",
+            "}\n",
+        );
+        let out = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
+        assert!(
+            out.contains("#[cfg(feature = \"embed-assets\")]"),
+            "production embedding must still be added:\n{out}"
+        );
+        assert!(
+            out.contains(".embedded_locales(&EMBEDDED_LOCALES)"),
+            "{out}"
         );
     }
 
