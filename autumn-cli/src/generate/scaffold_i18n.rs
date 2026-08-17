@@ -1503,13 +1503,20 @@ pub(super) fn stale_dockerfile_i18n_dir(dockerfile: &str, dir: &str) -> Option<S
         (dest.strip_prefix("./") == Some(src.as_str())).then_some(src)
     }
     /// The same for `COPY --from=builder /app/<x> /app/<x>`.
+    ///
+    /// A NESTED `<x>` counts. `dir = "locales/v1"` is a legal configuration and
+    /// this generator writes the pair for it itself, so refusing any path with a
+    /// separator held the runtime side to a stricter shape than the builder
+    /// side and the two never agreed: moving to `locales/v2` added the new pair
+    /// with no warning, and the old `COPY locales/v1 …` stayed behind to fail
+    /// the image build once that directory went away.
     fn runtime_copy_dir(line: &str) -> Option<String> {
         let (src, dest) = copy_operands(line, true)?;
         if src != dest {
             return None;
         }
         src.strip_prefix("/app/")
-            .filter(|d| !d.contains('/'))
+            .filter(|d| !d.is_empty())
             .map(str::to_owned)
     }
 
@@ -4525,6 +4532,34 @@ mod tests {
                 "i18n"
             ),
             None
+        );
+    }
+
+    /// A nested `dir` is a legal configuration, and one this generator writes
+    /// the `COPY` pair for itself — so the detector has to read one back. The
+    /// runtime side used to reject any path with a separator while the builder
+    /// side accepted it, so the two could never agree and the warning never
+    /// fired for the versioned-directory layout that most needs it.
+    #[test]
+    fn a_moved_nested_locale_dir_is_reported_too() {
+        let dockerfile = concat!(
+            "FROM rust AS builder\n",
+            "COPY migrations ./migrations\n",
+            "COPY locales/v1 ./locales/v1\n",
+            "\n",
+            "FROM debian AS runtime\n",
+            "COPY --from=builder /app/migrations /app/migrations\n",
+            "COPY --from=builder /app/locales/v1 /app/locales/v1\n",
+        );
+        assert_eq!(
+            stale_dockerfile_i18n_dir(dockerfile, "locales/v2").as_deref(),
+            Some("locales/v1"),
+            "the old pair is stale once `dir` moves"
+        );
+        assert_eq!(
+            stale_dockerfile_i18n_dir(dockerfile, "locales/v1"),
+            None,
+            "and not stale while it is still the configured one"
         );
     }
 
