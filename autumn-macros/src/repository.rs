@@ -11641,9 +11641,41 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             },
         );
+        // Regression (#1342 review round 10): the `dependents.is_empty()`
+        // check in `parse_repo_args` only sees repository-attribute
+        // `dependent(...)`. A model can ALSO declare
+        // `#[has_many(..., dependent = ...)]` / `#[has_one(...)]` directly —
+        // a separate proc-macro invocation (`#[model]`) this macro cannot
+        // see at compile time, resolved instead through the same runtime
+        // `Model::dependents()` (via `AutumnDependents`) the normal cascade
+        // delete path already drives. The sweep still mutates rows directly
+        // and never calls it, so the exact orphan/restrict-bypass risk the
+        // repository-attribute rejection exists for applies here too. Check
+        // at boot (mirroring the duration validation above) rather than on
+        // the sweep's first scheduled tick.
+        let model_dependents_boot_validation = quote! {
+            {
+                #[allow(unused_imports)]
+                use ::autumn_web::repository::AutumnDependents as _;
+                assert!(
+                    #model_name::dependents().is_empty(),
+                    "retention(...) on {} does not support a model-declared \
+                     #[has_many(..., dependent = ...)] (or #[has_one(...)]) association yet: \
+                     the sweep mutates rows directly and does not run the cascade-aware delete \
+                     path Model::dependents() drives, so a hard-delete sweep could orphan \
+                     children (or silently ignore an on_delete = restrict rule) and a \
+                     soft-delete sweep would leave active children attached to a swept parent. \
+                     Remove the model-side `dependent = ...`, or call \
+                     delete_many(ids)/delete_by_id(id) yourself from a hand-written \
+                     #[scheduled] sweep for now",
+                    ::core::stringify!(#model_name)
+                );
+            }
+        };
         let retention_duration_boot_validation = quote! {
             #after_boot_validation
             #purge_boot_validation
+            #model_dependents_boot_validation
         };
 
         let methods = quote! {
@@ -22623,6 +22655,37 @@ mod tests {
         assert!(
             task_info_region.contains("\"90d\""),
             "task_info builder must validate the `purge_deleted_after` duration string: {task_info_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_rejects_model_declared_dependents_at_boot() {
+        // Regression (#1342 review round 10): parse_repo_args's
+        // `dependents.is_empty()` check only sees repository-attribute
+        // `dependent(...)` — it can't see a model-declared
+        // `#[has_many(..., dependent = ...)]`/`#[has_one(...)]`, resolved
+        // only at runtime via `Model::dependents()` (a separate proc-macro
+        // invocation, `#[model]`). The generated task_info builder must
+        // assert that runtime slice is empty, at boot, for the same reason
+        // the compile-time dependent(...) rejection exists: the sweep
+        // mutates rows directly and never drives the cascade-aware delete
+        // path Model::dependents() feeds.
+        let generated = repository_macro(
+            quote! { Post, retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let task_info_start = generated
+            .find("fn __autumn_retention_task_info")
+            .expect("task_info builder present");
+        let task_info_region =
+            &generated[task_info_start..(task_info_start + 4000).min(generated.len())];
+
+        assert!(
+            task_info_region.contains("AutumnDependents")
+                && task_info_region.contains("dependents"),
+            "task_info builder must assert Model::dependents() is empty at boot: {task_info_region}"
         );
     }
 
