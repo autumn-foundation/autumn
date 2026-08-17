@@ -118,6 +118,14 @@ explicitly naming a hand-written task `retention-sweep-<table>` for the same
 table, or the two will compete for the same coordination lock and clobber
 each other's status in `/actuator/tasks`.
 
+Table-qualifying the name doesn't fully disambiguate on its own: a table can
+legitimately back more than one repository (e.g. a narrower view over the
+same rows). If two *different* `#[repository(...)]` declarations both target
+the same table and both declare `retention(...)`, they'd otherwise collide on
+one task name and silently merge their scheduler/actuator state. The app
+fails to boot instead, with an error naming the colliding task — only one
+repository per table may declare `retention(...)` for now.
+
 ## Counter Caches
 
 A retained model that is also a `#[belongs_to(Parent, counter_cache)]` child

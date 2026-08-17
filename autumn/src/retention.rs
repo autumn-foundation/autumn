@@ -85,11 +85,52 @@ inventory::collect!(RetentionSweepDescriptor);
 /// [`AppBuilder::tasks`](crate::app::AppBuilder::tasks).
 ///
 /// Called automatically at boot; apps never call this directly.
+///
+/// # Panics
+///
+/// Panics if two policies produce the same task name. The generated name is
+/// table-qualified (`retention-sweep-<table_name>`), which disambiguates two
+/// same-named models in different modules, but does NOT disambiguate two
+/// *different* `#[repository(...)]` declarations that both target the same
+/// table (a supported pattern — see e.g. `live_broadcast.rs`'s multiple
+/// repositories over one table) and both declare `retention(...)`. Rather
+/// than silently merging their scheduler/actuator state — which can make
+/// one policy's fleet-coordinated run skip in favor of the other's — this
+/// fails loudly at boot, matching every other "declared an unsupported
+/// combination" retention rejection, just checked here (at the one point
+/// with visibility across every `#[repository(...)]` in the binary) instead
+/// of at macro-expansion time.
 #[must_use]
 pub fn collect_retention_tasks() -> Vec<TaskInfo> {
-    inventory::iter::<RetentionSweepDescriptor>()
+    let tasks: Vec<TaskInfo> = inventory::iter::<RetentionSweepDescriptor>()
         .map(|descriptor| (descriptor.task_info)())
-        .collect()
+        .collect();
+    if let Some(message) = duplicate_retention_task_name(&tasks) {
+        panic!("{message}");
+    }
+    tasks
+}
+
+/// The panic message for [`collect_retention_tasks`], or `None` if every
+/// task name in `tasks` is unique. A free function (rather than inlined
+/// into `collect_retention_tasks`) so the collision case is unit-testable
+/// against a synthetic `Vec<TaskInfo>` — testing it through
+/// `collect_retention_tasks` itself would mean `inventory::submit!`-ing a
+/// colliding pair into the process-global registry, which every other test
+/// in the binary shares and can't un-register.
+fn duplicate_retention_task_name(tasks: &[TaskInfo]) -> Option<String> {
+    let mut seen = std::collections::HashSet::with_capacity(tasks.len());
+    tasks.iter().find_map(|task| {
+        (!seen.insert(task.name.as_str())).then(|| {
+            format!(
+                "two #[repository(..., retention(...))] policies both produced the retention \
+                 task name {:?} — most likely two different repositories declaring \
+                 retention(...) on the same table. Only one repository per table may declare \
+                 retention(...) for now.",
+                task.name
+            )
+        })
+    })
 }
 
 /// `true` once at least one `#[repository(..., retention(...))]` policy has
@@ -206,12 +247,39 @@ mod tests {
     }
 
     fn sample_task_info() -> TaskInfo {
+        task_info_named("retention-sweep-widget")
+    }
+
+    fn task_info_named(name: &str) -> TaskInfo {
         TaskInfo {
-            name: "retention-sweep-widget".to_string(),
+            name: name.to_string(),
             schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(3600)),
             coordination: crate::task::TaskCoordination::Fleet,
             handler: |_state| Box::pin(async { Ok(()) }),
         }
+    }
+
+    // `RetentionSweepDescriptor::task_info` is a plain `fn() -> TaskInfo`
+    // (no captures), so each `inventory::submit!` fixture below needs its
+    // own named function rather than a closure over `task_info_named` — and
+    // each must return a distinct name, now that `collect_retention_tasks`
+    // rejects duplicates (#1342 review round 7). Sharing `sample_task_info`
+    // across fixtures, as earlier versions of these tests did, is exactly
+    // the collision that check now catches.
+    fn by_model_name_task_info() -> TaskInfo {
+        task_info_named("retention-sweep-__retention_runtime_test_widgets")
+    }
+
+    fn by_table_name_task_info() -> TaskInfo {
+        task_info_named("retention-sweep-__retention_runtime_test_widgets_by_table")
+    }
+
+    fn ambiguous_a_task_info() -> TaskInfo {
+        task_info_named("retention-sweep-__retention_runtime_ambiguous_widgets_a")
+    }
+
+    fn ambiguous_b_task_info() -> TaskInfo {
+        task_info_named("retention-sweep-__retention_runtime_ambiguous_widgets_b")
     }
 
     #[test]
@@ -244,6 +312,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn duplicate_retention_task_name_detects_a_collision() {
+        // Regression (#1342 review round 7): two different repositories can
+        // legitimately target the same table (see live_broadcast.rs); if
+        // both declare retention(...), the table-qualified task name alone
+        // doesn't disambiguate them. Tested against the pure helper, not
+        // collect_retention_tasks() itself — inventory::submit! is
+        // process-global and can't be un-registered, so submitting a
+        // colliding pair here would break every other test in the binary
+        // that also calls collect_retention_tasks().
+        let tasks = vec![sample_task_info(), sample_task_info()];
+        let message = duplicate_retention_task_name(&tasks)
+            .expect("two tasks with the same name must be flagged as a collision");
+        assert!(message.contains(&sample_task_info().name), "{message}");
+    }
+
+    #[test]
+    fn duplicate_retention_task_name_accepts_unique_names() {
+        let mut b = sample_task_info();
+        b.name = "retention-sweep-other-table".to_string();
+        let tasks = vec![sample_task_info(), b];
+        assert!(
+            duplicate_retention_task_name(&tasks).is_none(),
+            "two tasks with different names must not be flagged as a collision"
+        );
+    }
+
     #[tokio::test]
     async fn run_retention_dry_run_filters_by_model_name() {
         struct Fixture;
@@ -251,7 +346,7 @@ mod tests {
             RetentionSweepDescriptor {
                 model_name: "__RetentionRuntimeTestWidget",
                 table_name: "__retention_runtime_test_widgets",
-                task_info: sample_task_info,
+                task_info: by_model_name_task_info,
                 dry_run: sample_dry_run,
             }
         }
@@ -274,7 +369,7 @@ mod tests {
             RetentionSweepDescriptor {
                 model_name: "__RetentionRuntimeTestWidgetByTable",
                 table_name: "__retention_runtime_test_widgets_by_table",
-                task_info: sample_task_info,
+                task_info: by_table_name_task_info,
                 dry_run: sample_dry_run,
             }
         }
@@ -298,7 +393,7 @@ mod tests {
             RetentionSweepDescriptor {
                 model_name: "__RetentionRuntimeAmbiguousWidget",
                 table_name: "__retention_runtime_ambiguous_widgets_a",
-                task_info: sample_task_info,
+                task_info: ambiguous_a_task_info,
                 dry_run: sample_dry_run,
             }
         }
@@ -306,7 +401,7 @@ mod tests {
             RetentionSweepDescriptor {
                 model_name: "__RetentionRuntimeAmbiguousWidget",
                 table_name: "__retention_runtime_ambiguous_widgets_b",
-                task_info: sample_task_info,
+                task_info: ambiguous_b_task_info,
                 dry_run: sample_dry_run,
             }
         }
