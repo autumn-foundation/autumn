@@ -3,16 +3,26 @@
 //! anything (issue #1342).
 //!
 //! Compiles the target binary (debug profile), runs it with
-//! `AUTUMN_RETENTION_DRY_RUN=1`, and parses the JSON report from its stdout.
-//! Running from inside the app is the only sound source: policies are
-//! compiled into the app's own model/repository types, so the standalone CLI
-//! (which links `autumn-web` but never the user's models) cannot see them —
-//! mirrors `autumn jobs manifest` / `autumn task --list`.
+//! `AUTUMN_RETENTION_DRY_RUN=1`, and reads the JSON report from the one line
+//! of its stdout starting with [`RETENTION_DRY_RUN_JSON_PREFIX`] — not the
+//! entirety of stdout, which can also carry tracing/migration output the
+//! child prints before the report line. Running from inside the app is the
+//! only sound source: policies are compiled into the app's own
+//! model/repository types, so the standalone CLI (which links `autumn-web`
+//! but never the user's models) cannot see them — mirrors `autumn jobs
+//! manifest` / `autumn task --list`.
 
 use std::fmt::Write as _;
 use std::process::{Command, Stdio};
 
 use serde::Deserialize;
+
+/// Line prefix framing the app's machine-readable JSON report, matched
+/// verbatim against `autumn_web`'s `app::RETENTION_DRY_RUN_JSON_PREFIX`
+/// (private to that crate, so duplicated here rather than shared — the same
+/// pattern already used for the `AUTUMN_RETENTION_DRY_RUN`/
+/// `AUTUMN_RETENTION_MODEL` env var names below).
+const RETENTION_DRY_RUN_JSON_PREFIX: &str = "AUTUMN_RETENTION_DRY_RUN_REPORT=";
 
 /// Options controlling `autumn retention`.
 pub struct RetentionOptions<'a> {
@@ -88,14 +98,38 @@ pub fn run(opts: &RetentionOptions<'_>) {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let reports: Vec<RetentionSweepReport> =
-        serde_json::from_str(&stdout).unwrap_or_else(|error| {
-            eprintln!("Failed to parse retention dry-run JSON: {error}");
+    let reports: Vec<RetentionSweepReport> = extract_dry_run_json(&stdout).map_or_else(
+        || {
+            eprintln!("Failed to find the retention dry-run report in the binary's output.");
             eprintln!("Raw output: {stdout}");
             std::process::exit(1);
-        });
+        },
+        |json| {
+            serde_json::from_str(json).unwrap_or_else(|error| {
+                eprintln!("Failed to parse retention dry-run JSON: {error}");
+                eprintln!("Raw output: {stdout}");
+                std::process::exit(1);
+            })
+        },
+    );
 
     print!("{}", format_retention_report(&reports));
+}
+
+/// Find the dry-run report line in the child's captured stdout and return
+/// its JSON payload (the text after [`RETENTION_DRY_RUN_JSON_PREFIX`]).
+///
+/// Not assumed to be the entirety of stdout (#1342 review round 14): the
+/// default `dev` profile initializes a stdout-backed tracing formatter, and
+/// Diesel writes pending-migration progress directly to stdout, both of
+/// which can print before the report line whenever anything is pending.
+/// Takes the *last* matching line — the report is always printed
+/// immediately before the child exits.
+fn extract_dry_run_json(stdout: &str) -> Option<&str> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(RETENTION_DRY_RUN_JSON_PREFIX))
 }
 
 /// Render a dry-run report as a fixed-width table, sorted by model name then
@@ -148,6 +182,35 @@ pub fn format_retention_report(reports: &[RetentionSweepReport]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_dry_run_json_finds_the_framed_report_line() {
+        let stdout = "2026-08-17T12:00:00Z INFO booting\nRunning migration 0001\n\
+                       AUTUMN_RETENTION_DRY_RUN_REPORT=[{\"model\":\"Widget\"}]\n";
+        assert_eq!(
+            extract_dry_run_json(stdout),
+            Some("[{\"model\":\"Widget\"}]")
+        );
+    }
+
+    #[test]
+    fn extract_dry_run_json_ignores_incidental_stdout_noise() {
+        // Regression (#1342 review round 14): the default `dev` profile's
+        // stdout-backed tracing formatter and Diesel's migration-progress
+        // output can both print before the report line whenever anything
+        // is pending — the extractor must not choke on (or accidentally
+        // match) any of that.
+        let stdout = "Running migration 20260101000000_create_widgets\n\
+                       {\"level\":\"INFO\",\"message\":\"listening\"}\n\
+                       AUTUMN_RETENTION_DRY_RUN_REPORT=[]\n";
+        assert_eq!(extract_dry_run_json(stdout), Some("[]"));
+    }
+
+    #[test]
+    fn extract_dry_run_json_returns_none_without_a_framed_line() {
+        let stdout = "some unrelated log output\nno report line here\n";
+        assert_eq!(extract_dry_run_json(stdout), None);
+    }
 
     #[test]
     fn format_retention_report_includes_model_and_row_count() {

@@ -5415,7 +5415,7 @@ impl AppBuilder {
         // needs to be counted.
         match crate::retention::resolve_retention_descriptors(model_filter.as_deref()) {
             Ok(descriptors) if descriptors.is_empty() => {
-                println!("[]");
+                println!("{RETENTION_DRY_RUN_JSON_PREFIX}[]");
                 std::process::exit(0);
             }
             Ok(_) => {}
@@ -5463,7 +5463,7 @@ impl AppBuilder {
         match crate::retention::run_retention_dry_run(&state, model_filter.as_deref()).await {
             Ok(reports) => match serde_json::to_string(&reports) {
                 Ok(json) => {
-                    println!("{json}");
+                    println!("{RETENTION_DRY_RUN_JSON_PREFIX}{json}");
                     #[cfg(feature = "managed-pg")]
                     crate::managed_pg::emergency_stop_async().await;
                     std::process::exit(0);
@@ -5488,17 +5488,18 @@ impl AppBuilder {
     /// database support: there is nothing to sweep, so report and exit 0
     /// (never starting the server).
     ///
-    /// Still prints `[]` to stdout — `autumn retention --dry-run` always
-    /// parses the child's stdout as a JSON report array, so silently
-    /// printing nothing here would surface as a JSON-parse failure instead
-    /// of the intended "no policies" result.
+    /// Still prints `[]` to stdout (framed by
+    /// [`RETENTION_DRY_RUN_JSON_PREFIX`]) — `autumn retention --dry-run`
+    /// always looks for that framed report line, so silently printing
+    /// nothing here would surface as a parse failure instead of the
+    /// intended "no policies" result.
     #[cfg(not(feature = "db"))]
     #[allow(clippy::unused_async)]
     async fn run_retention_dry_run_mode(self) {
         eprintln!(
             "autumn retention --dry-run: this build has no database support — nothing to report"
         );
-        println!("[]");
+        println!("{RETENTION_DRY_RUN_JSON_PREFIX}[]");
         std::process::exit(0);
     }
 
@@ -6223,6 +6224,23 @@ pub(crate) fn is_migrate_only_mode() -> bool {
 pub(crate) fn is_retention_dry_run_mode() -> bool {
     std::env::var("AUTUMN_RETENTION_DRY_RUN").as_deref() == Ok("1")
 }
+
+/// Line prefix framing the retention dry-run's machine-readable JSON report
+/// on stdout, matched verbatim by `autumn-cli/src/retention.rs`.
+///
+/// Regression (#1342 review round 14): the dry-run one-shot's stdout is not
+/// otherwise guaranteed to contain nothing but the JSON report — the default
+/// `dev` profile initializes a stdout-backed tracing formatter, and Diesel's
+/// `MigrationHarness` writes pending-migration progress directly to stdout
+/// (`HarnessWithOutput::write_to_stdout`), both of which run before the
+/// report line prints whenever anything is pending. Parsing the *entire*
+/// captured stdout as one JSON blob (the original approach) then fails on
+/// any of that incidental output. Framing the report as the one line
+/// starting with this prefix lets the CLI find it regardless of what else
+/// landed on stdout, without having to redirect every one-shot's logging or
+/// Diesel's hardcoded migration-progress writer — both shared with other
+/// boot paths (e.g. `autumn migrate`) that want stdout output.
+const RETENTION_DRY_RUN_JSON_PREFIX: &str = "AUTUMN_RETENTION_DRY_RUN_REPORT=";
 
 /// `AUTUMN_RETENTION_MODEL=<name>` narrows the dry-run report to one model's
 /// policy. Set by `autumn retention --dry-run --model <name>`.
