@@ -1275,10 +1275,6 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
     // about the chain the binary runs: treating it as done leaves production
     // falling through to `.i18n_auto()`, so an `--embed` deployment without the
     // sidecar directory panics with the static sitting unused in the binary.
-    let scopes = production_scopes(main_rs);
-    let installed_in_production = method_call_offsets(main_rs, ".embedded_locales")
-        .any(|at| in_production(main_rs, &scopes, at));
-
     if embedded_in_production {
         // Already embedded — but not necessarily from the right place. A
         // project that changed `[i18n] dir` after its first `--i18n` scaffold
@@ -1306,16 +1302,16 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
                 .copied()?;
             Some((start + rel, end))
         });
-        let mut out = match stale_macro {
+        let out = match stale_macro {
             Some((call_at, end)) => {
                 format!("{}{macro_call}{}", &main_rs[..call_at], &main_rs[end..])
             }
             None => main_rs.to_owned(),
         };
-        if !installed_in_production {
-            out = insert_locale_install(&out)?;
-        }
-        return Some(out);
+        // Unconditionally: the insertion is per-anchor and skips the ones
+        // already served, so "some branch has it" can no longer stand in for
+        // "every branch has it".
+        return insert_locale_install(&out);
     }
     // Beside the PRODUCTION static, on the same production test the install
     // below uses. A `#[cfg(test)]` module can declare its own fixture with the
@@ -1349,18 +1345,62 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
 /// `--embed` binary still falling through to a disk load, which panics when the
 /// deployment has no sidecar locale directory. Recomputed against the text
 /// passed in, since an earlier edit may have shifted every offset.
+/// EVERY production anchor, each judged on its own — the same per-branch shape
+/// `ensure_i18n_auto` uses, and for the same reason. A `main` that builds the
+/// app conditionally has one `embedded_static` install per branch, every one of
+/// them production; serving only the first leaves the others loading locales
+/// from disk, so an `--embed` deployment panics whenever it takes one of those
+/// branches, with the bundle sitting unused in the binary.
 fn insert_locale_install(src: &str) -> Option<String> {
     let scopes = production_scopes(src);
-    let at = real_offsets(src, INSTALL_ANCHOR)
+    let anchors: Vec<usize> = real_offsets(src, INSTALL_ANCHOR)
         .into_iter()
-        .find(|&at| in_production(src, &scopes, at))?;
-    let end = at + INSTALL_ANCHOR.len();
-    Some(format!(
-        "{}{INSTALL_ANCHOR}    #[cfg(feature = \"embed-assets\")]\n\
-         \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n{}",
-        &src[..at],
-        &src[end..]
-    ))
+        .filter(|&at| in_production(src, &scopes, at))
+        .collect();
+    let pending: Vec<usize> = anchors
+        .iter()
+        .copied()
+        .filter(|&at| !locales_installed_beside(src, at))
+        .collect();
+    if pending.is_empty() {
+        // Nothing to add — but say whether that is because everything is
+        // served or because there was nowhere to write. A file with no
+        // production anchor at all is only "done" when the call is already
+        // there; otherwise the caller has to warn.
+        let served = !anchors.is_empty()
+            || method_call_offsets(src, ".embedded_locales")
+                .any(|at| in_production(src, &scopes, at));
+        return served.then(|| src.to_owned());
+    }
+    // Back-to-front, so each insertion leaves the earlier offsets valid.
+    let mut out = src.to_owned();
+    for at in pending.into_iter().rev() {
+        let end = at + INSTALL_ANCHOR.len();
+        out = format!(
+            "{}{INSTALL_ANCHOR}    #[cfg(feature = \"embed-assets\")]\n\
+             \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n{}",
+            &out[..at],
+            &out[end..]
+        );
+    }
+    Some(out)
+}
+
+/// Whether the block holding the `embedded_static` install at `at` already
+/// installs the locales.
+///
+/// Per BLOCK, because that is what a conditional branch is: one branch already
+/// carrying the call says nothing about its sibling, and reading it file-wide
+/// would leave that sibling on a disk load.
+fn locales_installed_beside(src: &str, at: usize) -> bool {
+    let start = enclosing_block_start(src, at);
+    let end = start
+        .checked_sub(1)
+        .and_then(|brace| brace_block(src, brace))
+        .map_or(src.len(), |(_, close)| close);
+    method_call_offsets(&src[start..end], ".embedded_locales")
+        .next()
+        .is_some()
 }
 
 /// The function bodies holding the builders the binary runs.
@@ -2224,30 +2264,84 @@ fn method_called_before(src: &str, at: usize, method: &str) -> bool {
     // for `.i18n_auto` that is silent: the caller reports success and
     // production renders raw keys.
     let statement = &src[start..at];
-    let Some(mut name) = value_root(binds(statement).map_or(statement, |(_, init)| init)) else {
-        return false;
-    };
-    let mut before = start;
-    // Each hop is a `let <name> = <initialiser>;`. Following them transitively
-    // matters: giving up after one would miss a bundle installed two
-    // rebindings back, and MISSING one is the failure that clears it.
-    // Bounded only against a pathological input; valid Rust cannot cycle.
+    // Following them transitively matters: giving up after one hop would miss
+    // a bundle installed two rebindings back, and MISSING one is the failure
+    // that clears it. A conditional initialiser contributes EVERY branch's
+    // root, since which one runs is a runtime choice — so this is a frontier,
+    // not a single name. Bounded only against a pathological input; valid Rust
+    // cannot cycle.
+    let mut frontier: Vec<(&str, usize)> =
+        value_roots(binds(statement).map_or(statement, |(_, init)| init))
+            .into_iter()
+            .map(|name| (name, start))
+            .collect();
     for _ in 0..64 {
-        let Some((bind_start, bind_end)) = binding_of(src, before, name) else {
+        let Some((name, before)) = frontier.pop() else {
             return false;
+        };
+        let Some((bind_start, bind_end)) = binding_of(src, before, name) else {
+            continue;
         };
         let statement = &src[bind_start..bind_end];
         let initialiser = binds(statement).map_or(statement, |(_, init)| init);
         if calls_at_own_depth(initialiser, method) {
             return true;
         }
-        let Some(next) = value_root(initialiser) else {
-            return false;
-        };
-        name = next;
-        before = bind_start;
+        frontier.extend(
+            value_roots(initialiser)
+                .into_iter()
+                .map(|next| (next, bind_start)),
+        );
     }
     false
+}
+
+/// The identifiers an expression's value can come from.
+///
+/// One for a plain chain, and one per branch for a conditional: `let app = if
+/// use_tms { tms } else { plain };` produces whichever the flag picks, so both
+/// have to be followed. Empty when the expression starts from something with no
+/// binding behind it.
+fn value_roots(expr: &str) -> Vec<&str> {
+    if let Some(root) = value_root(expr) {
+        return vec![root];
+    }
+    // A conditional or block expression: each brace group at the expression's
+    // own PAREN depth is a branch, and its tail is what that branch yields.
+    // Groups nested inside a call — a closure body — are not branches.
+    brace_groups(expr)
+        .into_iter()
+        .filter_map(|(open, close)| value_root(&expr[open..close]))
+        .collect()
+}
+
+/// Spans just inside each `{ … }` group at `expr`'s own paren depth.
+fn brace_groups(expr: &str) -> Vec<(usize, usize)> {
+    let marks = delimiter_marks(expr, expr.len());
+    let mut out = Vec::new();
+    let mut paren = 0i32;
+    let mut brace = 0i32;
+    let mut open = 0usize;
+    for &(offset, byte) in &marks {
+        match byte {
+            b'(' | b'[' => paren += 1,
+            b')' | b']' => paren -= 1,
+            b'{' if paren <= 0 => {
+                if brace == 0 {
+                    open = offset + 1;
+                }
+                brace += 1;
+            }
+            b'}' if paren <= 0 => {
+                brace -= 1;
+                if brace == 0 {
+                    out.push((open, offset));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The nearest statement before `before` that gives `name` a value, searching
@@ -2435,12 +2529,16 @@ fn statement_start(src: &str, at: usize) -> usize {
     0
 }
 
-/// Whether `region` calls `method` at its OWN nesting level, rather than inside
-/// some group nested within it.
+/// Whether `region` calls `method` on the value it is building, rather than
+/// inside something nested in it.
 ///
-/// A `.i18n(…)` inside `.layer(from_fn(|| { … }))` is applied to whatever that
-/// closure builds, not to the app the region is assembling; counting it would
-/// read middleware internals as the app's own bundle.
+/// PAREN depth decides, not brace depth, and the difference is what a brace
+/// means here. `let app = if use_tms { app.i18n(bundle) } else { app };` puts
+/// the call in a branch of the very expression this value comes from — that IS
+/// the app on one path, and skipping it inserts `.i18n_auto()` after the join,
+/// clearing the bundle whenever the flag selects that branch. A `.i18n(…)`
+/// inside `.layer(from_fn(|| { … }))` is applied to whatever that closure
+/// builds and sits inside the call's parentheses, so it stays out.
 fn calls_at_own_depth(region: &str, method: &str) -> bool {
     let marks = delimiter_marks(region, region.len());
     let mut marks = marks.iter().peekable();
@@ -2451,8 +2549,8 @@ fn calls_at_own_depth(region: &str, method: &str) -> bool {
                 break;
             }
             match byte {
-                b'{' | b'(' | b'[' => depth += 1,
-                b'}' | b')' | b']' => depth -= 1,
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth -= 1,
                 _ => {}
             }
             marks.next();
@@ -4046,6 +4144,86 @@ mod tests {
             "}\n",
         );
         assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::CustomBundle);
+    }
+
+    /// A bundle installed on ONE branch of a conditional initialiser still
+    /// reaches the joined value. Skipping it wires `.i18n_auto()` after the
+    /// join, which CLEARS the bundle whenever the flag selects that branch.
+    #[test]
+    fn a_bundle_installed_in_one_branch_of_an_initialiser_is_still_found() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = App::new();\n",
+            "    let app = if use_tms { app.i18n(tms_bundle()) } else { app };\n",
+            "    let app = app.routes(routes![index]);\n",
+            "}\n",
+        );
+        assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::CustomBundle);
+    }
+
+    /// And when the branches only CHOOSE between builders, each one's own
+    /// binding is followed — the bundle can be a hop further back.
+    #[test]
+    fn every_branch_of_an_initialiser_is_followed_back() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let plain = App::new();\n",
+            "    let tms = App::new().i18n(tms_bundle());\n",
+            "    let app = if use_tms { tms } else { plain };\n",
+            "    let app = app.routes(routes![index]);\n",
+            "}\n",
+        );
+        assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::CustomBundle);
+    }
+
+    /// A closure body is not a branch. `.i18n(…)` inside middleware belongs to
+    /// whatever that closure builds, and counting it would report an app as
+    /// bundled because of something buried in a `.layer(…)` argument.
+    #[test]
+    fn a_call_inside_middleware_is_not_the_apps_own_bundle() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = App::new()\n",
+            "        .layer(from_fn(|req, next| async move { other.i18n(b); next.run(req).await }))\n",
+            "        .routes(routes![index]);\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("middleware internals are not this app's bundle");
+        };
+        assert!(out.contains(".i18n_auto()"), "{out}");
+    }
+
+    /// Every production branch gets its own locale install. A `main` that
+    /// builds the app conditionally has one `embedded_static` install per
+    /// branch; serving only the first leaves the others loading from disk, so
+    /// an `--embed` deployment panics whenever it takes one of them.
+    #[test]
+    fn every_production_branch_gets_the_locale_install() {
+        let main_rs = concat!(
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "\n",
+            "fn main() {\n",
+            "    if flag {\n",
+            "        let app = App::new().routes(routes![admin]);\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "    } else {\n",
+            "        let app = App::new().routes(routes![index]);\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "    }\n",
+            "}\n",
+        );
+        let out = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
+        assert_eq!(
+            out.matches(".embedded_locales(&EMBEDDED_LOCALES)").count(),
+            2,
+            "both branches must install them:\n{out}"
+        );
+        assert_eq!(
+            ensure_embedded_locales(&out, "i18n").as_deref(),
+            Some(out.as_str()),
+            "and a re-run adds nothing"
+        );
     }
 
     /// And an assignment to a DIFFERENT name still says nothing about this
