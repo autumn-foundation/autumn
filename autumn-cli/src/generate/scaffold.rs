@@ -5015,6 +5015,35 @@ mod attachment_read_back_tests {{
         render_unique_constraints_const(plural, &unique_fields, all_fields)
     };
 
+    // Issue #1349: "has already been taken" is shown to whoever submitted the
+    // duplicate, so it is view text like any other. It cannot come from
+    // `UNIQUE_CONSTRAINTS` under `--i18n` — that is a `const`, evaluated before
+    // there is a request to have a locale — so the const keeps its (constraint,
+    // field) mapping and the MESSAGE is looked up where the changeset error is
+    // built, in a handler that holds the extractor. One shared key rather than
+    // one per field: the const's message is the same sentence for every column.
+    //
+    // Recorded only when the scaffold actually has a unique column, for the
+    // same reason as the attachment meta — an `en.ftl` key no view references
+    // fails `autumn i18n check --strict`.
+    let (unique_message_binding, unique_message_expr) = if unique_fields.is_empty() {
+        ("message", "message.to_string()".to_owned())
+    } else {
+        (
+            if labels.enabled() {
+                "_message"
+            } else {
+                "message"
+            },
+            labels.expr(
+                "common.error.taken",
+                "has already been taken",
+                "message.to_string()",
+                &[],
+            ),
+        )
+    };
+
     let create_insert_block = if !unique_fields.is_empty() {
         // Issue #1872: `{blob_cleanup}` (empty unless the scaffold has attachment
         // fields) best-effort deletes the just-saved blob(s) on both the
@@ -5025,9 +5054,9 @@ mod attachment_read_back_tests {{
              Ok(())\n    \
              }}.await;\n    \
              if let Err(err) = result {{\n        \
-             if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n            \
+             if let Some((field, {unique_message_binding})) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n            \
              let mut errors = std::collections::HashMap::new();\n            \
-             errors.insert(field.to_string(), vec![message.to_string()]);\n            \
+             errors.insert(field.to_string(), vec![{unique_message_expr}]);\n            \
              let changeset = Changeset::from_errors(changeset.into_inner(), errors);\n            \
              {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {new_form_body}).into_response());\n        \
              }}\n        \
@@ -5162,9 +5191,9 @@ mod attachment_read_back_tests {{
              let updated = match result {{\n        \
              Ok(updated) => updated,\n        \
              Err(err) => {{\n            \
-             if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n                \
+             if let Some((field, {unique_message_binding})) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n                \
              let mut errors = std::collections::HashMap::new();\n                \
-             errors.insert(field.to_string(), vec![message.to_string()]);\n                \
+             errors.insert(field.to_string(), vec![{unique_message_expr}]);\n                \
              let changeset = Changeset::from_errors(changeset.into_inner(), errors);\n                \
              {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {edit_form_body}).into_response());\n            \
              }}\n            \
@@ -23140,6 +23169,62 @@ exempt_paths = [
         assert!(
             warning.contains("transition_controls"),
             "must name the widget the author has to look at: {warning}"
+        );
+    }
+
+    /// AC7: the duplicate-value error is shown to whoever submitted the form,
+    /// so it is view text too. It cannot ride in `UNIQUE_CONSTRAINTS` — a
+    /// `const` is evaluated before any request has a locale — so the const
+    /// keeps the mapping and the message is resolved in the handler.
+    #[test]
+    fn i18n_translates_the_unique_violation_message() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String:unique".into()],
+            "20260503000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        assert!(
+            routes.contains("vec![t!(locale, \"common.error.taken\")]"),
+            "the message must be resolved per request:\n{routes}"
+        );
+        assert!(
+            ftl.contains("common.error.taken = has already been taken"),
+            "{ftl}"
+        );
+        // The const still carries the constraint -> field mapping; only the
+        // message slot stops being the thing rendered.
+        assert!(routes.contains("const UNIQUE_CONSTRAINTS"), "{routes}");
+    }
+
+    /// Without the flag the whole path is byte-for-byte as it was, including
+    /// the binding name.
+    #[test]
+    fn without_i18n_the_unique_violation_message_is_the_const_text() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String:unique".into()],
+            "20260503000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("vec![message.to_string()]"), "{routes}");
+        assert!(
+            routes.contains("if let Some((field, message)) ="),
+            "{routes}"
         );
     }
 

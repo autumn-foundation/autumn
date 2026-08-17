@@ -816,10 +816,15 @@ fn i18n_scaffold(name: &str, fields: &[&str], flags: &[&str]) -> (tempfile::Temp
 #[test]
 #[ignore = "slow: compiles a generated project — run with `cargo test -p autumn-cli -- --ignored`"]
 fn i18n_scaffold_cargo_checks() {
+    // `title:String:unique` earns its place here: a unique column routes the
+    // duplicate-value message through the bundle instead of `UNIQUE_CONSTRAINTS`
+    // (issue #1349), which rebinds the `unique_violation_field` destructuring in
+    // both the create and update handlers. Nothing but a real compile proves
+    // those two still typecheck.
     let (_tmp, project) = i18n_scaffold(
         "i18n-check",
         &[
-            "title:String",
+            "title:String:unique",
             "body:Text",
             "published:bool",
             "views:i64",

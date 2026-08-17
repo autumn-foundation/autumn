@@ -411,15 +411,19 @@ fn remove_i18n_keys(
     excluding: &[PathBuf],
     overrides: &HashMap<PathBuf, String>,
 ) -> String {
-    let surviving_chrome = referenced_common_keys(
-        &project_root.join("src").join("routes"),
-        excluding,
-        overrides,
-    );
+    // The WHOLE source tree, not just `src/routes`. Chrome keys are ordinary
+    // Fluent keys once written, and nothing stops application code reusing
+    // them — a `t!(locale, "common.save")` in `src/components/navigation.rs` is
+    // exactly the sort of thing a project does. Scanning only the routes
+    // directory would call such a key unused when the last scaffold is
+    // destroyed, prune it, and break the surviving call at COMPILE time, which
+    // is the one failure mode this set exists to prevent. `autumn i18n check`
+    // reads the whole tree for the same reason.
+    let surviving_chrome = referenced_common_keys(&project_root.join("src"), excluding, overrides);
     super::scaffold_i18n::remove_en_ftl_keys(content, pascal, snake, &surviving_chrome)
 }
 
-/// Every `common.*` key still looked up by a surviving route module.
+/// Every `common.*` key still looked up by surviving source in `dir`.
 ///
 /// The SET, not a yes/no: chrome keys are per-surface, so a resource can be the
 /// only user of some of them. Destroying a `--soft-delete` resource while a
@@ -1822,6 +1826,35 @@ mod tests {
             let f = t!(other_locale, "common.nope");
         "#;
         assert!(t_macro_keys(src).is_empty(), "{:?}", t_macro_keys(src));
+    }
+
+    /// Chrome keys are ordinary keys once written, and application code outside
+    /// `src/routes` may well reuse them. Pruning one that a surviving
+    /// `src/components/…` still calls breaks the build, because `t!` validates
+    /// key existence at compile time.
+    #[test]
+    fn chrome_survives_when_only_non_route_source_still_uses_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("routes")).unwrap();
+        std::fs::create_dir_all(src.join("components")).unwrap();
+        // The only surviving caller of `common.save` lives outside `routes/`.
+        std::fs::write(
+            src.join("components").join("navigation.rs"),
+            "fn nav(locale: &Locale) -> Markup { html! { (t!(locale, \"common.save\")) } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("routes").join("posts.rs"),
+            "fn show(locale: &Locale) -> Markup { html! { (t!(locale, \"post.new\")) } }\n",
+        )
+        .unwrap();
+
+        let found = referenced_common_keys(&src, &[], &HashMap::new());
+        assert!(
+            found.contains("common.save"),
+            "a non-route caller keeps the key alive: {found:?}"
+        );
     }
 
     /// A lookup that is not CODE is not a lookup. Counting one keeps a key
