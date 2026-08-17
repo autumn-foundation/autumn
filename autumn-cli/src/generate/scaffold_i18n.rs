@@ -1018,8 +1018,27 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
     // deployment without the sidecar directory falls through to `.i18n_auto()`
     // and panics, having been told embedding was configured. Both halves are
     // required before this is treated as done, and a missing half is added.
-    let installed_in_production =
-        method_call_offsets(main_rs, ".embedded_locales").any(|at| !in_cfg_test(main_rs, at));
+    // Scoped to the function the PRODUCTION builder lives in, not merely to
+    // "outside `cfg(test)`". A preview or helper builder is ordinary
+    // non-test code, and one of those installing the locales says nothing
+    // about the chain the binary runs: treating it as done leaves production
+    // falling through to `.i18n_auto()`, so an `--embed` deployment without the
+    // sidecar directory panics with the static sitting unused in the binary.
+    let production_scopes: Vec<(usize, usize)> = production_routes_anchors(main_rs)
+        .into_iter()
+        .filter_map(|at| enclosing_body(main_rs, at))
+        .collect();
+    let installed_in_production = method_call_offsets(main_rs, ".embedded_locales").any(|at| {
+        if production_scopes.is_empty() {
+            // No identifiable production builder — fall back to the coarser
+            // question rather than claiming nothing is installed.
+            !in_cfg_test(main_rs, at)
+        } else {
+            production_scopes
+                .iter()
+                .any(|&(open, close)| open < at && at < close)
+        }
+    });
 
     if embedded_in_production {
         // Already embedded — but not necessarily from the right place. A
@@ -1604,6 +1623,21 @@ pub(super) enum I18nAutoWiring {
     /// The caller surfaces this as a plan warning rather than writing the call
     /// into a comment, where it would silently never run.
     NoAnchor,
+}
+
+/// The body braces of the innermost `fn` containing `at`.
+///
+/// Used where the question really is per-FUNCTION rather than per-chain: the
+/// locale install is a statement of its own (`let app =
+/// app.embedded_locales(&…);`), not a link in the builder chain, so "is this
+/// production?" is answered by which function it sits in.
+fn enclosing_body(src: &str, at: usize) -> Option<(usize, usize)> {
+    real_offsets(src, "fn ")
+        .into_iter()
+        .filter(|&fn_at| fn_at < at)
+        .filter_map(|fn_at| brace_block(src, fn_at))
+        .filter(|&(open, close)| open < at && at < close)
+        .max_by_key(|&(open, _)| open)
 }
 
 /// The `.routes(` calls belonging to builders the BINARY runs, or empty when
@@ -2832,6 +2866,34 @@ mod tests {
             out.matches("embedded_locales").count(),
             embedded.matches("embedded_locales").count(),
             "a spaced install must not be duplicated:\n{out}"
+        );
+    }
+
+    /// A preview helper is ordinary non-test code, so "outside `cfg(test)`" is
+    /// not the same question as "production". One of those installing the
+    /// locales says nothing about the chain the binary runs.
+    #[test]
+    fn an_install_in_a_helper_does_not_count_as_production() {
+        let main_rs = concat!(
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "#[cfg(feature = \"embed-assets\")]\n",
+            "static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();\n",
+            "\n",
+            "fn preview() -> App {\n",
+            "    let app = App::new().routes(routes![preview]);\n",
+            "    let app = app.embedded_locales(&EMBEDDED_LOCALES);\n",
+            "    app\n",
+            "}\n",
+            "\n",
+            "fn main() {\n",
+            "    let app = App::new().routes(routes![index]);\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "}\n",
+        );
+        let out = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
+        assert!(
+            out.matches(".embedded_locales(&EMBEDDED_LOCALES)").count() >= 2,
+            "production must get its own install, not inherit the helper's:\n{out}"
         );
     }
 
