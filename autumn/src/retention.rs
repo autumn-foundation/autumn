@@ -52,7 +52,18 @@ type DryRunFn =
 #[doc(hidden)]
 pub struct RetentionSweepDescriptor {
     /// The model name the policy is declared on (matched by `--model`).
+    ///
+    /// Not globally unique — two modules can declare same-named models
+    /// (`auth::Session`, `admin::Session`), each with its own policy. Prefer
+    /// [`table_name`](Self::table_name) to disambiguate; see
+    /// [`run_retention_dry_run`].
     pub model_name: &'static str,
+    /// The table the policy's model is backed by — schema-unique, unlike
+    /// `model_name`, and identical to the table-qualified component of the
+    /// generated task name (`retention-sweep-<table_name>`). Also matched by
+    /// `--model`, so a caller can pass this to disambiguate two models that
+    /// share a short name.
+    pub table_name: &'static str,
     /// Builds the recurring [`TaskInfo`] the scheduler registers.
     pub task_info: fn() -> TaskInfo,
     /// Counts (never deletes) the rows the policy would sweep.
@@ -86,35 +97,49 @@ pub fn has_retention_descriptors() -> bool {
 /// Run every registered policy's dry-run count, optionally filtered to one
 /// model. Never deletes anything — see [`RetentionSweepReport::dry_run`].
 ///
+/// `model_filter` matches against either `model_name` or `table_name`. Two
+/// different modules can declare same-named models (`auth::Session`,
+/// `admin::Session`), each with its own policy, so a `model_name` match is
+/// not necessarily unique — pass the table name instead (from the generated
+/// task name, `retention-sweep-<table_name>`) to disambiguate; an ambiguous
+/// `model_name` filter errors rather than silently running every match.
+///
 /// Reports are sorted by model name so `autumn retention --dry-run` prints a
 /// stable order.
 ///
 /// # Errors
 ///
-/// Returns the first policy's error (e.g. no database pool configured), or a
-/// not-found error when `model_filter` names a model with no registered
-/// policy.
+/// Returns the first policy's error (e.g. no database pool configured), a
+/// not-found error when `model_filter` names nothing registered, or a
+/// bad-request error when `model_filter` matches more than one policy.
 pub async fn run_retention_dry_run(
     state: &AppState,
     model_filter: Option<&str>,
 ) -> AutumnResult<Vec<RetentionSweepReport>> {
     let mut reports = Vec::new();
-    let mut matched = false;
-    for descriptor in inventory::iter::<RetentionSweepDescriptor> {
-        if let Some(filter) = model_filter
-            && descriptor.model_name != filter
-        {
-            continue;
+    if let Some(filter) = model_filter {
+        let matches: Vec<&RetentionSweepDescriptor> = inventory::iter::<RetentionSweepDescriptor>
+            .into_iter()
+            .filter(|descriptor| descriptor.model_name == filter || descriptor.table_name == filter)
+            .collect();
+        if matches.is_empty() {
+            return Err(crate::AutumnError::not_found_msg(format!(
+                "no #[repository(..., retention(...))] policy is registered for model {filter:?}"
+            )));
         }
-        matched = true;
-        reports.push((descriptor.dry_run)(state.clone()).await?);
-    }
-    if let Some(filter) = model_filter
-        && !matched
-    {
-        return Err(crate::AutumnError::not_found_msg(format!(
-            "no #[repository(..., retention(...))] policy is registered for model {filter:?}"
-        )));
+        if matches.len() > 1 {
+            let table_names: Vec<&str> = matches.iter().map(|d| d.table_name).collect();
+            return Err(crate::AutumnError::bad_request_msg(format!(
+                "{filter:?} matches more than one retention policy ({table_names:?}); pass the \
+                 table name instead of the model name to disambiguate, e.g. --model {}",
+                table_names[0]
+            )));
+        }
+        reports.push((matches[0].dry_run)(state.clone()).await?);
+    } else {
+        for descriptor in inventory::iter::<RetentionSweepDescriptor> {
+            reports.push((descriptor.dry_run)(state.clone()).await?);
+        }
     }
     reports.sort_by(|a, b| a.model.cmp(&b.model));
     Ok(reports)
@@ -206,6 +231,7 @@ mod tests {
         inventory::submit! {
             RetentionSweepDescriptor {
                 model_name: "__RetentionRuntimeTestWidget",
+                table_name: "__retention_runtime_test_widgets",
                 task_info: sample_task_info,
                 dry_run: sample_dry_run,
             }
@@ -220,6 +246,67 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].model, "Widget");
         assert!(reports[0].dry_run);
+    }
+
+    #[tokio::test]
+    async fn run_retention_dry_run_filters_by_table_name() {
+        struct Fixture;
+        inventory::submit! {
+            RetentionSweepDescriptor {
+                model_name: "__RetentionRuntimeTestWidgetByTable",
+                table_name: "__retention_runtime_test_widgets_by_table",
+                task_info: sample_task_info,
+                dry_run: sample_dry_run,
+            }
+        }
+        let _ = Fixture;
+
+        let state = AppState::for_test();
+        let reports =
+            run_retention_dry_run(&state, Some("__retention_runtime_test_widgets_by_table"))
+                .await
+                .expect("dry run should succeed when filtering by table name");
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].model, "Widget");
+    }
+
+    #[tokio::test]
+    async fn run_retention_dry_run_rejects_ambiguous_model_filter() {
+        struct FixtureA;
+        struct FixtureB;
+        inventory::submit! {
+            RetentionSweepDescriptor {
+                model_name: "__RetentionRuntimeAmbiguousWidget",
+                table_name: "__retention_runtime_ambiguous_widgets_a",
+                task_info: sample_task_info,
+                dry_run: sample_dry_run,
+            }
+        }
+        inventory::submit! {
+            RetentionSweepDescriptor {
+                model_name: "__RetentionRuntimeAmbiguousWidget",
+                table_name: "__retention_runtime_ambiguous_widgets_b",
+                task_info: sample_task_info,
+                dry_run: sample_dry_run,
+            }
+        }
+        let _ = (FixtureA, FixtureB);
+
+        let state = AppState::for_test();
+        let error = run_retention_dry_run(&state, Some("__RetentionRuntimeAmbiguousWidget"))
+            .await
+            .expect_err("two policies sharing a model name must be rejected as ambiguous");
+
+        assert!(
+            error
+                .to_string()
+                .contains("__retention_runtime_ambiguous_widgets_a")
+                || error
+                    .to_string()
+                    .contains("__retention_runtime_ambiguous_widgets_b"),
+            "error should name the disambiguating table names: {error}"
+        );
     }
 
     #[tokio::test]

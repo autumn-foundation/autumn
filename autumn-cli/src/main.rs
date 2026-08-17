@@ -679,7 +679,10 @@ enum Commands {
         /// required — there is no separate command to trigger a real sweep.
         #[arg(long)]
         dry_run: bool,
-        /// Narrow the report to a single model's policy.
+        /// Narrow the report to a single model's policy. Accepts either the
+        /// model name or the table name; if two different modules declare
+        /// same-named models with their own policy, the model name is
+        /// ambiguous and the table name is required instead.
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
     },

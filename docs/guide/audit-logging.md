@@ -187,11 +187,16 @@ and how long you keep them:
 - **JSONL file** → each line is a self-describing JSON object, so `jq`, `grep`,
   or bulk-loading into a warehouse all work; rotate/retain the file with your
   normal log-rotation tooling.
-- **Custom DB sink** → query with SQL and enforce retention by declaring
+- **Custom DB sink** → query with SQL. Keep audit rows immutable by default:
+  grant the app `INSERT`-only on the audit table, and never `UPDATE`/`DELETE`
+  an existing event from request-handling code. If you also want automatic
+  retention instead of hand-writing a scheduled purge job, declare
   `retention(after = "...", basis = created_at)` on the audit table's
   `#[repository(...)]` — see [Data-Retention Sweeps](retention-sweeps.md) —
-  rather than hand-writing a scheduled purge job. Keep audit rows immutable:
-  grant the app `INSERT`-only, and never `UPDATE`/`DELETE` an existing event.
+  but know that the sweep runs with the app's own DB credentials, so this
+  requires granting that role `DELETE` (and `UPDATE`, if the repository is
+  also `soft_delete`) on that one table. Everything else stays `INSERT`-only;
+  only the generated sweep gets the extra grant.
 
 Audit logging answers *who did what*. It is a natural foundation for adjacent
 compliance features such as GDPR data export and right-to-erasure workflows —

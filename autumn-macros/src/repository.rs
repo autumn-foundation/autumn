@@ -650,6 +650,16 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                  a larger value wraps to a negative LIMIT and every sweep query fails",
             ));
         }
+        if versioned {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support versioned = true yet: the sweep mutates rows \
+                 directly and does not run the version-history-writing delete path \
+                 delete_by_id/delete_many use, so a swept row would disappear with no audit \
+                 record. Remove `versioned = true`, or call delete_many(ids)/delete_by_id(id) \
+                 yourself from a hand-written #[scheduled] sweep for now",
+            ));
+        }
     }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
     let generated_internal_hooks = false;
@@ -11698,6 +11708,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::autumn_web::reexports::inventory::submit! {
                 ::autumn_web::retention::RetentionSweepDescriptor {
                     model_name: stringify!(#model_name),
+                    table_name: #table_name,
                     task_info: #pg_name::__autumn_retention_task_info,
                     dry_run: #pg_name::__autumn_retention_dry_run,
                 }
@@ -22196,6 +22207,25 @@ mod tests {
         assert!(
             error.to_string().contains("sharded"),
             "retention + sharded must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_versioned() {
+        // Regression (#1342 review round 4): the sweep mutates rows
+        // directly and does not run the version-history-writing delete
+        // path delete_by_id/delete_many use, so a swept row would vanish
+        // with no audit record. Reject rather than silently drop history.
+        let tokens: proc_macro2::TokenStream =
+            "Post, versioned = true, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + versioned = true must be rejected");
+        };
+        assert!(
+            error.to_string().contains("versioned"),
+            "retention + versioned = true must be rejected: {error}"
         );
     }
 
