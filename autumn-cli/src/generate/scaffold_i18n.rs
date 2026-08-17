@@ -381,31 +381,37 @@ fn reconcile_block(
         .collect();
 
     let mut body = String::new();
-    let mut kept: Vec<&str> = Vec::new();
+    let mut keeping_continuations = false;
     for line in existing[body_start..end].lines() {
-        let Some((raw_key, _)) = line.split_once('=') else {
-            // A comment or blank line inside the block — keep it where it is.
-            body.push_str(line);
-            body.push('\n');
-            continue;
-        };
-        let key = raw_key.trim();
+        // INDENTATION decides first, before any `=` split. A Fluent
+        // continuation is just indented text and usually contains no `=` at
+        // all (`    and a second line`), so testing for `=` first would file it
+        // as a comment and keep it even when its key is being dropped —
+        // producing exactly the orphan this reconciliation exists to avoid:
+        // the loader either rejects it or silently glues it onto the message
+        // above.
         if line.starts_with(' ') || line.starts_with('\t') {
-            // A continuation of the value above; it travels with its key, which
-            // was either kept (so this belongs) or dropped (so this goes too).
-            if kept.last().is_some() {
+            if keeping_continuations {
                 body.push_str(line);
                 body.push('\n');
             }
             continue;
         }
-        if wanted.contains_key(key) {
-            kept.push(key);
+        let Some((raw_key, _)) = line.split_once('=') else {
+            // A comment or blank line at the block's own indentation — keep it
+            // where the translator put it. It ends the previous key's value.
+            keeping_continuations = false;
+            body.push_str(line);
+            body.push('\n');
+            continue;
+        };
+        if wanted.contains_key(raw_key.trim()) {
+            keeping_continuations = true;
             body.push_str(line);
             body.push('\n');
         } else {
             // Dropped: its continuation lines go with it.
-            kept.clear();
+            keeping_continuations = false;
         }
     }
     let present: std::collections::BTreeSet<&str> = existing[body_start..end]
@@ -747,12 +753,6 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
     const STATIC_ANCHOR: &str =
         "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();";
     const INSTALL_ANCHOR: &str = "    let app = app.embedded_static(&EMBEDDED_STATIC);\n";
-    if main_rs.contains("EMBEDDED_LOCALES") {
-        return Some(main_rs.to_owned());
-    }
-    if !main_rs.contains(STATIC_ANCHOR) || !main_rs.contains(INSTALL_ANCHOR) {
-        return None;
-    }
     // `embed_locales!()` defaults to `i18n/`; a configured directory is passed
     // through as the macro's literal argument.
     let macro_call = if dir == "i18n" {
@@ -760,6 +760,29 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
     } else {
         format!("autumn_web::embed_locales!(\"{dir}\")")
     };
+    if main_rs.contains("EMBEDDED_LOCALES") {
+        // Already embedded — but not necessarily from the right place. A
+        // project that changed `[i18n] dir` after its first `--i18n` scaffold
+        // keeps embedding the OLD directory while the keys, the Docker `COPY`,
+        // and the runtime load all move to the new one, so an `--embed` build
+        // ships a bundle the app never reads. Repoint it.
+        if main_rs.contains(&macro_call) {
+            return Some(main_rs.to_owned());
+        }
+        let Some(call_at) = main_rs.find("autumn_web::embed_locales!") else {
+            // Someone hand-rolled the static; leave it entirely alone.
+            return Some(main_rs.to_owned());
+        };
+        let end = main_rs[call_at..].find(';')? + call_at;
+        return Some(format!(
+            "{}{macro_call}{}",
+            &main_rs[..call_at],
+            &main_rs[end..]
+        ));
+    }
+    if !main_rs.contains(STATIC_ANCHOR) || !main_rs.contains(INSTALL_ANCHOR) {
+        return None;
+    }
     let with_static = main_rs.replacen(
         STATIC_ANCHOR,
         &format!(
@@ -1611,6 +1634,69 @@ mod tests {
             ),
             after
         );
+    }
+
+    /// A Fluent continuation is just indented text and usually carries no `=`.
+    /// Keeping one whose key was pruned orphans it — the loader either rejects
+    /// the bundle (a startup panic, via `.i18n_auto()`) or glues the text onto
+    /// the message above, rewriting an unrelated translation.
+    #[test]
+    fn regeneration_drops_continuation_lines_with_their_pruned_key() {
+        let before = merge_en_ftl(
+            "",
+            "Post",
+            "post",
+            &keys(&[("post.new", "New Post"), ("post.field.body", "Body")]),
+        );
+        // A wrapped value with NO `=` in the continuation, and a kept key that
+        // also wraps — the first must go, the second must stay whole.
+        let edited = before
+            .replace(
+                "post.field.body = Body\n",
+                "post.field.body = Body\n    spilling over onto a second line\n",
+            )
+            .replace(
+                "post.new = New Post\n",
+                "post.new = New Post\n    also wrapped\n",
+            );
+        let after = merge_en_ftl(&edited, "Post", "post", &keys(&[("post.new", "New Post")]));
+        assert!(!after.contains("post.field.body"), "{after}");
+        assert!(
+            !after.contains("spilling over"),
+            "the pruned key's continuation must go with it:\n{after}"
+        );
+        assert!(
+            after.contains("also wrapped"),
+            "a surviving key keeps its own continuation:\n{after}"
+        );
+    }
+
+    #[test]
+    fn an_existing_embed_is_repointed_when_the_bundle_directory_changes() {
+        let main_rs = concat!(
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "fn main() {\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "}\n",
+        );
+        let embedded = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
+        // The project later moves its bundles; the embed has to follow, or an
+        // `--embed` build ships a directory the app no longer reads.
+        let moved = ensure_embedded_locales(&embedded, "translations").expect("already embedded");
+        assert!(
+            moved.contains("embed_locales!(\"translations\")"),
+            "{moved}"
+        );
+        assert!(!moved.contains("embed_locales!()"), "{moved}");
+        assert_eq!(
+            moved.matches("EMBEDDED_LOCALES").count(),
+            2,
+            "repointing must not duplicate the wiring:\n{moved}"
+        );
+        // …and moving back works too, without stacking arguments.
+        let back = ensure_embedded_locales(&moved, "i18n").expect("already embedded");
+        assert!(back.contains("embed_locales!()"), "{back}");
+        assert!(!back.contains("translations"), "{back}");
     }
 
     #[test]
