@@ -5392,6 +5392,7 @@ impl AppBuilder {
     #[cfg(feature = "db")]
     async fn run_retention_dry_run_mode(self) {
         let Self {
+            tasks,
             migrations,
             config_loader_factory,
             telemetry_provider,
@@ -5413,16 +5414,33 @@ impl AppBuilder {
         // check here reads only the compile-time-registered descriptor set.
         // A real database only gets touched once we know a policy actually
         // needs to be counted.
-        match crate::retention::resolve_retention_descriptors(model_filter.as_deref()) {
-            Ok(descriptors) if descriptors.is_empty() => {
-                println!("{RETENTION_DRY_RUN_JSON_PREFIX}[]");
-                std::process::exit(0);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("retention dry-run: {error}");
-                std::process::exit(1);
-            }
+        let descriptors =
+            match crate::retention::resolve_retention_descriptors(model_filter.as_deref()) {
+                Ok(descriptors) => descriptors,
+                Err(error) => {
+                    eprintln!("retention dry-run: {error}");
+                    std::process::exit(1);
+                }
+            };
+
+        // Regression (#1342 review round 18): resolve_retention_descriptors
+        // only validates collisions AMONG retention-generated task names
+        // (round 15's fix) — it has no visibility into hand-declared
+        // tasks![...] entries, which real boot merges in and validates via
+        // validate_unique_scheduled_task_names (round 12's fix). Without
+        // this, a dry run could report success for a policy whose
+        // generated name collides with a hand-declared task, even though
+        // real boot panics on exactly that collision. `tasks` is carried
+        // into this mode (destructured above) instead of discarded via `..`
+        // specifically so this check can run.
+        if let Err(error) = merge_and_validate_task_names(&descriptors, tasks) {
+            eprintln!("retention dry-run: {error}");
+            std::process::exit(1);
+        }
+
+        if descriptors.is_empty() {
+            println!("{RETENTION_DRY_RUN_JSON_PREFIX}[]");
+            std::process::exit(0);
         }
 
         let (config, _telemetry_guard) = load_config_and_telemetry(
@@ -6262,6 +6280,29 @@ fn retention_dry_run_model_filter_from_env() -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+/// Combines `descriptors`' generated task names with `tasks` (hand-declared
+/// via `tasks![...]`) and checks the merged set for a collision — the same
+/// merge-then-validate step real boot performs (`tasks.extend(...)` followed
+/// by `validate_unique_scheduled_task_names`, in `AppBuilder::build`) before
+/// ever spawning a scheduler loop.
+///
+/// A free function (rather than inlined into `run_retention_dry_run_mode`)
+/// so the collision case is unit-testable against synthetic descriptors and
+/// tasks without booting an `AppBuilder` or touching the process-global
+/// `inventory` registry (#1342 review round 18).
+#[cfg(feature = "db")]
+fn merge_and_validate_task_names(
+    descriptors: &[&crate::retention::RetentionSweepDescriptor],
+    tasks: Vec<crate::task::TaskInfo>,
+) -> Result<(), String> {
+    let mut merged: Vec<crate::task::TaskInfo> = descriptors
+        .iter()
+        .map(|descriptor| (descriptor.task_info)())
+        .collect();
+    merged.extend(tasks);
+    crate::task::validate_unique_scheduled_task_names(&merged)
 }
 
 /// Whether `AUTUMN_REPLAY_CAPSULE=<path>` requests the capsule-replay one-shot:
@@ -10628,6 +10669,112 @@ mod tests {
         temp_env::with_var("AUTUMN_RETENTION_MODEL", None::<&str>, || {
             assert_eq!(retention_dry_run_model_filter_from_env(), None);
         });
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn merge_and_validate_task_names_rejects_collision_with_hand_declared_task() {
+        // Regression (#1342 review round 18): resolve_retention_descriptors
+        // only validates collisions among retention-generated task names —
+        // it has no visibility into hand-declared tasks![...] entries, which
+        // real boot merges in via AppBuilder::build's tasks.extend(...) +
+        // validate_unique_scheduled_task_names (round 12). Without this
+        // check, a dry run could report success for a policy whose
+        // generated name collides with a hand-declared task, even though
+        // real boot panics on the exact same collision.
+        fn dry_run_stub(
+            _state: AppState,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = crate::AutumnResult<crate::retention::RetentionSweepReport>,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::retention::RetentionSweepReport {
+                    model: "Widget".to_string(),
+                    table: "widgets".to_string(),
+                    rows_swept: 0,
+                    duration_ms: 0,
+                    dry_run: true,
+                })
+            })
+        }
+        fn task_info_stub() -> crate::task::TaskInfo {
+            crate::task::TaskInfo {
+                name: "retention-sweep-widgets".to_string(),
+                schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(3600)),
+                coordination: crate::task::TaskCoordination::Fleet,
+                handler: |_state| Box::pin(async { Ok(()) }),
+            }
+        }
+        let descriptor = crate::retention::RetentionSweepDescriptor {
+            model_name: "Widget",
+            table_name: "widgets",
+            task_info: task_info_stub,
+            dry_run: dry_run_stub,
+        };
+        let hand_declared_collision = crate::task::TaskInfo {
+            name: "retention-sweep-widgets".to_string(),
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(60)),
+            coordination: crate::task::TaskCoordination::PerReplica,
+            handler: |_state| Box::pin(async { Ok(()) }),
+        };
+
+        let error = merge_and_validate_task_names(&[&descriptor], vec![hand_declared_collision])
+            .expect_err("a hand-declared task colliding with a generated task name must error");
+
+        assert!(
+            error.contains("retention-sweep-widgets"),
+            "the error must name the colliding task: {error}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn merge_and_validate_task_names_accepts_distinct_names() {
+        fn dry_run_stub(
+            _state: AppState,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = crate::AutumnResult<crate::retention::RetentionSweepReport>,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::retention::RetentionSweepReport {
+                    model: "Widget".to_string(),
+                    table: "widgets".to_string(),
+                    rows_swept: 0,
+                    duration_ms: 0,
+                    dry_run: true,
+                })
+            })
+        }
+        fn task_info_stub() -> crate::task::TaskInfo {
+            crate::task::TaskInfo {
+                name: "retention-sweep-widgets".to_string(),
+                schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(3600)),
+                coordination: crate::task::TaskCoordination::Fleet,
+                handler: |_state| Box::pin(async { Ok(()) }),
+            }
+        }
+        let descriptor = crate::retention::RetentionSweepDescriptor {
+            model_name: "Widget",
+            table_name: "widgets",
+            task_info: task_info_stub,
+            dry_run: dry_run_stub,
+        };
+        let unrelated_task = crate::task::TaskInfo {
+            name: "nightly-report".to_string(),
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(60)),
+            coordination: crate::task::TaskCoordination::PerReplica,
+            handler: |_state| Box::pin(async { Ok(()) }),
+        };
+
+        assert!(merge_and_validate_task_names(&[&descriptor], vec![unrelated_task]).is_ok());
     }
 
     #[test]
