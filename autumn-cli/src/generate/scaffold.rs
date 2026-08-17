@@ -1412,6 +1412,33 @@ fn plan_scaffold_with_options_impl(
                 ));
             }
 
+            // Validation MESSAGES are a third surface the flag cannot reach.
+            // `#[validate(...)]` carries an optional `message`, but the
+            // `validator` crate takes it as a compile-time literal, so it can
+            // never hold a runtime `t!` lookup; with no message, autumn-web's
+            // `collect_errors` renders `validation failed: <code>`. Either way
+            // the inline error under a rejected field is English while its
+            // label is translated.
+            //
+            // Reaching it means the handler mapping error CODES to lookups
+            // before building the changeset — and `into_changeset` flattens
+            // the codes away inside autumn-web, so that needs a public seam
+            // there (a code-to-message resolver), the same kind of framework
+            // API the two widgets above want. Emitting the mapping into every
+            // generated handler instead would duplicate `collect_errors`'
+            // nested/list recursion in template strings, which is worse than
+            // saying so.
+            if metadata.has_validator_rules() {
+                plan.warn(
+                    "`--i18n` translated this view's labels, but the inline messages from \
+                     `#[validate(...)]` stay English — the `validator` attribute takes a \
+                     compile-time literal, so a runtime lookup cannot go there, and an \
+                     unmessaged rule renders as `validation failed: <code>`. Translating them \
+                     needs a code-to-message seam in autumn-web's changeset conversion."
+                        .to_owned(),
+                );
+            }
+
             // A profile overlay can repoint i18n somewhere else entirely, and
             // the runtime resolves the fully layered config — so the base
             // bundle this generator just wrote (and the `COPY` it is about to
@@ -23384,6 +23411,54 @@ exempt_paths = [
                 .any(|w| w.contains("state-transition controls")),
             "{:?}",
             without_rich_text.warnings
+        );
+    }
+
+    /// A translated field label with an English error under it is the same
+    /// half-done state the widget gaps are, and it is reached the same way:
+    /// `validator` takes `message` as a compile-time literal, so no runtime
+    /// lookup can go there, and the code-to-message mapping lives inside
+    /// autumn-web's changeset conversion.
+    #[test]
+    fn i18n_says_so_when_validation_messages_stay_english() {
+        let tmp = project_with_main(default_main());
+        let mut options = i18n_options();
+        options.model.validations = vec!["email=email".to_owned()];
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Contact",
+            &["email:String".into()],
+            "20260503000000",
+            &options,
+        )
+        .unwrap();
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("#[validate(...)]"))
+            .unwrap_or_else(|| panic!("no validation warning in {:?}", plan.warnings));
+        assert!(
+            warning.contains("validation failed: <code>"),
+            "must show what the author will actually see: {warning}"
+        );
+
+        // A scaffold with no rules has nothing to warn about.
+        let unvalidated = plan_scaffold_with_options(
+            tmp.path(),
+            "Note",
+            &["body:Text".into()],
+            "20260503000001",
+            &i18n_options(),
+        )
+        .unwrap();
+        assert!(
+            !unvalidated
+                .warnings
+                .iter()
+                .any(|w| w.contains("#[validate(...)]")),
+            "{:?}",
+            unvalidated.warnings
         );
     }
 

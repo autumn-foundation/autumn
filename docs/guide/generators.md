@@ -1263,6 +1263,15 @@ autumn generate scaffold Post title:String body:Text published:bool --i18n
   needs new autumn-web API (a label per transition edge, and per toolbar
   control). Scaffolding either column with `--i18n` warns and names it,
   rather than leaving you to find it in the browser.
+- **Validation messages stay English.** A field label translates; the
+  inline error under it after a rejected submission does not.
+  `#[validate(...)]` accepts a `message`, but `validator` takes it as a
+  compile-time literal, so a runtime lookup cannot go there — and a rule
+  with no message renders as `validation failed: <code>`. Reaching these
+  means mapping error *codes* to lookups before the changeset is built,
+  and that conversion happens inside autumn-web, so it needs a seam there
+  rather than a generator change. Scaffolding with `--validate` under
+  `--i18n` warns.
 - Each view-rendering handler takes the `Locale` extractor as its **first**
   parameter (`Locale` is a `FromRequestParts` extractor, and axum requires
   the one body-consuming argument to stay last).
