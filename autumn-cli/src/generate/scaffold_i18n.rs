@@ -1050,7 +1050,11 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
     // release binary with no bundle in it — which panics on a machine that has
     // no sidecar locale directory. Same scoping `ensure_i18n_auto` applies to
     // its own detections; it belongs here for the same reason.
-    let embedded_in_production = real_offsets(main_rs, "EMBEDDED_LOCALES")
+    // As a WHOLE identifier. A substring match reads an unrelated
+    // `ADMIN_EMBEDDED_LOCALES` as this static, reports the file as already
+    // embedded, and then hands the install below a symbol the file never
+    // declares — an `--embed` build that stops compiling on an undefined name.
+    let embedded_in_production = identifier_offsets(main_rs, "EMBEDDED_LOCALES")
         .into_iter()
         .any(|at| !in_cfg_test(main_rs, at));
     // The static ALONE is not the setup. `embed_locales!` bakes the files into
@@ -1076,20 +1080,32 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
         // keeps embedding the OLD directory while the keys, the Docker `COPY`,
         // and the runtime load all move to the new one, so an `--embed` build
         // ships a bundle the app never reads. Repoint it.
-        let pointed_at_the_right_dir = real_offsets(main_rs, &macro_call)
-            .into_iter()
-            .any(|at| !in_cfg_test(main_rs, at));
-        // No `embed_locales!` at all: someone hand-rolled the static. The macro
-        // is left alone in that case — but the install below is still checked.
-        let mut out = if !pointed_at_the_right_dir
-            && let Some(call_at) = real_offsets(main_rs, "autumn_web::embed_locales!")
-                .into_iter()
-                .find(|&at| !in_cfg_test(main_rs, at))
-        {
-            let end = main_rs[call_at..].find(';')? + call_at;
-            format!("{}{macro_call}{}", &main_rs[..call_at], &main_rs[end..])
-        } else {
-            main_rs.to_owned()
+        //
+        // Within THIS static's own item, not anywhere in the file. A `main.rs`
+        // can carry more than one embedded directory — an `ADMIN_EMBEDDED_LOCALES`
+        // beside this one is ordinary — and rewriting whichever `embed_locales!`
+        // came first repoints somebody else's bundle at this resource's
+        // directory: the admin app then ships the wrong translations, and the
+        // static this call is actually about keeps its stale directory.
+        //
+        // No declaration found (a hand-rolled or macro-generated static), or no
+        // `embed_locales!` in it: the macro is left alone, and only the install
+        // below is checked.
+        let stale_macro = locales_static_item(main_rs).and_then(|(start, end)| {
+            let item = &main_rs[start..end];
+            if !real_offsets(item, &macro_call).is_empty() {
+                return None;
+            }
+            let rel = real_offsets(item, "autumn_web::embed_locales!")
+                .first()
+                .copied()?;
+            Some((start + rel, end))
+        });
+        let mut out = match stale_macro {
+            Some((call_at, end)) => {
+                format!("{}{macro_call}{}", &main_rs[..call_at], &main_rs[end..])
+            }
+            None => main_rs.to_owned(),
         };
         if !installed_in_production {
             out = insert_locale_install(&out)?;
@@ -1554,6 +1570,52 @@ fn json_str(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// Offsets of `name` in real code where it is a WHOLE identifier, not a slice
+/// of a longer one.
+///
+/// The same token-boundary rule [`method_call_offsets`] applies to method
+/// names, for the identifiers this module looks up by name.
+fn identifier_offsets(src: &str, name: &str) -> Vec<usize> {
+    let ident_char = |c: char| c.is_alphanumeric() || c == '_';
+    real_offsets(src, name)
+        .into_iter()
+        .filter(|&at| {
+            !src[..at].chars().next_back().is_some_and(ident_char)
+                && !src[at + name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(ident_char)
+        })
+        .collect()
+}
+
+/// The production `static EMBEDDED_LOCALES … ;` declaration, as the span from
+/// its name to its terminating `;`.
+///
+/// A DECLARATION, told from a use site (`.embedded_locales(&EMBEDDED_LOCALES)`)
+/// by the `static` keyword in front of it, so the repointing above rewrites the
+/// initialiser rather than something that merely mentions the name.
+fn locales_static_item(src: &str) -> Option<(usize, usize)> {
+    identifier_offsets(src, "EMBEDDED_LOCALES")
+        .into_iter()
+        .filter(|&at| !in_cfg_test(src, at))
+        .find_map(|at| {
+            let before = src[..at].trim_end();
+            let keyword = before.strip_suffix("static")?;
+            // On an identifier boundary of its own: `mystatic EMBEDDED_LOCALES`
+            // is not a static declaration.
+            if keyword
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                return None;
+            }
+            let semi = real_offsets(&src[at..], ";").first().copied()?;
+            Some((at, at + semi))
+        })
+}
+
 /// Offsets of real-code `method` calls, tolerating whitespace and comments
 /// between the method name and its opening paren, and requiring the name to end
 /// on a token boundary so `.i18n` does not match `.i18n_auto`.
@@ -1575,19 +1637,39 @@ fn method_call_offsets<'a>(src: &'a str, method: &'a str) -> impl Iterator<Item 
 }
 
 /// Length of the run of whitespace and comments at the start of `src`.
+///
+/// Block comments NEST in Rust, and this has to agree with [`real_offsets`]
+/// about where one ends, because [`method_call_offsets`] compares the two: the
+/// first `*/` in `.i18n /* outer /* nested */ tail */ (bundle())` closes only
+/// the inner comment, and stopping there put this length short of the paren
+/// `real_offsets` reports. The two disagreed, the call was not recognised as a
+/// call, and `.i18n_auto()` went in and CLEARED the bundle that comment was
+/// sitting next to.
 pub(super) fn ignorable_prefix_len(src: &str) -> usize {
+    let bytes = src.as_bytes();
     let mut i = 0;
     loop {
         let rest = &src[i..];
         let trimmed = rest.trim_start();
         i += rest.len() - trimmed.len();
-        let rest = &src[i..];
-        if let Some(after) = rest.strip_prefix("//") {
+        if let Some(after) = src[i..].strip_prefix("//") {
             i += 2 + after.find('\n').map_or(after.len(), |nl| nl + 1);
             continue;
         }
-        if let Some(after) = rest.strip_prefix("/*") {
-            i += 2 + after.find("*/").map_or(after.len(), |end| end + 2);
+        if src[i..].starts_with("/*") {
+            let mut depth = 1usize;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             continue;
         }
         return i;
@@ -3013,6 +3095,98 @@ mod tests {
         assert!(
             out.matches(".embedded_locales(&EMBEDDED_LOCALES)").count() >= 2,
             "production must get its own install, not inherit the helper's:\n{out}"
+        );
+    }
+
+    /// `ADMIN_EMBEDDED_LOCALES` is not this static. Reading it as one reports
+    /// the file as already embedded and then installs `&EMBEDDED_LOCALES` — a
+    /// symbol nothing declares, so the `--embed` build stops compiling.
+    #[test]
+    fn a_longer_identifier_is_not_this_static() {
+        let main_rs = concat!(
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "#[cfg(feature = \"embed-assets\")]\n",
+            "static ADMIN_EMBEDDED_LOCALES: autumn_web::include_dir::Dir =\n",
+            "    autumn_web::embed_locales!(\"admin\");\n",
+            "\n",
+            "fn main() {\n",
+            "    let app = App::new().routes(routes![index]);\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "}\n",
+        );
+        let out = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
+        assert!(
+            out.contains("static EMBEDDED_LOCALES:"),
+            "this static must be declared, not assumed:\n{out}"
+        );
+        assert!(
+            out.contains("autumn_web::embed_locales!(\"admin\")"),
+            "the unrelated bundle must keep its own directory:\n{out}"
+        );
+    }
+
+    /// And when both statics exist, repointing follows the DECLARATION rather
+    /// than the file's first `embed_locales!`: rewriting the neighbour ships
+    /// the admin app this resource's translations and leaves the static this
+    /// call is about still pointing at its stale directory.
+    #[test]
+    fn only_this_statics_own_macro_is_repointed() {
+        let main_rs = concat!(
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "#[cfg(feature = \"embed-assets\")]\n",
+            "static ADMIN_EMBEDDED_LOCALES: autumn_web::include_dir::Dir =\n",
+            "    autumn_web::embed_locales!(\"admin\");\n",
+            "#[cfg(feature = \"embed-assets\")]\n",
+            "static EMBEDDED_LOCALES: autumn_web::include_dir::Dir =\n",
+            "    autumn_web::embed_locales!(\"old\");\n",
+            "\n",
+            "fn main() {\n",
+            "    let app = App::new().routes(routes![index]);\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "    let app = app.embedded_locales(&EMBEDDED_LOCALES);\n",
+            "}\n",
+        );
+        let out = ensure_embedded_locales(main_rs, "translations").expect("already embedded");
+        assert!(
+            out.contains("autumn_web::embed_locales!(\"admin\")"),
+            "the neighbour is not this static's to rewrite:\n{out}"
+        );
+        assert!(
+            out.contains("autumn_web::embed_locales!(\"translations\")"),
+            "this static must follow the configured directory:\n{out}"
+        );
+        assert!(
+            !out.contains("\"old\""),
+            "the stale directory must go:\n{out}"
+        );
+    }
+
+    /// Block comments NEST. Stopping at the first `*/` left this scan short of
+    /// the paren `real_offsets` reports; the two disagreed, the call was not
+    /// recognised as a call, and `.i18n_auto()` went in and CLEARED the bundle.
+    #[test]
+    fn ignorable_prefix_len_counts_nested_block_comments() {
+        let src = "/* outer /* nested */ tail */ (";
+        assert_eq!(&src[ignorable_prefix_len(src)..], "(");
+        // An unterminated comment swallows the rest, as `real_offsets` does.
+        let open = "/* outer /* nested */ never closed";
+        assert_eq!(ignorable_prefix_len(open), open.len());
+    }
+
+    /// The same disagreement, end to end.
+    #[test]
+    fn a_nested_block_comment_does_not_hide_a_bundle() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = App::new()\n",
+            "        .i18n /* outer /* nested */ tail */ (tms_bundle())\n",
+            "        .routes(routes![index]);\n",
+            "}\n",
+        );
+        assert_eq!(
+            ensure_i18n_auto(main_rs),
+            I18nAutoWiring::CustomBundle,
+            "the commented-through `.i18n(...)` is still a call"
         );
     }
 
