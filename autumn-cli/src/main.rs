@@ -553,6 +553,9 @@ enum Commands {
     ///
     /// `autumn seed` checks for pending migrations before running and exits 1
     /// if any are found — run `autumn migrate` first.
+    ///
+    /// A `--count`/`--model` fake-seed request against a `prod`/`production`
+    /// profile is blocked unless `--yes-i-mean-prod` is also given.
     Seed {
         /// Profile forwarded to the seed binary via `AUTUMN_ENV`
         /// (default: `dev`).
@@ -571,6 +574,11 @@ enum Commands {
         /// Model to fake rows for (e.g. `Post`). Requires --count.
         #[arg(long, requires = "count")]
         model: Option<String>,
+        /// Confirm generating faked rows (`--count`/`--model`) against a
+        /// `prod`/`production` profile. Required to bypass the production
+        /// guard; has no effect otherwise.
+        #[arg(long)]
+        yes_i_mean_prod: bool,
     },
     /// Replay a recorded failure capsule against the application.
     ///
@@ -3215,7 +3223,14 @@ fn run_command(command: Commands) {
             package,
             count,
             model,
-        } => seed::run(&profile, package.as_deref(), count, model.as_deref()),
+            yes_i_mean_prod,
+        } => seed::run(
+            &profile,
+            package.as_deref(),
+            count,
+            model.as_deref(),
+            yes_i_mean_prod,
+        ),
         Commands::Replay {
             capsule,
             package,
@@ -5675,12 +5690,36 @@ mod tests {
                 package,
                 count,
                 model,
+                yes_i_mean_prod,
             } => {
                 assert_eq!(profile, "dev");
                 assert!(package.is_none());
                 assert!(count.is_none());
                 assert!(model.is_none());
+                assert!(!yes_i_mean_prod);
             }
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn parse_seed_with_yes_i_mean_prod() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "seed",
+            "--count",
+            "200",
+            "--model",
+            "Post",
+            "--profile",
+            "prod",
+            "--yes-i-mean-prod",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Seed {
+                yes_i_mean_prod, ..
+            } => assert!(yes_i_mean_prod),
             _ => panic!("expected Seed command"),
         }
     }

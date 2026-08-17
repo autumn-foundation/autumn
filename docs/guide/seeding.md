@@ -107,7 +107,8 @@ autumn seed --profile demo
 1. **Checks that `src/bin/seed.rs` exists.** If it does not, you get a clear
    error:
    ```
-   ✗ no seed binary found; create `src/bin/seed.rs` or run `autumn generate seed`
+   ✗ no seed binary found; create `src/bin/seed.rs`
+   See: https://autumn.rs/guide/seeding
    ```
 
 2. **Checks for pending migrations** (when the `diesel` CLI is available).
@@ -209,13 +210,112 @@ autumn migrate && autumn seed && autumn dev
 
 ---
 
+## Faking realistic volume data
+
+Hand-writing a few fixture rows is fine for a handful of records, but list
+views — pagination, full-text search, sort/filter, CSV export — need
+hundreds of *varied* rows before you can tell whether they actually work.
+Every `#[autumn_web::model]` gets a generated `{Model}Factory` whose
+`.fake()` fills any field you didn't explicitly set with realistic data
+inferred from the field's name and type (an `email` field gets a fake email,
+a `title` gets fake words, a `created_at` gets a recent timestamp, and so
+on).
+
+### One-line faked seed
+
+```rust
+use autumn_web::seed::SeedContext;
+
+#[autumn_web::main]
+async fn main() {
+    let ctx = SeedContext::build().expect("seed context");
+
+    // 200 faked posts, each with distinct fake title/body — enough to
+    // exercise pagination and search.
+    Post::factory().fake().create_many(200, ctx.pool()).await;
+}
+```
+
+`.fake()` never overwrites a field you set explicitly:
+
+```rust
+// `title` stays fixed; every other field is faked.
+Post::factory().title("Pinned announcement").fake().create(&pool).await;
+```
+
+Other factory methods that pair with `.fake()`:
+
+| Method | Description |
+|--------|-------------|
+| `.fake()` / `.fake_all()` | Fill every unset field with a fake value (aliases of each other). |
+| `.build()` | Construct one in-memory instance without persisting it. |
+| `.build_many(n)` | Construct `n` in-memory instances, each faked independently. |
+| `.create(&pool)` | Persist one instance. |
+| `.create_many(n, &pool)` | Persist `n` instances, returning `Vec<Model>`. |
+
+See `examples/bookmarks/src/bin/seed.rs` and its
+[README](../../examples/bookmarks/README.md#seeding-fake-data) for a
+complete working example that populates 200 rows this way.
+
+### The `fake` module directly
+
+`autumn_web::fake` also works standalone, outside a factory, when you want a
+realistic value for one field: `fake::name()`, `fake::username()`,
+`fake::email()`, `fake::word()` / `fake::words(n)` / `fake::sentence()` /
+`fake::paragraph()`, `fake::url()`, `fake::boolean()`,
+`fake::int_range(lo, hi)`, `fake::decimal()`, `fake::recent_datetime()`, and
+`fake::uuid()`.
+
+### Reproducible fake data
+
+Set `AUTUMN_FAKE_SEED` to a `u64` to make every `fake::*` call and every
+`.fake()`-driven factory deterministic — the same sequence of calls always
+produces the same values, which keeps golden-data tests and CI fixtures
+reproducible:
+
+```sh
+AUTUMN_FAKE_SEED=42 autumn seed --count 200 --model Post
+```
+
+Without `AUTUMN_FAKE_SEED` set, output varies from run to run. Tests can
+call `autumn_web::fake::reseed(seed)` directly instead of setting the env
+var.
+
+### Generating rows without editing `src/bin/seed.rs`
+
+`autumn seed --count N --model M` drives a registered model's factory
+directly — generate and insert `N` faked rows for model `M` without touching
+your seed binary at all:
+
+```sh
+autumn seed --count 200 --model Post
+```
+
+`--count` and `--model` must be passed together; passing neither preserves
+the default behavior described above (run `src/bin/seed.rs`). Every
+`#[autumn_web::model]` registers itself automatically, so any scaffolded
+model is reachable this way as soon as it exists — projects generated with
+`autumn new --with-seed` (or a model added via `autumn generate scaffold`)
+already wire their `src/bin/seed.rs` to handle this request via
+`autumn_web::seed::maybe_fake_seed`, so `--count`/`--model` work out of the
+box with no manual edits.
+
+---
+
 ## Out of scope
 
 - **Test fixtures** — use `autumn_web::test` helpers for integration test data.
 - **YAML/JSON/CSV loaders** — author a thin loader inside your seed binary if
   you want declarative fixtures.
-- **Faker / factory libraries** — compose with `fake`, `proptest`, `rand`, or
-  whatever you prefer; Autumn owns the runner, not the data generation.
+- **Relationship-aware faking** — `.fake()` fills scalar fields on a single
+  model; it does not know which rows exist in a parent table, so a foreign-key
+  field left unset gets a plain fake integer (or stays at `Default::default()`
+  without `.fake()`) rather than a valid parent id — either way, inserting
+  without addressing the FK will fail. For a model with a foreign key, either
+  set that field explicitly (`.user_id(id)`) or mark it `#[factory_assoc(Type)]`
+  in the `#[model]` definition so the factory creates (or accepts) a parent
+  automatically; see the `#[factory_assoc]` docs for the associated-model
+  factory pattern.
 - **`autumn generate seed`** — tracked in #493 follow-up work.
 
 ---

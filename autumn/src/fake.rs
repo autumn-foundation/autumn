@@ -15,6 +15,14 @@
 //!   reproducible fixtures. In this mode time-based helpers such as
 //!   [`recent_datetime`](crate::fake::recent_datetime) anchor to a fixed base instant rather than the wall
 //!   clock, so even timestamps are reproducible.
+//!
+//!   `AUTUMN_FAKE_SEED` is read exactly once, on the first `fake::*` call in
+//!   the process (the RNG lives behind a [`OnceLock`](std::sync::OnceLock)) — setting or changing
+//!   it later in the same process has no effect. This is transparent for the
+//!   `autumn` CLI (always a fresh process) but matters for tests that call
+//!   `std::env::set_var("AUTUMN_FAKE_SEED", ..)` at runtime: call
+//!   [`reseed`](crate::fake::reseed) directly instead, which always takes
+//!   effect immediately.
 //! - **Random**: with no seed configured, the RNG is seeded from OS entropy and
 //!   output varies per run.
 //!

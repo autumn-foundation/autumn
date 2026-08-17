@@ -295,7 +295,26 @@ pub enum FakeSeedError {
         /// The raw `AUTUMN_SEED_COUNT` value that failed to parse.
         value: String,
     },
+
+    /// The `AUTUMN_SEED_COUNT` value exceeds [`MAX_FAKE_SEED_COUNT`], the
+    /// sanity ceiling on a single fake-seed request.
+    #[error("AUTUMN_SEED_COUNT {value} exceeds the maximum of {max} rows per fake-seed request")]
+    CountTooLarge {
+        /// The requested count.
+        value: usize,
+        /// The ceiling it exceeded ([`MAX_FAKE_SEED_COUNT`]).
+        max: usize,
+    },
 }
+
+/// Sanity ceiling on a single `--count`/`AUTUMN_SEED_COUNT` fake-seed request.
+///
+/// Generously above any realistic dev-seeding volume, this exists solely to
+/// turn a mistyped or pasted-wrong count (e.g. an extra digit, or a stray
+/// `usize::MAX`) into a clear [`FakeSeedError::CountTooLarge`] instead of a
+/// `Vec::with_capacity` allocation panic deep inside the generated factory's
+/// `create_many`/`build_many`.
+pub const MAX_FAKE_SEED_COUNT: usize = 1_000_000;
 
 /// The names of every registered faked model, sorted, for diagnostics.
 #[must_use]
@@ -381,6 +400,12 @@ pub async fn maybe_fake_seed(pool: &Pool<RuntimeConnection>) -> Result<bool, Fak
         .trim()
         .parse()
         .map_err(|_| FakeSeedError::InvalidCount { value: count })?;
+    if count > MAX_FAKE_SEED_COUNT {
+        return Err(FakeSeedError::CountTooLarge {
+            value: count,
+            max: MAX_FAKE_SEED_COUNT,
+        });
+    }
     let inserted = fake_seed_model(&model, count, pool).await?;
     println!("Inserted {inserted} faked `{model}` row(s).");
     Ok(true)
@@ -504,6 +529,60 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn maybe_fake_seed_errors_on_count_above_max() {
+        let pool = lazy_pool();
+        let too_large = (MAX_FAKE_SEED_COUNT + 1).to_string();
+        temp_env::with_vars(
+            [
+                ("AUTUMN_SEED_MODEL", Some("DummyFakeSeederModel")),
+                ("AUTUMN_SEED_COUNT", Some(too_large.as_str())),
+            ],
+            || {
+                let err = futures::executor::block_on(maybe_fake_seed(&pool)).expect_err(
+                    "a count above the sanity ceiling must be a clean error, not a later \
+                     capacity-overflow panic inside create_many/build_many",
+                );
+                assert!(
+                    matches!(err, FakeSeedError::CountTooLarge { .. }),
+                    "expected CountTooLarge, got: {err:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn maybe_fake_seed_allows_count_at_max() {
+        // The boundary itself (MAX_FAKE_SEED_COUNT exactly) must not be
+        // rejected by the ceiling check — only values strictly above it.
+        // DummyFakeSeederModel's `run` just echoes `count` back without
+        // allocating, so this exercises the guard without a live database.
+        let pool = lazy_pool();
+        let at_max = MAX_FAKE_SEED_COUNT.to_string();
+        temp_env::with_vars(
+            [
+                ("AUTUMN_SEED_MODEL", Some("DummyFakeSeederModel")),
+                ("AUTUMN_SEED_COUNT", Some(at_max.as_str())),
+            ],
+            || {
+                let handled = futures::executor::block_on(maybe_fake_seed(&pool))
+                    .expect("count exactly at the ceiling must be accepted");
+                assert!(handled);
+            },
+        );
+    }
+
+    #[test]
+    fn count_too_large_error_message_reports_value_and_max() {
+        let msg = FakeSeedError::CountTooLarge {
+            value: 5_000_000,
+            max: MAX_FAKE_SEED_COUNT,
+        }
+        .to_string();
+        assert!(msg.contains("5000000"), "got: {msg}");
+        assert!(msg.contains(&MAX_FAKE_SEED_COUNT.to_string()), "got: {msg}");
     }
 
     // ── resolve_profile ────────────────────────────────────────────────────
