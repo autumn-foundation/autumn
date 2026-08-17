@@ -832,7 +832,48 @@ fn decode_toml_escapes(src: &str) -> String {
 /// configuration at all. A dotted `i18n.x` under some other table
 /// (`[server]\ni18n.x = …`) is a different key entirely, so only top-level ones
 /// count.
+/// Whether `autumn.toml` defines i18n configuration.
+///
+/// Parsed with the real TOML parser, which is already a direct dependency of
+/// this crate. The line scan below has been extended once per round for
+/// another spelling TOML allows — `[i18n]`, `["i18n"]`, `i18n = { … }`,
+/// `"i18n" = { … }`, `i18n.default_locale`, `"i18n".default_locale`, quoted
+/// member keys, escaped values, commas inside quoted values — and each miss
+/// had the generator append a SECOND `[i18n]` table, which makes the file
+/// unparseable for the app that has to read it. Enumerating token classes by
+/// hand does not converge; `toml::Table` knows them all.
+///
+/// The scan survives as the fallback for a file that does not parse. That is
+/// deliberate and predates this: a malformed `autumn.toml` should not fail
+/// generation here, because the app's own loader reports it far better.
 fn defines_i18n(autumn_toml: &str) -> bool {
+    autumn_toml.parse::<toml::Table>().map_or_else(
+        |_| defines_i18n_by_scan(autumn_toml),
+        |table| table.contains_key("i18n"),
+    )
+}
+
+/// What an existing `autumn.toml` configures for i18n, as
+/// `(default_locale, dir)`.
+///
+/// Structural for the same reason as [`defines_i18n`], and with the same
+/// fallback. Reading these from the source text rather than the parsed value
+/// is what sent generated keys to `i18n/en.ftl` while the runtime loaded
+/// `translations/fr.ftl`.
+pub(super) fn configured_i18n(autumn_toml: &str) -> (Option<String>, Option<String>) {
+    let Ok(table) = autumn_toml.parse::<toml::Table>() else {
+        return configured_i18n_by_scan(autumn_toml);
+    };
+    let i18n = table.get("i18n");
+    let member = |key: &str| {
+        i18n.and_then(|v| v.get(key))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    (member("default_locale"), member("dir"))
+}
+
+fn defines_i18n_by_scan(autumn_toml: &str) -> bool {
     let mut at_top_level = true;
     for line in autumn_toml.lines() {
         if let Some(name) = toml_table_name(line) {
@@ -872,7 +913,7 @@ fn defines_i18n(autumn_toml: &str) -> bool {
 /// and a malformed `autumn.toml` should not fail generation here — the app's own
 /// loader reports that far better. `[profile.<env>.i18n]` overlays are ignored:
 /// the generator writes the base bundle, which every profile inherits.
-pub(super) fn configured_i18n(autumn_toml: &str) -> (Option<String>, Option<String>) {
+fn configured_i18n_by_scan(autumn_toml: &str) -> (Option<String>, Option<String>) {
     let mut in_i18n = false;
     let mut at_top_level = true;
     let (mut locale, mut dir) = (None, None);
@@ -1020,8 +1061,31 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
 pub(super) fn ensure_dockerfile_i18n_copy(dockerfile: &str, dir: &str) -> Option<String> {
     let builder_anchor = "COPY migrations ./migrations";
     let runtime_anchor = "COPY --from=builder /app/migrations /app/migrations";
-    let builder_line = format!("COPY {dir} ./{dir}");
-    let runtime_line = format!("COPY --from=builder /app/{dir} /app/{dir}");
+    // A `dir` carrying whitespace is a legal path, and the shell form splits on
+    // it: `COPY translations v2 ./translations v2` reads as three sources and a
+    // destination, so the build either fails or copies the wrong thing. The
+    // JSON form is exactly what Docker documents for paths with spaces. Used
+    // only when needed, so the ordinary Dockerfile keeps its conventional
+    // shell-form lines.
+    let (builder_line, runtime_line) = if dir.contains(char::is_whitespace) {
+        (
+            format!(
+                "COPY [{}, {}]",
+                json_str(dir),
+                json_str(&format!("./{dir}"))
+            ),
+            format!(
+                "COPY --from=builder [{}, {}]",
+                json_str(&format!("/app/{dir}")),
+                json_str(&format!("/app/{dir}"))
+            ),
+        )
+    } else {
+        (
+            format!("COPY {dir} ./{dir}"),
+            format!("COPY --from=builder /app/{dir} /app/{dir}"),
+        )
+    };
     if dockerfile.contains(&builder_line) && dockerfile.contains(&runtime_line) {
         return Some(dockerfile.to_owned());
     }
@@ -1298,6 +1362,51 @@ pub(super) fn real_offsets(src: &str, needle: &str) -> Vec<usize> {
     out
 }
 
+/// `value` as a JSON string literal, for Dockerfile's exec/JSON `COPY` form.
+fn json_str(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Offsets of real-code `method` calls, tolerating whitespace and comments
+/// between the method name and its opening paren, and requiring the name to end
+/// on a token boundary so `.i18n` does not match `.i18n_auto`.
+fn method_call_offsets<'a>(src: &'a str, method: &'a str) -> impl Iterator<Item = usize> + 'a {
+    real_offsets(src, method).into_iter().filter(move |&at| {
+        let rest = &src[at + method.len()..];
+        // `.i18n_auto(` is a different method that starts with this name.
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+        // Only whitespace and comments may sit before the paren. `real_offsets`
+        // over the remainder is the cheapest way to say "the next real token".
+        real_offsets(rest, "(").first() == Some(&byte_len_of_ignorable_prefix(rest))
+    })
+}
+
+/// Length of the run of whitespace and comments at the start of `src`.
+fn byte_len_of_ignorable_prefix(src: &str) -> usize {
+    let mut i = 0;
+    loop {
+        let rest = &src[i..];
+        let trimmed = rest.trim_start();
+        i += rest.len() - trimmed.len();
+        let rest = &src[i..];
+        if let Some(after) = rest.strip_prefix("//") {
+            i += 2 + after.find('\n').map_or(after.len(), |nl| nl + 1);
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("/*") {
+            i += 2 + after.find("*/").map_or(after.len(), |end| end + 2);
+            continue;
+        }
+        return i;
+    }
+}
+
 /// Byte offset of a char literal's closing `'`, when `at` opens one.
 ///
 /// `None` for a lifetime (`&'a str`, `'static`), which shares the opening
@@ -1407,7 +1516,14 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
     if !real_offsets(main_rs, ".i18n_auto()").is_empty() {
         return I18nAutoWiring::Wired(main_rs.to_owned());
     }
-    if !real_offsets(main_rs, ".i18n(").is_empty() {
+    // Whitespace between the method and its paren is valid Rust — `.i18n
+    // (my_bundle())` after a rustfmt-unfriendly hand edit, or a comment in
+    // between. Missing it is not cosmetic: this branch is what stops the
+    // generator wiring `.i18n_auto()`, which CLEARS a preloaded bundle and
+    // switches to filesystem loading, so a missed detection silently replaces
+    // an app's embedded or TMS-backed bundle and can panic when no bundle is
+    // on disk.
+    if method_call_offsets(main_rs, ".i18n").next().is_some() {
         return I18nAutoWiring::CustomBundle;
     }
     // Prefer a builder inside `fn main`. A `main.rs` can hold more than one —
@@ -2098,15 +2214,93 @@ mod tests {
         }
     }
 
-    /// `"default_locale" = "fr"` is the same key as the bare spelling; serde
-    /// reads both, so the generator has to write where the runtime looks.
+    /// `.i18n_auto()` CLEARS a preloaded bundle and switches to filesystem
+    /// loading, so failing to spot a hand-installed `.i18n(…)` does not merely
+    /// add a call — it replaces the app's own bundle.
     #[test]
-    fn quoted_member_keys_still_select_the_bundle() {
-        let toml = "[i18n]\n\"default_locale\" = \"fr\"\n'dir' = \"translations\"\n";
-        assert_eq!(
-            configured_i18n(toml),
-            (Some("fr".to_owned()), Some("translations".to_owned()))
+    fn a_custom_bundle_is_seen_through_whitespace_and_comments() {
+        for call in [
+            ".i18n(my_bundle())",
+            ".i18n (my_bundle())",
+            ".i18n\n        (my_bundle())",
+            ".i18n /* keep ours */ (my_bundle())",
+        ] {
+            let main_rs = format!(
+                "fn main() {{\n    let app = App::new()\n        {call}\n        .routes(routes![index]);\n}}\n"
+            );
+            assert_eq!(
+                ensure_i18n_auto(&main_rs),
+                I18nAutoWiring::CustomBundle,
+                "for {call:?}"
+            );
+        }
+        // `.i18n_auto()` is a different method that starts with the same name,
+        // and must still read as already-wired rather than as a custom bundle.
+        let wired = "fn main() {\n    let app = App::new()\n        .i18n_auto()\n        .routes(routes![index]);\n}\n";
+        assert!(matches!(ensure_i18n_auto(wired), I18nAutoWiring::Wired(_)));
+    }
+
+    /// A `dir` with whitespace is a legal path, and the shell `COPY` form
+    /// splits on it — three sources and a destination, not one of each.
+    #[test]
+    fn a_locale_dir_with_spaces_uses_dockers_json_copy_form() {
+        let dockerfile = concat!(
+            "FROM rust AS builder\n",
+            "COPY migrations ./migrations\n",
+            "\n",
+            "FROM debian AS runtime\n",
+            "COPY --from=builder /app/migrations /app/migrations\n",
         );
+        let out = ensure_dockerfile_i18n_copy(dockerfile, "translations v2").expect("anchors");
+        assert!(
+            out.contains(r#"COPY ["translations v2", "./translations v2"]"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"COPY --from=builder ["/app/translations v2", "/app/translations v2"]"#),
+            "{out}"
+        );
+        // An ordinary directory keeps the conventional shell form.
+        let plain = ensure_dockerfile_i18n_copy(dockerfile, "i18n").expect("anchors");
+        assert!(plain.contains("COPY i18n ./i18n"), "{plain}");
+    }
+
+    /// Every spelling TOML allows for the same configuration reads the same.
+    ///
+    /// This is the table the hand-rolled scanner was extended for one row at a
+    /// time, each miss shipping as a bug: a wrong bundle path, or a second
+    /// `[i18n]` table appended over an existing one. Parsed properly, they are
+    /// all just the same value.
+    #[test]
+    fn every_toml_spelling_of_the_i18n_table_reads_alike() {
+        let expected = (Some("fr".to_owned()), Some("translations".to_owned()));
+        for src in [
+            "[i18n]\ndefault_locale = \"fr\"\ndir = \"translations\"\n",
+            "[\"i18n\"]\ndefault_locale = \"fr\"\ndir = \"translations\"\n",
+            "[i18n]\n\"default_locale\" = \"fr\"\n'dir' = \"translations\"\n",
+            "i18n = { default_locale = \"fr\", dir = \"translations\" }\n",
+            "\"i18n\" = { default_locale = \"fr\", dir = \"translations\" }\n",
+            "i18n.default_locale = \"fr\"\ni18n.dir = \"translations\"\n",
+            "\"i18n\".default_locale = \"fr\"\n\"i18n\".dir = \"translations\"\n",
+            // Escapes are decoded, not passed through as source text.
+            "[i18n]\ndefault_locale = \"\\u0066r\"\ndir = \"translations\"\n",
+            // A comma inside a quoted value is part of the value, and a
+            // trailing comment is not.
+            "[i18n]\ndefault_locale = \"fr\" # the default\ndir = \"translations\"\n",
+        ] {
+            assert_eq!(configured_i18n(src), expected, "for {src:?}");
+            assert!(defines_i18n(src), "for {src:?}");
+        }
+
+        // A comma really inside a value survives as one.
+        assert_eq!(
+            configured_i18n("i18n = { dir = \"translations,v2\", default_locale = \"fr\" }\n").1,
+            Some("translations,v2".to_owned())
+        );
+        // Absent is still absent, and a malformed file still falls back rather
+        // than failing generation.
+        assert!(!defines_i18n("[server]\nport = 3000\n"));
+        assert!(defines_i18n("[i18n]\nthis is not valid toml\n"));
     }
 
     /// A builder INSIDE `main` still wins over one that merely precedes it.
