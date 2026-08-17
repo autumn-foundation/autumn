@@ -516,11 +516,22 @@ fn t_macro_keys(src: &str) -> Vec<String> {
                 false
             }
         };
-        if !expect("(", &mut cursor)
-            || !expect("locale", &mut cursor)
-            || !expect(",", &mut cursor)
-            || !expect("\"", &mut cursor)
-        {
+        if !expect("(", &mut cursor) {
+            continue;
+        }
+        // The first argument is ANY Rust expression — `t!` parses it as one, so
+        // application code reusing a generated key is free to write
+        // `t!(lang, …)` or `t!(ctx.locale, …)`. Requiring the spelling the
+        // generator happens to emit would drop those from the surviving set and
+        // prune a key that is still called, which `t!` then rejects at compile
+        // time. That matters more since the scan widened to the whole source
+        // tree: outside `src/routes` is exactly where another binding name
+        // lives. So skip to the top-level comma instead of matching a name.
+        let Some(comma) = top_level_comma(src, cursor) else {
+            continue;
+        };
+        cursor = comma + 1;
+        if !expect("\"", &mut cursor) {
             continue;
         }
         let Some(end) = src[cursor..].find('"') else {
@@ -529,6 +540,40 @@ fn t_macro_keys(src: &str) -> Vec<String> {
         keys.push(src[cursor..cursor + end].to_owned());
     }
     keys
+}
+
+/// Byte offset of the comma separating `t!`'s first argument from its second,
+/// starting from just after the opening paren.
+///
+/// Depth- and string-aware: `t!(fmt(a, b), "key")` separates at the comma after
+/// `)`, not the one inside it, and a comma inside a string literal is text.
+/// `None` when the argument list ends first (`t!(locale)`) or is unterminated.
+fn top_level_comma(src: &str, from: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut depth = 0i32;
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    // The call closed without a second argument.
+                    return None;
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => return Some(i),
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += usize::from(bytes[i] == b'\\') + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// A complete generator plan — a sequence of actions plus the project root
@@ -1816,14 +1861,18 @@ mod tests {
         }
     }
 
-    /// The scan must not treat a longer identifier ending in `t` as the macro,
-    /// nor a `t!` whose first argument is something else.
+    /// The scan must not treat a longer identifier ending in `t` as the macro.
+    ///
+    /// It deliberately says nothing about the first ARGUMENT's spelling — see
+    /// [`chrome_scan_accepts_any_locale_expression`]. Erring toward matching
+    /// costs an unused key; erring the other way prunes a live one and breaks
+    /// the build.
     #[test]
     fn chrome_scan_ignores_lookalikes() {
         let src = r#"
             format!(locale, "common.not-a-lookup");
             let e = fmt!(locale, "common.also-not");
-            let f = t!(other_locale, "common.nope");
+            let f = emit!(locale, "common.still-not");
         "#;
         assert!(t_macro_keys(src).is_empty(), "{:?}", t_macro_keys(src));
     }
@@ -1855,6 +1904,49 @@ mod tests {
             found.contains("common.save"),
             "a non-route caller keeps the key alive: {found:?}"
         );
+    }
+
+    /// `t!` parses its first argument as an expression, so application code
+    /// reusing a generated key need not spell it `locale`. Missing those drops
+    /// a live lookup from the surviving set and prunes a key the call still
+    /// needs — rejected at compile time, not at runtime.
+    #[test]
+    fn chrome_scan_accepts_any_locale_expression() {
+        let src = r#"
+            let a = t!(lang, "common.one");
+            let b = t!(ctx.locale, "common.two");
+            let c = t!(&self.locale, "common.three");
+            let d = t!(pick(a, b), "common.four");
+            let e = t!(
+                locale,
+                "common.five",
+                n = &count.to_string()
+            );
+        "#;
+        let keys = t_macro_keys(src);
+        for expected in [
+            "common.one",
+            "common.two",
+            "common.three",
+            "common.four",
+            "common.five",
+        ] {
+            assert!(
+                keys.iter().any(|k| k == expected),
+                "{expected} not found in {keys:?}"
+            );
+        }
+    }
+
+    /// A `t!` with no second argument must not swallow whatever follows the
+    /// call.
+    #[test]
+    fn chrome_scan_skips_a_call_with_no_key() {
+        let src = r#"
+            let a = t!(locale);
+            let b = "common.not-a-key";
+        "#;
+        assert!(t_macro_keys(src).is_empty(), "{:?}", t_macro_keys(src));
     }
 
     /// A lookup that is not CODE is not a lookup. Counting one keeps a key

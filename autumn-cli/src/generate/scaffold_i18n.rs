@@ -633,7 +633,18 @@ fn toml_table_name(line: &str) -> Option<&str> {
     if !tail.is_empty() && !tail.starts_with('#') {
         return None;
     }
-    Some(rest[..close].trim())
+    // `["i18n"]` names the same table as `[i18n]` — TOML lets any key be
+    // quoted. Left quoted, the name never matches, so the caller concludes
+    // there is no `[i18n]` table and appends one: a SECOND definition of the
+    // same table, which makes `autumn.toml` unparseable for the app that has
+    // to read it.
+    let name = rest[..close].trim();
+    Some(
+        name.strip_prefix('"')
+            .and_then(|n| n.strip_suffix('"'))
+            .or_else(|| name.strip_prefix('\'').and_then(|n| n.strip_suffix('\'')))
+            .unwrap_or(name),
+    )
 }
 
 /// The scalar on the right of a TOML `key = value`, unquoted, with any trailing
@@ -2179,6 +2190,24 @@ mod tests {
     /// A comma inside a quoted value belongs to the value. Split through it and
     /// `toml_scalar_value` sees an unterminated string and discards it, so the
     /// generator falls back to `i18n/` and writes where the runtime never looks.
+    /// `["i18n"]` is the same table as `[i18n]`. Not recognising it appends a
+    /// second definition of it, which makes `autumn.toml` unparseable for the
+    /// app that has to read it.
+    #[test]
+    fn a_quoted_table_header_names_the_same_table() {
+        assert_eq!(toml_table_name(r#"["i18n"]"#), Some("i18n"));
+        assert_eq!(toml_table_name("['i18n']"), Some("i18n"));
+        assert_eq!(toml_table_name("[i18n]"), Some("i18n"));
+        assert_eq!(toml_table_name(r#"["i18n"]  # notes"#), Some("i18n"));
+        assert!(defines_i18n(
+            r#"["i18n"]
+default_locale = "fr"
+"#
+        ));
+        // Still not a table header at all.
+        assert_eq!(toml_table_name("i18n = 1"), None);
+    }
+
     #[test]
     fn an_inline_table_splits_on_separators_not_on_commas_in_values() {
         let toml = r#"i18n = { dir = "translations,v2", default_locale = "fr" }"#;
