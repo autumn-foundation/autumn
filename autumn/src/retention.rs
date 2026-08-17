@@ -246,12 +246,32 @@ pub fn resolve_retention_descriptors(
     let matches: Vec<&RetentionSweepDescriptor> = match model_filter {
         None => all,
         Some(filter) => {
-            let found: Vec<&RetentionSweepDescriptor> = all
-                .into_iter()
-                .filter(|descriptor| {
-                    descriptor.model_name == filter || descriptor.table_name == filter
-                })
+            // Regression (#1342 review round 24): the ambiguity error below
+            // tells the operator to pass the table name instead of the model
+            // name to disambiguate — but if a *different* policy's
+            // `table_name` happens to equal this filter (e.g. one repository
+            // uses model `Session` while another targets a table literally
+            // named `Session`), the combined `model_name == filter ||
+            // table_name == filter` filter below still collects both,
+            // making the suggested table-name filter just as ambiguous.
+            // Resolve an exact, unique `table_name` match first — schema
+            // table names are unique, so this can never be ambiguous — and
+            // only fall back to the model-or-table filter (whose ambiguity
+            // is expected and reported) when no single table matches.
+            let table_matches: Vec<&RetentionSweepDescriptor> = all
+                .iter()
+                .copied()
+                .filter(|descriptor| descriptor.table_name == filter)
                 .collect();
+            let found: Vec<&RetentionSweepDescriptor> = if table_matches.len() == 1 {
+                table_matches
+            } else {
+                all.into_iter()
+                    .filter(|descriptor| {
+                        descriptor.model_name == filter || descriptor.table_name == filter
+                    })
+                    .collect()
+            };
             if found.is_empty() {
                 return Err(crate::AutumnError::not_found_msg(format!(
                     "no #[repository(..., retention(...))] policy is registered for model \
@@ -395,6 +415,14 @@ mod tests {
         task_info_named("retention-sweep-__retention_runtime_ambiguous_widgets_b")
     }
 
+    fn table_shadows_model_task_info_a() -> TaskInfo {
+        task_info_named("retention-sweep-__retention_runtime_table_shadows_model_a")
+    }
+
+    fn table_shadows_model_task_info_b() -> TaskInfo {
+        task_info_named("retention-sweep-__retention_runtime_table_shadows_model_b")
+    }
+
     #[test]
     fn report_serializes_with_expected_fields() {
         let report = RetentionSweepReport {
@@ -533,6 +561,53 @@ mod tests {
                     .to_string()
                     .contains("__retention_runtime_ambiguous_widgets_b"),
             "error should name the disambiguating table names: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_retention_descriptors_prefers_exact_table_match_over_ambiguous_model_match() {
+        // Regression (#1342 review round 24): the ambiguity error tells the
+        // operator to pass the table name instead of the model name to
+        // disambiguate, but the combined `model_name == filter ||
+        // table_name == filter` filter treats a *different* policy's
+        // table_name equaling this policy's model_name as an ambiguous
+        // match too — making the suggested table-name filter just as
+        // ambiguous as the model-name filter it was meant to fix. An exact
+        // table_name match must resolve unambiguously regardless.
+        struct FixtureA;
+        struct FixtureB;
+        inventory::submit! {
+            RetentionSweepDescriptor {
+                model_name: "__RetentionRuntimeTableShadowsModel",
+                table_name: "__retention_runtime_table_shadows_model_a",
+                task_info: table_shadows_model_task_info_a,
+                dry_run: sample_dry_run,
+            }
+        }
+        inventory::submit! {
+            RetentionSweepDescriptor {
+                model_name: "__RetentionRuntimeTableShadowsModelOther",
+                table_name: "__RetentionRuntimeTableShadowsModel",
+                task_info: table_shadows_model_task_info_b,
+                dry_run: sample_dry_run,
+            }
+        }
+        let _ = (FixtureA, FixtureB);
+
+        let descriptors =
+            resolve_retention_descriptors(Some("__RetentionRuntimeTableShadowsModel")).expect(
+                "an exact table-name match must resolve unambiguously even though another \
+                 policy's model_name equals the same string",
+            );
+
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(
+            descriptors[0].table_name,
+            "__RetentionRuntimeTableShadowsModel"
+        );
+        assert_eq!(
+            descriptors[0].model_name,
+            "__RetentionRuntimeTableShadowsModelOther"
         );
     }
 
