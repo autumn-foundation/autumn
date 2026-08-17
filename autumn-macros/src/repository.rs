@@ -672,6 +672,17 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                  sweep for now",
             ));
         }
+        if broadcasts {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support broadcasts = true yet: the sweep mutates rows \
+                 directly and does not run the inline delete broadcast the scaffolded-live \
+                 delete path emits, so realtime subscribers would keep a stale record after a \
+                 swept row is gone. Remove `broadcasts = true`, or call \
+                 delete_many(ids)/delete_by_id(id) yourself from a hand-written #[scheduled] \
+                 sweep for now",
+            ));
+        }
     }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
     let generated_internal_hooks = false;
@@ -11310,6 +11321,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // `basis` — then decrements against exactly that locked
                     // set before mutating it. A model with no counter cache
                     // keeps the original single-statement path.
+                    //
+                    // `scoped_immediate_transaction`, not `scoped_transaction`
+                    // (#1342 review round 9): on `SQLite`, `maybe_for_update!`
+                    // degrades to a plain read (no `FOR UPDATE`), so a
+                    // deferred transaction wouldn't take a write lock until
+                    // the first write below — leaving a window for a
+                    // concurrent writer to commit between the locked-ids
+                    // SELECT and that write, which SQLite reports as
+                    // `SQLITE_BUSY_SNAPSHOT` rather than waiting on the
+                    // configured busy timeout. `scoped_immediate_transaction`
+                    // is what every other generated read-then-write mutation
+                    // path (e.g. the update-by-id counter-cache capture) uses
+                    // for exactly this reason.
                     let apply_stmt = if config.soft_delete {
                         quote! {
                             let __applied: u64 = if dry_run {
@@ -11320,7 +11344,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 #[allow(unused_imports)]
                                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                                 let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
-                                ::autumn_web::__private::scoped_transaction::<u64, ::autumn_web::AutumnError, _, _>(
+                                ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
                                     &mut *conn,
                                     |conn| async move {
                                         let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
@@ -11371,7 +11395,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
                                 #[allow(unused_imports)]
                                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                                ::autumn_web::__private::scoped_transaction::<u64, ::autumn_web::AutumnError, _, _>(
+                                ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
                                     &mut *conn,
                                     |conn| async move {
                                         let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
@@ -11539,7 +11563,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
                                     #[allow(unused_imports)]
                                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                                    ::autumn_web::__private::scoped_transaction::<u64, ::autumn_web::AutumnError, _, _>(
+                                    ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
                                         &mut *conn,
                                         |conn| async move {
                                             let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
@@ -22268,6 +22292,28 @@ mod tests {
     }
 
     #[test]
+    fn retention_rejects_broadcasts() {
+        // Regression (#1342 review round 9): the scaffolded-live broadcast
+        // hook (`broadcasts = true` without an explicit hooks type) is
+        // installed later in repository_macro, past the point where the
+        // retention validation block runs — so `hooks_type.is_some()` alone
+        // doesn't see it. The sweep still mutates rows directly and skips
+        // the inline delete broadcast, leaving realtime subscribers with a
+        // stale record after a sweep. Reject the combination explicitly.
+        let tokens: proc_macro2::TokenStream =
+            "Post, broadcasts = true, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + broadcasts = true must be rejected");
+        };
+        assert!(
+            error.to_string().contains("broadcasts"),
+            "retention + broadcasts = true must be rejected: {error}"
+        );
+    }
+
+    #[test]
     fn retention_rejects_dependent() {
         // Regression (#1342 review): the sweep mutates rows directly and
         // does not run the cascade-aware delete path dependent(...)
@@ -22450,6 +22496,42 @@ mod tests {
             2,
             "both the age (soft-delete) and purge (hard-delete) branches must \
              call counter_cache_before_delete_many: {retention_run}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_counter_cache_uses_immediate_transaction() {
+        // Regression (#1342 review round 9): on SQLite, maybe_for_update!
+        // degrades to a plain read (no FOR UPDATE), so a deferred
+        // scoped_transaction wouldn't take a write lock until the first
+        // write, leaving a window for a concurrent writer to commit between
+        // the locked-ids SELECT and that write — SQLite reports that as
+        // SQLITE_BUSY_SNAPSHOT rather than waiting on the busy timeout.
+        // Every counter-cache sweep transaction must use
+        // scoped_immediate_transaction instead, matching every other
+        // generated read-then-write mutation path.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
+        assert_eq!(
+            retention_run
+                .matches("scoped_immediate_transaction")
+                .count(),
+            2,
+            "both the age (soft-delete) and purge (hard-delete) counter-cache \
+             branches must use scoped_immediate_transaction: {retention_run}"
+        );
+        assert!(
+            !retention_run.contains("scoped_transaction ::"),
+            "counter-cache sweep transactions must not use the deferred \
+             scoped_transaction: {retention_run}"
         );
     }
 

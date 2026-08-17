@@ -5392,6 +5392,26 @@ impl AppBuilder {
             ..
         } = self;
 
+        let model_filter = retention_dry_run_model_filter_from_env();
+        // Resolve/validate the requested policy selection BEFORE connecting
+        // to the database (#1342 review round 9): an app with no
+        // retention(...) policies at all, or a --model that names nothing
+        // registered, can answer without ever opening a connection — every
+        // check here reads only the compile-time-registered descriptor set.
+        // A real database only gets touched once we know a policy actually
+        // needs to be counted.
+        match crate::retention::resolve_retention_descriptors(model_filter.as_deref()) {
+            Ok(descriptors) if descriptors.is_empty() => {
+                println!("[]");
+                std::process::exit(0);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("retention dry-run: {error}");
+                std::process::exit(1);
+            }
+        }
+
         let (config, _telemetry_guard) = load_config_and_telemetry(
             config_loader_factory,
             telemetry_provider,
@@ -5422,7 +5442,6 @@ impl AppBuilder {
             channels_backend,
         );
 
-        let model_filter = retention_dry_run_model_filter_from_env();
         // `process::exit` below skips `on_shutdown` — including a managed-Postgres
         // `stop()` — so every exit from this one-shot would otherwise leave the
         // postmaster `setup_database` may have started running, with its data

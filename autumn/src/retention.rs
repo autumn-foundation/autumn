@@ -166,33 +166,54 @@ pub async fn run_retention_dry_run(
     state: &AppState,
     model_filter: Option<&str>,
 ) -> AutumnResult<Vec<RetentionSweepReport>> {
-    let mut reports = Vec::new();
-    if let Some(filter) = model_filter {
-        let matches: Vec<&RetentionSweepDescriptor> = inventory::iter::<RetentionSweepDescriptor>
-            .into_iter()
-            .filter(|descriptor| descriptor.model_name == filter || descriptor.table_name == filter)
-            .collect();
-        if matches.is_empty() {
-            return Err(crate::AutumnError::not_found_msg(format!(
-                "no #[repository(..., retention(...))] policy is registered for model {filter:?}"
-            )));
-        }
-        if matches.len() > 1 {
-            let table_names: Vec<&str> = matches.iter().map(|d| d.table_name).collect();
-            return Err(crate::AutumnError::bad_request_msg(format!(
-                "{filter:?} matches more than one retention policy ({table_names:?}); pass the \
-                 table name instead of the model name to disambiguate, e.g. --model {}",
-                table_names[0]
-            )));
-        }
-        reports.push((matches[0].dry_run)(state.clone()).await?);
-    } else {
-        for descriptor in inventory::iter::<RetentionSweepDescriptor> {
-            reports.push((descriptor.dry_run)(state.clone()).await?);
-        }
+    let descriptors = resolve_retention_descriptors(model_filter)?;
+    let mut reports = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        reports.push((descriptor.dry_run)(state.clone()).await?);
     }
     reports.sort_by(|a, b| a.model.cmp(&b.model).then_with(|| a.table.cmp(&b.table)));
     Ok(reports)
+}
+
+/// Resolve `model_filter` to the descriptors [`run_retention_dry_run`] would
+/// query, without touching a database — every check here reads only the
+/// `inventory`-collected registry.
+///
+/// `None` resolves to every registered descriptor (possibly empty, if the
+/// binary declares no `retention(...)` policy at all). This is what lets
+/// `AppBuilder::run_retention_dry_run_mode` decide whether `autumn retention
+/// --dry-run` needs a database connection at all *before* opening one — see
+/// `docs/guide/retention-sweeps.md`.
+///
+/// # Errors
+///
+/// A not-found error when `model_filter` names nothing registered, or a
+/// bad-request error when it matches more than one policy.
+#[doc(hidden)]
+pub fn resolve_retention_descriptors(
+    model_filter: Option<&str>,
+) -> AutumnResult<Vec<&'static RetentionSweepDescriptor>> {
+    let Some(filter) = model_filter else {
+        return Ok(inventory::iter::<RetentionSweepDescriptor>().collect());
+    };
+    let matches: Vec<&RetentionSweepDescriptor> = inventory::iter::<RetentionSweepDescriptor>
+        .into_iter()
+        .filter(|descriptor| descriptor.model_name == filter || descriptor.table_name == filter)
+        .collect();
+    if matches.is_empty() {
+        return Err(crate::AutumnError::not_found_msg(format!(
+            "no #[repository(..., retention(...))] policy is registered for model {filter:?}"
+        )));
+    }
+    if matches.len() > 1 {
+        let table_names: Vec<&str> = matches.iter().map(|d| d.table_name).collect();
+        return Err(crate::AutumnError::bad_request_msg(format!(
+            "{filter:?} matches more than one retention policy ({table_names:?}); pass the \
+             table name instead of the model name to disambiguate, e.g. --model {}",
+            table_names[0]
+        )));
+    }
+    Ok(matches)
 }
 
 /// Emit the structured `{model, table, rows_swept, duration_ms}` log line for
