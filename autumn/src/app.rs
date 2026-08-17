@@ -5423,17 +5423,30 @@ impl AppBuilder {
         );
 
         let model_filter = retention_dry_run_model_filter_from_env();
+        // `process::exit` below skips `on_shutdown` — including a managed-Postgres
+        // `stop()` — so every exit from this one-shot would otherwise leave the
+        // postmaster `setup_database` may have started running, with its data
+        // directory locked for later commands (#1342 review round 6). Stop it
+        // explicitly before every exit rather than relying on `on_shutdown`.
         match crate::retention::run_retention_dry_run(&state, model_filter.as_deref()).await {
-            Ok(reports) => {
-                let json = serde_json::to_string(&reports).unwrap_or_else(|error| {
+            Ok(reports) => match serde_json::to_string(&reports) {
+                Ok(json) => {
+                    println!("{json}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(0);
+                }
+                Err(error) => {
                     eprintln!("retention dry-run: failed to serialize report: {error}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
                     std::process::exit(1);
-                });
-                println!("{json}");
-                std::process::exit(0);
-            }
+                }
+            },
             Err(error) => {
                 eprintln!("retention dry-run: {error}");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
                 std::process::exit(1);
             }
         }

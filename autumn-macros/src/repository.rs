@@ -11254,8 +11254,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // coordinates by name, so a collision merges two policies' actuator
         // state and can drop one under the Postgres advisory-lock backend.
         // Table names are already a hard uniqueness requirement the schema
-        // itself enforces.
-        let task_name_str = format!("retention-sweep-{}", table_name.to_lowercase());
+        // itself enforces — but only the exact string, not its lowercased
+        // form: Postgres allows distinct quoted tables like "Events" and
+        // "events", so `to_lowercase()` here would reintroduce exactly the
+        // collision this is meant to prevent (#1342 review round 6). Use
+        // `table_name` verbatim.
+        let task_name_str = format!("retention-sweep-{table_name}");
         // When both `after` and `purge_deleted_after` are declared, split
         // the per-run batch budget between them instead of sharing one
         // counter: a shared counter starves whichever branch runs second
@@ -22370,6 +22374,29 @@ mod tests {
         assert!(
             !generated.contains("retention-sweep-post\""),
             "task name must not be derived from the model name: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_task_name_preserves_table_case() {
+        // Regression (#1342 review round 6): Postgres allows distinct
+        // quoted tables that differ only in case ("Events" vs "events").
+        // Lowercasing the table name for the task name would collide them
+        // on one coordination lock — the exact bug the table-qualified
+        // task name was introduced to prevent. The table name must be used
+        // verbatim.
+        let generated = repository_macro(
+            quote! { Post, table = "Events", retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("retention-sweep-Events"),
+            "task name must preserve the table name's original case: {generated}"
+        );
+        assert!(
+            !generated.contains("retention-sweep-events"),
+            "task name must not be lowercased: {generated}"
         );
     }
 
