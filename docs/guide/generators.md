@@ -1344,8 +1344,13 @@ Notes and limits:
   into the *parent* resource's already-generated `show` handler, whose
   signature this generator does not own. Half-translated views under a flag
   that promises translatable output are worse than a refusal, so the
-  generator says so and writes nothing. A resource named `Common` is
-  refused too — its keys would collide with the shared chrome namespace.
+  generator says so and writes nothing. The nesting refusal follows the
+  *relationship*, not the flag: `--belongs-to` is typed once, so a later
+  `generate … --force --i18n` that omits it is still refused, naming the
+  parent routes file the nesting was recovered from. `autumn destroy
+  scaffold` that child first (it removes the parent-side section) to
+  scaffold it flat with `--i18n`. A resource named `Common` is refused too —
+  its keys would collide with the shared chrome namespace.
 - **Without `--i18n`, output is byte-for-byte unchanged.** The default
   scaffold stays zero-i18n-config.
 

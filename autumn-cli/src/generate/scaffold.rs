@@ -703,6 +703,42 @@ fn plan_scaffold_with_options_impl(
         for_revert,
     )?;
 
+    // Issue #1349: the `--belongs-to` refusal above reads the command line, and
+    // the command line is not where a nesting necessarily comes from. `resolve`
+    // deliberately recovers the relationship from the markers in the parent's
+    // routes file when the flag is not repeated — which is the ordinary "I
+    // changed a field, re-scaffold it" run. Without this second gate,
+    // `generate … --force --i18n` on an existing child is accepted and emits
+    // nested views whose heading, empty state, add button, and parent backlink
+    // are still hardcoded English: a half-translated module, which is precisely
+    // what the refusal exists to prevent.
+    //
+    // Two gates rather than one moved gate: the early one needs no disk reads
+    // and fires on the typed flag even in a project where `resolve` would fail
+    // first for an unrelated reason (an unscaffolded parent, say), so the user
+    // hears about the combination they asked for rather than about a
+    // precondition they would then have to satisfy only to be refused anyway.
+    // This one is reachable only for a recovered nesting, and says so.
+    if !for_revert
+        && options_with_key.i18n
+        && !options_with_key.api
+        && let Some(n) = nesting.as_ref()
+    {
+        return Err(GenerateError::Config(format!(
+            "`--i18n` is not yet supported for a nested resource, and {plural} is still nested \
+             under {parent}: src/routes/{parent}.rs renders their children section, which is \
+             where this run recovered the relationship from (`--belongs-to` is typed once, so \
+             a later `--force` rarely repeats it). The nested child list and inline create form \
+             are spliced into {parent}.rs's already-generated `show` handler, whose signature \
+             this scaffold does not own — so those views would stay hardcoded English while the \
+             rest of the module was translated. Drop `--i18n` to regenerate the nested scaffold \
+             as it is, or `autumn destroy scaffold {name} …` first (that removes the \
+             parent-side section from src/routes/{parent}.rs) and scaffold it flat with \
+             `--i18n`. Nothing has been written.",
+            parent = n.parent_plural,
+        )));
+    }
+
     // ── Counter cache (issue #1325) ────────────────────────────────────────
     // `--counter-cache` maintains `{parent}.{child}_count`. The maintenance is
     // declared on the CHILD's `belongs_to`, so the flag only makes sense
@@ -23239,6 +23275,48 @@ exempt_paths = [
                 "{label}: the error must name both flags: {msg}"
             );
         }
+    }
+
+    /// AC1/AC2: the `--belongs-to` refusal has to hold for nesting this run
+    /// INFERRED as well as nesting it was told about.
+    ///
+    /// `--belongs-to` is typed once, when the relationship is created; the
+    /// ordinary "I changed a field, re-scaffold it" run does not repeat it, and
+    /// [`super::nested::resolve`] deliberately recovers the relationship from
+    /// the markers in the parent's routes file so the two sides cannot drift
+    /// apart. That recovery has to reach the refusal too: otherwise
+    /// `generate … --force --i18n` on an existing child is accepted, and emits
+    /// nested views whose heading, empty state, add button, and parent backlink
+    /// are still hardcoded English — a half-translated module, which is exactly
+    /// what refusing `--belongs-to` outright exists to prevent.
+    #[test]
+    fn i18n_is_refused_for_nesting_recovered_from_the_parents_markers() {
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+
+        // No `belongs_to` here — exactly what a forgetful `--force --i18n`
+        // re-scaffold looks like on the command line.
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260429000000",
+            &ScaffoldOptions {
+                i18n: true,
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected a Config error, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--i18n") && msg.contains("posts.rs"),
+            "the refusal must name the flag and the evidence it was recovered from: {msg}"
+        );
     }
 
     /// AC2: per-field labels flow through one key per field, used by the index
