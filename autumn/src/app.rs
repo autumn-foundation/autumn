@@ -5433,7 +5433,16 @@ impl AppBuilder {
         // real boot panics on exactly that collision. `tasks` is carried
         // into this mode (destructured above) instead of discarded via `..`
         // specifically so this check can run.
-        if let Err(error) = merge_and_validate_task_names(&descriptors, tasks) {
+        //
+        // Merged against every registered retention descriptor, not just
+        // `descriptors` (which `--model` may have narrowed down to) (#1342
+        // review round 19): real boot has no filter concept, so a
+        // hand-declared task colliding with an UNSELECTED retention
+        // policy's generated name would still panic real boot, even though
+        // a `--model`-scoped dry run never counts that policy.
+        if let Err(error) =
+            merge_and_validate_task_names(&crate::retention::all_retention_descriptors(), tasks)
+        {
             eprintln!("retention dry-run: {error}");
             std::process::exit(1);
         }

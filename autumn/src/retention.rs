@@ -186,11 +186,15 @@ pub async fn run_retention_dry_run(
 /// --dry-run` needs a database connection at all *before* opening one — see
 /// `docs/guide/retention-sweeps.md`.
 ///
-/// Also runs each matched descriptor's `task_info()` — the same
-/// duration-parsing, model-dependents, and bind-limit validation real boot
-/// runs via `collect_retention_tasks()` — so a dry run is a faithful
-/// preview: a policy that would panic at boot panics here too, rather than
-/// reporting a misleadingly clean dry run (#1342 review round 14).
+/// Also runs `task_info()` on every registered descriptor — the same
+/// duration-parsing, model-dependents, bind-limit, and duplicate-task-name
+/// validation real boot runs via `collect_retention_tasks()` — so a dry run
+/// is a faithful preview: a policy that would panic at boot panics here
+/// too, rather than reporting a misleadingly clean dry run (#1342 review
+/// round 14). This validates the *complete* registry, not just the
+/// descriptors `model_filter` narrows down to (#1342 review round 19):
+/// real boot has no filter concept, so a `--model`-scoped dry run must
+/// still surface a collision between two other, unselected policies.
 ///
 /// # Errors
 ///
@@ -199,20 +203,50 @@ pub async fn run_retention_dry_run(
 ///
 /// # Panics
 ///
-/// Panics if any matched descriptor's declared `after`, `purge_deleted_after`,
-/// or `every` is not a valid duration string, if its model declares a
-/// model-side `dependent = ...` association, if its `batch_size` doesn't fit
-/// this backend's bind-parameter limit, or if two matched descriptors
-/// produce the same generated task name — the same conditions
-/// `collect_retention_tasks()` panics on at boot.
+/// Panics if any registered descriptor's declared `after`,
+/// `purge_deleted_after`, or `every` is not a valid duration string, if its
+/// model declares a model-side `dependent = ...` association, if its
+/// `batch_size` doesn't fit this backend's bind-parameter limit, or if two
+/// registered descriptors produce the same generated task name — the same
+/// conditions `collect_retention_tasks()` panics on at boot.
 #[doc(hidden)]
 pub fn resolve_retention_descriptors(
     model_filter: Option<&str>,
 ) -> AutumnResult<Vec<&'static RetentionSweepDescriptor>> {
+    let all: Vec<&RetentionSweepDescriptor> =
+        inventory::iter::<RetentionSweepDescriptor>().collect();
+    // Regression (#1342 review round 14): resolving descriptors alone
+    // doesn't validate them — the `every`/`after`/`purge_deleted_after`
+    // duration parsing, the model-dependents boot assert, and the
+    // backend-bind-limit assert all live inside `task_info()`, which this
+    // function never called. A policy with a bad `every` (e.g. "bogus")
+    // used to pass a dry run silently even though it panics the moment real
+    // boot calls `collect_retention_tasks()` (which does call `task_info()`
+    // on every descriptor). Run the exact same validation boot relies on —
+    // it's pure and DB-independent, so calling it here doesn't cost the
+    // "resolve before connecting" property this function exists for.
+    //
+    // Also apply the same duplicate-task-name check `collect_retention_tasks`
+    // applies (#1342 review round 15): calling `task_info()` alone catches a
+    // bad duration/dependents/bind-limit on any ONE descriptor, but not two
+    // different repositories that legitimately target the same table (see
+    // `live_broadcast.rs`) both declaring `retention(...)`.
+    //
+    // Validated against `all`, not the `--model`-narrowed `matches` below
+    // (#1342 review round 19): a filtered dry run used to validate only the
+    // selected descriptor, so a duplicate-name collision between two OTHER,
+    // unrelated policies not selected by `--model` went undetected — real
+    // boot's `collect_retention_tasks()` has no filter concept and walks
+    // every registered descriptor, so it would still panic on that
+    // collision regardless of what any dry run's `--model` happened to
+    // narrow to. Validate the complete registry up front, before narrowing
+    // to what `--model` actually selects for counting.
+    validate_resolved_descriptors(&all);
+
     let matches: Vec<&RetentionSweepDescriptor> = match model_filter {
-        None => inventory::iter::<RetentionSweepDescriptor>().collect(),
+        None => all,
         Some(filter) => {
-            let found: Vec<&RetentionSweepDescriptor> = inventory::iter::<RetentionSweepDescriptor>
+            let found: Vec<&RetentionSweepDescriptor> = all
                 .into_iter()
                 .filter(|descriptor| {
                     descriptor.model_name == filter || descriptor.table_name == filter
@@ -235,27 +269,21 @@ pub fn resolve_retention_descriptors(
             found
         }
     };
-    // Regression (#1342 review round 14): resolving descriptors alone
-    // doesn't validate them — the `every`/`after`/`purge_deleted_after`
-    // duration parsing, the model-dependents boot assert, and the
-    // backend-bind-limit assert all live inside `task_info()`, which this
-    // function never called. A policy with a bad `every` (e.g. "bogus")
-    // used to pass a dry run silently even though it panics the moment real
-    // boot calls `collect_retention_tasks()` (which does call `task_info()`
-    // on every descriptor). Run the exact same validation boot relies on —
-    // it's pure and DB-independent, so calling it here doesn't cost the
-    // "resolve before connecting" property this function exists for.
-    //
-    // Also apply the same duplicate-task-name check `collect_retention_tasks`
-    // applies (#1342 review round 15): calling `task_info()` alone catches a
-    // bad duration/dependents/bind-limit on any ONE descriptor, but not two
-    // different repositories that legitimately target the same table (see
-    // `live_broadcast.rs`) both declaring `retention(...)` — an unfiltered
-    // dry run without this would run both policies and report success,
-    // potentially double-counting the same rows, right up until real boot
-    // panics on the identical collision.
-    validate_resolved_descriptors(&matches);
     Ok(matches)
+}
+
+/// Every registered retention descriptor, unfiltered — the same set
+/// [`collect_retention_tasks`] walks at boot.
+///
+/// Used by the dry-run mode to validate hand-declared task-name collisions
+/// against the complete registry rather than whatever `--model` narrows the
+/// actual dry-run count to (#1342 review round 19) — the same reasoning
+/// [`resolve_retention_descriptors`] applies to its own duplicate-name
+/// check.
+#[doc(hidden)]
+#[must_use]
+pub fn all_retention_descriptors() -> Vec<&'static RetentionSweepDescriptor> {
+    inventory::iter::<RetentionSweepDescriptor>().collect()
 }
 
 /// Runs each descriptor's `task_info()` — the same duration/dependents/
@@ -565,6 +593,68 @@ mod tests {
             "resolve_retention_descriptors must call task_info() on every matched descriptor \
              to run the same validation collect_retention_tasks() runs at boot, so a dry run \
              cannot report success for a policy real boot would panic on"
+        );
+    }
+
+    // Regression (#1342 review round 19): a `--model`-filtered
+    // resolve_retention_descriptors call used to validate only the
+    // narrowed-down match, so a bad `every`/duplicate-name on some OTHER,
+    // unselected policy went undetected — real boot's
+    // collect_retention_tasks() has no filter concept and validates every
+    // registered descriptor, so it would still panic on that other
+    // policy's problem regardless of what any dry run's --model narrowed
+    // to. A separate counting fixture (not selected by the filter used
+    // below) proves the fix: filtering to one policy must still invoke
+    // task_info() on every OTHER registered descriptor too.
+    static UNSELECTED_TASK_INFO_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn unselected_counting_task_info() -> TaskInfo {
+        UNSELECTED_TASK_INFO_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        task_info_named("retention-sweep-__retention_runtime_test_unselected")
+    }
+
+    fn filter_selected_task_info() -> TaskInfo {
+        task_info_named("retention-sweep-__retention_runtime_test_filter_selected")
+    }
+
+    #[test]
+    fn resolve_retention_descriptors_validates_the_full_registry_even_when_filtered() {
+        struct SelectedFixture;
+        struct UnselectedFixture;
+        inventory::submit! {
+            RetentionSweepDescriptor {
+                model_name: "__RetentionRuntimeTestFilterSelected",
+                table_name: "__retention_runtime_test_filter_selected",
+                task_info: filter_selected_task_info,
+                dry_run: sample_dry_run,
+            }
+        }
+        inventory::submit! {
+            RetentionSweepDescriptor {
+                model_name: "__RetentionRuntimeTestFilterUnselected",
+                table_name: "__retention_runtime_test_unselected",
+                task_info: unselected_counting_task_info,
+                dry_run: sample_dry_run,
+            }
+        }
+        let _ = (SelectedFixture, UnselectedFixture);
+
+        let before = UNSELECTED_TASK_INFO_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let descriptors =
+            resolve_retention_descriptors(Some("__RetentionRuntimeTestFilterSelected"))
+                .expect("resolving a registered model must succeed");
+        let after = UNSELECTED_TASK_INFO_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            descriptors.len(),
+            1,
+            "the returned/counted set must still be narrowed to the --model filter"
+        );
+        assert!(
+            after > before,
+            "resolve_retention_descriptors must validate every registered descriptor, \
+             including ones --model does not select, since real boot has no filter concept"
         );
     }
 
