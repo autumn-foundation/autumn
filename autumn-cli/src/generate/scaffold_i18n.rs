@@ -1110,7 +1110,16 @@ pub(super) fn validator_bundle_path(project_root: &Path, env: &MacroEnv) -> Opti
         // own working directory, which for a cargo build is the workspace root.
         // The project root is that directory for a generated app.
         let path = project_root.join(file);
-        return path.is_file().then_some(path);
+        if path.is_file() {
+            return Some(path);
+        }
+        // FALLS THROUGH when that file is missing, exactly as the macro does:
+        // `locate_default_bundle` guards the explicit path with `is_file()` and
+        // then goes on to the locale candidate. Returning `None` here would
+        // read a stale or mistyped `AUTUMN_I18N_FILE` as "validation is off"
+        // while the macro quietly validates against `i18n/<locale>.ftl`, which
+        // then never receives the generated keys — a `compile_error!` per
+        // lookup.
     }
     let locale = env.default_locale.as_deref().unwrap_or("en");
     let path = project_root.join("i18n").join(format!("{locale}.ftl"));
@@ -3269,6 +3278,32 @@ mod tests {
             validator_bundle_path(root, &explicit),
             Some(root.join("custom.ftl"))
         );
+    }
+
+    /// A missing `AUTUMN_I18N_FILE` does not turn validation OFF — the macro
+    /// guards that path with `is_file()` and goes on to the locale candidate.
+    /// Stopping at the explicit path leaves the bundle it actually opens
+    /// without the generated keys.
+    #[test]
+    fn an_absent_explicit_bundle_falls_through_to_the_locale_candidate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("i18n")).unwrap();
+        std::fs::write(root.join("i18n").join("fr.ftl"), "a = A\n").unwrap();
+        let env = MacroEnv {
+            file: Some("gone.ftl".to_owned()),
+            default_locale: Some("fr".to_owned()),
+        };
+        assert_eq!(
+            validator_bundle_path(root, &env),
+            Some(root.join("i18n").join("fr.ftl"))
+        );
+        // And with neither present there is genuinely nothing to keep in step.
+        let nothing = MacroEnv {
+            file: Some("gone.ftl".to_owned()),
+            default_locale: Some("de".to_owned()),
+        };
+        assert_eq!(validator_bundle_path(root, &nothing), None);
     }
 
     /// A setting the macro needs on every build lives in `.cargo/config.toml`,
