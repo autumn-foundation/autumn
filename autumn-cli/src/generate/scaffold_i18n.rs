@@ -1219,16 +1219,21 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
         }
         return Some(out);
     }
-    if !main_rs.contains(STATIC_ANCHOR) {
-        return None;
-    }
-    let with_static = main_rs.replacen(
-        STATIC_ANCHOR,
-        &format!(
-            "{STATIC_ANCHOR}\n#[cfg(feature = \"embed-assets\")]\n\
-             static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = {macro_call};"
-        ),
-        1,
+    // Beside the PRODUCTION static, on the same production test the install
+    // below uses. A `#[cfg(test)]` module can declare its own fixture with the
+    // very same line, and a file-wide first-occurrence replacement then
+    // declared `EMBEDDED_LOCALES` inside that module while the install went —
+    // correctly — into the production builder: an `--embed` release that stops
+    // compiling on a symbol out of scope.
+    let static_at = real_offsets(main_rs, STATIC_ANCHOR)
+        .into_iter()
+        .find(|&at| !in_cfg_test(main_rs, at))?;
+    let end = static_at + STATIC_ANCHOR.len();
+    let with_static = format!(
+        "{}{STATIC_ANCHOR}\n#[cfg(feature = \"embed-assets\")]\n\
+         static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = {macro_call};{}",
+        &main_rs[..static_at],
+        &main_rs[end..]
     );
     insert_locale_install(&with_static)
 }
@@ -2065,50 +2070,96 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
 /// statement this call belongs to — so one branch being wired says nothing
 /// about its sibling.
 fn chain_already_wired(src: &str, at: usize) -> bool {
-    method_call_offsets(&src[chain_start(src, at)..at], ".i18n_auto")
-        .next()
-        .is_some()
+    method_called_before(src, at, ".i18n_auto")
 }
 
 /// Whether a bundle is already installed on the app the chain at `at` builds.
-///
-/// Scoped to the enclosing FUNCTION BODY up to `at`, not to the chain — and
-/// deliberately at a different granularity from [`chain_already_wired`] next to
-/// it, because the two fail in opposite directions:
-///
-///   * Missing a custom bundle inserts `.i18n_auto()`, which CLEARS the
-///     preloaded bundle and switches to a filesystem load — the app silently
-///     loses its embedded or TMS-backed translations, and panics at startup
-///     when nothing is on disk.
-///   * Seeing one that is not there skips the chain, and the caller warns.
-///
-/// So this one errs toward finding it. `let app = app.i18n(custom_bundle());`
-/// followed by `let app = app.routes(…);` is the ordinary builder rebinding —
-/// one app, two statements — and a chain-scoped search sees only the second and
-/// calls the app unbundled.
-///
-/// The BLOCK, though, not the whole function: a `main` that builds the app
-/// conditionally puts each branch in a block of its own, and one branch's
-/// hand-installed bundle genuinely says nothing about its sibling. Widening
-/// this to the enclosing `fn` would leave that sibling unwired and rendering
-/// raw keys. A block is exactly the scope a rebinding can cross and a branch
-/// cannot.
-///
-/// Stopping at `at` keeps a bundle installed AFTER the routes chain out of it:
-/// that one runs later and overrides `.i18n_auto()` rather than being clobbered
-/// by it, so there is nothing to protect.
 fn custom_bundle_before(src: &str, at: usize) -> bool {
-    let start = enclosing_block_start(src, at);
-    method_call_offsets(&src[start..at], ".i18n")
-        .next()
-        .is_some()
+    method_called_before(src, at, ".i18n")
+}
+
+/// Whether the app value reaching `at` has already flowed through `method`.
+///
+/// The value's LEXICAL FLOW, which is neither of the fixed windows tried
+/// before: the enclosing block up to `at`, then each ancestor level up to where
+/// the inner construct opened, and at every level only that level's own nesting
+/// depth. So an enclosing statement is visible and a sibling branch is not.
+///
+/// Each fixed window got a real layout wrong, and each got it wrong in the
+/// severe direction — inserting `.i18n_auto()`, which CLEARS a preloaded
+/// bundle and switches the app to a filesystem load, or skipping a chain that
+/// then renders raw keys:
+///
+///   * The CHAIN missed the ordinary rebinding `let app = app.i18n(bundle);`
+///     followed by `let app = app.routes(…);` — one app, two statements.
+///   * The enclosing FUNCTION read a sibling `if` branch's bundle as this
+///     branch's, and left the branch that had none unwired.
+///   * The enclosing BLOCK missed a bundle installed BEFORE an `if` and
+///     inherited by every branch, wiring `.i18n_auto()` into each of them.
+///
+/// Ascending the levels while skipping nested groups is exactly what separates
+/// "inherited from an enclosing statement" from "installed only in a sibling
+/// branch", so both questions this module asks about a chain can share it
+/// rather than trading one failure for another.
+///
+/// Stopping at `at` keeps a call made AFTER the routes chain out of it: that
+/// one runs later and overrides `.i18n_auto()` rather than being clobbered by
+/// it, so there is nothing to protect.
+fn method_called_before(src: &str, at: usize, method: &str) -> bool {
+    let mut end = at;
+    loop {
+        let start = enclosing_block_start(src, end);
+        if calls_at_own_depth(&src[start..end], method) {
+            return true;
+        }
+        if start == 0 {
+            return false;
+        }
+        // Step outside this level's opening delimiter and ask its parent. The
+        // delimiter itself bounds the parent's range, so the group just left is
+        // never re-read.
+        end = start - 1;
+    }
+}
+
+/// Whether `region` calls `method` at its OWN nesting level, rather than inside
+/// some group nested within it.
+///
+/// A `.i18n(…)` inside `.layer(from_fn(|| { … }))` is applied to whatever that
+/// closure builds, not to the app the region is assembling; counting it would
+/// read middleware internals as the app's own bundle.
+fn calls_at_own_depth(region: &str, method: &str) -> bool {
+    let marks = delimiter_marks(region, region.len());
+    let mut marks = marks.iter().peekable();
+    let mut depth = 0i32;
+    for at in method_call_offsets(region, method) {
+        while let Some(&&(offset, byte)) = marks.peek() {
+            if offset >= at {
+                break;
+            }
+            match byte {
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => depth -= 1,
+                _ => {}
+            }
+            marks.next();
+        }
+        if depth <= 0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Just inside the innermost block or delimiter pair containing `at`, or 0 at
 /// file scope.
 ///
-/// [`chain_start`] without its statement rule — the same balanced backward scan
-/// over real code, stopping one level out instead of at the previous `;`.
+/// A balanced backward scan over REAL code, so a `{` inside a string or comment
+/// is not mistaken for structure, and a nested
+/// `.layer(from_fn(|req, next| async move { … }))` — ordinary middleware — does
+/// not have its closing brace read as this level's opening one. A `;` is
+/// crossed rather than stopped at: statements are what an app value flows
+/// between.
 fn enclosing_block_start(src: &str, at: usize) -> usize {
     let mut depth = 0usize;
     for &(offset, byte) in delimiter_marks(src, at).iter().rev() {
@@ -2149,40 +2200,6 @@ fn delimiter_marks(src: &str, at: usize) -> Vec<(usize, u8)> {
     }
     marks.sort_unstable();
     marks
-}
-
-/// Start of the statement the call at `at` belongs to.
-///
-/// Balanced-delimiter aware, and reading only REAL code. A raw `rfind` for the
-/// previous `;` or `{` stops inside anything nested between the chain's start
-/// and this call — `.layer(from_fn(|req, next| async move { … }))` is ordinary
-/// middleware, and its closing brace looked like the statement boundary. That
-/// truncated chain hid an earlier `.i18n(...)`, so `.i18n_auto()` was inserted
-/// into a chain that already had a bundle and CLEARED it.
-fn chain_start(src: &str, at: usize) -> usize {
-    let mut depth = 0usize;
-    for &(offset, byte) in delimiter_marks(src, at).iter().rev() {
-        match byte {
-            b')' | b']' | b'}' => depth += 1,
-            b'(' | b'[' => {
-                // An unmatched opener encloses this call: the chain begins just
-                // inside it (an argument position, e.g. `foo(App::new()…)`).
-                let Some(next) = depth.checked_sub(1) else {
-                    return offset + 1;
-                };
-                depth = next;
-            }
-            b'{' => {
-                let Some(next) = depth.checked_sub(1) else {
-                    return offset + 1;
-                };
-                depth = next;
-            }
-            b';' if depth == 0 => return offset + 1,
-            _ => {}
-        }
-    }
-    0
 }
 
 #[cfg(test)]
@@ -3503,6 +3520,107 @@ mod tests {
             ensure_i18n_auto(main_rs),
             I18nAutoWiring::CustomBundle,
             "rebinding the same `app` is one builder, not two unrelated chains"
+        );
+    }
+
+    /// A bundle installed BEFORE an `if` is inherited by every branch. A
+    /// block-scoped search starts at the branch's own brace and cannot see it,
+    /// so `.i18n_auto()` went into each branch and CLEARED it.
+    #[test]
+    fn a_bundle_inherited_from_an_enclosing_statement_is_still_found() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = App::new().i18n(tms_bundle());\n",
+            "    let app = if flag {\n",
+            "        app.routes(routes![admin])\n",
+            "    } else {\n",
+            "        app.routes(routes![index])\n",
+            "    };\n",
+            "    app.serve();\n",
+            "}\n",
+        );
+        assert_eq!(
+            ensure_i18n_auto(main_rs),
+            I18nAutoWiring::CustomBundle,
+            "every branch continues the app the bundle was installed on"
+        );
+    }
+
+    /// The mirror of it, and the reason the search cannot simply widen to the
+    /// enclosing function: a bundle installed only in a SIBLING branch is not
+    /// this branch's, and reading it as one leaves this branch rendering raw
+    /// keys.
+    #[test]
+    fn a_sibling_branchs_bundle_is_still_not_this_branchs() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = if flag {\n",
+            "        App::new().i18n(tms_bundle()).routes(routes![admin])\n",
+            "    } else {\n",
+            "        App::new().routes(routes![index])\n",
+            "    };\n",
+            "}\n",
+        );
+        let I18nAutoWiring::Wired(out) = ensure_i18n_auto(main_rs) else {
+            panic!("the plain branch must still be wired");
+        };
+        assert_eq!(
+            out.matches(".i18n_auto()").count(),
+            1,
+            "exactly the unconfigured branch gets it:\n{out}"
+        );
+        let custom_at = out.find(".i18n(tms_bundle())").unwrap();
+        let auto_at = out.find(".i18n_auto()").unwrap();
+        assert!(auto_at > custom_at, "wired the wrong branch:\n{out}");
+    }
+
+    /// The already-wired question is asked the same way, so an inherited
+    /// `.i18n_auto()` is not wired a second time.
+    #[test]
+    fn an_inherited_auto_wiring_is_not_repeated() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let app = App::new().i18n_auto();\n",
+            "    let app = app.routes(routes![index]);\n",
+            "    app.serve();\n",
+            "}\n",
+        );
+        assert_eq!(
+            ensure_i18n_auto(main_rs),
+            I18nAutoWiring::Wired(main_rs.to_owned()),
+            "the app already loads its bundle; nothing to add"
+        );
+    }
+
+    /// A `#[cfg(test)]` fixture can declare the very same `EMBEDDED_STATIC`
+    /// line. Writing the locale static beside the FIRST one puts it in the test
+    /// module while the install goes into production — an `--embed` release
+    /// that stops compiling on a symbol out of scope.
+    #[test]
+    fn the_locale_static_is_declared_beside_the_production_one() {
+        let main_rs = concat!(
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "}\n",
+            "\n",
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "\n",
+            "fn main() {\n",
+            "    let app = App::new().routes(routes![index]);\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "}\n",
+        );
+        let out = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
+        let mod_end = out
+            .find("}\n\nstatic EMBEDDED_STATIC")
+            .expect("test module");
+        let locales_at = out
+            .find("static EMBEDDED_LOCALES")
+            .expect("the static is declared");
+        assert!(
+            locales_at > mod_end,
+            "the locale static must sit outside `#[cfg(test)]`:\n{out}"
         );
     }
 
