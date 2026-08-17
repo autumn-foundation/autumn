@@ -3,8 +3,8 @@ test integration::offline_sync_push_batching_perf::offline_sync_push_batching_pr
 === pg_stat_statements: push batch of 50 changes ===
 -- top by calls --
 calls=1      buffers=0      SELECT change_id, version, resolved_row FROM autumn_sync_applied WHERE scope = $1 AND device_id = $2 AND change_id = ANY($3)
-calls=1      buffers=62     SELECT nextval($2) AS version FROM generate_series($3, $1)
 calls=1      buffers=593    INSERT INTO autumn_sync_rows (scope, collection, pk, payload, version, deleted, updated_at, device_id, created_version) SELECT $1, t.* FROM UNNEST( $2::text[], $3::text[], $4::jsonb[], $5::bigint[], $6::bool[], $7::timestamptz[], $8::text[], $9::bigint[] ) AS t(collection, pk, payload, version, deleted, updated_at, device_id, created_version) ON CONFLICT (scope, collection, pk) DO UPDATE SET payload = excluded.payload, version = excluded.version, deleted = excluded.deleted, updated_at = excluded.updated_at, device_id = excluded.device_id, created_version = excluded.created_version
+calls=1      buffers=62     SELECT nextval($2) AS version FROM generate_series($3, $1) WITH ORDINALITY AS gs(n, ord) ORDER BY gs.ord
 calls=1      buffers=225    SELECT collection, pk, payload, version, deleted, updated_at, device_id, created_version FROM autumn_sync_rows WHERE scope = $1 AND (collection, pk) IN ( SELECT * FROM UNNEST($2::text[], $3::text[]) ) FOR UPDATE
 calls=1      buffers=101    INSERT INTO autumn_sync_applied (scope, device_id, change_id, version, resolved_row) SELECT $1, $2, t.change_id, t.version, t.resolved_row FROM UNNEST($3::text[], $4::bigint[], $5::jsonb[]) AS t(change_id, version, resolved_row)
 calls=1      buffers=0      SELECT horizon AS version FROM autumn_sync_horizons WHERE scope = $1
@@ -12,7 +12,7 @@ calls=1      buffers=0      SELECT horizon AS version FROM autumn_sync_horizons 
 buffers=593    calls=1      INSERT INTO autumn_sync_rows (scope, collection, pk, payload, version, deleted, updated_at, device_id, created_version) SELECT $1, t.* FROM UNNEST( $2::text[], $3::text[], $4::jsonb[], $5::bigint[], $6::bool[], $7::timestamptz[], $8::text[], $9::bigint[] ) AS t(collection, pk, payload, version, deleted, updated_at, device_id, created_version) ON CONFLICT (scope, collection, pk) DO UPDATE SET payload = excluded.payload, version = excluded.version, deleted = excluded.deleted, updated_at = excluded.updated_at, device_id = excluded.device_id, created_version = excluded.created_version
 buffers=225    calls=1      SELECT collection, pk, payload, version, deleted, updated_at, device_id, created_version FROM autumn_sync_rows WHERE scope = $1 AND (collection, pk) IN ( SELECT * FROM UNNEST($2::text[], $3::text[]) ) FOR UPDATE
 buffers=101    calls=1      INSERT INTO autumn_sync_applied (scope, device_id, change_id, version, resolved_row) SELECT $1, $2, t.change_id, t.version, t.resolved_row FROM UNNEST($3::text[], $4::bigint[], $5::jsonb[]) AS t(change_id, version, resolved_row)
-buffers=62     calls=1      SELECT nextval($2) AS version FROM generate_series($3, $1)
+buffers=62     calls=1      SELECT nextval($2) AS version FROM generate_series($3, $1) WITH ORDINALITY AS gs(n, ord) ORDER BY gs.ord
 buffers=0      calls=1      SELECT change_id, version, resolved_row FROM autumn_sync_applied WHERE scope = $1 AND device_id = $2 AND change_id = ANY($3)
 buffers=0      calls=1      SELECT horizon AS version FROM autumn_sync_horizons WHERE scope = $1
 TOTAL sync-table statement calls=6 buffers=981 (this batch, all statement shapes)
@@ -69,19 +69,19 @@ RowDump { collection: "notes", pk: "pk-00000037", payload: Some("{\"p\": 1, \"ed
 === pg_stat_statements: push batch of 250 changes ===
 -- top by calls --
 calls=1      buffers=1      SELECT change_id, version, resolved_row FROM autumn_sync_applied WHERE scope = $1 AND device_id = $2 AND change_id = ANY($3)
-calls=1      buffers=262    SELECT nextval($2) AS version FROM generate_series($3, $1)
-calls=1      buffers=2912   INSERT INTO autumn_sync_rows (scope, collection, pk, payload, version, deleted, updated_at, device_id, created_version) SELECT $1, t.* FROM UNNEST( $2::text[], $3::text[], $4::jsonb[], $5::bigint[], $6::bool[], $7::timestamptz[], $8::text[], $9::bigint[] ) AS t(collection, pk, payload, version, deleted, updated_at, device_id, created_version) ON CONFLICT (scope, collection, pk) DO UPDATE SET payload = excluded.payload, version = excluded.version, deleted = excluded.deleted, updated_at = excluded.updated_at, device_id = excluded.device_id, created_version = excluded.created_version
+calls=1      buffers=2914   INSERT INTO autumn_sync_rows (scope, collection, pk, payload, version, deleted, updated_at, device_id, created_version) SELECT $1, t.* FROM UNNEST( $2::text[], $3::text[], $4::jsonb[], $5::bigint[], $6::bool[], $7::timestamptz[], $8::text[], $9::bigint[] ) AS t(collection, pk, payload, version, deleted, updated_at, device_id, created_version) ON CONFLICT (scope, collection, pk) DO UPDATE SET payload = excluded.payload, version = excluded.version, deleted = excluded.deleted, updated_at = excluded.updated_at, device_id = excluded.device_id, created_version = excluded.created_version
+calls=1      buffers=262    SELECT nextval($2) AS version FROM generate_series($3, $1) WITH ORDINALITY AS gs(n, ord) ORDER BY gs.ord
 calls=1      buffers=1132   SELECT collection, pk, payload, version, deleted, updated_at, device_id, created_version FROM autumn_sync_rows WHERE scope = $1 AND (collection, pk) IN ( SELECT * FROM UNNEST($2::text[], $3::text[]) ) FOR UPDATE
 calls=1      buffers=655    INSERT INTO autumn_sync_applied (scope, device_id, change_id, version, resolved_row) SELECT $1, $2, t.change_id, t.version, t.resolved_row FROM UNNEST($3::text[], $4::bigint[], $5::jsonb[]) AS t(change_id, version, resolved_row)
 calls=1      buffers=0      SELECT horizon AS version FROM autumn_sync_horizons WHERE scope = $1
 -- top by buffers --
-buffers=2912   calls=1      INSERT INTO autumn_sync_rows (scope, collection, pk, payload, version, deleted, updated_at, device_id, created_version) SELECT $1, t.* FROM UNNEST( $2::text[], $3::text[], $4::jsonb[], $5::bigint[], $6::bool[], $7::timestamptz[], $8::text[], $9::bigint[] ) AS t(collection, pk, payload, version, deleted, updated_at, device_id, created_version) ON CONFLICT (scope, collection, pk) DO UPDATE SET payload = excluded.payload, version = excluded.version, deleted = excluded.deleted, updated_at = excluded.updated_at, device_id = excluded.device_id, created_version = excluded.created_version
+buffers=2914   calls=1      INSERT INTO autumn_sync_rows (scope, collection, pk, payload, version, deleted, updated_at, device_id, created_version) SELECT $1, t.* FROM UNNEST( $2::text[], $3::text[], $4::jsonb[], $5::bigint[], $6::bool[], $7::timestamptz[], $8::text[], $9::bigint[] ) AS t(collection, pk, payload, version, deleted, updated_at, device_id, created_version) ON CONFLICT (scope, collection, pk) DO UPDATE SET payload = excluded.payload, version = excluded.version, deleted = excluded.deleted, updated_at = excluded.updated_at, device_id = excluded.device_id, created_version = excluded.created_version
 buffers=1132   calls=1      SELECT collection, pk, payload, version, deleted, updated_at, device_id, created_version FROM autumn_sync_rows WHERE scope = $1 AND (collection, pk) IN ( SELECT * FROM UNNEST($2::text[], $3::text[]) ) FOR UPDATE
 buffers=655    calls=1      INSERT INTO autumn_sync_applied (scope, device_id, change_id, version, resolved_row) SELECT $1, $2, t.change_id, t.version, t.resolved_row FROM UNNEST($3::text[], $4::bigint[], $5::jsonb[]) AS t(change_id, version, resolved_row)
-buffers=262    calls=1      SELECT nextval($2) AS version FROM generate_series($3, $1)
+buffers=262    calls=1      SELECT nextval($2) AS version FROM generate_series($3, $1) WITH ORDINALITY AS gs(n, ord) ORDER BY gs.ord
 buffers=1      calls=1      SELECT change_id, version, resolved_row FROM autumn_sync_applied WHERE scope = $1 AND device_id = $2 AND change_id = ANY($3)
 buffers=0      calls=1      SELECT horizon AS version FROM autumn_sync_horizons WHERE scope = $1
-TOTAL sync-table statement calls=6 buffers=4962 (this batch, all statement shapes)
+TOTAL sync-table statement calls=6 buffers=4964 (this batch, all statement shapes)
 -- row dump (new/newdup pks), 54 rows --
 RowDump { collection: "notes", pk: "new-device-250-000000", payload: Some("{\"k\": 0, \"edit\": \"insert\"}"), version: 20211, deleted: false, device_id: "device-250", created_version: 20211 }
 RowDump { collection: "notes", pk: "new-device-250-000001", payload: Some("{\"k\": 1, \"edit\": \"insert\"}"), version: 20212, deleted: false, device_id: "device-250", created_version: 20212 }
@@ -324,19 +324,19 @@ RowDump { collection: "tags", pk: "pk-00005191", payload: Some("{\"p\": 9, \"edi
 === pg_stat_statements: push batch of 1000 changes ===
 -- top by calls --
 calls=1      buffers=4      SELECT change_id, version, resolved_row FROM autumn_sync_applied WHERE scope = $1 AND device_id = $2 AND change_id = ANY($3)
-calls=1      buffers=1012   SELECT nextval($2) AS version FROM generate_series($3, $1)
-calls=1      buffers=11709  INSERT INTO autumn_sync_rows (scope, collection, pk, payload, version, deleted, updated_at, device_id, created_version) SELECT $1, t.* FROM UNNEST( $2::text[], $3::text[], $4::jsonb[], $5::bigint[], $6::bool[], $7::timestamptz[], $8::text[], $9::bigint[] ) AS t(collection, pk, payload, version, deleted, updated_at, device_id, created_version) ON CONFLICT (scope, collection, pk) DO UPDATE SET payload = excluded.payload, version = excluded.version, deleted = excluded.deleted, updated_at = excluded.updated_at, device_id = excluded.device_id, created_version = excluded.created_version
+calls=1      buffers=11718  INSERT INTO autumn_sync_rows (scope, collection, pk, payload, version, deleted, updated_at, device_id, created_version) SELECT $1, t.* FROM UNNEST( $2::text[], $3::text[], $4::jsonb[], $5::bigint[], $6::bool[], $7::timestamptz[], $8::text[], $9::bigint[] ) AS t(collection, pk, payload, version, deleted, updated_at, device_id, created_version) ON CONFLICT (scope, collection, pk) DO UPDATE SET payload = excluded.payload, version = excluded.version, deleted = excluded.deleted, updated_at = excluded.updated_at, device_id = excluded.device_id, created_version = excluded.created_version
+calls=1      buffers=1012   SELECT nextval($2) AS version FROM generate_series($3, $1) WITH ORDINALITY AS gs(n, ord) ORDER BY gs.ord
 calls=1      buffers=4560   SELECT collection, pk, payload, version, deleted, updated_at, device_id, created_version FROM autumn_sync_rows WHERE scope = $1 AND (collection, pk) IN ( SELECT * FROM UNNEST($2::text[], $3::text[]) ) FOR UPDATE
 calls=1      buffers=3055   INSERT INTO autumn_sync_applied (scope, device_id, change_id, version, resolved_row) SELECT $1, $2, t.change_id, t.version, t.resolved_row FROM UNNEST($3::text[], $4::bigint[], $5::jsonb[]) AS t(change_id, version, resolved_row)
 calls=1      buffers=0      SELECT horizon AS version FROM autumn_sync_horizons WHERE scope = $1
 -- top by buffers --
-buffers=11709  calls=1      INSERT INTO autumn_sync_rows (scope, collection, pk, payload, version, deleted, updated_at, device_id, created_version) SELECT $1, t.* FROM UNNEST( $2::text[], $3::text[], $4::jsonb[], $5::bigint[], $6::bool[], $7::timestamptz[], $8::text[], $9::bigint[] ) AS t(collection, pk, payload, version, deleted, updated_at, device_id, created_version) ON CONFLICT (scope, collection, pk) DO UPDATE SET payload = excluded.payload, version = excluded.version, deleted = excluded.deleted, updated_at = excluded.updated_at, device_id = excluded.device_id, created_version = excluded.created_version
+buffers=11718  calls=1      INSERT INTO autumn_sync_rows (scope, collection, pk, payload, version, deleted, updated_at, device_id, created_version) SELECT $1, t.* FROM UNNEST( $2::text[], $3::text[], $4::jsonb[], $5::bigint[], $6::bool[], $7::timestamptz[], $8::text[], $9::bigint[] ) AS t(collection, pk, payload, version, deleted, updated_at, device_id, created_version) ON CONFLICT (scope, collection, pk) DO UPDATE SET payload = excluded.payload, version = excluded.version, deleted = excluded.deleted, updated_at = excluded.updated_at, device_id = excluded.device_id, created_version = excluded.created_version
 buffers=4560   calls=1      SELECT collection, pk, payload, version, deleted, updated_at, device_id, created_version FROM autumn_sync_rows WHERE scope = $1 AND (collection, pk) IN ( SELECT * FROM UNNEST($2::text[], $3::text[]) ) FOR UPDATE
 buffers=3055   calls=1      INSERT INTO autumn_sync_applied (scope, device_id, change_id, version, resolved_row) SELECT $1, $2, t.change_id, t.version, t.resolved_row FROM UNNEST($3::text[], $4::bigint[], $5::jsonb[]) AS t(change_id, version, resolved_row)
-buffers=1012   calls=1      SELECT nextval($2) AS version FROM generate_series($3, $1)
+buffers=1012   calls=1      SELECT nextval($2) AS version FROM generate_series($3, $1) WITH ORDINALITY AS gs(n, ord) ORDER BY gs.ord
 buffers=4      calls=1      SELECT change_id, version, resolved_row FROM autumn_sync_applied WHERE scope = $1 AND device_id = $2 AND change_id = ANY($3)
 buffers=0      calls=1      SELECT horizon AS version FROM autumn_sync_horizons WHERE scope = $1
-TOTAL sync-table statement calls=6 buffers=20340 (this batch, all statement shapes)
+TOTAL sync-table statement calls=6 buffers=20349 (this batch, all statement shapes)
 -- row dump (new/newdup pks), 210 rows --
 RowDump { collection: "notes", pk: "new-device-1000-000000", payload: Some("{\"k\": 0, \"edit\": \"insert\"}"), version: 20951, deleted: false, device_id: "device-1000", created_version: 20951 }
 RowDump { collection: "notes", pk: "new-device-1000-000001", payload: Some("{\"k\": 1, \"edit\": \"insert\"}"), version: 20952, deleted: false, device_id: "device-1000", created_version: 20952 }
@@ -1306,31 +1306,31 @@ TOTAL sync-table statement calls=2 buffers=8 (this batch, all statement shapes)
 
 === EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): dedup check (typical case: miss) ===
 SELECT version, resolved_row FROM autumn_sync_applied WHERE scope = 'global' AND device_id = 'device-1000' AND change_id = 'device-1000-chg-000001'
-Index Scan using autumn_sync_applied_pkey on public.autumn_sync_applied  (cost=0.28..8.30 rows=1 width=40) (actual time=0.170..0.171 rows=1 loops=1)
+Index Scan using autumn_sync_applied_pkey on public.autumn_sync_applied  (cost=0.28..8.30 rows=1 width=40) (actual time=0.096..0.097 rows=1 loops=1)
   Output: version, resolved_row
   Index Cond: ((autumn_sync_applied.scope = 'global'::text) AND (autumn_sync_applied.device_id = 'device-1000'::text) AND (autumn_sync_applied.change_id = 'device-1000-chg-000001'::text))
   Buffers: shared hit=3
 Query Identifier: 5474131966345183344
 Planning:
   Buffers: shared hit=17
-Planning Time: 0.343 ms
-Execution Time: 0.207 ms
+Planning Time: 0.264 ms
+Execution Time: 0.120 ms
 
 === EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): current-row fetch FOR UPDATE ===
 SELECT collection, pk, payload, version, deleted, updated_at, device_id, created_version FROM autumn_sync_rows WHERE scope = 'global' AND collection = 'notes' AND pk = 'pk-00010001' FOR UPDATE
-LockRows  (cost=0.41..8.44 rows=1 width=317) (actual time=0.050..0.056 rows=1 loops=1)
+LockRows  (cost=0.41..8.44 rows=1 width=317) (actual time=0.045..0.050 rows=1 loops=1)
   Output: collection, pk, payload, version, deleted, updated_at, device_id, created_version, ctid
   Buffers: shared hit=7
-  ->  Index Scan using autumn_sync_rows_pkey on public.autumn_sync_rows  (cost=0.41..8.43 rows=1 width=317) (actual time=0.032..0.037 rows=1 loops=1)
+  ->  Index Scan using autumn_sync_rows_pkey on public.autumn_sync_rows  (cost=0.41..8.43 rows=1 width=317) (actual time=0.032..0.036 rows=1 loops=1)
         Output: collection, pk, payload, version, deleted, updated_at, device_id, created_version, ctid
         Index Cond: ((autumn_sync_rows.scope = 'global'::text) AND (autumn_sync_rows.collection = 'notes'::text) AND (autumn_sync_rows.pk = 'pk-00010001'::text))
         Buffers: shared hit=6
 Query Identifier: -3770326553474516971
 Planning:
   Buffers: shared hit=3
-Planning Time: 0.134 ms
-Execution Time: 0.124 ms
+Planning Time: 0.124 ms
+Execution Time: 0.078 ms
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1573 filtered out; finished in 6.27s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1573 filtered out; finished in 4.77s
 

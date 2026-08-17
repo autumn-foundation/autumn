@@ -1085,6 +1085,14 @@ where
 /// calls to `next()` on the returned iterator matches the order `nextval()`
 /// would have assigned them one at a time (ascending), so a caller that
 /// consumes them in request order reproduces the old per-change assignment.
+///
+/// The `ORDER BY gs.ord` is load-bearing, not cosmetic: a plain `SELECT`
+/// over a `FROM` clause has no guaranteed row order without it, so nothing
+/// would otherwise pin "first row back" to "first `nextval()` call" — and a
+/// caller that assumes that pairing (as this one does) needs it to be exact
+/// (`nextval()` is `PARALLEL UNSAFE`, so this can't actually be parallelized
+/// today, but the explicit ordinal makes that a documented guarantee rather
+/// than an accident of the current planner).
 fn pg_next_versions<C>(conn: &mut C, n: usize) -> Result<Vec<Version>, diesel::result::Error>
 where
     C: diesel::connection::LoadConnection<Backend = diesel::pg::Pg>,
@@ -1092,10 +1100,14 @@ where
     if n == 0 {
         return Ok(Vec::new());
     }
-    sql_query("SELECT nextval('autumn_sync_version_seq') AS version FROM generate_series(1, $1)")
-        .bind::<BigInt, _>(i64::try_from(n).unwrap_or(i64::MAX))
-        .load::<PgVersionRecord>(conn)
-        .map(|records| records.into_iter().map(|record| record.version).collect())
+    sql_query(
+        "SELECT nextval('autumn_sync_version_seq') AS version \
+         FROM generate_series(1, $1) WITH ORDINALITY AS gs(n, ord) \
+         ORDER BY gs.ord",
+    )
+    .bind::<BigInt, _>(i64::try_from(n).unwrap_or(i64::MAX))
+    .load::<PgVersionRecord>(conn)
+    .map(|records| records.into_iter().map(|record| record.version).collect())
 }
 
 /// The scope's tombstone GC horizon — `0` when no tombstone of that scope
