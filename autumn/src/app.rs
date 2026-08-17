@@ -5432,7 +5432,14 @@ impl AppBuilder {
         )
         .await;
 
-        let database = setup_database(
+        // A `match`, not `.unwrap_or_else` (#1342 review round 15): a
+        // managed-Postgres provider may have already started its postmaster
+        // by the time `setup_database` fails (e.g. `pool_size = 0` failing
+        // the deadpool build in `create_pool`, after the postmaster is up).
+        // `emergency_stop_async()` is async, and `.unwrap_or_else`'s closure
+        // can't `.await` — matching the same restructuring every later exit
+        // in this function already uses (#1342 review round 6).
+        let database = match setup_database(
             &config,
             migrations,
             pool_provider_factory,
@@ -5442,10 +5449,15 @@ impl AppBuilder {
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
-        .unwrap_or_else(|error| {
-            eprintln!("{error}");
-            std::process::exit(1);
-        });
+        {
+            Ok(database) => database,
+            Err(error) => {
+                eprintln!("{error}");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+        };
 
         let state = build_state(
             &config,
