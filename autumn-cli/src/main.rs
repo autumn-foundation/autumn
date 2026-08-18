@@ -257,6 +257,38 @@ struct Cli {
     command: Commands,
 }
 
+/// Arguments for [`Commands::Upgrade`].
+///
+/// A separate `Args` struct rather than inline variant fields, deliberately.
+/// clap's derive builds every inline field of every variant inside one
+/// `Commands::augment_subcommands` frame, and with this many subcommands that
+/// frame is within a kilobyte of libtest's 2 MiB thread stack — close enough
+/// that a codegen difference between two rustc builds decides whether the
+/// argument-parsing tests overflow. An `Args` struct moves this command's share
+/// into `UpgradeArgs::augment_args`, which gets its own frame and pops.
+#[derive(clap::Args, Debug)]
+pub struct UpgradeArgs {
+    /// Project directory to migrate (defaults to the current directory).
+    #[arg(value_name = "PATH", default_value = ".")]
+    pub path: String,
+    /// Release this app is upgrading from. Defaults to the `autumn-web`
+    /// requirement recorded in the project's `Cargo.toml`.
+    #[arg(long, value_name = "VERSION")]
+    pub from: Option<String>,
+    /// Release to upgrade to. Defaults to this CLI's own version.
+    #[arg(long, value_name = "VERSION")]
+    pub to: Option<String>,
+    /// Write the rewrites. Without it the command only previews them.
+    #[arg(long)]
+    pub apply: bool,
+    /// Emit the machine-readable report instead of the human one.
+    #[arg(long)]
+    pub json: bool,
+    /// List the shipped app-code migrations and exit without scanning.
+    #[arg(long = "list-migrations")]
+    pub list_migrations: bool,
+}
+
 /// Available subcommands.
 #[derive(Subcommand)]
 enum Commands {
@@ -395,27 +427,7 @@ enum Commands {
     ///   autumn upgrade --list-migrations   # what ships today
     #[allow(clippy::doc_markdown)]
     #[command(verbatim_doc_comment)]
-    Upgrade {
-        /// Project directory to migrate (defaults to the current directory).
-        #[arg(value_name = "PATH", default_value = ".")]
-        path: String,
-        /// Release this app is upgrading from. Defaults to the `autumn-web`
-        /// requirement recorded in the project's `Cargo.toml`.
-        #[arg(long, value_name = "VERSION")]
-        from: Option<String>,
-        /// Release to upgrade to. Defaults to this CLI's own version.
-        #[arg(long, value_name = "VERSION")]
-        to: Option<String>,
-        /// Write the rewrites. Without it the command only previews them.
-        #[arg(long)]
-        apply: bool,
-        /// Emit the machine-readable report instead of the human one.
-        #[arg(long)]
-        json: bool,
-        /// List the shipped app-code migrations and exit without scanning.
-        #[arg(long = "list-migrations")]
-        list_migrations: bool,
-    },
+    Upgrade(UpgradeArgs),
     /// Run or inspect database migrations
     Migrate {
         #[command(subcommand)]
@@ -3471,14 +3483,14 @@ fn run_command(command: Commands) {
                 std::process::exit(1);
             }
         }
-        Commands::Upgrade {
+        Commands::Upgrade(UpgradeArgs {
             path,
             from,
             to,
             apply,
             json,
             list_migrations,
-        } => {
+        }) => {
             let code = upgrade::run_in(
                 std::path::Path::new(&path),
                 &upgrade::UpgradeOptions {

@@ -597,17 +597,25 @@ pub fn generated_repository_types(source: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut found = Vec::new();
-    collect_repository_types(&stream, &mut found);
+    collect_repository_types(&stream, Context::Code, &mut found);
     found
 }
 
-fn collect_repository_types(stream: &TokenStream, found: &mut Vec<String>) {
+/// Only declarations in ordinary code count.
+///
+/// Tokens inside a macro definition or invocation may never be expanded, or may
+/// be consumed as data — the same reason call sites there are reported rather
+/// than rewritten. Reading a declaration out of one would let a template that
+/// merely mentions `#[repository] trait AuditRepository` verify an unrelated
+/// `PgAuditRepository` elsewhere, which is the wrong rewrite this verification
+/// exists to prevent.
+fn collect_repository_types(stream: &TokenStream, context: Context, found: &mut Vec<String>) {
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
     for (index, tree) in trees.iter().enumerate() {
         match tree {
             // `# [repository ...]` — the attribute is a `#` followed by a
             // bracket group whose first token is the macro's name.
-            TokenTree::Punct(punct) if punct.as_char() == '#' => {
+            TokenTree::Punct(punct) if punct.as_char() == '#' && context == Context::Code => {
                 let Some(TokenTree::Group(group)) = trees.get(index + 1) else {
                     continue;
                 };
@@ -621,7 +629,11 @@ fn collect_repository_types(stream: &TokenStream, found: &mut Vec<String>) {
                     found.push(format!("Pg{trait_name}"));
                 }
             }
-            TokenTree::Group(group) => collect_repository_types(&group.stream(), found),
+            TokenTree::Group(group) => collect_repository_types(
+                &group.stream(),
+                group_context(&trees, index, context),
+                found,
+            ),
             _ => {}
         }
     }
@@ -858,6 +870,25 @@ mod tests {
         // A file that does not parse contributes nothing rather than failing
         // the whole scan; it is reported as skipped on its own account.
         assert!(generated_repository_types("fn f( {").is_empty());
+    }
+
+    #[test]
+    fn a_trait_inside_macro_input_is_not_evidence() {
+        // Tokens inside a macro definition or invocation may never be expanded,
+        // or may be consumed as data. Treating them as declarations would let a
+        // template that merely *mentions* `#[repository] trait AuditRepository`
+        // verify an unrelated `PgAuditRepository` elsewhere in the app — the
+        // exact wrong rewrite the verification exists to prevent.
+        assert!(
+            generated_repository_types(
+                "macro_rules! template { () => { #[repository] trait AuditRepository {} } }"
+            )
+            .is_empty()
+        );
+        assert!(
+            generated_repository_types("declare! { #[repository] trait AuditRepository {} }")
+                .is_empty()
+        );
     }
 
     #[test]
