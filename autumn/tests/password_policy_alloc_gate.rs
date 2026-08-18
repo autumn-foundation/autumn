@@ -33,7 +33,10 @@ fn workload() -> Vec<(&'static str, [&'static str; 2])> {
         ("password123", ["alice@example.com", "alice"]),
         ("Tr0ub4dour&3-Staple-Horse", ["bob@example.com", "bob"]),
         ("qwerty", ["carol@example.com", "carol"]),
-        ("Correct-Horse-Battery-Staple-9", ["dave@example.com", "dave"]),
+        (
+            "Correct-Horse-Battery-Staple-9",
+            ["dave@example.com", "dave"],
+        ),
         ("héllo-wörld-42", ["eve@example.com", "eve"]),
         ("N0t-A-C0mm0n-Passphrase!", ["frank@example.com", "frank"]),
         ("letmein2024", ["grace@example.com", "grace"]),
@@ -41,7 +44,7 @@ fn workload() -> Vec<(&'static str, [&'static str; 2])> {
     ]
 }
 
-fn policy() -> PasswordPolicy {
+const fn policy() -> PasswordPolicy {
     PasswordPolicy::new(8, true, BreachCheck::Off)
 }
 
@@ -85,21 +88,26 @@ fn validate_password_allocations_on_a_signup_workload() {
         info.count_total, info.bytes_total
     );
 
-    // Baseline (this workload, `reject_common = true`, 2-string context,
-    // debug profile, deterministic across runs): 3,401 blocks / 67,648 bytes
-    // for 800 calls (4 blocks / 84 bytes per call, average). The password gets
-    // `.to_lowercase()`'d twice per call — once in the common-corpus check,
-    // once more inside `is_similar_to_context` — for the same string.
+    // This workload, `reject_common = true`, 2-string context, debug profile,
+    // deterministic across runs: 3,401 blocks / 67,648 bytes for 800 calls
+    // before the fix below (the password got `.to_lowercase()`'d twice per
+    // call — once in the common-corpus check, once more inside
+    // `is_similar_to_context` — for the same string), **2,601 / 53,772**
+    // after sharing the one lowercase between both checks (-23.5% blocks /
+    // -20.5% bytes). The ceiling sits at the current measurement plus a little
+    // headroom for feature-set variance, same convention as
+    // `config_alloc_gate`'s ceilings; a failure a hair over the line means
+    // re-measure and re-derive, not nudge upwards.
     assert!(
-        info.count_total <= 3_401,
+        info.count_total <= 2_700,
         "validate_password allocated {} blocks over {calls} calls, over the \
-         3,401-block baseline ceiling",
+         2,700-block ceiling (2,601 measured; 3,401 was the pre-fix baseline)",
         info.count_total,
     );
     assert!(
-        info.bytes_total <= 67_648,
+        info.bytes_total <= 56_000,
         "validate_password allocated {} bytes over {calls} calls, over the \
-         67,648-byte baseline ceiling",
+         56,000-byte ceiling (53,772 measured; 67,648 was the pre-fix baseline)",
         info.bytes_total,
     );
 }
