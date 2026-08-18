@@ -8500,3 +8500,108 @@ fn codemod_gate_does_not_accept_a_guide_only_id_as_a_codemod() {
         gate_report(&output),
     );
 }
+
+#[test]
+fn codemod_gate_rejects_an_id_that_merely_starts_with_a_shipped_one() {
+    // Codex review on #2231: the known-id test was `index(visible, id)`, a bare
+    // substring, so a guide could name `0.7.0-with-pool-extra` — a codemod
+    // nobody wrote — and be vouched for by the shipped `0.7.0-with-pool`.
+    let mut guide = guide_with_breaking_change(
+        "0.7.0",
+        "Repository: `with_pool` is renamed to `with_pool_untracked`",
+        "**Automation:** `auto` — `autumn upgrade` rewrites every call site; \
+         codemod `0.7.0-with-pool-extra`.",
+    );
+    guide = guide.replace(
+        "- **Status:** performed 2026-01-01",
+        "- **Codemod:** `autumn upgrade --apply` covered the rename.\n\
+         - **Status:** performed 2026-01-01",
+    );
+    let tmp = gate_fixture_with_guide("0.7.0", &guide);
+    write_fixture_registry(&tmp, &["0.7.0-with-pool"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a longer id is a different codemod, not the shipped one\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("names no shipped codemod"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_accepts_a_shipped_id_that_is_a_prefix_of_a_longer_one() {
+    // The boundary fix must not swing the other way: naming the shipped
+    // `0.7.0-with-pool` is still valid when a longer id also ships.
+    let mut guide = guide_with_breaking_change(
+        "0.7.0",
+        "Repository: `with_pool` is renamed to `with_pool_untracked`",
+        "**Automation:** `auto` — `autumn upgrade` rewrites every call site; \
+         codemod `0.7.0-with-pool`.",
+    );
+    guide = guide.replace(
+        "- **Status:** performed 2026-01-01",
+        "- **Codemod:** `autumn upgrade --apply` covered the rename.\n\
+         - **Status:** performed 2026-01-01",
+    );
+    let tmp = gate_fixture_with_guide("0.7.0", &guide);
+    write_fixture_registry(&tmp, &["0.7.0-with-pool", "0.7.0-with-pool-extra"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(output.status.success(), "{}", gate_report(&output));
+}
+
+#[test]
+fn codemod_gate_rejects_a_walkthrough_codemod_bullet_that_ran_nothing() {
+    // Codex review on #2231: the walk-through requirement matched the
+    // `- **Codemod:**` label alone, so `none` recorded a codemod-first
+    // walk-through that never ran the codemod.
+    let mut guide = guide_with_breaking_change(
+        "0.7.0",
+        "Repository: `with_pool` is renamed to `with_pool_untracked`",
+        "**Automation:** `auto` — `autumn upgrade` rewrites every call site; \
+         codemod `0.7.0-with-pool`.",
+    );
+    guide = guide.replace(
+        "- **Status:** performed 2026-01-01",
+        "- **Codemod:** none\n\
+         - **Status:** performed 2026-01-01",
+    );
+    let tmp = gate_fixture_with_guide("0.7.0", &guide);
+    write_fixture_registry(&tmp, &["0.7.0-with-pool"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "`none` is not a codemod-first walk-through\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("codemod-first walk-through"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_accepts_a_walkthrough_codemod_bullet_wrapped_onto_a_continuation() {
+    // The value check reads the whole bullet, so a wrapped invocation — the
+    // shape `TEMPLATE.md` itself uses — still counts.
+    let mut guide = guide_with_breaking_change(
+        "0.7.0",
+        "Repository: `with_pool` is renamed to `with_pool_untracked`",
+        "**Automation:** `auto` — `autumn upgrade` rewrites every call site; \
+         codemod `0.7.0-with-pool`.",
+    );
+    guide = guide.replace(
+        "- **Status:** performed 2026-01-01",
+        "- **Codemod:** the preview first, then\n    \
+         `autumn upgrade --apply` for the rename.\n\
+         - **Status:** performed 2026-01-01",
+    );
+    let tmp = gate_fixture_with_guide("0.7.0", &guide);
+    write_fixture_registry(&tmp, &["0.7.0-with-pool"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(output.status.success(), "{}", gate_report(&output));
+}

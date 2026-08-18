@@ -2249,6 +2249,7 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             # Scoped like check 4 scopes the `Status:` line: only bullets under
             # this exact heading count, not ones under a later sibling.
             in_walkthrough = (text == walkthrough_heading)
+            in_codemod_bullet = 0
             if (in_walkthrough) next
             heading = text
             sub(/^###[[:space:]]*/, "", heading)
@@ -2266,8 +2267,20 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           }
           next
         }
+        # The bullet counts only if it records an `autumn upgrade` run:
+        # `- **Codemod:** none` names the label without doing the thing. The
+        # value may wrap onto continuation lines, as `TEMPLATE.md` shows, so
+        # the whole bullet is scanned rather than just its first line.
         in_walkthrough && visible ~ /^-[[:space:]]+\*\*Codemod:\*\*/ {
-          walkthrough_codemod = 1
+          in_codemod_bullet = 1
+          if (visible ~ /autumn upgrade/) walkthrough_codemod = 1
+        }
+        in_walkthrough && in_codemod_bullet && visible !~ /^-[[:space:]]+\*\*Codemod:\*\*/ {
+          if (visible ~ /^[[:space:]]*$/ || visible ~ /^-[[:space:]]/) {
+            in_codemod_bullet = 0
+          } else if (visible ~ /autumn upgrade/) {
+            walkthrough_codemod = 1
+          }
         }
         heading != "" {
           if (suppressed_by_comment(raw)) suppressed = 1
@@ -2275,8 +2288,11 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           # An id from *another* release does not cover this one: citing
           # the 0.6.0 codemod in the 0.7.0 guide would otherwise satisfy the
           # check. The draft has no version yet, so it accepts any shipped id.
+          # Matched as a complete code span: a bare substring would let
+          # `0.7.0-with-pool-extra` — a codemod nobody wrote — be vouched for
+          # by the shipped `0.7.0-with-pool`. Every guide spells ids this way.
           for (id in known) {
-            if (index(visible, id) == 0) continue
+            if (index(visible, "`" id "`") == 0) continue
             if (guide_version == "" || index(id, guide_version "-") == 1) named_known = 1
           }
 
