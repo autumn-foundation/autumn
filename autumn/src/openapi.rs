@@ -128,6 +128,15 @@ pub struct ApiDoc {
     pub sunset_opt_out: bool,
     /// Whether this route uses dynamic policy authorization.
     pub has_policy: bool,
+    /// Record-level authorization bindings declared by `#[authorize]` on the
+    /// handler, in source order — one entry per attribute, empty when the
+    /// handler declares none.
+    ///
+    /// This is the provable subset of [`Self::has_policy`], never a
+    /// replacement for it: that boolean is also `true` for a hand-written
+    /// `__check_policy` call in the body, which carries no binding a macro can
+    /// recover.
+    pub authorize_bindings: &'static [AuthorizeBinding],
     /// True when the handler is explicitly declared public via `#[public]`.
     ///
     /// Populated by the route macros from the `#[public]` marker. Used by the
@@ -164,6 +173,28 @@ pub struct ApiDoc {
     /// schema, this flag also exempts the tool from the JSON-out eligibility
     /// gate that otherwise excludes schema-less routes.
     pub mcp_stream: bool,
+}
+
+/// A record-level authorization binding declared by `#[authorize]`.
+///
+/// One entry per `#[authorize("action", resource = Type)]` attribute on a
+/// handler, recovered from the macro expansion, so a binding disappears from
+/// the metadata exactly when the attribute disappears from the source.
+///
+/// This is deliberately **not** the `Policy` implementation that serves the
+/// check. `#[authorize]` names only the resource `R`; the concrete
+/// `impl Policy<R>` is resolved from the `PolicyRegistry` at boot
+/// (`AppBuilder::policy::<R, _>(...)`) and is therefore not knowable at build
+/// time. [`Self::resource`] is likewise the identifier as written at the use
+/// site rather than a resolved path, so two same-named types in different
+/// modules are indistinguishable here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizeBinding {
+    /// Action verb passed to the policy check — the first `#[authorize]`
+    /// argument, recorded verbatim.
+    pub action: &'static str,
+    /// Resource type identifier exactly as written in `resource = Type`.
+    pub resource: &'static str,
 }
 
 /// Reference to a schema definition, produced by the route macros.

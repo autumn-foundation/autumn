@@ -33,7 +33,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before. See `docs/guide/retention-sweeps.md` and the `examples/saas`
   `PasswordResetToken` demo.
 
+- **security:** `autumn routes audit` now proves *what* a route is authorized
+  to do, not merely that it is guarded. The security posture manifest moves to
+  schema v3 and gains a fourth dimension, `authorization_policies`
+  (`provenance: "provable"`, `source: "macro:#[authorize]"`): one
+  `(action, resource)` entry per `#[authorize]` binding, recovered from the
+  macro expansion in either attribute order and through stacked guards, then
+  sorted by `(path, method, action, resource)` and deduplicated so a rebuild
+  of unchanged code stays byte-identical. The dimension carries a required
+  `runtime_caveat` naming the one step a build cannot prove — which
+  `impl Policy<R>` the `PolicyRegistry` serves at boot — rather than shipping
+  a bare `provable` tag it cannot defend. `authorization_policies` therefore
+  leaves the `excluded` list; `policy_registration` stays there for the
+  boot-time fact, reworded to point at that caveat, and a new
+  `repository_policy_bindings` entry discloses that
+  `#[repository(api = ..., policy = ...)]` auto-APIs set
+  `routes.entries[].policy` without leaving a binding the macro can recover
+  (`routes.entries[].policy` is a superset of the proven bindings, and stays
+  one). Carrying the bindings adds two pieces of route metadata:
+  `ApiDoc::authorize_bindings` (compile-time `&'static [AuthorizeBinding]`)
+  and its `RouteInfo::authorize_bindings` wire twin
+  (`Vec<AuthorizeBindingInfo>`, elided from the routes dump when empty, so
+  older dumps still deserialize unchanged). The recorded resource is the
+  identifier as written, never the `Policy` impl. The provenance rubric
+  deciding when a dimension may claim `provable`, `declared`, or
+  `runtime-only` — and when a mostly-provable dimension ships with a caveat
+  instead of a demotion, with outbound HTTP worked through as `declared` — is
+  now documented in `docs/guide/security-posture-manifest.md` (#1627).
+
 ### Fixed
+
+- **security:** `#[secured]`'s roles and scopes are no longer lost when another
+  guard wraps the handler body. With `#[secured("admin")]` written above
+  `#[authorize]`, `#[secured]` expands first and `#[authorize]` then buries its
+  role/scope marker consts one level deeper, inside the generated
+  `let __autumn_inner: T = (async move { … }).await;` wrapper — a shape the
+  marker walks did not descend. Extraction fell through
+  to the policy-check fallback, and the route reported `secured: true` with
+  empty `roles`/`scopes`: a *provable* manifest dimension silently understating
+  the posture it exists to prove. Both walks now descend the generated wrapper
+  through the same helper the `#[authorize]` binding walk uses, so the sibling
+  extractors can no longer disagree about depth (#1627).
+
+- **security:** two sibling route-metadata losses found by review of the same
+  extraction ladder: (1) `#[secured]` above the route macro with `#[authorize]`
+  below it dropped the roles/scopes to `&[]` — the live `#[authorize]`
+  attribute short-circuited the marker read, so deleting the `#[secured(...)]`
+  line produced zero manifest diff; the marker read now runs first. (2) The
+  `#[public]` marker walk could not descend a wrapping guard's generated body,
+  so `#[public]` above `#[throttle]` lost `public: true` and false-failed the
+  coverage gate as `unclassified`; the walk now uses the same shared
+  wrapper-descent helper as the other marker extractors (#1627).
 
 - **`generate admin` over an `#[encrypted]` model:** the generated admin adapter
   did not compile — it bound `&new_row` to `.values(…)` and `&diesel_changeset`

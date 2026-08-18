@@ -80,7 +80,7 @@ omitted. They do not need to be shown unless the user asks:
 If `autumn routes` fails because the project has not been compiled, tell the
 user to run `cargo build` first, then retry.
 
-## Auth-coverage audit (unreleased — trunk-dev, issues #1604, #1850)
+## Auth-coverage audit (unreleased — trunk-dev, issues #1604, #1850, #1627)
 
 On trunk-dev, `autumn routes audit` audits every route's authentication
 exposure. It prints each route's classification — `gated`, `public`,
@@ -101,6 +101,21 @@ An unclassified-route diagnostic now names the offending handler's `file:line`
 jumped to directly. See `docs/guide/route-auth-coverage.md` for the full
 default-deny posture model and how to classify `gated`/`public`/`framework`
 routes.
+
+The manifest (schema v3) carries four dimensions, each tagged with a provenance
+class:
+
+- `routes` (`provable`) — the per-route classification above.
+- `csrf` (`declared`) — CSRF enforcement per mutating route, from config.
+- `security_headers` (`declared`) — effective response headers, from config.
+- `authorization_policies` (`provable`) — one `(action, resource)` entry per
+  `#[authorize]` binding, plus a `runtime_caveat` recording that which
+  `impl Policy<R>` serves the check is a boot fact the build cannot see.
+
+Dimensions that are not yet emitted are named in the manifest's `excluded`
+list with the class they will eventually carry. See
+`docs/guide/security-posture-manifest.md` for the provenance rubric that
+decides a dimension's class.
 
 ## Comparing expected vs actual routes
 

@@ -20,10 +20,16 @@ use quote::{format_ident, quote};
 use syn::parse::Parser as _;
 use syn::{Expr, ExprLit, Ident, ItemFn, Lit, LitStr, Meta, Token, parse_quote};
 
+/// Parsed `#[authorize(...)]` arguments.
+///
+/// Visible to the crate so the route macro's metadata extractor
+/// (`api_doc::extract_authorize_bindings`) reads an attribute that has not
+/// expanded yet through this same grammar, keeping one source of truth for the
+/// syntax.
 #[derive(Default)]
-struct AuthorizeArgs {
-    action: Option<String>,
-    resource: Option<Ident>,
+pub struct AuthorizeArgs {
+    pub action: Option<String>,
+    pub resource: Option<Ident>,
     from: Option<Ident>,
 }
 
@@ -242,6 +248,8 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let action_lit = syn::LitStr::new(&action_str, proc_macro2::Span::call_site());
+    let resource_lit =
+        syn::LitStr::new(&resource_ident.to_string(), proc_macro2::Span::call_site());
     let original_body = &input_fn.block;
     let original_response = match &input_fn.sig.output {
         syn::ReturnType::Default => quote! {
@@ -279,6 +287,12 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = parse_quote! {
         {
+            // Route macros read this marker when #[authorize] expands before
+            // #[get]/#[post]/etc. It records the resource *identifier as
+            // written*, not the `Policy` impl that serves the check — that is
+            // resolved from the registry at boot and has no compile-time name.
+            // Inert: nothing reads it at runtime.
+            const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[(#action_lit, #resource_lit)];
             if let ::core::result::Result::Err(__autumn_error) = ::autumn_web::authorization::__check_policy_scoped::<#resource_ident>(
                 &__autumn_state,
                 &__autumn_session,
@@ -318,7 +332,7 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// string literal as the action: `#[authorize("update", resource = Foo)]`.
 /// Standard `Meta` parsing rejects bare literals as the first item,
 /// so we strip and re-thread it before the punctuated parse.
-fn parse_with_leading_literal(attr: TokenStream) -> syn::Result<AuthorizeArgs> {
+pub fn parse_with_leading_literal(attr: TokenStream) -> syn::Result<AuthorizeArgs> {
     use proc_macro2::TokenTree;
     let mut iter = attr.into_iter().peekable();
     let mut leading_action: Option<String> = None;
@@ -446,6 +460,52 @@ mod tests {
         assert!(
             !generated.contains("__check_policy (") && !generated.contains("__check_policy("),
             "#[authorize] must not generate the old unscoped __check_policy call: {generated}"
+        );
+    }
+
+    #[test]
+    fn authorize_emits_binding_marker_const() {
+        let generated = authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! {
+                async fn update_post(post: Post) -> &'static str {
+                    "ok"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(
+                r#"const __AUTUMN_AUTHORIZE_BINDINGS : & [(& str , & str)] = & [("update" , "Post")] ;"#
+            ),
+            "#[authorize] must leave a binding marker the route macro can read back when it \
+             expands first: {generated}"
+        );
+    }
+
+    #[test]
+    fn authorize_marker_precedes_policy_check() {
+        let generated = authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! {
+                async fn update_post(post: Post) -> &'static str {
+                    "ok"
+                }
+            },
+        )
+        .to_string();
+
+        let marker = generated
+            .find("__AUTUMN_AUTHORIZE_BINDINGS")
+            .unwrap_or_else(|| panic!("binding marker must be emitted: {generated}"));
+        let check = generated
+            .find("__check_policy_scoped")
+            .unwrap_or_else(|| panic!("policy check must be emitted: {generated}"));
+        assert!(
+            marker < check,
+            "the binding marker must be the first statement of the guarded body, so extractors \
+             find it before any generated control flow: {generated}"
         );
     }
 }

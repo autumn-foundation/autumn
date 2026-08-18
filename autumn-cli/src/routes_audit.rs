@@ -17,7 +17,8 @@
 use std::process::Command;
 
 use autumn_web::route_listing::{
-    CsrfDump, HeadersDump, OMITTED_ROUTES_MARKER, SECURITY_CONFIG_MARKER, SecurityDump,
+    AuthorizeBindingInfo, CsrfDump, HeadersDump, OMITTED_ROUTES_MARKER, SECURITY_CONFIG_MARKER,
+    SecurityDump,
 };
 use serde::{Deserialize, Serialize};
 
@@ -26,11 +27,19 @@ use crate::routes;
 /// Schema version of the emitted manifest. Bumped only on breaking changes to
 /// the document shape.
 ///
-/// v2 (#1627) wraps each dimension in a provenance envelope
-/// (`{ provenance, source, entries }`), adds the `csrf` and `security_headers`
-/// dimensions, and adds a top-level `excluded` list. The `routes` entries keep
+/// v2 (#1627) wrapped each dimension in a provenance envelope
+/// (`{ provenance, source, entries }`), added the `csrf` and `security_headers`
+/// dimensions, and added a top-level `excluded` list. The `routes` entries keep
 /// their v1 shape, only wrapped in the envelope.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 (#1627) promotes `authorization_policies` from `excluded` to a fourth
+/// emitted dimension: the route→action→resource bindings proven from expanded
+/// `#[authorize]` attributes, in a provenance envelope that carries an extra
+/// `runtime_caveat` naming the one part of the story a build cannot prove.
+/// `excluded` keeps `policy_registration` for that runtime fact and gains
+/// `repository_policy_bindings` for the auto-API guards whose policy type the
+/// macro discards. The v2 dimensions are unchanged.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
 
 /// Options controlling `autumn routes audit`.
 pub struct AuditOptions<'a> {
@@ -74,6 +83,11 @@ pub struct AuditRoute {
     /// `location` in the dump).
     #[serde(default)]
     pub location: Option<String>,
+    /// Record-level `(action, resource)` bindings proven from the handler's
+    /// `#[authorize]` attributes, already sorted and deduplicated by the dump.
+    /// Absent on older dumps and on routes that declare none.
+    #[serde(default)]
+    pub authorize_bindings: Vec<AuthorizeBindingInfo>,
 }
 
 impl AuditRoute {
@@ -89,7 +103,7 @@ impl AuditRoute {
     }
 }
 
-// ── Manifest document (schema v2, #1627) ────────────────────────────────────
+// ── Manifest document (schema v3, #1627) ────────────────────────────────────
 
 /// Provenance class of a manifest dimension. A small closed enum serialized to
 /// the exact lowercase tags used throughout the manifest.
@@ -108,7 +122,7 @@ pub enum Provenance {
     RuntimeOnly,
 }
 
-/// Top-level security manifest (schema v2).
+/// Top-level security manifest (schema v3).
 #[derive(Debug, Serialize)]
 pub struct Manifest {
     pub schema_version: u32,
@@ -119,12 +133,15 @@ pub struct Manifest {
 }
 
 /// Manifest dimensions. Order is fixed (`routes`, then `csrf`, then
-/// `security_headers`) so the serialized document is diff-stable.
+/// `security_headers`, then `authorization_policies`) so the serialized
+/// document is diff-stable. New dimensions append, keeping the v2 keys in
+/// place.
 #[derive(Debug, Serialize)]
 pub struct Dimensions {
     pub routes: RoutesDimension,
     pub csrf: CsrfDimension,
     pub security_headers: HeadersDimension,
+    pub authorization_policies: AuthorizationPoliciesDimension,
 }
 
 /// The `routes` dimension: provable auth posture per mounted route.
@@ -193,6 +210,38 @@ pub struct HeaderEntry {
     pub header: String,
     pub value: String,
     pub emitted: bool,
+}
+
+/// The `authorization_policies` dimension: provable record-level authorization
+/// bindings, one entry per route × `#[authorize]` binding.
+///
+/// Provable, because every entry is recovered from macro-expanded code — but
+/// only as far as the resource *identifier*. Which `impl Policy<Resource>`
+/// answers the check is a boot fact, disclosed on the dimension itself as
+/// [`Self::runtime_caveat`] rather than left for the reader to infer.
+#[derive(Debug, Serialize)]
+pub struct AuthorizationPoliciesDimension {
+    pub provenance: Provenance,
+    pub source: &'static str,
+    /// The part of the authorization story a build-time manifest cannot prove,
+    /// stated on the dimension itself instead of being buried in `excluded`.
+    pub runtime_caveat: &'static str,
+    pub entries: Vec<AuthorizationPolicyEntry>,
+}
+
+/// One authorization binding: a route plus the `(action, resource)` pair one of
+/// its `#[authorize]` attributes declares. A route carrying several bindings
+/// contributes several entries.
+#[derive(Debug, Serialize)]
+pub struct AuthorizationPolicyEntry {
+    pub path: String,
+    pub method: String,
+    pub name: String,
+    pub action: String,
+    pub resource: String,
+    /// How the binding was established. `"provable"` means it was derived from
+    /// macro-expanded code (route + `#[authorize]` arguments).
+    pub provenance: &'static str,
 }
 
 /// A dimension deliberately not yet emitted in this manifest build.
@@ -357,16 +406,68 @@ fn header_entry(header: &str, value: String) -> HeaderEntry {
     }
 }
 
+/// Build the `authorization_policies` dimension (provable): one flat entry per
+/// route × `#[authorize]` binding, ordered by `(path, method, action,
+/// resource)`.
+///
+/// Framework routes are skipped. The framework mounts them itself, so they can
+/// carry no `#[authorize]`; `route_listing::authorize_bindings_of` already
+/// drops any binding on them, and repeating the rule here keeps a malformed
+/// dump from inventing an authorization claim the code never made.
+///
+/// A route with `policy: true` but no bindings contributes nothing: that
+/// boolean is a superset also covering inline `__check_policy` calls and
+/// `#[repository(policy = ...)]` auto-APIs, neither of which proves an
+/// `(action, resource)` pair (see the `repository_policy_bindings` entry in
+/// [`excluded_dimensions`]).
+fn build_authorization_policies_dimension(routes: &[AuditRoute]) -> AuthorizationPoliciesDimension {
+    let mut entries: Vec<AuthorizationPolicyEntry> = routes
+        .iter()
+        .filter(|r| r.source != "framework")
+        .flat_map(|r| {
+            r.authorize_bindings
+                .iter()
+                .map(move |b| AuthorizationPolicyEntry {
+                    path: r.path.clone(),
+                    method: r.method.clone(),
+                    name: r.handler.clone(),
+                    action: b.action.clone(),
+                    resource: b.resource.clone(),
+                    provenance: "provable",
+                })
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.method.cmp(&b.method))
+            .then_with(|| a.action.cmp(&b.action))
+            .then_with(|| a.resource.cmp(&b.resource))
+    });
+
+    AuthorizationPoliciesDimension {
+        provenance: Provenance::Provable,
+        source: "macro:#[authorize]",
+        runtime_caveat: "the route→action→resource binding is proven from macro-expanded code; \
+                         which impl Policy<Resource> serves it is resolved from the \
+                         PolicyRegistry at boot (AppBuilder::policy::<R, _>(...)). A missing \
+                         registration is not visible at build time — see the policy_registration \
+                         entry in `excluded`.",
+        entries,
+    }
+}
+
 /// The fixed, deterministically-ordered list of dimensions deliberately
-/// excluded from this manifest build (#1627 slice 1).
+/// excluded from this manifest build (#1627).
 fn excluded_dimensions() -> Vec<ExcludedDimension> {
     vec![
         ExcludedDimension {
-            dimension: "authorization_policies",
+            dimension: "repository_policy_bindings",
             eventual_provenance: Provenance::Provable,
-            reason: "phase-1 follow-up: full #[authorize] action→policy-type binding needs new \
-                     macro metadata; boolean policy presence already ships in \
-                     routes.entries[].policy",
+            reason: "#[repository(api = ..., policy = ...)] auto-API handlers enforce fixed \
+                     show/create/update/delete policy actions, but the macro discards the policy \
+                     type at expansion and RepositoryApiMeta carries only a type-erased probe; \
+                     their presence still shows as routes.entries[].policy",
         },
         ExcludedDimension {
             dimension: "sessions",
@@ -402,7 +503,9 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
         ExcludedDimension {
             dimension: "policy_registration",
             eventual_provenance: Provenance::RuntimeOnly,
-            reason: "boot-time fact; excluded from a build-time manifest by design",
+            reason: "boot-time fact; excluded from a build-time manifest by design — the \
+                     authorization_policies dimension proves bindings and carries this as its \
+                     runtime_caveat",
         },
         ExcludedDimension {
             dimension: "serve_path_routers",
@@ -439,12 +542,14 @@ const fn empty_headers_dimension() -> HeadersDimension {
     }
 }
 
-/// Build a stable-ordered security manifest (schema v2) from the audited routes
+/// Build a stable-ordered security manifest (schema v3) from the audited routes
 /// and the resolved security configuration.
 ///
 /// When `security` is `None` (an older dump with no security-config marker) the
 /// declared dimensions are emitted empty rather than fabricated, keeping the
-/// schema stable without asserting configuration the dump did not report.
+/// schema stable without asserting configuration the dump did not report. The
+/// provable dimensions (`routes`, `authorization_policies`) read the dumped
+/// listing alone, so they are identical either way.
 ///
 /// All dimensions are deterministically ordered so the manifest is diff-friendly
 /// and reproducible across runs.
@@ -467,6 +572,7 @@ pub fn build_manifest(routes: &[AuditRoute], security: Option<&SecurityDump>) ->
             routes: routes_dim,
             csrf,
             security_headers,
+            authorization_policies: build_authorization_policies_dimension(routes),
         },
         excluded: excluded_dimensions(),
     }
@@ -700,7 +806,30 @@ mod tests {
             policy: false,
             module: None,
             location: None,
+            authorize_bindings: Vec::new(),
         }
+    }
+
+    /// A route guarded by one or more `#[authorize]` attributes: the dump
+    /// carries the `(action, resource)` pairs *and* sets `policy: true`, since
+    /// the expanded guard is a policy check like any other.
+    fn route_with_bindings(
+        method: &str,
+        path: &str,
+        handler: &str,
+        classification: &str,
+        bindings: &[(&str, &str)],
+    ) -> AuditRoute {
+        let mut r = route(method, path, handler, classification);
+        r.policy = true;
+        r.authorize_bindings = bindings
+            .iter()
+            .map(|(action, resource)| AuthorizeBindingInfo {
+                action: (*action).to_owned(),
+                resource: (*resource).to_owned(),
+            })
+            .collect();
+        r
     }
 
     // ── classification / gate ────────────────────────────────────────────────
@@ -794,7 +923,7 @@ mod tests {
         assert_eq!(manifest.dimensions.routes.entries[0].provenance, "provable");
 
         let json: serde_json::Value = serde_json::from_str(&manifest_json(&manifest)).unwrap();
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         let entry = &json["dimensions"]["routes"]["entries"][0];
         for key in [
             "path",
@@ -881,11 +1010,11 @@ mod tests {
         serde_json::from_str(&manifest_json(m)).unwrap()
     }
 
-    /// AC-1: the top-level document is schema v2, carries the three dimensions
+    /// AC-1: the top-level document is schema v3, carries the four dimensions
     /// with the correct provenance labels, and the `excluded` list with its
     /// closed provenance enum values.
     #[test]
-    fn manifest_v2_envelope_shape_and_provenance_labels() {
+    fn manifest_envelope_shape_and_provenance_labels() {
         let routes = vec![
             route("GET", "/health", "health", "framework"),
             route("POST", "/widgets", "create_widget", "gated"),
@@ -893,7 +1022,7 @@ mod tests {
         let sec = security_dump(true, &[]);
         let json = manifest_value(&build_manifest(&routes, Some(&sec)));
 
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         assert_eq!(json["dimensions"]["routes"]["provenance"], "provable");
         assert_eq!(
             json["dimensions"]["routes"]["source"],
@@ -909,12 +1038,40 @@ mod tests {
             json["dimensions"]["security_headers"]["source"],
             "config:security.headers"
         );
+        assert_eq!(
+            json["dimensions"]["authorization_policies"]["provenance"],
+            "provable"
+        );
+        assert_eq!(
+            json["dimensions"]["authorization_policies"]["source"],
+            "macro:#[authorize]"
+        );
+        // The provable dimension states its own limit on the wire rather than
+        // leaving readers to infer it from `excluded`.
+        assert!(
+            !json["dimensions"]["authorization_policies"]["runtime_caveat"]
+                .as_str()
+                .expect("runtime_caveat string")
+                .is_empty(),
+            "the authorization_policies dimension must carry a non-empty runtime_caveat"
+        );
 
         // Excluded list is present, ordered, and uses the closed enum values.
         let excluded = json["excluded"].as_array().expect("excluded array");
         assert_eq!(excluded.len(), 9);
-        assert_eq!(excluded[0]["dimension"], "authorization_policies");
+        assert_eq!(excluded[0]["dimension"], "repository_policy_bindings");
         assert_eq!(excluded[0]["eventual_provenance"], "provable");
+        // v3: `authorization_policies` graduated out of `excluded` into a real
+        // dimension; leaving a stale excluded entry behind would claim the
+        // manifest still cannot prove what it now proves.
+        assert!(
+            !excluded
+                .iter()
+                .any(|e| e["dimension"] == "authorization_policies"),
+            "authorization_policies is emitted now and must not also be listed as excluded"
+        );
+        // The registry lookup that resolves a binding to an `impl Policy<_>`
+        // stays a boot fact, so `policy_registration` stays excluded.
         let runtime_only = excluded
             .iter()
             .find(|e| e["dimension"] == "policy_registration")
@@ -929,6 +1086,264 @@ mod tests {
             .find(|e| e["dimension"] == "serve_path_routers")
             .expect("serve_path_routers excluded");
         assert_eq!(serve_path["eventual_provenance"], "provable");
+    }
+
+    // ── authorization_policies dimension (#1627 slice 2) ─────────────────────
+
+    /// AC-4: an `authorization_policies` entry carries exactly the route
+    /// coordinates plus the proven `(action, resource)` pair and its own
+    /// provenance tag — no more (the `from = ident` parameter name is a binding
+    /// detail, not a security fact) and no less.
+    #[test]
+    fn manifest_authorization_policies_entry_shape() {
+        let routes = vec![route_with_bindings(
+            "POST",
+            "/notes/{id}",
+            "update_note",
+            "gated",
+            &[("update", "Note")],
+        )];
+        let json = manifest_value(&build_manifest(&routes, None));
+        let entry = &json["dimensions"]["authorization_policies"]["entries"][0];
+        let obj = entry.as_object().expect("entry object");
+
+        let keys = ["path", "method", "name", "action", "resource", "provenance"];
+        for key in keys {
+            assert!(obj.contains_key(key), "entry missing `{key}`: {entry}");
+        }
+        assert_eq!(obj.len(), keys.len(), "unexpected extra keys: {entry}");
+
+        assert_eq!(entry["path"], "/notes/{id}");
+        assert_eq!(entry["method"], "POST");
+        assert_eq!(entry["name"], "update_note");
+        assert_eq!(entry["action"], "update");
+        assert_eq!(entry["resource"], "Note");
+        assert_eq!(entry["provenance"], "provable");
+    }
+
+    /// AC-4 keystone: removing one `#[authorize]` from a handler removes
+    /// exactly that binding's entry and leaves every other dimension
+    /// byte-identical. This is the falsifiability claim the dimension makes —
+    /// if the manifest kept reporting a binding whose attribute is gone, the
+    /// "provable" tag would be a lie.
+    #[test]
+    fn removing_an_authorize_binding_flips_only_that_entry() {
+        let dump = |bindings: &[(&str, &str)]| {
+            vec![
+                route("GET", "/health", "health", "framework"),
+                route_with_bindings("POST", "/notes/{id}", "update_note", "gated", bindings),
+            ]
+        };
+        let sec = security_dump(true, &[]);
+        let both = manifest_value(&build_manifest(
+            &dump(&[("delete", "Note"), ("update", "Note")]),
+            Some(&sec),
+        ));
+        let one = manifest_value(&build_manifest(&dump(&[("update", "Note")]), Some(&sec)));
+
+        // Every other dimension is untouched: the route is still `gated`, still
+        // carries `policy: true`, and is still the same mutating CSRF entry.
+        assert_eq!(both["dimensions"]["routes"], one["dimensions"]["routes"]);
+        assert_eq!(both["dimensions"]["csrf"], one["dimensions"]["csrf"]);
+        assert_eq!(
+            both["dimensions"]["security_headers"],
+            one["dimensions"]["security_headers"]
+        );
+
+        let entries = |v: &serde_json::Value| -> Vec<serde_json::Value> {
+            v["dimensions"]["authorization_policies"]["entries"]
+                .as_array()
+                .expect("entries array")
+                .clone()
+        };
+        let (both_entries, one_entries) = (entries(&both), entries(&one));
+        assert_eq!(both_entries.len(), 2, "{both_entries:?}");
+        assert_eq!(one_entries.len(), 1, "{one_entries:?}");
+
+        // The difference is exactly the removed binding; the surviving entry is
+        // byte-identical to the one it was listed beside.
+        let removed: Vec<&serde_json::Value> = both_entries
+            .iter()
+            .filter(|e| !one_entries.contains(e))
+            .collect();
+        assert_eq!(removed.len(), 1, "exactly one entry may disappear");
+        assert_eq!(removed[0]["action"], "delete");
+        assert_eq!(removed[0]["resource"], "Note");
+        assert_eq!(one_entries[0]["action"], "update");
+    }
+
+    /// The mirror claim (closing AC-7 in the other direction): changing a
+    /// route's *classification* moves the `routes` dimension and nothing else.
+    /// The route reclassified here is a safe-method GET with no bindings, so a
+    /// leak into `csrf` or `authorization_policies` can only be a bug.
+    #[test]
+    fn reclassifying_a_route_flips_only_the_routes_dimension() {
+        let dump = |cls: &str, roles: &[&str]| {
+            let mut reports = route("GET", "/reports", "reports", cls);
+            reports.roles = roles.iter().map(|r| (*r).to_owned()).collect();
+            vec![
+                reports,
+                route_with_bindings(
+                    "POST",
+                    "/notes/{id}",
+                    "update_note",
+                    "gated",
+                    &[("update", "Note")],
+                ),
+            ]
+        };
+        let sec = security_dump(true, &[]);
+        let before = manifest_value(&build_manifest(&dump("unclassified", &[]), Some(&sec)));
+        let after = manifest_value(&build_manifest(&dump("gated", &["admin"]), Some(&sec)));
+
+        assert_ne!(
+            before["dimensions"]["routes"], after["dimensions"]["routes"],
+            "reclassifying a route must be visible in the routes dimension"
+        );
+        assert_eq!(before["dimensions"]["csrf"], after["dimensions"]["csrf"]);
+        assert_eq!(
+            before["dimensions"]["security_headers"],
+            after["dimensions"]["security_headers"]
+        );
+        // Sanity: the comparison below is a real claim only while the dimension
+        // actually has entries to differ in.
+        assert!(
+            !before["dimensions"]["authorization_policies"]["entries"]
+                .as_array()
+                .expect("entries array")
+                .is_empty(),
+            "the fixture must seed at least one binding"
+        );
+        assert_eq!(
+            before["dimensions"]["authorization_policies"],
+            after["dimensions"]["authorization_policies"]
+        );
+    }
+
+    /// AC-6 ordering: entries are globally sorted by
+    /// `(path, method, action, resource)` regardless of dump order, so the
+    /// manifest diff stays reviewable.
+    #[test]
+    fn authorization_policies_entries_are_sorted() {
+        let routes = vec![
+            route_with_bindings(
+                "POST",
+                "/notes/{id}",
+                "update_note",
+                "gated",
+                &[("update", "Note"), ("delete", "Note")],
+            ),
+            route_with_bindings(
+                "GET",
+                "/notes/{id}",
+                "show_note",
+                "gated",
+                &[("show", "Note")],
+            ),
+            route_with_bindings(
+                "POST",
+                "/albums/{id}",
+                "update_album",
+                "gated",
+                &[("update", "Photo"), ("update", "Album")],
+            ),
+        ];
+        let manifest = build_manifest(&routes, None);
+        let order: Vec<(&str, &str, &str, &str)> = manifest
+            .dimensions
+            .authorization_policies
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.path.as_str(),
+                    e.method.as_str(),
+                    e.action.as_str(),
+                    e.resource.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("/albums/{id}", "POST", "update", "Album"),
+                ("/albums/{id}", "POST", "update", "Photo"),
+                ("/notes/{id}", "GET", "show", "Note"),
+                ("/notes/{id}", "POST", "delete", "Note"),
+                ("/notes/{id}", "POST", "update", "Note"),
+            ],
+            "entries sort by (path, method, action, resource)"
+        );
+    }
+
+    /// D6 pin: `routes.entries[].policy` is a *superset* boolean.
+    /// A `#[repository(policy = ...)]` auto-API route, or a handler calling
+    /// `__check_policy` inline, dumps `policy: true` with no bindings — and
+    /// must contribute no authorization entry rather than a fabricated one.
+    /// That gap is disclosed by the `repository_policy_bindings` excluded entry.
+    #[test]
+    fn policy_true_without_bindings_produces_no_authorization_entry() {
+        let mut r = route("POST", "/api/notes", "notes::create", "gated");
+        r.policy = true;
+        let json = manifest_value(&build_manifest(&[r], None));
+
+        assert_eq!(json["dimensions"]["routes"]["entries"][0]["policy"], true);
+        assert!(
+            json["dimensions"]["authorization_policies"]["entries"]
+                .as_array()
+                .expect("entries array")
+                .is_empty(),
+            "a bare `policy: true` proves no (action, resource) binding"
+        );
+
+        let excluded = json["excluded"].as_array().expect("excluded array");
+        let repo = excluded
+            .iter()
+            .find(|e| e["dimension"] == "repository_policy_bindings")
+            .expect("repository_policy_bindings excluded");
+        assert_eq!(repo["eventual_provenance"], "provable");
+        assert!(
+            repo["reason"]
+                .as_str()
+                .expect("reason string")
+                .contains("routes.entries[].policy"),
+            "the excluded entry must point readers at the superset boolean: {repo}"
+        );
+    }
+
+    /// Defense in depth at the CLI layer: framework routes are mounted by the
+    /// framework itself and can carry no `#[authorize]`, so
+    /// `route_listing::authorize_bindings_of` already drops any binding on
+    /// them. A dump claiming otherwise is malformed by construction, and the
+    /// builder mirrors that rule instead of trusting its input.
+    #[test]
+    fn framework_routes_never_contribute_authorization_entries() {
+        let mut framework = route_with_bindings(
+            "POST",
+            "/_autumn/unsubscribe",
+            "unsubscribe",
+            "framework",
+            &[("update", "Subscriber")],
+        );
+        framework.source = "framework".to_owned();
+        let routes = vec![
+            framework,
+            route_with_bindings(
+                "POST",
+                "/notes/{id}",
+                "update_note",
+                "gated",
+                &[("update", "Note")],
+            ),
+        ];
+        let manifest = build_manifest(&routes, None);
+        let entries = &manifest.dimensions.authorization_policies.entries;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, "/notes/{id}");
+        assert!(
+            !entries.iter().any(|e| e.path == "/_autumn/unsubscribe"),
+            "no framework route may appear: {entries:?}"
+        );
     }
 
     /// AC-2 falsifiability: one CSRF entry per mutating route; a safe-method
@@ -1318,18 +1733,29 @@ mod tests {
     }
 
     /// AC-6: two builds of identical source + config produce byte-identical
-    /// manifest JSON.
+    /// manifest JSON. Seeded with a multi-binding route so the
+    /// `authorization_policies` dimension is exercised too.
     #[test]
     fn manifest_rebuild_is_byte_identical() {
         let routes = vec![
             route("GET", "/health", "health", "framework"),
             route("POST", "/widgets", "create_widget", "gated"),
-            route("DELETE", "/widgets/{id}", "delete_widget", "gated"),
+            route_with_bindings(
+                "DELETE",
+                "/widgets/{id}",
+                "delete_widget",
+                "gated",
+                &[("delete", "Widget"), ("update", "Widget")],
+            ),
         ];
         let sec = security_dump(true, &["/api/", "/webhooks/"]);
         let a = manifest_json(&build_manifest(&routes, Some(&sec)));
         let b = manifest_json(&build_manifest(&routes, Some(&sec)));
         assert_eq!(a, b, "manifest must be reproducible byte-for-byte");
+        assert!(
+            a.contains("\"resource\": \"Widget\""),
+            "the seeded bindings must appear in the manifest: {a}"
+        );
     }
 
     /// The `parse_security_config` reader recovers the dump from a stderr stream
