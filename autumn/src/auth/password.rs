@@ -361,6 +361,12 @@ pub async fn validate_password(
     if is_similar_to_context(&lower, context) {
         failures.push(PasswordFailure::SimilarToContext);
     }
+    // Drop explicitly rather than let scope do it: `validate_password` is
+    // async and `lower` would otherwise live in the generated future's state
+    // across the `.await` below, holding the allocation for as long as the
+    // breach-check request is in flight instead of releasing it once the two
+    // synchronous checks above are done with it.
+    drop(lower);
 
     // 4. Breach check.
     if policy.breach_check != BreachCheck::Off {
