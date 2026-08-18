@@ -552,22 +552,49 @@ pub fn run_check_collisions() {
             .push("working tree".to_owned());
     }
 
-    let default_ref = resolve_default_branch_ref();
-    let mut default_branch_entries: BTreeSet<String> = BTreeSet::new();
-    if let Some(default_ref) = &default_ref {
-        for dir_name in migration_dirs_at_ref(default_ref, DEFAULT_MIGRATIONS_DIR) {
-            default_branch_entries.insert(dir_name.clone());
-            claimants
-                .entry(dir_name)
-                .or_default()
-                .push(default_ref.clone());
-        }
-    }
-
     // Resolved once and reused below for the coverage check too -- both uses
     // want the same "what does `origin` currently advertise" answer, and
     // `git ls-remote` is a network round trip worth paying only once.
     let remote_heads = remote_branch_heads();
+    let local_heads = local_origin_branch_heads();
+
+    // Whether `refs/remotes/origin/<branch_name>` is safe to scan for
+    // migration claims: not just present, but AT THE COMMIT `origin`
+    // currently advertises. A long-lived clone can retain a ref for a
+    // branch `origin` no longer has at all (nothing prunes it without an
+    // explicit `git fetch --prune`), or one that still exists but has moved
+    // since this checkout's last fetch -- scanning either reads content
+    // that either no longer exists upstream or isn't what would actually be
+    // pushed, so either can claim a version against a phantom, blocking a
+    // migration that reuses a version this checkout only THINKS is taken.
+    // `true` when advertisement state itself is unknown (no network, no
+    // `origin` remote): falls back to scanning every local ref, same as
+    // before this existed -- the coverage warning below already flags that
+    // degraded state.
+    let is_ref_current = |branch_name: &str| -> bool {
+        remote_heads.as_ref().is_none_or(|remote_heads| {
+            remote_heads
+                .get(branch_name)
+                .is_some_and(|remote_sha| local_heads.get(branch_name) == Some(remote_sha))
+        })
+    };
+
+    let default_ref = resolve_default_branch_ref();
+    let mut default_branch_entries: BTreeSet<String> = BTreeSet::new();
+    if let Some(default_ref) = &default_ref {
+        let is_current = default_ref
+            .strip_prefix("refs/remotes/origin/")
+            .is_some_and(|name| is_ref_current(name));
+        if is_current {
+            for dir_name in migration_dirs_at_ref(default_ref, DEFAULT_MIGRATIONS_DIR) {
+                default_branch_entries.insert(dir_name.clone());
+                claimants
+                    .entry(dir_name)
+                    .or_default()
+                    .push(default_ref.clone());
+            }
+        }
+    }
 
     let remote_refs = git_refs(&["refs/remotes"]);
     let refs_seen = remote_refs.len();
@@ -575,22 +602,10 @@ pub fn run_check_collisions() {
         if Some(git_ref) == default_ref.as_ref() {
             continue; // already recorded above
         }
-        // A long-lived clone can retain `refs/remotes/origin/<deleted>` for a
-        // branch `origin` no longer has -- nothing prunes it without an
-        // explicit `git fetch --prune`. Scanning it anyway would claim a
-        // version against a branch nobody can push a renumber to, keeping
-        // that version permanently unusable even after the real collision is
-        // gone. Only scan a ref `origin` currently advertises; when
-        // advertisement state is unknown (no network, no `origin` remote),
-        // fall back to scanning every local ref as before -- the coverage
-        // warning below already flags that degraded state.
-        if let Some(remote_heads) = &remote_heads {
-            let is_live = git_ref
-                .strip_prefix("refs/remotes/origin/")
-                .is_some_and(|name| remote_heads.contains_key(name));
-            if !is_live {
-                continue;
-            }
+        if let Some(branch_name) = git_ref.strip_prefix("refs/remotes/origin/")
+            && !is_ref_current(branch_name)
+        {
+            continue;
         }
         for dir_name in migration_dirs_at_ref(git_ref, DEFAULT_MIGRATIONS_DIR) {
             claimants.entry(dir_name).or_default().push(git_ref.clone());
@@ -622,7 +637,6 @@ pub fn run_check_collisions() {
     // are harmless here: this checker only reads them, so a leftover ref
     // for a branch that no longer exists costs nothing beyond checking a
     // branch that no longer matters.
-    let local_heads = local_origin_branch_heads();
     let full_branch_coverage = remote_heads.as_ref().is_some_and(|remote_heads| {
         !remote_heads.is_empty()
             && remote_heads
