@@ -2476,9 +2476,11 @@ pub enum AutumnWebDependency {
     /// Declared with a version requirement.
     Version(String),
     /// Declared, but with no version to read — a path or git entry.
-    /// (`{ workspace = true }` is [`Absent`](Self::Absent): it inherits the
-    /// root entry, which is read on its own.)
     WithoutVersion,
+    /// `{ workspace = true }`: the version lives in the enclosing workspace's
+    /// `[workspace.dependencies]`, which may be in an *ancestor* directory when
+    /// the command is pointed at a member rather than the workspace root.
+    Inherited,
 }
 
 /// Read the `autumn-web` version requirement from the `Cargo.toml` at `root`.
@@ -2491,7 +2493,9 @@ pub fn read_autumn_web_version_at(root: &std::path::Path) -> Option<String> {
         .into_iter()
         .find_map(|declaration| match declaration {
             AutumnWebDependency::Version(version) => Some(version),
-            AutumnWebDependency::Absent | AutumnWebDependency::WithoutVersion => None,
+            AutumnWebDependency::Absent
+            | AutumnWebDependency::WithoutVersion
+            | AutumnWebDependency::Inherited => None,
         })
 }
 
@@ -2532,11 +2536,9 @@ pub fn autumn_web_declarations_at(root: &std::path::Path) -> Vec<AutumnWebDepend
                 .map_or_else(
                     || {
                         if table.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
-                            // `{ workspace = true }` inherits the root's
-                            // `[workspace.dependencies]` entry, which is read
-                            // separately — this manifest adds no version of
-                            // its own.
-                            AutumnWebDependency::Absent
+                            // Resolved against the enclosing workspace, which
+                            // is not necessarily inside the scanned tree.
+                            AutumnWebDependency::Inherited
                         } else {
                             // A path or git entry: declared, no version to read.
                             AutumnWebDependency::WithoutVersion
@@ -2582,10 +2584,41 @@ pub fn autumn_web_declarations_at(root: &std::path::Path) -> Vec<AutumnWebDepend
                 .filter(|(key, entry)| is_autumn_web(key, entry))
                 .map(|(_, entry)| classify(entry))
         })
-        // `Absent` here means "inherits the workspace entry", which is read on
-        // its own — it is not a declaration this manifest contributes.
         .filter(|declaration| *declaration != AutumnWebDependency::Absent)
         .collect()
+}
+
+/// The `[workspace.dependencies]` entry for `autumn-web` in the `Cargo.toml` at
+/// `dir`, if that manifest defines a workspace at all.
+///
+/// Used to resolve `{ workspace = true }` when `autumn upgrade` is pointed at a
+/// member directory: Cargo walks up to the workspace root, and so must this.
+pub fn workspace_dependency_at(dir: &std::path::Path) -> Option<AutumnWebDependency> {
+    let content = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let table = toml::from_str::<toml::Table>(&content).ok()?;
+    let entry = table
+        .get("workspace")?
+        .get("dependencies")?
+        .as_table()?
+        .iter()
+        .find(|(key, entry)| {
+            *key == "autumn-web"
+                || entry
+                    .get("package")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|package| package == "autumn-web")
+        })
+        .map(|(_, entry)| entry)?;
+    Some(match entry {
+        toml::Value::String(version) => AutumnWebDependency::Version(version.clone()),
+        toml::Value::Table(table) => table
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .map_or(AutumnWebDependency::WithoutVersion, |version| {
+                AutumnWebDependency::Version(version.to_owned())
+            }),
+        _ => AutumnWebDependency::WithoutVersion,
+    })
 }
 
 /// Try to TCP-connect to a host:port within a short timeout.

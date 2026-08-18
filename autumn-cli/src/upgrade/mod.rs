@@ -469,14 +469,35 @@ fn recorded_version(root: &Path) -> Option<String> {
     // 0.5.0 -> 0.6.0 migration selected.
     use crate::doctor::AutumnWebDependency;
 
+    // `{ workspace = true }` resolves against the enclosing workspace, and that
+    // manifest is *above* the scan when the command is pointed at a member
+    // directory. Cargo walks up to find it; not doing so aborted a member with
+    // "cannot tell which version" over a version Cargo resolves fine.
+    // Canonicalised first: the scan root is usually the relative `.`, and
+    // `Path::new(".").ancestors()` yields only `.` — the walk upward would
+    // never leave the member directory it was pointed at.
+    let absolute_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let inherited = absolute_root
+        .ancestors()
+        .find_map(crate::doctor::workspace_dependency_at);
+
     let mut lowest: Option<(Version, String)> = None;
     for directory in std::iter::once(root.to_path_buf()).chain(member_manifests(root)) {
         // *Every* declaration in the manifest, not the first: a target-specific
         // requirement can be older than the package-wide one, and the source
         // scan rewrites that target's `#[cfg]` code either way.
         for declaration in crate::doctor::autumn_web_declarations_at(&directory) {
+            let declaration = match declaration {
+                // Substitute the workspace entry the member inherits. With no
+                // enclosing workspace to resolve it the manifest would not
+                // build at all, so asking for `--from` is the honest answer.
+                AutumnWebDependency::Inherited => inherited
+                    .clone()
+                    .unwrap_or(AutumnWebDependency::WithoutVersion),
+                other => other,
+            };
             let requirement = match declaration {
-                AutumnWebDependency::Absent => continue,
+                AutumnWebDependency::Absent | AutumnWebDependency::Inherited => continue,
                 // Declared as a path or git dependency: this crate is on *some*
                 // version of autumn-web and the manifest does not say which.
                 // Letting a sibling decide the floor would migrate this crate's

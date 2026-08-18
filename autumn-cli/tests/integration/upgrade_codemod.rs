@@ -1237,3 +1237,56 @@ fn a_symlinked_source_directory_is_reported_rather_than_ignored() {
         );
     }
 }
+
+#[test]
+fn running_inside_a_member_resolves_the_inherited_workspace_version() {
+    // `autumn upgrade` pointed at a member, not the workspace root. The
+    // member's only declaration is `{ workspace = true }`, and the entry it
+    // inherits lives one directory *up* — outside the scanned tree. Cargo walks
+    // up to find it; refusing to do so aborted over a version Cargo resolves.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"api\"]\n\n\
+         [workspace.dependencies]\nautumn-web = \"0.5.0\"\n",
+    );
+    write(
+        tmp.path(),
+        "api/Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = { workspace = true }\n",
+    );
+    write(tmp.path(), "api/src/lib.rs", USES_WITH_POOL);
+
+    let member = tmp.path().join("api");
+    let output = run_upgrade(&member, &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "api/src/lib.rs").contains("with_pool_untracked("),
+        "the inherited 0.5.0 puts the member in range:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn an_unresolvable_inherited_dependency_asks_for_from() {
+    // `{ workspace = true }` with no enclosing workspace to resolve it. The
+    // manifest would not build, so guessing a range for it is not an option.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = { workspace = true }\n",
+    );
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(!output.status.success(), "{}", report(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--from"),
+        "{}",
+        report(&output),
+    );
+}

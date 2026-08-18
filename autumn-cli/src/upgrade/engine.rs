@@ -490,13 +490,44 @@ fn takes_arguments(trees: &[TokenTree], index: usize, want: usize) -> bool {
 fn count_arguments(group: &proc_macro2::Group) -> usize {
     let mut arguments = 0;
     let mut in_argument = false;
+    // Angle brackets are not a `Group`, so the comma in
+    // `with_pool(make_pool::<Primary, Replica>())` sits at the same token level
+    // as a real argument separator. Depth is tracked only for a *turbofish*
+    // `::<`, which is unambiguous: opening on any bare `<` would let a
+    // comparison (`f(a < b, c)`) swallow the separator after it and undercount,
+    // and undercounting is the direction that produces a wrong edit. Other
+    // comma-bearing generic syntax still overcounts, which reports the site
+    // instead of rewriting it — the safe way to be wrong.
+    let mut generics = 0usize;
+    let mut previous_colons = 0usize;
+
     for tree in group.stream() {
         match &tree {
-            TokenTree::Punct(punct) if punct.as_char() == ',' => {
+            TokenTree::Punct(punct) if punct.as_char() == ',' && generics == 0 => {
                 arguments += 1;
                 in_argument = false;
+                previous_colons = 0;
             }
-            _ => in_argument = true,
+            TokenTree::Punct(punct) => {
+                in_argument = true;
+                match punct.as_char() {
+                    ':' => previous_colons += 1,
+                    '<' if previous_colons >= 2 => {
+                        generics += 1;
+                        previous_colons = 0;
+                    }
+                    // The `>` of a `->` closes nothing.
+                    '>' if generics > 0 => {
+                        generics -= 1;
+                        previous_colons = 0;
+                    }
+                    _ => previous_colons = 0,
+                }
+            }
+            _ => {
+                in_argument = true;
+                previous_colons = 0;
+            }
         }
     }
     // A trailing comma closes the last argument rather than opening one.
@@ -677,6 +708,26 @@ mod tests {
         let path_form =
             rewrite_source("fn f(p: P) { B::old_step(p); }", &[&METHOD_RENAME]).expect("parses");
         assert_eq!(path_form.updated, None, "a method rename leaves `::` alone");
+    }
+
+    #[test]
+    fn a_turbofish_inside_the_argument_does_not_inflate_the_arity() {
+        // The comma in `::<Primary, Replica>` is not an argument separator.
+        let out =
+            rewritten("fn f() { PgPostRepository::with_pool(make_pool::<Primary, Replica>()); }");
+        assert!(
+            out.contains("with_pool_untracked(make_pool::<Primary, Replica>())"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_comparison_in_the_argument_does_not_hide_a_separator() {
+        // Undercounting is the direction that produces a wrong edit, so a bare
+        // `<` must not open generic depth: this two-argument call stays a
+        // two-argument call and is left alone.
+        let result = run("fn f() { PgPostRepository::with_pool(a < b, pool); }");
+        assert_eq!(result.updated, None);
     }
 
     #[test]
