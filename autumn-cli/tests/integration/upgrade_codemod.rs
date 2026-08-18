@@ -29,12 +29,16 @@ fn read(root: &Path, rel: &str) -> String {
 }
 
 fn run_upgrade(root: &Path, args: &[&str]) -> Output {
-    Command::new(autumn_bin())
-        .arg("upgrade")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .expect("failed to run autumn upgrade")
+    run_upgrade_with_env(root, args, &[])
+}
+
+fn run_upgrade_with_env(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(autumn_bin());
+    command.arg("upgrade").args(args).current_dir(root);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("failed to run autumn upgrade")
 }
 
 fn stdout_of(output: &Output) -> String {
@@ -1463,5 +1467,117 @@ fn a_path_typo_is_reported_as_a_bad_path_not_a_missing_dependency() {
         !stderr.contains("Add an `autumn-web` dependency"),
         "and does not send the user to a manifest that does not exist:\n{}",
         report(&output)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_scan_root_that_cannot_be_read_is_a_failure_not_an_empty_report() {
+    // `is_dir()` answers "yes" for a directory with no read permission, so the
+    // root landed in `skipped` and the run exited 0 having examined nothing --
+    // a `--apply` that migrated no file at all, reported as success.
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let locked = tmp.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    write(&locked, "src/main.rs", USES_WITH_POOL);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Root ignores directory permissions, so there is nothing to assert when
+    // the suite runs as root. Restore the mode either way so the tempdir can be
+    // cleaned up.
+    let enforced = fs::read_dir(&locked).is_err();
+    let output = run_upgrade(
+        tmp.path(),
+        &["locked", "--from", "0.5.0", "--to", "0.6.0", "--apply"],
+    );
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    if !enforced {
+        return;
+    }
+
+    assert!(!output.status.success(), "{}", report(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not a readable directory"),
+        "an unreadable root is the bad-root exit, not an empty report:\n{}",
+        report(&output)
+    );
+}
+
+#[test]
+fn a_redirected_cargo_target_directory_is_still_build_output() {
+    // `CARGO_TARGET_DIR=build` puts build output somewhere the `target` name
+    // check never looks, so the walk descended into generated code and `--apply`
+    // rewrote artifacts that the next `cargo build` overwrites anyway.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(tmp.path(), "build/debug/build/generated.rs", USES_WITH_POOL);
+
+    let output = run_upgrade_with_env(
+        tmp.path(),
+        &["--to", "0.6.0", "--apply"],
+        &[("CARGO_TARGET_DIR", "build")],
+    );
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "app source is still migrated:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(tmp.path(), "build/debug/build/generated.rs").contains("with_pool(pool.clone())"),
+        "the configured target directory is build output:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn a_target_directory_configured_in_cargo_config_is_still_build_output() {
+    // The same redirection, written down in `.cargo/config.toml` instead of the
+    // environment -- the form a project commits rather than exports.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        ".cargo/config.toml",
+        "[build]\ntarget-dir = \"out\"\n",
+    );
+    write(tmp.path(), "out/debug/build/generated.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "app source is still migrated:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(tmp.path(), "out/debug/build/generated.rs").contains("with_pool(pool.clone())"),
+        "a committed target-dir redirect is build output too:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn a_module_named_like_a_redirected_target_directory_is_still_migrated() {
+    // The exclusion follows the *configured path*, not the name. With the target
+    // directory redirected to `out/`, an unrelated `src/out/mod.rs` is ordinary
+    // app code and must be migrated like any other module.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", "fn main() {}\n");
+    write(tmp.path(), "src/out/mod.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        ".cargo/config.toml",
+        "[build]\ntarget-dir = \"out\"\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/out/mod.rs").contains("with_pool_untracked("),
+        "only the configured path is build output, not the name:\n{}",
+        stdout_of(&output)
     );
 }

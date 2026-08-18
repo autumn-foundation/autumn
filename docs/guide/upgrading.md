@@ -105,7 +105,7 @@ it was; one unparsable file never stops the rest of the migration.
 |------|---------|
 | `0` | The scan completed. This includes a run that reported `manual` sites or skipped an unparsable file — both are in the report, and neither is a failure of the command. |
 | `1` | The apply step failed partway through. The report names the file it died on; the ones listed before it were already written. |
-| `2` | A bad argument, an unreadable `PATH`, or a version this command cannot parse. Nothing was scanned. |
+| `2` | A bad argument, a `PATH` that is not a readable directory, or a version this command cannot parse. Nothing was scanned. |
 
 There is no "found something" exit code: a preview that finds work is the
 command working. Gate on the `--json` report's `manual`, `skipped`, and
@@ -172,6 +172,11 @@ if your app keeps real source behind one, migrate it in its own checkout.
 `target/`, `vendor/`, `node_modules/`, `dist/` and `tmp/` are skipped where a
 crate begins — a directory holding a `Cargo.toml`. Beneath that they are
 ordinary module names, so `src/vendor/mod.rs` is migrated like any other file.
+
+If Cargo's output directory has been moved — `CARGO_TARGET_DIR`, or
+`build.target-dir` in `.cargo/config.toml` — that directory is skipped too,
+resolved as a path rather than matched by name. With the output in `out/`, an
+unrelated `src/out/mod.rs` is still migrated.
 
 Hidden directories are skipped by name — `.git`, `.github`, `.cargo`, `.vscode`
 and the like — not because they start with a dot. A dot-directory that holds

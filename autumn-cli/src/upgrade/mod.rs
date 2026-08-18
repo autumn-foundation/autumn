@@ -563,12 +563,27 @@ fn recorded_version(root: &Path) -> Option<String> {
 /// and both are visible in the report.
 fn member_manifests(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    collect_manifests(root, root, &mut found);
+    collect_manifests(
+        root,
+        root,
+        configured_target_dir(root).as_deref(),
+        &mut found,
+    );
     found.sort();
     found
 }
 
-fn collect_manifests(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) {
+/// Whether `path` is Cargo's configured output directory.
+///
+/// By resolved path, not by name: with the target directory redirected to
+/// `out/`, an unrelated `src/out/mod.rs` is ordinary app code.
+fn is_target_dir(path: &Path, target_dir: Option<&Path>) -> bool {
+    target_dir.is_some_and(|target_dir| {
+        std::fs::canonicalize(path).is_ok_and(|resolved| resolved == target_dir)
+    })
+}
+
+fn collect_manifests(root: &Path, dir: &Path, target_dir: Option<&Path>, found: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -587,21 +602,74 @@ fn collect_manifests(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) {
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_metadata = SKIPPED_HIDDEN_DIRS.contains(&name.as_str());
         let is_build_output = at_crate_root && SKIPPED_DIRS.contains(&name.as_str());
-        if is_metadata || is_build_output {
+        let path = entry.path();
+        if is_metadata || is_build_output || is_target_dir(&path, target_dir) {
             continue;
         }
-        let path = entry.path();
         if path.join("Cargo.toml").is_file() && path != root {
             found.push(path.clone());
         }
-        collect_manifests(root, &path, found);
+        collect_manifests(root, &path, target_dir, found);
     }
+}
+
+/// Cargo's output directory for `root`, when it is not the default `target/`.
+///
+/// `CARGO_TARGET_DIR` and `.cargo/config.toml`'s `build.target-dir` both move
+/// build output somewhere the `target` basename check will never look, and the
+/// walk then descends into generated code — `--apply` rewriting artifacts the
+/// next `cargo build` overwrites. Resolved the way Cargo resolves it: the
+/// environment variable against the current directory, a config entry against
+/// the directory holding the `.cargo` that declares it.
+///
+/// `None` means the default, which the basename check already covers.
+fn configured_target_dir(root: &Path) -> Option<PathBuf> {
+    fn canonical(path: PathBuf) -> Option<PathBuf> {
+        std::fs::canonicalize(path).ok()
+    }
+
+    if let Some(configured) = std::env::var_os("CARGO_TARGET_DIR") {
+        let configured = PathBuf::from(configured);
+        return canonical(if configured.is_absolute() {
+            configured
+        } else {
+            std::env::current_dir().ok()?.join(configured)
+        });
+    }
+
+    // Cargo reads `.cargo/config.toml` from the working directory upward, so a
+    // member inherits the workspace root's redirect.
+    let absolute_root = std::fs::canonicalize(root).ok()?;
+    for ancestor in absolute_root.ancestors() {
+        for name in ["config.toml", "config"] {
+            let Ok(content) = std::fs::read_to_string(ancestor.join(".cargo").join(name)) else {
+                continue;
+            };
+            let Ok(table) = toml::from_str::<toml::Table>(&content) else {
+                continue;
+            };
+            let Some(configured) = table
+                .get("build")
+                .and_then(|build| build.get("target-dir"))
+                .and_then(toml::Value::as_str)
+            else {
+                continue;
+            };
+            let configured = PathBuf::from(configured);
+            return canonical(if configured.is_absolute() {
+                configured
+            } else {
+                ancestor.join(configured)
+            });
+        }
+    }
+    None
 }
 
 /// Every `.rs` file under `root` that belongs to the app, in a stable order.
 fn app_sources(root: &Path) -> SourceScan {
     let mut scan = SourceScan::default();
-    collect_sources(root, &mut scan);
+    collect_sources(root, configured_target_dir(root).as_deref(), &mut scan);
     scan.files.sort();
     scan.symlinks.sort();
     scan.unreadable.sort();
@@ -622,7 +690,7 @@ struct SourceScan {
 
 /// Collect `.rs` files, recording what was deliberately or accidentally left
 /// out so the caller can report it rather than drop it silently.
-fn collect_sources(dir: &Path, scan: &mut SourceScan) {
+fn collect_sources(dir: &Path, target_dir: Option<&Path>, scan: &mut SourceScan) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         scan.unreadable.push(dir.to_path_buf());
         return;
@@ -647,10 +715,10 @@ fn collect_sources(dir: &Path, scan: &mut SourceScan) {
         if file_type.is_dir() {
             let is_metadata = SKIPPED_HIDDEN_DIRS.contains(&name.as_str());
             let is_build_output = at_crate_root && SKIPPED_DIRS.contains(&name.as_str());
-            if is_metadata || is_build_output {
+            if is_metadata || is_build_output || is_target_dir(&path, target_dir) {
                 continue;
             }
-            collect_sources(&path, scan);
+            collect_sources(&path, target_dir, scan);
         } else if file_type.is_symlink() {
             // A symlinked *directory* has `is_dir() == false`, so gating this
             // on a `.rs` extension hid a linked `src/` entirely: no traversal,
@@ -902,8 +970,11 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
     };
 
     // A path typo must not read as "your app is already migrated" — the same
-    // rule `autumn a11y verify` states for its scan root.
-    if !root.is_dir() {
+    // rule `autumn a11y verify` states for its scan root. Readability, not just
+    // `is_dir`: a directory the process cannot open answers "yes" to `is_dir`,
+    // and the walk would then report the root under `skipped` and exit 0 having
+    // examined no source at all.
+    if std::fs::read_dir(root).is_err() {
         eprintln!(
             "autumn upgrade: `{}` is not a readable directory.",
             root.display()
