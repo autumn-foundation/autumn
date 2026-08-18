@@ -1902,3 +1902,30 @@ fn a_receiver_backed_by_a_repository_trait_in_another_file_is_rewritten() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn a_qualified_repository_attribute_is_recognised() {
+    // `#[autumn_web::repository(...)]` is what the scaffold itself emits, so
+    // this is the *common* spelling, not an exotic one. Requiring the
+    // attribute's first token to be `repository` missed it, and every call site
+    // in a scaffolded app was then classified as an unverified receiver and
+    // left on the old name.
+    let tmp = app("0.5.0");
+    write(
+        tmp.path(),
+        "src/repositories.rs",
+        "use autumn_web::prelude::*;\n\n\
+         #[autumn_web::repository(Post, table = \"posts\")]\n\
+         pub trait PostRepository {\n    fn noop(&self);\n}\n\n\
+         pub fn build(pool: Pool) -> PgPostRepository {\n    \
+         PgPostRepository::with_pool(pool)\n}\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/repositories.rs").contains("with_pool_untracked(pool)"),
+        "the qualified spelling generates the type just the same:\n{}",
+        stdout_of(&output)
+    );
+}

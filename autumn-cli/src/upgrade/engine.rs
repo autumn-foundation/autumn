@@ -614,10 +614,7 @@ fn collect_repository_types(stream: &TokenStream, found: &mut Vec<String>) {
                 if group.delimiter() != Delimiter::Bracket {
                     continue;
                 }
-                let Some(TokenTree::Ident(name)) = group.stream().into_iter().next() else {
-                    continue;
-                };
-                if name != "repository" {
+                if !is_repository_attribute(&group.stream()) {
                     continue;
                 }
                 if let Some(trait_name) = trait_name_after(&trees, index + 2) {
@@ -628,6 +625,33 @@ fn collect_repository_types(stream: &TokenStream, found: &mut Vec<String>) {
             _ => {}
         }
     }
+}
+
+/// Whether an attribute body names the `repository` macro.
+///
+/// Matched on the *last* path segment, because the qualified spelling
+/// `#[autumn_web::repository(...)]` is the one the scaffold emits — insisting
+/// the attribute begin with `repository` missed the common case and classified
+/// every call site in a scaffolded app as unverified. The crate segment cannot
+/// be pinned down either: a manifest is free to rename the dependency
+/// (`autumn = { package = "autumn-web" }`), which makes the attribute
+/// `#[autumn::repository]`.
+///
+/// Only the path is read. Anything with an argument list — `#[cfg(feature =
+/// "repository")]` — is judged by its own name, not by what its arguments say.
+fn is_repository_attribute(stream: &TokenStream) -> bool {
+    let mut last_segment = None;
+    for tree in stream.clone() {
+        match tree {
+            TokenTree::Ident(ident) => last_segment = Some(ident.to_string()),
+            // Path separators, and a leading `::` for a fully-qualified path.
+            TokenTree::Punct(punct) if punct.as_char() == ':' => {}
+            // The argument list ends the path; anything else is not a path at
+            // all, and either way the name is already whatever came before it.
+            _ => break,
+        }
+    }
+    last_segment.is_some_and(|segment| segment == "repository")
 }
 
 /// The name of the trait an attribute at `from` is applied to.
@@ -791,6 +815,38 @@ mod tests {
         assert_eq!(
             types,
             vec!["PgPostRepository", "PgCommentRepository", "PgTagRepository"]
+        );
+    }
+
+    #[test]
+    fn recognises_the_qualified_attribute_spelling() {
+        // What the scaffold emits, plus the renamed-dependency spelling a
+        // manifest can produce and a fully-qualified path.
+        for attribute in [
+            "#[autumn_web::repository(Post, table = \"posts\")]",
+            "#[autumn::repository(Post)]",
+            "#[::autumn_web::repository]",
+        ] {
+            let types = generated_repository_types(&format!(
+                "{attribute}\npub trait PostRepository {{}}\n"
+            ));
+            assert_eq!(types, vec!["PgPostRepository"], "for {attribute}");
+        }
+    }
+
+    #[test]
+    fn does_not_read_repository_out_of_another_attributes_arguments() {
+        // The path is what names the macro. `#[cfg(feature = "repository")]`
+        // is a `cfg`, whatever its arguments happen to spell.
+        assert!(
+            generated_repository_types(
+                "#[cfg(feature = \"repository\")]\npub trait PostRepository {}\n"
+            )
+            .is_empty()
+        );
+        assert!(
+            generated_repository_types("#[derive(repository)]\npub trait PostRepository {}\n")
+                .is_empty()
         );
     }
 

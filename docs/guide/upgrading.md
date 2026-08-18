@@ -161,7 +161,9 @@ Manual - not rewritten; read the guide section:
 The name alone is not enough, though, because an app is free to write its own
 `PgAuditRepository` with its own one-argument `with_pool`. So the shape is only
 the first test: `autumn upgrade` also collects every `#[repository]` trait in
-the source it scans and derives the types they generate. A receiver has to be
+the source it scans — under any spelling of the attribute path, including the
+`#[autumn_web::repository(...)]` the scaffold emits — and derives the types they
+generate. A receiver has to be
 one of those to be rewritten. One that looks right but is not — because no
 `#[repository]` trait in the app accounts for it, or because the trait lives in
 a crate outside the scan — is reported rather than guessed at:
