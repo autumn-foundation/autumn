@@ -5282,10 +5282,19 @@ impl AppBuilder {
         // startup side effect of one), so skipping it here would let a collision
         // reach production before anything ever validated it: the first apply
         // would record the shared version and silently skip its colliding
-        // partner, and only a subsequent normal boot would notice. This path
-        // never applies the directory/shard-map guard sets (see the doc comment
-        // above), so unlike `run_startup_migrations` there is nothing to `.chain()`.
-        if log_migration_version_collisions(&migrations, false, false) {
+        // partner, and only a subsequent normal boot would notice.
+        //
+        // Unconditionally include the directory/shard-map sets in the CHECK
+        // (`true, true`) even though this path never APPLIES them (see the doc
+        // comment above -- the candidate's own boot creates those tables). An
+        // app/plugin migration colliding with one of those fixed framework
+        // versions would otherwise apply and record its version here first,
+        // silently, with only a later boot's apply of the real directory/
+        // shard-map migration -- not a version check -- exposing the fallout.
+        // Checking against them costs nothing on an unsharded app: a version
+        // that plainly does not collide never matches, so this never turns an
+        // otherwise-clean migrate-only run into a false failure.
+        if log_migration_version_collisions(&migrations, true, true) {
             // `process::exit` skips `on_shutdown`/`Drop`; stop any managed
             // Postgres child first, mirroring the SQLite guard below.
             #[cfg(feature = "managed-pg")]

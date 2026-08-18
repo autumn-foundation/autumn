@@ -94,6 +94,35 @@ fn git_refs(patterns: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Whether `origin`'s configured fetch refspec pulls every branch
+/// (`refs/heads/*` on the source side) rather than a narrowed subset.
+///
+/// `refs_seen > 0` alone is not evidence of full coverage: `git clone
+/// --single-branch --branch main origin` (or an equivalent narrowed
+/// `actions/checkout` `ref`/sparse setup) leaves `refs/remotes/origin/HEAD`
+/// and `refs/remotes/origin/main` present -- a nonzero, seemingly healthy ref
+/// count -- while every OTHER pushed branch is simply absent, so a real
+/// collision on `origin/other-branch` would go undetected and this checker
+/// would report a clean bill of health it did not earn. A missing or
+/// unreadable `remote.origin.fetch` (e.g. no `git` on PATH, no `origin`
+/// remote) degrades to `false`: the caller then treats it exactly like the
+/// `refs_seen == 0` shallow-clone case, which is the safe direction to
+/// default degradation in either failure mode.
+fn fetches_all_branches() -> bool {
+    let Ok(output) = Command::new("git")
+        .args(["config", "--get-all", "remote.origin.fetch"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|refspec| refspec.contains("refs/heads/*:refs/remotes/"))
+}
+
 /// The current directory's path relative to the repository root, as git's
 /// `<ref>:path` syntax needs it: that syntax is always root-relative, never
 /// CWD-relative, so a migrations directory that is not itself the repo root
@@ -436,13 +465,21 @@ pub fn run_check_collisions() {
             .push("autumn framework migrations".to_owned());
     }
 
-    if refs_seen == 0 {
+    // `refs_seen > 0` alone does not mean every branch was fetched -- see
+    // `fetches_all_branches`. Both failure modes (nothing fetched at all, or
+    // only a narrowed subset) get the same loud warning and the same
+    // working-tree-only degrade, since either one means a real collision on
+    // an unfetched branch would go undetected.
+    let full_branch_coverage = refs_seen > 0 && fetches_all_branches();
+    if !full_branch_coverage {
         eprintln!(
-            "\nWARNING: no origin refs are available in this clone, so ONLY the working tree\n\
-             \x20        and this CLI's compiled-in framework migrations were checked -- the\n\
-             \x20        cross-branch half of this check did not run.\n\n\
-             \x20        In CI this means the checkout is shallow: set `fetch-depth: 0` on\n\
-             \x20        actions/checkout, or fetch the branch refs explicitly:\n\n\
+            "\nWARNING: this clone does not have every branch's refs available, so ONLY the\n\
+             \x20        working tree and this CLI's compiled-in framework migrations were\n\
+             \x20        checked -- the cross-branch half of this check did not run (or only\n\
+             \x20        ran against a narrowed subset of branches).\n\n\
+             \x20        In CI this means the checkout is shallow or single-branch: set\n\
+             \x20        `fetch-depth: 0` on actions/checkout (and drop any `ref:`/sparse\n\
+             \x20        narrowing), or fetch every branch explicitly:\n\n\
              \x20            git fetch origin '+refs/heads/*:refs/remotes/origin/*'\n\n\
              \x20        Locally, `git fetch origin` is enough.\n"
         );
@@ -507,7 +544,7 @@ pub fn run_check_collisions() {
         );
     }
 
-    if refs_seen > 0 {
+    if full_branch_coverage {
         println!(
             "OK: no migration this checkout introduces collides with the default branch or \
              with any of {refs_seen} remote ref(s)"
