@@ -33,9 +33,9 @@ autumn upgrade - app-code migrations 0.5.0 -> 0.6.0
 
 Migrations in range (2):
   manual  0.6.0-tenancy-jwt-secret-secretstring  `TenancyConfig::jwt_secret` is now a `secrecy::SecretString`
-          docs/migrations/0.6.0.md#security-tenancyconfigjwt_secret-is-now-a-secrecysecretstring
+          https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.6.0.md#security-tenancyconfigjwt_secret-is-now-a-secrecysecretstring
   auto    0.6.0-repository-with-pool-untracked  repository constructor `with_pool` is renamed to `with_pool_untracked`
-          docs/migrations/0.6.0.md#repository-with_pool-is-renamed-to-with_pool_untracked
+          https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.6.0.md#repository-with_pool-is-renamed-to-with_pool_untracked
 
 Preview (nothing is written without --apply):
 
@@ -49,7 +49,7 @@ src/repositories.rs (2 sites)
 
 Manual - not rewritten; read the guide section:
   (whole change)  0.6.0-tenancy-jwt-secret-secretstring (no machine-applyable rewrite)
-      docs/migrations/0.6.0.md#security-tenancyconfigjwt_secret-is-now-a-secrecysecretstring
+      https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.6.0.md#security-tenancyconfigjwt_secret-is-now-a-secrecysecretstring
 
 2 sites in 1 file would be rewritten; 14 file(s) scanned.
 Nothing was written. Re-run with `--apply` to write these changes.
@@ -82,7 +82,7 @@ look like a call may never become one:
 ```text
 Manual - not rewritten; read the guide section:
   src/repositories.rs:40  0.6.0-repository-with-pool-untracked (inside a macro invocation)
-      docs/migrations/0.6.0.md#repository-with_pool-is-renamed-to-with_pool_untracked
+      https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.6.0.md#repository-with_pool-is-renamed-to-with_pool_untracked
 ```
 
 A file that is not valid Rust is reported under **Skipped** and left exactly as
@@ -94,7 +94,7 @@ it was; one unparsable file never stops the rest of the migration.
 |------|--------|
 | `PATH` | Project directory to migrate (positional, defaults to `.`). |
 | `--apply` | Write the rewrites. Without it the command only previews. |
-| `--from VERSION` | Override the recorded `autumn-web` version. Needed when you already bumped the dependency, or when any manifest declares a requirement with no single floor — a git pin, `*`, a multi-comparator range, or an upper bound like `"<0.6"`. The root and every workspace member are read together (including `[target.'cfg(…)'.dependencies]`), the oldest floor wins, and one ambiguous declaration anywhere makes the whole answer a guess rather than being ignored. |
+| `--from VERSION` | Override the recorded `autumn-web` version. Needed when you already bumped the dependency, or when any manifest declares a requirement with no single floor — a git pin, a bare `*`, a multi-comparator range, or an upper bound like `"<0.6"`. A wildcard in a later position does have a floor and is read: `"0.5.*"` is `0.5.0`, the same as `"0.5"`. The root and every workspace member are read together (including `[target.'cfg(…)'.dependencies]`), the oldest floor wins, and one ambiguous declaration anywhere makes the whole answer a guess rather than being ignored. |
 | `--to VERSION` | Upgrade to this release instead of the CLI's own version. |
 | `--json` | Machine-readable report — the same content, for CI. |
 | `--list-migrations` | Print the shipped codemods and exit, without scanning. |

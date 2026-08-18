@@ -297,6 +297,11 @@ impl std::fmt::Display for Version {
 /// multi-comparator range, a git branch name) returns `None` so the caller can
 /// ask for `--from` instead of rewriting against a guessed release.
 pub fn parse_version_req(req: &str) -> Option<Version> {
+    /// A `*`/`x`/`X` segment: Cargo's wildcard requirement, floored at zero.
+    fn is_wildcard(part: &str) -> bool {
+        matches!(part, "*" | "x" | "X")
+    }
+
     let req = req.trim();
     // A comma is Cargo's comparator separator: `>=0.4, <0.6` pins a range whose
     // floor says nothing about which migrations the app has already taken.
@@ -324,16 +329,32 @@ pub fn parse_version_req(req: &str) -> Option<Version> {
         return None;
     }
     let mut parts = core.split('.');
-    // An omitted segment is Cargo's "any value here", whose floor is zero.
-    let major = parts.next()?.parse::<u64>().ok()?;
-    let minor = match parts.next() {
-        Some(part) => part.parse::<u64>().ok()?,
-        None => 0,
+    // An omitted segment is Cargo's "any value here", whose floor is zero, and
+    // an explicit wildcard segment says the same thing: `0.5.*` and `0.5` pin
+    // the same floor. Only the *major* wildcard is refused — a bare `*` accepts
+    // every release, so reading it as 0.0.0 would silently select every
+    // migration ever written instead of asking for `--from`.
+    let first = parts.next()?;
+    if is_wildcard(first) {
+        return None;
+    }
+    let major = first.parse::<u64>().ok()?;
+    let mut wildcarded = false;
+    let mut segment = |part: Option<&str>| -> Option<u64> {
+        match part {
+            None => Some(0),
+            Some(part) if is_wildcard(part) => {
+                wildcarded = true;
+                Some(0)
+            }
+            // `1.*.3` is not a requirement Cargo accepts, and reading the `3`
+            // after a wildcard would invent precision the user did not write.
+            Some(_) if wildcarded => None,
+            Some(part) => part.parse::<u64>().ok(),
+        }
     };
-    let patch = match parts.next() {
-        Some(part) => part.parse::<u64>().ok()?,
-        None => 0,
-    };
+    let minor = segment(parts.next())?;
+    let patch = segment(parts.next())?;
     // A fourth segment is not semver; refuse rather than silently ignore it.
     if parts.next().is_some() {
         return None;
@@ -342,6 +363,27 @@ pub fn parse_version_req(req: &str) -> Option<Version> {
         prerelease,
         ..Version::new(major, minor, patch)
     })
+}
+
+/// Where the migration guides live, for a reader who is not standing in the
+/// Autumn repository.
+///
+/// The registry stores repo-relative paths because that is what the release
+/// gate checks against the tree. Printed verbatim by an installed CLI running
+/// in someone's app, `docs/migrations/0.6.0.md` names a file in *their*
+/// project — a dead end at exactly the point the report says to go read
+/// something. The human report renders this prefix instead.
+///
+/// Pinned to the default branch rather than to each release's tag: guides are
+/// append-only historical documents, the branch always resolves, and a
+/// migration registered for a release that has not been tagged yet — the case
+/// `docs/migrations/next.md` exists for — would otherwise link to a 404.
+pub const GUIDE_BASE_URL: &str = "https://github.com/autumn-foundation/autumn/blob/trunk-dev/";
+
+/// A repo-relative guide location as a URL anyone can open.
+#[must_use]
+pub fn guide_url(guide: &str) -> String {
+    format!("{GUIDE_BASE_URL}{guide}")
 }
 
 /// The migrations that apply when upgrading `from` → `to`.
@@ -448,7 +490,25 @@ mod tests {
         assert_eq!(parse_version_req("<=0.6.0"), None);
         assert_eq!(parse_version_req(""), None);
         assert_eq!(parse_version_req("trunk-dev"), None);
-        assert_eq!(parse_version_req("0.x"), None);
+        // A wildcard *major* is the bare `*` in another spelling.
+        assert_eq!(parse_version_req("x"), None);
+        assert_eq!(parse_version_req("X.1"), None);
+        // Precision after a wildcard is not a requirement Cargo accepts, and
+        // honouring the `3` would invent a floor the user did not write.
+        assert_eq!(parse_version_req("1.*.3"), None);
+    }
+
+    #[test]
+    fn a_wildcard_segment_floors_at_zero() {
+        // Cargo's wildcard requirements. `0.5.*` and `0.5` are the same
+        // requirement, so they have to parse to the same floor — and `0.*` is
+        // `0` written out, which this has always accepted as 0.0.0. Only the
+        // major position is refused, because `*` alone accepts every release.
+        assert_eq!(parse_version_req("0.5.*"), Some(Version::new(0, 5, 0)));
+        assert_eq!(parse_version_req("0.5.x"), Some(Version::new(0, 5, 0)));
+        assert_eq!(parse_version_req("^1.2.*"), Some(Version::new(1, 2, 0)));
+        assert_eq!(parse_version_req("0.*"), parse_version_req("0"));
+        assert_eq!(parse_version_req("0.x"), Some(Version::new(0, 0, 0)));
     }
 
     #[test]

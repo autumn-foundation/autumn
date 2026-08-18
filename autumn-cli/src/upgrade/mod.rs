@@ -219,7 +219,7 @@ fn render_migrations(out: &mut String, report: &Report) {
             migration.id,
             migration.title
         );
-        let _ = writeln!(out, "          {}", migration.guide);
+        let _ = writeln!(out, "          {}", migrations::guide_url(migration.guide));
     }
 }
 
@@ -288,7 +288,7 @@ fn render_entries(out: &mut String, heading: &str, entries: &[ManualEntry]) {
             entry.migration,
             entry.reason
         );
-        let _ = writeln!(out, "      {}", entry.guide);
+        let _ = writeln!(out, "      {}", migrations::guide_url(entry.guide));
     }
 }
 
@@ -395,6 +395,7 @@ fn migrations_json(migrations: &[&'static AppMigration]) -> serde_json::Value {
                     "title": migration.title,
                     "confidence": migration.confidence.label(),
                     "guide": migration.guide,
+                    "guide_url": migrations::guide_url(migration.guide),
                     "rewrites_code": !matches!(migration.rewrite, migrations::Rewrite::GuideOnly),
                 })
             })
@@ -413,6 +414,7 @@ fn manual_json(entries: &[ManualEntry]) -> serde_json::Value {
                     "migration": entry.migration,
                     "reason": entry.reason,
                     "guide": entry.guide,
+                    "guide_url": migrations::guide_url(entry.guide),
                 })
             })
             .collect(),
@@ -1018,7 +1020,7 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
                     migration.id,
                     migration.title
                 );
-                println!("          {}", migration.guide);
+                println!("          {}", migrations::guide_url(migration.guide));
             }
         }
         return 0;

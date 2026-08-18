@@ -1702,3 +1702,114 @@ fn a_nested_workspaces_member_resolves_against_its_own_workspace() {
         report(&output)
     );
 }
+
+#[test]
+fn guide_locations_are_printed_as_urls_the_user_can_open() {
+    // The registry stores repo-relative paths so the release gate can check
+    // them against the tree. Printed verbatim by an installed CLI running in
+    // someone's app, `docs/migrations/0.6.0.md#...` names a file in *their*
+    // project -- a dead end at exactly the point the report is telling them to
+    // go read something.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0"]);
+    assert!(output.status.success(), "{}", report(&output));
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains(
+            "https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.6.0.md#"
+        ),
+        "guide locations are openable URLs:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(" docs/migrations/"),
+        "and no bare repo-relative path is left in the report:\n{stdout}"
+    );
+}
+
+#[test]
+fn list_migrations_prints_guide_urls_too() {
+    let tmp = app("0.5.0");
+    let output = run_upgrade(tmp.path(), &["--list-migrations"]);
+    assert!(output.status.success(), "{}", report(&output));
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains(" docs/migrations/"), "{stdout}");
+}
+
+#[test]
+fn json_keeps_the_repo_relative_guide_and_adds_the_url() {
+    // Automation pinned to the registry's own paths keeps working; the URL is
+    // additive.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--json"]);
+    assert!(output.status.success(), "{}", report(&output));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout_of(&output)).expect("json");
+    let migration = &parsed["migrations"][0];
+    assert!(
+        migration["guide"]
+            .as_str()
+            .expect("guide")
+            .starts_with("docs/migrations/"),
+        "{parsed:#}"
+    );
+    assert!(
+        migration["guide_url"]
+            .as_str()
+            .expect("guide_url")
+            .starts_with("https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/"),
+        "{parsed:#}"
+    );
+}
+
+#[test]
+fn a_wildcard_version_requirement_has_a_floor() {
+    // `autumn-web = "0.5.*"` is a documented Cargo requirement whose floor is
+    // unambiguously 0.5.0 -- the same floor as `"0.5"`, which is already
+    // accepted. Refusing it sent the user to `--from` for no reason.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"0.5.*\"\n",
+    );
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "0.5.* floors at 0.5.0:\n{}",
+        report(&output)
+    );
+}
+
+#[test]
+fn a_bare_wildcard_requirement_still_has_no_floor() {
+    // `*` accepts every release, so it says nothing about which one the app is
+    // on. Reading it as 0.0.0 would silently select every migration ever
+    // written; asking for `--from` is the honest answer.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"*\"\n",
+    );
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(!output.status.success(), "{}", report(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--from"),
+        "{}",
+        report(&output)
+    );
+}
