@@ -220,15 +220,37 @@ fn framework_migration_names() -> Vec<String> {
 /// # Errors
 /// Returns an error (rather than guessing) when the latest taken version is
 /// more than a week ahead of `now` -- that far ahead means a mistyped year
-/// or a badly wrong clock, not skew worth silently absorbing -- or when no
-/// free second exists in the two minutes after the starting point.
+/// or a badly wrong clock, not skew worth silently absorbing -- when the
+/// latest taken version isn't a valid calendar timestamp at all (Diesel only
+/// requires 14 digits, not a real date, so a hand-typed version like
+/// `20261301000000` -- month 13 -- satisfies `version_prefix` but can't be
+/// arithmetic'd on) -- or when no free second exists in the two minutes
+/// after the starting point.
 fn resolve_free_version(taken: &BTreeSet<String>, now: NaiveDateTime) -> Result<String, String> {
-    let max_taken = taken.iter().filter_map(|v| parse_version(v)).max();
+    // Lexical string comparison, not `parse_version`+`max`: all versions are
+    // fixed-width digit strings, so string order and chronological order are
+    // the same order REGARDLESS of whether the string is a valid calendar
+    // date. Deciding "is anything already ahead of `now`" this way means a
+    // garbage-but-14-digit version (`20261301000000`) still counts instead of
+    // silently vanishing from consideration -- only the arithmetic below
+    // (bumping past it, checking the horizon) needs it to actually parse, and
+    // that failure gets a loud error rather than a quietly wrong ordering.
+    let max_taken_str = taken.iter().max().cloned();
 
     let mut version = now;
-    if let Some(max_taken) = max_taken
-        && max_taken > version
+    if let Some(max_taken_str) = &max_taken_str
+        && max_taken_str.as_str() > format_version(now).as_str()
     {
+        let Some(max_taken) = parse_version(max_taken_str) else {
+            return Err(format!(
+                "the latest existing migration version is {max_taken_str}, which is not a \
+                 valid calendar timestamp -- Diesel only requires 14 digits, not a real date, \
+                 but this generator needs to do date arithmetic on the latest one to guarantee \
+                 the next version sorts after it.\n\
+                 Fix migrations/{max_taken_str}_* to a real UTC timestamp (or rename it if it \
+                 was a typo) before generating another migration.",
+            ));
+        };
         let horizon = version + Duration::days(7);
         if max_taken > horizon {
             return Err(format!(
@@ -385,28 +407,38 @@ pub fn run_new(name: &str) {
 
 /// The remote-tracking ref for the repository's default branch.
 ///
-/// Tries the local `refs/remotes/origin/HEAD` symref first (cheap, no
-/// network). Many checkouts never set it, though -- a shallow or
-/// partial CI clone commonly skips it entirely -- so this then asks the
-/// remote directly via `git ls-remote --symref origin HEAD`, which reports
-/// the SAME answer `origin/HEAD` would if it existed, for any default
-/// branch name whatsoever. Guessing from a fixed name list (`main`,
-/// `trunk`, ...) instead of asking would silently misresolve any repo whose
-/// default branch is not one of those names: `default_branch_entries` would
-/// then stay empty, and EVERY existing working-tree migration would be
-/// misclassified as introduced by the current checkout -- so a pre-existing
-/// collision between the real default branch and some other already-merged
-/// branch would fail every unrelated PR's gate, not just the one that
-/// actually caused it.
+/// Asks the remote directly first, via `git ls-remote --symref origin
+/// HEAD` -- the same lightweight, no-objects-transferred query
+/// `remote_branch_names` already uses, so this adds no new network
+/// round-trip when both are called. That answer is authoritative and works
+/// for any default branch name; falls back to the local `refs/remotes/
+/// origin/HEAD` symref only when the network query fails (offline, no
+/// `origin` remote), and to a fixed name list as a last resort.
 ///
-/// `None` when neither resolves (e.g. no `origin` remote, no network, no
-/// `git` on PATH) -- the caller then treats every working-tree migration as
-/// introduced by this checkout, which is the safe direction only in the
-/// sense that it never hides a real collision (it can still misattribute
-/// one to the wrong checkout, but that is what `remote_branch_names`
-/// returning `None` already puts the caller on notice about via the
-/// coverage warning).
+/// The local symref is checked LAST, not first, because it can go silently
+/// stale: `git fetch` updates branch refs but never touches this symref, so
+/// a checkout that predates a default-branch rename (`master` -> `main`,
+/// or any org-wide rename) keeps resolving the OLD name forever unless
+/// something explicitly runs `git remote set-head origin -a`. Preferring
+/// it would misclassify every migration already on the real (new) default
+/// branch as "introduced by this checkout," and a pre-existing collision
+/// on the real default branch would then fail an unrelated PR's gate.
+/// Guessing from a fixed name list (`main`, `trunk`, ...) has the same
+/// failure mode for any default branch name not on that list:
+/// `default_branch_entries` would stay empty and EVERY existing
+/// working-tree migration would be misclassified the same way.
+///
+/// `None` when nothing resolves (e.g. no `origin` remote, no network AND no
+/// local symref, no `git` on PATH) -- the caller then treats every
+/// working-tree migration as introduced by this checkout, which is the safe
+/// direction only in the sense that it never hides a real collision (it can
+/// still misattribute one to the wrong checkout, but that is what
+/// `remote_branch_names` returning `None` already puts the caller on notice
+/// about via the coverage warning).
 fn resolve_default_branch_ref() -> Option<String> {
+    if let Some(branch) = remote_head_branch() {
+        return Some(format!("refs/remotes/origin/{branch}"));
+    }
     if let Ok(output) = Command::new("git")
         .args(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
         .output()
@@ -416,9 +448,6 @@ fn resolve_default_branch_ref() -> Option<String> {
         if !r.is_empty() {
             return Some(r);
         }
-    }
-    if let Some(branch) = remote_head_branch() {
-        return Some(format!("refs/remotes/origin/{branch}"));
     }
     ["main", "master", "trunk", "trunk-dev"]
         .into_iter()
@@ -712,6 +741,33 @@ mod tests {
         let now = dt("20260812120000");
         let err = resolve_free_version(&taken, now).unwrap_err();
         assert!(err.contains("more than a week ahead"), "{err}");
+    }
+
+    #[test]
+    fn resolve_free_version_rejects_a_calendar_invalid_max_taken_version() {
+        // 14 digits, so `version_prefix` (and Diesel) accept it as a
+        // version, but month 13 is not a real calendar date -- arithmetic on
+        // it (bumping past it, checking the horizon) is undefined, so this
+        // must error rather than silently drop it from consideration and
+        // risk generating a version that sorts before it.
+        let mut taken = BTreeSet::new();
+        taken.insert("20261301000000".to_owned());
+        let now = dt("20260812120000");
+        let err = resolve_free_version(&taken, now).unwrap_err();
+        assert!(err.contains("20261301000000"), "{err}");
+        assert!(err.contains("not a valid calendar timestamp"), "{err}");
+    }
+
+    #[test]
+    fn resolve_free_version_ignores_a_calendar_invalid_version_that_is_not_the_max() {
+        // A garbage version that is NOT the lexical max (an earlier taken
+        // version dominates it) never enters the arithmetic path at all, so
+        // it must not block an otherwise-valid resolution.
+        let mut taken = BTreeSet::new();
+        taken.insert("20260812120000".to_owned());
+        taken.insert("00000013000000".to_owned()); // 14 digits, garbage, but sorts first
+        let now = dt("20260812120000");
+        assert_eq!(resolve_free_version(&taken, now).unwrap(), "20260812120001");
     }
 
     #[test]
