@@ -3292,9 +3292,11 @@ fn render_routes_file(
     let back_to_list = labels.lit("common.back", "Back to list");
     let back_to_list_markup = labels.markup("common.back", "Back to list");
     let edit_link_text = labels.lit("common.edit", "Edit");
-    // Create/edit form chrome. `common.new` carries the pattern and the resource
-    // display name arrives as a Fluent argument, so a translation controls word
-    // order instead of having "New" concatenated in front of a noun.
+    // Create/edit form chrome. The `New {Pascal}` title is the SAME
+    // per-resource `{snake}.new` key the index link uses, for the reason given
+    // above: interpolating the model name into a shared pattern hands the
+    // translator a sentence whose article and adjective must agree with a noun
+    // they cannot see.
     let new_title = labels.lit_ref(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
     let new_heading = labels.markup(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
     let create_button = labels.lit("common.create", "Create");
