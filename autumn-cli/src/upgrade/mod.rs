@@ -35,7 +35,7 @@ pub mod diff;
 pub mod engine;
 pub mod migrations;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use migrations::{AppMigration, Version};
@@ -692,23 +692,86 @@ fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
     // The two settings read here merge differently and must not be pooled:
     // `build.target-dir` is a scalar, so the *nearest* declaration wins and the
     // rest are overridden — unioning them pruned directories that are really
-    // app source. The `[source.*]` tables merge, so every level contributes.
+    // app source. The `[source.*]` tables merge into one table across every
+    // level, so `replace-with` in one file can name a source another defines;
+    // resolving each file alone found neither half.
+    let mut levels: Vec<(PathBuf, PathBuf)> = absolute_root
+        .ancestors()
+        .map(|ancestor| (ancestor.join(".cargo"), ancestor.to_path_buf()))
+        .collect();
+    levels.extend(cargo_home().map(|home| (home.clone(), home)));
+
+    let mut sources = Sources::new();
     let mut nearest_target = None;
-    for ancestor in absolute_root.ancestors() {
-        let (target, vendored) =
-            config_excluded_dirs_in(&ancestor.join(".cargo"), ancestor, target_dir_from_config);
-        nearest_target = nearest_target.or(target);
-        found.extend(vendored);
-    }
-    if let Some(home) = cargo_home() {
-        let (target, vendored) = config_excluded_dirs_in(&home, &home, target_dir_from_config);
-        nearest_target = nearest_target.or(target);
-        found.extend(vendored);
+    // Farthest first, so a nearer level overwrites what it declares and leaves
+    // the rest of the merged table standing.
+    for (config_dir, base) in levels.iter().rev() {
+        let (target, declared) = config_at(config_dir, base, target_dir_from_config);
+        if target.is_some() {
+            nearest_target = target;
+        }
+        merge_sources(&mut sources, declared);
     }
     found.extend(nearest_target);
+    found.extend(active_vendor_dirs(&sources));
 
-    collect_target_dirs(&absolute_root, target_dir_from_config, &mut found);
+    collect_target_dirs(&absolute_root, target_dir_from_config, &sources, &mut found);
     found
+}
+
+/// One `[source.*]` entry: where it points, and what it is replaced with.
+///
+/// `directory` is already resolved against the base of the config that declared
+/// it, because a merged table mixes entries from levels with different bases.
+#[derive(Clone, Default)]
+struct SourceEntry {
+    directory: Option<PathBuf>,
+    replace_with: Option<String>,
+}
+
+type Sources = BTreeMap<String, SourceEntry>;
+
+/// Overlay `nearer` onto `sources`, field by field.
+fn merge_sources(sources: &mut Sources, nearer: Sources) {
+    for (name, entry) in nearer {
+        let merged = sources.entry(name).or_default();
+        if entry.directory.is_some() {
+            merged.directory = entry.directory;
+        }
+        if entry.replace_with.is_some() {
+            merged.replace_with = entry.replace_with;
+        }
+    }
+}
+
+/// The directories of every source that something is actually replaced *with*.
+///
+/// Source replacement is activated by `replace-with`: defining `[source.archive]
+/// directory = "src"` and never replacing anything with it leaves `src` as
+/// ordinary app source. A replacement may itself be replaced, so the chain is
+/// followed to its end.
+fn active_vendor_dirs(sources: &Sources) -> Vec<PathBuf> {
+    let mut active: BTreeSet<&str> = BTreeSet::new();
+    let mut pending: Vec<&str> = sources
+        .values()
+        .filter_map(|entry| entry.replace_with.as_deref())
+        .collect();
+    // `active` doubles as the seen-set, so a config that points two sources at
+    // each other terminates instead of spinning.
+    while let Some(name) = pending.pop() {
+        if !active.insert(name) {
+            continue;
+        }
+        pending.extend(
+            sources
+                .get(name)
+                .and_then(|entry| entry.replace_with.as_deref()),
+        );
+    }
+    active
+        .into_iter()
+        .filter_map(|name| sources.get(name)?.directory.clone())
+        .collect()
 }
 
 /// Cargo's own configuration directory — `$CARGO_HOME`, or `~/.cargo`.
@@ -738,8 +801,19 @@ fn cargo_home() -> Option<PathBuf> {
 /// the walk happens to learn of it first; directory order is not guaranteed.
 /// The source walk excludes it either way, so what is at stake there is the
 /// traversal cost, not whether the directory is migrated.
-fn collect_target_dirs(dir: &Path, target_dir_from_config: bool, found: &mut BTreeSet<PathBuf>) {
-    found.extend(config_excluded_dirs_at(dir, target_dir_from_config));
+fn collect_target_dirs(
+    dir: &Path,
+    target_dir_from_config: bool,
+    inherited: &Sources,
+    found: &mut BTreeSet<PathBuf>,
+) {
+    // A nested crate inherits the hierarchy above it, so its own `replace-with`
+    // may name a source one of those levels defines.
+    let (target, declared) = config_at(&dir.join(".cargo"), dir, target_dir_from_config);
+    found.extend(target);
+    let mut sources = inherited.clone();
+    merge_sources(&mut sources, declared);
+    found.extend(active_vendor_dirs(&sources));
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -763,7 +837,7 @@ fn collect_target_dirs(dir: &Path, target_dir_from_config: bool, found: &mut BTr
         if is_target_dir(&path, found) {
             continue;
         }
-        collect_target_dirs(&path, target_dir_from_config, found);
+        collect_target_dirs(&path, target_dir_from_config, inherited, found);
     }
 }
 
@@ -778,34 +852,19 @@ fn resolve_against(base: &Path, path: &str) -> Option<PathBuf> {
     std::fs::canonicalize(absolute).ok()
 }
 
-/// The directories the `.cargo/config.toml` in `dir` itself declares as
-/// generated or third-party: `build.target-dir`, and the `directory` of every
-/// `[source.*]` replacement.
-///
-/// Cargo resolves a relative entry against the directory holding the `.cargo`
-/// that declares it, so that is what these resolve against. `target_dir` is
-/// false when `CARGO_TARGET_DIR` has already decided that question.
-fn config_excluded_dirs_at(dir: &Path, target_dir: bool) -> Vec<PathBuf> {
-    let (target, mut found) = config_excluded_dirs_in(&dir.join(".cargo"), dir, target_dir);
-    found.extend(target);
-    found
-}
-
-/// The `build.target-dir` and the `[source.*]` directories a Cargo config in
+/// The `build.target-dir` and the `[source.*]` entries a Cargo config in
 /// `config_dir` declares, resolved against `base`.
 ///
 /// Cargo resolves a relative entry against the directory holding the config
-/// that declares it, so that is what these resolve against. `target_dir` is
-/// false when `CARGO_TARGET_DIR` has already decided that question.
+/// that declares it, so that is what these resolve against — and why the
+/// resolution happens here rather than after merging, when the base is gone.
+/// `target_dir` is false when `CARGO_TARGET_DIR` has already decided that
+/// question.
 ///
 /// `config` is read before `config.toml`: when a project holds both, Cargo uses
 /// the extensionless name and warns. Reading the other one first meant the
 /// directory Cargo actually builds into was scanned as app source.
-fn config_excluded_dirs_in(
-    config_dir: &Path,
-    base: &Path,
-    target_dir: bool,
-) -> (Option<PathBuf>, Vec<PathBuf>) {
+fn config_at(config_dir: &Path, base: &Path, target_dir: bool) -> (Option<PathBuf>, Sources) {
     for name in ["config", "config.toml"] {
         let Ok(content) = std::fs::read_to_string(config_dir.join(name)) else {
             continue;
@@ -821,45 +880,27 @@ fn config_excluded_dirs_in(
             .and_then(|configured| resolve_against(base, configured));
         // `[source.vendored-sources] directory = "third-party"` — where
         // `cargo vendor <path>` was told to put dependency sources.
-        //
-        // Only sources that are actually *replaced with* count. Defining
-        // `[source.archive] directory = "src"` activates nothing on its own, and
-        // excluding it dropped the whole app from the scan without a word.
-        let mut found = Vec::new();
-        if let Some(sources) = table.get("source").and_then(toml::Value::as_table) {
-            let replacement_of = |name: &str| {
-                sources
-                    .get(name)
-                    .and_then(|source| source.get("replace-with"))
-                    .and_then(toml::Value::as_str)
-            };
-            // A replacement may itself be replaced, so the chain is followed to
-            // its end. `active` doubles as the seen-set, so a config that points
-            // two sources at each other terminates instead of spinning.
-            let mut active: BTreeSet<&str> = BTreeSet::new();
-            let mut pending: Vec<&str> = sources
-                .values()
-                .filter_map(|source| source.get("replace-with").and_then(toml::Value::as_str))
-                .collect();
-            while let Some(name) = pending.pop() {
-                if !active.insert(name) {
-                    continue;
-                }
-                pending.extend(replacement_of(name));
-            }
-            for name in active {
-                if let Some(directory) = sources
-                    .get(name)
-                    .and_then(|source| source.get("directory"))
-                    .and_then(toml::Value::as_str)
-                {
-                    found.extend(resolve_against(base, directory));
-                }
+        let mut sources = Sources::new();
+        if let Some(declared) = table.get("source").and_then(toml::Value::as_table) {
+            for (source_name, source) in declared {
+                sources.insert(
+                    source_name.clone(),
+                    SourceEntry {
+                        directory: source
+                            .get("directory")
+                            .and_then(toml::Value::as_str)
+                            .and_then(|directory| resolve_against(base, directory)),
+                        replace_with: source
+                            .get("replace-with")
+                            .and_then(toml::Value::as_str)
+                            .map(str::to_owned),
+                    },
+                );
             }
         }
-        return (target, found);
+        return (target, sources);
     }
-    (None, Vec::new())
+    (None, Sources::new())
 }
 
 /// Every `.rs` file under `root` that belongs to the app, in a stable order.

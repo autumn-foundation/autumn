@@ -2535,3 +2535,50 @@ fn a_chained_source_replacement_is_followed() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn a_source_replacement_split_across_config_levels_is_followed() {
+    // Codex review on #2231, and a regression from making activation per-file:
+    // Cargo merges `[source.*]` across the hierarchy, so `replace-with` in the
+    // project config can name a source another level defines. Resolving each
+    // file alone found neither half, and vendored dependencies were rewritten.
+    let outer = TempDir::new().expect("tempdir");
+    write(
+        outer.path(),
+        "app/Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"0.5.0\"\n",
+    );
+    write(outer.path(), "app/src/main.rs", USES_WITH_POOL);
+    // The activation lives here …
+    write(
+        outer.path(),
+        "app/.cargo/config.toml",
+        "[source.crates-io]\nreplace-with = 'vendored'\n",
+    );
+    // … and the directory it names lives a level up, relative to *that* file.
+    write(
+        outer.path(),
+        ".cargo/config.toml",
+        "[source.vendored]\ndirectory = 'app/third-party'\n",
+    );
+    write(
+        outer.path(),
+        "app/third-party/some-crate/src/lib.rs",
+        USES_WITH_POOL,
+    );
+
+    let output = run_upgrade(&outer.path().join("app"), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(outer.path(), "app/third-party/some-crate/src/lib.rs")
+            .contains("with_pool(pool.clone())"),
+        "the merged replacement names a vendor directory:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(outer.path(), "app/src/main.rs").contains("with_pool_untracked("),
+        "and app source is still migrated:\n{}",
+        stdout_of(&output)
+    );
+}
