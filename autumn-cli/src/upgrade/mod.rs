@@ -650,8 +650,8 @@ fn collect_manifests(
     }
 }
 
-/// Every directory Cargo has been told to put build output in, anywhere in the
-/// scan.
+/// Every directory Cargo has been told to hold generated or third-party code,
+/// anywhere in the scan.
 ///
 /// `CARGO_TARGET_DIR` and `.cargo/config.toml`'s `build.target-dir` both move
 /// output somewhere the `target` basename check will never look, and the walk
@@ -663,25 +663,29 @@ fn collect_manifests(
 /// `tools/helper/.cargo/config.toml` may say `target-dir = "../../build"`, and
 /// that directory is reached by a different branch of the walk entirely.
 ///
-/// `CARGO_TARGET_DIR` overrides every config file, so when it is set it is the
-/// only answer.
+/// Two kinds: build output (`build.target-dir`) and vendored dependencies
+/// (`[source.*] directory`, which is where `cargo vendor <path>` puts them).
+/// Neither is the app's own code, and rewriting the second corrupts a
+/// dependency.
+///
+/// `CARGO_TARGET_DIR` overrides every config file's `target-dir`, but has no
+/// equivalent for vendoring, so the config walk runs either way.
 fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
-    if let Some(configured) = std::env::var_os("CARGO_TARGET_DIR") {
-        return std::env::current_dir()
-            .ok()
-            .and_then(|cwd| resolve_against(&cwd, &configured.to_string_lossy()))
-            .into_iter()
-            .collect();
-    }
+    let forced_target_dir = std::env::var_os("CARGO_TARGET_DIR").and_then(|configured| {
+        let cwd = std::env::current_dir().ok()?;
+        resolve_against(&cwd, &configured.to_string_lossy())
+    });
+    let target_dir_from_config = forced_target_dir.is_none();
 
     let mut found = BTreeSet::new();
+    found.extend(forced_target_dir);
     // Cargo reads `.cargo/config.toml` from the invocation directory upward, so
     // a redirect above the scan root applies to everything inside it.
     let absolute_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     for ancestor in absolute_root.ancestors() {
-        found.extend(config_target_dir_at(ancestor));
+        found.extend(config_excluded_dirs_at(ancestor, target_dir_from_config));
     }
-    collect_target_dirs(&absolute_root, &mut found);
+    collect_target_dirs(&absolute_root, target_dir_from_config, &mut found);
     found
 }
 
@@ -698,8 +702,8 @@ fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
 /// the walk happens to learn of it first; directory order is not guaranteed.
 /// The source walk excludes it either way, so what is at stake there is the
 /// traversal cost, not whether the directory is migrated.
-fn collect_target_dirs(dir: &Path, found: &mut BTreeSet<PathBuf>) {
-    found.extend(config_target_dir_at(dir));
+fn collect_target_dirs(dir: &Path, target_dir_from_config: bool, found: &mut BTreeSet<PathBuf>) {
+    found.extend(config_excluded_dirs_at(dir, target_dir_from_config));
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -723,7 +727,7 @@ fn collect_target_dirs(dir: &Path, found: &mut BTreeSet<PathBuf>) {
         if is_target_dir(&path, found) {
             continue;
         }
-        collect_target_dirs(&path, found);
+        collect_target_dirs(&path, target_dir_from_config, found);
     }
 }
 
@@ -738,14 +742,17 @@ fn resolve_against(base: &Path, path: &str) -> Option<PathBuf> {
     std::fs::canonicalize(absolute).ok()
 }
 
-/// `build.target-dir` from the `.cargo/config.toml` in `dir` itself, if any.
+/// The directories the `.cargo/config.toml` in `dir` itself declares as
+/// generated or third-party: `build.target-dir`, and the `directory` of every
+/// `[source.*]` replacement.
 ///
 /// Cargo resolves a relative entry against the directory holding the `.cargo`
-/// that declares it, so that is what this resolves against.
-fn config_target_dir_at(dir: &Path) -> Option<PathBuf> {
+/// that declares it, so that is what these resolve against. `target_dir` is
+/// false when `CARGO_TARGET_DIR` has already decided that question.
+fn config_excluded_dirs_at(dir: &Path, target_dir: bool) -> Vec<PathBuf> {
     let config_dir = dir.join(".cargo");
     if !config_dir.is_dir() {
-        return None;
+        return Vec::new();
     }
     for name in ["config.toml", "config"] {
         let Ok(content) = std::fs::read_to_string(config_dir.join(name)) else {
@@ -754,15 +761,27 @@ fn config_target_dir_at(dir: &Path) -> Option<PathBuf> {
         let Ok(table) = toml::from_str::<toml::Table>(&content) else {
             continue;
         };
-        if let Some(configured) = table
-            .get("build")
-            .and_then(|build| build.get("target-dir"))
-            .and_then(toml::Value::as_str)
+        let mut found = Vec::new();
+        if target_dir
+            && let Some(configured) = table
+                .get("build")
+                .and_then(|build| build.get("target-dir"))
+                .and_then(toml::Value::as_str)
         {
-            return resolve_against(dir, configured);
+            found.extend(resolve_against(dir, configured));
         }
+        // `[source.vendored-sources] directory = "third-party"` — where
+        // `cargo vendor <path>` was told to put dependency sources.
+        if let Some(sources) = table.get("source").and_then(toml::Value::as_table) {
+            for source in sources.values() {
+                if let Some(directory) = source.get("directory").and_then(toml::Value::as_str) {
+                    found.extend(resolve_against(dir, directory));
+                }
+            }
+        }
+        return found;
     }
-    None
+    Vec::new()
 }
 
 /// Every `.rs` file under `root` that belongs to the app, in a stable order.

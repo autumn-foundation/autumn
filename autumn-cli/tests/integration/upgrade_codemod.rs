@@ -2314,3 +2314,36 @@ fn an_unparsable_file_is_not_evidence_for_a_receiver_elsewhere() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn a_configured_vendor_directory_is_never_rewritten() {
+    // `cargo vendor third-party` puts dependency sources somewhere the `vendor`
+    // basename check never looks, and `[source.vendored-sources]` is what says
+    // where. Rewriting a third-party crate corrupts a dependency.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        ".cargo/config.toml",
+        "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
+         [source.vendored-sources]\ndirectory = \"third-party\"\n",
+    );
+    write(
+        tmp.path(),
+        "third-party/some-crate/src/lib.rs",
+        USES_WITH_POOL,
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "app source is still migrated:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(tmp.path(), "third-party/some-crate/src/lib.rs").contains("with_pool(pool.clone())"),
+        "a configured vendor directory holds dependencies, not app code:\n{}",
+        stdout_of(&output)
+    );
+}

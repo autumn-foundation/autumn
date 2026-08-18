@@ -225,7 +225,12 @@ unrelated `src/out/mod.rs` is still migrated.
 Every `.cargo/config.toml` in the scan is read, not just the one at the root: a
 nested standalone crate redirects its own output, and the path it names need not
 sit under that crate. `CARGO_TARGET_DIR` is the exception — it overrides every
-config file, so when it is set no config redirect applies.
+config file's `target-dir`, so when it is set no config redirect applies to
+build output.
+
+Vendored dependencies are excluded the same way. `cargo vendor third-party`
+records the path in `[source.vendored-sources]`, and that directory is skipped
+wherever it is — the `vendor` name is only Cargo's default, not the rule.
 
 Hidden directories are skipped by name — `.git`, `.github`, `.cargo`, `.vscode`
 and the like — not because they start with a dot. A dot-directory that holds
