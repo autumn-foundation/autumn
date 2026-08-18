@@ -632,9 +632,13 @@ pub fn run_check_collisions() {
         }
     }
 
-    for name in framework_migration_names() {
+    // Kept as a set (not just pushed into `claimants`) so the attribution
+    // pass below can recognize a framework-sourced name specifically --
+    // see the `mine`/`others` loop.
+    let framework_names: BTreeSet<String> = framework_migration_names().into_iter().collect();
+    for name in &framework_names {
         claimants
-            .entry(name)
+            .entry(name.clone())
             .or_default()
             .push("autumn framework migrations".to_owned());
     }
@@ -695,18 +699,28 @@ pub fn run_check_collisions() {
         if names.len() < 2 {
             continue;
         }
-        // Attributing a collision to THIS checkout needs either a verified
-        // default-branch baseline (so "not in default_branch_entries"
-        // reliably means "not already on trunk"), or every claimant coming
-        // from the working tree alone (a same-checkout duplicate is real
-        // regardless of branch state -- it needs no branch data at all).
-        // Without either, a name that's only "in working_tree_only" because
-        // the default branch couldn't be verified might already be shipped,
-        // unchanged, on that branch -- misattributing a pre-existing
-        // collision between two OTHER branches to this checkout instead of
-        // counting it under `others`.
+        // Attributing a collision to THIS checkout needs one of three
+        // things to be true:
+        //  - a verified default-branch baseline (so "not in
+        //    default_branch_entries" reliably means "not already on
+        //    trunk"),
+        //  - every claimant coming from the working tree alone (a
+        //    same-checkout duplicate is real regardless of branch state --
+        //    it needs no branch data at all), or
+        //  - a framework claimant present in this version's names.
+        //    FRAMEWORK_MIGRATIONS isn't scoped to any git branch -- it's
+        //    compiled into the exact CLI binary running this check right
+        //    now, so a version bump that introduces a colliding framework
+        //    migration is inherently this checkout's own concern even when
+        //    the OTHER claimant already shipped on the default branch.
+        // Without any of the three, a name that's only "in
+        // working_tree_only" because the default branch couldn't be
+        // verified might already be shipped, unchanged, on that branch --
+        // misattributing a pre-existing collision between two OTHER
+        // branches to this checkout instead of counting it under `others`.
         let purely_local = names.iter().all(|n| working_tree.contains(n));
-        let attributable = default_verified || purely_local;
+        let has_framework_claimant = names.iter().any(|n| framework_names.contains(n));
+        let attributable = default_verified || purely_local || has_framework_claimant;
         if attributable && names.iter().any(|n| working_tree_only.contains(n)) {
             mine.push((version.clone(), names.clone()));
         } else {
