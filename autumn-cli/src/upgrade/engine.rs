@@ -855,7 +855,42 @@ fn collect_repository_types(
 /// Only the path is read. Anything with an argument list — `#[cfg(feature =
 /// "repository")]` — is judged by its own name, not by what its arguments say.
 fn is_repository_attribute(stream: &TokenStream) -> bool {
-    attribute_last_segment(stream).is_some_and(|segment| segment == "repository")
+    let segments = attribute_path_segments(stream);
+    let Some((last, crate_segment)) = segments.split_last() else {
+        return false;
+    };
+    if last != "repository" {
+        return false;
+    }
+    // A qualified path names the crate the macro comes from, and only Autumn's
+    // proves Autumn generated the type: another dependency's
+    // `#[other_macros::repository]` was otherwise read as evidence, which then
+    // licensed rewriting an unrelated same-named import. A manifest may rename
+    // the dependency, so a rename combined with the *qualified* spelling is
+    // reported rather than rewritten — the safe direction, and the bare
+    // `#[repository]` the scaffold emits is unaffected.
+    crate_segment
+        .first()
+        .is_none_or(|krate| matches!(krate.as_str(), "autumn_web" | "autumn"))
+}
+
+/// The path segments of an attribute body, outermost first.
+///
+/// `autumn_web::repository(Post)` yields `["autumn_web", "repository"]`; the
+/// argument list ends the path.
+fn attribute_path_segments(stream: &TokenStream) -> Vec<String> {
+    let mut segments = Vec::new();
+    for tree in stream.clone() {
+        match tree {
+            TokenTree::Ident(ident) => segments.push(ident.to_string()),
+            // Path separators, and a leading `::` for a fully-qualified path.
+            TokenTree::Punct(punct) if punct.as_char() == ':' => {}
+            // The argument list ends the path; anything else is not a path at
+            // all, and either way the name is already whatever came before it.
+            _ => break,
+        }
+    }
+    segments
 }
 
 /// The last path segment of an attribute body, or `None` if it names no path.
@@ -1130,6 +1165,25 @@ mod tests {
             types,
             vec!["PgPostRepository", "PgCommentRepository", "PgTagRepository"]
         );
+    }
+
+    #[test]
+    fn a_foreign_repository_attribute_is_not_evidence() {
+        // Codex review on #2231: the matcher read only the last path segment,
+        // so another crate's `repository` attribute proved that Autumn had
+        // generated `PgAuditRepository` — and an unrelated imported type of
+        // that name was then rewritten.
+        for attribute in [
+            "#[other_macros::repository]",
+            "#[diesel::repository(Audit)]",
+            "#[::sea_orm::repository]",
+        ] {
+            assert!(
+                generated_names(&format!("{attribute}\npub trait AuditRepository {{}}\n"))
+                    .is_empty(),
+                "for {attribute}",
+            );
+        }
     }
 
     #[test]

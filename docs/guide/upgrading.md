@@ -99,6 +99,12 @@ not:
   is reported rather than matched against a repository declared in some other
   module. Spell the path from the crate root — `crate::repositories::PgAuditRepository`
   — and it is rewritten.
+- **A `#[repository]` attribute qualified by a renamed dependency.** Only
+  Autumn's own attribute is evidence, so `#[autumn_web::repository]`,
+  `#[autumn::repository]` and the bare `#[repository]` the scaffold emits all
+  count, while another crate's `#[other_macros::repository]` does not. If your
+  manifest renames the dependency to something else *and* you use the qualified
+  spelling, those call sites are reported rather than rewritten.
 - **`#[cfg]`-gated repository declarations.** A `#[cfg(feature = "postgres")] #[repository] trait AuditRepository`
   generates its type only when that feature is on, so it cannot vouch for a
   call unconditionally; under the other configuration the same name may be an
