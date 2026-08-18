@@ -27,7 +27,7 @@
 //! [`PgSyncBackend::gc_tombstones`] call per tier only ever exposes that
 //! tier's tombstones — mirroring the disjoint-slice technique
 //! `offline_sync_push_batching_perf.rs` uses for its three batch sizes. One
-//! scope (`tenant-000001`) is pre-seeded with an existing horizon HIGHER
+//! scope (`tenant-000000`) is pre-seeded with an existing horizon HIGHER
 //! than anything this sweep would compute, to prove the batched UPSERT still
 //! honors `GREATEST` and never lowers a horizon.
 
@@ -279,8 +279,10 @@ async fn offline_sync_gc_tombstones_batching_profile() {
             n_scopes * TOMBSTONED_PER_SCOPE,
             "tier {idx} (n_scopes={n_scopes}) must drop exactly its own tombstones, no more/less"
         );
-        let (calls, buffers) =
-            print_profile(&mut conn, &format!("gc_tombstones sweep, {n_scopes} scopes"));
+        let (calls, buffers) = print_profile(
+            &mut conn,
+            &format!("gc_tombstones sweep, {n_scopes} scopes"),
+        );
         assert!(
             calls > 0,
             "expected at least one horizon-upsert statement for a non-empty sweep"
@@ -303,7 +305,10 @@ async fn offline_sync_gc_tombstones_batching_profile() {
         .expect("gc_tombstones replay");
     assert_eq!(removed_again, 0, "replay sweep must drop nothing new");
     let (replay_calls, _) = print_profile(&mut conn, "replay sweep (idempotency, nothing to drop)");
-    assert_eq!(replay_calls, 0, "replay sweep must issue zero horizon-upserts");
+    assert_eq!(
+        replay_calls, 0,
+        "replay sweep must issue zero horizon-upserts"
+    );
 
     explain(
         &mut conn,
