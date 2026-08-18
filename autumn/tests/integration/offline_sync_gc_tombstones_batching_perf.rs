@@ -275,8 +275,8 @@ async fn offline_sync_gc_tombstones_batching_profile() {
             .gc_tombstones(cumulative_up_to)
             .expect("gc_tombstones");
         assert_eq!(
-            removed as usize,
-            n_scopes * TOMBSTONED_PER_SCOPE,
+            removed,
+            (n_scopes * TOMBSTONED_PER_SCOPE) as u64,
             "tier {idx} (n_scopes={n_scopes}) must drop exactly its own tombstones, no more/less"
         );
         let (calls, buffers) = print_profile(
@@ -355,7 +355,7 @@ async fn offline_sync_gc_tombstones_batching_profile() {
         .find(|h| h.scope == scope_name(0))
         .expect("tenant-000000 horizon present");
     assert_eq!(
-        tenant_0.horizon, 999999,
+        tenant_0.horizon, 999_999,
         "GREATEST must preserve a pre-existing higher horizon"
     );
 }
