@@ -820,7 +820,7 @@ fn display_path(root: &Path, path: &Path) -> String {
 /// parsed contributes nothing rather than failing the scan — it is reported on
 /// its own account when the rewrite pass reaches it.
 fn generated_receivers(files: &[PathBuf]) -> engine::GeneratedRepositories {
-    files
+    let mut generated: engine::GeneratedRepositories = files
         .iter()
         .filter_map(|path| {
             let source = std::fs::read_to_string(path).ok()?;
@@ -834,7 +834,14 @@ fn generated_receivers(files: &[PathBuf]) -> engine::GeneratedRepositories {
             ))
         })
         .flatten()
-        .collect()
+        .collect();
+    generated.note_handwritten(
+        files
+            .iter()
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .flat_map(|source| engine::defined_type_names(&source)),
+    );
+    generated
 }
 
 /// The module path a file contributes, from Cargo's file-to-module mapping.

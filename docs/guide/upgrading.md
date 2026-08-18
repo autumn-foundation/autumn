@@ -176,8 +176,16 @@ Manual - not rewritten; read the guide section:
 A receiver written with a module in front of it is checked against that module
 too, so a real `repositories::PgAuditRepository` does not vouch for an unrelated
 `custom::PgAuditRepository`. An unqualified receiver is accepted on its name
-alone: resolving it would mean following `use` declarations, so an alias that
-imports a same-named type from elsewhere is the one case this cannot tell apart.
+alone — with one guard: because `#[repository]` produces its type from a macro,
+that type never appears in your source, so a `struct PgAuditRepository` written
+out anywhere in the scan is proof of a *different*, hand-written type. When both
+exist, an unqualified call could mean either and is reported rather than
+rewritten. Write the module in front of it to say which you mean.
+
+What remains unresolved is an alias: `use custom::PgAuditRepository;` followed by
+an unqualified call, where nothing in the scan spells out a competing
+definition. Following `use` declarations is name resolution, which this command
+does not do.
 
 Preview is still the default and the diff still names every file and line —
 read it before you `--apply`, and `git diff` after. This is also the line the

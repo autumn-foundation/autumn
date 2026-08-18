@@ -2026,3 +2026,50 @@ fn an_inline_module_qualifier_matching_the_declaration_is_rewritten() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn a_locally_defined_type_is_not_verified_by_another_crates_trait() {
+    // Two crates in one scan. `api` declares `#[repository] trait
+    // AuditRepository`, so `PgAuditRepository` is generated *there*. `tools`
+    // defines its own struct of that name and calls it unqualified. A global
+    // name set verified the wrong one.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"api\", \"tools\"]\n",
+    );
+    for member in ["api", "tools"] {
+        write(
+            tmp.path(),
+            &format!("{member}/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        );
+    }
+    write(
+        tmp.path(),
+        "api/src/lib.rs",
+        "use autumn_web::prelude::*;\n\n\
+         #[repository]\npub trait AuditRepository {\n    fn noop(&self);\n}\n",
+    );
+    write(
+        tmp.path(),
+        "tools/src/lib.rs",
+        "pub struct PgAuditRepository;\n\n\
+         impl PgAuditRepository {\n    \
+         pub fn with_pool(_pool: Pool) -> Self {\n        Self\n    }\n}\n\n\
+         pub fn build(pool: Pool) -> PgAuditRepository {\n    \
+         PgAuditRepository::with_pool(pool)\n}\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "tools/src/lib.rs").contains("PgAuditRepository::with_pool(pool)"),
+        "a hand-written type must not be verified by a trait elsewhere:\n{}",
+        stdout_of(&output)
+    );
+}

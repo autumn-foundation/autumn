@@ -601,6 +601,55 @@ pub fn generated_repository_types(source: &str) -> Vec<(String, Vec<String>)> {
     found
 }
 
+/// Type names the source *writes out* — `struct`, `enum`, `union`, `type`.
+///
+/// `#[repository]` produces its type from a macro, so it never appears here. A
+/// name that does appear is therefore a hand-written type, which is what makes
+/// this the counter-evidence to a generated name: an app that declares
+/// `#[repository] trait AuditRepository` in one place and writes
+/// `struct PgAuditRepository` in another has two different types spelled the
+/// same, and an unqualified call cannot be attributed to either.
+#[must_use]
+pub fn defined_type_names(source: &str) -> Vec<String> {
+    let Ok(stream) = source.parse::<TokenStream>() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    collect_defined_types(&stream, Context::Code, &mut found);
+    found
+}
+
+fn collect_defined_types(stream: &TokenStream, context: Context, found: &mut Vec<String>) {
+    let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
+    for (index, tree) in trees.iter().enumerate() {
+        match tree {
+            TokenTree::Ident(keyword)
+                if context == Context::Code
+                    && matches!(keyword.to_string().as_str(), "struct" | "enum" | "union") =>
+            {
+                if let Some(TokenTree::Ident(name)) = trees.get(index + 1) {
+                    found.push(name.to_string());
+                }
+            }
+            // `type Alias = …;`, but not the `type` of an associated item
+            // binding, which is followed by `=` only after a generic list.
+            TokenTree::Ident(keyword) if context == Context::Code && keyword == "type" => {
+                if let Some(TokenTree::Ident(name)) = trees.get(index + 1) {
+                    found.push(name.to_string());
+                }
+            }
+            TokenTree::Group(group) => {
+                collect_defined_types(
+                    &group.stream(),
+                    group_context(&trees, index, context),
+                    found,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The generated repository types an app declares, and where.
 ///
 /// The module path matters because a name on its own can be ambiguous: an app
@@ -608,15 +657,23 @@ pub fn generated_repository_types(source: &str) -> Vec<(String, Vec<String>)> {
 /// `custom::PgAuditRepository`, and a call written against the second one would
 /// otherwise be verified by the first.
 #[derive(Debug, Default)]
-pub struct GeneratedRepositories(BTreeMap<String, BTreeSet<Vec<String>>>);
+pub struct GeneratedRepositories {
+    declared: BTreeMap<String, BTreeSet<Vec<String>>>,
+    /// Names the scanned source defines as ordinary types. See
+    /// [`defined_type_names`].
+    handwritten: BTreeSet<String>,
+}
 
 impl FromIterator<(String, Vec<String>)> for GeneratedRepositories {
     fn from_iter<I: IntoIterator<Item = (String, Vec<String>)>>(iter: I) -> Self {
-        let mut map: BTreeMap<String, BTreeSet<Vec<String>>> = BTreeMap::new();
+        let mut declared: BTreeMap<String, BTreeSet<Vec<String>>> = BTreeMap::new();
         for (name, module) in iter {
-            map.entry(name).or_default().insert(module);
+            declared.entry(name).or_default().insert(module);
         }
-        Self(map)
+        Self {
+            declared,
+            handwritten: BTreeSet::new(),
+        }
     }
 }
 
@@ -632,9 +689,14 @@ impl GeneratedRepositories {
     /// `repositories::…`, `crate::repositories::…` and a bare `…` inside that
     /// module all are. A qualifier naming a module that generates nothing —
     /// `custom::PgAuditRepository` — is not this type.
+    /// Record the type names the scanned source writes out itself.
+    pub fn note_handwritten<I: IntoIterator<Item = String>>(&mut self, names: I) {
+        self.handwritten.extend(names);
+    }
+
     #[must_use]
     pub fn accepts(&self, name: &str, qualifier: &[String]) -> bool {
-        let Some(declared) = self.0.get(name) else {
+        let Some(declared) = self.declared.get(name) else {
             return false;
         };
         // `crate::`, `self::` and `super::` say where to start resolving, not
@@ -647,7 +709,11 @@ impl GeneratedRepositories {
             .cloned()
             .collect();
         if qualifier.is_empty() {
-            return true;
+            // Nothing in the call says which module it means, so a hand-written
+            // type of the same name anywhere in the scan makes it ambiguous —
+            // including one in a different crate, since a `use` can bring
+            // either spelling into scope unqualified. Reported, not guessed at.
+            return !self.handwritten.contains(name);
         }
         declared
             .iter()
@@ -985,6 +1051,44 @@ mod tests {
         // A file that does not parse contributes nothing rather than failing
         // the whole scan; it is reported as skipped on its own account.
         assert!(generated_names("fn f( {").is_empty());
+    }
+
+    #[test]
+    fn a_handwritten_type_of_the_same_name_makes_an_unqualified_call_ambiguous() {
+        let mut generated: GeneratedRepositories = std::iter::once((
+            "PgAuditRepository".to_owned(),
+            vec!["repositories".to_owned()],
+        ))
+        .collect();
+        assert!(
+            generated.accepts("PgAuditRepository", &[]),
+            "with nothing else of that name, the generated type is the only reading"
+        );
+
+        generated.note_handwritten(std::iter::once("PgAuditRepository".to_owned()));
+        assert!(
+            !generated.accepts("PgAuditRepository", &[]),
+            "once the source writes out a type of that name the call is ambiguous"
+        );
+        // A qualifier still decides it: the author said which module they meant.
+        assert!(generated.accepts("PgAuditRepository", &["repositories".to_owned()]));
+    }
+
+    #[test]
+    fn reads_the_type_names_the_source_writes_out() {
+        assert_eq!(
+            defined_type_names("pub struct PgAuditRepository;\nenum E {}\ntype Alias = u8;"),
+            vec!["PgAuditRepository", "E", "Alias"]
+        );
+        // `#[repository]` output never appears in source, so a trait declaring
+        // one contributes nothing here — that is what makes the two sets
+        // independent evidence.
+        assert!(defined_type_names("#[repository]\npub trait PostRepository {}").is_empty());
+        // Macro input is not a definition, for the same reason it is not a
+        // declaration.
+        assert!(
+            defined_type_names("macro_rules! m { () => { struct PgAuditRepository; } }").is_empty()
+        );
     }
 
     #[test]
