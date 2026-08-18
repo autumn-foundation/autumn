@@ -567,12 +567,13 @@ pub fn run_check_collisions() {
     // that either no longer exists upstream or isn't what would actually be
     // pushed, so either can claim a version against a phantom, blocking a
     // migration that reuses a version this checkout only THINKS is taken.
-    // `true` when advertisement state itself is unknown (no network, no
-    // `origin` remote): falls back to scanning every local ref, same as
-    // before this existed -- the coverage warning below already flags that
-    // degraded state.
+    // `false` (nothing scanned) when advertisement state itself is unknown
+    // (no network, no `origin` remote): the coverage warning below already
+    // tells the caller the cross-branch half did not run, so actually
+    // scanning unverifiable local refs in that state would both contradict
+    // the warning and risk a false FAIL against content nobody can confirm.
     let is_ref_current = |branch_name: &str| -> bool {
-        remote_heads.as_ref().is_none_or(|remote_heads| {
+        remote_heads.as_ref().is_some_and(|remote_heads| {
             remote_heads
                 .get(branch_name)
                 .is_some_and(|remote_sha| local_heads.get(branch_name) == Some(remote_sha))
@@ -596,7 +597,12 @@ pub fn run_check_collisions() {
         }
     }
 
-    let remote_refs = git_refs(&["refs/remotes"]);
+    // Scoped to `origin` only, not the whole `refs/remotes` namespace: a
+    // differently configured remote (e.g. `upstream`) is not what this
+    // checkout would push a fix to, and its refs are outside
+    // `is_ref_current`'s verification entirely -- scanning them would
+    // silently bypass the OID check above for every ref they contain.
+    let remote_refs = git_refs(&["refs/remotes/origin"]);
     let refs_seen = remote_refs.len();
     for git_ref in &remote_refs {
         if Some(git_ref) == default_ref.as_ref() {
