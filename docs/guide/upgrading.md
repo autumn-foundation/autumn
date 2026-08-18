@@ -105,6 +105,10 @@ not:
   count, while another crate's `#[other_macros::repository]` does not. If your
   manifest renames the dependency to something else *and* you use the qualified
   spelling, those call sites are reported rather than rewritten.
+- **A `#[repository]` trait declared inside a function body.** The type it
+  generates is visible only in that block, so it cannot vouch for a call
+  elsewhere in the module; such calls are reported. Declare the trait at module
+  level and it is rewritten as usual.
 - **`#[cfg]`-gated repository declarations.** A `#[cfg(feature = "postgres")] #[repository] trait AuditRepository`
   generates its type only when that feature is on, so it cannot vouch for a
   call unconditionally; under the other configuration the same name may be an

@@ -613,7 +613,7 @@ pub fn generated_repository_types(source: &str) -> Vec<(String, Vec<String>)> {
         return Vec::new();
     };
     let mut found = Vec::new();
-    collect_repository_types(&stream, Context::Code, &[], &mut found);
+    collect_repository_types(&stream, Context::Code, &[], Scope::Module, &mut found);
     found
 }
 
@@ -781,6 +781,17 @@ impl GeneratedRepositories {
     }
 }
 
+/// Whether a declaration here is visible to the rest of the module.
+///
+/// `#[repository]` inside a function body generates a type scoped to that body;
+/// recording it against the enclosing module let it vouch for an unrelated
+/// same-named import elsewhere in the file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Module,
+    Block,
+}
+
 /// Only declarations in ordinary code count.
 ///
 /// Tokens inside a macro definition or invocation may never be expanded, or may
@@ -793,6 +804,7 @@ fn collect_repository_types(
     stream: &TokenStream,
     context: Context,
     module: &[String],
+    scope: Scope,
     found: &mut Vec<(String, Vec<String>)>,
 ) {
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
@@ -817,7 +829,12 @@ fn collect_repository_types(
                 if attribute_run_is_cfg_gated(&trees, index) {
                     continue;
                 }
-                if let Some(trait_name) = trait_name_after(&trees, index + 2) {
+                // A declaration inside a block generates a type visible only
+                // in that block, so it vouches for nothing beyond it — and the
+                // calls it could vouch for are all inside it too.
+                if scope == Scope::Module
+                    && let Some(trait_name) = trait_name_after(&trees, index + 2)
+                {
                     found.push((format!("Pg{trait_name}"), module.to_vec()));
                 }
             }
@@ -830,10 +847,19 @@ fn collect_repository_types(
                     nested
                 });
                 let inner = nested.as_deref().unwrap_or(module);
+                // Anything that is not a `mod` body is a block: a `mod` written
+                // *inside* one is still only visible there, so the scope never
+                // widens again once it has narrowed.
+                let inner_scope = if nested.is_some() && scope == Scope::Module {
+                    Scope::Module
+                } else {
+                    Scope::Block
+                };
                 collect_repository_types(
                     &group.stream(),
                     group_context(&trees, index, context),
                     inner,
+                    inner_scope,
                     found,
                 );
             }
@@ -1310,10 +1336,44 @@ mod tests {
                 vec!["repositories".to_owned(), "inner".to_owned()]
             )]
         );
-        // A plain block is not a module and contributes no path segment.
+        // A declaration inside a plain block is scoped to that block, so it is
+        // not evidence for anything — see the block-scope test below.
+        assert!(
+            generated_repository_types("fn f() { #[repository] trait PostRepository {} }")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_block_local_repository_is_not_module_wide_evidence() {
+        // Codex review on #2231: a trait declared in a function body generates a
+        // type visible only in that body, so recording it against the enclosing
+        // module let an unrelated `PgPostRepository` imported elsewhere in that
+        // module be treated as verified and rewritten.
+        for source in [
+            "fn f() { #[repository] trait PostRepository {} }",
+            "mod repositories { fn f() { #[repository] trait PostRepository {} } }",
+            // A `mod` nested inside a block is still only visible in the block.
+            "fn f() { mod inner { #[repository] trait PostRepository {} } }",
+        ] {
+            assert!(
+                generated_repository_types(source).is_empty(),
+                "for {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_module_level_repository_is_still_evidence() {
+        // The scope fix must not swing the other way.
         assert_eq!(
-            generated_repository_types("fn f() { #[repository] trait PostRepository {} }"),
-            vec![("PgPostRepository".to_owned(), Vec::<String>::new())]
+            generated_repository_types(
+                "mod repositories { #[repository] trait PostRepository {} }"
+            ),
+            vec![(
+                "PgPostRepository".to_owned(),
+                vec!["repositories".to_owned()]
+            )]
         );
     }
 
