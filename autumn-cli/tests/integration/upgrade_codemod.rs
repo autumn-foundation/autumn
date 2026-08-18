@@ -1347,3 +1347,121 @@ fn tool_and_vcs_metadata_directories_are_still_skipped() {
         "and metadata is skipped quietly, not reported on every run"
     );
 }
+
+#[test]
+fn a_hidden_workspace_member_still_decides_the_floor() {
+    // The source walk now scans non-metadata hidden directories, so a crate
+    // under one gets its sources rewritten. The manifest walk has to agree:
+    // reading only the root's 0.6.0 selects no migration at all, and the hidden
+    // crate's call sites — scanned, planned, and left alone — stay on the old
+    // name with the report claiming there was nothing to do.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"0.6.0\"\n",
+    );
+    write(tmp.path(), "src/main.rs", "fn main() {}\n");
+    write(
+        tmp.path(),
+        ".generated-app/Cargo.toml",
+        "[package]\nname = \"generated\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"0.5.0\"\n",
+    );
+    write(tmp.path(), ".generated-app/src/lib.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), ".generated-app/src/lib.rs").contains("with_pool_untracked("),
+        "a hidden crate the walk scans must also vote on the floor:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn an_inherited_aliased_dependency_resolves_through_the_workspace_key() {
+    // The member says `autumn = { workspace = true }` — no literal `autumn-web`
+    // key and no `package` field of its own. Only the workspace entry names the
+    // real crate. Matching the member's key against that entry is the only way
+    // to see the dependency Cargo resolves without trouble.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"api\"]\n\n\
+         [workspace.dependencies]\n\
+         autumn = { package = \"autumn-web\", version = \"0.5.0\" }\n",
+    );
+    write(
+        tmp.path(),
+        "api/Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn = { workspace = true }\n",
+    );
+    write(tmp.path(), "api/src/lib.rs", USES_WITH_POOL);
+
+    let member = tmp.path().join("api");
+    let output = run_upgrade(&member, &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "api/src/lib.rs").contains("with_pool_untracked("),
+        "the aliased workspace entry records 0.5.0:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn an_inherited_dependency_on_another_crate_is_not_mistaken_for_autumn_web() {
+    // Resolving inherited entries by key must not turn every `{ workspace =
+    // true }` line into an autumn-web declaration: this app inherits `serde`
+    // and declares autumn-web outright, and the serde entry has no bearing on
+    // the floor.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"api\"]\n\n\
+         [workspace.dependencies]\nserde = \"1\"\n",
+    );
+    write(
+        tmp.path(),
+        "api/Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nserde = { workspace = true }\nautumn-web = \"0.5.0\"\n",
+    );
+    write(tmp.path(), "api/src/lib.rs", USES_WITH_POOL);
+
+    let member = tmp.path().join("api");
+    let output = run_upgrade(&member, &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "api/src/lib.rs").contains("with_pool_untracked("),
+        "an inherited serde must not make the autumn-web version unreadable:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn a_path_typo_is_reported_as_a_bad_path_not_a_missing_dependency() {
+    // `recorded_version` on a nonexistent directory finds nothing, so running
+    // it first turned an ordinary typo into "add an `autumn-web` dependency to
+    // Cargo.toml" — advice about a manifest that is not there either. The scan
+    // root is checked before anything is read from it.
+    let tmp = TempDir::new().expect("tempdir");
+
+    let output = run_upgrade(tmp.path(), &["no-such-directory", "--to", "0.6.0"]);
+    assert!(!output.status.success(), "{}", report(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not a readable directory"),
+        "a path typo names the path:\n{}",
+        report(&output)
+    );
+    assert!(
+        !stderr.contains("Add an `autumn-web` dependency"),
+        "and does not send the user to a manifest that does not exist:\n{}",
+        report(&output)
+    );
+}

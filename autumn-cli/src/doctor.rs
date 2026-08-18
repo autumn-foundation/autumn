@@ -2480,7 +2480,13 @@ pub enum AutumnWebDependency {
     /// `{ workspace = true }`: the version lives in the enclosing workspace's
     /// `[workspace.dependencies]`, which may be in an *ancestor* directory when
     /// the command is pointed at a member rather than the workspace root.
-    Inherited,
+    ///
+    /// Carries the *key* the member used, because that is the only handle on
+    /// the entry: under Cargo's renamed form the member writes `autumn =
+    /// { workspace = true }` and nothing but the workspace entry it points at
+    /// says the package is `autumn-web`. Resolve it with
+    /// [`workspace_dependency_for`].
+    Inherited(String),
 }
 
 /// Read the `autumn-web` version requirement from the `Cargo.toml` at `root`.
@@ -2495,7 +2501,7 @@ pub fn read_autumn_web_version_at(root: &std::path::Path) -> Option<String> {
             AutumnWebDependency::Version(version) => Some(version),
             AutumnWebDependency::Absent
             | AutumnWebDependency::WithoutVersion
-            | AutumnWebDependency::Inherited => None,
+            | AutumnWebDependency::Inherited(_) => None,
         })
 }
 
@@ -2527,7 +2533,15 @@ pub fn autumn_web_declarations_at(root: &std::path::Path) -> Vec<AutumnWebDepend
                 .is_some_and(|package| package == "autumn-web")
     }
 
-    fn classify(entry: &toml::Value) -> AutumnWebDependency {
+    /// Whether this entry defers to the enclosing workspace.
+    fn is_inherited(entry: &toml::Value) -> bool {
+        entry
+            .get("workspace")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn classify(key: &str, entry: &toml::Value) -> AutumnWebDependency {
         match entry {
             toml::Value::String(version) => AutumnWebDependency::Version(version.clone()),
             toml::Value::Table(table) => table
@@ -2538,7 +2552,7 @@ pub fn autumn_web_declarations_at(root: &std::path::Path) -> Vec<AutumnWebDepend
                         if table.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
                             // Resolved against the enclosing workspace, which
                             // is not necessarily inside the scanned tree.
-                            AutumnWebDependency::Inherited
+                            AutumnWebDependency::Inherited(key.to_owned())
                         } else {
                             // A path or git entry: declared, no version to read.
                             AutumnWebDependency::WithoutVersion
@@ -2581,19 +2595,29 @@ pub fn autumn_web_declarations_at(root: &std::path::Path) -> Vec<AutumnWebDepend
         .filter_map(toml::Value::as_table)
         .flat_map(|deps| {
             deps.iter()
-                .filter(|(key, entry)| is_autumn_web(key, entry))
-                .map(|(_, entry)| classify(entry))
+                // Inherited entries come along under *any* key: a member
+                // writing `autumn = { workspace = true }` names neither
+                // `autumn-web` nor a `package`, so whether it is this
+                // dependency can only be answered by the workspace entry it
+                // points at. The caller resolves them and drops the ones that
+                // turn out to be some other crate.
+                .filter(|(key, entry)| is_autumn_web(key, entry) || is_inherited(entry))
+                .map(|(key, entry)| classify(key, entry))
         })
         .filter(|declaration| *declaration != AutumnWebDependency::Absent)
         .collect()
 }
 
-/// The `[workspace.dependencies]` entry for `autumn-web` in the `Cargo.toml` at
-/// `dir`, if that manifest defines a workspace at all.
+/// The `[workspace.dependencies]` entry named `key` in the `Cargo.toml` at
+/// `dir`, but only when that entry resolves to `autumn-web`.
 ///
 /// Used to resolve `{ workspace = true }` when `autumn upgrade` is pointed at a
 /// member directory: Cargo walks up to the workspace root, and so must this.
-pub fn workspace_dependency_at(dir: &std::path::Path) -> Option<AutumnWebDependency> {
+/// The lookup is by the member's key rather than by the crate name because a
+/// renamed workspace entry — `autumn = { package = "autumn-web", … }` — is the
+/// only place the real package is written down. `None` means the workspace does
+/// not define `key`, or defines it as a different crate.
+pub fn workspace_dependency_for(dir: &std::path::Path, key: &str) -> Option<AutumnWebDependency> {
     let content = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
     let table = toml::from_str::<toml::Table>(&content).ok()?;
     let entry = table
@@ -2601,12 +2625,13 @@ pub fn workspace_dependency_at(dir: &std::path::Path) -> Option<AutumnWebDepende
         .get("dependencies")?
         .as_table()?
         .iter()
-        .find(|(key, entry)| {
-            *key == "autumn-web"
-                || entry
-                    .get("package")
-                    .and_then(toml::Value::as_str)
-                    .is_some_and(|package| package == "autumn-web")
+        .find(|(candidate, entry)| {
+            *candidate == key
+                && (key == "autumn-web"
+                    || entry
+                        .get("package")
+                        .and_then(toml::Value::as_str)
+                        .is_some_and(|package| package == "autumn-web"))
         })
         .map(|(_, entry)| entry)?;
     Some(match entry {

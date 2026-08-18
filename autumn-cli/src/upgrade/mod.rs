@@ -489,9 +489,14 @@ fn recorded_version(root: &Path) -> Option<String> {
     // `Path::new(".").ancestors()` yields only `.` — the walk upward would
     // never leave the member directory it was pointed at.
     let absolute_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let inherited = absolute_root
-        .ancestors()
-        .find_map(crate::doctor::workspace_dependency_at);
+    // By the member's own key, not by the crate name: `autumn = { workspace =
+    // true }` paired with a renamed workspace entry is the shape where nothing
+    // on the member side mentions `autumn-web` at all.
+    let inherited = |key: &str| {
+        absolute_root
+            .ancestors()
+            .find_map(|ancestor| crate::doctor::workspace_dependency_for(ancestor, key))
+    };
 
     let mut lowest: Option<(Version, String)> = None;
     for directory in std::iter::once(root.to_path_buf()).chain(member_manifests(root)) {
@@ -500,16 +505,25 @@ fn recorded_version(root: &Path) -> Option<String> {
         // scan rewrites that target's `#[cfg]` code either way.
         for declaration in crate::doctor::autumn_web_declarations_at(&directory) {
             let declaration = match declaration {
-                // Substitute the workspace entry the member inherits. With no
-                // enclosing workspace to resolve it the manifest would not
-                // build at all, so asking for `--from` is the honest answer.
-                AutumnWebDependency::Inherited => inherited
-                    .clone()
-                    .unwrap_or(AutumnWebDependency::WithoutVersion),
+                // Substitute the workspace entry the member inherits.
+                //
+                // Unresolved splits two ways. A literal `autumn-web =
+                // { workspace = true }` that resolves nowhere is a manifest
+                // that would not build, so asking for `--from` is the honest
+                // answer. Any other key that resolves nowhere is simply some
+                // other crate's inherited dependency — every `{ workspace =
+                // true }` entry is collected because the member side cannot
+                // tell them apart, and this is where the ones that are not
+                // autumn-web drop out.
+                AutumnWebDependency::Inherited(key) => match inherited(&key) {
+                    Some(resolved) => resolved,
+                    None if key == "autumn-web" => AutumnWebDependency::WithoutVersion,
+                    None => continue,
+                },
                 other => other,
             };
             let requirement = match declaration {
-                AutumnWebDependency::Absent | AutumnWebDependency::Inherited => continue,
+                AutumnWebDependency::Absent | AutumnWebDependency::Inherited(_) => continue,
                 // Declared as a path or git dependency: this crate is on *some*
                 // version of autumn-web and the manifest does not say which.
                 // Letting a sibling decide the floor would migrate this crate's
@@ -558,6 +572,11 @@ fn collect_manifests(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    // Exactly the exclusions the source walk uses, for exactly its reason: the
+    // floor has to be taken over the same crates the rewrite covers. A blanket
+    // dot-directory skip here let a hidden crate's sources be scanned and
+    // rewritten while its `Cargo.toml` had no vote on which migrations ran.
+    let at_crate_root = dir.join("Cargo.toml").is_file();
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -566,7 +585,9 @@ fn collect_manifests(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || SKIPPED_DIRS.contains(&name.as_str()) {
+        let is_metadata = SKIPPED_HIDDEN_DIRS.contains(&name.as_str());
+        let is_build_output = at_crate_root && SKIPPED_DIRS.contains(&name.as_str());
+        if is_metadata || is_build_output {
             continue;
         }
         let path = entry.path();
@@ -880,6 +901,16 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
         return 2;
     };
 
+    // A path typo must not read as "your app is already migrated" — the same
+    // rule `autumn a11y verify` states for its scan root.
+    if !root.is_dir() {
+        eprintln!(
+            "autumn upgrade: `{}` is not a readable directory.",
+            root.display()
+        );
+        return 2;
+    }
+
     let recorded = opts.from.clone().or_else(|| recorded_version(root));
     let Some(recorded) = recorded else {
         eprintln!(
@@ -895,16 +926,6 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
         );
         return 2;
     };
-
-    // A path typo must not read as "your app is already migrated" — the same
-    // rule `autumn a11y verify` states for its scan root.
-    if !root.is_dir() {
-        eprintln!(
-            "autumn upgrade: `{}` is not a readable directory.",
-            root.display()
-        );
-        return 2;
-    }
 
     let mut report = plan(root, from, to);
     let mut failure = None;

@@ -177,3 +177,7 @@ Hidden directories are skipped by name — `.git`, `.github`, `.cargo`, `.vscode
 and the like — not because they start with a dot. A dot-directory that holds
 compiled source, say a `#[path = ".generated/repositories.rs"]` module, is
 migrated.
+
+The same exclusions decide which `Cargo.toml` files the version floor is read
+from, so a crate whose sources are rewritten always gets a vote on which
+migrations run.
