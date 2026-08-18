@@ -94,12 +94,12 @@ fn git_refs(patterns: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Every branch name currently on `origin`, from `git ls-remote --heads
-/// origin` -- a lightweight ref advertisement that transfers no objects, so
-/// it stays cheap even on a large repository. `None` when this cannot be
-/// determined (no network, no `origin` remote, no `git` on PATH); the
-/// caller then treats coverage as unknown, degrading the same as a
-/// shallow/partial clone.
+/// Every branch on `origin`, mapped to its current commit OID, from `git
+/// ls-remote --heads origin` -- a lightweight ref advertisement that
+/// transfers no objects, so it stays cheap even on a large repository.
+/// `None` when this cannot be determined (no network, no `origin` remote,
+/// no `git` on PATH); the caller then treats coverage as unknown,
+/// degrading the same as a shallow/partial clone.
 ///
 /// This checks the actual remote state, not local configuration: `remote.
 /// origin.fetch` reflects what a bare `git fetch` WOULD pull, but a CI
@@ -108,13 +108,18 @@ fn git_refs(patterns: &[&str]) -> Vec<String> {
 /// check can read "fetches every branch" while only one branch was ever
 /// actually retrieved.
 ///
-/// Returns the branch **names**, not just a count: a long-lived local clone
-/// can retain a stale `refs/remotes/origin/<deleted-branch>` (nothing prunes
-/// it without an explicit `git fetch --prune`) while missing a
-/// newly-created branch, and the two counts can coincidentally still match
-/// -- so only comparing identities, not sizes, catches that a real branch
-/// this checkout has never seen is missing.
-fn remote_branch_names() -> Option<BTreeSet<String>> {
+/// Keyed by branch name with the OID as the value, not just a name set or a
+/// count: a long-lived local clone can retain a stale `refs/remotes/origin/
+/// <deleted-branch>` (nothing prunes it without an explicit `git fetch
+/// --prune`) while missing a newly-created branch, so a bare count can
+/// coincidentally still match. A name-only set closes that gap but not a
+/// narrower one: a branch this checkout already knows by name can still
+/// have moved on the remote since the last fetch, and the local ref -- and
+/// therefore whatever `migration_dirs_at_ref` reads -- is the OLD tip until
+/// fetched again. Comparing OIDs, not just names, is what catches a branch
+/// that has been pushed to (not just created) since this checkout last saw
+/// it.
+fn remote_branch_heads() -> Option<BTreeMap<String, String>> {
     let output = Command::new("git")
         .args(["ls-remote", "--heads", "origin"])
         .output()
@@ -125,11 +130,41 @@ fn remote_branch_names() -> Option<BTreeSet<String>> {
     Some(
         String::from_utf8_lossy(&output.stdout)
             .lines()
-            .filter_map(|line| line.rsplit('\t').next())
-            .filter_map(|refname| refname.strip_prefix("refs/heads/"))
-            .map(str::to_owned)
+            .filter_map(|line| {
+                let (sha, refname) = line.split_once('\t')?;
+                let name = refname.strip_prefix("refs/heads/")?;
+                Some((name.to_owned(), sha.to_owned()))
+            })
             .collect(),
     )
+}
+
+/// Every `refs/remotes/origin/*` branch (excluding the `HEAD` symref)
+/// currently in this checkout, mapped to the commit OID it points at --
+/// the local counterpart to [`remote_branch_heads`], compared against it to
+/// decide whether every branch is not just present but actually current.
+fn local_origin_branch_heads() -> BTreeMap<String, String> {
+    let Ok(output) = Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/remotes/origin",
+        ])
+        .output()
+    else {
+        return BTreeMap::new();
+    };
+    if !output.status.success() {
+        return BTreeMap::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (sha, refname) = line.split_once(' ')?;
+            let name = refname.strip_prefix("refs/remotes/origin/")?;
+            (name != "HEAD").then(|| (name.to_owned(), sha.to_owned()))
+        })
+        .collect()
 }
 
 /// The current directory's path relative to the repository root, as git's
@@ -548,27 +583,29 @@ pub fn run_check_collisions() {
     }
 
     // `refs_seen > 0` alone does not mean every branch was fetched -- see
-    // `remote_branch_names`. Both failure modes (nothing fetched at all, or
-    // only a narrowed subset) get the same loud warning and the same
-    // working-tree-only degrade, since either one means a real collision on
-    // an unfetched branch would go undetected.
+    // `remote_branch_heads`. Every failure mode (nothing fetched at all, a
+    // narrowed subset, or a known branch that has since moved) gets the
+    // same loud warning and the same working-tree-only degrade, since all
+    // three mean a real collision could go undetected.
     //
-    // Compares NAME SETS, not counts: a stale local `refs/remotes/origin/*`
-    // for a since-deleted branch (nothing prunes it without `git fetch
-    // --prune`) can keep the local ref COUNT matching the remote's even
-    // while a genuinely new branch is missing -- coverage means every
-    // advertised branch has a local ref, not merely the same tally. Extra
-    // local refs (stale ones) are harmless here: this checker only reads
-    // them, so a leftover ref for a deleted branch costs nothing beyond
-    // checking a branch that no longer matters.
-    let local_origin_branches: BTreeSet<String> = remote_refs
-        .iter()
-        .filter_map(|r| r.strip_prefix("refs/remotes/origin/"))
-        .filter(|name| *name != "HEAD")
-        .map(str::to_owned)
-        .collect();
-    let full_branch_coverage = remote_branch_names().is_some_and(|remote_branches| {
-        !remote_branches.is_empty() && remote_branches.is_subset(&local_origin_branches)
+    // Compares (name, OID) PAIRS, not just names or counts. A name-only
+    // check still misses two cases: a stale local `refs/remotes/origin/*`
+    // for a since-deleted branch keeps the local ref COUNT matching the
+    // remote's even while a genuinely new branch is missing (why this isn't
+    // a bare count), and a branch this checkout already knows by name can
+    // still have been pushed to since the last fetch -- the local ref (and
+    // therefore whatever `migration_dirs_at_ref` reads) is the OLD tip
+    // until fetched again, so the branch being "present" proves nothing
+    // about it being CURRENT. Extra local refs (stale, deleted branches)
+    // are harmless here: this checker only reads them, so a leftover ref
+    // for a branch that no longer exists costs nothing beyond checking a
+    // branch that no longer matters.
+    let local_heads = local_origin_branch_heads();
+    let full_branch_coverage = remote_branch_heads().is_some_and(|remote_heads| {
+        !remote_heads.is_empty()
+            && remote_heads
+                .iter()
+                .all(|(name, sha)| local_heads.get(name) == Some(sha))
     });
     if !full_branch_coverage {
         eprintln!(

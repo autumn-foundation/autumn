@@ -5261,6 +5261,8 @@ impl AppBuilder {
             config_loader_factory,
             telemetry_provider,
             plugin_config_roots,
+            shard_router,
+            directory_shard_router,
             ..
         } = self;
 
@@ -5299,28 +5301,51 @@ impl AppBuilder {
         // would record the shared version and silently skip its colliding
         // partner, and only a subsequent normal boot would notice.
         //
-        // Includes the directory/shard-map sets in the CHECK whenever shards
-        // are configured, even though this path never APPLIES them (see the
-        // doc comment above -- the candidate's own boot creates those
-        // tables): an app/plugin migration colliding with one of those fixed
-        // framework versions would otherwise apply and record its version
-        // here first, silently, with only a later boot's apply of the real
-        // directory/shard-map migration -- not a version check -- exposing
-        // the fallout. Gated on `!shard_targets.is_empty()` (equivalent to
-        // `config.database.has_shards()`, which both
-        // `directory_migration_is_required`/`shard_map_migration_is_required`
-        // require) rather than unconditional: those two sets are NEVER
-        // applied by ANY path on an unsharded app, so an unconditional check
-        // would turn a merely coincidental version match into a false
-        // startup failure. Same reasoning for FRAMEWORK_MIGRATIONS on a
-        // `sqlite://` control target -- Postgres-only DDL that SQLite never
-        // applies at all.
-        let sharded = !shard_targets.is_empty();
+        // Includes the directory/shard-map sets in the CHECK whenever they
+        // would actually be required later, even though this path never
+        // APPLIES them (see the doc comment above -- the candidate's own
+        // boot creates those tables): an app/plugin migration colliding with
+        // one of those fixed framework versions would otherwise apply and
+        // record its version here first, silently, with only a later boot's
+        // apply of the real directory/shard-map migration -- not a version
+        // check -- exposing the fallout.
+        //
+        // The two flags are NOT interchangeable: `shard_map_migration_is_required`
+        // depends only on `has_shards`, but `directory_migration_is_required`
+        // ALSO requires directory routing specifically (no explicit
+        // `with_shard_router`, and `directory_shard_router` enabled) -- a
+        // sharded app on the default hash router or a custom router never
+        // creates `_autumn_shard_directory` at all, so unconditionally tying
+        // both flags to "is this app sharded" would itself manufacture a
+        // false positive for that app. Mirrors the exact predicate
+        // `setup_database` computes for `run_startup_migrations`. Neither
+        // set is ever applied by ANY path on an app that doesn't need it, so
+        // omitting them here (rather than checking unconditionally) is what
+        // keeps an unrelated coincidental version match from becoming a
+        // false startup failure -- same reasoning as FRAMEWORK_MIGRATIONS on
+        // a `sqlite://` control target, which is Postgres-only DDL that
+        // SQLite never applies at all.
+        let has_shards = !shard_targets.is_empty();
+        let use_directory_router = shard_router.is_none()
+            && (directory_shard_router || config.database.directory_shard_router);
+        let directory_migration_required = directory_migration_is_required(
+            use_directory_router,
+            has_shards,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let shard_map_migration_required = shard_map_migration_is_required(
+            has_shards,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
         let control_targets_postgres = control_url
             .as_deref()
             .is_some_and(|url| !control_backend_is_sqlite(url));
-        if log_migration_version_collisions(&migrations, control_targets_postgres, sharded, sharded)
-        {
+        if log_migration_version_collisions(
+            &migrations,
+            control_targets_postgres,
+            directory_migration_required,
+            shard_map_migration_required,
+        ) {
             // `process::exit` skips `on_shutdown`/`Drop`; stop any managed
             // Postgres child first, mirroring the SQLite guard below.
             #[cfg(feature = "managed-pg")]
@@ -11882,6 +11907,22 @@ mod tests {
         assert!(
             collision_check < first_apply,
             "the version-collision guard must run BEFORE the migration loop / apply_pending_or_exit"
+        );
+
+        // The collision guard's directory/shard-map flags must use the SAME
+        // predicates `setup_database` computes for `run_startup_migrations`
+        // -- not a naive "is this app sharded" stand-in. A sharded app on
+        // the default hash router (or an explicit `with_shard_router`)
+        // never actually requires the directory migration even though it IS
+        // sharded, so tying that flag to sharding alone would check a
+        // migration set that will never be applied and risk a false-positive
+        // startup abort on nothing more than an unlucky version match (a
+        // Codex review finding on the PR that added this guard).
+        assert!(
+            handler.contains("directory_migration_is_required(")
+                && handler.contains("shard_map_migration_is_required("),
+            "the migrate handler must compute the real directory/shard-map requirement \
+             predicates, not approximate them from whether shards are merely configured"
         );
 
         assert!(
