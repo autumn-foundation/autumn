@@ -665,6 +665,19 @@ fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
     found
 }
 
+/// Walk `dir` for `.cargo/config.toml` redirects, adding each to `found`.
+///
+/// Directories already known to be build output are not descended into. That
+/// is partly cost — a populated target tree holds tens of thousands of
+/// directories, and this walk runs on every invocation — and partly
+/// correctness: a `.cargo/config.toml` that got copied or generated inside
+/// build output is not this project's configuration, and honouring it can
+/// exclude real source.
+///
+/// A redirect that points *outside* the crate declaring it is only pruned if
+/// the walk happens to learn of it first; directory order is not guaranteed.
+/// The source walk excludes it either way, so what is at stake there is the
+/// traversal cost, not whether the directory is migrated.
 fn collect_target_dirs(dir: &Path, found: &mut BTreeSet<PathBuf>) {
     found.extend(config_target_dir_at(dir));
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -686,7 +699,11 @@ fn collect_target_dirs(dir: &Path, found: &mut BTreeSet<PathBuf>) {
         {
             continue;
         }
-        collect_target_dirs(&entry.path(), found);
+        let path = entry.path();
+        if is_target_dir(&path, found) {
+            continue;
+        }
+        collect_target_dirs(&path, found);
     }
 }
 

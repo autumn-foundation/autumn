@@ -2217,3 +2217,39 @@ fn an_unparsable_member_manifest_fails_detection() {
         report(&output)
     );
 }
+
+#[test]
+fn a_config_inside_build_output_does_not_exclude_app_source() {
+    // Target-directory discovery walks the tree looking for `.cargo/config.toml`.
+    // A populated target tree is huge, and anything inside it is build output --
+    // including a config that got copied there. Descending into a directory
+    // already known to be output let such a file exclude `src/` itself.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        ".cargo/config.toml",
+        "[build]\ntarget-dir = \"out\"\n",
+    );
+    write(tmp.path(), "out/debug/generated.rs", USES_WITH_POOL);
+    // A stray config inside the output tree, naming the app's own source.
+    write(
+        tmp.path(),
+        "out/debug/vendored/.cargo/config.toml",
+        // Three levels up from `out/debug/vendored` is the project root.
+        "[build]\ntarget-dir = \"../../../src\"\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "app source must not be excluded by a config found inside build output:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(tmp.path(), "out/debug/generated.rs").contains("with_pool(pool.clone())"),
+        "and the configured output directory is still excluded:\n{}",
+        stdout_of(&output)
+    );
+}
