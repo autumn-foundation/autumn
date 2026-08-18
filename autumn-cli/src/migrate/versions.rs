@@ -94,33 +94,37 @@ fn git_refs(patterns: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Whether `origin`'s configured fetch refspec pulls every branch
-/// (`refs/heads/*` on the source side) rather than a narrowed subset.
+/// The number of branch heads currently on `origin`, from `git ls-remote
+/// --heads origin` -- a lightweight ref advertisement that transfers no
+/// objects, so it stays cheap even on a large repository. `None` when this
+/// cannot be determined (no network, no `origin` remote, no `git` on PATH);
+/// the caller then treats coverage as unknown, degrading the same as a
+/// shallow/partial clone.
 ///
-/// `refs_seen > 0` alone is not evidence of full coverage: `git clone
-/// --single-branch --branch main origin` (or an equivalent narrowed
-/// `actions/checkout` `ref`/sparse setup) leaves `refs/remotes/origin/HEAD`
-/// and `refs/remotes/origin/main` present -- a nonzero, seemingly healthy ref
-/// count -- while every OTHER pushed branch is simply absent, so a real
-/// collision on `origin/other-branch` would go undetected and this checker
-/// would report a clean bill of health it did not earn. A missing or
-/// unreadable `remote.origin.fetch` (e.g. no `git` on PATH, no `origin`
-/// remote) degrades to `false`: the caller then treats it exactly like the
-/// `refs_seen == 0` shallow-clone case, which is the safe direction to
-/// default degradation in either failure mode.
-fn fetches_all_branches() -> bool {
-    let Ok(output) = Command::new("git")
-        .args(["config", "--get-all", "remote.origin.fetch"])
+/// This checks the actual remote state, not local configuration: `remote.
+/// origin.fetch` reflects what a bare `git fetch` WOULD pull, but a CI
+/// checkout commonly runs an explicit, narrower fetch (a specific ref, a
+/// shallow depth) that never consults that refspec at all -- so a config
+/// check can read "fetches every branch" while only one branch was ever
+/// actually retrieved. Comparing the real upstream branch count against
+/// what actually landed in `refs/remotes/origin/*` catches that case; a
+/// nonzero local ref count proves nothing on its own (`git clone
+/// --single-branch --branch main`, or an equivalent narrowed
+/// `actions/checkout` setup, leaves exactly one branch present).
+fn remote_branch_count() -> Option<usize> {
+    let output = Command::new("git")
+        .args(["ls-remote", "--heads", "origin"])
         .output()
-    else {
-        return false;
-    };
+        .ok()?;
     if !output.status.success() {
-        return false;
+        return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|refspec| refspec.contains("refs/heads/*:refs/remotes/"))
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
+    )
 }
 
 /// The current directory's path relative to the repository root, as git's
@@ -466,11 +470,18 @@ pub fn run_check_collisions() {
     }
 
     // `refs_seen > 0` alone does not mean every branch was fetched -- see
-    // `fetches_all_branches`. Both failure modes (nothing fetched at all, or
+    // `remote_branch_count`. Both failure modes (nothing fetched at all, or
     // only a narrowed subset) get the same loud warning and the same
     // working-tree-only degrade, since either one means a real collision on
     // an unfetched branch would go undetected.
-    let full_branch_coverage = refs_seen > 0 && fetches_all_branches();
+    let local_origin_branches = remote_refs
+        .iter()
+        .filter(|r| {
+            r.starts_with("refs/remotes/origin/") && r.as_str() != "refs/remotes/origin/HEAD"
+        })
+        .count();
+    let full_branch_coverage = remote_branch_count()
+        .is_some_and(|remote_total| remote_total > 0 && local_origin_branches >= remote_total);
     if !full_branch_coverage {
         eprintln!(
             "\nWARNING: this clone does not have every branch's refs available, so ONLY the\n\
