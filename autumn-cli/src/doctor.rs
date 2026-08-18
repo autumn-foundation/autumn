@@ -2483,15 +2483,27 @@ pub fn read_autumn_web_version_at(root: &std::path::Path) -> Option<String> {
         }
     };
 
-    // [dependencies] then [workspace.dependencies]
+    // [dependencies], then [workspace.dependencies], then any
+    // [target.'cfg(...)'.dependencies] — Cargo honours all three, so a version
+    // declared only under a target table is a real declaration and reporting
+    // "cannot determine the version" for it would be wrong. Same traversal
+    // `autumn console` documents for its dependency scan.
     table
         .get("dependencies")
-        .and_then(find_in_deps)
+        .and_then(&find_in_deps)
         .or_else(|| {
             table
                 .get("workspace")
-                .and_then(|w| w.get("dependencies"))
-                .and_then(find_in_deps)
+                .and_then(|workspace| workspace.get("dependencies"))
+                .and_then(&find_in_deps)
+        })
+        .or_else(|| {
+            table
+                .get("target")?
+                .as_table()?
+                .values()
+                .filter_map(|target| target.get("dependencies"))
+                .find_map(&find_in_deps)
         })
 }
 

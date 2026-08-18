@@ -59,6 +59,33 @@ pub enum CallForm {
     Method,
 }
 
+/// The naming shape the framework gives the type a renamed function lives on.
+///
+/// `#[repository]` emits its concrete type as `Pg{trait}`, and every trait the
+/// scaffold generates is `{Model}Repository`, so a generated repository is
+/// `PgPostRepository`, `PgSubredditRepository`, and so on. Matching the whole
+/// shape rather than just the `Pg` prefix keeps an app's own `PgCache` out of
+/// the rewrite.
+///
+/// A hand-named trait that breaks the convention (`PostStore` -> `PgPostStore`)
+/// does not match and is *reported* under `manual` — a site to apply by hand,
+/// never a silent miss and never a wrong edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiverShape {
+    pub prefix: &'static str,
+    pub suffix: &'static str,
+}
+
+impl ReceiverShape {
+    /// Whether `ident` is a name the framework would have generated.
+    #[must_use]
+    pub fn matches(&self, ident: &str) -> bool {
+        ident.len() >= self.prefix.len() + self.suffix.len()
+            && ident.starts_with(self.prefix)
+            && ident.ends_with(self.suffix)
+    }
+}
+
 /// What a migration mechanically does to app source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rewrite {
@@ -75,16 +102,8 @@ pub enum Rewrite {
         form: CallForm,
         /// Exact number of top-level arguments the function takes.
         args: usize,
-        /// Required prefix on the receiver path segment, when the framework
-        /// names the type carrying this function.
-        ///
-        /// `#[repository]` emits its concrete type as `format_ident!("Pg{trait}")`
-        /// — every generated repository is `PgPostRepository`, `PgBookmarkRepository`,
-        /// and so on — so a genuine call site reads `PgFooRepository::with_pool(pool)`.
-        /// Requiring the prefix keeps an app's own `Cache::with_pool(pool)` out of
-        /// the rewrite. A receiver that does not match is *reported*, not skipped:
-        /// it could be an aliased import.
-        receiver: Option<&'static str>,
+        /// Naming shape the receiver must have — see [`ReceiverShape`].
+        receiver: Option<ReceiverShape>,
     },
     /// Nothing is rewritten; the change is reported with its guide link so the
     /// user still sees it in the upgrade summary.
@@ -200,7 +219,10 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
             // still carry the old name and must not be touched.
             form: CallForm::AssociatedFunction,
             args: 1,
-            receiver: Some("Pg"),
+            receiver: Some(ReceiverShape {
+                prefix: "Pg",
+                suffix: "Repository",
+            }),
         },
     },
 ];
@@ -570,9 +592,31 @@ mod tests {
                 to: "with_pool_untracked",
                 form: CallForm::AssociatedFunction,
                 args: 1,
-                receiver: Some("Pg"),
+                receiver: Some(ReceiverShape {
+                    prefix: "Pg",
+                    suffix: "Repository",
+                }),
             }
         );
+    }
+
+    #[test]
+    fn the_receiver_shape_matches_what_the_repository_macro_emits() {
+        let shape = ReceiverShape {
+            prefix: "Pg",
+            suffix: "Repository",
+        };
+        // `#[repository]` on `trait PostRepository` emits `PgPostRepository`.
+        assert!(shape.matches("PgPostRepository"));
+        assert!(shape.matches("PgSubredditRepository"));
+        assert!(shape.matches("PgRepository"), "a trait named `Repository`");
+        // An app type that merely starts with `Pg`, or merely ends in
+        // `Repository`, is not something the macro generated.
+        assert!(!shape.matches("PgCache"));
+        assert!(!shape.matches("PgConnectionPool"));
+        assert!(!shape.matches("PostRepository"), "that is the trait");
+        assert!(!shape.matches("Cache"));
+        assert!(!shape.matches("Pg"));
     }
 
     #[test]

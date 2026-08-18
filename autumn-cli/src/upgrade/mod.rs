@@ -447,14 +447,22 @@ fn recorded_version(root: &Path) -> Option<String> {
     // root would let a workspace whose root records 0.6.0 hide a member that
     // still pins 0.5.0 — the walk then migrates that member's source with no
     // 0.5.0 -> 0.6.0 migration selected.
-    std::iter::once(root.to_path_buf())
-        .chain(member_manifests(root))
-        .filter_map(|directory| crate::doctor::read_autumn_web_version_at(&directory))
-        .filter_map(|requirement| {
-            migrations::parse_version_req(&requirement).map(|version| (version, requirement))
-        })
-        .min_by_key(|(version, _)| *version)
-        .map(|(_, requirement)| requirement)
+    let mut lowest: Option<(Version, String)> = None;
+    for directory in std::iter::once(root.to_path_buf()).chain(member_manifests(root)) {
+        let Some(requirement) = crate::doctor::read_autumn_web_version_at(&directory) else {
+            continue;
+        };
+        // A manifest that *declares* `autumn-web` with a requirement carrying no
+        // usable floor makes the whole answer a guess. Dropping it and taking
+        // some other manifest's version would silently skip that member —
+        // exactly what refusing an upper-bound-only requirement was meant to
+        // prevent. Fail detection and let the caller ask for `--from`.
+        let version = migrations::parse_version_req(&requirement)?;
+        if lowest.as_ref().is_none_or(|(lowest, _)| version < *lowest) {
+            lowest = Some((version, requirement));
+        }
+    }
+    lowest.map(|(_, requirement)| requirement)
 }
 
 /// Directories under `root` (excluding `root` itself) that hold a `Cargo.toml`.

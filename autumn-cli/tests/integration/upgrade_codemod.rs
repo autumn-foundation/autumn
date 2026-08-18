@@ -535,8 +535,8 @@ fn a_file_with_both_rewritable_and_macro_sites_gets_both_treatments() {
     write(
         tmp.path(),
         "src/main.rs",
-        "pub fn a(pool: Pool) -> Repo {\n    PgRepo::with_pool(pool)\n}\n\n\
-         pub fn b(pool: Pool) {\n    make_repo! { PgRepo::with_pool(pool) }\n}\n",
+        "pub fn a(pool: Pool) -> Repo {\n    PgPostRepository::with_pool(pool)\n}\n\n\
+         pub fn b(pool: Pool) {\n    make_repo! { PgPostRepository::with_pool(pool) }\n}\n",
     );
 
     let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
@@ -544,11 +544,11 @@ fn a_file_with_both_rewritable_and_macro_sites_gets_both_treatments() {
 
     let after = read(tmp.path(), "src/main.rs");
     assert!(
-        after.contains("PgRepo::with_pool_untracked(pool)\n}"),
+        after.contains("PgPostRepository::with_pool_untracked(pool)\n}"),
         "the reachable site is rewritten:\n{after}"
     );
     assert!(
-        after.contains("make_repo! { PgRepo::with_pool(pool) }"),
+        after.contains("make_repo! { PgPostRepository::with_pool(pool) }"),
         "the macro body is left alone:\n{after}"
     );
     let out = stdout_of(&output);
@@ -566,7 +566,7 @@ fn a_function_reference_that_is_never_called_is_reported_not_skipped() {
     write(
         tmp.path(),
         "src/main.rs",
-        "pub fn a(xs: Vec<Pool>) {\n    xs.into_iter().map(PgRepo::with_pool);\n}\n",
+        "pub fn a(xs: Vec<Pool>) {\n    xs.into_iter().map(PgPostRepository::with_pool);\n}\n",
     );
 
     let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
@@ -575,7 +575,7 @@ fn a_function_reference_that_is_never_called_is_reported_not_skipped() {
     assert!(out.contains("src/main.rs:2"), "{out}");
     assert!(out.contains("referenced without being called"), "{out}");
     assert!(
-        read(tmp.path(), "src/main.rs").contains("map(PgRepo::with_pool)"),
+        read(tmp.path(), "src/main.rs").contains("map(PgPostRepository::with_pool)"),
         "a reference is reported, never rewritten"
     );
 }
@@ -719,7 +719,7 @@ fn a_preview_whose_every_site_is_manual_does_not_offer_apply() {
     write(
         tmp.path(),
         "src/lib.rs",
-        "pub fn f(pool: Pool) {\n    make_repo! { PgRepo::with_pool(pool) }\n}\n",
+        "pub fn f(pool: Pool) {\n    make_repo! { PgPostRepository::with_pool(pool) }\n}\n",
     );
 
     let output = run_upgrade(tmp.path(), &["--to", "0.6.0"]);
@@ -913,4 +913,62 @@ fn an_unrelated_type_with_the_same_associated_function_is_reported_not_rewritten
         out.contains("receiver is not a generated repository"),
         "and the reason is given: {out}"
     );
+}
+
+#[test]
+fn an_ambiguous_member_requirement_fails_detection_instead_of_being_ignored() {
+    // Root says 0.6.0, one member declares `<0.6` — a requirement with no
+    // usable floor. Dropping that member and trusting the root would migrate
+    // nothing while scanning its 0.5.x source, which is what refusing
+    // upper-bound-only requirements exists to prevent.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"api\", \"legacy\"]\n\n\
+         [workspace.dependencies]\nautumn-web = \"0.6.0\"\n",
+    );
+    write(
+        tmp.path(),
+        "api/Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write(tmp.path(), "api/src/lib.rs", "pub fn f() {}\n");
+    write(
+        tmp.path(),
+        "legacy/Cargo.toml",
+        "[package]\nname = \"legacy\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"<0.6\"\n",
+    );
+    write(tmp.path(), "legacy/src/lib.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(!output.status.success(), "{}", report(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--from"),
+        "{}",
+        report(&output),
+    );
+    assert!(
+        read(tmp.path(), "legacy/src/lib.rs").contains("with_pool(pool.clone())"),
+        "nothing is rewritten while the range is a guess"
+    );
+}
+
+#[test]
+fn a_target_specific_dependency_declaration_is_a_declaration() {
+    // Cargo honours `[target.'cfg(unix)'.dependencies]`, so reporting "cannot
+    // determine the version" for one would be wrong.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [target.'cfg(unix)'.dependencies]\nautumn-web = \"0.5.0\"\n",
+    );
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(read(tmp.path(), "src/main.rs").contains("with_pool_untracked("));
 }

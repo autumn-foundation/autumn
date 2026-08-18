@@ -24,7 +24,7 @@
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 
-use super::migrations::{AppMigration, CallForm, Rewrite};
+use super::migrations::{AppMigration, CallForm, ReceiverShape, Rewrite};
 
 /// Why a site was left for a human.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,8 +131,8 @@ struct Rename {
     form: CallForm,
     /// Exact top-level argument count of the renamed function.
     args: usize,
-    /// Required prefix on the receiver path segment, if any.
-    receiver: Option<&'static str>,
+    /// Naming shape the receiver must have, if the framework fixes one.
+    receiver: Option<ReceiverShape>,
 }
 
 /// Apply `migrations` to one file's `source`.
@@ -538,10 +538,11 @@ fn turbofish_argument_list(trees: &[TokenTree], angle: usize) -> Option<&proc_ma
 /// Whether the receiver path segment carries the prefix the framework gives
 /// the type this function is generated on.
 ///
-/// `#[repository]` names its concrete type `Pg{trait}`, so `PgPostRepository`
-/// is a genuine receiver and an app's own `Cache` is not. A rename with no
-/// declared prefix accepts any receiver.
-fn receiver_matches(trees: &[TokenTree], index: usize, required: Option<&str>) -> bool {
+/// `#[repository]` names its concrete type `Pg{trait}` and the scaffold names
+/// every trait `{Model}Repository`, so `PgPostRepository` is a genuine receiver
+/// while an app's own `Cache` or `PgCache` is not. A rename with no declared
+/// shape accepts any receiver.
+fn receiver_matches(trees: &[TokenTree], index: usize, required: Option<ReceiverShape>) -> bool {
     let Some(required) = required else {
         return true;
     };
@@ -553,7 +554,7 @@ fn receiver_matches(trees: &[TokenTree], index: usize, required: Option<&str>) -
         return false;
     };
     matches!(trees.get(at), Some(TokenTree::Ident(ident))
-        if ident.to_string().starts_with(required))
+        if required.matches(&ident.to_string()))
 }
 
 /// Which call form `trees[index]` is written in, if any: `.` makes it a method
@@ -600,8 +601,12 @@ mod tests {
             to: "with_pool_untracked",
             form: CallForm::AssociatedFunction,
             args: 1,
-            // Mirrors the shipped migration: `#[repository]` emits `Pg{trait}`.
-            receiver: Some("Pg"),
+            // Mirrors the shipped migration: `#[repository]` emits `Pg{trait}`
+            // and the scaffold names every trait `{Model}Repository`.
+            receiver: Some(ReceiverShape {
+                prefix: "Pg",
+                suffix: "Repository",
+            }),
         },
     };
 
@@ -687,23 +692,26 @@ mod tests {
     fn arity_is_counted_at_the_top_level_only() {
         // A comma nested inside an argument is not an argument separator, and
         // a trailing comma does not open a new argument.
-        let out = rewritten("fn f() { PgRepo::with_pool(make(a, b),); }");
+        let out = rewritten("fn f() { PgPostRepository::with_pool(make(a, b),); }");
         assert!(out.contains("with_pool_untracked(make(a, b),)"), "{out}");
     }
 
     #[test]
     fn rewrites_a_turbofished_call() {
-        let out = rewritten("fn f() { PgRepo::with_pool::<Pg>(p); }");
-        assert_eq!(out, "fn f() { PgRepo::with_pool_untracked::<Pg>(p); }");
+        let out = rewritten("fn f() { PgPostRepository::with_pool::<Pg>(p); }");
+        assert_eq!(
+            out,
+            "fn f() { PgPostRepository::with_pool_untracked::<Pg>(p); }"
+        );
     }
 
     #[test]
     fn preserves_formatting_comments_and_line_endings() {
-        let source = "fn f() {\r\n    // build it with_pool, historically\r\n    let r = PgRepo::with_pool(p);   // trailing\r\n}\r\n";
+        let source = "fn f() {\r\n    // build it with_pool, historically\r\n    let r = PgPostRepository::with_pool(p);   // trailing\r\n}\r\n";
         let out = rewritten(source);
         assert_eq!(
             out,
-            "fn f() {\r\n    // build it with_pool, historically\r\n    let r = PgRepo::with_pool_untracked(p);   // trailing\r\n}\r\n"
+            "fn f() {\r\n    // build it with_pool, historically\r\n    let r = PgPostRepository::with_pool_untracked(p);   // trailing\r\n}\r\n"
         );
     }
 
@@ -711,14 +719,14 @@ mod tests {
     fn leaves_the_already_renamed_call_untouched() {
         // Applying twice is a no-op: the rename is matched on whole tokens, so
         // the new name is simply a different identifier.
-        let result = run("fn f() { PgRepo::with_pool_untracked(p); }");
+        let result = run("fn f() { PgPostRepository::with_pool_untracked(p); }");
         assert_eq!(result.updated, None);
         assert!(result.rewritten.is_empty());
     }
 
     #[test]
     fn leaves_a_different_identifier_with_the_same_prefix_untouched() {
-        let result = run("fn f() { PgRepo::with_pool_provider(p); }");
+        let result = run("fn f() { PgPostRepository::with_pool_provider(p); }");
         assert_eq!(result.updated, None);
     }
 
@@ -747,7 +755,7 @@ mod tests {
 
     #[test]
     fn reports_a_macro_body_site_as_manual_without_rewriting_it() {
-        let source = "fn f() {\n    make_repo! { PgRepo::with_pool(p) }\n}\n";
+        let source = "fn f() {\n    make_repo! { PgPostRepository::with_pool(p) }\n}\n";
         let result = run(source);
         assert_eq!(result.updated, None, "a macro body is never rewritten");
         assert!(result.rewritten.is_empty());
@@ -760,7 +768,7 @@ mod tests {
 
     #[test]
     fn reports_a_nested_macro_body_site_as_manual() {
-        let source = "fn f() {\n    outer!(inner!(PgRepo::with_pool(p)));\n}\n";
+        let source = "fn f() {\n    outer!(inner!(PgPostRepository::with_pool(p)));\n}\n";
         let result = run(source);
         assert_eq!(result.updated, None);
         assert_eq!(result.manual.len(), 1);
@@ -769,7 +777,7 @@ mod tests {
 
     #[test]
     fn reports_an_attribute_site_as_manual() {
-        let source = "#[derive_repo(build = PgRepo::with_pool(p))]\nstruct S;\n";
+        let source = "#[derive_repo(build = PgPostRepository::with_pool(p))]\nstruct S;\n";
         let result = run(source);
         assert_eq!(result.updated, None);
         assert_eq!(result.manual.len(), 1);
@@ -787,13 +795,12 @@ mod tests {
 
     #[test]
     fn records_line_and_column_for_every_rewritten_site() {
-        let source =
-            "fn f() {\n    let a = PgRepo::with_pool(p);\n    let b = PgOther::with_pool(q);\n}\n";
+        let source = "fn f() {\n    let a = PgPostRepository::with_pool(p);\n    let b = PgCommentRepository::with_pool(q);\n}\n";
         let result = run(source);
         assert_eq!(result.rewritten.len(), 2);
         assert_eq!(result.rewritten[0].line, 2);
         assert_eq!(
-            result.rewritten[0].column, 21,
+            result.rewritten[0].column, 31,
             "1-based column of `with_pool`"
         );
         assert_eq!(result.rewritten[1].line, 3);
@@ -804,23 +811,24 @@ mod tests {
     fn splices_correctly_after_multibyte_characters() {
         // Byte offsets, not char offsets: an em dash before the site shifts the
         // two apart, and getting it wrong corrupts the file.
-        let source = "fn f() {\n    // — a note —\n    let r = PgRepo::with_pool(p);\n}\n";
+        let source =
+            "fn f() {\n    // — a note —\n    let r = PgPostRepository::with_pool(p);\n}\n";
         let out = rewritten(source);
         assert_eq!(
             out,
-            "fn f() {\n    // — a note —\n    let r = PgRepo::with_pool_untracked(p);\n}\n"
+            "fn f() {\n    // — a note —\n    let r = PgPostRepository::with_pool_untracked(p);\n}\n"
         );
     }
 
     #[test]
     fn rewrites_every_site_in_a_file() {
-        let source = "fn f() { PgA::with_pool(p); PgB::with_pool(q); PgC::with_pool(r); }";
+        let source = "fn f() { PgAlphaRepository::with_pool(p); PgBetaRepository::with_pool(q); PgGammaRepository::with_pool(r); }";
         let result = run(source);
         assert_eq!(result.rewritten.len(), 3);
         assert_eq!(
             result.updated.as_deref(),
             Some(
-                "fn f() { PgA::with_pool_untracked(p); PgB::with_pool_untracked(q); PgC::with_pool_untracked(r); }"
+                "fn f() { PgAlphaRepository::with_pool_untracked(p); PgBetaRepository::with_pool_untracked(q); PgGammaRepository::with_pool_untracked(r); }"
             )
         );
     }
@@ -829,7 +837,7 @@ mod tests {
     fn rewrites_inside_cfg_disabled_code() {
         // `#[cfg(...)]` code is still the app's source and still has to compile
         // on the configuration that enables it.
-        let source = "#[cfg(feature = \"db\")]\nfn f() { PgRepo::with_pool(p); }\n";
+        let source = "#[cfg(feature = \"db\")]\nfn f() { PgPostRepository::with_pool(p); }\n";
         let out = rewritten(source);
         assert!(out.contains("with_pool_untracked"));
     }
@@ -844,8 +852,8 @@ mod tests {
             guide: "docs/migrations/0.6.0.md#anchor",
             rewrite: Rewrite::GuideOnly,
         };
-        let result =
-            rewrite_source("fn f() { PgRepo::with_pool(p); }", &[&GUIDE_ONLY]).expect("parses");
+        let result = rewrite_source("fn f() { PgPostRepository::with_pool(p); }", &[&GUIDE_ONLY])
+            .expect("parses");
         assert_eq!(result.updated, None);
         assert!(result.rewritten.is_empty());
         assert!(result.manual.is_empty());
@@ -885,13 +893,13 @@ mod tests {
     #[test]
     fn every_macro_definition_shape_is_treated_as_macro_input() {
         for source in [
-            "macro_rules! m { () => { PgR::with_pool(p) }; }",
-            "macro_rules! m ( () => ( PgR::with_pool(p) ); );",
-            "macro_rules! m [ () => [ PgR::with_pool(p) ]; ];",
-            "#[macro_export]\nmacro_rules! m { () => { PgR::with_pool(p) }; }",
-            "fn outer() { macro_rules! m { () => { PgR::with_pool(p) }; } }",
-            "pub macro m() { PgR::with_pool(p) }",
-            "pub macro m { () => { PgR::with_pool(p) } }",
+            "macro_rules! m { () => { PgPostRepository::with_pool(p) }; }",
+            "macro_rules! m ( () => ( PgPostRepository::with_pool(p) ); );",
+            "macro_rules! m [ () => [ PgPostRepository::with_pool(p) ]; ];",
+            "#[macro_export]\nmacro_rules! m { () => { PgPostRepository::with_pool(p) }; }",
+            "fn outer() { macro_rules! m { () => { PgPostRepository::with_pool(p) }; } }",
+            "pub macro m() { PgPostRepository::with_pool(p) }",
+            "pub macro m { () => { PgPostRepository::with_pool(p) } }",
         ] {
             let result = run(source);
             assert_eq!(result.updated, None, "must not rewrite: {source}");
@@ -928,9 +936,9 @@ mod tests {
         // "No site is silently skipped": a function item handed somewhere else
         // still stops compiling after the rename, so it has to be reported.
         for source in [
-            "fn f() { xs.iter().map(PgRepo::with_pool); }",
-            "fn f() { let g = PgRepo::with_pool; g(p); }",
-            "fn f() { let g: fn(P) -> R = PgRepo::with_pool; }",
+            "fn f() { xs.iter().map(PgPostRepository::with_pool); }",
+            "fn f() { let g = PgPostRepository::with_pool; g(p); }",
+            "fn f() { let g: fn(P) -> R = PgPostRepository::with_pool; }",
         ] {
             let result = run(source);
             assert_eq!(
@@ -950,14 +958,17 @@ mod tests {
 
     #[test]
     fn a_raw_identifier_call_site_is_rewritten_keeping_its_prefix() {
-        let out = rewritten("fn f() { PgRepo::r#with_pool(p); }");
-        assert_eq!(out, "fn f() { PgRepo::r#with_pool_untracked(p); }");
+        let out = rewritten("fn f() { PgPostRepository::r#with_pool(p); }");
+        assert_eq!(
+            out,
+            "fn f() { PgPostRepository::r#with_pool_untracked(p); }"
+        );
     }
 
     #[test]
     fn a_turbofish_that_is_not_a_call_is_not_rewritten() {
-        // `Vec<PgRepo::with_pool::<T>>` is a type path, not a call.
-        let result = run("fn f(x: Vec<PgRepo::with_pool::<T>>) {}");
+        // `Vec<PgPostRepository::with_pool::<T>>` is a type path, not a call.
+        let result = run("fn f(x: Vec<PgPostRepository::with_pool::<T>>) {}");
         assert_eq!(result.updated, None);
         assert!(
             result
@@ -970,7 +981,7 @@ mod tests {
     #[test]
     fn a_turbofish_returning_a_function_type_still_reads_as_a_call() {
         // The `>` of the `->` inside the generic argument closes nothing.
-        let out = rewritten("fn f() { PgRepo::with_pool::<fn(A) -> B>(p); }");
+        let out = rewritten("fn f() { PgPostRepository::with_pool::<fn(A) -> B>(p); }");
         assert!(
             out.contains("with_pool_untracked::<fn(A) -> B>(p)"),
             "{out}"
@@ -1013,10 +1024,11 @@ mod tests {
         let chain: [&'static AppMigration; 2] = [&FIRST, &SECOND];
 
         let first_run =
-            rewrite_source_for_releases("fn f() { PgR::with_pool(p); }", &chain).expect("parses");
+            rewrite_source_for_releases("fn f() { PgPostRepository::with_pool(p); }", &chain)
+                .expect("parses");
         assert_eq!(
             first_run.updated.as_deref(),
-            Some("fn f() { PgR::untracked_pool(p); }"),
+            Some("fn f() { PgPostRepository::untracked_pool(p); }"),
             "one run reaches the newest name"
         );
 
@@ -1057,7 +1069,7 @@ mod tests {
             },
         };
         // `old_name` (0.7.0) is on line 2, `with_pool` (0.6.0) on line 3.
-        let source = "fn f() {\n    R::old_name(p);\n    PgR::with_pool(p);\n}\n";
+        let source = "fn f() {\n    R::old_name(p);\n    PgPostRepository::with_pool(p);\n}\n";
         let result = rewrite_source_for_releases(source, &[&A, &B]).expect("parses");
         let lines: Vec<usize> = result.rewritten.iter().map(|site| site.line).collect();
         assert_eq!(
@@ -1076,6 +1088,19 @@ mod tests {
         let result = run("fn f(p: Pool) { let c = Cache::with_pool(p); }");
         assert_eq!(result.updated, None, "an unrelated type is not rewritten");
         assert_eq!(result.manual.len(), 1, "and not silently skipped either");
+        assert_eq!(
+            result.manual[0].manual,
+            Some(ManualReason::UnexpectedReceiver)
+        );
+    }
+
+    #[test]
+    fn leaves_an_app_type_that_merely_starts_with_pg_alone() {
+        // `PgCache` is an ordinary Postgres helper someone wrote, not a type
+        // `#[repository]` emitted. Reported, so an aliased repository is not
+        // lost, but never rewritten.
+        let result = run("fn f(p: Pool) { let c = PgCache::with_pool(p); }");
+        assert_eq!(result.updated, None);
         assert_eq!(
             result.manual[0].manual,
             Some(ManualReason::UnexpectedReceiver)

@@ -94,7 +94,7 @@ it was; one unparsable file never stops the rest of the migration.
 |------|--------|
 | `PATH` | Project directory to migrate (positional, defaults to `.`). |
 | `--apply` | Write the rewrites. Without it the command only previews. |
-| `--from VERSION` | Override the recorded `autumn-web` version. Needed when you already bumped the dependency, or when the requirement has no single floor — a git pin, `*`, a multi-comparator range, or an upper bound like `"<0.6"`. In a virtual workspace the members' own manifests are read, and the oldest floor among them wins. |
+| `--from VERSION` | Override the recorded `autumn-web` version. Needed when you already bumped the dependency, or when any manifest declares a requirement with no single floor — a git pin, `*`, a multi-comparator range, or an upper bound like `"<0.6"`. The root and every workspace member are read together (including `[target.'cfg(…)'.dependencies]`), the oldest floor wins, and one ambiguous declaration anywhere makes the whole answer a guess rather than being ignored. |
 | `--to VERSION` | Upgrade to this release instead of the CLI's own version. |
 | `--json` | Machine-readable report — the same content, for CI. |
 | `--list-migrations` | Print the shipped codemods and exit, without scanning. |
@@ -145,19 +145,21 @@ one argument, so only `Repo::with_pool(pool)` matches — `state.with_pool(pool)
 and the UFCS `AppState::with_pool(state, pool)` are provably different
 functions and are left alone.
 
-The receiver narrows it further. `#[repository]` names its concrete type
-`Pg` + the trait name, so only a `PgSomething::with_pool(pool)` call is
-rewritten — your own `Cache::with_pool(pool)` is not. A receiver that does not
-match is *reported* rather than dropped, because an aliased import
-(`use PgPostRepository as Repo;`) would look the same from the outside:
+The receiver narrows it further. `#[repository]` names its concrete type `Pg` +
+the trait name, and the scaffold names every trait `{Model}Repository`, so only
+a `PgSomethingRepository::with_pool(pool)` call is rewritten — your own
+`Cache::with_pool(pool)` and `PgCache::with_pool(pool)` are not. A receiver that
+does not match is *reported* rather than dropped, because an aliased import
+(`use PgPostRepository as Repo;`) or a hand-named trait (`PostStore` →
+`PgPostStore`) would look the same from the outside:
 
 ```text
 Manual - not rewritten; read the guide section:
   src/cache.rs:18  0.6.0-repository-with-pool-untracked (receiver is not a generated repository)
 ```
 
-What remains is an app type named `Pg…` with a one-argument associated
-`with_pool` of its own. This is why preview is the default and why the diff
+What remains is an app type named `Pg…Repository` with a one-argument
+associated `with_pool` of its own. This is why preview is the default and why the diff
 names every file and line — read it before you `--apply`, and `git diff` after.
 It is also the line the `auto` label draws: a change that needs to know a
 receiver's *type* rather than its name is labelled `review` or `manual`, never
