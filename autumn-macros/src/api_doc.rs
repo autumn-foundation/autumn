@@ -749,9 +749,13 @@ fn extract_secured_roles_marker_from_stmt(stmt: &syn::Stmt) -> Option<Vec<String
 fn extract_secured_roles_marker_from_expr(expr: &syn::Expr) -> Option<Vec<String>> {
     match expr {
         syn::Expr::Block(block) => extract_secured_roles_marker_from_stmts(&block.block.stmts),
-        syn::Expr::Async(block) => extract_secured_roles_marker_from_stmts(&block.block.stmts),
         syn::Expr::Unsafe(block) => extract_secured_roles_marker_from_stmts(&block.block.stmts),
-        _ => None,
+        // A guard that expands after `#[secured]` (e.g. `#[authorize]`) buries
+        // the marker inside `let __autumn_inner: T = (async move { … }).await;`
+        // — descend that generated wrapper or the roles silently vanish from
+        // the route metadata while `secured` stays `true` via the fallbacks.
+        _ => crate::idempotency_guard::expr_nested_async_body(expr)
+            .and_then(|block| extract_secured_roles_marker_from_stmts(&block.stmts)),
     }
 }
 
@@ -870,9 +874,11 @@ fn extract_secured_scopes_marker_from_stmt(stmt: &syn::Stmt) -> Option<Vec<Strin
 fn extract_secured_scopes_marker_from_expr(expr: &syn::Expr) -> Option<Vec<String>> {
     match expr {
         syn::Expr::Block(block) => extract_secured_scopes_marker_from_stmts(&block.block.stmts),
-        syn::Expr::Async(block) => extract_secured_scopes_marker_from_stmts(&block.block.stmts),
         syn::Expr::Unsafe(block) => extract_secured_scopes_marker_from_stmts(&block.block.stmts),
-        _ => None,
+        // Same generated-wrapper descent as the roles walk above: the scopes
+        // marker sits wherever the roles marker sits.
+        _ => crate::idempotency_guard::expr_nested_async_body(expr)
+            .and_then(|block| extract_secured_scopes_marker_from_stmts(&block.stmts)),
     }
 }
 
@@ -1382,6 +1388,36 @@ mod tests {
                 ("first".to_owned(), "Note".to_owned()),
                 ("second".to_owned(), "Note".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn secured_roles_survive_authorize_wrapper() {
+        // `#[secured]`'s role markers end up under the
+        // `let __autumn_inner: T = (async move { … }).await;` wrapper when a
+        // guard expands after it. The roles walk must descend that shape, like
+        // the authorize-binding walk does, or the roles silently vanish.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("update", "Note")];
+                let __autumn_inner: ::autumn_web::reexports::axum::response::Response =
+                    (async move {
+                        const __AUTUMN_SECURED_ROLES: &[&str] = &["admin"];
+                        const __AUTUMN_SECURED_SCOPES: &[&str] = &["notes:write"];
+                    })
+                    .await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        let (secured, roles, scopes) = extract_secured_info(&input_fn);
+        assert!(secured);
+        assert!(
+            roles.to_string().contains("\"admin\""),
+            "roles buried under a generated wrapper must be recovered: {roles}"
+        );
+        assert!(
+            scopes.to_string().contains("\"notes:write\""),
+            "scopes buried under a generated wrapper must be recovered: {scopes}"
         );
     }
 

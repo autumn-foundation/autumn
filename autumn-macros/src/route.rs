@@ -1163,6 +1163,36 @@ mod tests {
     }
 
     #[test]
+    fn route_macro_preserves_secured_roles_when_authorize_wraps_them() {
+        // `#[secured("admin")]` above `#[authorize]` above `#[post]`: secured
+        // expands first and leaves its role marker in the body; authorize then
+        // wraps that body in `let __autumn_inner: T = (async move { … }).await;`.
+        // The roles walk must descend that generated wrapper — otherwise the
+        // route silently reports `required_roles: &[]` and a `provable` manifest
+        // dimension under-states the posture.
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn update_note(note: Note) -> &'static str { "ok" }
+            },
+        );
+        let authorized =
+            crate::authorize::authorize_macro(quote! { "update", resource = Note }, secured);
+        let generated =
+            route_macro("POST", "post", quote! { "/notes/{id}" }, authorized).to_string();
+
+        assert!(
+            generated.contains(r#"required_roles : & ["admin"]"#),
+            "roles from a #[secured] buried under an #[authorize] wrapper must survive: \
+             {generated}"
+        );
+        assert!(
+            generated.contains(r#"AuthorizeBinding { action : "update" , resource : "Note" }"#),
+            "…and the authorize binding must be recorded alongside them: {generated}"
+        );
+    }
+
+    #[test]
     fn route_macro_orders_marker_binding_before_live_attribute() {
         // Mixed arrangement: `#[authorize(A)]` ABOVE `#[post]` (already
         // expanded into a marker by the time the route macro runs) and
