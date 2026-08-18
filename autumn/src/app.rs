@@ -5277,6 +5277,22 @@ impl AppBuilder {
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
 
+        // Same guard `run_startup_migrations` runs on a normal boot -- this path
+        // applies migrations directly (it IS the deploy's migration step, not a
+        // startup side effect of one), so skipping it here would let a collision
+        // reach production before anything ever validated it: the first apply
+        // would record the shared version and silently skip its colliding
+        // partner, and only a subsequent normal boot would notice. This path
+        // never applies the directory/shard-map guard sets (see the doc comment
+        // above), so unlike `run_startup_migrations` there is nothing to `.chain()`.
+        if log_migration_version_collisions(&migrations, false, false) {
+            // `process::exit` skips `on_shutdown`/`Drop`; stop any managed
+            // Postgres child first, mirroring the SQLite guard below.
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop();
+            std::process::exit(1);
+        }
+
         // Writable targets only: the control primary, then each shard primary.
         let control_url = config.database.effective_primary_url().map(str::to_owned);
         let shard_targets: Vec<(String, String)> = config
@@ -11720,6 +11736,21 @@ mod tests {
             guard_call < first_apply,
             "the SQLite guard must run BEFORE the migration loop / apply_pending_or_exit"
         );
+
+        // The migrate one-shot applies migrations directly — it IS the deploy's
+        // migration step, not a side effect of a normal boot — so it must run the
+        // same version-collision guard `run_startup_migrations` runs, and run it
+        // BEFORE the apply loop: otherwise a collision reaches production before
+        // anything ever validated it (a Codex review finding on the PR that added
+        // this guard).
+        let collision_check = handler
+            .find("log_migration_version_collisions(")
+            .expect("migrate handler runs the version-collision guard");
+        assert!(
+            collision_check < first_apply,
+            "the version-collision guard must run BEFORE the migration loop / apply_pending_or_exit"
+        );
+
         assert!(
             !handler.contains("initialize_job_runtime")
                 && !handler.contains("try_build_router_inner"),

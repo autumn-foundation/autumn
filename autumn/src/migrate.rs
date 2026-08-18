@@ -721,9 +721,9 @@ pub struct AppliedUserMigration {
 /// no error anywhere. A plugin author has no way to see the versions an app,
 /// or another plugin, already used, so this cannot be prevented by
 /// convention once more than one plugin is in play. See
-/// [`check_migration_version_collisions`], which [`crate::app`] calls at
-/// startup so the failure is loud and immediate instead of a silently
-/// skipped migration.
+/// [`check_migration_version_collisions`], which the [`mod@crate::app`]
+/// module calls at startup so the failure is loud and immediate instead of
+/// a silently skipped migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationVersionCollision {
     /// The version both (or all) directories claim, e.g. `"20260812000000"`.
@@ -751,10 +751,21 @@ impl std::fmt::Display for MigrationVersionCollision {
 /// registered via two different sets — e.g. the shard-required
 /// version-history migration, which is deliberately duplicated into both
 /// [`FRAMEWORK_MIGRATIONS`] and the standalone
-/// [`crate::version_history::VERSION_HISTORY_MIGRATIONS`] set) are not a
-/// collision: they are the same migration applying once, harmlessly skipped
-/// the second time it is registered. Only **different** names sharing one
-/// version are reported.
+/// [`crate::version_history::VERSION_HISTORY_MIGRATIONS`] set) are treated
+/// as harmless: the common case by far is the same migration registered
+/// twice, applying once and being skipped the second time. Only
+/// **different** names sharing one version are reported.
+///
+/// This is a name-based check, not a content-based one: Diesel's
+/// [`Migration`] trait exposes no way to read a compiled [`EmbeddedMigrations`]
+/// entry's raw SQL (only `run`/`revert`/`name`), so two independently
+/// compiled migrations that coincidentally share both a version **and** an
+/// identical descriptive suffix, but carry different SQL, cannot be told
+/// apart from the same migration registered twice. That coincidence needs a
+/// 14-digit timestamp match on top of a human-chosen suffix match — far
+/// less likely than the differently-named version collision this function
+/// exists to catch — and is the same limitation the framework's own
+/// checksum-drift guard has for embedded (as opposed to on-disk) migrations.
 ///
 /// Returns an empty `Vec` when a set cannot be read (e.g. corrupt embedded
 /// metadata) rather than failing — this check runs before any database
