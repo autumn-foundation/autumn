@@ -699,7 +699,7 @@ raw Diesel:
 | `primary_reads` (attr) / `on_primary()` | Pin reads to primary; read-your-writes after a save |
 | `soft_delete`, `tenant_scoped` (attrs), `across_tenants()` | Soft deletion and tenant scoping |
 | `hooks = MyHooks` (attr) | `before_/after_create/update/delete` + `after_*_commit` lifecycle hooks with `MutationContext` |
-| `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(unreleased)** shard-scoped construction; `with_pool_untracked` is new on trunk-dev — published 0.5.0 repositories have **no** pool constructor at all |
+| `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(unreleased)** shard-scoped construction; `with_pool_untracked` is new on trunk-dev — published 0.5.0 repositories have **no** pool constructor at all. An app carrying the older `with_pool` name is migrated by `autumn upgrade --apply` (codemod `0.6.0-repository-with-pool-untracked`, issue #1629) rather than by hand |
 | `find_in_batches(batch_size)`, `find_each(batch_size)` | **(unreleased)** Bounded-memory whole-table iteration via a primary-key keyset cursor (`WHERE id > last ORDER BY id ASC LIMIT batch_size` — never `LIMIT`/`OFFSET`), generated on every repository. `find_in_batches` returns a `FindInBatches` handle — drive with `while let Some(chunk) = b.next_batch().await?`; `find_each` returns `FindEach` yielding one model per `next().await?`. Inherits soft-delete filtering, tenant scoping, and read routing like `find_all`; errors are retryable (cursor advances only on success; `Ok(None)` always means completion); `batch_size == 0` errors instead of spinning; `batch_size` is **not** clamped to `MAX_PAGE_SIZE`; sharded repos reject cross-shard `across_tenants()` iteration (iterate per shard via `from_shard`). Handle types: `autumn_web::batches::{FindInBatches, FindEach, BatchSource}` (not in the prelude). See "Batched iteration" in `docs/guide/pagination.md` |
 | `find_or_create_by_<field>[_and_<field>...](<field>, &new)` | **(unreleased)** Race-safe get-or-insert; declare `fn find_or_create_by_slug(slug: String);` (lookup fields only) to generate an inherent `find_or_create_by_slug(&self, slug: String, new: &NewModel) -> AutumnResult<(Model, bool)>`. Reads on the read path first (tenant/soft-delete aware), else inserts on the primary with `ON CONFLICT DO NOTHING` — under concurrency exactly one row is created, exactly one caller sees `created == true`, and no `23505` escapes. `before_/after_create` + commit hooks fire only on the created path; works on hooked repos (unlike `upsert_many`). **Requires a unique constraint on the lookup column(s)** (`_or_` is rejected). See "Race-safe get-or-insert" in `docs/guide/repositories.md` |
 | `retention(after = "30d", basis = created_at)` / `retention(purge_deleted_after = "90d")` (attr) | **(unreleased)** Declarative data-retention: reach for this instead of hand-writing a `#[scheduled]` cleanup fn for expiring sessions, drafts, one-time codes, or other transient rows. Compiles to a batched (`batch_size`, default 500), cursor-paginated sweep auto-registered with fleet coordination — no `tasks![...]` entry needed. On a `soft_delete` repository, `after` soft-deletes (never re-touching an already-deleted row) and `purge_deleted_after` hard-purges (re-checking `deleted_at` at delete time so a concurrent `restore()` survives); without `soft_delete`, `after` hard-deletes. Sweeps run across **all** tenants on a `tenant_scoped` repository (no per-tenant opt-out) and are not supported on `sharded` repositories (compile error). `autumn retention --dry-run [--model NAME]` reports rows-that-would-be-swept without deleting. Emits `retention_sweep_rows_total` / `retention_sweep_duration_seconds` metrics + a structured log line per run. See `docs/guide/retention-sweeps.md` |
@@ -1877,7 +1877,37 @@ autumn release init --target azure-container-apps   # Terraform scaffold: main.t
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
+autumn upgrade                   # preview each release's mechanical app-code migrations (renames) as a per-file diff; writes nothing
+autumn upgrade --apply           # take them; --from/--to override the range, --list-migrations shows what ships (#1629)
 ```
+
+### Upgrading an app across releases — `autumn upgrade` (unreleased — trunk-dev, issue #1629)
+
+**Reach for this before hand-editing call sites out of a migration guide.**
+For each release between the `autumn-web` version the app's `Cargo.toml`
+records and the target, it applies that release's *mechanical* migrations —
+API renames — to the app's own Rust source. First shipped: 0.6.0's
+`with_pool` → `with_pool_untracked`.
+
+Three things to get right when advising on it:
+
+- **Run it before bumping the dependency.** The release it migrates *from* is
+  the one the manifest still records, so bumping `autumn-web` first leaves
+  nothing in range and the command reports "nothing to change". If the bump
+  already happened, pass `--from <previous-version>`.
+- **Preview is the default.** A bare `autumn upgrade` prints a per-file diff
+  plus a count of affected sites and writes nothing; `--apply` is the write
+  step. Tell users to commit or stash first — `git diff` is how they check
+  its work.
+- **It reports what it will not touch.** A call site inside a macro
+  invocation, a `macro_rules!` body, or an attribute, and a reference that is
+  never called (`.map(Repo::with_pool)`), are listed with `file:line` and a
+  guide link under `manual` — those are the ones a human (or you) still has to
+  edit. `--json` gives the same report for scripting.
+
+Every breaking change in `docs/migrations/*.md` carries an `**Automation:**`
+label — `auto` (the codemod does it), `review` (it rewrites, and flags each
+site), or `manual` (read the guide section). See `docs/guide/upgrading.md`.
 
 `autumn console` is Autumn's `rails console` equivalent. Rust has no stable
 `eval`, so it follows loco.rs's edit-and-run model instead of shipping a REPL:
