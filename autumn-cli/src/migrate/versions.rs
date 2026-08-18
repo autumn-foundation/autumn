@@ -582,7 +582,18 @@ pub fn run_check_collisions() {
 
     let default_ref = resolve_default_branch_ref();
     let mut default_branch_entries: BTreeSet<String> = BTreeSet::new();
-    if let Some(default_ref) = &default_ref {
+    // Whether `default_branch_entries` above is trustworthy enough to use as
+    // a baseline for "did THIS checkout introduce this migration" -- `false`
+    // when the default ref couldn't even be resolved, OR when it resolved
+    // but its local tip doesn't match what origin currently advertises. In
+    // that case `default_branch_entries` stays EMPTY, which is NOT evidence
+    // that nothing exists there -- just that this checkout never verified
+    // it. Treating it as evidence anyway would misattribute a pre-existing
+    // collision between the (unverified) default branch and some OTHER
+    // (verified) branch to this checkout, since a working-tree migration
+    // inherited unchanged from trunk would look "not yet on the default
+    // branch" purely because we never confirmed otherwise.
+    let default_verified = if let Some(default_ref) = &default_ref {
         let is_current = default_ref
             .strip_prefix("refs/remotes/origin/")
             .is_some_and(|name| is_ref_current(name));
@@ -595,7 +606,10 @@ pub fn run_check_collisions() {
                     .push(default_ref.clone());
             }
         }
-    }
+        is_current
+    } else {
+        false
+    };
 
     // Scoped to `origin` only, not the whole `refs/remotes` namespace: a
     // differently configured remote (e.g. `upstream`) is not what this
@@ -681,7 +695,19 @@ pub fn run_check_collisions() {
         if names.len() < 2 {
             continue;
         }
-        if names.iter().any(|n| working_tree_only.contains(n)) {
+        // Attributing a collision to THIS checkout needs either a verified
+        // default-branch baseline (so "not in default_branch_entries"
+        // reliably means "not already on trunk"), or every claimant coming
+        // from the working tree alone (a same-checkout duplicate is real
+        // regardless of branch state -- it needs no branch data at all).
+        // Without either, a name that's only "in working_tree_only" because
+        // the default branch couldn't be verified might already be shipped,
+        // unchanged, on that branch -- misattributing a pre-existing
+        // collision between two OTHER branches to this checkout instead of
+        // counting it under `others`.
+        let purely_local = names.iter().all(|n| working_tree.contains(n));
+        let attributable = default_verified || purely_local;
+        if attributable && names.iter().any(|n| working_tree_only.contains(n)) {
             mine.push((version.clone(), names.clone()));
         } else {
             others += 1;
