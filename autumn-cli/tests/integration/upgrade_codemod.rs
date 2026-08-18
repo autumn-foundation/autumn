@@ -787,3 +787,68 @@ fn every_pre_target_release_in_range_is_reported_not_just_the_newest() {
         );
     }
 }
+
+#[test]
+fn a_virtual_workspace_whose_members_declare_the_dependency_is_migrated() {
+    // A virtual root has no `[dependencies]` and no `[workspace.dependencies]`;
+    // each member carries its own `autumn-web` line. Reading only the root
+    // would abort an ordinary layout with "cannot tell which version".
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"api\", \"worker\"]\n",
+    );
+    for member in ["api", "worker"] {
+        write(
+            tmp.path(),
+            &format!("{member}/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        );
+        write(tmp.path(), &format!("{member}/src/lib.rs"), USES_WITH_POOL);
+    }
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    for member in ["api", "worker"] {
+        assert!(
+            read(tmp.path(), &format!("{member}/src/lib.rs")).contains("with_pool_untracked("),
+            "{member} declares autumn-web itself and must be migrated"
+        );
+    }
+}
+
+#[test]
+fn members_on_different_versions_take_the_oldest_floor() {
+    // The member that is furthest behind decides: a migration the other member
+    // is already past finds nothing to do there, while taking the newest floor
+    // would strand the one that is genuinely behind.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"old\", \"new\"]\n",
+    );
+    for (member, version) in [("old", "0.5.0"), ("new", "0.6.0")] {
+        write(
+            tmp.path(),
+            &format!("{member}/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [dependencies]\nautumn-web = \"{version}\"\n"
+            ),
+        );
+    }
+    write(tmp.path(), "old/src/lib.rs", USES_WITH_POOL);
+    write(tmp.path(), "new/src/lib.rs", "pub fn f() {}\n");
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "old/src/lib.rs").contains("with_pool_untracked("),
+        "the member still on 0.5.0 is migrated"
+    );
+}

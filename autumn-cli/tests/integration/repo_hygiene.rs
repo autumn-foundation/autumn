@@ -7908,15 +7908,37 @@ fn migration_guide_gate_does_not_match_an_unescaped_label_to_an_escaped_one() {
 // stated reason it stays manual.
 // ---------------------------------------------------------------------------
 
-/// A codemod registry the gate can read, in the shape it greps for.
+/// A codemod registry the gate can read, in the shape it greps for: entries of
+/// the production `APP_MIGRATIONS` table that actually carry a rewrite.
 fn write_fixture_registry(tmp: &tempfile::TempDir, ids: &[&str]) {
+    write_fixture_registry_with(tmp, ids, &[]);
+}
+
+/// As [`write_fixture_registry`], plus `guide_only` ids that rewrite nothing —
+/// the gate must not accept those as backing an `auto`/`review` label.
+fn write_fixture_registry_with(tmp: &tempfile::TempDir, rewriting: &[&str], guide_only: &[&str]) {
     let dir = tmp.path().join("autumn-cli/src/upgrade");
     std::fs::create_dir_all(&dir).expect("registry dir");
     let mut body = String::from("pub static APP_MIGRATIONS: &[AppMigration] = &[\n");
-    for id in ids {
-        let _ = writeln!(body, "    AppMigration {{\n        id: \"{id}\",\n    }},");
+    for id in rewriting {
+        let _ = writeln!(
+            body,
+            "    AppMigration {{\n        id: \"{id}\",\n                     rewrite: Rewrite::CallRename {{ from: \"a\", to: \"b\" }},\n    }},"
+        );
+    }
+    for id in guide_only {
+        let _ = writeln!(
+            body,
+            "    AppMigration {{\n        id: \"{id}\",\n                     rewrite: Rewrite::GuideOnly,\n    }},"
+        );
     }
     body.push_str("];\n");
+    // A `#[cfg(test)]` fixture table lives in the real file below the
+    // production one; ids from it must never count as shipped.
+    body.push_str(
+        "\n#[cfg(test)]\nmod tests {\n    static FIXTURE_REGISTRY: &[AppMigration] = &[\n\
+         \x20       AppMigration {\n            id: \"9.9.9-test-only\",\n                     rewrite: Rewrite::CallRename { from: \"x\", to: \"y\" },\n        },\n    ];\n}\n",
+    );
     std::fs::write(dir.join("migrations.rs"), body).expect("registry");
 }
 
@@ -8422,6 +8444,58 @@ fn codemod_gate_survives_a_registry_it_cannot_read() {
     );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("cannot be read"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_does_not_accept_a_test_only_registry_id() {
+    // The registry file carries a `#[cfg(test)]` fixture table below the
+    // production one. A guide citing an id from it names no shipped codemod.
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `foo` is renamed to `bar`",
+            "**Automation:** `auto` — codemod `9.9.9-test-only` rewrites every site.",
+        ),
+    );
+    write_fixture_registry(&tmp, &["0.7.0-real"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a test-fixture id is not a shipped codemod\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("names no shipped codemod"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_does_not_accept_a_guide_only_id_as_a_codemod() {
+    // A `GuideOnly` entry exists so the upgrade summary can link the guide; it
+    // rewrites nothing, so it cannot back an `auto` label.
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `foo` is renamed to `bar`",
+            "**Automation:** `auto` — codemod `0.7.0-guide-only` rewrites every site.",
+        ),
+    );
+    write_fixture_registry_with(&tmp, &[], &["0.7.0-guide-only"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a migration that rewrites nothing is not a codemod\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("names no shipped codemod"),
         "{}",
         gate_report(&output),
     );

@@ -386,11 +386,64 @@ pub fn render_json(report: &Report) -> String {
 
 /// Read the `autumn-web` requirement recorded by the app at `root`.
 ///
-/// Both `[dependencies]` and `[workspace.dependencies]` are read, in that
-/// order, so a workspace root that pins the version once for its members
-/// answers for the whole tree.
+/// The root manifest answers first — `[dependencies]` then
+/// `[workspace.dependencies]`, so a workspace that pins the version once for
+/// its members speaks for the whole tree. A *virtual* workspace root declares
+/// neither: its members each carry their own `autumn-web` line, and reading
+/// only the root would abort a perfectly ordinary layout with "cannot tell
+/// which version".
+///
+/// When members disagree, the **oldest** floor wins. That is the conservative
+/// answer: a migration for a release a member is already past finds nothing to
+/// do in that member (the rename it applies has already been applied), while
+/// taking the newest floor would skip a member that is genuinely behind.
 fn recorded_version(root: &Path) -> Option<String> {
-    crate::doctor::read_autumn_web_version_at(root)
+    if let Some(version) = crate::doctor::read_autumn_web_version_at(root) {
+        return Some(version);
+    }
+    member_manifests(root)
+        .into_iter()
+        .filter_map(|directory| crate::doctor::read_autumn_web_version_at(&directory))
+        .filter_map(|requirement| {
+            migrations::parse_version_req(&requirement).map(|version| (version, requirement))
+        })
+        .min_by_key(|(version, _)| *version)
+        .map(|(_, requirement)| requirement)
+}
+
+/// Directories under `root` (excluding `root` itself) that hold a `Cargo.toml`.
+///
+/// Found by walking rather than by parsing `[workspace] members`, which would
+/// mean implementing Cargo's glob patterns; the walk already knows which
+/// directories are not the app's own code.
+fn member_manifests(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    collect_manifests(root, root, &mut found);
+    found.sort();
+    found
+}
+
+fn collect_manifests(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || SKIPPED_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.join("Cargo.toml").is_file() && path != root {
+            found.push(path.clone());
+        }
+        collect_manifests(root, &path, found);
+    }
 }
 
 /// Every `.rs` file under `root` that belongs to the app, in a stable order.

@@ -2122,8 +2122,31 @@ if [[ -e "$CODEMOD_REGISTRY" ]]; then
   if [[ ! -r "$CODEMOD_REGISTRY" ]]; then
     die "$CODEMOD_REGISTRY exists but cannot be read."
   fi
-  # `    id: "0.6.0-repository-with-pool-untracked",` -> the bare id.
-  if ! sed -n 's/^[[:space:]]*id:[[:space:]]*"\([^"]*\)".*/\1/p' "$CODEMOD_REGISTRY" >"$codemod_ids"; then
+  # Only ids that name a *shipped rewrite*: entries of the production
+  # `APP_MIGRATIONS` table whose `rewrite` is a `CallRename`. A blanket scan for
+  # `id:` also picked up the `#[cfg(test)]` fixture registry and every
+  # `GuideOnly` entry, so a guide could satisfy an `auto` label by citing a
+  # test id or a migration that rewrites nothing — which is the one thing this
+  # check exists to prevent.
+  if ! awk '
+        /^pub static APP_MIGRATIONS/ { in_registry = 1; next }
+        in_registry && /^\];/       { in_registry = 0 }
+        !in_registry                { next }
+        /AppMigration[[:space:]]*\{/ { entry = 1; id = ""; rewrites = 0 }
+        !entry { next }
+        {
+          if (match($0, /id:[[:space:]]*"[^"]*"/)) {
+            id = substr($0, RSTART, RLENGTH)
+            sub(/^id:[[:space:]]*"/, "", id)
+            sub(/"$/, "", id)
+          }
+          if ($0 ~ /Rewrite::CallRename/) rewrites = 1
+        }
+        /^[[:space:]]{4}\},/ {
+          if (id != "" && rewrites) print id
+          entry = 0
+        }
+      ' "$CODEMOD_REGISTRY" >"$codemod_ids"; then
     die "$CODEMOD_REGISTRY could not be scanned for codemod ids."
     : >"$codemod_ids"
   fi

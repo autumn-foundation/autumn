@@ -94,7 +94,7 @@ it was; one unparsable file never stops the rest of the migration.
 |------|--------|
 | `PATH` | Project directory to migrate (positional, defaults to `.`). |
 | `--apply` | Write the rewrites. Without it the command only previews. |
-| `--from VERSION` | Override the recorded `autumn-web` version. Needed when you already bumped the dependency, or when it is a git pin or a range with no single floor. |
+| `--from VERSION` | Override the recorded `autumn-web` version. Needed when you already bumped the dependency, or when the requirement has no single floor — a git pin, `*`, a multi-comparator range, or an upper bound like `"<0.6"`. In a virtual workspace the members' own manifests are read, and the oldest floor among them wins. |
 | `--to VERSION` | Upgrade to this release instead of the CLI's own version. |
 | `--json` | Machine-readable report — the same content, for CI. |
 | `--list-migrations` | Print the shipped codemods and exit, without scanning. |
