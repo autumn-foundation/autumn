@@ -179,6 +179,17 @@ let post: Post = posts::table.find(id).first(&mut *db).await?;
 authorize::<Post>(&state, &session, "update", &post).await?;
 ```
 
+Every `#[authorize]` attribute is also recorded in the build-time security
+manifest: `autumn routes audit` emits one `(action, resource)` entry per
+binding in its provable `authorization_policies` dimension, so deleting an
+attribute deletes exactly that entry. The recorded resource is the identifier
+as written — `Post`, not the `PostPolicy` impl, which the attribute never names
+and the registry only resolves at boot. The inline `authorize::<Post>`
+call above is invisible to the audit by contrast: it is a call site, not an
+attribute, so it contributes no binding *and* no classification — a handler
+relying on it still needs `#[secured]` or `#[public]` to pass the coverage
+gate. See [Security Posture Manifest](./security-posture-manifest.md).
+
 ## The `#[repository] policy =` argument
 
 `#[repository(api = "/posts")]` auto-mounts JSON CRUD endpoints. Without

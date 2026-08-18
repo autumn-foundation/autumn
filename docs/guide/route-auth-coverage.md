@@ -29,8 +29,8 @@ no fourth, silent, default state — a route that fits none of these is
 Anything already carrying `#[secured]` or `#[authorize]` is `gated`
 automatically; there is nothing new to add. See the [Authorization
 guide](authorization.md) for `#[secured]` vs. `#[authorize]` vs. the `Policy`
-trait. The manifest also carries the declared roles/scopes and whether a
-dynamic policy is attached:
+trait. The manifest also carries the declared roles/scopes and a `policy`
+boolean recording that a record-level check runs:
 
 ```rust
 use autumn_web::prelude::*;
@@ -43,6 +43,27 @@ async fn delete_widget(/* … */) -> AutumnResult<()> { /* … */ }
 ```json
 { "path": "/widgets/{id}", "method": "DELETE", "classification": "gated", "roles": ["admin"] }
 ```
+
+For `#[authorize]` the manifest goes one step further than the boolean: the
+separate `authorization_policies` dimension records the `(action, resource)`
+binding each attribute declares, so you can read *what* the route is guarded to
+do rather than only *that* it is guarded.
+
+```rust
+#[get("/posts/{id}/edit")]
+#[authorize("update", resource = Post)]
+async fn edit_post(post: Post) -> AutumnResult<Markup> { /* … */ }
+```
+
+```json
+{ "path": "/posts/{id}/edit", "method": "GET", "name": "edit_post", "action": "update", "resource": "Post", "provenance": "provable" }
+```
+
+The two are not redundant, and `policy` is the wider of the pair: a route can
+set the boolean without contributing a binding — a `#[repository(api = ...,
+policy = ...)]` auto-API does exactly that. Both readings, and that superset
+relationship, are covered in the [Security Posture
+Manifest](security-posture-manifest.md).
 
 A `#[repository(api = ..., policy = ...)]` or `scope = ...` auto-API route is
 also `gated` — its guard lives on the generated CRUD handler, not on a
@@ -154,10 +175,14 @@ the nest enumerable.
 
 The `routes` dimension of the emitted JSON manifest is `provenance:
 "provable"` — every classification is a direct consequence of macro-expanded
-code, not a report of configuration. See [Security Posture Manifest —
-Provenance Classes](security-posture-manifest.md) for how the `routes`,
-`csrf`, and `security_headers` dimensions are tagged, and what `declared` and
-`runtime-only` mean for the dimensions that aren't (yet) provable this way.
+code, not a report of configuration. So is `authorization_policies`, which
+carries the `#[authorize]` bindings, with a `runtime_caveat` naming the one
+step it cannot prove (which `Policy` impl the registry serves at boot). See
+[Security Posture Manifest — Provenance Classes](security-posture-manifest.md)
+for how the `routes`, `csrf`, `security_headers`, and `authorization_policies`
+dimensions are tagged, for the rubric that decides a dimension's class, and for
+what `declared` and `runtime-only` mean for the dimensions that aren't (yet)
+provable this way.
 
 ## See also
 
