@@ -731,3 +731,59 @@ fn a_preview_whose_every_site_is_manual_does_not_offer_apply() {
     );
     assert!(out.contains("a human"), "{out}");
 }
+
+#[test]
+fn a_same_named_framework_builder_method_is_never_rewritten() {
+    // `AppState::with_pool` and `AuthzContext::with_pool` are *current*
+    // framework builders that still carry the old name. The renamed repository
+    // constructor takes no `self`, so the `.` call form is a different function
+    // — rewriting it would break ordinary test setup and the app would not
+    // compile, which is the one thing this command must never do.
+    let tmp = app("0.5.0");
+    write(
+        tmp.path(),
+        "src/main.rs",
+        "pub fn setup(state: AppState, pool: Pool) -> AppState {\n\
+        \x20   let repo = PostRepository::with_pool(pool.clone());\n\
+        \x20   drop(repo);\n\
+        \x20   state.with_pool(pool)\n\
+         }\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+
+    let after = read(tmp.path(), "src/main.rs");
+    assert!(
+        after.contains("PostRepository::with_pool_untracked(pool.clone())"),
+        "the repository constructor is migrated:\n{after}"
+    );
+    assert!(
+        after.contains("state.with_pool(pool)"),
+        "the AppState builder method is left exactly as it was:\n{after}"
+    );
+}
+
+#[test]
+fn every_pre_target_release_in_range_is_reported_not_just_the_newest() {
+    // An app coming from 0.3.x has 0.4.0 and 0.5.0 breaks ahead of it too.
+    // Reporting only the 0.6.0 ones would read as "those are the only breaks".
+    let tmp = app("0.3.0");
+    write(tmp.path(), "src/main.rs", "fn main() {}\n");
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--json"]);
+    assert!(output.status.success(), "{}", report(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout_of(&output)).expect("valid JSON");
+    let versions: Vec<&str> = value["migrations"]
+        .as_array()
+        .expect("migrations")
+        .iter()
+        .map(|m| m["version"].as_str().expect("version"))
+        .collect();
+    for release in ["0.4.0", "0.5.0", "0.6.0"] {
+        assert!(
+            versions.contains(&release),
+            "{release} is in range and must be reported, got {versions:?}"
+        );
+    }
+}

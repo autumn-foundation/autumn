@@ -736,7 +736,7 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::migrations::{Confidence, Rewrite};
+    use super::migrations::{CallForm, Confidence, Rewrite};
     use super::*;
 
     static AUTO: AppMigration = AppMigration {
@@ -748,6 +748,8 @@ mod tests {
         rewrite: Rewrite::CallRename {
             from: "with_pool",
             to: "with_pool_untracked",
+            form: CallForm::AssociatedFunction,
+            args: 1,
         },
     };
 
@@ -892,6 +894,8 @@ mod tests {
         rewrite: Rewrite::CallRename {
             from: "with_pool",
             to: "with_pool_untracked",
+            form: CallForm::AssociatedFunction,
+            args: 1,
         },
     };
 

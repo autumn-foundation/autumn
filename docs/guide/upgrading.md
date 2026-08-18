@@ -134,14 +134,23 @@ change*, for the label convention and the release gate that enforces it.
 
 ## What it can get wrong
 
-The tool matches identifiers in call position; it does not resolve types. If
-your own code happens to define a method with the same name as a renamed
-framework API and calls it as `thing.with_pool(…)`, that call is rewritten too.
-This is why preview is the default and why the diff names every file and line:
-read it before you `--apply`, and `git diff` after. The rename this ships is
-deliberately framework-specific for exactly that reason, and the risk is the
-line the `auto` label draws — a change that needs to know a receiver's type is
-labelled `review` or `manual` instead, never `auto`.
+The tool matches call sites by name, call form, and argument count; it does not
+resolve types.
+
+Form and arity carry more weight than they might look like. Autumn itself has
+same-named APIs that are *not* being renamed: `AppState::with_pool` and
+`AuthzContext::with_pool` are current builder methods. They survive the 0.6.0
+codemod because the renamed repository constructor takes no `self` and exactly
+one argument, so only `Repo::with_pool(pool)` matches — `state.with_pool(pool)`
+and the UFCS `AppState::with_pool(state, pool)` are provably different
+functions and are left alone.
+
+What remains is a same-named API in *your* code with the same form and arity:
+a one-argument associated `with_pool` on a type of your own would be rewritten.
+This is why preview is the default and why the diff names every file and line —
+read it before you `--apply`, and `git diff` after. It is also the line the
+`auto` label draws: a change that needs to know a receiver's type is labelled
+`review` or `manual`, never `auto`.
 
 Symlinked source files are not followed. Rewriting through a link could write
 outside the project, so a symlink is left alone; if your app keeps real source

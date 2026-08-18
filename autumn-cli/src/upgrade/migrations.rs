@@ -40,15 +40,41 @@ impl Confidence {
     }
 }
 
+/// How the renamed function is called — the property that tells the framework
+/// API apart from every same-named API that is *not* being renamed.
+///
+/// This matters because names collide inside Autumn itself: 0.6.0 renamed the
+/// generated repository constructor `with_pool`, while `AppState::with_pool`
+/// and `AuthzContext::with_pool` are current, unrenamed builder methods. The
+/// two are distinguishable without type inference, because a constructor takes
+/// no `self` and a builder does: `Repo::with_pool(pool)` can only be the
+/// former and `state.with_pool(pool)` can only be the latter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallForm {
+    /// `Type::name(args)` — an associated function, no `self` parameter. Only
+    /// the `::` call form is rewritten.
+    AssociatedFunction,
+    /// `value.name(args)` — a method taking `self`. Only the `.` call form is
+    /// rewritten.
+    Method,
+}
+
 /// What a migration mechanically does to app source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rewrite {
-    /// Rename a method or associated function *at its call sites*: `.from(` and
-    /// `::from(` become `.to(` / `::to(`. Only the name changes, so the
+    /// Rename a function *at its call sites*. Only the name changes, so the
     /// replacement never spans a line break.
+    ///
+    /// A site matches only when the call *form* and the exact top-level
+    /// argument count both agree with the renamed function's real signature —
+    /// a rename changes neither, and insisting on both is what keeps a
+    /// same-named API on another type from being rewritten.
     CallRename {
         from: &'static str,
         to: &'static str,
+        form: CallForm,
+        /// Exact number of top-level arguments the function takes.
+        args: usize,
     },
     /// Nothing is rewritten; the change is reported with its guide link so the
     /// user still sees it in the upgrade summary.
@@ -77,6 +103,70 @@ pub struct AppMigration {
 
 /// The canonical registry of app-code migrations, oldest release first.
 pub static APP_MIGRATIONS: &[AppMigration] = &[
+    // 0.4.0 and 0.5.0 ship no codemod — every break in those releases is
+    // semantic or configuration-level. They are registered anyway: without an
+    // entry, an app upgrading 0.3.x -> 0.6.0 would be told about the two 0.6.0
+    // changes and nothing else, which reads as "those are the only breaks in
+    // range". A `GuideOnly` entry is how the summary names the change and links
+    // its guide section. `MIGRATION_GUIDE_FLOOR` in
+    // `scripts/check-migration-guides.sh` is 0.4.0, so that is where this
+    // starts too.
+    AppMigration {
+        id: "0.4.0-security-production-signing-secret",
+        version: "0.4.0",
+        title: "a production signing secret is required",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.4.0.md#security-production-signing-secret-is-required",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.4.0-storage-s3-plugin-crate",
+        version: "0.4.0",
+        title: "`storage-s3` moved to the `autumn-storage-s3` plugin crate",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.4.0.md#storage-storage-s3-moved-to-a-plugin-crate",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.4.0-authorization-policy-required",
+        version: "0.4.0",
+        title: "repository APIs require a policy in production",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.4.0.md#authorization-repository-apis-require-a-policy-in-production",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.4.0-mail-deliver-later-durable",
+        version: "0.4.0",
+        title: "production `deliver_later` must be durable or acknowledged",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.4.0.md#mail-production-deliver_later-must-be-durable-or-acknowledged",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.5.0-security-forwarded-header-trust",
+        version: "0.5.0",
+        title: "forwarded-header trust is declared once, centrally",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.5.0.md#security-forwarded-header-trust-is-now-declared-once",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.5.0-deprecated-configuration-keys",
+        version: "0.5.0",
+        title: "deprecated configuration keys",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.5.0.md#deprecated-configuration-keys",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.5.0-client-identity-extractors",
+        version: "0.5.0",
+        title: "read client identity through `ClientAddr` / `ClientHost` / `ClientScheme`",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.5.0.md#reading-client-identity-clientaddr-clienthost-clientscheme",
+        rewrite: Rewrite::GuideOnly,
+    },
     AppMigration {
         id: "0.6.0-tenancy-jwt-secret-secretstring",
         version: "0.6.0",
@@ -94,6 +184,12 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         rewrite: Rewrite::CallRename {
             from: "with_pool",
             to: "with_pool_untracked",
+            // `pub fn with_pool_untracked(pool) -> Self` — an associated
+            // function taking exactly the pool. `AppState::with_pool(pool)`
+            // and `AuthzContext::with_pool(pool)` are builder *methods* that
+            // still carry the old name and must not be touched.
+            form: CallForm::AssociatedFunction,
+            args: 1,
         },
     },
 ];
@@ -131,8 +227,14 @@ pub fn parse_version_req(req: &str) -> Option<Version> {
     if req.is_empty() || req.contains(',') {
         return None;
     }
+    // An upper bound is not a floor. `autumn-web = "<0.6"` says nothing about
+    // which release the app is on — stripping the `<` would read it as 0.6.0
+    // and skip the very 0.6.0 codemod a 0.5.x app needs. Ask for `--from`.
+    if req.starts_with('<') {
+        return None;
+    }
     let core = req
-        .trim_start_matches(['=', '^', '~', '>', '<'])
+        .trim_start_matches(['=', '^', '~', '>'])
         .trim()
         // Build metadata and a pre-release suffix both leave the release
         // identity alone: 0.7.0-rc.1 is the 0.7.0 line for migration purposes.
@@ -235,6 +337,10 @@ mod tests {
         // for `--from` than to guess and rewrite against the wrong release.
         assert_eq!(parse_version_req("*"), None);
         assert_eq!(parse_version_req(">=0.4, <0.6"), None);
+        // An upper bound is not a floor: reading `<0.6` as 0.6.0 would skip
+        // the 0.6.0 codemod on an app actually resolved to 0.5.x.
+        assert_eq!(parse_version_req("<0.6"), None);
+        assert_eq!(parse_version_req("<=0.6.0"), None);
         assert_eq!(parse_version_req(""), None);
         assert_eq!(parse_version_req("trunk-dev"), None);
         assert_eq!(parse_version_req("0.x"), None);
@@ -266,13 +372,15 @@ mod tests {
 
     #[test]
     fn excludes_migrations_newer_than_the_target() {
-        let ids: Vec<_> = migrations_between(v(0, 4, 0), v(0, 5, 0))
-            .iter()
-            .map(|m| m.id)
-            .collect();
+        let selected = migrations_between(v(0, 4, 0), v(0, 5, 0));
         assert!(
-            ids.is_empty(),
-            "a 0.6.0 migration must not run when targeting 0.5.0, got {ids:?}"
+            selected.iter().all(|m| m.version == "0.5.0"),
+            "targeting 0.5.0 selects 0.5.0 and nothing newer, got {:?}",
+            selected.iter().map(|m| m.id).collect::<Vec<_>>()
+        );
+        assert!(
+            !selected.is_empty(),
+            "0.5.0 is ahead of 0.4.0 and its changes must be reported"
         );
     }
 
@@ -319,6 +427,8 @@ mod tests {
             rewrite: Rewrite::CallRename {
                 from: "old",
                 to: "new",
+                form: CallForm::AssociatedFunction,
+                args: 1,
             },
         },
         AppMigration {
@@ -330,6 +440,8 @@ mod tests {
             rewrite: Rewrite::CallRename {
                 from: "older",
                 to: "newer",
+                form: CallForm::AssociatedFunction,
+                args: 1,
             },
         },
     ];
@@ -388,7 +500,7 @@ mod tests {
                 migration.guide
             );
             match migration.rewrite {
-                Rewrite::CallRename { from, to } => {
+                Rewrite::CallRename { from, to, .. } => {
                     assert_ne!(from, to, "{} renames nothing", migration.id);
                     assert_ne!(
                         migration.confidence,
@@ -443,6 +555,8 @@ mod tests {
             Rewrite::CallRename {
                 from: "with_pool",
                 to: "with_pool_untracked",
+                form: CallForm::AssociatedFunction,
+                args: 1,
             }
         );
     }

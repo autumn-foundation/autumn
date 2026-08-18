@@ -24,7 +24,7 @@
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 
-use super::migrations::{AppMigration, Rewrite};
+use super::migrations::{AppMigration, CallForm, Rewrite};
 
 /// Why a site was left for a human.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +121,10 @@ struct Rename {
     id: &'static str,
     from: &'static str,
     to: &'static str,
+    /// Which call form the renamed function actually has.
+    form: CallForm,
+    /// Exact top-level argument count of the renamed function.
+    args: usize,
 }
 
 /// Apply `migrations` to one file's `source`.
@@ -139,10 +143,17 @@ pub fn rewrite_source(
     let renames: Vec<Rename> = migrations
         .iter()
         .filter_map(|migration| match migration.rewrite {
-            Rewrite::CallRename { from, to } => Some(Rename {
+            Rewrite::CallRename {
+                from,
+                to,
+                form,
+                args,
+            } => Some(Rename {
                 id: migration.id,
                 from,
                 to,
+                form,
+                args,
             }),
             Rewrite::GuideOnly => None,
         })
@@ -286,12 +297,12 @@ fn scan(stream: &TokenStream, context: Context, renames: &[Rename], hits: &mut V
                 );
             }
             TokenTree::Ident(ident) => {
-                // The separator is what makes this the framework API rather
-                // than any other use of the word; whether an argument list
-                // follows decides between rewriting it and reporting it.
-                if !is_receiver_separator(&trees, index) {
+                // The separator is what makes this a call on something rather
+                // than any other use of the word, and *which* separator says
+                // whether it can be the renamed function at all.
+                let Some(separator) = receiver_separator(&trees, index) else {
                     continue;
-                }
+                };
                 let name = ident.to_string();
                 // `r#with_pool` is the same name written raw. Match on the bare
                 // name and carry the prefix through to the splice, or the site
@@ -299,11 +310,18 @@ fn scan(stream: &TokenStream, context: Context, renames: &[Rename], hits: &mut V
                 let (prefix, bare) = name
                     .strip_prefix("r#")
                     .map_or(("", name.as_str()), |bare| ("r#", bare));
-                let Some(rename) = renames.iter().find(|rename| rename.from == bare) else {
+                // The form must match too. `AppState::with_pool` is a *builder
+                // method* that keeps the old name, so a `.with_pool(pool)` call
+                // is provably not the renamed constructor — not a site this
+                // declines to rewrite, a site that is a different function.
+                let Some(rename) = renames
+                    .iter()
+                    .find(|rename| rename.from == bare && rename.form == separator)
+                else {
                     continue;
                 };
                 let manual = context.manual_reason().or_else(|| {
-                    (!has_argument_list(&trees, index)).then_some(ManualReason::NotACall)
+                    (!takes_arguments(&trees, index, rename.args)).then_some(ManualReason::NotACall)
                 });
                 let span = ident.span();
                 let start = span.start();
@@ -424,23 +442,53 @@ fn is_macro_name(trees: &[TokenTree], bang: usize) -> bool {
 /// A reference is not renamed: `xs.map(Repo::with_pool)` hands the function
 /// itself somewhere, and the tool has no way to know the receiver's type. Such
 /// a site is reported as [`ManualReason::NotACall`] rather than skipped.
-fn has_argument_list(trees: &[TokenTree], index: usize) -> bool {
-    match trees.get(index + 1) {
-        Some(TokenTree::Group(group)) => group.delimiter() == Delimiter::Parenthesis,
+fn takes_arguments(trees: &[TokenTree], index: usize, want: usize) -> bool {
+    let arguments = match trees.get(index + 1) {
+        Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis => group,
         // Turbofish: `name::<T>(...)` is a call; `Vec<Repo::with_pool::<T>>` is
         // a type, so the closing angle has to be followed by an argument list.
         Some(TokenTree::Punct(punct)) if punct.as_char() == ':' => {
-            matches!(trees.get(index + 2), Some(TokenTree::Punct(second)) if second.as_char() == ':')
-                && matches!(trees.get(index + 3), Some(TokenTree::Punct(angle)) if angle.as_char() == '<')
-                && turbofish_closes_on_a_call(trees, index + 3)
+            if !matches!(trees.get(index + 2), Some(TokenTree::Punct(second)) if second.as_char() == ':')
+                || !matches!(trees.get(index + 3), Some(TokenTree::Punct(angle)) if angle.as_char() == '<')
+            {
+                return false;
+            }
+            match turbofish_argument_list(trees, index + 3) {
+                Some(group) => group,
+                None => return false,
+            }
         }
-        _ => false,
-    }
+        _ => return false,
+    };
+    count_arguments(arguments) == want
 }
 
-/// Walk from the `<` at `angle` to its matching `>` and report whether an
-/// argument list follows it.
-fn turbofish_closes_on_a_call(trees: &[TokenTree], angle: usize) -> bool {
+/// Top-level arguments in a call's parentheses.
+///
+/// A rename cannot change arity, so this is what separates the renamed
+/// function from a same-named one reached through UFCS: the generated
+/// `Repo::with_pool(pool)` takes one argument, while `AppState::with_pool`
+/// written as `AppState::with_pool(state, pool)` takes two. Nested groups are
+/// atomic token trees, so every comma seen here is an argument separator.
+fn count_arguments(group: &proc_macro2::Group) -> usize {
+    let mut arguments = 0;
+    let mut in_argument = false;
+    for tree in group.stream() {
+        match &tree {
+            TokenTree::Punct(punct) if punct.as_char() == ',' => {
+                arguments += 1;
+                in_argument = false;
+            }
+            _ => in_argument = true,
+        }
+    }
+    // A trailing comma closes the last argument rather than opening one.
+    arguments + usize::from(in_argument)
+}
+
+/// Walk from the `<` at `angle` to its matching `>` and return the argument
+/// list that follows it, if any.
+fn turbofish_argument_list(trees: &[TokenTree], angle: usize) -> Option<&proc_macro2::Group> {
     let mut depth = 0usize;
     for at in angle..trees.len() {
         let TokenTree::Punct(punct) = &trees[at] else {
@@ -454,48 +502,53 @@ fn turbofish_closes_on_a_call(trees: &[TokenTree], angle: usize) -> bool {
             {
                 depth -= 1;
                 if depth == 0 {
-                    return matches!(trees.get(at + 1), Some(TokenTree::Group(group))
-                        if group.delimiter() == Delimiter::Parenthesis);
+                    return match trees.get(at + 1) {
+                        Some(TokenTree::Group(group))
+                            if group.delimiter() == Delimiter::Parenthesis =>
+                        {
+                            Some(group)
+                        }
+                        _ => None,
+                    };
                 }
             }
             _ => {}
         }
     }
-    false
+    None
 }
 
-/// Whether `trees[index]` is preceded by a `.` or a full `::`.
+/// Which call form `trees[index]` is written in, if any: `.` makes it a method
+/// call, a full `::` makes it an associated-function call.
 ///
 /// The `::` test insists on *both* colons: a single `:` before an identifier is
 /// a struct-literal field value or a type ascription (`Config { pool: with_pool }`),
-/// which is not the renamed associated function.
-fn is_receiver_separator(trees: &[TokenTree], index: usize) -> bool {
-    let Some(before) = index.checked_sub(1) else {
-        return false;
-    };
+/// which is not a call at all.
+fn receiver_separator(trees: &[TokenTree], index: usize) -> Option<CallForm> {
+    let before = index.checked_sub(1)?;
     let TokenTree::Punct(punct) = &trees[before] else {
-        return false;
+        return None;
+    };
+    let preceded_by = |ch: char| {
+        matches!(
+            before.checked_sub(1).map(|at| &trees[at]),
+            Some(TokenTree::Punct(first)) if first.as_char() == ch
+        )
     };
     match punct.as_char() {
         // A second `.` makes this a range or struct-update expression
         // (`0..with_pool(n)`, `C { ..with_pool(d) }`), whose operand is a free
         // function — not a method on a receiver.
-        '.' => !matches!(
-            before.checked_sub(1).map(|at| &trees[at]),
-            Some(TokenTree::Punct(first)) if first.as_char() == '.'
-        ),
-        ':' => matches!(
-            before.checked_sub(1).map(|at| &trees[at]),
-            Some(TokenTree::Punct(first)) if first.as_char() == ':'
-        ),
-        _ => false,
+        '.' if !preceded_by('.') => Some(CallForm::Method),
+        ':' if preceded_by(':') => Some(CallForm::AssociatedFunction),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::upgrade::migrations::{AppMigration, Confidence};
+    use crate::upgrade::migrations::{AppMigration, CallForm, Confidence};
 
     /// The shipped 0.6.0 rename, used by every case below.
     static RENAME: AppMigration = AppMigration {
@@ -507,6 +560,8 @@ mod tests {
         rewrite: Rewrite::CallRename {
             from: "with_pool",
             to: "with_pool_untracked",
+            form: CallForm::AssociatedFunction,
+            args: 1,
         },
     };
 
@@ -533,12 +588,64 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_a_method_call() {
-        let out = rewritten("fn f(b: B, p: Pool) { let r = b.with_pool(p); }");
-        assert_eq!(
-            out,
-            "fn f(b: B, p: Pool) { let r = b.with_pool_untracked(p); }"
+    fn leaves_a_same_named_builder_method_alone() {
+        // `AppState::with_pool` and `AuthzContext::with_pool` are *current*
+        // framework builder methods that keep the old name. The renamed
+        // constructor takes no `self`, so a `.with_pool(pool)` call is provably
+        // a different function — rewriting it would break
+        // `AppState::for_test().with_pool(pool)`, which is ordinary test setup.
+        let result = run("fn f(s: AppState, p: Pool) { let s = s.with_pool(p); }");
+        assert_eq!(result.updated, None);
+        assert!(
+            result.manual.is_empty(),
+            "not an ambiguous site to flag — a different function entirely: {:?}",
+            result.manual
         );
+    }
+
+    #[test]
+    fn rewrites_a_method_call_for_a_method_form_rename() {
+        // The form is a property of the migration, not a global rule: a future
+        // rename of a real method rewrites the `.` form and not the `::` one.
+        static METHOD_RENAME: AppMigration = AppMigration {
+            id: "test-method-rename",
+            version: "0.7.0",
+            title: "method rename",
+            confidence: Confidence::Auto,
+            guide: "docs/migrations/0.7.0.md#anchor",
+            rewrite: Rewrite::CallRename {
+                from: "old_step",
+                to: "new_step",
+                form: CallForm::Method,
+                args: 1,
+            },
+        };
+        let result = rewrite_source("fn f(b: B, p: P) { b.old_step(p); }", &[&METHOD_RENAME])
+            .expect("parses");
+        assert_eq!(
+            result.updated.as_deref(),
+            Some("fn f(b: B, p: P) { b.new_step(p); }")
+        );
+        let path_form =
+            rewrite_source("fn f(p: P) { B::old_step(p); }", &[&METHOD_RENAME]).expect("parses");
+        assert_eq!(path_form.updated, None, "a method rename leaves `::` alone");
+    }
+
+    #[test]
+    fn leaves_a_ufcs_call_with_the_wrong_arity_alone() {
+        // `AppState::with_pool(state, pool)` is the builder method reached
+        // through UFCS: same name, same `::` form, one argument too many. A
+        // rename cannot change arity, so arity tells them apart.
+        let result = run("fn f(s: AppState, p: Pool) { let s = AppState::with_pool(s, p); }");
+        assert_eq!(result.updated, None);
+    }
+
+    #[test]
+    fn arity_is_counted_at_the_top_level_only() {
+        // A comma nested inside an argument is not an argument separator, and
+        // a trailing comma does not open a new argument.
+        let out = rewritten("fn f() { Repo::with_pool(make(a, b),); }");
+        assert!(out.contains("with_pool_untracked(make(a, b),)"), "{out}");
     }
 
     #[test]
@@ -638,7 +745,7 @@ mod tests {
     #[test]
     fn records_line_and_column_for_every_rewritten_site() {
         let source =
-            "fn f() {\n    let a = Repo::with_pool(p);\n    let b = other.with_pool(q);\n}\n";
+            "fn f() {\n    let a = Repo::with_pool(p);\n    let b = Other::with_pool(q);\n}\n";
         let result = run(source);
         assert_eq!(result.rewritten.len(), 2);
         assert_eq!(result.rewritten[0].line, 2);
@@ -664,13 +771,13 @@ mod tests {
 
     #[test]
     fn rewrites_every_site_in_a_file() {
-        let source = "fn f() { A::with_pool(p); B::with_pool(q); c.with_pool(r); }";
+        let source = "fn f() { A::with_pool(p); B::with_pool(q); C::with_pool(r); }";
         let result = run(source);
         assert_eq!(result.rewritten.len(), 3);
         assert_eq!(
             result.updated.as_deref(),
             Some(
-                "fn f() { A::with_pool_untracked(p); B::with_pool_untracked(q); c.with_pool_untracked(r); }"
+                "fn f() { A::with_pool_untracked(p); B::with_pool_untracked(q); C::with_pool_untracked(r); }"
             )
         );
     }
@@ -712,7 +819,7 @@ mod tests {
         // The dangerous half: rewriting the matcher makes the macro reject the
         // invocations its users write, while those invocations are (correctly)
         // reported as manual and left alone — a tree that does not compile.
-        let source = "macro_rules! forward {\n    ($s:ident . with_pool ( $p:expr )) => { $s.with_pool($p) };\n}\n";
+        let source = "macro_rules! forward {\n    ($t:ident :: with_pool ( $p:expr )) => { $t::with_pool($p) };\n}\n";
         let result = run(source);
         assert_eq!(
             result.updated, None,
@@ -841,6 +948,8 @@ mod tests {
             rewrite: Rewrite::CallRename {
                 from: "with_pool",
                 to: "with_pool_untracked",
+                form: CallForm::AssociatedFunction,
+                args: 1,
             },
         };
         static SECOND: AppMigration = AppMigration {
@@ -852,6 +961,8 @@ mod tests {
             rewrite: Rewrite::CallRename {
                 from: "with_pool_untracked",
                 to: "untracked_pool",
+                form: CallForm::AssociatedFunction,
+                args: 1,
             },
         };
         let chain: [&'static AppMigration; 2] = [&FIRST, &SECOND];
@@ -881,6 +992,8 @@ mod tests {
             rewrite: Rewrite::CallRename {
                 from: "with_pool",
                 to: "with_pool_untracked",
+                form: CallForm::AssociatedFunction,
+                args: 1,
             },
         };
         static B: AppMigration = AppMigration {
@@ -892,6 +1005,8 @@ mod tests {
             rewrite: Rewrite::CallRename {
                 from: "old_name",
                 to: "new_name",
+                form: CallForm::AssociatedFunction,
+                args: 1,
             },
         };
         // `old_name` (0.7.0) is on line 2, `with_pool` (0.6.0) on line 3.
