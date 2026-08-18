@@ -22,7 +22,7 @@
 //! — the tokens that look like a call may never become one, and a macro is free
 //! to build the identifier by concatenation, so a rewrite there is a guess.
 
-use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::migrations::{AppMigration, CallForm, ReceiverShape, Rewrite};
@@ -744,13 +744,23 @@ impl GeneratedRepositories {
         let Some(declared) = self.declared.get(name) else {
             return false;
         };
-        // `crate::`, `self::` and `super::` say where to start resolving, not
-        // which module declares the type. `super` cannot be resolved without
-        // knowing the caller's own module, so it is dropped rather than guessed
-        // at — erring toward accepting a name that is generated somewhere.
+        // `self::` and `super::` are relative to the module the *call* is
+        // written in, which this command does not track. Dropping them and
+        // judging the call as if it were unqualified let a generated type in
+        // any module vouch for it, so `self::PgAuditRepository::with_pool`
+        // could be rewritten on the strength of a repository declared
+        // elsewhere entirely. Unresolvable means reported, as everywhere else.
+        if matches!(
+            qualifier.first().map(String::as_str),
+            Some("self" | "super")
+        ) {
+            return false;
+        }
+        // `crate::` is absolute: it says where to start resolving, not which
+        // module declares the type.
         let qualifier: Vec<String> = qualifier
             .iter()
-            .skip_while(|segment| matches!(segment.as_str(), "crate" | "self" | "super" | "$crate"))
+            .skip_while(|segment| matches!(segment.as_str(), "crate" | "$crate"))
             .cloned()
             .collect();
         if qualifier.is_empty() {
@@ -800,6 +810,13 @@ fn collect_repository_types(
                 if !is_repository_attribute(&group.stream()) {
                     continue;
                 }
+                // The generated type exists only in the configuration the
+                // `#[cfg]` selects. Under the other one the same name may be an
+                // unrelated import, so a conditional declaration cannot vouch
+                // for a call unconditionally.
+                if attribute_run_is_cfg_gated(&trees, index) {
+                    continue;
+                }
                 if let Some(trait_name) = trait_name_after(&trees, index + 2) {
                     found.push((format!("Pg{trait_name}"), module.to_vec()));
                 }
@@ -838,6 +855,11 @@ fn collect_repository_types(
 /// Only the path is read. Anything with an argument list — `#[cfg(feature =
 /// "repository")]` — is judged by its own name, not by what its arguments say.
 fn is_repository_attribute(stream: &TokenStream) -> bool {
+    attribute_last_segment(stream).is_some_and(|segment| segment == "repository")
+}
+
+/// The last path segment of an attribute body, or `None` if it names no path.
+fn attribute_last_segment(stream: &TokenStream) -> Option<String> {
     let mut last_segment = None;
     for tree in stream.clone() {
         match tree {
@@ -849,7 +871,49 @@ fn is_repository_attribute(stream: &TokenStream) -> bool {
             _ => break,
         }
     }
-    last_segment.is_some_and(|segment| segment == "repository")
+    last_segment
+}
+
+/// Whether an attribute makes the item it decorates conditional.
+fn is_cfg_attribute(stream: &TokenStream) -> bool {
+    attribute_last_segment(stream).is_some_and(|segment| segment == "cfg" || segment == "cfg_attr")
+}
+
+/// Whether the attribute run containing `trees[index]` carries a `#[cfg]`.
+///
+/// Attributes stack in whatever order the author chose, so the run is walked in
+/// both directions from the `#[repository]` that was just matched.
+fn attribute_run_is_cfg_gated(trees: &[TokenTree], index: usize) -> bool {
+    fn attribute_at(trees: &[TokenTree], at: usize) -> Option<&Group> {
+        match (trees.get(at), trees.get(at + 1)) {
+            (Some(TokenTree::Punct(punct)), Some(TokenTree::Group(group)))
+                if punct.as_char() == '#' && group.delimiter() == Delimiter::Bracket =>
+            {
+                Some(group)
+            }
+            _ => None,
+        }
+    }
+
+    let mut before = index;
+    while before >= 2 {
+        let Some(group) = attribute_at(trees, before - 2) else {
+            break;
+        };
+        if is_cfg_attribute(&group.stream()) {
+            return true;
+        }
+        before -= 2;
+    }
+
+    let mut after = index + 2;
+    while let Some(group) = attribute_at(trees, after) {
+        if is_cfg_attribute(&group.stream()) {
+            return true;
+        }
+        after += 2;
+    }
+    false
 }
 
 /// The module name when `trees[index]` is the body of `mod name { … }`.
@@ -1816,6 +1880,79 @@ mod tests {
         assert!(
             out.contains("PgPostRepository::with_pool_untracked(p)"),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn a_self_qualified_receiver_is_reported_not_rewritten() {
+        // Codex review on #2231: `self::` was stripped and the call then judged
+        // as if it were unqualified, so a generated type of that name in *any*
+        // module vouched for it. `self::` means the caller's own module, which
+        // this command cannot resolve, so the site is reported instead.
+        let generated: GeneratedRepositories =
+            std::iter::once(("PgPostRepository".to_owned(), vec!["repos".to_owned()])).collect();
+        let result = rewrite_source(
+            "fn f(p: Pool) { self::PgPostRepository::with_pool(p); }",
+            &[&RENAME],
+            &generated,
+        )
+        .expect("parses");
+        assert_eq!(result.updated, None);
+        assert_eq!(
+            result.manual[0].manual,
+            Some(ManualReason::UnverifiedReceiver)
+        );
+    }
+
+    #[test]
+    fn a_super_qualified_receiver_is_reported_not_rewritten() {
+        let generated: GeneratedRepositories =
+            std::iter::once(("PgPostRepository".to_owned(), vec!["repos".to_owned()])).collect();
+        let result = rewrite_source(
+            "fn f(p: Pool) { super::PgPostRepository::with_pool(p); }",
+            &[&RENAME],
+            &generated,
+        )
+        .expect("parses");
+        assert_eq!(result.updated, None);
+        assert_eq!(
+            result.manual[0].manual,
+            Some(ManualReason::UnverifiedReceiver)
+        );
+    }
+
+    #[test]
+    fn a_cfg_gated_repository_declaration_is_not_evidence() {
+        // Codex review on #2231: the generated type only exists in the
+        // configuration the `#[cfg]` selects, so it cannot vouch for a call
+        // unconditionally — under the other configuration the same name may be
+        // an unrelated import.
+        assert!(
+            generated_names(
+                "#[cfg(feature = \"postgres\")]\n#[repository]\npub trait AuditRepository {}\n"
+            )
+            .is_empty(),
+            "a conditional declaration is conditional evidence",
+        );
+    }
+
+    #[test]
+    fn a_cfg_gated_repository_declaration_is_not_evidence_when_cfg_follows() {
+        // Attribute order is the author's choice, not a signal.
+        assert!(
+            generated_names(
+                "#[repository]\n#[cfg(feature = \"postgres\")]\npub trait AuditRepository {}\n"
+            )
+            .is_empty(),
+        );
+    }
+
+    #[test]
+    fn an_unconditional_repository_declaration_is_still_evidence() {
+        // The cfg fix must not swing the other way.
+        assert_eq!(
+            generated_names("#[repository]\npub trait AuditRepository {}\n"),
+            vec!["PgAuditRepository".to_owned()],
         );
     }
 

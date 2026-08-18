@@ -90,6 +90,20 @@ it was; one unparsable file never stops the rest of the migration. "Valid" means
 it parses as Rust, not merely that its delimiters balance — `let = f();` is
 skipped, not rewritten.
 
+The same applies to a receiver the tool cannot pin down to a generated
+repository. Two cases are worth naming, because both look rewritable and are
+not:
+
+- **`self::` and `super::` receivers.** These are relative to the module the
+  call is written in, which this command does not track. `self::PgAuditRepository::with_pool(pool)`
+  is reported rather than matched against a repository declared in some other
+  module. Spell the path from the crate root — `crate::repositories::PgAuditRepository`
+  — and it is rewritten.
+- **`#[cfg]`-gated repository declarations.** A `#[cfg(feature = "postgres")] #[repository] trait AuditRepository`
+  generates its type only when that feature is on, so it cannot vouch for a
+  call unconditionally; under the other configuration the same name may be an
+  unrelated import. Calls to such a type are reported for a human.
+
 ## Flags
 
 | Flag | Effect |
