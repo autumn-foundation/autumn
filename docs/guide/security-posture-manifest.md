@@ -165,7 +165,7 @@ contributes one entry per binding, keyed by the route it sits on:
 The same route also appears in the `routes` dimension with `"policy": true` —
 the boolean says *a* record-level check runs, this dimension says *which* one.
 
-Two properties of `resource` are load-bearing when you read these entries:
+Three properties of these entries are load-bearing when you read them:
 
 - **It is the resource identifier exactly as written at the use site** — the
   `Post` in `resource = Post`. It is deliberately *not* the `Policy`
@@ -177,6 +177,18 @@ Two properties of `resource` are load-bearing when you read these entries:
   indistinguishable in the manifest. That is a known limitation of proving
   from an expansion: name resolution is the compiler's job, and it happens
   after the macro has run.
+- **Attribute detection is by name, not by resolved import** — the same
+  no-name-resolution boundary, on the attribute side. When `#[authorize]` sits
+  *below* the route attribute it is recognized textually (`authorize`, or a
+  path ending in it, e.g. `#[autumn_web::authorize]`). Import the macro under
+  an alias — `use autumn_web::authorize as policy;` — and a `#[policy(...)]`
+  written below the route attribute still guards the route at runtime but
+  records no binding (and no `policy: true` either; every name-based attribute
+  check in the route macros — `#[secured]`, `#[public]`, `#[throttle]` — has
+  always shared this boundary). Written *above* the route attribute the alias
+  is harmless: the guard expands first and the route macro reads the marker
+  its expansion emits, whatever name invoked it. If you alias the guard
+  macros, put them above the route attribute — or don't alias them.
 
 Entries are sorted by `(path, method, action, resource)`, and each route's own
 bindings are sorted and deduplicated before they reach the manifest, so a
