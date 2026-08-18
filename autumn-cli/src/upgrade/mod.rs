@@ -679,14 +679,43 @@ fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
 
     let mut found = BTreeSet::new();
     found.extend(forced_target_dir);
-    // Cargo reads `.cargo/config.toml` from the invocation directory upward, so
-    // a redirect above the scan root applies to everything inside it.
     let absolute_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+
+    // Cargo's hierarchy is the invocation directory upward, then Cargo home.
+    // The two settings read here merge differently and must not be pooled:
+    // `build.target-dir` is a scalar, so the *nearest* declaration wins and the
+    // rest are overridden — unioning them pruned directories that are really
+    // app source. The `[source.*]` tables merge, so every level contributes.
+    let mut nearest_target = None;
     for ancestor in absolute_root.ancestors() {
-        found.extend(config_excluded_dirs_at(ancestor, target_dir_from_config));
+        let (target, vendored) =
+            config_excluded_dirs_in(&ancestor.join(".cargo"), ancestor, target_dir_from_config);
+        nearest_target = nearest_target.or(target);
+        found.extend(vendored);
     }
+    if let Some(home) = cargo_home() {
+        let (target, vendored) = config_excluded_dirs_in(&home, &home, target_dir_from_config);
+        nearest_target = nearest_target.or(target);
+        found.extend(vendored);
+    }
+    found.extend(nearest_target);
+
     collect_target_dirs(&absolute_root, target_dir_from_config, &mut found);
     found
+}
+
+/// Cargo's own configuration directory — `$CARGO_HOME`, or `~/.cargo`.
+///
+/// The last level of the hierarchy, and the one with no `.cargo` component:
+/// the file is `$CARGO_HOME/config.toml`, not `$CARGO_HOME/.cargo/config.toml`.
+fn cargo_home() -> Option<PathBuf> {
+    if let Some(configured) = std::env::var_os("CARGO_HOME") {
+        let path = PathBuf::from(configured);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    Some(directories::BaseDirs::new()?.home_dir().join(".cargo"))
 }
 
 /// Walk `dir` for `.cargo/config.toml` redirects, adding each to `found`.
@@ -750,38 +779,52 @@ fn resolve_against(base: &Path, path: &str) -> Option<PathBuf> {
 /// that declares it, so that is what these resolve against. `target_dir` is
 /// false when `CARGO_TARGET_DIR` has already decided that question.
 fn config_excluded_dirs_at(dir: &Path, target_dir: bool) -> Vec<PathBuf> {
-    let config_dir = dir.join(".cargo");
-    if !config_dir.is_dir() {
-        return Vec::new();
-    }
-    for name in ["config.toml", "config"] {
+    let (target, mut found) = config_excluded_dirs_in(&dir.join(".cargo"), dir, target_dir);
+    found.extend(target);
+    found
+}
+
+/// The `build.target-dir` and the `[source.*]` directories a Cargo config in
+/// `config_dir` declares, resolved against `base`.
+///
+/// Cargo resolves a relative entry against the directory holding the config
+/// that declares it, so that is what these resolve against. `target_dir` is
+/// false when `CARGO_TARGET_DIR` has already decided that question.
+///
+/// `config` is read before `config.toml`: when a project holds both, Cargo uses
+/// the extensionless name and warns. Reading the other one first meant the
+/// directory Cargo actually builds into was scanned as app source.
+fn config_excluded_dirs_in(
+    config_dir: &Path,
+    base: &Path,
+    target_dir: bool,
+) -> (Option<PathBuf>, Vec<PathBuf>) {
+    for name in ["config", "config.toml"] {
         let Ok(content) = std::fs::read_to_string(config_dir.join(name)) else {
             continue;
         };
         let Ok(table) = toml::from_str::<toml::Table>(&content) else {
             continue;
         };
-        let mut found = Vec::new();
-        if target_dir
-            && let Some(configured) = table
-                .get("build")
-                .and_then(|build| build.get("target-dir"))
-                .and_then(toml::Value::as_str)
-        {
-            found.extend(resolve_against(dir, configured));
-        }
+        let target = table
+            .get("build")
+            .and_then(|build| build.get("target-dir"))
+            .and_then(toml::Value::as_str)
+            .filter(|_| target_dir)
+            .and_then(|configured| resolve_against(base, configured));
         // `[source.vendored-sources] directory = "third-party"` — where
         // `cargo vendor <path>` was told to put dependency sources.
+        let mut found = Vec::new();
         if let Some(sources) = table.get("source").and_then(toml::Value::as_table) {
             for source in sources.values() {
                 if let Some(directory) = source.get("directory").and_then(toml::Value::as_str) {
-                    found.extend(resolve_against(dir, directory));
+                    found.extend(resolve_against(base, directory));
                 }
             }
         }
-        return found;
+        return (target, found);
     }
-    Vec::new()
+    (None, Vec::new())
 }
 
 /// Every `.rs` file under `root` that belongs to the app, in a stable order.

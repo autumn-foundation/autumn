@@ -2347,3 +2347,107 @@ fn a_configured_vendor_directory_is_never_rewritten() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn the_extensionless_cargo_config_wins_when_both_exist() {
+    // Codex review on #2231: Cargo gives `.cargo/config` precedence over
+    // `.cargo/config.toml` when both are present (and warns). Reading
+    // `config.toml` first meant the real target directory was scanned, and
+    // `--apply` rewrote build output.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(tmp.path(), ".cargo/config", "[build]\ntarget-dir = 'out'\n");
+    write(
+        tmp.path(),
+        ".cargo/config.toml",
+        "[build]\ntarget-dir = 'ignored'\n",
+    );
+    write(tmp.path(), "out/debug/generated.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "out/debug/generated.rs").contains("with_pool(pool.clone())"),
+        "`.cargo/config` decides the target directory when both exist:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "and app source is still migrated:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn a_target_directory_configured_in_cargo_home_is_build_output() {
+    // Codex review on #2231: `$CARGO_HOME/config.toml` is the last level of
+    // Cargo's hierarchy. An absolute in-tree `target-dir` set there applies
+    // even though no ancestor of the project holds a `.cargo` directory.
+    let tmp = app("0.5.0");
+    let home = TempDir::new().expect("tempdir");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(tmp.path(), "out/debug/generated.rs", USES_WITH_POOL);
+    let target = tmp.path().join("out");
+    write(
+        home.path(),
+        "config.toml",
+        // A literal string: a Windows path is full of backslashes, which a
+        // basic TOML string would read as escapes.
+        &format!("[build]\ntarget-dir = '{}'\n", target.display()),
+    );
+
+    let output = run_upgrade_with_env(
+        tmp.path(),
+        &["--to", "0.6.0", "--apply"],
+        &[("CARGO_HOME", home.path().to_str().expect("utf-8 path"))],
+    );
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "out/debug/generated.rs").contains("with_pool(pool.clone())"),
+        "Cargo home's config redirects the target directory too:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn the_nearest_cargo_config_decides_the_target_directory() {
+    // Codex review on #2231: `build.target-dir` is a scalar, so Cargo takes the
+    // nearest value rather than every ancestor's. Unioning them pruned a
+    // directory that is really app source, leaving its call sites unmigrated —
+    // silently, which is the one thing the report is meant not to do.
+    let outer = TempDir::new().expect("tempdir");
+    write(
+        outer.path(),
+        "app/Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"0.5.0\"\n",
+    );
+    write(outer.path(), "app/src/main.rs", USES_WITH_POOL);
+    // The nearer config wins for `target-dir` …
+    write(
+        outer.path(),
+        "app/.cargo/config.toml",
+        "[build]\ntarget-dir = 'out'\n",
+    );
+    // … so this ancestor value is overridden, and `app/keep` is app source.
+    write(
+        outer.path(),
+        ".cargo/config.toml",
+        "[build]\ntarget-dir = 'app/keep'\n",
+    );
+    write(outer.path(), "app/out/debug/generated.rs", USES_WITH_POOL);
+    write(outer.path(), "app/keep/mod.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(&outer.path().join("app"), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(outer.path(), "app/out/debug/generated.rs").contains("with_pool(pool.clone())"),
+        "the nearest config names the real target directory:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(outer.path(), "app/keep/mod.rs").contains("with_pool_untracked("),
+        "the overridden ancestor path is app source, not build output:\n{}",
+        stdout_of(&output)
+    );
+}
