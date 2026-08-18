@@ -671,10 +671,17 @@ fn collect_manifests(
 /// `CARGO_TARGET_DIR` overrides every config file's `target-dir`, but has no
 /// equivalent for vendoring, so the config walk runs either way.
 fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
-    let forced_target_dir = std::env::var_os("CARGO_TARGET_DIR").and_then(|configured| {
-        let cwd = std::env::current_dir().ok()?;
-        resolve_against(&cwd, &configured.to_string_lossy())
-    });
+    // `CARGO_TARGET_DIR` is the dedicated variable; `CARGO_BUILD_TARGET_DIR` is
+    // the generic `CARGO_BUILD_<key>` form Cargo documents for `build.target-dir`.
+    // Either one overrides every config file, so both are read here.
+    let forced_target_dir = ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .find(|configured| !configured.is_empty())
+        .and_then(|configured| {
+            let cwd = std::env::current_dir().ok()?;
+            resolve_against(&cwd, &configured.to_string_lossy())
+        });
     let target_dir_from_config = forced_target_dir.is_none();
 
     let mut found = BTreeSet::new();
@@ -814,10 +821,38 @@ fn config_excluded_dirs_in(
             .and_then(|configured| resolve_against(base, configured));
         // `[source.vendored-sources] directory = "third-party"` — where
         // `cargo vendor <path>` was told to put dependency sources.
+        //
+        // Only sources that are actually *replaced with* count. Defining
+        // `[source.archive] directory = "src"` activates nothing on its own, and
+        // excluding it dropped the whole app from the scan without a word.
         let mut found = Vec::new();
         if let Some(sources) = table.get("source").and_then(toml::Value::as_table) {
-            for source in sources.values() {
-                if let Some(directory) = source.get("directory").and_then(toml::Value::as_str) {
+            let replacement_of = |name: &str| {
+                sources
+                    .get(name)
+                    .and_then(|source| source.get("replace-with"))
+                    .and_then(toml::Value::as_str)
+            };
+            // A replacement may itself be replaced, so the chain is followed to
+            // its end. `active` doubles as the seen-set, so a config that points
+            // two sources at each other terminates instead of spinning.
+            let mut active: BTreeSet<&str> = BTreeSet::new();
+            let mut pending: Vec<&str> = sources
+                .values()
+                .filter_map(|source| source.get("replace-with").and_then(toml::Value::as_str))
+                .collect();
+            while let Some(name) = pending.pop() {
+                if !active.insert(name) {
+                    continue;
+                }
+                pending.extend(replacement_of(name));
+            }
+            for name in active {
+                if let Some(directory) = sources
+                    .get(name)
+                    .and_then(|source| source.get("directory"))
+                    .and_then(toml::Value::as_str)
+                {
                     found.extend(resolve_against(base, directory));
                 }
             }

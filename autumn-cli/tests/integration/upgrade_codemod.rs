@@ -2451,3 +2451,87 @@ fn the_nearest_cargo_config_decides_the_target_directory() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn the_environment_form_of_build_target_dir_is_honoured() {
+    // Codex review on #2231: Cargo maps `CARGO_BUILD_TARGET_DIR` to
+    // `build.target-dir`. Only the special `CARGO_TARGET_DIR` was read, so a
+    // build redirected the documented config-env way had its output scanned.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(tmp.path(), "out/debug/generated.rs", USES_WITH_POOL);
+
+    let output = run_upgrade_with_env(
+        tmp.path(),
+        &["--to", "0.6.0", "--apply"],
+        &[(
+            "CARGO_BUILD_TARGET_DIR",
+            tmp.path().join("out").to_str().expect("utf-8 path"),
+        )],
+    );
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "out/debug/generated.rs").contains("with_pool(pool.clone())"),
+        "`CARGO_BUILD_TARGET_DIR` redirects the target directory:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "and app source is still migrated:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn a_defined_but_unreplaced_source_does_not_exclude_anything() {
+    // Codex review on #2231: `[source.x] directory = …` does nothing until
+    // something is replaced *with* it. Treating every definition as vendored
+    // let a config that merely names `src` silently drop the whole app.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        ".cargo/config.toml",
+        "[source.archive]\ndirectory = 'src'\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "an inactive source definition is not a vendor directory:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn a_chained_source_replacement_is_followed() {
+    // `replace-with` may point at a source that is itself a replacement.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        ".cargo/config.toml",
+        "[source.crates-io]\nreplace-with = 'mirror'\n\n\
+         [source.mirror]\nreplace-with = 'vendored'\n\n\
+         [source.vendored]\ndirectory = 'third-party'\n",
+    );
+    write(
+        tmp.path(),
+        "third-party/some-crate/src/lib.rs",
+        USES_WITH_POOL,
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "third-party/some-crate/src/lib.rs").contains("with_pool(pool.clone())"),
+        "the end of the replacement chain is the vendor directory:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "and app source is still migrated:\n{}",
+        stdout_of(&output)
+    );
+}
