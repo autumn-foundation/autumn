@@ -137,9 +137,30 @@ pub struct Report {
 }
 
 impl Report {
-    /// Total rewritten sites across every file.
+    /// Total rewritten sites across every file in the plan.
     pub fn rewritten_sites(&self) -> usize {
         self.files.iter().map(|f| f.sites.len()).sum()
+    }
+
+    /// Sites in the files that actually reached disk.
+    ///
+    /// The same as [`Self::rewritten_sites`] for a complete apply and zero for
+    /// a preview; for a partial apply it counts only the prefix of files
+    /// written before the failure. Reported separately because they are
+    /// different questions — "what did this run plan" and "what is on disk
+    /// now" — and automation that gates on the wrong one treats an interrupted
+    /// run as a finished one.
+    pub fn written_sites(&self) -> usize {
+        match self.outcome {
+            Outcome::Preview => 0,
+            Outcome::Applied => self.rewritten_sites(),
+            Outcome::Partial { written } => self
+                .files
+                .iter()
+                .take(written)
+                .map(|file| file.sites.len())
+                .sum(),
+        }
     }
 }
 
@@ -323,12 +344,7 @@ fn render_summary(out: &mut String, report: &Report) {
         // saying "N sites rewritten" and "3 files written" in the same summary
         // is worse than either number alone.
         Outcome::Partial { written } => {
-            let written_sites: usize = report
-                .files
-                .iter()
-                .take(written)
-                .map(|file| file.sites.len())
-                .sum();
+            let written_sites = report.written_sites();
             let _ = writeln!(
                 out,
                 "\n{written_sites} site{} in {written} file{} written before the run stopped; \
@@ -455,7 +471,11 @@ pub fn render_json(report: &Report) -> String {
             Outcome::Preview => 0,
         },
         "files_scanned": report.files_scanned,
+        // The plan, and the part of it that reached disk. Equal for a complete
+        // apply; the second is what to gate on when the question is what the
+        // working tree now contains.
         "rewritten_sites": report.rewritten_sites(),
+        "written_sites": report.written_sites(),
         "migrations": migrations_json(&report.migrations),
         "files": files,
         "review": manual_json(&report.review),
@@ -1549,6 +1569,16 @@ mod tests {
             json["applied"], false,
             "`applied` stays a strict did-everything-land flag"
         );
+        // The two site counts must not be conflated: automation gating on what
+        // landed would otherwise read the whole plan as having landed.
+        assert_eq!(
+            json["rewritten_sites"], 3,
+            "the plan is still reported in full"
+        );
+        assert_eq!(
+            json["written_sites"], 1,
+            "but only the sites in the files that reached disk are written"
+        );
     }
 
     #[test]
@@ -1558,6 +1588,10 @@ mod tests {
         assert_eq!(json["outcome"], "applied");
         assert_eq!(json["applied"], true);
         assert_eq!(json["files_written"], 1);
+        assert_eq!(
+            json["written_sites"], json["rewritten_sites"],
+            "a complete apply writes everything it planned"
+        );
     }
 
     #[test]

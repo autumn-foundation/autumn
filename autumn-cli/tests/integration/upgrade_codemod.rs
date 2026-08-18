@@ -370,6 +370,10 @@ fn json_output_is_machine_readable() {
     assert_eq!(value["to"], "0.6.0");
     assert_eq!(value["applied"], false);
     assert_eq!(value["rewritten_sites"], 2);
+    assert_eq!(
+        value["written_sites"], 0,
+        "a preview plans sites without writing any"
+    );
     let confidences: Vec<&str> = value["migrations"]
         .as_array()
         .expect("migrations array")

@@ -110,8 +110,15 @@ skipped, not rewritten.
 | `2` | A bad argument, a `PATH` that is not a readable directory, or a version this command cannot parse. Nothing was scanned. |
 
 There is no "found something" exit code: a preview that finds work is the
-command working. Gate on the `--json` report's `manual`, `skipped`, and
-`rewritten_sites` fields instead.
+command working. Gate on the `--json` report's `manual`, `skipped`, and site
+counts instead.
+
+The report carries two site counts, because "what did this run plan" and "what
+is on disk now" are different questions. `rewritten_sites` is the plan;
+`written_sites` is the part of it that reached disk — equal after a complete
+apply, zero for a preview, and only the files written before the failure after
+a partial one. Gate on `written_sites` when you care about the state of the
+working tree.
 
 ## Before you run it
 
