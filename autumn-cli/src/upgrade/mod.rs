@@ -146,6 +146,18 @@ impl Report {
 /// Beneath that, these are ordinary module names.
 const SKIPPED_DIRS: &[&str] = &["target", "vendor", "node_modules", "dist", "tmp"];
 
+/// Hidden directories that hold tool or VCS metadata rather than app code.
+///
+/// Skipping *every* dot-directory dropped source an app really compiles —
+/// `#[path = ".generated/repositories.rs"] mod repositories;` is legal, and the
+/// files behind it kept the old API with nothing in the report to say so. These
+/// names are skipped by name instead, and any other hidden directory is
+/// scanned like a normal one.
+const SKIPPED_HIDDEN_DIRS: &[&str] = &[
+    ".git", ".github", ".gitlab", ".hg", ".svn", ".cargo", ".vscode", ".idea", ".direnv", ".venv",
+    ".tox", ".claude",
+];
+
 /// Render the human-readable report.
 pub fn render_text(report: &Report) -> String {
     use std::fmt::Write as _;
@@ -612,7 +624,9 @@ fn collect_sources(dir: &Path, scan: &mut SourceScan) {
         let name = entry.file_name().to_string_lossy().into_owned();
 
         if file_type.is_dir() {
-            if name.starts_with('.') || (at_crate_root && SKIPPED_DIRS.contains(&name.as_str())) {
+            let is_metadata = SKIPPED_HIDDEN_DIRS.contains(&name.as_str());
+            let is_build_output = at_crate_root && SKIPPED_DIRS.contains(&name.as_str());
+            if is_metadata || is_build_output {
                 continue;
             }
             collect_sources(&path, scan);

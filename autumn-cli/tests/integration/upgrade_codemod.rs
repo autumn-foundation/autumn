@@ -636,6 +636,9 @@ fn an_unreadable_path_is_a_failure_not_an_empty_report() {
 
 #[test]
 fn generated_and_dependency_trees_are_never_scanned() {
+    // Hidden directories are covered separately: only *known* metadata names
+    // are skipped, because an unknown dot-directory can hold compiled source
+    // (see `source_in_a_hidden_directory_is_migrated_not_dropped`).
     let tmp = app("0.5.0");
     write(tmp.path(), "src/main.rs", "fn main() {}\n");
     for excluded in [
@@ -644,7 +647,6 @@ fn generated_and_dependency_trees_are_never_scanned() {
         "node_modules/thing/x.rs",
         "dist/out.rs",
         "tmp/scratch.rs",
-        ".cargo-cache/dep.rs",
     ] {
         write(tmp.path(), excluded, USES_WITH_POOL);
     }
@@ -657,7 +659,6 @@ fn generated_and_dependency_trees_are_never_scanned() {
         "node_modules/thing/x.rs",
         "dist/out.rs",
         "tmp/scratch.rs",
-        ".cargo-cache/dep.rs",
     ] {
         assert!(
             read(tmp.path(), excluded).contains("with_pool(pool.clone())"),
@@ -1288,5 +1289,61 @@ fn an_unresolvable_inherited_dependency_asks_for_from() {
         String::from_utf8_lossy(&output.stderr).contains("--from"),
         "{}",
         report(&output),
+    );
+}
+
+#[test]
+fn source_in_a_hidden_directory_is_migrated_not_dropped() {
+    // `#[path = ".generated/repositories.rs"] mod repositories;` is legal, and
+    // the file behind it is compiled app code. Skipping every dot-directory
+    // left it on the old API with nothing in the report to say so.
+    let tmp = app("0.5.0");
+    write(
+        tmp.path(),
+        "src/main.rs",
+        "#[path = \"../.generated/repositories.rs\"]\nmod repositories;\n\nfn main() {}\n",
+    );
+    write(tmp.path(), ".generated/repositories.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), ".generated/repositories.rs").contains("with_pool_untracked("),
+        "compiled source in a hidden directory must be migrated:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn tool_and_vcs_metadata_directories_are_still_skipped() {
+    // The exclusion is by name now, so the dot-directories that hold metadata
+    // rather than app code stay out — without reporting noise on every run.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", "fn main() {}\n");
+    for metadata in [
+        ".git/hooks/x.rs",
+        ".github/scripts/x.rs",
+        ".cargo/registry/x.rs",
+        ".vscode/x.rs",
+    ] {
+        write(tmp.path(), metadata, USES_WITH_POOL);
+    }
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    for metadata in [
+        ".git/hooks/x.rs",
+        ".github/scripts/x.rs",
+        ".cargo/registry/x.rs",
+        ".vscode/x.rs",
+    ] {
+        assert!(
+            read(tmp.path(), metadata).contains("with_pool(pool.clone())"),
+            "{metadata} is metadata, not app source"
+        );
+    }
+    assert!(
+        !stdout_of(&output).contains(".git"),
+        "and metadata is skipped quietly, not reported on every run"
     );
 }

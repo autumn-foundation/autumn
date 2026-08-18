@@ -172,3 +172,8 @@ if your app keeps real source behind one, migrate it in its own checkout.
 `target/`, `vendor/`, `node_modules/`, `dist/` and `tmp/` are skipped where a
 crate begins — a directory holding a `Cargo.toml`. Beneath that they are
 ordinary module names, so `src/vendor/mod.rs` is migrated like any other file.
+
+Hidden directories are skipped by name — `.git`, `.github`, `.cargo`, `.vscode`
+and the like — not because they start with a dot. A dot-directory that holds
+compiled source, say a `#[path = ".generated/repositories.rs"]` module, is
+migrated.
