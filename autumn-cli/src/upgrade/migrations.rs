@@ -233,20 +233,25 @@ pub fn app_migrations() -> &'static [AppMigration] {
 }
 
 /// A `major.minor.patch` version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
     pub major: u64,
     pub minor: u64,
     pub patch: u64,
-    /// Whether this is a pre-release of the triple (`0.7.0-rc.1`).
+    /// The pre-release identifier, if this is a pre-release of the triple:
+    /// `Some("rc.1")` for `0.7.0-rc.1`.
     ///
-    /// A flag rather than the identifier, because the only comparison that has
-    /// to be right is pre-release against *stable*: every registry version is a
-    /// released one, so `rc.1` vs `rc.2` never decides which migrations apply.
-    /// Two pre-releases of the same triple therefore compare equal, and when
-    /// they are two workspace members racing to set the floor either answer
-    /// selects the same migrations.
-    pub prerelease: bool,
+    /// Kept verbatim so the report can echo the version that was actually asked
+    /// for — `0.7.0-rc.1` and `0.7.0-beta.2` are different releases, and a
+    /// machine-readable record that flattens both to `0.7.0-pre` is not a
+    /// record of anything.
+    ///
+    /// *Ordering* still only distinguishes pre-release from stable. That is the
+    /// one comparison that has to be right: every registry version is a
+    /// released one, so `rc.1` vs `rc.2` never decides which migrations apply,
+    /// and when two workspace members race to set the floor either answer
+    /// selects the same set.
+    pub prerelease: Option<String>,
 }
 
 impl Version {
@@ -257,7 +262,7 @@ impl Version {
             major,
             minor,
             patch,
-            prerelease: false,
+            prerelease: None,
         }
     }
 }
@@ -269,7 +274,7 @@ impl Ord for Version {
             // `0.7.0-rc.1` precedes `0.7.0`, so an app on the candidate is
             // *behind* the release and still needs its migrations. Derived
             // ordering would have put `false` first and inverted this.
-            .then_with(|| other.prerelease.cmp(&self.prerelease))
+            .then_with(|| other.prerelease.is_some().cmp(&self.prerelease.is_some()))
     }
 }
 
@@ -282,8 +287,8 @@ impl PartialOrd for Version {
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
-        if self.prerelease {
-            f.write_str("-pre")?;
+        if let Some(prerelease) = &self.prerelease {
+            write!(f, "-{prerelease}")?;
         }
         Ok(())
     }
@@ -321,9 +326,10 @@ pub fn parse_version_req(req: &str) -> Option<Version> {
         .trim()
         .split('+')
         .next()?;
-    let (core, prerelease) = without_build
-        .split_once('-')
-        .map_or((without_build, false), |(core, _)| (core, true));
+    let (core, prerelease) = without_build.split_once('-').map_or_else(
+        || (without_build, None),
+        |(core, identifier)| (core, Some(identifier.to_owned())),
+    );
     let core = core.trim();
     if core.is_empty() {
         return None;
@@ -392,7 +398,7 @@ pub fn guide_url(guide: &str) -> String {
 /// no newer than the target: `from < version <= to`. An app already on the
 /// release that broke the API has, by definition, already dealt with the break.
 /// Registry order is preserved, so the result is oldest release first.
-pub fn migrations_between(from: Version, to: Version) -> Vec<&'static AppMigration> {
+pub fn migrations_between(from: &Version, to: &Version) -> Vec<&'static AppMigration> {
     select_between(APP_MIGRATIONS, from, to)
 }
 
@@ -400,14 +406,14 @@ pub fn migrations_between(from: Version, to: Version) -> Vec<&'static AppMigrati
 /// testable against a table with more than one release in it.
 pub fn select_between(
     registry: &'static [AppMigration],
-    from: Version,
-    to: Version,
+    from: &Version,
+    to: &Version,
 ) -> Vec<&'static AppMigration> {
     registry
         .iter()
         .filter(|migration| {
             parse_version_req(migration.version)
-                .is_some_and(|version| version > from && version <= to)
+                .is_some_and(|version| version > *from && version <= *to)
         })
         .collect()
 }
@@ -421,9 +427,15 @@ mod tests {
     }
 
     /// A pre-release of the triple, e.g. `0.7.0-rc.1`.
+    /// A pre-release of the triple. The identifier is kept verbatim, so tests
+    /// that care about it can name it and the rest can use the default.
     fn pre(major: u64, minor: u64, patch: u64) -> Version {
+        pre_id(major, minor, patch, "rc.1")
+    }
+
+    fn pre_id(major: u64, minor: u64, patch: u64, identifier: &str) -> Version {
         Version {
-            prerelease: true,
+            prerelease: Some(identifier.to_owned()),
             ..Version::new(major, minor, patch)
         }
     }
@@ -451,6 +463,38 @@ mod tests {
         assert_eq!(parse_version_req("0.7.0+build.5"), Some(v(0, 7, 0)));
         assert_eq!(parse_version_req("0.7.0-rc.1"), Some(pre(0, 7, 0)));
         assert_eq!(parse_version_req("0.7.0-rc.1+build.5"), Some(pre(0, 7, 0)));
+        // The identifier is carried verbatim, not flattened: the report has to
+        // be able to echo the version that was actually asked for.
+        assert_eq!(
+            parse_version_req("0.7.0-beta.2"),
+            Some(pre_id(0, 7, 0, "beta.2"))
+        );
+        assert_eq!(
+            parse_version_req("0.7.0-rc.1")
+                .map(|v| v.to_string())
+                .as_deref(),
+            Some("0.7.0-rc.1")
+        );
+        assert_eq!(
+            parse_version_req("0.7.0-beta.2")
+                .map(|v| v.to_string())
+                .as_deref(),
+            Some("0.7.0-beta.2")
+        );
+    }
+
+    #[test]
+    fn prereleases_of_one_triple_are_interchangeable_for_selection() {
+        // Ordering only has to separate pre-release from stable: every registry
+        // version is a released one, so `rc.1` vs `beta.2` never decides which
+        // migrations apply. Display keeps them distinct; comparison does not.
+        assert_eq!(pre_id(0, 7, 0, "rc.1"), pre_id(0, 7, 0, "rc.1"));
+        assert!(pre_id(0, 7, 0, "beta.2") < v(0, 7, 0));
+        assert_eq!(
+            pre_id(0, 7, 0, "rc.1").cmp(&pre_id(0, 7, 0, "beta.2")),
+            std::cmp::Ordering::Equal,
+            "two pre-releases of one triple are interchangeable for selection"
+        );
     }
 
     #[test]
@@ -465,7 +509,11 @@ mod tests {
         // Upgrading 0.7.0-rc.1 -> 0.7.0: the candidate is *behind* the release,
         // so the release's migrations apply. Treating the two as equal selected
         // nothing.
-        let ids = ids(&select_between(FIXTURE_REGISTRY, pre(0, 7, 0), v(0, 7, 0)));
+        let ids = ids(&select_between(
+            FIXTURE_REGISTRY,
+            &pre(0, 7, 0),
+            &v(0, 7, 0),
+        ));
         assert_eq!(ids, vec!["0.7.0-c"]);
     }
 
@@ -473,7 +521,11 @@ mod tests {
     fn targeting_a_release_candidate_does_not_select_the_release() {
         // `--to 0.7.0-rc.1` must not pull in migrations registered for the
         // finished 0.7.0.
-        let ids = ids(&select_between(FIXTURE_REGISTRY, v(0, 6, 0), pre(0, 7, 0)));
+        let ids = ids(&select_between(
+            FIXTURE_REGISTRY,
+            &v(0, 6, 0),
+            &pre(0, 7, 0),
+        ));
         assert!(ids.is_empty(), "0.7.0 is not reached yet, got {ids:?}");
     }
 
@@ -513,7 +565,7 @@ mod tests {
 
     #[test]
     fn selects_migrations_newer_than_the_recorded_version() {
-        let ids: Vec<_> = migrations_between(v(0, 5, 0), v(0, 6, 0))
+        let ids: Vec<_> = migrations_between(&v(0, 5, 0), &v(0, 6, 0))
             .iter()
             .map(|m| m.id)
             .collect();
@@ -525,7 +577,7 @@ mod tests {
 
     #[test]
     fn excludes_migrations_the_app_is_already_past() {
-        let ids: Vec<_> = migrations_between(v(0, 6, 0), v(0, 7, 0))
+        let ids: Vec<_> = migrations_between(&v(0, 6, 0), &v(0, 7, 0))
             .iter()
             .map(|m| m.id)
             .collect();
@@ -537,7 +589,7 @@ mod tests {
 
     #[test]
     fn excludes_migrations_newer_than_the_target() {
-        let selected = migrations_between(v(0, 4, 0), v(0, 5, 0));
+        let selected = migrations_between(&v(0, 4, 0), &v(0, 5, 0));
         assert!(
             selected.iter().all(|m| m.version == "0.5.0"),
             "targeting 0.5.0 selects 0.5.0 and nothing newer, got {:?}",
@@ -551,13 +603,13 @@ mod tests {
 
     #[test]
     fn selection_is_empty_when_target_is_not_newer() {
-        assert!(migrations_between(v(0, 6, 0), v(0, 6, 0)).is_empty());
-        assert!(migrations_between(v(0, 6, 0), v(0, 5, 0)).is_empty());
+        assert!(migrations_between(&v(0, 6, 0), &v(0, 6, 0)).is_empty());
+        assert!(migrations_between(&v(0, 6, 0), &v(0, 5, 0)).is_empty());
     }
 
     #[test]
     fn selection_is_ordered_oldest_release_first() {
-        let selected = migrations_between(v(0, 0, 0), v(9, 9, 9));
+        let selected = migrations_between(&v(0, 0, 0), &v(9, 9, 9));
         let mut previous = v(0, 0, 0);
         for migration in &selected {
             let current = parse_version_req(migration.version)
@@ -620,7 +672,7 @@ mod tests {
     #[test]
     fn a_multi_release_range_selects_every_release_it_spans_in_order() {
         assert_eq!(
-            ids(&select_between(FIXTURE_REGISTRY, v(0, 4, 0), v(0, 7, 0))),
+            ids(&select_between(FIXTURE_REGISTRY, &v(0, 4, 0), &v(0, 7, 0))),
             vec!["0.5.0-a", "0.6.0-b", "0.7.0-c"],
         );
     }
@@ -629,15 +681,15 @@ mod tests {
     fn a_multi_release_range_excludes_both_ends_correctly() {
         // Already on 0.5.0, upgrading to 0.6.0: only 0.6.0 is ahead.
         assert_eq!(
-            ids(&select_between(FIXTURE_REGISTRY, v(0, 5, 0), v(0, 6, 0))),
+            ids(&select_between(FIXTURE_REGISTRY, &v(0, 5, 0), &v(0, 6, 0))),
             vec!["0.6.0-b"],
         );
         // Skipping a release still picks up the one in the middle.
         assert_eq!(
-            ids(&select_between(FIXTURE_REGISTRY, v(0, 5, 0), v(0, 7, 0))),
+            ids(&select_between(FIXTURE_REGISTRY, &v(0, 5, 0), &v(0, 7, 0))),
             vec!["0.6.0-b", "0.7.0-c"],
         );
-        assert!(select_between(FIXTURE_REGISTRY, v(0, 7, 0), v(0, 7, 0)).is_empty());
+        assert!(select_between(FIXTURE_REGISTRY, &v(0, 7, 0), &v(0, 7, 0)).is_empty());
     }
 
     #[test]

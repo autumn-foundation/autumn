@@ -921,7 +921,8 @@ fn file_module_path(path: &Path) -> Vec<String> {
 
 /// Build the report for `root` without writing anything.
 fn plan(root: &Path, from: Version, to: Version) -> Report {
-    plan_with(root, from, to, &migrations::migrations_between(from, to))
+    let selected = migrations::migrations_between(&from, &to);
+    plan_with(root, from, to, &selected)
 }
 
 /// [`plan`] over an explicit migration selection.

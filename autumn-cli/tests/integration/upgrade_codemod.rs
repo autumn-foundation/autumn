@@ -2257,3 +2257,60 @@ fn a_config_inside_build_output_does_not_exclude_app_source() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn a_prerelease_is_reported_as_the_version_that_was_asked_for() {
+    // `0.7.0-rc.1` and `0.7.0-beta.2` are different releases. Reporting either
+    // as `0.7.0-pre` makes the human heading wrong and the JSON record of what
+    // was migrated unusable.
+    let tmp = app("0.6.0");
+    write(tmp.path(), "src/main.rs", "fn main() {}\n");
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.7.0-rc.1", "--json"]);
+    assert!(output.status.success(), "{}", report(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout_of(&output)).expect("json");
+    assert_eq!(value["to"], "0.7.0-rc.1", "{value:#}");
+
+    let human = run_upgrade(
+        tmp.path(),
+        &["--from", "0.6.0-beta.2", "--to", "0.7.0-rc.1"],
+    );
+    assert!(human.status.success(), "{}", report(&human));
+    assert!(
+        stdout_of(&human).contains("0.6.0-beta.2 -> 0.7.0-rc.1"),
+        "the heading echoes what was asked for:\n{}",
+        stdout_of(&human)
+    );
+}
+
+#[test]
+fn an_unparsable_file_is_not_evidence_for_a_receiver_elsewhere() {
+    // `#[repository] trait AuditRepository;` tokenises but is not valid Rust —
+    // a trait needs a body — so nothing is generated from it. Counting it as a
+    // declaration let it verify an unrelated `PgAuditRepository` in a file that
+    // *is* valid, and that call was rewritten.
+    let tmp = app("0.5.0");
+    write(
+        tmp.path(),
+        "src/broken.rs",
+        "#[repository]\npub trait AuditRepository;\n",
+    );
+    // The type is imported from a dependency, so nothing in the scan writes it
+    // out and the hand-written veto cannot help — the bogus declaration is the
+    // only evidence in play.
+    write(
+        tmp.path(),
+        "src/main.rs",
+        "use other_crate::PgAuditRepository;\n\n\
+         pub fn build(pool: Pool) -> PgAuditRepository {\n    \
+         PgAuditRepository::with_pool(pool)\n}\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("PgAuditRepository::with_pool(pool)"),
+        "a declaration in a file that is not valid Rust generates nothing:\n{}",
+        stdout_of(&output)
+    );
+}

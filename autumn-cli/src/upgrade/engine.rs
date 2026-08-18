@@ -601,6 +601,14 @@ fn turbofish_argument_list(trees: &[TokenTree], angle: usize) -> Option<&proc_ma
 /// — it is already reported as skipped on its own account.
 #[must_use]
 pub fn generated_repository_types(source: &str) -> Vec<(String, Vec<String>)> {
+    // Positive evidence has to be sound: `#[repository] trait AuditRepository;`
+    // tokenises and generates nothing, because a trait without a body is not
+    // Rust. Believing it would verify an unrelated `PgAuditRepository` in a file
+    // that *is* valid. The counter-evidence in `defined_type_names` deliberately
+    // does not do this — see there.
+    if syn::parse_file(source).is_err() {
+        return Vec::new();
+    }
     let Ok(stream) = source.parse::<TokenStream>() else {
         return Vec::new();
     };
@@ -610,6 +618,12 @@ pub fn generated_repository_types(source: &str) -> Vec<(String, Vec<String>)> {
 }
 
 /// Type names the source *writes out* — `struct`, `enum`, `union`, `type`.
+///
+/// Deliberately not gated on the file parsing, unlike
+/// [`generated_repository_types`]. This is counter-evidence: it only ever moves
+/// a call from rewritten to reported. A file too broken to parse is exactly
+/// where a hand-written `PgAuditRepository` might be hiding, and ignoring it
+/// would err toward rewriting.
 ///
 /// `#[repository]` produces its type from a macro, so it never appears here. A
 /// name that does appear is therefore a hand-written type, which is what makes
