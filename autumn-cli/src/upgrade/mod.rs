@@ -469,24 +469,29 @@ fn recorded_version(root: &Path) -> Option<String> {
 
     let mut lowest: Option<(Version, String)> = None;
     for directory in std::iter::once(root.to_path_buf()).chain(member_manifests(root)) {
-        let requirement = match crate::doctor::read_autumn_web_dependency_at(&directory) {
-            AutumnWebDependency::Absent => continue,
-            // Declared as a path or git dependency: this crate is on *some*
-            // version of autumn-web and the manifest does not say which.
-            // Letting a sibling decide the floor would migrate this crate's
-            // source against a version nobody checked — and a vendored
-            // checkout is exactly the population the 0.6.0 rename affects.
-            AutumnWebDependency::WithoutVersion => return None,
-            AutumnWebDependency::Version(requirement) => requirement,
-        };
-        // A manifest that *declares* `autumn-web` with a requirement carrying no
-        // usable floor makes the whole answer a guess. Dropping it and taking
-        // some other manifest's version would silently skip that member —
-        // exactly what refusing an upper-bound-only requirement was meant to
-        // prevent. Fail detection and let the caller ask for `--from`.
-        let version = migrations::parse_version_req(&requirement)?;
-        if lowest.as_ref().is_none_or(|(lowest, _)| version < *lowest) {
-            lowest = Some((version, requirement));
+        // *Every* declaration in the manifest, not the first: a target-specific
+        // requirement can be older than the package-wide one, and the source
+        // scan rewrites that target's `#[cfg]` code either way.
+        for declaration in crate::doctor::autumn_web_declarations_at(&directory) {
+            let requirement = match declaration {
+                AutumnWebDependency::Absent => continue,
+                // Declared as a path or git dependency: this crate is on *some*
+                // version of autumn-web and the manifest does not say which.
+                // Letting a sibling decide the floor would migrate this crate's
+                // source against a version nobody checked — and a vendored
+                // checkout is exactly the population the 0.6.0 rename affects.
+                AutumnWebDependency::WithoutVersion => return None,
+                AutumnWebDependency::Version(requirement) => requirement,
+            };
+            // A requirement carrying no usable floor makes the whole answer a
+            // guess. Dropping it and taking another declaration's version would
+            // silently skip that crate — exactly what refusing an
+            // upper-bound-only requirement was meant to prevent. Fail detection
+            // and let the caller ask for `--from`.
+            let version = migrations::parse_version_req(&requirement)?;
+            if lowest.as_ref().is_none_or(|(lowest, _)| version < *lowest) {
+                lowest = Some((version, requirement));
+            }
         }
     }
     lowest.map(|(_, requirement)| requirement)

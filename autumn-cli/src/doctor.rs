@@ -2483,28 +2483,42 @@ pub enum AutumnWebDependency {
 
 /// Read the `autumn-web` version requirement from the `Cargo.toml` at `root`.
 ///
-/// Shared with `autumn upgrade`, which needs the same answer for a directory
-/// it was pointed at rather than the process's working directory.
+/// The first readable version across every dependency table. Callers that need
+/// *all* of them — `autumn upgrade`, which takes the oldest floor — use
+/// [`autumn_web_declarations_at`] instead.
 pub fn read_autumn_web_version_at(root: &std::path::Path) -> Option<String> {
-    match read_autumn_web_dependency_at(root) {
-        AutumnWebDependency::Version(version) => Some(version),
-        AutumnWebDependency::Absent | AutumnWebDependency::WithoutVersion => None,
-    }
+    autumn_web_declarations_at(root)
+        .into_iter()
+        .find_map(|declaration| match declaration {
+            AutumnWebDependency::Version(version) => Some(version),
+            AutumnWebDependency::Absent | AutumnWebDependency::WithoutVersion => None,
+        })
 }
 
-/// As [`read_autumn_web_version_at`], but distinguishing a declaration with no
-/// readable version from no declaration at all.
-pub fn read_autumn_web_dependency_at(root: &std::path::Path) -> AutumnWebDependency {
-    let Ok(content) = std::fs::read_to_string(root.join("Cargo.toml")) else {
-        return AutumnWebDependency::Absent;
-    };
-    let Ok(table) = toml::from_str::<toml::Table>(&content) else {
-        return AutumnWebDependency::Absent;
-    };
+/// Every `autumn-web` declaration in the `Cargo.toml` at `root`.
+///
+/// All of them, not the first: a manifest can declare the dependency under
+/// `[dependencies]`, `[workspace.dependencies]`, and any number of
+/// `[target.'cfg(…)'.dependencies]` tables, and Cargo honours each. Returning
+/// the first match let a newer target-specific requirement hide an older one
+/// while the older target's `#[cfg]` code was still scanned and rewritten.
+///
+/// Both spellings are recognised: the literal `autumn-web` key, and Cargo's
+/// renamed form `autumn_web = { package = "autumn-web", version = "…" }`.
+///
+/// An empty result means the manifest does not mention `autumn-web` at all.
+pub fn autumn_web_declarations_at(root: &std::path::Path) -> Vec<AutumnWebDependency> {
+    /// Whether this dependency entry is `autumn-web`, under either spelling.
+    fn is_autumn_web(key: &str, entry: &toml::Value) -> bool {
+        key == "autumn-web"
+            || entry
+                .get("package")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|package| package == "autumn-web")
+    }
 
-    let find_in_deps = |deps: &toml::Value| -> Option<AutumnWebDependency> {
-        let entry = deps.get("autumn-web")?;
-        Some(match entry {
+    fn classify(entry: &toml::Value) -> AutumnWebDependency {
+        match entry {
             toml::Value::String(version) => AutumnWebDependency::Version(version.clone()),
             toml::Value::Table(table) => table
                 .get("version")
@@ -2525,32 +2539,45 @@ pub fn read_autumn_web_dependency_at(root: &std::path::Path) -> AutumnWebDepende
                     |version| AutumnWebDependency::Version(version.to_owned()),
                 ),
             _ => AutumnWebDependency::WithoutVersion,
-        })
+        }
+    }
+
+    let Ok(content) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&content) else {
+        return Vec::new();
     };
 
-    // [dependencies], then [workspace.dependencies], then any
-    // [target.'cfg(...)'.dependencies] — Cargo honours all three, so a version
-    // declared only under a target table is a real declaration and reporting
-    // "cannot determine the version" for it would be wrong. Same traversal
-    // `autumn console` documents for its dependency scan.
-    table
-        .get("dependencies")
-        .and_then(&find_in_deps)
-        .or_else(|| {
-            table
-                .get("workspace")
-                .and_then(|workspace| workspace.get("dependencies"))
-                .and_then(&find_in_deps)
-        })
-        .or_else(|| {
-            table
-                .get("target")?
-                .as_table()?
+    // Every dependency table Cargo reads: the package's own, the workspace's,
+    // and one per target predicate.
+    let mut tables: Vec<&toml::Value> = Vec::new();
+    tables.extend(table.get("dependencies"));
+    tables.extend(
+        table
+            .get("workspace")
+            .and_then(|workspace| workspace.get("dependencies")),
+    );
+    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+        tables.extend(
+            targets
                 .values()
-                .filter_map(|target| target.get("dependencies"))
-                .find_map(&find_in_deps)
+                .filter_map(|target| target.get("dependencies")),
+        );
+    }
+
+    tables
+        .into_iter()
+        .filter_map(toml::Value::as_table)
+        .flat_map(|deps| {
+            deps.iter()
+                .filter(|(key, entry)| is_autumn_web(key, entry))
+                .map(|(_, entry)| classify(entry))
         })
-        .unwrap_or(AutumnWebDependency::Absent)
+        // `Absent` here means "inherits the workspace entry", which is read on
+        // its own — it is not a declaration this manifest contributes.
+        .filter(|declaration| *declaration != AutumnWebDependency::Absent)
+        .collect()
 }
 
 /// Try to TCP-connect to a host:port within a short timeout.

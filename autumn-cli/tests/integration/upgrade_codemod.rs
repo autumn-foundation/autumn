@@ -1017,3 +1017,71 @@ fn a_path_dependency_without_a_version_fails_detection() {
     assert!(forced.status.success(), "{}", report(&forced));
     assert!(read(tmp.path(), "vendored/src/lib.rs").contains("with_pool_untracked("));
 }
+
+#[test]
+fn an_aliased_dependency_declaration_is_recognised() {
+    // Cargo's renamed-dependency form. An exact-key lookup reads this as "no
+    // autumn-web here", which in a workspace lets a sibling pick the floor for
+    // a crate whose sources are rewritten anyway.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.5.0\" }\n",
+    );
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "an aliased declaration still records the version"
+    );
+}
+
+#[test]
+fn the_oldest_target_specific_requirement_decides_the_floor() {
+    // Disjoint target tables at different versions. Taking the first match
+    // could pick 0.6.0 and skip the codemod, while the source scan rewrites the
+    // 0.5.x target's `#[cfg]` code regardless.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [target.'cfg(windows)'.dependencies]\nautumn-web = \"0.6.0\"\n\n\
+         [target.'cfg(unix)'.dependencies]\nautumn-web = \"0.5.0\"\n",
+    );
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "the older target requirement must decide the floor:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn an_aliased_path_dependency_is_still_ambiguous() {
+    // The alias must not become a way to slip a version-less declaration past
+    // the ambiguity check.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn_web = { package = \"autumn-web\", path = \"../autumn\" }\n",
+    );
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(!output.status.success(), "{}", report(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--from"),
+        "{}",
+        report(&output),
+    );
+}
