@@ -744,6 +744,15 @@ fn merge_sources(sources: &mut Sources, nearer: Sources) {
     }
 }
 
+/// Whether Cargo would consult this source without something pointing at it.
+///
+/// The default registry, and the URL-keyed entries `cargo vendor` writes for
+/// git and alternative-registry dependencies. A plain name like `vendored` is a
+/// local alias: real until something is replaced *with* it, inert otherwise.
+fn is_consulted_source(name: &str) -> bool {
+    name == "crates-io" || name.contains("://")
+}
+
 /// The directories of every source that something is actually replaced *with*.
 ///
 /// Source replacement is activated by `replace-with`: defining `[source.archive]
@@ -752,9 +761,14 @@ fn merge_sources(sources: &mut Sources, nearer: Sources) {
 /// followed to its end.
 fn active_vendor_dirs(sources: &Sources) -> Vec<PathBuf> {
     let mut active: BTreeSet<&str> = BTreeSet::new();
+    // Reachability starts at the sources Cargo actually consults, not at every
+    // declared edge: `[source.unused] replace-with = "vendored"` that nothing
+    // references activates nothing, and treating it as active excluded whatever
+    // `vendored` pointed at — the app's own `src/`, in the reported case.
     let mut pending: Vec<&str> = sources
-        .values()
-        .filter_map(|entry| entry.replace_with.as_deref())
+        .iter()
+        .filter(|(name, _)| is_consulted_source(name))
+        .filter_map(|(_, entry)| entry.replace_with.as_deref())
         .collect();
     // `active` doubles as the seen-set, so a config that points two sources at
     // each other terminates instead of spinning.
@@ -837,7 +851,7 @@ fn collect_target_dirs(
         if is_target_dir(&path, found) {
             continue;
         }
-        collect_target_dirs(&path, target_dir_from_config, inherited, found);
+        collect_target_dirs(&path, target_dir_from_config, &sources, found);
     }
 }
 

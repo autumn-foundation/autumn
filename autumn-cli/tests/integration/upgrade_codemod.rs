@@ -2582,3 +2582,98 @@ fn a_source_replacement_split_across_config_levels_is_followed() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn a_nested_config_inherits_the_level_above_it() {
+    // Codex review on #2231: the recursion passed the scan root's map instead of
+    // the one merged at the current directory, so `tools/helper` never saw the
+    // `[source.vendored]` that `tools` defines.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        "tools/.cargo/config.toml",
+        "[source.vendored]\ndirectory = 'third-party'\n",
+    );
+    write(
+        tmp.path(),
+        "tools/helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write(
+        tmp.path(),
+        "tools/helper/.cargo/config.toml",
+        "[source.crates-io]\nreplace-with = 'vendored'\n",
+    );
+    write(
+        tmp.path(),
+        "tools/third-party/some-crate/src/lib.rs",
+        USES_WITH_POOL,
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "tools/third-party/some-crate/src/lib.rs")
+            .contains("with_pool(pool.clone())"),
+        "the nested config inherits the definition above it:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "and app source is still migrated:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn a_disconnected_replacement_chain_excludes_nothing() {
+    // Codex review on #2231: seeding the traversal from every `replace-with`
+    // edge made `vendored` active because an unreferenced `unused` pointed at
+    // it — which excluded the application's own `src/` and migrated nothing.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        ".cargo/config.toml",
+        "[source.unused]\nreplace-with = 'vendored'\n\n\
+         [source.vendored]\ndirectory = 'src'\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "nothing replaces crates-io, so nothing is vendored:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn a_vendored_git_source_is_still_excluded() {
+    // `cargo vendor` writes a URL-keyed source for a git dependency, and that
+    // key is a source Cargo really consults — it must keep seeding traversal.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        ".cargo/config.toml",
+        "[source.\"git+https://github.com/example/dep\"]\n\
+         git = 'https://github.com/example/dep'\n\
+         replace-with = 'vendored-sources'\n\n\
+         [source.vendored-sources]\ndirectory = 'third-party'\n",
+    );
+    write(
+        tmp.path(),
+        "third-party/some-crate/src/lib.rs",
+        USES_WITH_POOL,
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "third-party/some-crate/src/lib.rs").contains("with_pool(pool.clone())"),
+        "a vendored git source is still a vendor directory:\n{}",
+        stdout_of(&output)
+    );
+}
