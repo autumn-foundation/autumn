@@ -876,6 +876,160 @@ fn extract_secured_scopes_marker_from_expr(expr: &syn::Expr) -> Option<Vec<Strin
     }
 }
 
+/// Name of the marker const `#[authorize]` prepends to a guarded body so the
+/// binding survives the attribute's own removal.
+const AUTHORIZE_BINDINGS_MARKER: &str = "__AUTUMN_AUTHORIZE_BINDINGS";
+
+/// Extract the `#[authorize]` bindings declared on a handler, as
+/// `(action, resource)` pairs in source order.
+///
+/// Mirrors [`extract_secured_info`]'s attribute/marker duality, but takes the
+/// **union** of the two rather than the first that matches: a mixed stack
+/// (`#[authorize(A)]` above the route macro, `#[authorize(B)]` below it) leaves
+/// one already-expanded marker *and* one live attribute, and both are real
+/// bindings.
+///
+/// 1. Attributes still present — the route macro is outermost, so `#[authorize]`
+///    has not expanded yet. Parsed with the `#[authorize]` grammar itself
+///    ([`crate::authorize::parse_with_leading_literal`]) so the two sites cannot
+///    drift apart. Every matching attribute contributes, since nothing stops a
+///    handler from stacking several.
+/// 2. Marker consts in the body — `#[authorize]` expanded first and deleted its
+///    own attribute. The walk descends the generated `(async move { … }).await`
+///    wrappers, because each guard that expands afterwards buries the marker one
+///    level deeper, and collects every level instead of stopping at the first.
+///
+/// Markers are decoded structurally (`&[( "action", "Resource" ), …]`), never by
+/// scanning stringified tokens, so handler *text* that merely spells the marker
+/// cannot forge a binding. A same-named const of any other shape is not ours to
+/// interpret and contributes nothing rather than erroring.
+pub fn extract_authorize_bindings(input_fn: &syn::ItemFn) -> Vec<(String, String)> {
+    let mut bindings = Vec::new();
+
+    for attr in &input_fn.attrs {
+        if attr.path().is_ident("authorize")
+            || attr
+                .path()
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "authorize")
+        {
+            bindings.extend(authorize_binding_from_attr(attr));
+        }
+    }
+
+    collect_authorize_markers_in_stmts(&input_fn.block.stmts, &mut bindings);
+    bindings
+}
+
+/// Read one still-unexpanded `#[authorize(...)]` attribute.
+///
+/// Returns `None` for an attribute the `#[authorize]` macro will itself reject
+/// (a bare `#[authorize]` with no arguments, a missing action or resource): the
+/// macro reports the diagnostic, and metadata extraction stays silent rather
+/// than emitting a second error or a half-formed binding.
+fn authorize_binding_from_attr(attr: &syn::Attribute) -> Option<(String, String)> {
+    let syn::Meta::List(list) = &attr.meta else {
+        return None;
+    };
+    let args = crate::authorize::parse_with_leading_literal(list.tokens.clone()).ok()?;
+    Some((args.action?, args.resource?.to_string()))
+}
+
+fn collect_authorize_markers_in_stmts(stmts: &[syn::Stmt], out: &mut Vec<(String, String)>) {
+    for stmt in stmts {
+        collect_authorize_markers_in_stmt(stmt, out);
+    }
+}
+
+fn collect_authorize_markers_in_stmt(stmt: &syn::Stmt, out: &mut Vec<(String, String)>) {
+    match stmt {
+        syn::Stmt::Item(syn::Item::Const(item_const))
+            if item_const.ident == AUTHORIZE_BINDINGS_MARKER =>
+        {
+            collect_authorize_bindings_from_marker_expr(&item_const.expr, out);
+        }
+        syn::Stmt::Expr(expr, _) => collect_authorize_markers_in_expr(expr, out),
+        syn::Stmt::Local(local) => {
+            if let Some(init) = &local.init {
+                collect_authorize_markers_in_expr(&init.expr, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_authorize_markers_in_expr(expr: &syn::Expr, out: &mut Vec<(String, String)>) {
+    match expr {
+        syn::Expr::Block(block) => collect_authorize_markers_in_stmts(&block.block.stmts, out),
+        syn::Expr::Unsafe(block) => collect_authorize_markers_in_stmts(&block.block.stmts, out),
+        // Everything the body guards generate — `(async move { … }).await`,
+        // optionally inside `IntoResponse::into_response(…)`, parens or
+        // invisible groups — is unwrapped by the shared helper, so a marker
+        // stays reachable however many guards expanded around it.
+        _ => {
+            if let Some(block) = crate::idempotency_guard::expr_nested_async_body(expr) {
+                collect_authorize_markers_in_stmts(&block.stmts, out);
+            }
+        }
+    }
+}
+
+/// Decode a `&[("action", "Resource"), …]` marker initializer.
+///
+/// All-or-nothing per marker: one element of an unexpected shape means the const
+/// is not the one we emit, so none of it is recorded.
+fn collect_authorize_bindings_from_marker_expr(expr: &syn::Expr, out: &mut Vec<(String, String)>) {
+    let syn::Expr::Reference(reference) = expr else {
+        return;
+    };
+    let syn::Expr::Array(array) = reference.expr.as_ref() else {
+        return;
+    };
+
+    let mut decoded = Vec::with_capacity(array.elems.len());
+    for elem in &array.elems {
+        let syn::Expr::Tuple(tuple) = elem else {
+            return;
+        };
+        let [action, resource] = tuple.elems.iter().collect::<Vec<_>>()[..] else {
+            return;
+        };
+        let (Some(action), Some(resource)) =
+            (string_literal_value(action), string_literal_value(resource))
+        else {
+            return;
+        };
+        decoded.push((action, resource));
+    }
+    out.extend(decoded);
+}
+
+fn string_literal_value(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) => Some(s.value()),
+        _ => None,
+    }
+}
+
+/// Emit the `&'static [AuthorizeBinding]` slice for `ApiDoc::authorize_bindings`.
+pub fn emit_authorize_binding_slice(bindings: &[(String, String)]) -> TokenStream {
+    if bindings.is_empty() {
+        return quote! { &[] };
+    }
+    let entries = bindings.iter().map(|(action, resource)| {
+        let action = LitStr::new(action, Span::call_site());
+        let resource = LitStr::new(resource, Span::call_site());
+        quote! {
+            ::autumn_web::openapi::AuthorizeBinding { action: #action, resource: #resource }
+        }
+    });
+    quote! { &[#(#entries),*] }
+}
+
 fn emit_static_str_slice(items: &[String]) -> TokenStream {
     if items.is_empty() {
         quote! { &[] }
@@ -1100,5 +1254,113 @@ mod tests {
             async fn handler() {}
         };
         assert!(!is_public(&input_fn));
+    }
+
+    // ── #[authorize] binding extraction (#1627) ──────────────────────────────
+
+    #[test]
+    fn extract_authorize_bindings_from_attribute() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[authorize("update", resource = Note)]
+            async fn handler(note: Note) {}
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            vec![("update".to_owned(), "Note".to_owned())]
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_from_marker() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("update", "Note")];
+            }
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            vec![("update".to_owned(), "Note".to_owned())]
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_from_nested_marker() {
+        // A guard that expanded after `#[authorize]` wraps the marker in
+        // `(async move { … }).await`, one level per stacked guard.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                let __autumn_inner: ::autumn_web::reexports::axum::response::Response =
+                    (async move {
+                        const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("update", "Note")];
+                    })
+                    .await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            vec![("update".to_owned(), "Note".to_owned())]
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_is_empty_without_authorize() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {}
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_handles_string_literal_resource() {
+        // `resource = "Note"` is accepted by the #[authorize] grammar and
+        // normalized back to an identifier; reading the attribute through that
+        // same parser keeps both spellings recording the same binding.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[authorize("update", resource = "Note")]
+            async fn handler(note: Note) {}
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            vec![("update".to_owned(), "Note".to_owned())]
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_unions_attr_and_marker() {
+        // A mixed stack (`#[authorize(A)]` above the route macro, `#[authorize(B)]`
+        // below it) leaves one marker and one attribute — both are real bindings,
+        // so neither case may short-circuit the other.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[authorize("publish", resource = Note)]
+            async fn handler(note: Note) {
+                const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("update", "Note")];
+            }
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            vec![
+                ("publish".to_owned(), "Note".to_owned()),
+                ("update".to_owned(), "Note".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_ignores_malformed_marker() {
+        // A same-named const of a foreign shape is not ours to interpret: it
+        // contributes nothing rather than panicking on the unexpected AST.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, u32)] = &[("update", 1)];
+            }
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            Vec::<(String, String)>::new()
+        );
     }
 }

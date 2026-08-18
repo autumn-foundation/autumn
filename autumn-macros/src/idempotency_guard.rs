@@ -49,10 +49,17 @@ fn stmt_is_generated_replay_guard(stmt: &Stmt) -> bool {
 }
 
 fn stmt_is_generated_auth_prologue(stmt: &Stmt) -> bool {
+    // Marker consts the auth guards prepend ahead of their check. They carry no
+    // behaviour, so the scan must step over them: a prologue statement that is
+    // not recognized stops the walk, the replay guard behind it reads as absent,
+    // and an enclosing guard emits a second one *ahead* of the auth check —
+    // serving a cached response before authentication/authorization runs.
     if matches!(
         stmt,
         Stmt::Item(Item::Const(item))
-            if item.ident == "__AUTUMN_SECURED_ROLES" || item.ident == "__AUTUMN_SECURED_SCOPES"
+            if item.ident == "__AUTUMN_SECURED_ROLES"
+                || item.ident == "__AUTUMN_SECURED_SCOPES"
+                || item.ident == "__AUTUMN_AUTHORIZE_BINDINGS"
     ) {
         return true;
     }
@@ -459,7 +466,15 @@ fn pat_binds_inner_response(pat: &Pat) -> bool {
     }
 }
 
-fn expr_nested_async_body(expr: &Expr) -> Option<&Block> {
+/// Unwrap the `(async move { … }).await` wrapper the body guards (`#[secured]`,
+/// `#[authorize]`, `#[throttle]`, …) put a handler's original body inside —
+/// including the `IntoResponse::into_response(…)` call, parens, and invisible
+/// groups they may sit behind — and yield the inner block.
+///
+/// Shared with `api_doc`'s marker walks: each guard that expands *before*
+/// another buries the earlier guard's marker consts one wrapper level deeper,
+/// so a walk that does not descend through this shape silently loses them.
+pub fn expr_nested_async_body(expr: &Expr) -> Option<&Block> {
     match expr {
         Expr::Async(expr_async) => Some(&expr_async.block),
         Expr::Await(await_expr) => expr_nested_async_body(&await_expr.base),
@@ -928,6 +943,58 @@ mod tests {
             })
             .await;
             ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+        });
+
+        assert!(block_has_replay_guard(&block));
+    }
+
+    #[test]
+    fn generated_authorize_bindings_marker_does_not_hide_replay_guard() {
+        // `#[authorize]` prepends a binding marker const ahead of its policy
+        // check (#1627). Like the `#[secured]` role/scope markers, it must be
+        // transparent to this scan: a prologue statement that is not skipped
+        // stops the walk, so the replay guard behind it would look absent and
+        // the enclosing guard would emit a second one ahead of the policy
+        // check — serving a cached response before authorization runs.
+        let generated = crate::authorize::authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! {
+                async fn update_post(post: Post) -> &'static str { "ok" }
+            },
+        );
+        let generated_fn: syn::ItemFn =
+            syn::parse2(generated).expect("#[authorize] must emit a parseable function");
+        assert!(
+            matches!(
+                generated_fn.block.stmts.first(),
+                Some(syn::Stmt::Item(syn::Item::Const(item)))
+                    if item.ident == "__AUTUMN_AUTHORIZE_BINDINGS"
+            ),
+            "this test's hand-written prologue must keep matching what #[authorize] emits"
+        );
+
+        let block: syn::Block = syn::parse_quote!({
+            const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("update", "Post")];
+            if let ::core::result::Result::Err(__autumn_error) =
+                ::autumn_web::authorization::__check_policy_scoped::<Post>(
+                    &__autumn_state,
+                    &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
+                    "update",
+                    &post,
+                )
+                .await
+            {
+                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    __autumn_error,
+                );
+            }
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
         });
 
         assert!(block_has_replay_guard(&block));

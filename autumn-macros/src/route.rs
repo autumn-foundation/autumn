@@ -189,6 +189,11 @@ pub fn route_macro(
         }
     };
     let has_policy_val = has_policy_only(&input_fn);
+    // Source order is preserved here on purpose: `ApiDoc` stays faithful to the
+    // handler as written, and the route listing canonicalizes (sorts/dedupes)
+    // when it projects these onto the wire.
+    let authorize_bindings =
+        api_doc::emit_authorize_binding_slice(&api_doc::extract_authorize_bindings(&input_fn));
     let seo_defaults = route_args.seo.emit();
 
     // ── Path helper ─────────────────────────────────────────────
@@ -224,6 +229,7 @@ pub fn route_macro(
                     api_version: #api_version_expr,
                     sunset_opt_out: #sunset_opt_out_val,
                     has_policy: #has_policy_val,
+                    authorize_bindings: #authorize_bindings,
                     public: #is_public,
                     module_path: ::core::module_path!(),
                     source_file: ::core::file!(),
@@ -1039,6 +1045,144 @@ mod tests {
         assert!(
             generated.contains("RouteTimeout :: Disabled"),
             "timeout = \"off\" must emit RouteTimeout::Disabled: {generated}"
+        );
+    }
+
+    // ── #[authorize] bindings recorded in ApiDoc (#1627) ────────────────────
+
+    #[test]
+    fn route_macro_emits_empty_authorize_bindings_by_default() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/widgets" },
+            quote! { async fn create_widget() -> &'static str { "ok" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("authorize_bindings : & []"),
+            "an unguarded route must record no authorization bindings: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_records_authorize_binding_when_attribute_present() {
+        // Ordering A: `#[post]` outermost, `#[authorize]` still an attribute
+        // below it, so the route macro reads the arguments straight off the
+        // unexpanded attribute.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/notes/{id}" },
+            quote! {
+                #[authorize("update", resource = Note)]
+                async fn update_note(note: Note) -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(r#"AuthorizeBinding { action : "update" , resource : "Note" }"#),
+            "an #[authorize] attribute must record its (action, resource) binding: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_records_authorize_binding_from_expanded_marker() {
+        // Ordering B: `#[authorize]` written ABOVE `#[post]`, so it expands
+        // first, removes its own attribute and leaves only the generated body.
+        // The binding must survive in the marker const it injects.
+        let authorized = crate::authorize::authorize_macro(
+            quote! { "update", resource = Note },
+            quote! {
+                async fn update_note(note: Note) -> &'static str { "ok" }
+            },
+        );
+        let generated =
+            route_macro("POST", "post", quote! { "/notes/{id}" }, authorized).to_string();
+
+        assert!(
+            generated.contains(r#"AuthorizeBinding { action : "update" , resource : "Note" }"#),
+            "an already-expanded #[authorize] must still record its binding: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_records_authorize_binding_under_secured_wrapper() {
+        // `#[authorize]` above `#[secured]` above `#[post]`: authorize expands
+        // first, then secured wraps that whole body in
+        // `(async move { … }).await`, burying the marker one level down. The
+        // walk must descend the generated wrapper instead of stopping at the
+        // outermost statement list.
+        let authorized = crate::authorize::authorize_macro(
+            quote! { "update", resource = Note },
+            quote! {
+                async fn update_note(note: Note) -> &'static str { "ok" }
+            },
+        );
+        let secured = crate::secured::secured_macro(quote! { "admin" }, authorized);
+        let generated = route_macro("POST", "post", quote! { "/notes/{id}" }, secured).to_string();
+
+        assert!(
+            generated.contains(r#"AuthorizeBinding { action : "update" , resource : "Note" }"#),
+            "a binding nested inside a #[secured] wrapper must not be lost: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_records_all_bindings_for_stacked_authorize_attributes() {
+        // Every attribute contributes: the existing `policy` boolean collapses
+        // N bindings into one flag, so the list must not do the same.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/notes/{id}" },
+            quote! {
+                #[authorize("update", resource = Note)]
+                #[authorize("publish", resource = Note)]
+                async fn update_note(note: Note) -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+
+        let update = generated
+            .find(r#"AuthorizeBinding { action : "update" , resource : "Note" }"#)
+            .unwrap_or_else(|| {
+                panic!("the first stacked #[authorize] must record a binding: {generated}")
+            });
+        let publish = generated
+            .find(r#"AuthorizeBinding { action : "publish" , resource : "Note" }"#)
+            .unwrap_or_else(|| {
+                panic!("the second stacked #[authorize] must record a binding: {generated}")
+            });
+        assert!(
+            update < publish,
+            "stacked bindings must be recorded in source order: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_string_literal_authorize_marker_is_not_a_binding() {
+        // Handler *text* that merely spells the marker const must not be
+        // mistaken for one: the marker is decoded structurally, never scanned
+        // for as a string.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/items" },
+            quote! {
+                async fn create_item() -> &'static str {
+                    let _ = "const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[(\"update\", \"Note\")];";
+                    "created"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("authorize_bindings : & []"),
+            "a string literal must not be mistaken for a generated binding marker: {generated}"
         );
     }
 }
