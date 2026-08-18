@@ -183,6 +183,14 @@ pub fn rewrite_source(
         return Ok(SourceRewrite::default());
     }
 
+    // A token stream proves the file *lexes*, not that it is Rust: `let = f();`
+    // has balanced delimiters and valid tokens and is still rejected by the
+    // compiler. Splicing into a file like that would produce a rewrite of
+    // something that was never going to build, and count it as migrated.
+    // Parsing first is what makes "not valid Rust is reported, not rewritten"
+    // true rather than approximately true.
+    syn::parse_file(source).map_err(|error| error.to_string())?;
+
     let stream: TokenStream = source
         .parse()
         .map_err(|error: proc_macro2::LexError| error.to_string())?;

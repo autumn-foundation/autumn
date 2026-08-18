@@ -2477,6 +2477,13 @@ pub enum AutumnWebDependency {
     Version(String),
     /// Declared, but with no version to read — a path or git entry.
     WithoutVersion,
+    /// The manifest exists but could not be read or parsed.
+    ///
+    /// Distinct from [`Self::Absent`] on purpose: a crate whose manifest cannot
+    /// be read may well be the oldest in the workspace, and reading it as
+    /// "declares nothing" lets a newer sibling decide the floor while this
+    /// crate's sources are scanned and rewritten anyway.
+    Unreadable,
     /// `{ workspace = true }`: the version lives in the enclosing workspace's
     /// `[workspace.dependencies]`, which may be in an *ancestor* directory when
     /// the command is pointed at a member rather than the workspace root.
@@ -2500,6 +2507,7 @@ pub fn read_autumn_web_version_at(root: &std::path::Path) -> Option<String> {
         .find_map(|declaration| match declaration {
             AutumnWebDependency::Version(version) => Some(version),
             AutumnWebDependency::Absent
+            | AutumnWebDependency::Unreadable
             | AutumnWebDependency::WithoutVersion
             | AutumnWebDependency::Inherited(_) => None,
         })
@@ -2564,11 +2572,18 @@ pub fn autumn_web_declarations_at(root: &std::path::Path) -> Vec<AutumnWebDepend
         }
     }
 
-    let Ok(content) = std::fs::read_to_string(root.join("Cargo.toml")) else {
-        return Vec::new();
+    let manifest = root.join("Cargo.toml");
+    let Ok(content) = std::fs::read_to_string(&manifest) else {
+        // No manifest at all is a directory that is not a crate. One that
+        // exists and cannot be read is a crate whose version is unknown.
+        return if manifest.exists() {
+            vec![AutumnWebDependency::Unreadable]
+        } else {
+            Vec::new()
+        };
     };
     let Ok(table) = toml::from_str::<toml::Table>(&content) else {
-        return Vec::new();
+        return vec![AutumnWebDependency::Unreadable];
     };
 
     // Every dependency table Cargo reads: the package's own, the workspace's,

@@ -537,12 +537,17 @@ fn recorded_version(root: &Path) -> Option<String> {
             };
             let requirement = match declaration {
                 AutumnWebDependency::Absent | AutumnWebDependency::Inherited(_) => continue,
-                // Declared as a path or git dependency: this crate is on *some*
-                // version of autumn-web and the manifest does not say which.
-                // Letting a sibling decide the floor would migrate this crate's
-                // source against a version nobody checked — and a vendored
-                // checkout is exactly the population the 0.6.0 rename affects.
-                AutumnWebDependency::WithoutVersion => return None,
+                // Two ways to know a crate's version is unknown rather than
+                // absent: a path or git dependency, which says this crate is on
+                // *some* version without saying which; and a manifest that
+                // exists but cannot be read or parsed, which says nothing at
+                // all. Letting a sibling decide the floor in either case would
+                // migrate this crate's source against a version nobody checked
+                // — and a vendored checkout is exactly the population the 0.6.0
+                // rename affects.
+                AutumnWebDependency::WithoutVersion | AutumnWebDependency::Unreadable => {
+                    return None;
+                }
                 AutumnWebDependency::Version(requirement) => requirement,
             };
             // A requirement carrying no usable floor makes the whole answer a

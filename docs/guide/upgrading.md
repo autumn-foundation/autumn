@@ -86,7 +86,9 @@ Manual - not rewritten; read the guide section:
 ```
 
 A file that is not valid Rust is reported under **Skipped** and left exactly as
-it was; one unparsable file never stops the rest of the migration.
+it was; one unparsable file never stops the rest of the migration. "Valid" means
+it parses as Rust, not merely that its delimiters balance — `let = f();` is
+skipped, not rewritten.
 
 ## Flags
 

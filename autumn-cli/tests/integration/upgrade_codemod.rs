@@ -2159,3 +2159,61 @@ fn a_target_directory_pointing_outside_its_crate_is_still_excluded() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn a_syntactically_invalid_file_is_skipped_not_rewritten() {
+    // `let = …;` tokenises perfectly well — balanced delimiters, valid tokens —
+    // but it is not valid Rust. Accepting the token stream as proof of validity
+    // meant rewriting a file the compiler will reject anyway, and counting it
+    // as migrated.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        "src/broken.rs",
+        "#[repository]\npub trait PostRepository { fn noop(&self); }\n\n\
+         pub fn build(pool: Pool) {\n    let = PgPostRepository::with_pool(pool);\n}\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/broken.rs").contains("let = PgPostRepository::with_pool(pool);"),
+        "a file that is not valid Rust must be left alone:\n{}",
+        stdout_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("src/broken.rs"),
+        "and reported under Skipped:\n{stdout}"
+    );
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "one unparsable file does not stop the rest:\n{stdout}"
+    );
+}
+
+#[test]
+fn an_unparsable_member_manifest_fails_detection() {
+    // A member whose `Cargo.toml` cannot be parsed may well be the oldest crate
+    // in the workspace. Reading it as "declares nothing" let a newer sibling
+    // pick the floor and skip the migration its sources still need.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"0.6.0\"\n",
+    );
+    write(tmp.path(), "src/main.rs", "fn main() {}\n");
+    write(tmp.path(), "member/Cargo.toml", "[package\nname = broken\n");
+    write(tmp.path(), "member/src/lib.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(!output.status.success(), "{}", report(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--from"),
+        "a manifest that cannot be read is not evidence of absence:\n{}",
+        report(&output)
+    );
+}

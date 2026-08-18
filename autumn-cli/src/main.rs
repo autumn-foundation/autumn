@@ -267,26 +267,26 @@ struct Cli {
 /// argument-parsing tests overflow. An `Args` struct moves this command's share
 /// into `UpgradeArgs::augment_args`, which gets its own frame and pops.
 #[derive(clap::Args, Debug)]
-pub struct UpgradeArgs {
+struct UpgradeArgs {
     /// Project directory to migrate (defaults to the current directory).
     #[arg(value_name = "PATH", default_value = ".")]
-    pub path: String,
+    path: String,
     /// Release this app is upgrading from. Defaults to the `autumn-web`
     /// requirement recorded in the project's `Cargo.toml`.
     #[arg(long, value_name = "VERSION")]
-    pub from: Option<String>,
+    from: Option<String>,
     /// Release to upgrade to. Defaults to this CLI's own version.
     #[arg(long, value_name = "VERSION")]
-    pub to: Option<String>,
+    to: Option<String>,
     /// Write the rewrites. Without it the command only previews them.
     #[arg(long)]
-    pub apply: bool,
+    apply: bool,
     /// Emit the machine-readable report instead of the human one.
     #[arg(long)]
-    pub json: bool,
+    json: bool,
     /// List the shipped app-code migrations and exit without scanning.
     #[arg(long = "list-migrations")]
-    pub list_migrations: bool,
+    list_migrations: bool,
 }
 
 /// Available subcommands.
