@@ -23,7 +23,7 @@
 //! to build the identifier by concatenation, so a rewrite there is a guess.
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::migrations::{AppMigration, CallForm, ReceiverShape, Rewrite};
 
@@ -157,7 +157,7 @@ struct Rename {
 pub fn rewrite_source(
     source: &str,
     migrations: &[&'static AppMigration],
-    generated: &BTreeSet<String>,
+    generated: &GeneratedRepositories,
 ) -> Result<SourceRewrite, String> {
     let renames: Vec<Rename> = migrations
         .iter()
@@ -265,7 +265,7 @@ pub fn rewrite_source(
 pub fn rewrite_source_for_releases(
     source: &str,
     migrations: &[&'static AppMigration],
-    generated: &BTreeSet<String>,
+    generated: &GeneratedRepositories,
 ) -> Result<SourceRewrite, String> {
     let mut current = source.to_owned();
     let mut combined = SourceRewrite::default();
@@ -310,7 +310,7 @@ fn scan(
     stream: &TokenStream,
     context: Context,
     renames: &[Rename],
-    generated: &BTreeSet<String>,
+    generated: &GeneratedRepositories,
     hits: &mut Vec<Hit>,
 ) {
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
@@ -592,13 +592,67 @@ fn turbofish_argument_list(trees: &[TokenTree], angle: usize) -> Option<&proc_ma
 /// A file that does not parse contributes nothing rather than failing the scan
 /// — it is already reported as skipped on its own account.
 #[must_use]
-pub fn generated_repository_types(source: &str) -> Vec<String> {
+pub fn generated_repository_types(source: &str) -> Vec<(String, Vec<String>)> {
     let Ok(stream) = source.parse::<TokenStream>() else {
         return Vec::new();
     };
     let mut found = Vec::new();
-    collect_repository_types(&stream, Context::Code, &mut found);
+    collect_repository_types(&stream, Context::Code, &[], &mut found);
     found
+}
+
+/// The generated repository types an app declares, and where.
+///
+/// The module path matters because a name on its own can be ambiguous: an app
+/// with a real `repositories::PgAuditRepository` may also have an unrelated
+/// `custom::PgAuditRepository`, and a call written against the second one would
+/// otherwise be verified by the first.
+#[derive(Debug, Default)]
+pub struct GeneratedRepositories(BTreeMap<String, BTreeSet<Vec<String>>>);
+
+impl FromIterator<(String, Vec<String>)> for GeneratedRepositories {
+    fn from_iter<I: IntoIterator<Item = (String, Vec<String>)>>(iter: I) -> Self {
+        let mut map: BTreeMap<String, BTreeSet<Vec<String>>> = BTreeMap::new();
+        for (name, module) in iter {
+            map.entry(name).or_default().insert(module);
+        }
+        Self(map)
+    }
+}
+
+impl GeneratedRepositories {
+    /// Whether a call on `name`, written with `qualifier` in front of it,
+    /// refers to a type some `#[repository]` trait generates.
+    ///
+    /// An unqualified receiver is accepted on the name alone — that is how the
+    /// overwhelming majority of call sites are written, and resolving it
+    /// properly would mean following `use` declarations. A *qualified* one
+    /// carries the module the author meant, so it is checked: the qualifier has
+    /// to be a trailing part of some declaration's own path, which is what
+    /// `repositories::…`, `crate::repositories::…` and a bare `…` inside that
+    /// module all are. A qualifier naming a module that generates nothing —
+    /// `custom::PgAuditRepository` — is not this type.
+    #[must_use]
+    pub fn accepts(&self, name: &str, qualifier: &[String]) -> bool {
+        let Some(declared) = self.0.get(name) else {
+            return false;
+        };
+        // `crate::`, `self::` and `super::` say where to start resolving, not
+        // which module declares the type. `super` cannot be resolved without
+        // knowing the caller's own module, so it is dropped rather than guessed
+        // at — erring toward accepting a name that is generated somewhere.
+        let qualifier: Vec<String> = qualifier
+            .iter()
+            .skip_while(|segment| matches!(segment.as_str(), "crate" | "self" | "super" | "$crate"))
+            .cloned()
+            .collect();
+        if qualifier.is_empty() {
+            return true;
+        }
+        declared
+            .iter()
+            .any(|path| path.len() >= qualifier.len() && path.ends_with(&qualifier[..]))
+    }
 }
 
 /// Only declarations in ordinary code count.
@@ -609,7 +663,12 @@ pub fn generated_repository_types(source: &str) -> Vec<String> {
 /// merely mentions `#[repository] trait AuditRepository` verify an unrelated
 /// `PgAuditRepository` elsewhere, which is the wrong rewrite this verification
 /// exists to prevent.
-fn collect_repository_types(stream: &TokenStream, context: Context, found: &mut Vec<String>) {
+fn collect_repository_types(
+    stream: &TokenStream,
+    context: Context,
+    module: &[String],
+    found: &mut Vec<(String, Vec<String>)>,
+) {
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
     for (index, tree) in trees.iter().enumerate() {
         match tree {
@@ -626,14 +685,25 @@ fn collect_repository_types(stream: &TokenStream, context: Context, found: &mut 
                     continue;
                 }
                 if let Some(trait_name) = trait_name_after(&trees, index + 2) {
-                    found.push(format!("Pg{trait_name}"));
+                    found.push((format!("Pg{trait_name}"), module.to_vec()));
                 }
             }
-            TokenTree::Group(group) => collect_repository_types(
-                &group.stream(),
-                group_context(&trees, index, context),
-                found,
-            ),
+            TokenTree::Group(group) => {
+                // `mod name { … }` opens a module; every other brace is just a
+                // block, and the path it holds is the one it inherits.
+                let nested = module_name_before(&trees, index).map(|name| {
+                    let mut nested = module.to_vec();
+                    nested.push(name);
+                    nested
+                });
+                let inner = nested.as_deref().unwrap_or(module);
+                collect_repository_types(
+                    &group.stream(),
+                    group_context(&trees, index, context),
+                    inner,
+                    found,
+                );
+            }
             _ => {}
         }
     }
@@ -664,6 +734,23 @@ fn is_repository_attribute(stream: &TokenStream) -> bool {
         }
     }
     last_segment.is_some_and(|segment| segment == "repository")
+}
+
+/// The module name when `trees[index]` is the body of `mod name { … }`.
+fn module_name_before(trees: &[TokenTree], index: usize) -> Option<String> {
+    let TokenTree::Group(group) = &trees[index] else {
+        return None;
+    };
+    if group.delimiter() != Delimiter::Brace {
+        return None;
+    }
+    let Some(TokenTree::Ident(name)) = trees.get(index.checked_sub(1)?) else {
+        return None;
+    };
+    // The `mod` keyword sits directly before the name under either spelling —
+    // `pub mod name { … }` puts the visibility before the keyword, not after.
+    let keyword = trees.get(index.checked_sub(2)?);
+    matches!(keyword, Some(TokenTree::Ident(keyword)) if keyword == "mod").then(|| name.to_string())
 }
 
 /// The name of the trait an attribute at `from` is applied to.
@@ -717,7 +804,7 @@ fn receiver_verdict(
     trees: &[TokenTree],
     index: usize,
     required: Option<ReceiverShape>,
-    generated: &BTreeSet<String>,
+    generated: &GeneratedRepositories,
 ) -> Option<ManualReason> {
     let required = required?;
     // `PgPostRepository :: with_pool` — the receiver sits three tokens back,
@@ -734,10 +821,36 @@ fn receiver_verdict(
     if !required.matches(&receiver) {
         return Some(ManualReason::UnexpectedReceiver);
     }
-    if generated.contains(&receiver) {
+    if generated.accepts(&receiver, &path_qualifier(trees, at)) {
         return None;
     }
     Some(ManualReason::UnverifiedReceiver)
+}
+
+/// The module path written in front of the receiver at `at`, outermost first.
+///
+/// `custom::PgAuditRepository::with_pool` yields `["custom"]`; a bare
+/// `PgAuditRepository::with_pool` yields nothing.
+fn path_qualifier(trees: &[TokenTree], at: usize) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut index = at;
+    // Each step back over `ident ::` is one more segment.
+    while index >= 3 {
+        let separator = matches!(&trees[index - 1], TokenTree::Punct(punct) if punct.as_char() == ':')
+            && matches!(&trees[index - 2], TokenTree::Punct(punct) if punct.as_char() == ':');
+        if !separator {
+            break;
+        }
+        let Some(TokenTree::Ident(ident)) = trees.get(index - 3) else {
+            break;
+        };
+        segments.push(ident.to_string());
+        index -= 3;
+    }
+    // A leading `::` on a fully-qualified path leaves no ident to read, and the
+    // segments were collected innermost first.
+    segments.reverse();
+    segments
 }
 
 /// Which call form `trees[index]` is written in, if any: `.` makes it a method
@@ -801,7 +914,7 @@ mod tests {
     /// and obscure what each case is actually pinning. `PgCache` is left out on
     /// purpose: it is the fixture for a receiver of the wrong *shape*, which
     /// must fail before verification is ever consulted.
-    fn assumed_generated() -> BTreeSet<String> {
+    fn assumed_generated() -> GeneratedRepositories {
         [
             "PgPostRepository",
             "PgCommentRepository",
@@ -810,8 +923,17 @@ mod tests {
             "PgGammaRepository",
         ]
         .into_iter()
-        .map(str::to_owned)
+        .map(|name| (name.to_owned(), Vec::new()))
         .collect()
+    }
+
+    /// Just the generated type names, for the cases that are about detection
+    /// rather than about where the trait lives.
+    fn generated_names(source: &str) -> Vec<String> {
+        generated_repository_types(source)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
     }
 
     #[test]
@@ -819,7 +941,7 @@ mod tests {
         // Every spelling the attribute is written in, including the arguments
         // form (`tenant_scoped`) and a doc comment between the two, which is
         // itself an attribute by the time the token stream sees it.
-        let types = generated_repository_types(
+        let types = generated_names(
             "#[repository]\npub trait PostRepository {}\n\
              #[repository(tenant_scoped)]\ntrait CommentRepository {}\n\
              #[repository]\n/// docs\npub(crate) trait TagRepository {}\n",
@@ -839,9 +961,7 @@ mod tests {
             "#[autumn::repository(Post)]",
             "#[::autumn_web::repository]",
         ] {
-            let types = generated_repository_types(&format!(
-                "{attribute}\npub trait PostRepository {{}}\n"
-            ));
+            let types = generated_names(&format!("{attribute}\npub trait PostRepository {{}}\n"));
             assert_eq!(types, vec!["PgPostRepository"], "for {attribute}");
         }
     }
@@ -851,25 +971,61 @@ mod tests {
         // The path is what names the macro. `#[cfg(feature = "repository")]`
         // is a `cfg`, whatever its arguments happen to spell.
         assert!(
-            generated_repository_types(
-                "#[cfg(feature = \"repository\")]\npub trait PostRepository {}\n"
-            )
-            .is_empty()
-        );
-        assert!(
-            generated_repository_types("#[derive(repository)]\npub trait PostRepository {}\n")
+            generated_names("#[cfg(feature = \"repository\")]\npub trait PostRepository {}\n")
                 .is_empty()
         );
+        assert!(generated_names("#[derive(repository)]\npub trait PostRepository {}\n").is_empty());
     }
 
     #[test]
     fn ignores_repository_attributes_that_are_not_on_a_trait() {
         // Nothing is generated, so nothing may be claimed as generated.
-        assert!(generated_repository_types("#[repository]\nstruct Post;\n").is_empty());
-        assert!(generated_repository_types("#[serde(rename)]\ntrait Post {}\n").is_empty());
+        assert!(generated_names("#[repository]\nstruct Post;\n").is_empty());
+        assert!(generated_names("#[serde(rename)]\ntrait Post {}\n").is_empty());
         // A file that does not parse contributes nothing rather than failing
         // the whole scan; it is reported as skipped on its own account.
-        assert!(generated_repository_types("fn f( {").is_empty());
+        assert!(generated_names("fn f( {").is_empty());
+    }
+
+    #[test]
+    fn a_qualifier_decides_between_same_named_types() {
+        let generated: GeneratedRepositories = std::iter::once((
+            "PgAuditRepository".to_owned(),
+            vec!["repositories".to_owned()],
+        ))
+        .collect();
+
+        // Unqualified: accepted on the name. Resolving it would mean following
+        // `use` declarations, and this is how nearly every call site is written.
+        assert!(generated.accepts("PgAuditRepository", &[]));
+        // The module it is actually declared in, however the path is spelled.
+        assert!(generated.accepts("PgAuditRepository", &["repositories".to_owned()]));
+        assert!(generated.accepts(
+            "PgAuditRepository",
+            &["crate".to_owned(), "repositories".to_owned()]
+        ));
+        // A module that generates nothing of that name.
+        assert!(!generated.accepts("PgAuditRepository", &["custom".to_owned()]));
+        // And a name nothing generates at all.
+        assert!(!generated.accepts("PgOtherRepository", &[]));
+    }
+
+    #[test]
+    fn records_the_module_a_trait_is_declared_in() {
+        assert_eq!(
+            generated_repository_types(
+                "mod repositories {\n  mod inner { #[repository] pub trait PostRepository {} }\n}"
+            ),
+            vec![(
+                "PgPostRepository".to_owned(),
+                vec!["repositories".to_owned(), "inner".to_owned()]
+            )]
+        );
+        // A plain block is not a module and contributes no path segment.
+        assert_eq!(
+            generated_repository_types("fn f() { #[repository] trait PostRepository {} }"),
+            vec![("PgPostRepository".to_owned(), Vec::<String>::new())]
+        );
     }
 
     #[test]
@@ -880,20 +1036,17 @@ mod tests {
         // verify an unrelated `PgAuditRepository` elsewhere in the app — the
         // exact wrong rewrite the verification exists to prevent.
         assert!(
-            generated_repository_types(
+            generated_names(
                 "macro_rules! template { () => { #[repository] trait AuditRepository {} } }"
             )
             .is_empty()
         );
-        assert!(
-            generated_repository_types("declare! { #[repository] trait AuditRepository {} }")
-                .is_empty()
-        );
+        assert!(generated_names("declare! { #[repository] trait AuditRepository {} }").is_empty());
     }
 
     #[test]
     fn finds_traits_nested_inside_a_module() {
-        let types = generated_repository_types(
+        let types = generated_names(
             "mod repositories {\n    #[repository]\n    pub trait PostRepository {}\n}\n",
         );
         assert_eq!(types, vec!["PgPostRepository"]);
@@ -1476,8 +1629,19 @@ mod tests {
     #[test]
     fn rewrites_a_generated_repository_receiver_however_it_is_pathed() {
         // The prefix is on the final path segment, so a fully-qualified path to
-        // a generated repository still matches.
-        let out = rewritten("fn f(p: Pool) { crate::repos::PgPostRepository::with_pool(p); }");
+        // a generated repository still matches — provided the path leads to the
+        // module the trait is declared in, which is what makes it *this* type
+        // rather than a same-named one somewhere else.
+        let generated: GeneratedRepositories =
+            std::iter::once(("PgPostRepository".to_owned(), vec!["repos".to_owned()])).collect();
+        let out = rewrite_source(
+            "fn f(p: Pool) { crate::repos::PgPostRepository::with_pool(p); }",
+            &[&RENAME],
+            &generated,
+        )
+        .expect("parses")
+        .updated
+        .expect("source was rewritten");
         assert!(
             out.contains("PgPostRepository::with_pool_untracked(p)"),
             "{out}"

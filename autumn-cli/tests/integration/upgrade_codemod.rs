@@ -1929,3 +1929,100 @@ fn a_qualified_repository_attribute_is_recognised() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn a_same_named_type_in_another_module_is_not_verified_by_the_real_one() {
+    // `#[repository] trait AuditRepository` in `repositories` makes
+    // `PgAuditRepository` a generated type *there*. An app is free to have an
+    // unrelated type of the same name elsewhere, and a call written against
+    // that one names the module it came from.
+    let tmp = app("0.5.0");
+    write(
+        tmp.path(),
+        "src/repositories.rs",
+        "use autumn_web::prelude::*;\n\n\
+         #[repository]\npub trait AuditRepository {\n    fn noop(&self);\n}\n",
+    );
+    write(
+        tmp.path(),
+        "src/custom.rs",
+        "pub struct PgAuditRepository;\n\n\
+         impl PgAuditRepository {\n    \
+         pub fn with_pool(_pool: Pool) -> Self {\n        Self\n    }\n}\n",
+    );
+    write(
+        tmp.path(),
+        "src/main.rs",
+        "mod custom;\nmod repositories;\n\n\
+         pub fn build(pool: Pool) -> custom::PgAuditRepository {\n    \
+         custom::PgAuditRepository::with_pool(pool)\n}\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("custom::PgAuditRepository::with_pool(pool)"),
+        "a receiver qualified with a module that generates nothing must not be rewritten:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn a_module_qualified_generated_receiver_is_still_rewritten() {
+    // The common way to write it once the trait lives in its own module. This
+    // must keep working: scoping the check must not cost the ordinary path.
+    let tmp = app("0.5.0");
+    write(
+        tmp.path(),
+        "src/repositories.rs",
+        "use autumn_web::prelude::*;\n\n\
+         #[repository]\npub trait PostRepository {\n    fn noop(&self);\n}\n",
+    );
+    write(
+        tmp.path(),
+        "src/main.rs",
+        "mod repositories;\n\n\
+         pub fn a(pool: Pool) -> repositories::PgPostRepository {\n    \
+         repositories::PgPostRepository::with_pool(pool)\n}\n\n\
+         pub fn b(pool: Pool) -> crate::repositories::PgPostRepository {\n    \
+         crate::repositories::PgPostRepository::with_pool(pool)\n}\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    let after = read(tmp.path(), "src/main.rs");
+    assert!(
+        after.contains("repositories::PgPostRepository::with_pool_untracked(pool)"),
+        "a module-qualified generated receiver is still the generated type:\n{}",
+        stdout_of(&output)
+    );
+    assert_eq!(
+        after.matches("with_pool_untracked").count(),
+        2,
+        "both the relative and the `crate::` spelling:\n{after}"
+    );
+}
+
+#[test]
+fn an_inline_module_qualifier_matching_the_declaration_is_rewritten() {
+    // The trait declared in an inline `mod` block, called with that module as
+    // the qualifier from the file's top level.
+    let tmp = app("0.5.0");
+    write(
+        tmp.path(),
+        "src/main.rs",
+        "use autumn_web::prelude::*;\n\n\
+         mod repositories {\n    \
+         #[repository]\n    pub trait PostRepository {\n        fn noop(&self);\n    }\n}\n\n\
+         pub fn build(pool: Pool) -> repositories::PgPostRepository {\n    \
+         repositories::PgPostRepository::with_pool(pool)\n}\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked(pool)"),
+        "{}",
+        stdout_of(&output)
+    );
+}

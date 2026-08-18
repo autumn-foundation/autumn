@@ -35,7 +35,6 @@ pub mod diff;
 pub mod engine;
 pub mod migrations;
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use migrations::{AppMigration, Version};
@@ -820,12 +819,52 @@ fn display_path(root: &Path, path: &Path) -> String {
 /// call site normally live in different modules. A file that cannot be read or
 /// parsed contributes nothing rather than failing the scan — it is reported on
 /// its own account when the rewrite pass reaches it.
-fn generated_receivers(files: &[PathBuf]) -> BTreeSet<String> {
+fn generated_receivers(files: &[PathBuf]) -> engine::GeneratedRepositories {
     files
         .iter()
-        .filter_map(|path| std::fs::read_to_string(path).ok())
-        .flat_map(|source| engine::generated_repository_types(&source))
+        .filter_map(|path| {
+            let source = std::fs::read_to_string(path).ok()?;
+            let prefix = file_module_path(path);
+            Some(engine::generated_repository_types(&source).into_iter().map(
+                move |(name, inner)| {
+                    let mut module = prefix.clone();
+                    module.extend(inner);
+                    (name, module)
+                },
+            ))
+        })
+        .flatten()
         .collect()
+}
+
+/// The module path a file contributes, from Cargo's file-to-module mapping.
+///
+/// `src/repositories.rs` is the module `repositories`, `src/a/b.rs` is `a::b`,
+/// and `mod.rs` / `lib.rs` / `main.rs` name their directory rather than
+/// themselves. A file outside a `src` directory — a test or an example — is
+/// treated as the crate root, which only ever makes verification more
+/// permissive.
+///
+/// `#[path = "…"]` can move a module somewhere this does not predict. The cost
+/// is a *qualified* call being reported for a human instead of rewritten, which
+/// is the safe direction and is visible in the report.
+fn file_module_path(path: &Path) -> Vec<String> {
+    let components: Vec<String> = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let Some(src_at) = components.iter().rposition(|component| component == "src") else {
+        return Vec::new();
+    };
+    let mut module: Vec<String> = components[src_at + 1..].to_vec();
+    let Some(last) = module.pop() else {
+        return Vec::new();
+    };
+    let stem = last.strip_suffix(".rs").unwrap_or(&last);
+    if !matches!(stem, "mod" | "lib" | "main") {
+        module.push(stem.to_owned());
+    }
+    module
 }
 
 /// Build the report for `root` without writing anything.

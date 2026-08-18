@@ -173,6 +173,12 @@ Manual - not rewritten; read the guide section:
   src/audit.rs:10  0.6.0-repository-with-pool-untracked (no `#[repository]` trait in this app generates this receiver)
 ```
 
+A receiver written with a module in front of it is checked against that module
+too, so a real `repositories::PgAuditRepository` does not vouch for an unrelated
+`custom::PgAuditRepository`. An unqualified receiver is accepted on its name
+alone: resolving it would mean following `use` declarations, so an alias that
+imports a same-named type from elsewhere is the one case this cannot tell apart.
+
 Preview is still the default and the diff still names every file and line —
 read it before you `--apply`, and `git diff` after. This is also the line the
 `auto` label draws: a change that needs to know a receiver's *type* rather than
