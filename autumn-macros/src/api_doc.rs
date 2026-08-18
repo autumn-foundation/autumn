@@ -889,15 +889,21 @@ const AUTHORIZE_BINDINGS_MARKER: &str = "__AUTUMN_AUTHORIZE_BINDINGS";
 /// one already-expanded marker *and* one live attribute, and both are real
 /// bindings.
 ///
-/// 1. Attributes still present — the route macro is outermost, so `#[authorize]`
+/// 1. Marker consts in the body — `#[authorize]` expanded first and deleted its
+///    own attribute. The walk descends the generated `(async move { … }).await`
+///    wrappers, because each guard that expands afterwards buries the marker one
+///    level deeper, and collects every level instead of stopping at the first.
+/// 2. Attributes still present — the route macro is outermost, so `#[authorize]`
 ///    has not expanded yet. Parsed with the `#[authorize]` grammar itself
 ///    ([`crate::authorize::parse_with_leading_literal`]) so the two sites cannot
 ///    drift apart. Every matching attribute contributes, since nothing stops a
 ///    handler from stacking several.
-/// 2. Marker consts in the body — `#[authorize]` expanded first and deleted its
-///    own attribute. The walk descends the generated `(async move { … }).await`
-///    wrappers, because each guard that expands afterwards buries the marker one
-///    level deeper, and collects every level instead of stopping at the first.
+///
+/// The result is source-ordered. Markers precede live attributes because a
+/// marker only ever comes from an attribute *above* the route macro, and live
+/// attributes sit *below* it; within the markers, deeper nesting means an
+/// earlier expansion — i.e. higher in the source stack — so the walk records
+/// nested markers before the level that wraps them.
 ///
 /// Markers are decoded structurally (`&[( "action", "Resource" ), …]`), never by
 /// scanning stringified tokens, so handler *text* that merely spells the marker
@@ -905,6 +911,8 @@ const AUTHORIZE_BINDINGS_MARKER: &str = "__AUTUMN_AUTHORIZE_BINDINGS";
 /// interpret and contributes nothing rather than erroring.
 pub fn extract_authorize_bindings(input_fn: &syn::ItemFn) -> Vec<(String, String)> {
     let mut bindings = Vec::new();
+
+    collect_authorize_markers_in_stmts(&input_fn.block.stmts, &mut bindings);
 
     for attr in &input_fn.attrs {
         if attr.path().is_ident("authorize")
@@ -918,7 +926,6 @@ pub fn extract_authorize_bindings(input_fn: &syn::ItemFn) -> Vec<(String, String
         }
     }
 
-    collect_authorize_markers_in_stmts(&input_fn.block.stmts, &mut bindings);
     bindings
 }
 
@@ -937,25 +944,26 @@ fn authorize_binding_from_attr(attr: &syn::Attribute) -> Option<(String, String)
 }
 
 fn collect_authorize_markers_in_stmts(stmts: &[syn::Stmt], out: &mut Vec<(String, String)>) {
+    // Nested wrappers first: a deeper marker was expanded earlier, i.e. its
+    // attribute sat higher in the source stack, so it must be recorded before
+    // this level's own marker for the result to stay source-ordered.
     for stmt in stmts {
-        collect_authorize_markers_in_stmt(stmt, out);
+        match stmt {
+            syn::Stmt::Expr(expr, _) => collect_authorize_markers_in_expr(expr, out),
+            syn::Stmt::Local(local) => {
+                if let Some(init) = &local.init {
+                    collect_authorize_markers_in_expr(&init.expr, out);
+                }
+            }
+            _ => {}
+        }
     }
-}
-
-fn collect_authorize_markers_in_stmt(stmt: &syn::Stmt, out: &mut Vec<(String, String)>) {
-    match stmt {
-        syn::Stmt::Item(syn::Item::Const(item_const))
-            if item_const.ident == AUTHORIZE_BINDINGS_MARKER =>
+    for stmt in stmts {
+        if let syn::Stmt::Item(syn::Item::Const(item_const)) = stmt
+            && item_const.ident == AUTHORIZE_BINDINGS_MARKER
         {
             collect_authorize_bindings_from_marker_expr(&item_const.expr, out);
         }
-        syn::Stmt::Expr(expr, _) => collect_authorize_markers_in_expr(expr, out),
-        syn::Stmt::Local(local) => {
-            if let Some(init) = &local.init {
-                collect_authorize_markers_in_expr(&init.expr, out);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1333,7 +1341,8 @@ mod tests {
     fn extract_authorize_bindings_unions_attr_and_marker() {
         // A mixed stack (`#[authorize(A)]` above the route macro, `#[authorize(B)]`
         // below it) leaves one marker and one attribute — both are real bindings,
-        // so neither case may short-circuit the other.
+        // so neither case may short-circuit the other. The marker comes from the
+        // attribute *above* the route macro, so source order puts it first.
         let input_fn: syn::ItemFn = syn::parse_quote! {
             #[authorize("publish", resource = Note)]
             async fn handler(note: Note) {
@@ -1343,8 +1352,35 @@ mod tests {
         assert_eq!(
             extract_authorize_bindings(&input_fn),
             vec![
-                ("publish".to_owned(), "Note".to_owned()),
                 ("update".to_owned(), "Note".to_owned()),
+                ("publish".to_owned(), "Note".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_orders_stacked_markers_by_source() {
+        // Two `#[authorize]`s above the route macro expand top-down: the first
+        // (higher in source) is wrapped by the second, so its marker sits one
+        // wrapper level *deeper*. Source order is therefore deepest-first, and
+        // the walk must record nested markers before the level that wraps them.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("second", "Note")];
+                let __autumn_inner: ::autumn_web::reexports::axum::response::Response =
+                    (async move {
+                        const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] =
+                            &[("first", "Note")];
+                    })
+                    .await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            vec![
+                ("first".to_owned(), "Note".to_owned()),
+                ("second".to_owned(), "Note".to_owned()),
             ]
         );
     }

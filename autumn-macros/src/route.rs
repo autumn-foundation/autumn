@@ -1163,6 +1163,38 @@ mod tests {
     }
 
     #[test]
+    fn route_macro_orders_marker_binding_before_live_attribute() {
+        // Mixed arrangement: `#[authorize(A)]` ABOVE `#[post]` (already
+        // expanded into a marker by the time the route macro runs) and
+        // `#[authorize(B)]` BELOW it (still a live attribute). A is higher in
+        // the source than B, so the recorded order must be [A, B] — the marker
+        // before the attribute, not the collection-mechanism order.
+        let authorized = crate::authorize::authorize_macro(
+            quote! { "update", resource = Note },
+            quote! {
+                async fn update_note(note: Note) -> &'static str { "ok" }
+            },
+        );
+        let mixed = quote! {
+            #[authorize("publish", resource = Note)]
+            #authorized
+        };
+        let generated = route_macro("POST", "post", quote! { "/notes/{id}" }, mixed).to_string();
+
+        let update = generated
+            .find(r#"AuthorizeBinding { action : "update" , resource : "Note" }"#)
+            .unwrap_or_else(|| panic!("the marker binding must be recorded: {generated}"));
+        let publish = generated
+            .find(r#"AuthorizeBinding { action : "publish" , resource : "Note" }"#)
+            .unwrap_or_else(|| panic!("the live-attribute binding must be recorded: {generated}"));
+        assert!(
+            update < publish,
+            "the marker comes from the attribute above the route macro, so it precedes the \
+             live attribute below it in source order: {generated}"
+        );
+    }
+
+    #[test]
     fn route_macro_string_literal_authorize_marker_is_not_a_binding() {
         // Handler *text* that merely spells the marker const must not be
         // mistaken for one: the marker is decoded structurally, never scanned
