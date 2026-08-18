@@ -24,6 +24,7 @@ mod scaffold_bulk_delete;
 mod scaffold_csv_export;
 mod scaffold_encrypted;
 mod scaffold_form_for;
+mod scaffold_i18n;
 mod scaffold_lock_version;
 mod scaffold_nested_resources;
 mod scaffold_rich_text;

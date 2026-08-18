@@ -31,6 +31,7 @@ pub mod plugin;
 pub mod policy;
 pub mod pwa;
 pub mod scaffold;
+mod scaffold_i18n;
 pub mod schema_edit;
 pub mod system_test;
 pub mod task;

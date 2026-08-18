@@ -78,6 +78,7 @@ jobs:
   #   generated_policy_scaffold_cargo_checks      (generate.rs)
   #   generated_nested_scaffold_cargo_checks      (generate.rs)
   #   generated_scaffold_config_cargo_checks      (generate.rs)
+  #   i18n_scaffold_*_cargo_checks                (cli_tests, #1349)
   #   generated_validated_scaffold_round_trip_test_passes (generate.rs)
   #   controller_generates_compiles_and_lists_routes (generate.rs)
   #   controller_api_generates_json               (generate.rs)
@@ -232,6 +233,40 @@ jobs:
         run: |
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_form_for::generated_attachment_scaffold_multipart_test_passes \
+            -- --ignored --exact
+
+      # ── translatable scaffold views (#1349) ─────────────────────────────
+      #
+      # The ONLY machine proof that `--i18n` emits Rust that COMPILES. Every
+      # other i18n test string-matches the output, and the two bugs the feature
+      # shipped with were invisible to that: a `&t!(…)` temporary borrowed into
+      # a `columns` vec that outlives it, and a `transition_<field>` handler
+      # missing the `locale` parameter its body used. Adding the `Locale`
+      # extractor also pushes handlers toward axum's 16-argument `Handler`
+      # ceiling, which no string assertion can see. Same `cli_tests` caveat as
+      # the blocks above — named explicitly or they never execute anywhere.
+      - name: i18n_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_i18n::i18n_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: i18n_scaffold_with_trash_and_search_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_i18n::i18n_scaffold_with_trash_and_search_cargo_checks \
+            -- --ignored --exact
+
+      - name: i18n_scaffold_with_owner_scoped_search_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_i18n::i18n_scaffold_with_owner_scoped_search_cargo_checks \
+            -- --ignored --exact
+
+      - name: i18n_scaffold_with_state_machine_and_attachment_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_i18n::i18n_scaffold_with_state_machine_and_attachment_cargo_checks \
             -- --ignored --exact
 
       # ── `{encrypted}` field-DSL modifier (#1340) ────────────────────────
