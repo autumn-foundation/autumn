@@ -5340,11 +5340,21 @@ impl AppBuilder {
         let control_targets_postgres = control_url
             .as_deref()
             .is_some_and(|url| !control_backend_is_sqlite(url));
+        // Same extra gate as `run_startup_migrations`: `directory_migration_
+        // required`/`shard_map_migration_required` only know about routing/
+        // sharding config, not whether a control database is even
+        // configured. `control_url` here comes from the SAME config a
+        // normal boot resolves its own control target from, so when it is
+        // None (or SQLite) here, the candidate's own later boot will find
+        // the identical thing and never apply either set either -- e.g. a
+        // hash-routed sharded app with no control database configured has
+        // `shard_map_migration_required == true` from sharding alone, but
+        // nothing on any path ever applies that migration for it.
         if log_migration_version_collisions(
             &migrations,
             control_targets_postgres,
-            directory_migration_required,
-            shard_map_migration_required,
+            directory_migration_required && control_targets_postgres,
+            shard_map_migration_required && control_targets_postgres,
         ) {
             // `process::exit` skips `on_shutdown`/`Drop`; stop any managed
             // Postgres child first, mirroring the SQLite guard below.
@@ -9114,11 +9124,22 @@ async fn run_startup_migrations(
     let control_targets_postgres = control_url
         .as_deref()
         .is_some_and(|url| !control_backend_is_sqlite(url));
+    // The directory/shard-map sets are applied ONLY inside the `Some(url) =
+    // control_url` Postgres branch below (never on a `sqlite://` control
+    // target, which returns early, and never with no control target at all).
+    // `directory_migration_is_required`/`shard_map_migration_is_required`
+    // only know about routing/sharding config, not whether a control
+    // database is even configured -- e.g. a hash-routed sharded app with no
+    // control database intentionally set up has `shard_map_migration_required
+    // == true` from sharding alone, but that migration is never applied
+    // anywhere. Without this extra gate, an app migration that happens to
+    // share a version with one of these sets would abort startup over a set
+    // that could never actually collide with it on any real database.
     if log_migration_version_collisions(
         &migrations,
         control_targets_postgres,
-        directory_migration_required,
-        shard_map_migration_required,
+        directory_migration_required && control_targets_postgres,
+        shard_map_migration_required && control_targets_postgres,
     ) {
         // Same orphan hazard as a migration failure below: `process::exit`
         // skips `on_shutdown`, so stop any managed Postgres before bailing.
@@ -11923,6 +11944,25 @@ mod tests {
                 && handler.contains("shard_map_migration_is_required("),
             "the migrate handler must compute the real directory/shard-map requirement \
              predicates, not approximate them from whether shards are merely configured"
+        );
+
+        // Neither predicate above knows whether a control database is even
+        // configured -- e.g. a hash-routed sharded app with no control
+        // database has `shard_map_migration_required == true` from sharding
+        // alone, but nothing on any path ever applies that migration for it.
+        // The guard call must additionally gate both flags on
+        // `control_targets_postgres` (a Codex review finding), the same
+        // gate FRAMEWORK_MIGRATIONS already uses.
+        let guard_invocation_start = handler
+            .find("if log_migration_version_collisions(")
+            .expect("migrate handler calls the version-collision guard");
+        let guard_invocation = &handler[guard_invocation_start..guard_invocation_start + 400];
+        assert!(
+            guard_invocation.contains("directory_migration_required && control_targets_postgres")
+                && guard_invocation
+                    .contains("shard_map_migration_required && control_targets_postgres"),
+            "the migrate handler must gate directory/shard-map requirement flags on an actual \
+             Postgres control target, not just on sharding/routing config: {guard_invocation}"
         );
 
         assert!(

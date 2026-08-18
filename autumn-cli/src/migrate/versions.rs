@@ -564,11 +564,33 @@ pub fn run_check_collisions() {
         }
     }
 
+    // Resolved once and reused below for the coverage check too -- both uses
+    // want the same "what does `origin` currently advertise" answer, and
+    // `git ls-remote` is a network round trip worth paying only once.
+    let remote_heads = remote_branch_heads();
+
     let remote_refs = git_refs(&["refs/remotes"]);
     let refs_seen = remote_refs.len();
     for git_ref in &remote_refs {
         if Some(git_ref) == default_ref.as_ref() {
             continue; // already recorded above
+        }
+        // A long-lived clone can retain `refs/remotes/origin/<deleted>` for a
+        // branch `origin` no longer has -- nothing prunes it without an
+        // explicit `git fetch --prune`. Scanning it anyway would claim a
+        // version against a branch nobody can push a renumber to, keeping
+        // that version permanently unusable even after the real collision is
+        // gone. Only scan a ref `origin` currently advertises; when
+        // advertisement state is unknown (no network, no `origin` remote),
+        // fall back to scanning every local ref as before -- the coverage
+        // warning below already flags that degraded state.
+        if let Some(remote_heads) = &remote_heads {
+            let is_live = git_ref
+                .strip_prefix("refs/remotes/origin/")
+                .is_some_and(|name| remote_heads.contains_key(name));
+            if !is_live {
+                continue;
+            }
         }
         for dir_name in migration_dirs_at_ref(git_ref, DEFAULT_MIGRATIONS_DIR) {
             claimants.entry(dir_name).or_default().push(git_ref.clone());
@@ -601,7 +623,7 @@ pub fn run_check_collisions() {
     // for a branch that no longer exists costs nothing beyond checking a
     // branch that no longer matters.
     let local_heads = local_origin_branch_heads();
-    let full_branch_coverage = remote_branch_heads().is_some_and(|remote_heads| {
+    let full_branch_coverage = remote_heads.as_ref().is_some_and(|remote_heads| {
         !remote_heads.is_empty()
             && remote_heads
                 .iter()
