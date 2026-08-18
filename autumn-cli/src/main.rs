@@ -52,6 +52,7 @@ mod task;
 mod test_cmd;
 mod text_width;
 mod token;
+mod upgrade;
 mod webhook;
 /// Subcommands for `autumn check`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
@@ -256,6 +257,38 @@ struct Cli {
     command: Commands,
 }
 
+/// Arguments for [`Commands::Upgrade`].
+///
+/// A separate `Args` struct rather than inline variant fields, deliberately.
+/// clap's derive builds every inline field of every variant inside one
+/// `Commands::augment_subcommands` frame, and with this many subcommands that
+/// frame is within a kilobyte of libtest's 2 MiB thread stack — close enough
+/// that a codegen difference between two rustc builds decides whether the
+/// argument-parsing tests overflow. An `Args` struct moves this command's share
+/// into `UpgradeArgs::augment_args`, which gets its own frame and pops.
+#[derive(clap::Args, Debug)]
+struct UpgradeArgs {
+    /// Project directory to migrate (defaults to the current directory).
+    #[arg(value_name = "PATH", default_value = ".")]
+    path: String,
+    /// Release this app is upgrading from. Defaults to the `autumn-web`
+    /// requirement recorded in the project's `Cargo.toml`.
+    #[arg(long, value_name = "VERSION")]
+    from: Option<String>,
+    /// Release to upgrade to. Defaults to this CLI's own version.
+    #[arg(long, value_name = "VERSION")]
+    to: Option<String>,
+    /// Write the rewrites. Without it the command only previews them.
+    #[arg(long)]
+    apply: bool,
+    /// Emit the machine-readable report instead of the human one.
+    #[arg(long)]
+    json: bool,
+    /// List the shipped app-code migrations and exit without scanning.
+    #[arg(long = "list-migrations")]
+    list_migrations: bool,
+}
+
 /// Available subcommands.
 #[derive(Subcommand)]
 enum Commands {
@@ -373,6 +406,28 @@ enum Commands {
         #[command(subcommand)]
         action: AssetsCommands,
     },
+    /// Apply a release's mechanical app-code migrations to your own source.
+    ///
+    /// For each release between the `autumn-web` version this app records and
+    /// the target, `autumn upgrade` applies that release's machine-applyable
+    /// migrations -- today, API renames -- to the app's own Rust code.
+    ///
+    /// It writes nothing by default: a bare `autumn upgrade` prints a per-file
+    /// diff plus a count of affected sites, and `--apply` is the explicit write
+    /// step. Anything it cannot safely rewrite (a call site inside a macro
+    /// invocation, or a change with no mechanical form) is listed with its
+    /// location and a link to the guide section, never guessed at.
+    ///
+    /// Run it BEFORE bumping the `autumn-web` dependency: the release it
+    /// migrates *from* is the one the project manifest records. If the bump
+    /// already happened, pass `--from <previous-version>`.
+    ///
+    ///   autumn upgrade                     # preview
+    ///   autumn upgrade --apply             # write the rewrites
+    ///   autumn upgrade --list-migrations   # what ships today
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Upgrade(UpgradeArgs),
     /// Run or inspect database migrations
     Migrate {
         #[command(subcommand)]
@@ -3440,6 +3495,26 @@ fn run_command(command: Commands) {
                 );
                 std::process::exit(1);
             }
+        }
+        Commands::Upgrade(UpgradeArgs {
+            path,
+            from,
+            to,
+            apply,
+            json,
+            list_migrations,
+        }) => {
+            let code = upgrade::run_in(
+                std::path::Path::new(&path),
+                &upgrade::UpgradeOptions {
+                    from,
+                    to,
+                    apply,
+                    json,
+                    list: list_migrations,
+                },
+            );
+            std::process::exit(code);
         }
         Commands::Doctor {
             json,

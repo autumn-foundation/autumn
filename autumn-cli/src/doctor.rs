@@ -2460,31 +2460,205 @@ fn read_msrv() -> Option<String> {
 
 /// Read the `autumn-web` version requirement from the project's `Cargo.toml`.
 fn read_autumn_web_version() -> Option<String> {
-    let content = std::fs::read_to_string("Cargo.toml").ok()?;
-    let table: toml::Table = toml::from_str(&content).ok()?;
+    read_autumn_web_version_at(std::path::Path::new("."))
+}
 
-    let find_in_deps = |deps: &toml::Value| -> Option<String> {
-        let entry = deps.get("autumn-web")?;
+/// How a manifest declares `autumn-web`, if it does.
+///
+/// `autumn upgrade` needs the middle case told apart from the absent one: a
+/// `{ path = "../autumn" }` or `{ git = "..." }` dependency *is* a declaration,
+/// it just carries no version to compare. Treating it as "not declared" lets a
+/// sibling manifest pick the floor for a crate whose version is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutumnWebDependency {
+    /// The manifest does not mention `autumn-web`.
+    Absent,
+    /// Declared with a version requirement.
+    Version(String),
+    /// Declared, but with no version to read — a path or git entry.
+    WithoutVersion,
+    /// The manifest exists but could not be read or parsed.
+    ///
+    /// Distinct from [`Self::Absent`] on purpose: a crate whose manifest cannot
+    /// be read may well be the oldest in the workspace, and reading it as
+    /// "declares nothing" lets a newer sibling decide the floor while this
+    /// crate's sources are scanned and rewritten anyway.
+    Unreadable,
+    /// `{ workspace = true }`: the version lives in the enclosing workspace's
+    /// `[workspace.dependencies]`, which may be in an *ancestor* directory when
+    /// the command is pointed at a member rather than the workspace root.
+    ///
+    /// Carries the *key* the member used, because that is the only handle on
+    /// the entry: under Cargo's renamed form the member writes `autumn =
+    /// { workspace = true }` and nothing but the workspace entry it points at
+    /// says the package is `autumn-web`. Resolve it with
+    /// [`workspace_dependency_for`].
+    Inherited(String),
+}
+
+/// Read the `autumn-web` version requirement from the `Cargo.toml` at `root`.
+///
+/// The first readable version across every dependency table. Callers that need
+/// *all* of them — `autumn upgrade`, which takes the oldest floor — use
+/// [`autumn_web_declarations_at`] instead.
+pub fn read_autumn_web_version_at(root: &std::path::Path) -> Option<String> {
+    autumn_web_declarations_at(root)
+        .into_iter()
+        .find_map(|declaration| match declaration {
+            AutumnWebDependency::Version(version) => Some(version),
+            AutumnWebDependency::Absent
+            | AutumnWebDependency::Unreadable
+            | AutumnWebDependency::WithoutVersion
+            | AutumnWebDependency::Inherited(_) => None,
+        })
+}
+
+/// Every `autumn-web` declaration in the `Cargo.toml` at `root`.
+///
+/// All of them, not the first: a manifest can declare the dependency under
+/// `[dependencies]`, `[workspace.dependencies]`, and any number of
+/// `[target.'cfg(…)'.dependencies]` tables, and Cargo honours each. Returning
+/// the first match let a newer target-specific requirement hide an older one
+/// while the older target's `#[cfg]` code was still scanned and rewritten.
+///
+/// Both spellings are recognised: the literal `autumn-web` key, and Cargo's
+/// renamed form `autumn_web = { package = "autumn-web", version = "…" }`.
+///
+/// An empty result means the manifest does not mention `autumn-web` at all.
+pub fn autumn_web_declarations_at(root: &std::path::Path) -> Vec<AutumnWebDependency> {
+    /// Every dependency-table kind Cargo reads. `dev-` and `build-` count: a
+    /// crate depending on autumn-web only for its tests or its `build.rs` still
+    /// has those sources scanned and rewritten, so it gets a vote on the
+    /// version.
+    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+    /// Whether this dependency entry is `autumn-web`, under either spelling.
+    fn is_autumn_web(key: &str, entry: &toml::Value) -> bool {
+        key == "autumn-web"
+            || entry
+                .get("package")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|package| package == "autumn-web")
+    }
+
+    /// Whether this entry defers to the enclosing workspace.
+    fn is_inherited(entry: &toml::Value) -> bool {
+        entry
+            .get("workspace")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn classify(key: &str, entry: &toml::Value) -> AutumnWebDependency {
         match entry {
-            toml::Value::String(v) => Some(v.clone()),
-            toml::Value::Table(t) => t
-                .get("version")?
-                .as_str()
-                .map(std::borrow::ToOwned::to_owned),
-            _ => None,
+            toml::Value::String(version) => AutumnWebDependency::Version(version.clone()),
+            toml::Value::Table(table) => table
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .map_or_else(
+                    || {
+                        if table.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                            // Resolved against the enclosing workspace, which
+                            // is not necessarily inside the scanned tree.
+                            AutumnWebDependency::Inherited(key.to_owned())
+                        } else {
+                            // A path or git entry: declared, no version to read.
+                            AutumnWebDependency::WithoutVersion
+                        }
+                    },
+                    |version| AutumnWebDependency::Version(version.to_owned()),
+                ),
+            _ => AutumnWebDependency::WithoutVersion,
         }
+    }
+
+    let manifest = root.join("Cargo.toml");
+    let Ok(content) = std::fs::read_to_string(&manifest) else {
+        // No manifest at all is a directory that is not a crate. One that
+        // exists and cannot be read is a crate whose version is unknown.
+        return if manifest.exists() {
+            vec![AutumnWebDependency::Unreadable]
+        } else {
+            Vec::new()
+        };
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&content) else {
+        return vec![AutumnWebDependency::Unreadable];
     };
 
-    // [dependencies] then [workspace.dependencies]
-    table
-        .get("dependencies")
-        .and_then(find_in_deps)
-        .or_else(|| {
+    // Every dependency table Cargo reads: the package's own, the workspace's,
+    // and one per target predicate — in each of the three kinds.
+    let mut tables: Vec<&toml::Value> = Vec::new();
+    for kind in KINDS {
+        tables.extend(table.get(kind));
+        tables.extend(
             table
                 .get("workspace")
-                .and_then(|w| w.get("dependencies"))
-                .and_then(find_in_deps)
+                .and_then(|workspace| workspace.get(kind)),
+        );
+    }
+    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            for kind in KINDS {
+                tables.extend(target.get(kind));
+            }
+        }
+    }
+
+    tables
+        .into_iter()
+        .filter_map(toml::Value::as_table)
+        .flat_map(|deps| {
+            deps.iter()
+                // Inherited entries come along under *any* key: a member
+                // writing `autumn = { workspace = true }` names neither
+                // `autumn-web` nor a `package`, so whether it is this
+                // dependency can only be answered by the workspace entry it
+                // points at. The caller resolves them and drops the ones that
+                // turn out to be some other crate.
+                .filter(|(key, entry)| is_autumn_web(key, entry) || is_inherited(entry))
+                .map(|(key, entry)| classify(key, entry))
         })
+        .filter(|declaration| *declaration != AutumnWebDependency::Absent)
+        .collect()
+}
+
+/// The `[workspace.dependencies]` entry named `key` in the `Cargo.toml` at
+/// `dir`, but only when that entry resolves to `autumn-web`.
+///
+/// Used to resolve `{ workspace = true }` when `autumn upgrade` is pointed at a
+/// member directory: Cargo walks up to the workspace root, and so must this.
+/// The lookup is by the member's key rather than by the crate name because a
+/// renamed workspace entry — `autumn = { package = "autumn-web", … }` — is the
+/// only place the real package is written down. `None` means the workspace does
+/// not define `key`, or defines it as a different crate.
+pub fn workspace_dependency_for(dir: &std::path::Path, key: &str) -> Option<AutumnWebDependency> {
+    let content = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let table = toml::from_str::<toml::Table>(&content).ok()?;
+    let entry = table
+        .get("workspace")?
+        .get("dependencies")?
+        .as_table()?
+        .iter()
+        .find(|(candidate, entry)| {
+            *candidate == key
+                && (key == "autumn-web"
+                    || entry
+                        .get("package")
+                        .and_then(toml::Value::as_str)
+                        .is_some_and(|package| package == "autumn-web"))
+        })
+        .map(|(_, entry)| entry)?;
+    Some(match entry {
+        toml::Value::String(version) => AutumnWebDependency::Version(version.clone()),
+        toml::Value::Table(table) => table
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .map_or(AutumnWebDependency::WithoutVersion, |version| {
+                AutumnWebDependency::Version(version.to_owned())
+            }),
+        _ => AutumnWebDependency::WithoutVersion,
+    })
 }
 
 /// Try to TCP-connect to a host:port within a short timeout.

@@ -2053,6 +2053,333 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
   shopt -u nullglob
 fi
 
+# ---------------------------------------------------------------------------
+# Check 5: codemod coverage (issue #1629).
+#
+# #1588 made the guide a gate; this makes the *automation* a gate. Every
+# breaking entry in a guide -- each `### ` section under `## Breaking changes`
+# -- declares how much of it a machine can apply, with a one-word confidence
+# label that a reader and this script both understand:
+#
+#   **Automation:** `auto`   -- `autumn upgrade` rewrites every call site.
+#   **Automation:** `review` -- it rewrites, and flags each site for a human.
+#   **Automation:** `manual` -- no rewrite; this guide section is the fix path.
+#
+# Four things are enforced:
+#
+#   1. Classification where it is load-bearing. A rename-level entry -- the
+#      class `autumn upgrade` can apply -- must carry a label; shipping one
+#      unclassified is the exact failure issue #1629 exists to prevent. That
+#      *every* breaking entry in this repository's guides carries a label is
+#      asserted separately, over the real guides as a set, by the
+#      `upgrade_codemod` test suite in autumn-cli.
+#
+#      Entries are read under *every* `## ` section, not only
+#      `## Breaking changes`: a rename documented under `## Behavior changes`
+#      or `## Configuration changes` breaks apps exactly as hard, and scoping
+#      the scan to one heading let it through. `### Guide-only upgrade
+#      walkthrough` is the one `### ` that is never an entry.
+#   2. The codemod exists. An `auto`/`review` entry must name a migration id
+#      that is actually shipped in the registry ($CODEMOD_REGISTRY). A guide
+#      promising a codemod nobody wrote is worse than no promise.
+#   3. Rename-level changes justify staying manual. A rename or an import move
+#      is the class `autumn upgrade` can apply safely, so `manual` there needs
+#      a stated reason. Semantic and behavioural changes need no justification:
+#      the label alone is the whole answer for them.
+#   4. Codemod-first walk-through. A released guide that ships an `auto`/
+#      `review` codemod records a `- **Codemod:**` line under
+#      `### Guide-only upgrade walkthrough`, because #1629 requires the
+#      per-release walk-through to run `autumn upgrade` before any manual step.
+#
+# Rename detection is textual, like the unmarked-break lint above, and it
+# deliberately errs toward *over*-detecting: a false positive costs the author
+# one sentence of justification, while a false negative is a release that
+# strands users on a hand-edit the tool could have done. Negations are not
+# special-cased for that reason.
+#
+# The registry is read as text rather than by building the CLI, so this stays a
+# lint-job-speed check. A missing registry file reads as "no codemods shipped",
+# which makes the gate stricter (every `auto`/`review` claim fails), never
+# laxer.
+#
+# An entry carrying the `<!-- migration-guide-gate: <reason> -->` suppression
+# (the same one check 1 reads) is exempt from all four, so an entry that merely
+# *documents* the convention does not have to satisfy it. Like every use of
+# that token it is greppable and shows up in the diff.
+#
+# Residual risk, stated plainly: a breaking change written as prose with no
+# `### ` heading of its own -- including one written as a setext heading -- is
+# not an entry here, so it is not classified. TEMPLATE.md gives every change its
+# own ATX heading; reviewers remain the backstop.
+# ---------------------------------------------------------------------------
+CODEMOD_REGISTRY="${CODEMOD_REGISTRY:-autumn-cli/src/upgrade/migrations.rs}"
+codemod_ids="$defs_dir/codemod.ids"
+: >"$codemod_ids"
+if [[ -e "$CODEMOD_REGISTRY" ]]; then
+  # A registry that exists but cannot be read is not "no codemods shipped" —
+  # it is a broken checkout, and reading it as an empty list would turn every
+  # honest `auto` label into a failure with a misleading message.
+  if [[ ! -r "$CODEMOD_REGISTRY" ]]; then
+    die "$CODEMOD_REGISTRY exists but cannot be read."
+  fi
+  # Only ids that name a *shipped rewrite*: entries of the production
+  # `APP_MIGRATIONS` table whose `rewrite` is a `CallRename`. A blanket scan for
+  # `id:` also picked up the `#[cfg(test)]` fixture registry and every
+  # `GuideOnly` entry, so a guide could satisfy an `auto` label by citing a
+  # test id or a migration that rewrites nothing — which is the one thing this
+  # check exists to prevent.
+  if ! awk '
+        /^pub static APP_MIGRATIONS/ { in_registry = 1; next }
+        in_registry && /^\];/       { in_registry = 0 }
+        !in_registry                { next }
+        /AppMigration[[:space:]]*\{/ { entry = 1; id = ""; rewrites = 0 }
+        !entry { next }
+        {
+          if (match($0, /id:[[:space:]]*"[^"]*"/)) {
+            id = substr($0, RSTART, RLENGTH)
+            sub(/^id:[[:space:]]*"/, "", id)
+            sub(/"$/, "", id)
+          }
+          if ($0 ~ /Rewrite::CallRename/) rewrites = 1
+        }
+        /^[[:space:]]{4}\},/ {
+          if (id != "" && rewrites) print id
+          entry = 0
+        }
+      ' "$CODEMOD_REGISTRY" >"$codemod_ids"; then
+    die "$CODEMOD_REGISTRY could not be scanned for codemod ids."
+    : >"$codemod_ids"
+  fi
+fi
+
+if [[ -d "$MIGRATIONS_DIR" ]]; then
+  shopt -s nullglob
+  for guide in "$MIGRATIONS_DIR"/*.md; do
+    base="$(basename "$guide")"
+    [[ "$base" == "README.md" || "$base" == "TEMPLATE.md" ]] && continue
+
+    # The rolling draft is a skeleton recreated from TEMPLATE.md after every
+    # release; it has no walk-through to have performed yet, and no version of
+    # its own to match codemod ids against.
+    guide_is_draft=0
+    [[ "$guide" == "$UNRELEASED_GUIDE" ]] && guide_is_draft=1
+    guide_version="${base%.md}"
+    [[ "$guide_is_draft" == "1" ]] && guide_version=""
+
+    codemod_findings="$(
+      awk -v codemod_ids="$codemod_ids" -v is_draft="$guide_is_draft" \
+          -v guide_version="$guide_version" \
+          -v walkthrough_heading="### Guide-only upgrade walkthrough" \
+          "$AWK_MARKDOWN_LIB"'
+        function load_codemods(path,   line) {
+          while ((getline line < path) > 0) {
+            sub(/[[:space:]]+$/, "", line)
+            if (line != "") known[line] = 1
+          }
+          close(path)
+        }
+        # The text of a line with its indentation and any list marker removed.
+        # A label written as a bullet is the same declaration a reader sees as
+        # one; reading only unmarked paragraphs let a bulleted `auto` claim a
+        # codemod nobody wrote, unchecked.
+        function label_line_body(text,   body) {
+          body = block_body(text)
+          sub(/^[-*+][[:space:]]+/, "", body)
+          sub(/^[0-9]+[.)][[:space:]]+/, "", body)
+          sub(/^[[:space:]]+/, "", body)
+          return body
+        }
+        # A rename or an import move is the class `autumn upgrade` can apply.
+        function looks_mechanical(text,   t) {
+          t = tolower(text)
+          return (t ~ /renam/ || t ~ /moved (to|from|into)/ || t ~ /import move/)
+        }
+        # The entry just finished: report what it failed to say.
+        function flush_entry() {
+          if (heading == "") return
+          if (suppressed) { heading = ""; return }
+          if (!has_label) {
+            # Classification of *every* breaking change is asserted over the
+            # real guides by the `upgrade_codemod` suite in autumn-cli, which
+            # reads them as a set. Here the gate demands a label where the
+            # decision is load-bearing: a rename or import move is the class
+            # `autumn upgrade` applies, so shipping one unclassified is the
+            # exact failure issue #1629 exists to prevent.
+            if (rename_level) {
+              printf "NOLABEL\t%s\t%d\t-\n", heading, heading_line
+            }
+          } else if (label_value != "auto" && label_value != "review" &&
+                     label_value != "manual") {
+            printf "BADLABEL\t%s\t%d\t%s\n", heading, label_line, label_value
+          } else if (label_value == "auto" || label_value == "review") {
+            if (named_known) {
+              guide_ships = 1
+            } else {
+              printf "NOCODEMOD\t%s\t%d\t%s\n", heading, label_line, label_value
+            }
+          } else if (rename_level && !justified) {
+            printf "NOJUSTIFY\t%s\t%d\t-\n", heading, label_line
+          }
+          heading = ""
+        }
+        BEGIN { load_codemods(codemod_ids) }
+        {
+          if (!md_in_fence) track_block_indent($0)
+          raw = $0
+          visible = visible_text($0)
+          if (md_fence_hit) next
+          # A fenced body, a comment and a raw HTML block are all sample or
+          # invisible text: an `**Automation:**` label was never going to live
+          # in one, and a before/after snippet is not a declaration.
+          if (md_in_fence || md_in_comment || md_in_html_block) {
+            # A sample interrupts the label paragraph: prose after it is new
+            # prose, not a continuation of the justification.
+            in_label_block = 0
+            next
+          }
+        }
+        is_atx_heading(visible) {
+          text = heading_text(visible)
+          level = 0
+          while (substr(text, level + 1, 1) == "#") level++
+          if (level <= 3) flush_entry()
+          if (level <= 2) in_walkthrough = 0
+          if (level == 2) next
+          if (level == 3) {
+            # Scoped like check 4 scopes the `Status:` line: only bullets under
+            # this exact heading count, not ones under a later sibling.
+            in_walkthrough = (text == walkthrough_heading)
+            in_codemod_bullet = 0
+            if (in_walkthrough) next
+            heading = text
+            sub(/^###[[:space:]]*/, "", heading)
+            heading_line = NR
+            has_label = 0
+            label_value = ""
+            label_line = 0
+            named_known = 0
+            justified = 0
+            justification = ""
+            in_label_block = 0
+            suppressed = suppressed_by_comment(raw)
+            rename_level = looks_mechanical(heading)
+            next
+          }
+          next
+        }
+        # The bullet counts only if it records an `autumn upgrade` run:
+        # `- **Codemod:** none` names the label without doing the thing. The
+        # value may wrap onto continuation lines, as `TEMPLATE.md` shows, so
+        # the whole bullet is scanned rather than just its first line.
+        in_walkthrough && visible ~ /^-[[:space:]]+\*\*Codemod:\*\*/ {
+          in_codemod_bullet = 1
+          if (visible ~ /autumn upgrade/) walkthrough_codemod = 1
+        }
+        in_walkthrough && in_codemod_bullet && visible !~ /^-[[:space:]]+\*\*Codemod:\*\*/ {
+          if (visible ~ /^[[:space:]]*$/ || visible ~ /^-[[:space:]]/) {
+            in_codemod_bullet = 0
+          } else if (visible ~ /autumn upgrade/) {
+            walkthrough_codemod = 1
+          }
+        }
+        heading != "" {
+          if (suppressed_by_comment(raw)) suppressed = 1
+          if (looks_mechanical(visible)) rename_level = 1
+          # An id from *another* release does not cover this one: citing
+          # the 0.6.0 codemod in the 0.7.0 guide would otherwise satisfy the
+          # check. The draft has no version yet, so it accepts any shipped id.
+          # Matched as a complete code span: a bare substring would let
+          # `0.7.0-with-pool-extra` — a codemod nobody wrote — be vouched for
+          # by the shipped `0.7.0-with-pool`. Every guide spells ids this way.
+          for (id in known) {
+            if (index(visible, "`" id "`") == 0) continue
+            if (guide_version == "" || index(id, guide_version "-") == 1) named_known = 1
+          }
+
+          if (label_line_body(visible) ~ /^\*\*Automation:\*\*/) {
+            has_label = 1
+            label_line = NR
+            in_label_block = 1
+            rest = label_line_body(visible)
+            sub(/^\*\*Automation:\*\*[[:space:]]*/, "", rest)
+            # The label is the first code span, so `auto` is read from
+            # `` `auto` `` and never from the sentence that follows it.
+            if (match(rest, /^`[a-z]+`/)) {
+              label_value = substr(rest, RSTART + 1, RLENGTH - 2)
+              rest = substr(rest, RSTART + RLENGTH)
+            } else {
+              label_value = "(none)"
+            }
+            justification = rest
+          } else if (in_label_block) {
+            if (visible ~ /^[[:space:]]*$/) {
+              in_label_block = 0
+            } else {
+              justification = justification " " visible
+            }
+          }
+          if (has_label) {
+            plain = justification
+            gsub(/[^[:alnum:]]/, "", plain)
+            # A bare label is a classification, not a reason. Twelve
+            # alphanumerics is a few words -- enough to carry one, and low
+            # enough that the reasons this gate itself suggests ("needs new
+            # arguments") clear it.
+            justified = (length(plain) >= 12)
+          }
+        }
+        END {
+          flush_entry()
+          if (!is_draft && guide_ships && !walkthrough_codemod) {
+            printf "NOWALKTHROUGH\t-\t0\t-\n"
+          }
+        }
+      ' "$guide"
+    )"
+
+    [[ -z "$codemod_findings" ]] && continue
+    while IFS=$'\t' read -r kind entry line detail; do
+      [[ -n "$kind" ]] || continue
+      case "$kind" in
+        NOLABEL)
+          die "$guide:$line: breaking change '$entry' carries no automation label.
+       Classify it under the heading (issue #1629):
+         **Automation:** \`auto\` | \`review\` | \`manual\` - <one clause>
+       An \`auto\`/\`review\` entry also names the shipped codemod id from
+       $CODEMOD_REGISTRY."
+          ;;
+        BADLABEL)
+          die "$guide:$line: breaking change '$entry' has an unknown automation
+       label \`$detail\`. Use \`auto\`, \`review\`, or \`manual\`."
+          ;;
+        NOCODEMOD)
+          die "$guide:$line: breaking change '$entry' is labelled \`$detail\` but
+       names no shipped codemod for this release. Add the migration id from
+       $CODEMOD_REGISTRY to the entry -- in its prose, not inside a fenced
+       sample, and prefixed with this release version -- or relabel it
+       \`manual\` with the reason no codemod applies."
+          ;;
+        NOJUSTIFY)
+          die "$guide:$line: breaking change '$entry' reads as a rename or an
+       import move but is labelled \`manual\` with no reason given.
+       Rename-level changes are the class \`autumn upgrade\` applies safely, so
+       staying manual is a decision that needs stating: say why in the same
+       paragraph (needs new arguments, only reachable inside a macro, a config
+       key rather than app code, ...). Issue #1629."
+          ;;
+        NOWALKTHROUGH)
+          die "$guide ships a codemod but records no codemod-first walk-through.
+       Add a '- **Codemod:** ...' line under
+       '### Guide-only upgrade walkthrough' naming the \`autumn upgrade\`
+       invocation the walk-through ran before any manual step (issue #1629,
+       docs/release-checklist.md)."
+          ;;
+      esac
+    done <<<"$codemod_findings"
+  done
+  shopt -u nullglob
+fi
+
 echo ""
 if [[ "$failures" -gt 0 ]]; then
   echo "Migration guide gate FAILED with $failures finding(s)." >&2

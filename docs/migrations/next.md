@@ -56,6 +56,10 @@ only a layer implemented non-generically against `Route` itself can notice.
 
 ### Routing: `Route` and `StaticRouteMeta` gained an `seo` field
 
+**Automation:** `manual` — no mechanical rewrite. A new struct field needs a
+value, and only the author of the route knows which one; adding arguments is
+outside the rename-level scope of `autumn upgrade`.
+
 **Why:** route-level SEO defaults (`#[get("/about", seo(title = "..."))]`) are
 recorded on the route itself, so the router can install the request extension
 only for routes that declared something and routes without `seo(...)` pay
@@ -101,6 +105,9 @@ rg -n 'Route \{|StaticRouteMeta \{' src/
 
 ### JSON API: a `lock_version` model now requires the version on `PUT`/`PATCH`
 
+**Automation:** `manual` — no mechanical rewrite. The change is on the wire,
+in clients this tool never sees, not in the app's Rust source.
+
 **Why:** declaring a column literally named `lock_version` opts a model into
 optimistic locking (#1318). `#[lock_version]` carries the column on
 `Update{Model}` as the *expected* version, which is what lets the repository
@@ -137,6 +144,9 @@ generate` prints a warning naming this escape hatch whenever it detects the
 name.
 
 ### App-wide layers are now erased
+
+**Automation:** `manual` — no mechanical rewrite. The fix is to make a layer
+impl generic, which is a change of shape rather than of name.
 
 **Why:** `AppBuilder::layer` / `static_gate` registrations (including plugin
 layers) are type-erased at registration time and composed into a single
@@ -180,6 +190,11 @@ rg -n 'Layer<axum::routing::Route>|Layer<Route>' src/
 ## Deprecations (non-breaking)
 
 ### `scheduler::now_unix_secs` / `scheduler::now_unix_duration`
+
+**Automation:** `manual` — no mechanical rewrite. The replacement takes the
+app's injected clock as a new argument, and finding the right `AppState` in
+scope is inference well beyond a rename — explicitly out of scope for
+`autumn upgrade` (issue #1629).
 
 Both read the real system clock directly, off the framework's injected-clock
 seam, so anything derived from them — a scheduled-task tick key, an expiry

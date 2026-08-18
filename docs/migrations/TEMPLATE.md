@@ -42,22 +42,37 @@ full commit-level picture.
 
 ## Step-by-step
 
-1. **Bump the dependency.**
+1. **Run `autumn upgrade`** — *before* the dependency bump. The release it
+   migrates from is the one your `Cargo.toml` still records, so bumping first
+   leaves nothing in range. It previews every mechanical change this release
+   can apply to your own source — a per-file diff plus a count of affected
+   sites — and writes nothing; re-run with `--apply` to take them. Anything it
+   cannot safely rewrite is listed with `file:line` and a link to the guide
+   section that explains it.
+
+   ```bash
+   cargo install autumn-cli --version {X.Z.0}
+   autumn upgrade            # preview
+   autumn upgrade --apply    # take it
+   ```
+
+2. **Bump the dependency.**
    ```toml
    # Cargo.toml
    [dependencies]
    autumn-web = "{(X+1).0}"
    ```
 
-2. **Run `cargo check`.** Work through the compiler errors section by
-   section using the cheat sheet below.
+3. **Run `cargo check`.** Work through the compiler errors section by
+   section using the cheat sheet below. Only the changes labelled `review` or
+   `manual` above should still need you.
 
-3. **Apply configuration changes** (see
+4. **Apply configuration changes** (see
    [Configuration changes](#configuration-changes)).
 
-4. **Run the test suite.**
+5. **Run the test suite.**
 
-5. **Run the application locally** and exercise each feature at least
+6. **Run the application locally** and exercise each feature at least
    once. Pay attention to the [Behavior changes](#behavior-changes)
    section.
 
@@ -83,8 +98,16 @@ care about.
 // paste the equivalent on the new version
 ```
 
-**If you are automating the upgrade:** optional `sed`/`rg` one-liner or
-note about a `cargo fix --edition`-style tool if one applies.
+**Automation:** `manual` — {why no codemod applies: it needs new arguments, it
+is a configuration or behaviour change, it is only reachable inside a macro, ….
+For a change `autumn upgrade` *does* rewrite, use `auto` (safe by construction:
+renames and import moves) or `review` (rewritten, every site flagged for a
+human) instead, and name the shipped codemod id from
+`autumn-cli/src/upgrade/migrations.rs` in this paragraph.}
+
+Every breaking change carries this label — `scripts/check-migration-guides.sh`
+fails without it, and fails an `auto`/`review` label that names no shipped
+codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
 ---
 
@@ -161,17 +184,25 @@ commands with expected output, not "make sure everything works". Required by
 
 ### Guide-only upgrade walkthrough
 
-Upgrade an app scaffolded with `autumn new` on the **previous** release using
-only this guide — no changelog, no source reading — and record the result here
-before publishing to crates.io. See
-[`docs/release-checklist.md`](../release-checklist.md), *Migration Guide Gate*.
+(The heading keeps its historical name; the walk-through itself is
+codemod-first.) Upgrade an app scaffolded with `autumn new` on the **previous** release
+**codemod-first** — `autumn upgrade` before any manual step — using only this
+guide for what remains, and record the result here before publishing to
+crates.io. See [`docs/release-checklist.md`](../release-checklist.md),
+*Migration Guide Gate*.
 
+- **Codemod:** {the `autumn upgrade` invocation the walk-through ran first, and
+  what it covered. Required once this release ships any `auto`/`review`
+  codemod; the remaining manual steps below must be only the `review`/`manual`
+  changes.}
 - **Status:** pending
   {the value must *begin* with `performed YYYY-MM-DD` once the walk-through is
   done, or `backfilled` for a guide written after its release shipped;
   `pending` is accepted only while this file is still `next.md`}
 - **From → to:** `autumn-cli {X.Y.Z}` app upgraded to `autumn-web {X.Z.0}`
-- **Elapsed:** {minutes — the success metric is under 30}
+- **Elapsed:** {minutes — the budget is under 30 for a guide-only
+  walk-through, and under 10 once `autumn upgrade` covers this release's
+  rename-level changes (issue #1629)}
 - **Gaps found and fixed in this guide:** {none, or what the walk-through
   exposed}
 
