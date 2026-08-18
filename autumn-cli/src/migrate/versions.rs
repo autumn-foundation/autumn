@@ -94,11 +94,11 @@ fn git_refs(patterns: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// The number of branch heads currently on `origin`, from `git ls-remote
-/// --heads origin` -- a lightweight ref advertisement that transfers no
-/// objects, so it stays cheap even on a large repository. `None` when this
-/// cannot be determined (no network, no `origin` remote, no `git` on PATH);
-/// the caller then treats coverage as unknown, degrading the same as a
+/// Every branch name currently on `origin`, from `git ls-remote --heads
+/// origin` -- a lightweight ref advertisement that transfers no objects, so
+/// it stays cheap even on a large repository. `None` when this cannot be
+/// determined (no network, no `origin` remote, no `git` on PATH); the
+/// caller then treats coverage as unknown, degrading the same as a
 /// shallow/partial clone.
 ///
 /// This checks the actual remote state, not local configuration: `remote.
@@ -106,12 +106,15 @@ fn git_refs(patterns: &[&str]) -> Vec<String> {
 /// checkout commonly runs an explicit, narrower fetch (a specific ref, a
 /// shallow depth) that never consults that refspec at all -- so a config
 /// check can read "fetches every branch" while only one branch was ever
-/// actually retrieved. Comparing the real upstream branch count against
-/// what actually landed in `refs/remotes/origin/*` catches that case; a
-/// nonzero local ref count proves nothing on its own (`git clone
-/// --single-branch --branch main`, or an equivalent narrowed
-/// `actions/checkout` setup, leaves exactly one branch present).
-fn remote_branch_count() -> Option<usize> {
+/// actually retrieved.
+///
+/// Returns the branch **names**, not just a count: a long-lived local clone
+/// can retain a stale `refs/remotes/origin/<deleted-branch>` (nothing prunes
+/// it without an explicit `git fetch --prune`) while missing a
+/// newly-created branch, and the two counts can coincidentally still match
+/// -- so only comparing identities, not sizes, catches that a real branch
+/// this checkout has never seen is missing.
+fn remote_branch_names() -> Option<BTreeSet<String>> {
     let output = Command::new("git")
         .args(["ls-remote", "--heads", "origin"])
         .output()
@@ -122,8 +125,10 @@ fn remote_branch_count() -> Option<usize> {
     Some(
         String::from_utf8_lossy(&output.stdout)
             .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count(),
+            .filter_map(|line| line.rsplit('\t').next())
+            .filter_map(|refname| refname.strip_prefix("refs/heads/"))
+            .map(str::to_owned)
+            .collect(),
     )
 }
 
@@ -378,11 +383,29 @@ pub fn run_new(name: &str) {
     println!("{}", dir.display());
 }
 
-/// The remote-tracking ref for the repository's default branch
-/// (`refs/remotes/origin/HEAD`'s symbolic target), falling back to the first
-/// of a few common default-branch names that actually exists as a remote
-/// ref. `None` when neither resolves (e.g. no `origin` remote is
-/// configured).
+/// The remote-tracking ref for the repository's default branch.
+///
+/// Tries the local `refs/remotes/origin/HEAD` symref first (cheap, no
+/// network). Many checkouts never set it, though -- a shallow or
+/// partial CI clone commonly skips it entirely -- so this then asks the
+/// remote directly via `git ls-remote --symref origin HEAD`, which reports
+/// the SAME answer `origin/HEAD` would if it existed, for any default
+/// branch name whatsoever. Guessing from a fixed name list (`main`,
+/// `trunk`, ...) instead of asking would silently misresolve any repo whose
+/// default branch is not one of those names: `default_branch_entries` would
+/// then stay empty, and EVERY existing working-tree migration would be
+/// misclassified as introduced by the current checkout -- so a pre-existing
+/// collision between the real default branch and some other already-merged
+/// branch would fail every unrelated PR's gate, not just the one that
+/// actually caused it.
+///
+/// `None` when neither resolves (e.g. no `origin` remote, no network, no
+/// `git` on PATH) -- the caller then treats every working-tree migration as
+/// introduced by this checkout, which is the safe direction only in the
+/// sense that it never hides a real collision (it can still misattribute
+/// one to the wrong checkout, but that is what `remote_branch_names`
+/// returning `None` already puts the caller on notice about via the
+/// coverage warning).
 fn resolve_default_branch_ref() -> Option<String> {
     if let Ok(output) = Command::new("git")
         .args(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
@@ -394,6 +417,9 @@ fn resolve_default_branch_ref() -> Option<String> {
             return Some(r);
         }
     }
+    if let Some(branch) = remote_head_branch() {
+        return Some(format!("refs/remotes/origin/{branch}"));
+    }
     ["main", "master", "trunk", "trunk-dev"]
         .into_iter()
         .map(|name| format!("refs/remotes/origin/{name}"))
@@ -402,6 +428,29 @@ fn resolve_default_branch_ref() -> Option<String> {
                 .args(["show-ref", "--verify", "--quiet", r])
                 .status()
                 .is_ok_and(|s| s.success())
+        })
+}
+
+/// `origin`'s actual default branch name, resolved directly from the
+/// remote via `git ls-remote --symref origin HEAD` -- the same lightweight,
+/// no-objects-transferred query `remote_branch_names` already uses. Its
+/// output includes a `ref: refs/heads/<name>\tHEAD` line naming the
+/// branch `HEAD` points at; `None` when that line is absent (a remote with
+/// a detached/unset HEAD, or the query itself failing).
+fn remote_head_branch() -> Option<String> {
+    let output = Command::new("git")
+        .args(["ls-remote", "--symref", "origin", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("ref: ")?;
+            let refname = rest.split('\t').next()?;
+            refname.strip_prefix("refs/heads/").map(str::to_owned)
         })
 }
 
@@ -470,18 +519,28 @@ pub fn run_check_collisions() {
     }
 
     // `refs_seen > 0` alone does not mean every branch was fetched -- see
-    // `remote_branch_count`. Both failure modes (nothing fetched at all, or
+    // `remote_branch_names`. Both failure modes (nothing fetched at all, or
     // only a narrowed subset) get the same loud warning and the same
     // working-tree-only degrade, since either one means a real collision on
     // an unfetched branch would go undetected.
-    let local_origin_branches = remote_refs
+    //
+    // Compares NAME SETS, not counts: a stale local `refs/remotes/origin/*`
+    // for a since-deleted branch (nothing prunes it without `git fetch
+    // --prune`) can keep the local ref COUNT matching the remote's even
+    // while a genuinely new branch is missing -- coverage means every
+    // advertised branch has a local ref, not merely the same tally. Extra
+    // local refs (stale ones) are harmless here: this checker only reads
+    // them, so a leftover ref for a deleted branch costs nothing beyond
+    // checking a branch that no longer matters.
+    let local_origin_branches: BTreeSet<String> = remote_refs
         .iter()
-        .filter(|r| {
-            r.starts_with("refs/remotes/origin/") && r.as_str() != "refs/remotes/origin/HEAD"
-        })
-        .count();
-    let full_branch_coverage = remote_branch_count()
-        .is_some_and(|remote_total| remote_total > 0 && local_origin_branches >= remote_total);
+        .filter_map(|r| r.strip_prefix("refs/remotes/origin/"))
+        .filter(|name| *name != "HEAD")
+        .map(str::to_owned)
+        .collect();
+    let full_branch_coverage = remote_branch_names().is_some_and(|remote_branches| {
+        !remote_branches.is_empty() && remote_branches.is_subset(&local_origin_branches)
+    });
     if !full_branch_coverage {
         eprintln!(
             "\nWARNING: this clone does not have every branch's refs available, so ONLY the\n\

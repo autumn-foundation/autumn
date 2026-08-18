@@ -8967,9 +8967,21 @@ fn log_migration_version_collisions(
     directory_migration_required: bool,
     shard_map_migration_required: bool,
 ) -> bool {
+    // FRAMEWORK_MIGRATIONS is included unconditionally, not just when the app
+    // happens to have registered it: `autumn new`'s scaffold only calls
+    // `.migrations(MIGRATIONS)` (the app's own set), never
+    // `.migrations(FRAMEWORK_MIGRATIONS)`, so for a typical generated app
+    // `migrations` never contains it at all -- `autumn migrate` applies it
+    // separately. Without this, a plugin migration sharing a version with an
+    // actual framework migration would compare against nothing here and slip
+    // through the one guard meant to catch exactly that. Re-registering the
+    // same migration twice (an app that DOES also call
+    // `.migrations(FRAMEWORK_MIGRATIONS)`, e.g. some examples) is harmless --
+    // see `check_migration_version_collisions`'s same-name handling.
     let collisions = crate::migrate::check_migration_version_collisions(
         migrations
             .iter()
+            .chain(std::iter::once(&crate::migrate::FRAMEWORK_MIGRATIONS))
             .chain(
                 directory_migration_required
                     .then_some(&crate::sharding::SHARD_DIRECTORY_MIGRATIONS),
