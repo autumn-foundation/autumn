@@ -1663,3 +1663,42 @@ fn an_environment_target_redirect_wins_over_a_nested_config() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn a_nested_workspaces_member_resolves_against_its_own_workspace() {
+    // A whole workspace sitting inside the scanned tree. Its member inherits
+    // with the literal key, and the entry lives in `tools/ws/Cargo.toml` --
+    // *between* the member and the scan root. Resolving inheritance from the
+    // scan root's ancestors instead of the member's finds nothing, and an
+    // unresolved literal `autumn-web` is treated as a declaration with no
+    // readable version, which fails detection for the entire run.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"0.6.0\"\n",
+    );
+    write(tmp.path(), "src/main.rs", "fn main() {}\n");
+    write(
+        tmp.path(),
+        "tools/ws/Cargo.toml",
+        "[workspace]\nmembers = [\"api\"]\n\n\
+         [workspace.dependencies]\nautumn-web = \"0.5.0\"\n",
+    );
+    write(
+        tmp.path(),
+        "tools/ws/api/Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = { workspace = true }\n",
+    );
+    write(tmp.path(), "tools/ws/api/src/lib.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "tools/ws/api/src/lib.rs").contains("with_pool_untracked("),
+        "the nested workspace's own entry records 0.5.0:\n{}",
+        report(&output)
+    );
+}

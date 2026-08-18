@@ -481,22 +481,29 @@ fn recorded_version(root: &Path) -> Option<String> {
     // 0.5.0 -> 0.6.0 migration selected.
     use crate::doctor::AutumnWebDependency;
 
-    // `{ workspace = true }` resolves against the enclosing workspace, and that
-    // manifest is *above* the scan when the command is pointed at a member
-    // directory. Cargo walks up to find it; not doing so aborted a member with
-    // "cannot tell which version" over a version Cargo resolves fine.
-    // Canonicalised first: the scan root is usually the relative `.`, and
-    // `Path::new(".").ancestors()` yields only `.` — the walk upward would
-    // never leave the member directory it was pointed at.
-    let absolute_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // `{ workspace = true }` resolves against the enclosing workspace, and Cargo
+    // finds that manifest by walking *up from the crate that inherits*. Not
+    // doing so aborted a member with "cannot tell which version" over a version
+    // Cargo resolves fine.
+    //
+    // Up from the crate, not up from the scan root: a whole workspace can sit
+    // inside the scanned tree, and then the entry its members inherit lives
+    // between them and the root. Searching the root's ancestors misses it, and
+    // an unresolved literal `autumn-web` reads as a declaration with no version
+    // — which fails detection for the entire run, not just that member.
+    //
     // By the member's own key, not by the crate name: `autumn = { workspace =
     // true }` paired with a renamed workspace entry is the shape where nothing
     // on the member side mentions `autumn-web` at all.
-    let inherited = |key: &str| {
-        absolute_root
+    fn inherited(from: &Path, key: &str) -> Option<AutumnWebDependency> {
+        // Canonicalised first: the scan root is usually the relative `.`, and
+        // `Path::new(".").ancestors()` yields only `.` — the walk upward would
+        // never leave the directory it started in.
+        let absolute = std::fs::canonicalize(from).unwrap_or_else(|_| from.to_path_buf());
+        absolute
             .ancestors()
             .find_map(|ancestor| crate::doctor::workspace_dependency_for(ancestor, key))
-    };
+    }
 
     let mut lowest: Option<(Version, String)> = None;
     for directory in std::iter::once(root.to_path_buf()).chain(member_manifests(root)) {
@@ -515,7 +522,7 @@ fn recorded_version(root: &Path) -> Option<String> {
                 // true }` entry is collected because the member side cannot
                 // tell them apart, and this is where the ones that are not
                 // autumn-web drop out.
-                AutumnWebDependency::Inherited(key) => match inherited(&key) {
+                AutumnWebDependency::Inherited(key) => match inherited(&directory, &key) {
                     Some(resolved) => resolved,
                     None if key == "autumn-web" => AutumnWebDependency::WithoutVersion,
                     None => continue,
