@@ -85,13 +85,44 @@ pub struct FileReport {
     pub absolute: PathBuf,
 }
 
+/// What became of the planned rewrites.
+///
+/// A partial apply is its own state rather than a `false`: reporting "nothing
+/// was written" after some files were already rewritten is the one message
+/// that could send someone looking in the wrong place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Preview only — nothing was written.
+    Preview,
+    /// Every planned file was written.
+    Applied,
+    /// The apply step failed partway. This many files were already written.
+    Partial { written: usize },
+}
+
+impl Outcome {
+    /// Whether anything at all reached the disk.
+    pub const fn wrote_anything(self) -> bool {
+        matches!(self, Self::Applied | Self::Partial { .. })
+    }
+
+    /// The label used in `--json`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Preview => "preview",
+            Self::Applied => "applied",
+            Self::Partial { .. } => "partial",
+        }
+    }
+}
+
 /// Everything one `autumn upgrade` run found.
 #[derive(Debug, Clone)]
 pub struct Report {
     pub from: Version,
     pub to: Version,
-    /// Whether the rewrites were written to disk.
-    pub applied: bool,
+    /// What the apply step actually did.
+    pub outcome: Outcome,
     /// `.rs` files read.
     pub files_scanned: usize,
     /// Migrations selected for this version range.
@@ -215,10 +246,10 @@ fn render_diffs(out: &mut String, report: &Report) {
     let _ = writeln!(
         out,
         "\n{}:",
-        if report.applied {
-            "Applied"
-        } else {
-            "Preview (nothing is written without --apply)"
+        match report.outcome {
+            Outcome::Applied => "Applied",
+            Outcome::Partial { .. } => "Applied in part — see the error below",
+            Outcome::Preview => "Preview (nothing is written without --apply)",
         }
     );
     for file in &report.files {
@@ -275,7 +306,7 @@ fn render_summary(out: &mut String, report: &Report) {
             "\n{sites} site{} in {files} file{} {}; {} file(s) scanned.",
             plural(sites),
             plural(files),
-            if report.applied {
+            if report.outcome.wrote_anything() {
                 "rewritten"
             } else {
                 "would be rewritten"
@@ -283,7 +314,14 @@ fn render_summary(out: &mut String, report: &Report) {
             report.files_scanned
         );
     }
-    if report.applied {
+    if let Outcome::Partial { written } = report.outcome {
+        let _ = writeln!(
+            out,
+            "Partially applied: {written} file{} written before the run stopped. \
+             `git diff` shows exactly which.",
+            plural(written)
+        );
+    } else if report.outcome == Outcome::Applied {
         if sites > 0 {
             let _ = writeln!(out, "Review the result with `git diff` before committing.");
         }
@@ -369,7 +407,15 @@ pub fn render_json(report: &Report) -> String {
     let value = serde_json::json!({
         "from": report.from.to_string(),
         "to": report.to.to_string(),
-        "applied": report.applied,
+        "outcome": report.outcome.label(),
+        // Kept as a bool for anything already reading it; true only for a
+        // *complete* apply, with `outcome` carrying the partial case.
+        "applied": report.outcome == Outcome::Applied,
+        "files_written": match report.outcome {
+            Outcome::Partial { written } => written,
+            Outcome::Applied => report.files.len(),
+            Outcome::Preview => 0,
+        },
         "files_scanned": report.files_scanned,
         "rewritten_sites": report.rewritten_sites(),
         "migrations": migrations_json(&report.migrations),
@@ -386,23 +432,23 @@ pub fn render_json(report: &Report) -> String {
 
 /// Read the `autumn-web` requirement recorded by the app at `root`.
 ///
-/// The root manifest answers first — `[dependencies]` then
-/// `[workspace.dependencies]`, so a workspace that pins the version once for
-/// its members speaks for the whole tree. A *virtual* workspace root declares
-/// neither: its members each carry their own `autumn-web` line, and reading
-/// only the root would abort a perfectly ordinary layout with "cannot tell
-/// which version".
+/// The root manifest (`[dependencies]`, then `[workspace.dependencies]`) and
+/// every member manifest are read together. A *virtual* workspace root
+/// declares neither, so reading only the root would abort a perfectly ordinary
+/// layout with "cannot tell which version"; and a root that *does* declare one
+/// can still be paired with a member that pins something older.
 ///
-/// When members disagree, the **oldest** floor wins. That is the conservative
+/// When they disagree, the **oldest** floor wins. That is the conservative
 /// answer: a migration for a release a member is already past finds nothing to
 /// do in that member (the rename it applies has already been applied), while
 /// taking the newest floor would skip a member that is genuinely behind.
 fn recorded_version(root: &Path) -> Option<String> {
-    if let Some(version) = crate::doctor::read_autumn_web_version_at(root) {
-        return Some(version);
-    }
-    member_manifests(root)
-        .into_iter()
+    // The root and the members are read *together*. Returning early on the
+    // root would let a workspace whose root records 0.6.0 hide a member that
+    // still pins 0.5.0 — the walk then migrates that member's source with no
+    // 0.5.0 -> 0.6.0 migration selected.
+    std::iter::once(root.to_path_buf())
+        .chain(member_manifests(root))
         .filter_map(|directory| crate::doctor::read_autumn_web_version_at(&directory))
         .filter_map(|requirement| {
             migrations::parse_version_req(&requirement).map(|version| (version, requirement))
@@ -530,7 +576,7 @@ fn plan_with(
     let mut report = Report {
         from,
         to,
-        applied: false,
+        outcome: Outcome::Preview,
         files_scanned: 0,
         migrations: selected.to_vec(),
         files: Vec::new(),
@@ -644,10 +690,11 @@ fn plan_with(
 /// original, so an interrupted write leaves the original intact rather than a
 /// truncated source file.
 fn write_plan(report: &Report) -> Result<(), WriteFailure> {
-    for file in &report.files {
+    for (written, file) in report.files.iter().enumerate() {
         write_one(file).map_err(|error| WriteFailure {
             path: file.path.clone(),
             error,
+            written,
         })?;
     }
     Ok(())
@@ -660,6 +707,8 @@ fn write_plan(report: &Report) -> Result<(), WriteFailure> {
 struct WriteFailure {
     path: String,
     error: std::io::Error,
+    /// Files successfully written before this one.
+    written: usize,
 }
 
 /// Write one file through a sibling temporary file renamed over the original.
@@ -760,13 +809,19 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
     let mut report = plan(root, from, to);
     let mut failure = None;
     if opts.apply {
-        report.applied = true;
-        if let Err(write_failure) = write_plan(&report) {
-            // Report first, fail second: a partial apply is exactly when the
-            // user most needs to see which files were in the plan and which one
-            // stopped it.
-            report.applied = false;
-            failure = Some(write_failure);
+        match write_plan(&report) {
+            Ok(()) => report.outcome = Outcome::Applied,
+            Err(write_failure) => {
+                // Report first, fail second: a partial apply is exactly when
+                // the user most needs to see which files were in the plan and
+                // which one stopped it — and saying "nothing was written" when
+                // some files already changed would be worse than saying
+                // nothing at all.
+                report.outcome = Outcome::Partial {
+                    written: write_failure.written,
+                };
+                failure = Some(write_failure);
+            }
         }
     }
 
@@ -776,7 +831,7 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
         print!("{}", render_text(&report));
     }
 
-    if let Some(WriteFailure { path, error }) = failure {
+    if let Some(WriteFailure { path, error, .. }) = failure {
         eprintln!(
             "autumn upgrade: failed while writing {path}: {error}\n\
              Files listed before it in the report above were already written; \
@@ -803,6 +858,7 @@ mod tests {
             to: "with_pool_untracked",
             form: CallForm::AssociatedFunction,
             args: 1,
+            receiver: None,
         },
     };
 
@@ -823,11 +879,11 @@ mod tests {
         }
     }
 
-    fn sample(applied: bool) -> Report {
+    fn sample(outcome: Outcome) -> Report {
         Report {
             from: version(0, 5, 0),
             to: version(0, 6, 0),
-            applied,
+            outcome,
             files_scanned: 7,
             migrations: vec![&AUTO, &MANUAL],
             files: vec![FileReport {
@@ -863,11 +919,11 @@ mod tests {
         }
     }
 
-    fn empty(applied: bool) -> Report {
+    fn empty(outcome: Outcome) -> Report {
         Report {
             from: version(0, 6, 0),
             to: version(0, 6, 0),
-            applied,
+            outcome,
             files_scanned: 3,
             migrations: Vec::new(),
             files: Vec::new(),
@@ -879,13 +935,13 @@ mod tests {
 
     #[test]
     fn rewritten_sites_totals_every_file() {
-        assert_eq!(sample(false).rewritten_sites(), 1);
-        assert_eq!(empty(false).rewritten_sites(), 0);
+        assert_eq!(sample(Outcome::Preview).rewritten_sites(), 1);
+        assert_eq!(empty(Outcome::Preview).rewritten_sites(), 0);
     }
 
     #[test]
     fn preview_text_shows_the_diff_the_counts_and_that_nothing_was_written() {
-        let out = render_text(&sample(false));
+        let out = render_text(&sample(Outcome::Preview));
         assert!(out.contains("src/main.rs"), "{out}");
         assert!(out.contains("@@ line 12 @@"), "{out}");
         assert!(out.contains("1 site"), "site count is reported: {out}");
@@ -898,7 +954,7 @@ mod tests {
 
     #[test]
     fn preview_text_lists_every_manual_site_with_location_and_guide() {
-        let out = render_text(&sample(false));
+        let out = render_text(&sample(Outcome::Preview));
         assert!(out.contains("src/lib.rs:40"), "{out}");
         assert!(out.contains("inside a macro invocation"), "{out}");
         assert!(out.contains("docs/migrations/0.6.0.md#rename"), "{out}");
@@ -907,7 +963,7 @@ mod tests {
 
     #[test]
     fn preview_text_labels_each_selected_migration_with_its_confidence() {
-        let out = render_text(&sample(false));
+        let out = render_text(&sample(Outcome::Preview));
         // The fixture ids deliberately contain neither word, so these can only
         // pass if the label column is actually rendered.
         assert!(out.contains("auto    0.6.0-pool-rename"), "{out}");
@@ -916,21 +972,21 @@ mod tests {
 
     #[test]
     fn preview_text_reports_skipped_files() {
-        let out = render_text(&sample(false));
+        let out = render_text(&sample(Outcome::Preview));
         assert!(out.contains("src/broken.rs"), "{out}");
         assert!(out.contains("expected `{`"), "{out}");
     }
 
     #[test]
     fn applied_text_says_what_was_written_and_not_what_would_be() {
-        let out = render_text(&sample(true));
+        let out = render_text(&sample(Outcome::Applied));
         assert!(!out.to_lowercase().contains("nothing was written"), "{out}");
         assert!(out.contains("1 site in 1 file rewritten"), "{out}");
     }
 
     #[test]
     fn an_unaffected_app_reports_nothing_to_change() {
-        let out = render_text(&empty(false));
+        let out = render_text(&empty(Outcome::Preview));
         assert!(
             out.to_lowercase().contains("nothing to change"),
             "an app that never used the affected APIs must say so plainly: {out}"
@@ -949,6 +1005,7 @@ mod tests {
             to: "with_pool_untracked",
             form: CallForm::AssociatedFunction,
             args: 1,
+            receiver: None,
         },
     };
 
@@ -1014,7 +1071,7 @@ mod tests {
 
     #[test]
     fn json_report_carries_the_range_counts_and_labels() {
-        let out = render_json(&sample(false));
+        let out = render_json(&sample(Outcome::Preview));
         let value: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(value["from"], "0.5.0");
         assert_eq!(value["to"], "0.6.0");
@@ -1031,10 +1088,60 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_apply_never_claims_nothing_was_written() {
+        // The failure mode this guards: some files already rewritten, and the
+        // report telling the user to "re-run with --apply" as if the tree were
+        // untouched.
+        let mut report = sample(Outcome::Preview);
+        report.outcome = Outcome::Partial { written: 3 };
+
+        let text = render_text(&report);
+        assert!(
+            text.contains("Partially applied: 3 files written"),
+            "{text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("nothing was written"),
+            "the tree was modified: {text}"
+        );
+        assert!(
+            !text.contains("Re-run with `--apply`"),
+            "the apply step already ran: {text}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json(&report)).expect("valid JSON");
+        assert_eq!(json["outcome"], "partial");
+        assert_eq!(json["files_written"], 3);
+        assert_eq!(
+            json["applied"], false,
+            "`applied` stays a strict did-everything-land flag"
+        );
+    }
+
+    #[test]
+    fn a_complete_apply_reports_every_file_it_wrote() {
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json(&sample(Outcome::Applied))).expect("valid JSON");
+        assert_eq!(json["outcome"], "applied");
+        assert_eq!(json["applied"], true);
+        assert_eq!(json["files_written"], 1);
+    }
+
+    #[test]
+    fn a_preview_wrote_nothing_and_says_so_in_json() {
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json(&sample(Outcome::Preview))).expect("valid JSON");
+        assert_eq!(json["outcome"], "preview");
+        assert_eq!(json["applied"], false);
+        assert_eq!(json["files_written"], 0);
+    }
+
+    #[test]
     fn json_report_omits_the_rewritten_file_bodies() {
         // The report is a summary, not a payload: dumping every rewritten file
         // into it would make `--json` unusable on a real app.
-        let out = render_json(&sample(false));
+        let out = render_json(&sample(Outcome::Preview));
         assert!(!out.contains("\"updated\""), "{out}");
     }
 }

@@ -41,11 +41,11 @@ Preview (nothing is written without --apply):
 
 src/repositories.rs (2 sites)
 @@ line 12 @@
--    let repo = PostRepository::with_pool(pool.clone());
-+    let repo = PostRepository::with_pool_untracked(pool.clone());
+-    let repo = PgPostRepository::with_pool(pool.clone());
++    let repo = PgPostRepository::with_pool_untracked(pool.clone());
 @@ line 18 @@
--    let repo = CommentRepository::with_pool(pool.clone());
-+    let repo = CommentRepository::with_pool_untracked(pool.clone());
+-    let repo = PgCommentRepository::with_pool(pool.clone());
++    let repo = PgCommentRepository::with_pool_untracked(pool.clone());
 
 Manual - not rewritten; read the guide section:
   (whole change)  0.6.0-tenancy-jwt-secret-secretstring (no machine-applyable rewrite)
@@ -145,12 +145,23 @@ one argument, so only `Repo::with_pool(pool)` matches — `state.with_pool(pool)
 and the UFCS `AppState::with_pool(state, pool)` are provably different
 functions and are left alone.
 
-What remains is a same-named API in *your* code with the same form and arity:
-a one-argument associated `with_pool` on a type of your own would be rewritten.
-This is why preview is the default and why the diff names every file and line —
-read it before you `--apply`, and `git diff` after. It is also the line the
-`auto` label draws: a change that needs to know a receiver's type is labelled
-`review` or `manual`, never `auto`.
+The receiver narrows it further. `#[repository]` names its concrete type
+`Pg` + the trait name, so only a `PgSomething::with_pool(pool)` call is
+rewritten — your own `Cache::with_pool(pool)` is not. A receiver that does not
+match is *reported* rather than dropped, because an aliased import
+(`use PgPostRepository as Repo;`) would look the same from the outside:
+
+```text
+Manual - not rewritten; read the guide section:
+  src/cache.rs:18  0.6.0-repository-with-pool-untracked (receiver is not a generated repository)
+```
+
+What remains is an app type named `Pg…` with a one-argument associated
+`with_pool` of its own. This is why preview is the default and why the diff
+names every file and line — read it before you `--apply`, and `git diff` after.
+It is also the line the `auto` label draws: a change that needs to know a
+receiver's *type* rather than its name is labelled `review` or `manual`, never
+`auto`.
 
 Symlinked source files are not followed. Rewriting through a link could write
 outside the project, so a symlink is left alone; if your app keeps real source

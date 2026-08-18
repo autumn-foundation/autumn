@@ -69,11 +69,11 @@ const USES_WITH_POOL: &str = r"use autumn_web::prelude::*;
 
 pub fn build(pool: Pool) -> PostRepository {
     // Historically this was `with_pool`.
-    PostRepository::with_pool(pool.clone())
+    PgPostRepository::with_pool(pool.clone())
 }
 
 pub fn build_two(pool: Pool) -> CommentRepository {
-    let repo = CommentRepository::with_pool(pool);
+    let repo = PgCommentRepository::with_pool(pool);
     repo
 }
 ";
@@ -115,7 +115,7 @@ fn apply_rewrites_every_call_site() {
 
     let after = read(tmp.path(), "src/main.rs");
     assert!(
-        !after.contains("PostRepository::with_pool("),
+        !after.contains("PgPostRepository::with_pool("),
         "no bare `with_pool` call site remains:\n{after}"
     );
     assert_eq!(
@@ -180,7 +180,7 @@ fn macro_call_sites_are_listed_as_manual_with_file_and_line() {
     write(
         tmp.path(),
         "src/lib.rs",
-        "pub fn f(pool: Pool) {\n    make_repo! { PostRepository::with_pool(pool) }\n}\n",
+        "pub fn f(pool: Pool) {\n    make_repo! { PgPostRepository::with_pool(pool) }\n}\n",
     );
 
     let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
@@ -198,7 +198,7 @@ fn macro_call_sites_are_listed_as_manual_with_file_and_line() {
         "the guide is linked: {out}"
     );
     assert!(
-        read(tmp.path(), "src/lib.rs").contains("PostRepository::with_pool(pool)"),
+        read(tmp.path(), "src/lib.rs").contains("PgPostRepository::with_pool(pool)"),
         "a macro body is never rewritten"
     );
 }
@@ -234,7 +234,7 @@ fn the_version_range_is_read_from_the_apps_cargo_manifest() {
         report(&output)
     );
     assert!(
-        read(tmp.path(), "src/main.rs").contains("PostRepository::with_pool(pool.clone())"),
+        read(tmp.path(), "src/main.rs").contains("PgPostRepository::with_pool(pool.clone())"),
         "nothing was rewritten"
     );
 }
@@ -254,7 +254,7 @@ fn an_undetectable_version_asks_for_from_instead_of_guessing() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--from"), "{stderr}");
     assert!(
-        read(tmp.path(), "src/main.rs").contains("PostRepository::with_pool(pool.clone())"),
+        read(tmp.path(), "src/main.rs").contains("PgPostRepository::with_pool(pool.clone())"),
         "a run that cannot determine its range must not rewrite anything"
     );
 }
@@ -535,8 +535,8 @@ fn a_file_with_both_rewritable_and_macro_sites_gets_both_treatments() {
     write(
         tmp.path(),
         "src/main.rs",
-        "pub fn a(pool: Pool) -> Repo {\n    Repo::with_pool(pool)\n}\n\n\
-         pub fn b(pool: Pool) {\n    make_repo! { Repo::with_pool(pool) }\n}\n",
+        "pub fn a(pool: Pool) -> Repo {\n    PgRepo::with_pool(pool)\n}\n\n\
+         pub fn b(pool: Pool) {\n    make_repo! { PgRepo::with_pool(pool) }\n}\n",
     );
 
     let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
@@ -544,11 +544,11 @@ fn a_file_with_both_rewritable_and_macro_sites_gets_both_treatments() {
 
     let after = read(tmp.path(), "src/main.rs");
     assert!(
-        after.contains("Repo::with_pool_untracked(pool)\n}"),
+        after.contains("PgRepo::with_pool_untracked(pool)\n}"),
         "the reachable site is rewritten:\n{after}"
     );
     assert!(
-        after.contains("make_repo! { Repo::with_pool(pool) }"),
+        after.contains("make_repo! { PgRepo::with_pool(pool) }"),
         "the macro body is left alone:\n{after}"
     );
     let out = stdout_of(&output);
@@ -566,7 +566,7 @@ fn a_function_reference_that_is_never_called_is_reported_not_skipped() {
     write(
         tmp.path(),
         "src/main.rs",
-        "pub fn a(xs: Vec<Pool>) {\n    xs.into_iter().map(Repo::with_pool);\n}\n",
+        "pub fn a(xs: Vec<Pool>) {\n    xs.into_iter().map(PgRepo::with_pool);\n}\n",
     );
 
     let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
@@ -575,7 +575,7 @@ fn a_function_reference_that_is_never_called_is_reported_not_skipped() {
     assert!(out.contains("src/main.rs:2"), "{out}");
     assert!(out.contains("referenced without being called"), "{out}");
     assert!(
-        read(tmp.path(), "src/main.rs").contains("map(Repo::with_pool)"),
+        read(tmp.path(), "src/main.rs").contains("map(PgRepo::with_pool)"),
         "a reference is reported, never rewritten"
     );
 }
@@ -719,7 +719,7 @@ fn a_preview_whose_every_site_is_manual_does_not_offer_apply() {
     write(
         tmp.path(),
         "src/lib.rs",
-        "pub fn f(pool: Pool) {\n    make_repo! { Repo::with_pool(pool) }\n}\n",
+        "pub fn f(pool: Pool) {\n    make_repo! { PgRepo::with_pool(pool) }\n}\n",
     );
 
     let output = run_upgrade(tmp.path(), &["--to", "0.6.0"]);
@@ -744,7 +744,7 @@ fn a_same_named_framework_builder_method_is_never_rewritten() {
         tmp.path(),
         "src/main.rs",
         "pub fn setup(state: AppState, pool: Pool) -> AppState {\n\
-        \x20   let repo = PostRepository::with_pool(pool.clone());\n\
+        \x20   let repo = PgPostRepository::with_pool(pool.clone());\n\
         \x20   drop(repo);\n\
         \x20   state.with_pool(pool)\n\
          }\n",
@@ -755,7 +755,7 @@ fn a_same_named_framework_builder_method_is_never_rewritten() {
 
     let after = read(tmp.path(), "src/main.rs");
     assert!(
-        after.contains("PostRepository::with_pool_untracked(pool.clone())"),
+        after.contains("PgPostRepository::with_pool_untracked(pool.clone())"),
         "the repository constructor is migrated:\n{after}"
     );
     assert!(
@@ -850,5 +850,67 @@ fn members_on_different_versions_take_the_oldest_floor() {
     assert!(
         read(tmp.path(), "old/src/lib.rs").contains("with_pool_untracked("),
         "the member still on 0.5.0 is migrated"
+    );
+}
+
+#[test]
+fn a_member_pinned_behind_the_workspace_root_still_decides_the_floor() {
+    // The root records 0.6.0 but one member is still on 0.5.0. Taking the root
+    // alone would select no migration while happily scanning that member's
+    // source, leaving it unmigrated.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"api\", \"legacy\"]\n\n\
+         [workspace.dependencies]\nautumn-web = \"0.6.0\"\n",
+    );
+    write(
+        tmp.path(),
+        "api/Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = { workspace = true }\n",
+    );
+    write(tmp.path(), "api/src/lib.rs", "pub fn f() {}\n");
+    write(
+        tmp.path(),
+        "legacy/Cargo.toml",
+        "[package]\nname = \"legacy\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"0.5.0\"\n",
+    );
+    write(tmp.path(), "legacy/src/lib.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "legacy/src/lib.rs").contains("with_pool_untracked("),
+        "the member still on 0.5.0 must be migrated:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn an_unrelated_type_with_the_same_associated_function_is_reported_not_rewritten() {
+    // `#[repository]` names its concrete type `Pg{trait}`, so an app's own
+    // `Cache::with_pool(pool)` is not the renamed constructor — but it is
+    // reported, because an aliased import would look identical.
+    let tmp = app("0.5.0");
+    write(
+        tmp.path(),
+        "src/cache.rs",
+        "pub fn build(pool: Pool) -> Cache {\n    Cache::with_pool(pool)\n}\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/cache.rs").contains("Cache::with_pool(pool)"),
+        "an unrelated type must not be rewritten"
+    );
+    let out = stdout_of(&output);
+    assert!(out.contains("src/cache.rs:2"), "the site is named: {out}");
+    assert!(
+        out.contains("receiver is not a generated repository"),
+        "and the reason is given: {out}"
     );
 }

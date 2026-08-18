@@ -75,6 +75,16 @@ pub enum Rewrite {
         form: CallForm,
         /// Exact number of top-level arguments the function takes.
         args: usize,
+        /// Required prefix on the receiver path segment, when the framework
+        /// names the type carrying this function.
+        ///
+        /// `#[repository]` emits its concrete type as `format_ident!("Pg{trait}")`
+        /// — every generated repository is `PgPostRepository`, `PgBookmarkRepository`,
+        /// and so on — so a genuine call site reads `PgFooRepository::with_pool(pool)`.
+        /// Requiring the prefix keeps an app's own `Cache::with_pool(pool)` out of
+        /// the rewrite. A receiver that does not match is *reported*, not skipped:
+        /// it could be an aliased import.
+        receiver: Option<&'static str>,
     },
     /// Nothing is rewritten; the change is reported with its guide link so the
     /// user still sees it in the upgrade summary.
@@ -190,6 +200,7 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
             // still carry the old name and must not be touched.
             form: CallForm::AssociatedFunction,
             args: 1,
+            receiver: Some("Pg"),
         },
     },
 ];
@@ -429,6 +440,7 @@ mod tests {
                 to: "new",
                 form: CallForm::AssociatedFunction,
                 args: 1,
+                receiver: None,
             },
         },
         AppMigration {
@@ -442,6 +454,7 @@ mod tests {
                 to: "newer",
                 form: CallForm::AssociatedFunction,
                 args: 1,
+                receiver: None,
             },
         },
     ];
@@ -557,6 +570,7 @@ mod tests {
                 to: "with_pool_untracked",
                 form: CallForm::AssociatedFunction,
                 args: 1,
+                receiver: Some("Pg"),
             }
         );
     }
