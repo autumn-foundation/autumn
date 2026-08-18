@@ -1640,8 +1640,16 @@ impl TestApp {
     #[must_use]
     #[cfg_attr(not(feature = "inbound-mail"), allow(unused_mut))]
     pub fn build(mut self) -> TestClient {
-        // Reset the global cache to prevent cross-test contamination.
-        crate::cache::clear_global_cache();
+        // Reset the global cache to prevent cross-test contamination. Briefly
+        // held so this can't land mid-flight inside another same-process
+        // test's own global-cache critical section (issue #2218) — see
+        // `GLOBAL_CACHE_TEST_LOCK`'s doc comment.
+        {
+            let _guard = crate::cache::GLOBAL_CACHE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::cache::clear_global_cache();
+        }
         // Reset the global event bus so a prior test's listeners/recorder do not
         // leak into this one (it is re-installed below).
         crate::events::clear_global_event_bus();
