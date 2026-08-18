@@ -610,16 +610,21 @@ pub fn generated_repository_types(source: &str) -> Vec<(String, Vec<String>)> {
 /// `struct PgAuditRepository` in another has two different types spelled the
 /// same, and an unqualified call cannot be attributed to either.
 #[must_use]
-pub fn defined_type_names(source: &str) -> Vec<String> {
+pub fn defined_type_names(source: &str) -> Vec<(String, Vec<String>)> {
     let Ok(stream) = source.parse::<TokenStream>() else {
         return Vec::new();
     };
     let mut found = Vec::new();
-    collect_defined_types(&stream, Context::Code, &mut found);
+    collect_defined_types(&stream, Context::Code, &[], &mut found);
     found
 }
 
-fn collect_defined_types(stream: &TokenStream, context: Context, found: &mut Vec<String>) {
+fn collect_defined_types(
+    stream: &TokenStream,
+    context: Context,
+    module: &[String],
+    found: &mut Vec<(String, Vec<String>)>,
+) {
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
     for (index, tree) in trees.iter().enumerate() {
         match tree {
@@ -628,20 +633,26 @@ fn collect_defined_types(stream: &TokenStream, context: Context, found: &mut Vec
                     && matches!(keyword.to_string().as_str(), "struct" | "enum" | "union") =>
             {
                 if let Some(TokenTree::Ident(name)) = trees.get(index + 1) {
-                    found.push(name.to_string());
+                    found.push((name.to_string(), module.to_vec()));
                 }
             }
             // `type Alias = …;`, but not the `type` of an associated item
             // binding, which is followed by `=` only after a generic list.
             TokenTree::Ident(keyword) if context == Context::Code && keyword == "type" => {
                 if let Some(TokenTree::Ident(name)) = trees.get(index + 1) {
-                    found.push(name.to_string());
+                    found.push((name.to_string(), module.to_vec()));
                 }
             }
             TokenTree::Group(group) => {
+                let nested = module_name_before(&trees, index).map(|name| {
+                    let mut nested = module.to_vec();
+                    nested.push(name);
+                    nested
+                });
                 collect_defined_types(
                     &group.stream(),
                     group_context(&trees, index, context),
+                    nested.as_deref().unwrap_or(module),
                     found,
                 );
             }
@@ -659,9 +670,9 @@ fn collect_defined_types(stream: &TokenStream, context: Context, found: &mut Vec
 #[derive(Debug, Default)]
 pub struct GeneratedRepositories {
     declared: BTreeMap<String, BTreeSet<Vec<String>>>,
-    /// Names the scanned source defines as ordinary types. See
+    /// Names the scanned source defines as ordinary types, and where. See
     /// [`defined_type_names`].
-    handwritten: BTreeSet<String>,
+    handwritten: BTreeMap<String, BTreeSet<Vec<String>>>,
 }
 
 impl FromIterator<(String, Vec<String>)> for GeneratedRepositories {
@@ -672,7 +683,7 @@ impl FromIterator<(String, Vec<String>)> for GeneratedRepositories {
         }
         Self {
             declared,
-            handwritten: BTreeSet::new(),
+            handwritten: BTreeMap::new(),
         }
     }
 }
@@ -689,9 +700,21 @@ impl GeneratedRepositories {
     /// `repositories::…`, `crate::repositories::…` and a bare `…` inside that
     /// module all are. A qualifier naming a module that generates nothing —
     /// `custom::PgAuditRepository` — is not this type.
-    /// Record the type names the scanned source writes out itself.
-    pub fn note_handwritten<I: IntoIterator<Item = String>>(&mut self, names: I) {
-        self.handwritten.extend(names);
+    /// Record the type names the scanned source writes out itself, with the
+    /// module each is written in.
+    pub fn note_handwritten<I: IntoIterator<Item = (String, Vec<String>)>>(&mut self, names: I) {
+        for (name, module) in names {
+            self.handwritten.entry(name).or_default().insert(module);
+        }
+    }
+
+    /// Whether any recorded path ends with `qualifier`.
+    fn any_path_matches(paths: Option<&BTreeSet<Vec<String>>>, qualifier: &[String]) -> bool {
+        paths.is_some_and(|paths| {
+            paths
+                .iter()
+                .any(|path| path.len() >= qualifier.len() && path.ends_with(qualifier))
+        })
     }
 
     #[must_use]
@@ -713,11 +736,16 @@ impl GeneratedRepositories {
             // type of the same name anywhere in the scan makes it ambiguous —
             // including one in a different crate, since a `use` can bring
             // either spelling into scope unqualified. Reported, not guessed at.
-            return !self.handwritten.contains(name);
+            return !self.handwritten.contains_key(name);
         }
-        declared
-            .iter()
-            .any(|path| path.len() >= qualifier.len() && path.ends_with(&qualifier[..]))
+        // A qualifier narrows both sides equally. Module paths carry no crate
+        // identity, so `repositories::PgAuditRepository` can name a generated
+        // type in one crate and a hand-written one in another; when the
+        // qualifier fits both, it has decided nothing.
+        if Self::any_path_matches(self.handwritten.get(name), &qualifier) {
+            return false;
+        }
+        Self::any_path_matches(Some(declared), &qualifier)
     }
 }
 
@@ -1065,19 +1093,36 @@ mod tests {
             "with nothing else of that name, the generated type is the only reading"
         );
 
-        generated.note_handwritten(std::iter::once("PgAuditRepository".to_owned()));
+        generated.note_handwritten(std::iter::once((
+            "PgAuditRepository".to_owned(),
+            vec!["custom".to_owned()],
+        )));
         assert!(
             !generated.accepts("PgAuditRepository", &[]),
             "once the source writes out a type of that name the call is ambiguous"
         );
-        // A qualifier still decides it: the author said which module they meant.
+        // A qualifier still decides it when the two live in different modules:
+        // the author said which one they meant.
         assert!(generated.accepts("PgAuditRepository", &["repositories".to_owned()]));
+        assert!(!generated.accepts("PgAuditRepository", &["custom".to_owned()]));
+
+        // But a hand-written type at the *same* module path — another crate's
+        // `repositories`, since these paths carry no crate identity — leaves
+        // the qualifier deciding nothing.
+        generated.note_handwritten(std::iter::once((
+            "PgAuditRepository".to_owned(),
+            vec!["repositories".to_owned()],
+        )));
+        assert!(!generated.accepts("PgAuditRepository", &["repositories".to_owned()]));
     }
 
     #[test]
     fn reads_the_type_names_the_source_writes_out() {
         assert_eq!(
-            defined_type_names("pub struct PgAuditRepository;\nenum E {}\ntype Alias = u8;"),
+            defined_type_names("pub struct PgAuditRepository;\nenum E {}\ntype Alias = u8;")
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
             vec!["PgAuditRepository", "E", "Alias"]
         );
         // `#[repository]` output never appears in source, so a trait declaring

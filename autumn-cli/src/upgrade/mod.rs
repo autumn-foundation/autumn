@@ -35,6 +35,7 @@ pub mod diff;
 pub mod engine;
 pub mod migrations;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use migrations::{AppMigration, Version};
@@ -81,6 +82,9 @@ pub struct FileReport {
     pub diff: String,
     /// The full rewritten text (not serialized; used by the apply step).
     pub updated: String,
+    /// The text this rewrite was computed from, kept so the apply step can
+    /// prove the file has not changed underneath it.
+    pub original: String,
     /// Absolute path to write to.
     pub absolute: PathBuf,
 }
@@ -572,12 +576,7 @@ fn recorded_version(root: &Path) -> Option<String> {
 /// and both are visible in the report.
 fn member_manifests(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let (forced, target_dir) = root_target_dir(root);
-    let target_dir = TargetDir {
-        forced,
-        path: target_dir.as_deref(),
-    };
-    collect_manifests(root, root, target_dir, &mut found);
+    collect_manifests(root, root, &configured_target_dirs(root), &mut found);
     found.sort();
     found
 }
@@ -586,13 +585,17 @@ fn member_manifests(root: &Path) -> Vec<PathBuf> {
 ///
 /// By resolved path, not by name: with the target directory redirected to
 /// `out/`, an unrelated `src/out/mod.rs` is ordinary app code.
-fn is_target_dir(path: &Path, target_dir: Option<&Path>) -> bool {
-    target_dir.is_some_and(|target_dir| {
-        std::fs::canonicalize(path).is_ok_and(|resolved| resolved == target_dir)
-    })
+fn is_target_dir(path: &Path, target_dirs: &BTreeSet<PathBuf>) -> bool {
+    !target_dirs.is_empty()
+        && std::fs::canonicalize(path).is_ok_and(|resolved| target_dirs.contains(&resolved))
 }
 
-fn collect_manifests(root: &Path, dir: &Path, target_dir: TargetDir<'_>, found: &mut Vec<PathBuf>) {
+fn collect_manifests(
+    root: &Path,
+    dir: &Path,
+    target_dirs: &BTreeSet<PathBuf>,
+    found: &mut Vec<PathBuf>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -612,60 +615,73 @@ fn collect_manifests(root: &Path, dir: &Path, target_dir: TargetDir<'_>, found: 
         let is_metadata = SKIPPED_HIDDEN_DIRS.contains(&name.as_str());
         let is_build_output = at_crate_root && SKIPPED_DIRS.contains(&name.as_str());
         let path = entry.path();
-        if is_metadata || is_build_output || is_target_dir(&path, target_dir.path) {
+        if is_metadata || is_build_output || is_target_dir(&path, target_dirs) {
             continue;
         }
         if path.join("Cargo.toml").is_file() && path != root {
             found.push(path.clone());
         }
-        let nested = target_dir.nested_at(&path);
-        collect_manifests(root, &path, target_dir.or_inherited(nested.as_ref()), found);
+        collect_manifests(root, &path, target_dirs, found);
     }
 }
 
-/// Where Cargo's build output lands for the directory currently being walked.
+/// Every directory Cargo has been told to put build output in, anywhere in the
+/// scan.
 ///
 /// `CARGO_TARGET_DIR` and `.cargo/config.toml`'s `build.target-dir` both move
 /// output somewhere the `target` basename check will never look, and the walk
 /// then descends into generated code — `--apply` rewriting artifacts the next
 /// `cargo build` overwrites.
 ///
-/// It is a walk-time value rather than one path for the whole scan because
-/// Cargo reads `.cargo/config.toml` from the invocation directory upward: a
-/// nested standalone crate redirects its *own* output, and a redirect declared
-/// there applies to that subtree only. The environment variable is the one
-/// exception — it overrides every config file, so when it is set no nested
-/// config is consulted at all.
-#[derive(Clone, Copy, Default)]
-struct TargetDir<'a> {
-    /// `CARGO_TARGET_DIR` decided this, so nested configs are not in effect.
-    forced: bool,
-    /// The resolved output directory, or `None` for the default `target/`,
-    /// which the basename check already covers.
-    path: Option<&'a Path>,
-}
-
-impl TargetDir<'_> {
-    /// What applies inside `dir`, given what applies to its parent.
-    ///
-    /// Returns the nested override so the caller can own it for the length of
-    /// the recursive call; `None` means `dir` inherits.
-    fn nested_at(self, dir: &Path) -> Option<PathBuf> {
-        if self.forced {
-            return None;
-        }
-        config_target_dir_at(dir)
+/// Collected as a set over the whole tree rather than inherited downward,
+/// because a configured path need not sit under the crate that declares it:
+/// `tools/helper/.cargo/config.toml` may say `target-dir = "../../build"`, and
+/// that directory is reached by a different branch of the walk entirely.
+///
+/// `CARGO_TARGET_DIR` overrides every config file, so when it is set it is the
+/// only answer.
+fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
+    if let Some(configured) = std::env::var_os("CARGO_TARGET_DIR") {
+        return std::env::current_dir()
+            .ok()
+            .and_then(|cwd| resolve_against(&cwd, &configured.to_string_lossy()))
+            .into_iter()
+            .collect();
     }
 
-    /// The same value with `nested` substituted when there is one.
-    fn or_inherited<'n>(self, nested: Option<&'n PathBuf>) -> TargetDir<'n>
-    where
-        Self: 'n,
-    {
-        TargetDir {
-            forced: self.forced,
-            path: nested.map(PathBuf::as_path).or(self.path),
+    let mut found = BTreeSet::new();
+    // Cargo reads `.cargo/config.toml` from the invocation directory upward, so
+    // a redirect above the scan root applies to everything inside it.
+    let absolute_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    for ancestor in absolute_root.ancestors() {
+        found.extend(config_target_dir_at(ancestor));
+    }
+    collect_target_dirs(&absolute_root, &mut found);
+    found
+}
+
+fn collect_target_dirs(dir: &Path, found: &mut BTreeSet<PathBuf>) {
+    found.extend(config_target_dir_at(dir));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let at_crate_root = dir.join("Cargo.toml").is_file();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
         }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // The same pruning the source walk uses: a `.cargo` inside a vendored
+        // tree is not this project's configuration.
+        if SKIPPED_HIDDEN_DIRS.contains(&name.as_str())
+            || (at_crate_root && SKIPPED_DIRS.contains(&name.as_str()))
+        {
+            continue;
+        }
+        collect_target_dirs(&entry.path(), found);
     }
 }
 
@@ -707,34 +723,10 @@ fn config_target_dir_at(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// What applies at the scan root, before the walk starts.
-///
-/// The environment variable resolves against the current directory, the way
-/// Cargo resolves it. Failing that, `.cargo/config.toml` is searched from the
-/// root *upward*, so a member inherits the workspace root's redirect.
-fn root_target_dir(root: &Path) -> (bool, Option<PathBuf>) {
-    if let Some(configured) = std::env::var_os("CARGO_TARGET_DIR") {
-        let resolved = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| resolve_against(&cwd, &configured.to_string_lossy()));
-        return (true, resolved);
-    }
-    let Ok(absolute_root) = std::fs::canonicalize(root) else {
-        return (false, None);
-    };
-    let found = absolute_root.ancestors().find_map(config_target_dir_at);
-    (false, found)
-}
-
 /// Every `.rs` file under `root` that belongs to the app, in a stable order.
 fn app_sources(root: &Path) -> SourceScan {
     let mut scan = SourceScan::default();
-    let (forced, target_dir) = root_target_dir(root);
-    let target_dir = TargetDir {
-        forced,
-        path: target_dir.as_deref(),
-    };
-    collect_sources(root, target_dir, &mut scan);
+    collect_sources(root, &configured_target_dirs(root), &mut scan);
     scan.files.sort();
     scan.symlinks.sort();
     scan.unreadable.sort();
@@ -755,7 +747,7 @@ struct SourceScan {
 
 /// Collect `.rs` files, recording what was deliberately or accidentally left
 /// out so the caller can report it rather than drop it silently.
-fn collect_sources(dir: &Path, target_dir: TargetDir<'_>, scan: &mut SourceScan) {
+fn collect_sources(dir: &Path, target_dirs: &BTreeSet<PathBuf>, scan: &mut SourceScan) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         scan.unreadable.push(dir.to_path_buf());
         return;
@@ -780,11 +772,10 @@ fn collect_sources(dir: &Path, target_dir: TargetDir<'_>, scan: &mut SourceScan)
         if file_type.is_dir() {
             let is_metadata = SKIPPED_HIDDEN_DIRS.contains(&name.as_str());
             let is_build_output = at_crate_root && SKIPPED_DIRS.contains(&name.as_str());
-            if is_metadata || is_build_output || is_target_dir(&path, target_dir.path) {
+            if is_metadata || is_build_output || is_target_dir(&path, target_dirs) {
                 continue;
             }
-            let nested = target_dir.nested_at(&path);
-            collect_sources(&path, target_dir.or_inherited(nested.as_ref()), scan);
+            collect_sources(&path, target_dirs, scan);
         } else if file_type.is_symlink() {
             // A symlinked *directory* has `is_dir() == false`, so gating this
             // on a `.rs` extension hid a linked `src/` entirely: no traversal,
@@ -838,8 +829,20 @@ fn generated_receivers(files: &[PathBuf]) -> engine::GeneratedRepositories {
     generated.note_handwritten(
         files
             .iter()
-            .filter_map(|path| std::fs::read_to_string(path).ok())
-            .flat_map(|source| engine::defined_type_names(&source)),
+            .filter_map(|path| {
+                let source = std::fs::read_to_string(path).ok()?;
+                let prefix = file_module_path(path);
+                Some(
+                    engine::defined_type_names(&source)
+                        .into_iter()
+                        .map(move |(name, inner)| {
+                            let mut module = prefix.clone();
+                            module.extend(inner);
+                            (name, module)
+                        }),
+                )
+            })
+            .flatten(),
     );
     generated
 }
@@ -994,6 +997,7 @@ fn plan_with(
                 sites: rewrite.rewritten,
                 diff: diff::render(&source, &updated),
                 updated,
+                original: source,
                 absolute: path,
             });
         }
@@ -1051,9 +1055,67 @@ fn write_one(file: &FileReport) -> std::io::Result<()> {
     if let Ok(metadata) = std::fs::metadata(&file.absolute) {
         let _ = temp.as_file().set_permissions(metadata.permissions());
     }
+    // Planning reads every file before anything is written, so a formatter, a
+    // generator, or the user's editor can change one inside that window. The
+    // rewrite was computed from a snapshot; writing it now would silently
+    // revert whatever landed since. Re-read and compare first, and skip the
+    // file rather than take the newer content away.
+    match std::fs::read_to_string(&file.absolute) {
+        Ok(current) if current == file.original => {}
+        Ok(_) => {
+            return Err(std::io::Error::other(
+                "file changed on disk after it was planned - re-run `autumn upgrade` to \
+                 migrate it against its current contents",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
     temp.persist(&file.absolute)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod write_guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_changed_after_planning_is_not_overwritten() {
+        // Planning reads every file before anything is written. A formatter or
+        // an editor saving inside that window would otherwise have its work
+        // silently replaced by the rewrite of a stale snapshot.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("main.rs");
+        std::fs::write(&path, "fn main() {}\n").expect("write");
+
+        let planned = FileReport {
+            path: "main.rs".to_owned(),
+            sites: Vec::new(),
+            diff: String::new(),
+            updated: "fn main() { /* rewritten */ }\n".to_owned(),
+            original: "fn main() {}\n".to_owned(),
+            absolute: path.clone(),
+        };
+        // Unchanged: the write lands.
+        write_one(&planned).expect("an untouched file is written");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            planned.updated
+        );
+
+        // Changed underneath the plan: refused, and what is on disk survives.
+        std::fs::write(&path, "fn main() { /* someone else */ }\n").expect("write");
+        let error = write_one(&planned).expect_err("a changed file must not be overwritten");
+        assert!(
+            error.to_string().contains("changed on disk"),
+            "the reason names the cause: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "fn main() { /* someone else */ }\n",
+            "the newer contents are left alone"
+        );
+    }
 }
 
 /// Run `autumn upgrade` against `root`, returning the process exit code.
@@ -1213,6 +1275,7 @@ mod tests {
                 }],
                 diff: "@@ line 12 @@\n-a\n+b\n".into(),
                 updated: "b\n".into(),
+                original: "a\n".into(),
                 absolute: PathBuf::from("/tmp/app/src/main.rs"),
             }],
             review: Vec::new(),
@@ -1429,6 +1492,7 @@ mod tests {
             ],
             diff: "@@ line 4 @@\n-a\n+b\n".into(),
             updated: "b\n".into(),
+            original: "a\n".into(),
             absolute: PathBuf::from("/tmp/app/src/second.rs"),
         });
         report.outcome = Outcome::Partial { written: 1 };

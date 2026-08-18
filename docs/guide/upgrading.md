@@ -124,6 +124,12 @@ Commit or stash first. `autumn upgrade --apply` edits files in place, and the
 diff you reviewed in the preview is the only record of what changed — `git
 diff` afterwards is how you check its work.
 
+Every file is read before any file is written, so a rewrite is computed from a
+snapshot. If something else changes one of those files in between — a formatter,
+a code generator, an editor saving — that file is refused rather than
+overwritten with the rewrite of stale contents, and the run reports it. Re-run
+to migrate it against what is now on disk.
+
 ## Adding a codemod (contributors)
 
 The registry is `autumn-cli/src/upgrade/migrations.rs`, one `AppMigration` per
@@ -180,7 +186,9 @@ alone — with one guard: because `#[repository]` produces its type from a macro
 that type never appears in your source, so a `struct PgAuditRepository` written
 out anywhere in the scan is proof of a *different*, hand-written type. When both
 exist, an unqualified call could mean either and is reported rather than
-rewritten. Write the module in front of it to say which you mean.
+rewritten. Write the module in front of it to say which you mean — unless the
+two sit at the same module path in different crates, in which case even that
+does not distinguish them and the call is still reported.
 
 What remains unresolved is an alias: `use custom::PgAuditRepository;` followed by
 an unqualified call, where nothing in the scan spells out a competing
@@ -205,10 +213,10 @@ If Cargo's output directory has been moved — `CARGO_TARGET_DIR`, or
 resolved as a path rather than matched by name. With the output in `out/`, an
 unrelated `src/out/mod.rs` is still migrated.
 
-The redirect is resolved the way Cargo resolves it, which means per subtree: a
-nested standalone crate with its own `.cargo/config.toml` redirects only its own
-output. `CARGO_TARGET_DIR` is the exception — it overrides every config file, so
-when it is set no nested config applies.
+Every `.cargo/config.toml` in the scan is read, not just the one at the root: a
+nested standalone crate redirects its own output, and the path it names need not
+sit under that crate. `CARGO_TARGET_DIR` is the exception — it overrides every
+config file, so when it is set no config redirect applies.
 
 Hidden directories are skipped by name — `.git`, `.github`, `.cargo`, `.vscode`
 and the like — not because they start with a dot. A dot-directory that holds

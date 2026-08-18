@@ -2073,3 +2073,89 @@ fn a_locally_defined_type_is_not_verified_by_another_crates_trait() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn a_qualified_receiver_is_vetoed_by_a_same_pathed_handwritten_type() {
+    // Crate `api` generates `repositories::PgAuditRepository`; crate `tools`
+    // writes its own type at the same module path and calls it with that path.
+    // Matching the qualifier against generated declarations alone accepted the
+    // wrong crate's evidence.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"api\", \"tools\"]\n",
+    );
+    for member in ["api", "tools"] {
+        write(
+            tmp.path(),
+            &format!("{member}/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        );
+    }
+    write(
+        tmp.path(),
+        "api/src/repositories.rs",
+        "use autumn_web::prelude::*;\n\n\
+         #[repository]\npub trait AuditRepository {\n    fn noop(&self);\n}\n",
+    );
+    write(
+        tmp.path(),
+        "tools/src/repositories.rs",
+        "pub struct PgAuditRepository;\n\n\
+         impl PgAuditRepository {\n    \
+         pub fn with_pool(_pool: Pool) -> Self {\n        Self\n    }\n}\n",
+    );
+    write(
+        tmp.path(),
+        "tools/src/lib.rs",
+        "pub mod repositories;\n\n\
+         pub fn build(pool: Pool) -> repositories::PgAuditRepository {\n    \
+         repositories::PgAuditRepository::with_pool(pool)\n}\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "tools/src/lib.rs")
+            .contains("repositories::PgAuditRepository::with_pool(pool)"),
+        "a hand-written type at the same module path makes the qualifier ambiguous:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn a_target_directory_pointing_outside_its_crate_is_still_excluded() {
+    // `target-dir = "../../build"` puts the output beside the workspace root,
+    // not under the crate that configured it. Carrying the override only while
+    // descending never reaches that sibling directory.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        "tools/helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write(
+        tmp.path(),
+        "tools/helper/.cargo/config.toml",
+        "[build]\ntarget-dir = \"../../build\"\n",
+    );
+    write(tmp.path(), "build/debug/generated.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "app source is still migrated:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(tmp.path(), "build/debug/generated.rs").contains("with_pool(pool.clone())"),
+        "a target directory outside the declaring crate is still build output:\n{}",
+        stdout_of(&output)
+    );
+}
