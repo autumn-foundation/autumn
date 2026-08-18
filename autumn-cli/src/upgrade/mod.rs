@@ -142,6 +142,8 @@ impl Report {
 /// Directory names never scanned: build output and vendored third-party
 /// sources are not the app's own code, and rewriting them is at best wasted
 /// work and at worst a corrupted dependency.
+/// Skipped only where a crate begins — a directory holding a `Cargo.toml`.
+/// Beneath that, these are ordinary module names.
 const SKIPPED_DIRS: &[&str] = &["target", "vendor", "node_modules", "dist", "tmp"];
 
 /// Render the human-readable report.
@@ -557,7 +559,8 @@ fn app_sources(root: &Path) -> SourceScan {
 struct SourceScan {
     /// Regular `.rs` files to migrate.
     files: Vec<PathBuf>,
-    /// Symlinked `.rs` files, reported rather than followed.
+    /// Symlinked `.rs` files and symlinked directories, reported rather than
+    /// followed.
     symlinks: Vec<PathBuf>,
     /// Directories the walk could not read.
     unreadable: Vec<PathBuf>,
@@ -570,28 +573,40 @@ fn collect_sources(dir: &Path, scan: &mut SourceScan) {
         scan.unreadable.push(dir.to_path_buf());
         return;
     };
+    // `target/`, `vendor/` and friends name build output or third-party code
+    // only where a crate begins. Matching the basename at *any* depth silently
+    // dropped ordinary modules like `src/vendor/mod.rs` — the app then fails to
+    // compile after the bump with nothing in the report to explain why.
+    let at_crate_root = dir.join("Cargo.toml").is_file();
+
     for entry in entries.flatten() {
         // `file_type` does not follow symlinks, so a link into `target/`, a
         // link out of the project, or a cycle is neither descended into nor
-        // rewritten. A linked `.rs` file is still *reported*: quietly leaving a
-        // source file out of the migration is the failure mode this command
-        // exists to remove.
+        // rewritten. Links are still *reported*: quietly leaving source out of
+        // the migration is the failure mode this command exists to remove.
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
+
         if file_type.is_dir() {
-            if name.starts_with('.') || SKIPPED_DIRS.contains(&name.as_str()) {
+            if name.starts_with('.') || (at_crate_root && SKIPPED_DIRS.contains(&name.as_str())) {
                 continue;
             }
             collect_sources(&path, scan);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            if file_type.is_file() {
-                scan.files.push(path);
-            } else if file_type.is_symlink() {
+        } else if file_type.is_symlink() {
+            // A symlinked *directory* has `is_dir() == false`, so gating this
+            // on a `.rs` extension hid a linked `src/` entirely: no traversal,
+            // no report, and a run that says "nothing to change" about an app
+            // it never looked at.
+            let links_to_directory =
+                std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir());
+            if links_to_directory || path.extension().is_some_and(|ext| ext == "rs") {
                 scan.symlinks.push(path);
             }
+        } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            scan.files.push(path);
         }
     }
 }

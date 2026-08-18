@@ -165,6 +165,10 @@ It is also the line the `auto` label draws: a change that needs to know a
 receiver's *type* rather than its name is labelled `review` or `manual`, never
 `auto`.
 
-Symlinked source files are not followed. Rewriting through a link could write
-outside the project, so a symlink is left alone; if your app keeps real source
-behind one, migrate it in its own checkout.
+Symlinked source files and directories are not followed. Rewriting through a
+link could write outside the project, so a symlink is reported and left alone;
+if your app keeps real source behind one, migrate it in its own checkout.
+
+`target/`, `vendor/`, `node_modules/`, `dist/` and `tmp/` are skipped where a
+crate begins — a directory holding a `Cargo.toml`. Beneath that they are
+ordinary module names, so `src/vendor/mod.rs` is migrated like any other file.

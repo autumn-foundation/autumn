@@ -1152,3 +1152,88 @@ fn an_app_on_the_release_candidate_of_the_target_still_gets_that_release() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn an_app_module_named_like_a_build_directory_is_still_migrated() {
+    // `target`, `vendor`, `tmp` name build output or third-party code only at
+    // a crate root. Under `src/` they are ordinary modules, and skipping them
+    // left the app failing to compile with nothing in the report to say why.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", "fn main() {}\n");
+    for module in [
+        "src/vendor/mod.rs",
+        "src/tmp/helper.rs",
+        "src/target/mod.rs",
+        "src/dist/mod.rs",
+    ] {
+        write(tmp.path(), module, USES_WITH_POOL);
+    }
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    for module in [
+        "src/vendor/mod.rs",
+        "src/tmp/helper.rs",
+        "src/target/mod.rs",
+        "src/dist/mod.rs",
+    ] {
+        assert!(
+            read(tmp.path(), module).contains("with_pool_untracked("),
+            "{module} is an app module, not a build tree"
+        );
+    }
+}
+
+#[test]
+fn build_directories_at_a_workspace_member_root_are_still_skipped() {
+    // The rule is "at a crate root", so a member's own `target/` is skipped
+    // just as the workspace root's is.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"api\"]\n\n\
+         [workspace.dependencies]\nautumn-web = \"0.5.0\"\n",
+    );
+    write(
+        tmp.path(),
+        "api/Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write(tmp.path(), "api/src/lib.rs", USES_WITH_POOL);
+    write(tmp.path(), "api/target/debug/gen.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(read(tmp.path(), "api/src/lib.rs").contains("with_pool_untracked("));
+    assert!(
+        read(tmp.path(), "api/target/debug/gen.rs").contains("with_pool(pool.clone())"),
+        "a member's own build output is not app source"
+    );
+}
+
+#[test]
+fn a_symlinked_source_directory_is_reported_rather_than_ignored() {
+    // A linked `src/` has `is_dir() == false`, so an extension-gated check saw
+    // nothing at all: no traversal, no report, and a run that says "nothing to
+    // change" about an app it never looked at.
+    #[cfg(not(unix))]
+    return;
+    #[cfg(unix)]
+    {
+        let tmp = app("0.5.0");
+        write(tmp.path(), "real/lib.rs", USES_WITH_POOL);
+        std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("src"))
+            .expect("symlink");
+
+        let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+        assert!(output.status.success(), "{}", report(&output));
+        let out = stdout_of(&output);
+        assert!(out.contains("src"), "the linked directory is named: {out}");
+        assert!(out.contains("symbolic link"), "{out}");
+        assert!(
+            !out.to_lowercase().contains("nothing to change"),
+            "a linked source tree must not read as a clean app: {out}"
+        );
+    }
+}
