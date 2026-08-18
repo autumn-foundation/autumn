@@ -2463,24 +2463,69 @@ fn read_autumn_web_version() -> Option<String> {
     read_autumn_web_version_at(std::path::Path::new("."))
 }
 
+/// How a manifest declares `autumn-web`, if it does.
+///
+/// `autumn upgrade` needs the middle case told apart from the absent one: a
+/// `{ path = "../autumn" }` or `{ git = "..." }` dependency *is* a declaration,
+/// it just carries no version to compare. Treating it as "not declared" lets a
+/// sibling manifest pick the floor for a crate whose version is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutumnWebDependency {
+    /// The manifest does not mention `autumn-web`.
+    Absent,
+    /// Declared with a version requirement.
+    Version(String),
+    /// Declared, but with no version to read — a path or git entry.
+    /// (`{ workspace = true }` is [`Absent`](Self::Absent): it inherits the
+    /// root entry, which is read on its own.)
+    WithoutVersion,
+}
+
 /// Read the `autumn-web` version requirement from the `Cargo.toml` at `root`.
 ///
 /// Shared with `autumn upgrade`, which needs the same answer for a directory
 /// it was pointed at rather than the process's working directory.
 pub fn read_autumn_web_version_at(root: &std::path::Path) -> Option<String> {
-    let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
-    let table: toml::Table = toml::from_str(&content).ok()?;
+    match read_autumn_web_dependency_at(root) {
+        AutumnWebDependency::Version(version) => Some(version),
+        AutumnWebDependency::Absent | AutumnWebDependency::WithoutVersion => None,
+    }
+}
 
-    let find_in_deps = |deps: &toml::Value| -> Option<String> {
+/// As [`read_autumn_web_version_at`], but distinguishing a declaration with no
+/// readable version from no declaration at all.
+pub fn read_autumn_web_dependency_at(root: &std::path::Path) -> AutumnWebDependency {
+    let Ok(content) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return AutumnWebDependency::Absent;
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&content) else {
+        return AutumnWebDependency::Absent;
+    };
+
+    let find_in_deps = |deps: &toml::Value| -> Option<AutumnWebDependency> {
         let entry = deps.get("autumn-web")?;
-        match entry {
-            toml::Value::String(v) => Some(v.clone()),
-            toml::Value::Table(t) => t
-                .get("version")?
-                .as_str()
-                .map(std::borrow::ToOwned::to_owned),
-            _ => None,
-        }
+        Some(match entry {
+            toml::Value::String(version) => AutumnWebDependency::Version(version.clone()),
+            toml::Value::Table(table) => table
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .map_or_else(
+                    || {
+                        if table.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                            // `{ workspace = true }` inherits the root's
+                            // `[workspace.dependencies]` entry, which is read
+                            // separately — this manifest adds no version of
+                            // its own.
+                            AutumnWebDependency::Absent
+                        } else {
+                            // A path or git entry: declared, no version to read.
+                            AutumnWebDependency::WithoutVersion
+                        }
+                    },
+                    |version| AutumnWebDependency::Version(version.to_owned()),
+                ),
+            _ => AutumnWebDependency::WithoutVersion,
+        })
     };
 
     // [dependencies], then [workspace.dependencies], then any
@@ -2505,6 +2550,7 @@ pub fn read_autumn_web_version_at(root: &std::path::Path) -> Option<String> {
                 .filter_map(|target| target.get("dependencies"))
                 .find_map(&find_in_deps)
         })
+        .unwrap_or(AutumnWebDependency::Absent)
 }
 
 /// Try to TCP-connect to a host:port within a short timeout.

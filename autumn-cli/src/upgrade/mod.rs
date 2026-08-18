@@ -101,11 +101,6 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// Whether anything at all reached the disk.
-    pub const fn wrote_anything(self) -> bool {
-        matches!(self, Self::Applied | Self::Partial { .. })
-    }
-
     /// The label used in `--json`.
     pub const fn label(self) -> &'static str {
         match self {
@@ -299,39 +294,62 @@ fn render_skipped(out: &mut String, report: &Report) {
 fn render_summary(out: &mut String, report: &Report) {
     use std::fmt::Write as _;
     let sites = report.rewritten_sites();
-    if sites > 0 {
-        let files = report.files.len();
-        let _ = writeln!(
-            out,
-            "\n{sites} site{} in {files} file{} {}; {} file(s) scanned.",
-            plural(sites),
-            plural(files),
-            if report.outcome.wrote_anything() {
-                "rewritten"
-            } else {
-                "would be rewritten"
-            },
-            report.files_scanned
-        );
+    if sites == 0 {
+        return;
     }
-    if let Outcome::Partial { written } = report.outcome {
-        let _ = writeln!(
-            out,
-            "Partially applied: {written} file{} written before the run stopped. \
-             `git diff` shows exactly which.",
-            plural(written)
-        );
-    } else if report.outcome == Outcome::Applied {
-        if sites > 0 {
+    let files = report.files.len();
+
+    match report.outcome {
+        // Whole-plan totals would claim every site landed. Only the files
+        // before the failure did, so the two halves are counted separately —
+        // saying "N sites rewritten" and "3 files written" in the same summary
+        // is worse than either number alone.
+        Outcome::Partial { written } => {
+            let written_sites: usize = report
+                .files
+                .iter()
+                .take(written)
+                .map(|file| file.sites.len())
+                .sum();
+            let _ = writeln!(
+                out,
+                "\n{written_sites} site{} in {written} file{} written before the run stopped; \
+                 {} site{} in {} file{} planned and not written.",
+                plural(written_sites),
+                plural(written),
+                sites - written_sites,
+                plural(sites - written_sites),
+                files - written,
+                plural(files - written),
+            );
+            let _ = writeln!(
+                out,
+                "`git diff` shows exactly what landed; the error below names the file that stopped it."
+            );
+        }
+        Outcome::Applied => {
+            let _ = writeln!(
+                out,
+                "\n{sites} site{} in {files} file{} rewritten; {} file(s) scanned.",
+                plural(sites),
+                plural(files),
+                report.files_scanned
+            );
             let _ = writeln!(out, "Review the result with `git diff` before committing.");
         }
-    } else if sites > 0 {
-        // Only offered when `--apply` would actually write something: a run
-        // whose every remaining site is `manual` has nothing for it to do.
-        let _ = writeln!(
-            out,
-            "Nothing was written. Re-run with `--apply` to write these changes."
-        );
+        Outcome::Preview => {
+            let _ = writeln!(
+                out,
+                "\n{sites} site{} in {files} file{} would be rewritten; {} file(s) scanned.",
+                plural(sites),
+                plural(files),
+                report.files_scanned
+            );
+            let _ = writeln!(
+                out,
+                "Nothing was written. Re-run with `--apply` to write these changes."
+            );
+        }
     }
 }
 
@@ -447,10 +465,19 @@ fn recorded_version(root: &Path) -> Option<String> {
     // root would let a workspace whose root records 0.6.0 hide a member that
     // still pins 0.5.0 — the walk then migrates that member's source with no
     // 0.5.0 -> 0.6.0 migration selected.
+    use crate::doctor::AutumnWebDependency;
+
     let mut lowest: Option<(Version, String)> = None;
     for directory in std::iter::once(root.to_path_buf()).chain(member_manifests(root)) {
-        let Some(requirement) = crate::doctor::read_autumn_web_version_at(&directory) else {
-            continue;
+        let requirement = match crate::doctor::read_autumn_web_dependency_at(&directory) {
+            AutumnWebDependency::Absent => continue,
+            // Declared as a path or git dependency: this crate is on *some*
+            // version of autumn-web and the manifest does not say which.
+            // Letting a sibling decide the floor would migrate this crate's
+            // source against a version nobody checked — and a vendored
+            // checkout is exactly the population the 0.6.0 rename affects.
+            AutumnWebDependency::WithoutVersion => return None,
+            AutumnWebDependency::Version(requirement) => requirement,
         };
         // A manifest that *declares* `autumn-web` with a requirement carrying no
         // usable floor makes the whole answer a guess. Dropping it and taking
@@ -467,9 +494,19 @@ fn recorded_version(root: &Path) -> Option<String> {
 
 /// Directories under `root` (excluding `root` itself) that hold a `Cargo.toml`.
 ///
-/// Found by walking rather than by parsing `[workspace] members`, which would
-/// mean implementing Cargo's glob patterns; the walk already knows which
-/// directories are not the app's own code.
+/// Deliberately every nested manifest, not Cargo's `[workspace] members` /
+/// `exclude` set. The rule this keeps is *the floor is taken across exactly the
+/// code this command will rewrite*: the source walk visits every directory
+/// here, so a crate whose sources are about to be migrated also gets a vote on
+/// which migrations apply. Deriving membership from Cargo metadata would split
+/// those two sets — a crate under `exclude` would be rewritten against a floor
+/// chosen without it.
+///
+/// The cost is a crate outside the workspace proper (an excluded fixture, a
+/// standalone example) pulling the floor back or, if its requirement is
+/// ambiguous, making the command ask for `--from`. Both err toward doing more
+/// migration or doing none, never toward migrating against the wrong version,
+/// and both are visible in the report.
 fn member_manifests(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     collect_manifests(root, root, &mut found);
@@ -1100,13 +1137,42 @@ mod tests {
         // The failure mode this guards: some files already rewritten, and the
         // report telling the user to "re-run with --apply" as if the tree were
         // untouched.
+        // Two planned files, one of them written.
         let mut report = sample(Outcome::Preview);
-        report.outcome = Outcome::Partial { written: 3 };
+        report.files.push(FileReport {
+            path: "src/second.rs".into(),
+            sites: vec![
+                engine::Site {
+                    line: 4,
+                    column: 9,
+                    migration: AUTO.id,
+                    manual: None,
+                },
+                engine::Site {
+                    line: 7,
+                    column: 9,
+                    migration: AUTO.id,
+                    manual: None,
+                },
+            ],
+            diff: "@@ line 4 @@\n-a\n+b\n".into(),
+            updated: "b\n".into(),
+            absolute: PathBuf::from("/tmp/app/src/second.rs"),
+        });
+        report.outcome = Outcome::Partial { written: 1 };
 
         let text = render_text(&report);
         assert!(
-            text.contains("Partially applied: 3 files written"),
-            "{text}"
+            text.contains("1 site in 1 file written before the run stopped"),
+            "only what landed is counted as written: {text}"
+        );
+        assert!(
+            text.contains("2 sites in 1 file planned and not written"),
+            "and the rest is named as not written: {text}"
+        );
+        assert!(
+            !text.contains("3 sites in 2 files rewritten"),
+            "the whole plan must not be claimed as rewritten: {text}"
         );
         assert!(
             !text.to_lowercase().contains("nothing was written"),
@@ -1120,7 +1186,7 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&render_json(&report)).expect("valid JSON");
         assert_eq!(json["outcome"], "partial");
-        assert_eq!(json["files_written"], 3);
+        assert_eq!(json["files_written"], 1);
         assert_eq!(
             json["applied"], false,
             "`applied` stays a strict did-everything-land flag"

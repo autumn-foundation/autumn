@@ -972,3 +972,48 @@ fn a_target_specific_dependency_declaration_is_a_declaration() {
     assert!(output.status.success(), "{}", report(&output));
     assert!(read(tmp.path(), "src/main.rs").contains("with_pool_untracked("));
 }
+
+#[test]
+fn a_path_dependency_without_a_version_fails_detection() {
+    // `autumn-web = { path = "../autumn" }` is a declaration with no version
+    // to read — and a vendored checkout is exactly the population the 0.6.0
+    // rename affects. Letting the sibling's 0.6.0 decide the floor would
+    // migrate this crate's source against a version nobody checked.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"api\", \"vendored\"]\n",
+    );
+    write(
+        tmp.path(),
+        "api/Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"0.6.0\"\n",
+    );
+    write(tmp.path(), "api/src/lib.rs", "pub fn f() {}\n");
+    write(
+        tmp.path(),
+        "vendored/Cargo.toml",
+        "[package]\nname = \"vendored\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = { path = \"../../autumn\" }\n",
+    );
+    write(tmp.path(), "vendored/src/lib.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(!output.status.success(), "{}", report(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--from"),
+        "{}",
+        report(&output),
+    );
+    assert!(
+        read(tmp.path(), "vendored/src/lib.rs").contains("with_pool(pool.clone())"),
+        "nothing is rewritten while the range is a guess"
+    );
+
+    // With the range stated explicitly, the same tree migrates.
+    let forced = run_upgrade(tmp.path(), &["--from", "0.5.0", "--to", "0.6.0", "--apply"]);
+    assert!(forced.status.success(), "{}", report(&forced));
+    assert!(read(tmp.path(), "vendored/src/lib.rs").contains("with_pool_untracked("));
+}
