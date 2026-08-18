@@ -158,12 +158,23 @@ Manual - not rewritten; read the guide section:
   src/cache.rs:18  0.6.0-repository-with-pool-untracked (receiver is not a generated repository)
 ```
 
-What remains is an app type named `Pg…Repository` with a one-argument
-associated `with_pool` of its own. This is why preview is the default and why the diff
-names every file and line — read it before you `--apply`, and `git diff` after.
-It is also the line the `auto` label draws: a change that needs to know a
-receiver's *type* rather than its name is labelled `review` or `manual`, never
-`auto`.
+The name alone is not enough, though, because an app is free to write its own
+`PgAuditRepository` with its own one-argument `with_pool`. So the shape is only
+the first test: `autumn upgrade` also collects every `#[repository]` trait in
+the source it scans and derives the types they generate. A receiver has to be
+one of those to be rewritten. One that looks right but is not — because no
+`#[repository]` trait in the app accounts for it, or because the trait lives in
+a crate outside the scan — is reported rather than guessed at:
+
+```text
+Manual - not rewritten; read the guide section:
+  src/audit.rs:10  0.6.0-repository-with-pool-untracked (no `#[repository]` trait in this app generates this receiver)
+```
+
+Preview is still the default and the diff still names every file and line —
+read it before you `--apply`, and `git diff` after. This is also the line the
+`auto` label draws: a change that needs to know a receiver's *type* rather than
+what generates it is labelled `review` or `manual`, never `auto`.
 
 Symlinked source files and directories are not followed. Rewriting through a
 link could write outside the project, so a symlink is reported and left alone;

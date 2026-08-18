@@ -69,7 +69,22 @@ fn app(version: &str) -> TempDir {
 }
 
 /// The 0.6.0 rename's call sites, as an app on 0.5.x would have written them.
+///
+/// The `#[repository]` traits are part of the fixture, not decoration: they are
+/// what makes `PgPostRepository` and `PgCommentRepository` generated types
+/// rather than names that merely look like them, and the codemod refuses to
+/// rewrite a receiver no scanned trait accounts for.
 const USES_WITH_POOL: &str = r"use autumn_web::prelude::*;
+
+#[repository]
+pub trait PostRepository {
+    fn noop(&self);
+}
+
+#[repository]
+pub trait CommentRepository {
+    fn noop(&self);
+}
 
 pub fn build(pool: Pool) -> PostRepository {
     // Historically this was `with_pool`.
@@ -539,7 +554,8 @@ fn a_file_with_both_rewritable_and_macro_sites_gets_both_treatments() {
     write(
         tmp.path(),
         "src/main.rs",
-        "pub fn a(pool: Pool) -> Repo {\n    PgPostRepository::with_pool(pool)\n}\n\n\
+        "#[repository]\npub trait PostRepository {\n    fn noop(&self);\n}\n\n\
+         pub fn a(pool: Pool) -> Repo {\n    PgPostRepository::with_pool(pool)\n}\n\n\
          pub fn b(pool: Pool) {\n    make_repo! { PgPostRepository::with_pool(pool) }\n}\n",
     );
 
@@ -557,7 +573,9 @@ fn a_file_with_both_rewritable_and_macro_sites_gets_both_treatments() {
     );
     let out = stdout_of(&output);
     assert!(
-        out.contains("src/main.rs:6"),
+        // The `#[repository]` trait the fixture declares occupies the first
+        // five lines, so the macro site sits at 11.
+        out.contains("src/main.rs:11"),
         "the macro site is named: {out}"
     );
 }
@@ -748,7 +766,8 @@ fn a_same_named_framework_builder_method_is_never_rewritten() {
     write(
         tmp.path(),
         "src/main.rs",
-        "pub fn setup(state: AppState, pool: Pool) -> AppState {\n\
+        "#[repository]\npub trait PostRepository {\n    fn noop(&self);\n}\n\n\
+         pub fn setup(state: AppState, pool: Pool) -> AppState {\n\
         \x20   let repo = PgPostRepository::with_pool(pool.clone());\n\
         \x20   drop(repo);\n\
         \x20   state.with_pool(pool)\n\
@@ -1811,5 +1830,75 @@ fn a_bare_wildcard_requirement_still_has_no_floor() {
         String::from_utf8_lossy(&output.stderr).contains("--from"),
         "{}",
         report(&output)
+    );
+}
+
+/// A `#[repository]` trait, which is what makes `Pg{Trait}` a generated type.
+fn repository_trait(name: &str) -> String {
+    format!(
+        "use autumn_web::prelude::*;\n\n\
+         #[repository]\npub trait {name} {{\n    fn noop(&self);\n}}\n"
+    )
+}
+
+#[test]
+fn a_receiver_no_repository_trait_generates_is_reported_not_rewritten() {
+    // `PgAuditRepository` follows the generated naming convention exactly, but
+    // nothing in this app declares `#[repository] trait AuditRepository`, so the
+    // type is the app's own. Rewriting it produces a call to a method that does
+    // not exist; the convention alone is not evidence.
+    let tmp = app("0.5.0");
+    write(
+        tmp.path(),
+        "src/repositories.rs",
+        &repository_trait("PostRepository"),
+    );
+    write(
+        tmp.path(),
+        "src/audit.rs",
+        "pub struct PgAuditRepository;\n\n\
+         impl PgAuditRepository {\n    \
+         pub fn with_pool(_pool: Pool) -> Self {\n        Self\n    }\n}\n\n\
+         pub fn build(pool: Pool) -> PgAuditRepository {\n    \
+         PgAuditRepository::with_pool(pool)\n}\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/audit.rs").contains("PgAuditRepository::with_pool(pool)"),
+        "an app's own type must not be rewritten:\n{}",
+        stdout_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("src/audit.rs:10"),
+        "and it must be reported, not silently skipped:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_receiver_backed_by_a_repository_trait_in_another_file_is_rewritten() {
+    // The trait and the call site normally live in different modules, so the
+    // evidence has to be collected across the whole scan rather than per file.
+    let tmp = app("0.5.0");
+    write(
+        tmp.path(),
+        "src/repositories.rs",
+        &repository_trait("PostRepository"),
+    );
+    write(
+        tmp.path(),
+        "src/routes.rs",
+        "pub fn build(pool: Pool) -> PgPostRepository {\n    \
+         PgPostRepository::with_pool(pool)\n}\n",
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/routes.rs").contains("with_pool_untracked(pool)"),
+        "a trait declared elsewhere in the app still generates this type:\n{}",
+        stdout_of(&output)
     );
 }

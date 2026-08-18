@@ -23,6 +23,7 @@
 //! to build the identifier by concatenation, so a rewrite there is a guess.
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use std::collections::BTreeSet;
 
 use super::migrations::{AppMigration, CallForm, ReceiverShape, Rewrite};
 
@@ -43,6 +44,12 @@ pub enum ManualReason {
     /// a same-named field. A rename is only safe at a call site, so the
     /// reference is reported instead of guessed at.
     NotACall,
+    /// The receiver is spelled like a generated repository, but no
+    /// `#[repository]` trait anywhere in the scanned source generates that
+    /// type. The naming convention on its own is not evidence: an app is free
+    /// to write its own `PgAuditRepository` with its own `with_pool`, and
+    /// rewriting that produces a call to a method which does not exist.
+    UnverifiedReceiver,
 }
 
 impl ManualReason {
@@ -53,6 +60,9 @@ impl ManualReason {
             Self::Attribute => "inside an attribute",
             Self::NotACall => "referenced without being called",
             Self::UnexpectedReceiver => "receiver is not a generated repository",
+            Self::UnverifiedReceiver => {
+                "no `#[repository]` trait in this app generates this receiver"
+            }
         }
     }
 }
@@ -147,6 +157,7 @@ struct Rename {
 pub fn rewrite_source(
     source: &str,
     migrations: &[&'static AppMigration],
+    generated: &BTreeSet<String>,
 ) -> Result<SourceRewrite, String> {
     let renames: Vec<Rename> = migrations
         .iter()
@@ -177,7 +188,7 @@ pub fn rewrite_source(
         .map_err(|error: proc_macro2::LexError| error.to_string())?;
 
     let mut hits = Vec::new();
-    scan(&stream, Context::Code, &renames, &mut hits);
+    scan(&stream, Context::Code, &renames, generated, &mut hits);
     // Token order is source order for a single stream, but nested groups are
     // walked depth-first, so the flattened list is not. Sorting makes the diff,
     // the reported sites, and the splice all read top-to-bottom.
@@ -254,13 +265,14 @@ pub fn rewrite_source(
 pub fn rewrite_source_for_releases(
     source: &str,
     migrations: &[&'static AppMigration],
+    generated: &BTreeSet<String>,
 ) -> Result<SourceRewrite, String> {
     let mut current = source.to_owned();
     let mut combined = SourceRewrite::default();
     let mut rewritten_anything = false;
 
     for release in releases(migrations) {
-        let pass = rewrite_source(&current, &release)?;
+        let pass = rewrite_source(&current, &release, generated)?;
         combined.rewritten.extend(pass.rewritten);
         combined.manual.extend(pass.manual);
         if let Some(updated) = pass.updated {
@@ -294,7 +306,13 @@ fn releases(migrations: &[&'static AppMigration]) -> Vec<Vec<&'static AppMigrati
 }
 
 /// Walk a token stream, recording every matching call site.
-fn scan(stream: &TokenStream, context: Context, renames: &[Rename], hits: &mut Vec<Hit>) {
+fn scan(
+    stream: &TokenStream,
+    context: Context,
+    renames: &[Rename],
+    generated: &BTreeSet<String>,
+    hits: &mut Vec<Hit>,
+) {
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
     for (index, tree) in trees.iter().enumerate() {
         match tree {
@@ -303,6 +321,7 @@ fn scan(stream: &TokenStream, context: Context, renames: &[Rename], hits: &mut V
                     &group.stream(),
                     group_context(&trees, index, context),
                     renames,
+                    generated,
                     hits,
                 );
             }
@@ -336,10 +355,7 @@ fn scan(stream: &TokenStream, context: Context, renames: &[Rename], hits: &mut V
                         (!takes_arguments(&trees, index, rename.args))
                             .then_some(ManualReason::NotACall)
                     })
-                    .or_else(|| {
-                        (!receiver_matches(&trees, index, rename.receiver))
-                            .then_some(ManualReason::UnexpectedReceiver)
-                    });
+                    .or_else(|| receiver_verdict(&trees, index, rename.receiver, generated));
                 let span = ident.span();
                 let start = span.start();
                 hits.push(Hit {
@@ -566,26 +582,126 @@ fn turbofish_argument_list(trees: &[TokenTree], angle: usize) -> Option<&proc_ma
     None
 }
 
+/// The concrete types `#[repository]` generates from the traits in `source`.
+///
+/// `#[repository]` names its type `Pg{trait}`, so a trait `PostRepository`
+/// yields `PgPostRepository`. Collecting these across the scan turns the
+/// receiver test from a naming convention into evidence: a call on a type no
+/// scanned trait generates is the app's own, however it is spelled.
+///
+/// A file that does not parse contributes nothing rather than failing the scan
+/// — it is already reported as skipped on its own account.
+#[must_use]
+pub fn generated_repository_types(source: &str) -> Vec<String> {
+    let Ok(stream) = source.parse::<TokenStream>() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    collect_repository_types(&stream, &mut found);
+    found
+}
+
+fn collect_repository_types(stream: &TokenStream, found: &mut Vec<String>) {
+    let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
+    for (index, tree) in trees.iter().enumerate() {
+        match tree {
+            // `# [repository ...]` — the attribute is a `#` followed by a
+            // bracket group whose first token is the macro's name.
+            TokenTree::Punct(punct) if punct.as_char() == '#' => {
+                let Some(TokenTree::Group(group)) = trees.get(index + 1) else {
+                    continue;
+                };
+                if group.delimiter() != Delimiter::Bracket {
+                    continue;
+                }
+                let Some(TokenTree::Ident(name)) = group.stream().into_iter().next() else {
+                    continue;
+                };
+                if name != "repository" {
+                    continue;
+                }
+                if let Some(trait_name) = trait_name_after(&trees, index + 2) {
+                    found.push(format!("Pg{trait_name}"));
+                }
+            }
+            TokenTree::Group(group) => collect_repository_types(&group.stream(), found),
+            _ => {}
+        }
+    }
+}
+
+/// The name of the trait an attribute at `from` is applied to.
+///
+/// Skips whatever sits between the attribute and the `trait` keyword — further
+/// attributes, doc comments (which are attributes by the time this sees them),
+/// and a visibility modifier. Anything else means the attribute is not on a
+/// trait, and nothing is generated.
+fn trait_name_after(trees: &[TokenTree], from: usize) -> Option<String> {
+    let mut index = from;
+    while let Some(tree) = trees.get(index) {
+        match tree {
+            TokenTree::Punct(punct) if punct.as_char() == '#' => {
+                // Another attribute: step over it and its bracket group.
+                index += 2;
+            }
+            TokenTree::Ident(ident) if ident == "pub" => {
+                index += 1;
+                // An optional `(crate)` / `(super)` restriction.
+                if matches!(trees.get(index), Some(TokenTree::Group(group))
+                    if group.delimiter() == Delimiter::Parenthesis)
+                {
+                    index += 1;
+                }
+            }
+            TokenTree::Ident(ident) if ident == "unsafe" || ident == "auto" => index += 1,
+            TokenTree::Ident(ident) if ident == "trait" => {
+                return match trees.get(index + 1) {
+                    Some(TokenTree::Ident(name)) => Some(name.to_string()),
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Whether the receiver path segment carries the prefix the framework gives
 /// the type this function is generated on.
 ///
 /// `#[repository]` names its concrete type `Pg{trait}` and the scaffold names
-/// every trait `{Model}Repository`, so `PgPostRepository` is a genuine receiver
-/// while an app's own `Cache` or `PgCache` is not. A rename with no declared
-/// shape accepts any receiver.
-fn receiver_matches(trees: &[TokenTree], index: usize, required: Option<ReceiverShape>) -> bool {
-    let Some(required) = required else {
-        return true;
-    };
+/// every trait `{Model}Repository`, so `PgPostRepository` has the shape of a
+/// genuine receiver while an app's own `Cache` or `PgCache` does not. A rename
+/// with no declared shape accepts any receiver.
+///
+/// The shape is the first of two tests. `generated` carries the types the
+/// scanned `#[repository]` traits actually generate, and a receiver that looks
+/// right but is not among them is the app's own — reported, never rewritten.
+fn receiver_verdict(
+    trees: &[TokenTree],
+    index: usize,
+    required: Option<ReceiverShape>,
+    generated: &BTreeSet<String>,
+) -> Option<ManualReason> {
+    let required = required?;
     // `PgPostRepository :: with_pool` — the receiver sits three tokens back,
     // past the pair of colons. Anything else (a `>` closing `<T as Trait>`, a
     // macro-built path) is not a plain receiver and is reported rather than
     // rewritten.
     let Some(at) = index.checked_sub(3) else {
-        return false;
+        return Some(ManualReason::UnexpectedReceiver);
     };
-    matches!(trees.get(at), Some(TokenTree::Ident(ident))
-        if required.matches(&ident.to_string()))
+    let Some(TokenTree::Ident(ident)) = trees.get(at) else {
+        return Some(ManualReason::UnexpectedReceiver);
+    };
+    let receiver = ident.to_string();
+    if !required.matches(&receiver) {
+        return Some(ManualReason::UnexpectedReceiver);
+    }
+    if generated.contains(&receiver) {
+        return None;
+    }
+    Some(ManualReason::UnverifiedReceiver)
 }
 
 /// Which call form `trees[index]` is written in, if any: `.` makes it a method
@@ -641,8 +757,100 @@ mod tests {
         },
     };
 
+    /// The receivers the shape/form/arity fixtures use, taken as generated.
+    ///
+    /// Those tests are about whether a *call* is the renamed one — call form,
+    /// arity, macro context, splicing. Requiring each of them to also declare a
+    /// `#[repository]` trait would test the verification layer over and over
+    /// and obscure what each case is actually pinning. `PgCache` is left out on
+    /// purpose: it is the fixture for a receiver of the wrong *shape*, which
+    /// must fail before verification is ever consulted.
+    fn assumed_generated() -> BTreeSet<String> {
+        [
+            "PgPostRepository",
+            "PgCommentRepository",
+            "PgAlphaRepository",
+            "PgBetaRepository",
+            "PgGammaRepository",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    #[test]
+    fn collects_the_type_each_repository_trait_generates() {
+        // Every spelling the attribute is written in, including the arguments
+        // form (`tenant_scoped`) and a doc comment between the two, which is
+        // itself an attribute by the time the token stream sees it.
+        let types = generated_repository_types(
+            "#[repository]\npub trait PostRepository {}\n\
+             #[repository(tenant_scoped)]\ntrait CommentRepository {}\n\
+             #[repository]\n/// docs\npub(crate) trait TagRepository {}\n",
+        );
+        assert_eq!(
+            types,
+            vec!["PgPostRepository", "PgCommentRepository", "PgTagRepository"]
+        );
+    }
+
+    #[test]
+    fn ignores_repository_attributes_that_are_not_on_a_trait() {
+        // Nothing is generated, so nothing may be claimed as generated.
+        assert!(generated_repository_types("#[repository]\nstruct Post;\n").is_empty());
+        assert!(generated_repository_types("#[serde(rename)]\ntrait Post {}\n").is_empty());
+        // A file that does not parse contributes nothing rather than failing
+        // the whole scan; it is reported as skipped on its own account.
+        assert!(generated_repository_types("fn f( {").is_empty());
+    }
+
+    #[test]
+    fn finds_traits_nested_inside_a_module() {
+        let types = generated_repository_types(
+            "mod repositories {\n    #[repository]\n    pub trait PostRepository {}\n}\n",
+        );
+        assert_eq!(types, vec!["PgPostRepository"]);
+    }
+
+    #[test]
+    fn a_conventional_name_no_trait_generates_is_reported_not_rewritten() {
+        // The whole point of collecting the traits: `PgAuditRepository` has the
+        // generated shape exactly, and is still the app's own type.
+        let result = rewrite_source(
+            "fn f(p: P) { PgAuditRepository::with_pool(p); }",
+            &[&RENAME],
+            &assumed_generated(),
+        )
+        .expect("parses");
+        assert!(result.updated.is_none(), "nothing may be rewritten");
+        assert_eq!(
+            result.manual.first().map(|site| site.manual),
+            Some(Some(ManualReason::UnverifiedReceiver)),
+            "and the site is reported with the reason, got {:?}",
+            result.manual
+        );
+    }
+
+    #[test]
+    fn a_receiver_of_the_wrong_shape_is_still_the_shape_complaint() {
+        // Verification does not swallow the earlier test: `PgCache` fails on
+        // shape, and saying "no trait generates this" would misdescribe it.
+        let result = rewrite_source(
+            "fn f(p: P) { PgCache::with_pool(p); }",
+            &[&RENAME],
+            &assumed_generated(),
+        )
+        .expect("parses");
+        assert_eq!(
+            result.manual.first().map(|site| site.manual),
+            Some(Some(ManualReason::UnexpectedReceiver)),
+            "got {:?}",
+            result.manual
+        );
+    }
+
     fn run(source: &str) -> SourceRewrite {
-        rewrite_source(source, &[&RENAME]).expect("source parses")
+        rewrite_source(source, &[&RENAME], &assumed_generated()).expect("source parses")
     }
 
     fn rewritten(source: &str) -> String {
@@ -699,14 +907,22 @@ mod tests {
                 receiver: None,
             },
         };
-        let result = rewrite_source("fn f(b: B, p: P) { b.old_step(p); }", &[&METHOD_RENAME])
-            .expect("parses");
+        let result = rewrite_source(
+            "fn f(b: B, p: P) { b.old_step(p); }",
+            &[&METHOD_RENAME],
+            &assumed_generated(),
+        )
+        .expect("parses");
         assert_eq!(
             result.updated.as_deref(),
             Some("fn f(b: B, p: P) { b.new_step(p); }")
         );
-        let path_form =
-            rewrite_source("fn f(p: P) { B::old_step(p); }", &[&METHOD_RENAME]).expect("parses");
+        let path_form = rewrite_source(
+            "fn f(p: P) { B::old_step(p); }",
+            &[&METHOD_RENAME],
+            &assumed_generated(),
+        )
+        .expect("parses");
         assert_eq!(path_form.updated, None, "a method rename leaves `::` alone");
     }
 
@@ -903,8 +1119,12 @@ mod tests {
             guide: "docs/migrations/0.6.0.md#anchor",
             rewrite: Rewrite::GuideOnly,
         };
-        let result = rewrite_source("fn f() { PgPostRepository::with_pool(p); }", &[&GUIDE_ONLY])
-            .expect("parses");
+        let result = rewrite_source(
+            "fn f() { PgPostRepository::with_pool(p); }",
+            &[&GUIDE_ONLY],
+            &assumed_generated(),
+        )
+        .expect("parses");
         assert_eq!(result.updated, None);
         assert!(result.rewritten.is_empty());
         assert!(result.manual.is_empty());
@@ -912,7 +1132,8 @@ mod tests {
 
     #[test]
     fn an_unparsable_file_is_an_error_not_a_rewrite() {
-        let err = rewrite_source("fn f( {", &[&RENAME]).expect_err("must not silently succeed");
+        let err = rewrite_source("fn f( {", &[&RENAME], &assumed_generated())
+            .expect_err("must not silently succeed");
         assert!(!err.is_empty(), "the parse error is reported to the user");
     }
 
@@ -1074,18 +1295,24 @@ mod tests {
         };
         let chain: [&'static AppMigration; 2] = [&FIRST, &SECOND];
 
-        let first_run =
-            rewrite_source_for_releases("fn f() { PgPostRepository::with_pool(p); }", &chain)
-                .expect("parses");
+        let first_run = rewrite_source_for_releases(
+            "fn f() { PgPostRepository::with_pool(p); }",
+            &chain,
+            &assumed_generated(),
+        )
+        .expect("parses");
         assert_eq!(
             first_run.updated.as_deref(),
             Some("fn f() { PgPostRepository::untracked_pool(p); }"),
             "one run reaches the newest name"
         );
 
-        let second_run =
-            rewrite_source_for_releases(first_run.updated.as_deref().expect("rewritten"), &chain)
-                .expect("parses");
+        let second_run = rewrite_source_for_releases(
+            first_run.updated.as_deref().expect("rewritten"),
+            &chain,
+            &assumed_generated(),
+        )
+        .expect("parses");
         assert_eq!(second_run.updated, None, "and a second run is a no-op");
     }
 
@@ -1121,7 +1348,8 @@ mod tests {
         };
         // `old_name` (0.7.0) is on line 2, `with_pool` (0.6.0) on line 3.
         let source = "fn f() {\n    R::old_name(p);\n    PgPostRepository::with_pool(p);\n}\n";
-        let result = rewrite_source_for_releases(source, &[&A, &B]).expect("parses");
+        let result =
+            rewrite_source_for_releases(source, &[&A, &B], &assumed_generated()).expect("parses");
         let lines: Vec<usize> = result.rewritten.iter().map(|site| site.line).collect();
         assert_eq!(
             lines,
@@ -1196,8 +1424,12 @@ mod tests {
                 receiver: None,
             },
         };
-        let result =
-            rewrite_source("fn f(p: P) { Anything::old_ctor(p); }", &[&ANY]).expect("parses");
+        let result = rewrite_source(
+            "fn f(p: P) { Anything::old_ctor(p); }",
+            &[&ANY],
+            &assumed_generated(),
+        )
+        .expect("parses");
         assert_eq!(
             result.updated.as_deref(),
             Some("fn f(p: P) { Anything::new_ctor(p); }")

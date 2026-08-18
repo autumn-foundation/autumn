@@ -35,6 +35,7 @@ pub mod diff;
 pub mod engine;
 pub mod migrations;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use migrations::{AppMigration, Version};
@@ -812,6 +813,21 @@ fn display_path(root: &Path, path: &Path) -> String {
         .join("/")
 }
 
+/// Which types the app's own `#[repository]` traits generate.
+///
+/// Collected across the whole scan before any rewriting: this is what turns the
+/// receiver test from a naming convention into evidence, and the trait and the
+/// call site normally live in different modules. A file that cannot be read or
+/// parsed contributes nothing rather than failing the scan — it is reported on
+/// its own account when the rewrite pass reaches it.
+fn generated_receivers(files: &[PathBuf]) -> BTreeSet<String> {
+    files
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|source| engine::generated_repository_types(&source))
+        .collect()
+}
+
 /// Build the report for `root` without writing anything.
 fn plan(root: &Path, from: Version, to: Version) -> Report {
     plan_with(root, from, to, &migrations::migrations_between(from, to))
@@ -878,6 +894,7 @@ fn plan_with(
             "directory could not be read - nothing under it was migrated".to_owned(),
         ));
     }
+    let generated = generated_receivers(&scan.files);
     for path in scan.files {
         let display = display_path(root, &path);
         let source = match std::fs::read_to_string(&path) {
@@ -888,7 +905,7 @@ fn plan_with(
             }
         };
         report.files_scanned += 1;
-        let rewrite = match engine::rewrite_source_for_releases(&source, selected) {
+        let rewrite = match engine::rewrite_source_for_releases(&source, selected, &generated) {
             Ok(rewrite) => rewrite,
             Err(error) => {
                 report.skipped.push((display, error));
