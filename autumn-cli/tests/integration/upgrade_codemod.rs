@@ -1581,3 +1581,85 @@ fn a_module_named_like_a_redirected_target_directory_is_still_migrated() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn a_nested_crate_redirects_its_own_target_directory() {
+    // Cargo reads `.cargo/config.toml` from the invocation directory upward, so
+    // a nested crate redirects its *own* output. Resolving the redirect once at
+    // the scan root left `tools/helper/build/` looking like app source.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        "tools/helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write(
+        tmp.path(),
+        "tools/helper/.cargo/config.toml",
+        "[build]\ntarget-dir = \"build\"\n",
+    );
+    write(tmp.path(), "tools/helper/src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        "tools/helper/build/debug/generated.rs",
+        USES_WITH_POOL,
+    );
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "tools/helper/src/main.rs").contains("with_pool_untracked("),
+        "the nested crate's own source is still app code:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(tmp.path(), "tools/helper/build/debug/generated.rs")
+            .contains("with_pool(pool.clone())"),
+        "the nested crate's configured output directory is build output:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "and the redirect does not leak upward:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn an_environment_target_redirect_wins_over_a_nested_config() {
+    // `CARGO_TARGET_DIR` overrides every `.cargo/config.toml`, so a nested
+    // crate's `target-dir` is not in effect at all when it is set — that
+    // directory is ordinary source and must be migrated like any other.
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", "fn main() {}\n");
+    write(
+        tmp.path(),
+        "tools/helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write(
+        tmp.path(),
+        "tools/helper/.cargo/config.toml",
+        "[build]\ntarget-dir = \"build\"\n",
+    );
+    write(tmp.path(), "tools/helper/build/mod.rs", USES_WITH_POOL);
+    write(tmp.path(), "out/debug/generated.rs", USES_WITH_POOL);
+
+    let output = run_upgrade_with_env(
+        tmp.path(),
+        &["--to", "0.6.0", "--apply"],
+        &[("CARGO_TARGET_DIR", "out")],
+    );
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "tools/helper/build/mod.rs").contains("with_pool_untracked("),
+        "the overridden config is not in effect:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        read(tmp.path(), "out/debug/generated.rs").contains("with_pool(pool.clone())"),
+        "the environment redirect is where output actually lands:\n{}",
+        stdout_of(&output)
+    );
+}

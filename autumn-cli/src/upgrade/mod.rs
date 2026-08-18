@@ -563,12 +563,12 @@ fn recorded_version(root: &Path) -> Option<String> {
 /// and both are visible in the report.
 fn member_manifests(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    collect_manifests(
-        root,
-        root,
-        configured_target_dir(root).as_deref(),
-        &mut found,
-    );
+    let (forced, target_dir) = root_target_dir(root);
+    let target_dir = TargetDir {
+        forced,
+        path: target_dir.as_deref(),
+    };
+    collect_manifests(root, root, target_dir, &mut found);
     found.sort();
     found
 }
@@ -583,7 +583,7 @@ fn is_target_dir(path: &Path, target_dir: Option<&Path>) -> bool {
     })
 }
 
-fn collect_manifests(root: &Path, dir: &Path, target_dir: Option<&Path>, found: &mut Vec<PathBuf>) {
+fn collect_manifests(root: &Path, dir: &Path, target_dir: TargetDir<'_>, found: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -603,73 +603,129 @@ fn collect_manifests(root: &Path, dir: &Path, target_dir: Option<&Path>, found: 
         let is_metadata = SKIPPED_HIDDEN_DIRS.contains(&name.as_str());
         let is_build_output = at_crate_root && SKIPPED_DIRS.contains(&name.as_str());
         let path = entry.path();
-        if is_metadata || is_build_output || is_target_dir(&path, target_dir) {
+        if is_metadata || is_build_output || is_target_dir(&path, target_dir.path) {
             continue;
         }
         if path.join("Cargo.toml").is_file() && path != root {
             found.push(path.clone());
         }
-        collect_manifests(root, &path, target_dir, found);
+        let nested = target_dir.nested_at(&path);
+        collect_manifests(root, &path, target_dir.or_inherited(nested.as_ref()), found);
     }
 }
 
-/// Cargo's output directory for `root`, when it is not the default `target/`.
+/// Where Cargo's build output lands for the directory currently being walked.
 ///
 /// `CARGO_TARGET_DIR` and `.cargo/config.toml`'s `build.target-dir` both move
-/// build output somewhere the `target` basename check will never look, and the
-/// walk then descends into generated code — `--apply` rewriting artifacts the
-/// next `cargo build` overwrites. Resolved the way Cargo resolves it: the
-/// environment variable against the current directory, a config entry against
-/// the directory holding the `.cargo` that declares it.
+/// output somewhere the `target` basename check will never look, and the walk
+/// then descends into generated code — `--apply` rewriting artifacts the next
+/// `cargo build` overwrites.
 ///
-/// `None` means the default, which the basename check already covers.
-fn configured_target_dir(root: &Path) -> Option<PathBuf> {
-    fn canonical(path: PathBuf) -> Option<PathBuf> {
-        std::fs::canonicalize(path).ok()
+/// It is a walk-time value rather than one path for the whole scan because
+/// Cargo reads `.cargo/config.toml` from the invocation directory upward: a
+/// nested standalone crate redirects its *own* output, and a redirect declared
+/// there applies to that subtree only. The environment variable is the one
+/// exception — it overrides every config file, so when it is set no nested
+/// config is consulted at all.
+#[derive(Clone, Copy, Default)]
+struct TargetDir<'a> {
+    /// `CARGO_TARGET_DIR` decided this, so nested configs are not in effect.
+    forced: bool,
+    /// The resolved output directory, or `None` for the default `target/`,
+    /// which the basename check already covers.
+    path: Option<&'a Path>,
+}
+
+impl TargetDir<'_> {
+    /// What applies inside `dir`, given what applies to its parent.
+    ///
+    /// Returns the nested override so the caller can own it for the length of
+    /// the recursive call; `None` means `dir` inherits.
+    fn nested_at(self, dir: &Path) -> Option<PathBuf> {
+        if self.forced {
+            return None;
+        }
+        config_target_dir_at(dir)
     }
 
-    if let Some(configured) = std::env::var_os("CARGO_TARGET_DIR") {
-        let configured = PathBuf::from(configured);
-        return canonical(if configured.is_absolute() {
-            configured
-        } else {
-            std::env::current_dir().ok()?.join(configured)
-        });
+    /// The same value with `nested` substituted when there is one.
+    fn or_inherited<'n>(self, nested: Option<&'n PathBuf>) -> TargetDir<'n>
+    where
+        Self: 'n,
+    {
+        TargetDir {
+            forced: self.forced,
+            path: nested.map(PathBuf::as_path).or(self.path),
+        }
     }
+}
 
-    // Cargo reads `.cargo/config.toml` from the working directory upward, so a
-    // member inherits the workspace root's redirect.
-    let absolute_root = std::fs::canonicalize(root).ok()?;
-    for ancestor in absolute_root.ancestors() {
-        for name in ["config.toml", "config"] {
-            let Ok(content) = std::fs::read_to_string(ancestor.join(".cargo").join(name)) else {
-                continue;
-            };
-            let Ok(table) = toml::from_str::<toml::Table>(&content) else {
-                continue;
-            };
-            let Some(configured) = table
-                .get("build")
-                .and_then(|build| build.get("target-dir"))
-                .and_then(toml::Value::as_str)
-            else {
-                continue;
-            };
-            let configured = PathBuf::from(configured);
-            return canonical(if configured.is_absolute() {
-                configured
-            } else {
-                ancestor.join(configured)
-            });
+/// Resolve `path` against `base` unless it is already absolute, then canonicalise.
+fn resolve_against(base: &Path, path: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(path);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    };
+    std::fs::canonicalize(absolute).ok()
+}
+
+/// `build.target-dir` from the `.cargo/config.toml` in `dir` itself, if any.
+///
+/// Cargo resolves a relative entry against the directory holding the `.cargo`
+/// that declares it, so that is what this resolves against.
+fn config_target_dir_at(dir: &Path) -> Option<PathBuf> {
+    let config_dir = dir.join(".cargo");
+    if !config_dir.is_dir() {
+        return None;
+    }
+    for name in ["config.toml", "config"] {
+        let Ok(content) = std::fs::read_to_string(config_dir.join(name)) else {
+            continue;
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&content) else {
+            continue;
+        };
+        if let Some(configured) = table
+            .get("build")
+            .and_then(|build| build.get("target-dir"))
+            .and_then(toml::Value::as_str)
+        {
+            return resolve_against(dir, configured);
         }
     }
     None
 }
 
+/// What applies at the scan root, before the walk starts.
+///
+/// The environment variable resolves against the current directory, the way
+/// Cargo resolves it. Failing that, `.cargo/config.toml` is searched from the
+/// root *upward*, so a member inherits the workspace root's redirect.
+fn root_target_dir(root: &Path) -> (bool, Option<PathBuf>) {
+    if let Some(configured) = std::env::var_os("CARGO_TARGET_DIR") {
+        let resolved = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| resolve_against(&cwd, &configured.to_string_lossy()));
+        return (true, resolved);
+    }
+    let Ok(absolute_root) = std::fs::canonicalize(root) else {
+        return (false, None);
+    };
+    let found = absolute_root.ancestors().find_map(config_target_dir_at);
+    (false, found)
+}
+
 /// Every `.rs` file under `root` that belongs to the app, in a stable order.
 fn app_sources(root: &Path) -> SourceScan {
     let mut scan = SourceScan::default();
-    collect_sources(root, configured_target_dir(root).as_deref(), &mut scan);
+    let (forced, target_dir) = root_target_dir(root);
+    let target_dir = TargetDir {
+        forced,
+        path: target_dir.as_deref(),
+    };
+    collect_sources(root, target_dir, &mut scan);
     scan.files.sort();
     scan.symlinks.sort();
     scan.unreadable.sort();
@@ -690,7 +746,7 @@ struct SourceScan {
 
 /// Collect `.rs` files, recording what was deliberately or accidentally left
 /// out so the caller can report it rather than drop it silently.
-fn collect_sources(dir: &Path, target_dir: Option<&Path>, scan: &mut SourceScan) {
+fn collect_sources(dir: &Path, target_dir: TargetDir<'_>, scan: &mut SourceScan) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         scan.unreadable.push(dir.to_path_buf());
         return;
@@ -715,10 +771,11 @@ fn collect_sources(dir: &Path, target_dir: Option<&Path>, scan: &mut SourceScan)
         if file_type.is_dir() {
             let is_metadata = SKIPPED_HIDDEN_DIRS.contains(&name.as_str());
             let is_build_output = at_crate_root && SKIPPED_DIRS.contains(&name.as_str());
-            if is_metadata || is_build_output || is_target_dir(&path, target_dir) {
+            if is_metadata || is_build_output || is_target_dir(&path, target_dir.path) {
                 continue;
             }
-            collect_sources(&path, target_dir, scan);
+            let nested = target_dir.nested_at(&path);
+            collect_sources(&path, target_dir.or_inherited(nested.as_ref()), scan);
         } else if file_type.is_symlink() {
             // A symlinked *directory* has `is_dir() == false`, so gating this
             // on a `.rs` extension hid a linked `src/` entirely: no traversal,

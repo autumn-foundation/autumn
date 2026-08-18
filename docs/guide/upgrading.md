@@ -178,6 +178,11 @@ If Cargo's output directory has been moved — `CARGO_TARGET_DIR`, or
 resolved as a path rather than matched by name. With the output in `out/`, an
 unrelated `src/out/mod.rs` is still migrated.
 
+The redirect is resolved the way Cargo resolves it, which means per subtree: a
+nested standalone crate with its own `.cargo/config.toml` redirects only its own
+output. `CARGO_TARGET_DIR` is the exception — it overrides every config file, so
+when it is set no nested config applies.
+
 Hidden directories are skipped by name — `.git`, `.github`, `.cargo`, `.vscode`
 and the like — not because they start with a dot. A dot-directory that holds
 compiled source, say a `#[path = ".generated/repositories.rs"]` module, is
