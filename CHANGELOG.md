@@ -75,6 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the same helper the `#[authorize]` binding walk uses, so the sibling
   extractors can no longer disagree about depth (#1627).
 
+- **security:** two sibling route-metadata losses found by review of the same
+  extraction ladder: (1) `#[secured]` above the route macro with `#[authorize]`
+  below it dropped the roles/scopes to `&[]` — the live `#[authorize]`
+  attribute short-circuited the marker read, so deleting the `#[secured(...)]`
+  line produced zero manifest diff; the marker read now runs first. (2) The
+  `#[public]` marker walk could not descend a wrapping guard's generated body,
+  so `#[public]` above `#[throttle]` lost `public: true` and false-failed the
+  coverage gate as `unclassified`; the walk now uses the same shared
+  wrapper-descent helper as the other marker extractors (#1627).
+
 - **`generate admin` over an `#[encrypted]` model:** the generated admin adapter
   did not compile — it bound `&new_row` to `.values(…)` and `&diesel_changeset`
   to `.set(…)`, and diesel implements `Insertable`/`AsChangeset` only for the

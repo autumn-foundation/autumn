@@ -956,6 +956,16 @@ mod tests {
         // stops the walk, so the replay guard behind it would look absent and
         // the enclosing guard would emit a second one ahead of the policy
         // check — serving a cached response before authorization runs.
+        //
+        // Scope of this test: it pins the SKIP-LIST behavior on the
+        // marker-plus-policy-check prologue prefix, via a reduced hand-written
+        // block. It deliberately does NOT run the walk over full real
+        // `#[authorize]` output: the walk already fails there on the
+        // unrecognized sunset-check statement the guard emits between the
+        // policy check and the replay stop — a pre-existing gap that predates
+        // the marker (and equally affects `#[secured]`'s UNAUTHORIZED-wrapped
+        // failure branch), tracked as its own follow-up because recognizing
+        // those statements changes replay-layer composition at runtime.
         let generated = crate::authorize::authorize_macro(
             quote::quote! { "update", resource = Post },
             quote::quote! {
@@ -970,7 +980,8 @@ mod tests {
                 Some(syn::Stmt::Item(syn::Item::Const(item)))
                     if item.ident == "__AUTUMN_AUTHORIZE_BINDINGS"
             ),
-            "this test's hand-written prologue must keep matching what #[authorize] emits"
+            "the reduced block's FIRST statement must keep matching what #[authorize] emits \
+             (the rest of the real expansion is deliberately not walked here — see above)"
         );
 
         let block: syn::Block = syn::parse_quote!({

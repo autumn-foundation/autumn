@@ -190,6 +190,18 @@ Three properties of these entries are load-bearing when you read them:
   its expansion emits, whatever name invoked it. If you alias the guard
   macros, put them above the route attribute — or don't alias them.
 
+One boundary applies to every marker-read fact in the manifest, not just this
+dimension: the marker consts (`__AUTUMN_AUTHORIZE_BINDINGS`,
+`__AUTUMN_SECURED_ROLES`, `__AUTUMN_PUBLIC`, …) are framework-internal
+declarations the macros emit, and the extractors take them at their word.
+Hand-writing one in a handler body forges the corresponding claim — a forged
+public marker even turns the coverage gate green for an unguarded route. The
+manifest's threat model is **drift detection, not an adversarial author**: it
+proves what your code declares, so an author lying to their own manifest is an
+author lying in their own code, and that is what code review of the
+application is for. The audit deliberately does not try to out-verify a
+developer with commit access to the code it audits.
+
 Entries are sorted by `(path, method, action, resource)`, and each route's own
 bindings are sorted and deduplicated before they reach the manifest, so a
 rebuild of unchanged code is byte-identical and a diff shows only what actually
@@ -288,9 +300,9 @@ entries do not measure the same thing, and the manifest never pretends they do:
 routes.entries[].policy  ⊇  authorization_policies.entries
 ```
 
-Every route with a binding has `policy: true`, but not every route with
-`policy: true` has a binding. Two guards set the boolean while leaving nothing
-a macro can recover:
+For every route the macros generate, a binding implies `policy: true` — but not
+every route with `policy: true` has a binding. Two guards set the boolean while
+leaving nothing a macro can recover:
 
 - **An inline `__check_policy` / `__check_policy_scoped` call** in the handler
   body. That is the shape `#[authorize]` itself expands to, and the route macro

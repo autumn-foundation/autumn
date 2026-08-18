@@ -625,7 +625,25 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream, Token
         }
     }
 
-    // Case 1b — #[authorize] or #[autumn_web::authorize] visible as a remaining attribute.
+    // Case 2 — #[secured] was above the route macro and already expanded;
+    // read the markers emitted into the guarded function body. This runs
+    // BEFORE the live-#[authorize] fallback below: `#[secured]` above the
+    // route macro with `#[authorize]` below it leaves both an expanded marker
+    // and a live attribute, and letting the attribute win would drop the
+    // roles/scopes to `&[]` while `secured` stayed true — deleting the
+    // `#[secured(...)]` line would then produce zero manifest diff on a
+    // `provable` dimension.
+    if let Some(roles) = extract_secured_roles_marker(input_fn) {
+        let scopes = extract_secured_scopes_marker(input_fn).unwrap_or_default();
+        return (
+            true,
+            emit_static_str_slice(&roles),
+            emit_static_str_slice(&scopes),
+        );
+    }
+
+    // Case 1b — #[authorize] or #[autumn_web::authorize] visible as a remaining
+    // attribute (and no secured markers anywhere in the body).
     for attr in &input_fn.attrs {
         if attr.path().is_ident("authorize")
             || attr
@@ -636,17 +654,6 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream, Token
         {
             return (true, quote! { &[] }, quote! { &[] });
         }
-    }
-
-    // Case 2 — #[secured] was above the route macro and already expanded;
-    // read the markers emitted into the guarded function body.
-    if let Some(roles) = extract_secured_roles_marker(input_fn) {
-        let scopes = extract_secured_scopes_marker(input_fn).unwrap_or_default();
-        return (
-            true,
-            emit_static_str_slice(&roles),
-            emit_static_str_slice(&scopes),
-        );
     }
 
     // Case 2b — #[authorize] was above the route macro and already expanded;
@@ -714,9 +721,13 @@ fn has_public_marker_in_stmt(stmt: &syn::Stmt) -> bool {
 fn has_public_marker_in_expr(expr: &syn::Expr) -> bool {
     match expr {
         syn::Expr::Block(block) => has_public_marker_in_stmts(&block.block.stmts),
-        syn::Expr::Async(block) => has_public_marker_in_stmts(&block.block.stmts),
         syn::Expr::Unsafe(block) => has_public_marker_in_stmts(&block.block.stmts),
-        _ => false,
+        // Same generated-wrapper descent as the secured/authorize marker walks:
+        // a body guard expanding after `#[public]` (e.g. `#[throttle]`) buries
+        // the marker inside `(async move { … }).await`, and losing it here
+        // flips the route to `unclassified` and false-fails the coverage gate.
+        _ => crate::idempotency_guard::expr_nested_async_body(expr)
+            .is_some_and(|block| has_public_marker_in_stmts(&block.stmts)),
     }
 }
 
@@ -1388,6 +1399,52 @@ mod tests {
                 ("first".to_owned(), "Note".to_owned()),
                 ("second".to_owned(), "Note".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn secured_markers_survive_live_authorize_attribute() {
+        // `#[secured]` ABOVE the route macro (already expanded into markers)
+        // with `#[authorize]` BELOW it (still a live attribute): the marker
+        // read must win over the authorize-attribute fallback, or the roles
+        // and scopes silently drop to `&[]` while `secured` stays true.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[authorize("update", resource = Note)]
+            async fn handler(note: Note) {
+                const __AUTUMN_SECURED_ROLES: &[&str] = &["admin"];
+                const __AUTUMN_SECURED_SCOPES: &[&str] = &["notes:write"];
+            }
+        };
+        let (secured, roles, scopes) = extract_secured_info(&input_fn);
+        assert!(secured);
+        assert!(
+            roles.to_string().contains("\"admin\""),
+            "roles from an expanded #[secured] must survive a live #[authorize] attribute: {roles}"
+        );
+        assert!(
+            scopes.to_string().contains("\"notes:write\""),
+            "scopes must survive alongside the roles: {scopes}"
+        );
+    }
+
+    #[test]
+    fn public_marker_survives_generated_wrapper() {
+        // `#[public]` above a wrapping guard (e.g. `#[throttle]`): the guard
+        // buries the `__AUTUMN_PUBLIC` marker inside its generated
+        // `(async move { … }).await` body. The walk must descend that wrapper,
+        // or the route silently loses `public: true` and false-fails the
+        // coverage gate as `unclassified`.
+        let public = crate::public::public_macro(
+            quote::quote! {},
+            quote::quote! { async fn h() -> &'static str { "ok" } },
+        );
+        let throttled =
+            crate::throttle::throttle_macro(quote::quote! { limit = 5, per = "1m" }, public);
+        let parsed: syn::ItemFn =
+            syn::parse2(throttled).expect("#[throttle] over #[public] output must parse");
+        assert!(
+            is_public(&parsed),
+            "the public marker must survive a #[throttle] wrapper"
         );
     }
 

@@ -1193,6 +1193,39 @@ mod tests {
     }
 
     #[test]
+    fn route_macro_preserves_secured_roles_when_authorize_is_still_an_attribute() {
+        // The remaining ordering of {secured, route, authorize}: `#[secured]`
+        // ABOVE `#[post]` (already expanded into markers) with `#[authorize]`
+        // BELOW it (still a live attribute). The marker read must not be
+        // short-circuited by the live-authorize fallback — both idioms are the
+        // documented house style, and losing the roles here means deleting the
+        // `#[secured(...)]` line produces zero manifest diff on a `provable`
+        // dimension.
+        let secured = crate::secured::secured_macro(
+            quote! { "admin", scopes = ["notes:write"] },
+            quote! {
+                #[authorize("update", resource = Note)]
+                async fn update_note(note: Note) -> &'static str { "ok" }
+            },
+        );
+        let generated = route_macro("POST", "post", quote! { "/notes/{id}" }, secured).to_string();
+
+        assert!(
+            generated.contains(r#"required_roles : & ["admin"]"#),
+            "roles from an expanded #[secured] must survive a live #[authorize] attribute: \
+             {generated}"
+        );
+        assert!(
+            generated.contains(r#"required_scopes : & ["notes:write"]"#),
+            "scopes must survive alongside the roles: {generated}"
+        );
+        assert!(
+            generated.contains(r#"AuthorizeBinding { action : "update" , resource : "Note" }"#),
+            "…and the authorize binding must be recorded alongside them: {generated}"
+        );
+    }
+
+    #[test]
     fn route_macro_orders_marker_binding_before_live_attribute() {
         // Mixed arrangement: `#[authorize(A)]` ABOVE `#[post]` (already
         // expanded into a marker by the time the route macro runs) and
