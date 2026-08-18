@@ -8924,8 +8924,52 @@ mod sqlite_sharding_unsupported_guard_tests {
     }
 }
 
+/// Check for, and log, a Diesel migration version claimed by two
+/// differently-named migrations across the combined framework/plugin/app
+/// registrations. Returns `true` when startup must abort.
+///
+/// All of them apply against one shared `__diesel_schema_migrations` table
+/// (keyed by version), so a collision would otherwise mean a fresh database
+/// silently skips one of them — see
+/// [`crate::migrate::check_migration_version_collisions`]. Plugin authors
+/// cannot coordinate versions with every other plugin or app that might
+/// register alongside theirs, so this check, not convention, is what catches
+/// it. Pure static analysis of the embedded migration metadata: it runs even
+/// when the app never auto-applies migrations.
 #[cfg(feature = "db")]
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+fn log_migration_version_collisions(
+    migrations: &[crate::migrate::EmbeddedMigrations],
+    directory_migration_required: bool,
+    shard_map_migration_required: bool,
+) -> bool {
+    let collisions = crate::migrate::check_migration_version_collisions(
+        migrations
+            .iter()
+            .chain(
+                directory_migration_required
+                    .then_some(&crate::sharding::SHARD_DIRECTORY_MIGRATIONS),
+            )
+            .chain(shard_map_migration_required.then_some(&crate::sharding::SHARD_MAP_MIGRATIONS)),
+    );
+    for collision in &collisions {
+        tracing::error!(
+            version = %collision.version,
+            names = ?collision.names,
+            "Migration version claimed by more than one migration; a fresh database would \
+             apply only one and silently skip the rest. Renumber the newer migration so every \
+             registered migration version is unique (`autumn migrate new <name>` picks a free \
+             one)."
+        );
+    }
+    !collisions.is_empty()
+}
+
+#[cfg(feature = "db")]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_lines
+)]
 async fn run_startup_migrations(
     config: &AutumnConfig,
     control_configured: bool,
@@ -8935,6 +8979,18 @@ async fn run_startup_migrations(
     directory_migration_required: bool,
     shard_map_migration_required: bool,
 ) {
+    if log_migration_version_collisions(
+        &migrations,
+        directory_migration_required,
+        shard_map_migration_required,
+    ) {
+        // Same orphan hazard as a migration failure below: `process::exit`
+        // skips `on_shutdown`, so stop any managed Postgres before bailing.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
+        std::process::exit(1);
+    }
+
     let control_url = if control_configured {
         // Prefer a provider-resolved URL (e.g. managed Postgres, whose socket
         // URL isn't in config) carried on the topology: the runtime pool is

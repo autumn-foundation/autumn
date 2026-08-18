@@ -28,6 +28,51 @@ The lock covers:
 
 ---
 
+## Version collisions
+
+Diesel records applied migrations **by version** — the leading
+`YYYYMMDDHHMMSS` prefix of a migration directory's name — in a single shared
+table. When two differently-named migration directories share one version, a
+fresh database applies exactly one of them and records the version as done;
+the other is skipped **forever, with no error anywhere**. A skipped migration
+is not merely absent: a constraint it was supposed to add will appear to
+exist in code review and not exist in the database.
+
+This is most likely when two branches each add a migration around the same
+time and one picks a round, hand-typed timestamp (midnight, on the hour)
+instead of the actual current second — two people reaching for `00:00:00` on
+the same day collide; two people reaching for the real current second, to the
+second, essentially never do.
+
+Autumn closes this at three points:
+
+* **`autumn migrate new <name>`** creates
+  `migrations/<version>_<name>/{up,down}.sql` with a version guaranteed free
+  across the working tree, every local and remote-tracking git branch this
+  checkout has fetched, and the framework's own compiled-in migrations. Use
+  this instead of hand-creating a migration directory.
+* **`autumn migrate check-collisions`** is the CI-time backstop for a
+  collision `migrate new` could not see — a branch pushed after, or a
+  teammate's concurrent PR. It fails when a version this checkout introduces
+  is already claimed by a different directory on the default branch, another
+  pushed branch, or the framework's own migrations, and is silent about a
+  collision between two *other* branches (that is their gate to fail on, not
+  this checkout's). It needs the full branch history
+  (`actions/checkout@v7` with `fetch-depth: 0`, or a local `git fetch
+  origin`); without it, it degrades to a working-tree-only check and prints a
+  loud warning rather than failing closed.
+* **At app startup**, every registered `EmbeddedMigrations` set — the
+  framework's own, every plugin's, and the app's own `migrations/` directory,
+  everything passed to `AppBuilder::migrations(…)` — is checked for a version
+  claimed by two differently-named migrations. This is the layer that matters
+  once plugins are involved: a plugin author has no way to see the versions
+  an app, or another plugin, already used, so a collision between two
+  unrelated plugins (or a plugin and the app) cannot be prevented by
+  convention. Startup aborts immediately, before any migration runs, rather
+  than silently skipping one.
+
+---
+
 ## Lock key
 
 The advisory lock uses a single `bigint` key:

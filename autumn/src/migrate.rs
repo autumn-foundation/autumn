@@ -705,6 +705,94 @@ pub struct AppliedUserMigration {
     pub dir: Option<std::path::PathBuf>,
 }
 
+/// A Diesel migration version claimed by two or more differently-named
+/// migrations.
+///
+/// The claimants may come from anywhere across the app's combined
+/// [`AppBuilder::migrations`](crate::app::AppBuilder::migrations)
+/// registrations — framework, plugins, and the app's own `migrations/`
+/// directory all contribute to that one list.
+///
+/// Diesel records applied migrations **by version** in a single shared
+/// `__diesel_schema_migrations` table, regardless of which
+/// [`EmbeddedMigrations`] set a migration came from. When two differently
+/// named migrations share a version, a fresh database applies exactly one of
+/// them and records the version as done — the other is skipped forever, with
+/// no error anywhere. A plugin author has no way to see the versions an app,
+/// or another plugin, already used, so this cannot be prevented by
+/// convention once more than one plugin is in play. See
+/// [`check_migration_version_collisions`], which [`crate::app`] calls at
+/// startup so the failure is loud and immediate instead of a silently
+/// skipped migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationVersionCollision {
+    /// The version both (or all) directories claim, e.g. `"20260812000000"`.
+    pub version: String,
+    /// Every distinct migration name claiming this version (its full
+    /// embedded-directory name, e.g. `"20260812000000_create_widgets"`),
+    /// sorted for stable output.
+    pub names: Vec<String>,
+}
+
+impl std::fmt::Display for MigrationVersionCollision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "version {} claimed by:", self.version)?;
+        for name in &self.names {
+            write!(f, "\n    {name}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Scan every registered [`EmbeddedMigrations`] set for a version claimed by
+/// two or more differently-named migrations.
+///
+/// Two occurrences of the exact same migration name (the same directory,
+/// registered via two different sets — e.g. the shard-required
+/// version-history migration, which is deliberately duplicated into both
+/// [`FRAMEWORK_MIGRATIONS`] and the standalone
+/// [`crate::version_history::VERSION_HISTORY_MIGRATIONS`] set) are not a
+/// collision: they are the same migration applying once, harmlessly skipped
+/// the second time it is registered. Only **different** names sharing one
+/// version are reported.
+///
+/// Returns an empty `Vec` when a set cannot be read (e.g. corrupt embedded
+/// metadata) rather than failing — this check runs before any database
+/// connection exists, and a set that cannot enumerate its own migrations will
+/// fail loudly and specifically once Diesel actually tries to apply it.
+///
+/// Takes an iterator of references (rather than `&[EmbeddedMigrations]`) so
+/// callers can `.chain()` conditional sets — e.g. the sharding control
+/// migrations, which only join the apply list when a directory/shard-map
+/// table is actually required — without first collecting everything into an
+/// owned `Vec`.
+#[must_use]
+pub fn check_migration_version_collisions<'a>(
+    migrations: impl IntoIterator<Item = &'a EmbeddedMigrations>,
+) -> Vec<MigrationVersionCollision> {
+    let mut by_version: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for set in migrations {
+        let Ok(entries) = MigrationSource::<Pg>::migrations(set) else {
+            continue;
+        };
+        for m in entries {
+            by_version
+                .entry(m.name().version().to_string())
+                .or_default()
+                .insert(m.name().to_string());
+        }
+    }
+    by_version
+        .into_iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(version, names)| MigrationVersionCollision {
+            version,
+            names: names.into_iter().collect(),
+        })
+        .collect()
+}
+
 /// Versions of all embedded framework migrations: the control-plane
 /// [`FRAMEWORK_MIGRATIONS`] plus the shard-required version-history and
 /// commit-hook queue migrations.
@@ -2758,6 +2846,50 @@ pub(crate) fn auto_migrate_sqlite(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Cross-source migration version collisions ──────────────────────────
+
+    const COLLISION_A: EmbeddedMigrations =
+        diesel_migrations::embed_migrations!("test_migrations_collision_a");
+    const COLLISION_B: EmbeddedMigrations =
+        diesel_migrations::embed_migrations!("test_migrations_collision_b");
+    const MARKER: EmbeddedMigrations = diesel_migrations::embed_migrations!("test_migrations");
+
+    #[test]
+    fn check_migration_version_collisions_flags_two_sets_sharing_a_version() {
+        let collisions = check_migration_version_collisions([&COLLISION_A, &COLLISION_B]);
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].version, "20260601000000");
+        assert_eq!(
+            collisions[0].names,
+            vec![
+                "20260601000000_widget_alpha".to_string(),
+                "20260601000000_widget_beta".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn check_migration_version_collisions_is_empty_for_disjoint_versions() {
+        let collisions = check_migration_version_collisions([&COLLISION_A, &MARKER]);
+        assert!(collisions.is_empty(), "got {collisions:?}");
+    }
+
+    #[test]
+    fn check_migration_version_collisions_tolerates_the_same_set_registered_twice() {
+        // Mirrors the framework's own intentional duplication: the same named
+        // migration registered via two different `EmbeddedMigrations` values
+        // (e.g. a shard-required migration also baked into the control
+        // FRAMEWORK_MIGRATIONS set) is not a collision — it is the same
+        // migration, applied once and harmlessly skipped the second time.
+        let collisions = check_migration_version_collisions([&COLLISION_A, &COLLISION_A]);
+        assert!(collisions.is_empty(), "got {collisions:?}");
+    }
+
+    #[test]
+    fn check_migration_version_collisions_is_empty_for_no_sets() {
+        assert!(check_migration_version_collisions(std::iter::empty()).is_empty());
+    }
 
     // ── Per-attempt connect_timeout injection (`--wait`) ───────────────────
 

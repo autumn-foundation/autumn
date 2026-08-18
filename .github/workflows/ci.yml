@@ -99,6 +99,39 @@ jobs:
         # clippy failure can't stop it from running.
         run: ./scripts/check-migration-guides.sh
 
+  migration-collisions:
+    name: Diesel migration version collisions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # `autumn migrate check-collisions` compares this branch's migration
+          # versions against every other pushed branch, which needs the
+          # remote-tracking refs a shallow (default) checkout doesn't fetch.
+          # Without this, the gate still runs — it degrades to a working-tree
+          # -only check with a loud warning rather than failing closed — but
+          # would silently lose the cross-branch half of the protection on
+          # every PR in this repo's own CI.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Migration version collision gate
+        # Diesel records applied migrations BY VERSION (the leading
+        # `YYYYMMDDHHMMSS` directory prefix). When two directories share one
+        # version, a fresh database runs exactly one of them and records the
+        # version as done -- the other is skipped forever, with no error
+        # anywhere. This is the enforcing half of `autumn migrate new`, which
+        # hands out a collision-free version at generation time; this gate
+        # catches a collision that generator could not see (a branch pushed
+        # after, a teammate's concurrent PR) before it reaches the default
+        # branch, on the push that introduced it rather than after both land.
+        #
+        # Framework-owned migrations live in `autumn/migrations`, not a
+        # repository-root `migrations/`, so this runs from within `autumn/` —
+        # exactly like a downstream app would run it from its own project
+        # root once `autumn migrate check-collisions` ships in a release.
+        run: (cd autumn && cargo run -p autumn-cli --bin autumn -- migrate check-collisions)
+
   supply-chain:
     name: Supply chain (cargo-deny)
     runs-on: ubuntu-latest
