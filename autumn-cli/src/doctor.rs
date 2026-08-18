@@ -2460,7 +2460,15 @@ fn read_msrv() -> Option<String> {
 
 /// Read the `autumn-web` version requirement from the project's `Cargo.toml`.
 fn read_autumn_web_version() -> Option<String> {
-    let content = std::fs::read_to_string("Cargo.toml").ok()?;
+    read_autumn_web_version_at(std::path::Path::new("."))
+}
+
+/// Read the `autumn-web` version requirement from the `Cargo.toml` at `root`.
+///
+/// Shared with `autumn upgrade`, which needs the same answer for a directory
+/// it was pointed at rather than the process's working directory.
+pub fn read_autumn_web_version_at(root: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
     let table: toml::Table = toml::from_str(&content).ok()?;
 
     let find_in_deps = |deps: &toml::Value| -> Option<String> {

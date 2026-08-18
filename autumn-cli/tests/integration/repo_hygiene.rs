@@ -7898,3 +7898,531 @@ fn migration_guide_gate_does_not_match_an_unescaped_label_to_an_escaped_one() {
         "an unescaped label does not resolve to an escaped definition",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Codemod coverage (issue #1629).
+//
+// #1588 made the migration guide a release gate; these pin the follow-on gate:
+// a rename-level break -- the class `autumn upgrade` can rewrite -- does not
+// ship without either a codemod that actually exists in the registry, or a
+// stated reason it stays manual.
+// ---------------------------------------------------------------------------
+
+/// A codemod registry the gate can read, in the shape it greps for.
+fn write_fixture_registry(tmp: &tempfile::TempDir, ids: &[&str]) {
+    let dir = tmp.path().join("autumn-cli/src/upgrade");
+    std::fs::create_dir_all(&dir).expect("registry dir");
+    let mut body = String::from("pub static APP_MIGRATIONS: &[AppMigration] = &[\n");
+    for id in ids {
+        let _ = writeln!(body, "    AppMigration {{\n        id: \"{id}\",\n    }},");
+    }
+    body.push_str("];\n");
+    std::fs::write(dir.join("migrations.rs"), body).expect("registry");
+}
+
+/// A guide whose single breaking change is `body`, appended under the heading.
+fn guide_with_breaking_change(version: &str, heading: &str, body: &str) -> String {
+    format!(
+        "# Migrating to `{version}`\n\n\
+         ## At a glance\n\n\
+         - **New version:** `autumn-web {version}`\n\n\
+         ## Summary\n\n\
+         Why this release breaks.\n\n\
+         ## Before you start\n\n\
+         Pin the old version and get green.\n\n\
+         ## Breaking changes\n\n\
+         ### {heading}\n\n\
+         {body}\n\n\
+         ## How to verify\n\n\
+         Run `cargo check`.\n\n\
+         ### Guide-only upgrade walkthrough\n\n\
+         - **Status:** performed 2026-01-01\n"
+    )
+}
+
+/// The changelog every fixture below shares: one breaking entry, guide linked.
+fn breaking_changelog(version: &str) -> String {
+    format!(
+        "# Changelog\n\n\
+         ## [{version}] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** the constructor changed. See the \
+         [migration guide](docs/migrations/{version}.md).\n"
+    )
+}
+
+fn gate_fixture_with_guide(version: &str, guide: &str) -> tempfile::TempDir {
+    let tmp = migration_gate_fixture(version);
+    write_fixture_guide(&tmp, version, guide);
+    std::fs::write(tmp.path().join("CHANGELOG.md"), breaking_changelog(version))
+        .expect("changelog");
+    tmp
+}
+
+#[test]
+fn codemod_gate_fails_a_rename_with_no_automation_label() {
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `with_pool` is renamed to `with_pool_untracked`",
+            "Only the name changes.",
+        ),
+    );
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a rename-level break must be classified (issue #1629)\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("automation label"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_ignores_a_semantic_change_with_no_automation_label() {
+    // "Semantic/behavioral changes remain guide-only with no justification
+    // needed" — the gate must not turn every behaviour change into paperwork.
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Security: the signing secret is required in production",
+            "Set `AUTUMN_TENANCY__JWT_SECRET` before booting.",
+        ),
+    );
+    let output = run_migration_gate(tmp.path());
+    assert!(output.status.success(), "{}", gate_report(&output));
+}
+
+#[test]
+fn codemod_gate_fails_an_auto_label_naming_no_shipped_codemod() {
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `with_pool` is renamed to `with_pool_untracked`",
+            "**Automation:** `auto` — `autumn upgrade` rewrites every call site; \
+             codemod `0.7.0-not-shipped`.",
+        ),
+    );
+    write_fixture_registry(&tmp, &["0.6.0-something-else"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a guide may not promise a codemod nobody wrote\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("names no shipped codemod"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_accepts_an_auto_label_backed_by_the_registry() {
+    let mut guide = guide_with_breaking_change(
+        "0.7.0",
+        "Repository: `with_pool` is renamed to `with_pool_untracked`",
+        "**Automation:** `auto` — `autumn upgrade` rewrites every call site; \
+         codemod `0.7.0-with-pool`.",
+    );
+    // A shipped codemod also has to have been used by the walk-through.
+    guide = guide.replace(
+        "- **Status:** performed 2026-01-01",
+        "- **Codemod:** `autumn upgrade --apply` covered the rename.\n\
+         - **Status:** performed 2026-01-01",
+    );
+    let tmp = gate_fixture_with_guide("0.7.0", &guide);
+    write_fixture_registry(&tmp, &["0.7.0-with-pool"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(output.status.success(), "{}", gate_report(&output));
+}
+
+#[test]
+fn codemod_gate_fails_a_shipped_codemod_with_no_codemod_first_walkthrough() {
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `with_pool` is renamed to `with_pool_untracked`",
+            "**Automation:** `auto` — codemod `0.7.0-with-pool` rewrites every site.",
+        ),
+    );
+    write_fixture_registry(&tmp, &["0.7.0-with-pool"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "the walk-through is performed codemod-first (issue #1629)\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("codemod-first walk-through"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_fails_a_rename_left_manual_without_a_reason() {
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `with_pool` is renamed to `with_pool_untracked`",
+            "**Automation:** `manual`",
+        ),
+    );
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a rename left manual has to say why\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no reason given"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_accepts_a_rename_left_manual_with_a_reason() {
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `with_pool` is renamed to `with_pool_untracked`",
+            "**Automation:** `manual` — the new name is only reachable from \
+             inside the `repository!` macro, which no codemod may rewrite.",
+        ),
+    );
+    let output = run_migration_gate(tmp.path());
+    assert!(output.status.success(), "{}", gate_report(&output));
+}
+
+#[test]
+fn codemod_gate_rejects_an_unknown_automation_label() {
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `with_pool` is renamed to `with_pool_untracked`",
+            "**Automation:** `probably` — we think a codemod could do this.",
+        ),
+    );
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "only auto/review/manual are labels\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unknown automation"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_reads_a_label_from_the_code_span_not_the_prose() {
+    // "…we chose `manual` because auto was unsafe" must not read as `auto`.
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `with_pool` is renamed to `with_pool_untracked`",
+            "**Automation:** `manual` — an auto rewrite would need type \
+             inference this tool does not have.",
+        ),
+    );
+    let output = run_migration_gate(tmp.path());
+    assert!(output.status.success(), "{}", gate_report(&output));
+}
+
+#[test]
+fn codemod_gate_does_not_read_labels_out_of_fenced_samples() {
+    // A guide that *documents* the convention shows the label in a fence; that
+    // is a sample, not a declaration, and must not satisfy a real entry.
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `with_pool` is renamed to `with_pool_untracked`",
+            "```markdown\n**Automation:** `auto` — codemod `0.7.0-with-pool`.\n```",
+        ),
+    );
+    write_fixture_registry(&tmp, &["0.7.0-with-pool"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a label inside a fence is a sample, not a classification\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("automation label"),
+        "the entry must fail as unclassified, not for some unrelated reason\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_reads_the_registry_this_repository_actually_ships() {
+    // The real registry and the real guides have to agree with each other, and
+    // the gate is the thing that keeps them agreeing.
+    let root = workspace_root();
+    let registry = root.join("autumn-cli/src/upgrade/migrations.rs");
+    assert!(
+        registry.is_file(),
+        "the codemod registry is the path the gate greps: {}",
+        registry.display(),
+    );
+    let body = std::fs::read_to_string(&registry).expect("read registry");
+    assert!(
+        body.contains("id: \"0.6.0-repository-with-pool-untracked\""),
+        "the first shipped codemod is the 0.6.0 with_pool rename (issue #1629)",
+    );
+    // The whole-repo gate run itself is asserted by
+    // `migration_guide_gate_passes_for_this_repository`; this test pins the
+    // path and the id the gate greps for.
+    assert!(
+        std::fs::read_to_string(root.join("docs/migrations/0.6.0.md"))
+            .expect("read the 0.6.0 guide")
+            .contains("0.6.0-repository-with-pool-untracked"),
+        "the guide and the registry name the same codemod",
+    );
+}
+
+#[test]
+fn codemod_gate_reads_a_label_written_as_a_list_item() {
+    // A bulleted label renders as the same declaration a reader sees, so it has
+    // to be held to the same rule — otherwise a bullet is a way to promise a
+    // codemod nobody wrote.
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Config: the `session.ttl` default changed",
+            "- **Automation:** `auto` — `autumn upgrade` fixes every call site; \
+             codemod `0.7.0-vapourware`.",
+        ),
+    );
+    write_fixture_registry(&tmp, &["0.7.0-something-else"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a bulleted label is still a label\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("names no shipped codemod"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_reads_entries_outside_the_breaking_changes_section() {
+    // A rename documented under `## Behavior changes` breaks apps exactly as
+    // hard as one under `## Breaking changes`.
+    let guide = valid_migration_guide("0.7.0").replace(
+        "## How to verify",
+        "## Behavior changes\n\n\
+         ### Routing: `Router::mount` is renamed to `Router::attach`\n\n\
+         Only the name changes.\n\n\
+         ## How to verify",
+    );
+    let tmp = gate_fixture_with_guide("0.7.0", &guide);
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a rename outside `## Breaking changes` must still be classified\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("automation label"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_does_not_accept_another_releases_codemod() {
+    // Citing the previous release's codemod says nothing about this release.
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `foo` is renamed to `bar`",
+            "**Automation:** `auto` — codemod \
+             `0.6.0-repository-with-pool-untracked` rewrites every site.",
+        ),
+    );
+    write_fixture_registry(&tmp, &["0.6.0-repository-with-pool-untracked"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a 0.6.0 codemod does not cover a 0.7.0 rename\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("names no shipped codemod"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_scopes_the_codemod_record_to_the_walkthrough_section() {
+    // A `- **Codemod:**` bullet parked under a later sibling heading is not a
+    // record of a codemod-first walk-through.
+    let guide = guide_with_breaking_change(
+        "0.7.0",
+        "Repository: `with_pool` is renamed to `with_pool_untracked`",
+        "**Automation:** `auto` — codemod `0.7.0-with-pool` rewrites every site.",
+    )
+    .replace(
+        "- **Status:** performed 2026-01-01",
+        "- **Status:** performed 2026-01-01\n\n\
+         ### An unrelated later subsection\n\n\
+         - **Codemod:** `autumn upgrade --apply`\n",
+    );
+    let tmp = gate_fixture_with_guide("0.7.0", &guide);
+    write_fixture_registry(&tmp, &["0.7.0-with-pool"]);
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "the codemod record has to sit under the walk-through heading\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("codemod-first walk-through"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_rejects_a_label_that_is_not_in_a_code_span() {
+    // `**Automation:** auto` is prose, not a declaration the parser can read;
+    // failing it beats silently reading the first word of the sentence.
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `with_pool` is renamed to `with_pool_untracked`",
+            "**Automation:** auto — we think a codemod covers this.",
+        ),
+    );
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an unbackticked label is not a label\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unknown automation"),
+        "{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn codemod_gate_accepts_a_reason_wrapped_across_lines() {
+    // Real guides wrap. A justification whose *first* line is short is still a
+    // justification, and rejecting it would push authors to write one long line.
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `with_pool` is renamed to `with_pool_untracked`",
+            "**Automation:** `manual` — no\nmechanical rewrite is possible here.",
+        ),
+    );
+    let output = run_migration_gate(tmp.path());
+    assert!(output.status.success(), "{}", gate_report(&output));
+}
+
+#[test]
+fn codemod_gate_accepts_the_reason_the_error_message_suggests() {
+    // The `NOJUSTIFY` message offers "needs new arguments" as an acceptable
+    // reason; a threshold that rejects it would be telling authors a lie.
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Repository: `with_pool` is renamed to `with_pool_untracked`",
+            "**Automation:** `manual` — needs new arguments.",
+        ),
+    );
+    let output = run_migration_gate(tmp.path());
+    assert!(output.status.success(), "{}", gate_report(&output));
+}
+
+#[test]
+fn codemod_gate_honours_the_documented_suppression_token() {
+    // An entry that *documents* the convention rather than declaring a break
+    // uses the same escape hatch every other check in this gate offers.
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Process: how a rename is classified",
+            "Explains the labels. \
+             <!-- migration-guide-gate: describes the convention itself -->",
+        ),
+    );
+    let output = run_migration_gate(tmp.path());
+    assert!(output.status.success(), "{}", gate_report(&output));
+}
+
+#[test]
+fn codemod_gate_survives_a_registry_it_cannot_read() {
+    // Fails closed and says so, rather than reading an unreadable registry as
+    // "no codemods shipped" and blaming the guide.
+    let tmp = gate_fixture_with_guide(
+        "0.7.0",
+        &guide_with_breaking_change(
+            "0.7.0",
+            "Security: the signing secret is required",
+            "Set it before booting.",
+        ),
+    );
+    let registry = tmp.path().join("unreadable-registry.rs");
+    std::fs::write(&registry, "id: \"0.7.0-x\",\n").expect("registry");
+    let mut permissions = std::fs::metadata(&registry)
+        .expect("metadata")
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o000);
+    }
+    std::fs::set_permissions(&registry, permissions).expect("chmod");
+
+    let output = bash_command()
+        .arg("scripts/check-migration-guides.sh")
+        .env("CODEMOD_REGISTRY", "unreadable-registry.rs")
+        .current_dir(tmp.path())
+        .output()
+        .expect("run migration-guide gate");
+
+    // Running as root defeats the permission bits; only assert when it took.
+    if std::fs::read_to_string(&registry).is_ok() {
+        return;
+    }
+    assert!(
+        !output.status.success(),
+        "an unreadable registry is a broken checkout, not an empty one\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot be read"),
+        "{}",
+        gate_report(&output),
+    );
+}

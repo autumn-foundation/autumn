@@ -206,6 +206,13 @@ guide** — the guide is a gate, not a courtesy (issue #1588). See
   index entry.
 - [ ] `./scripts/check-migration-guides.sh --list` shows the breaking-entry
   count for the release being cut, and it matches what you expect to ship.
+- [ ] Every breaking change in the guide carries an `**Automation:**` label
+  (`auto` / `review` / `manual`), and each `auto`/`review` entry names a codemod
+  that is actually shipped in `autumn-cli/src/upgrade/migrations.rs`. The same
+  gate enforces this — see [`docs/migrations/README.md`](migrations/README.md),
+  *Classifying a breaking change* (issue #1629).
+- [ ] `cargo run -p autumn-cli --bin autumn -- upgrade --list-migrations` shows
+  the codemods this release ships, and each one's guide link resolves.
 
 ### Rename the rolling draft
 
@@ -226,26 +233,42 @@ guide** — the guide is a gate, not a courtesy (issue #1588). See
 - [ ] Update the index in [`docs/migrations/README.md`](migrations/README.md):
   add `X.Y.Z.md`, keep `next.md`.
 
-### Guide-only upgrade walk-through (required before `cargo publish`)
+### Upgrade walk-through (required before `cargo publish`)
 
 The guide is only proven when someone who has not read the diff can follow it.
-Perform this against the **previous** release and record the result — the
-success metric is under 30 minutes.
+Perform this against the **previous** release and record the result. It is
+**codemod-first**: `autumn upgrade` runs before any manual step, so the steps
+that remain are only the changes labelled `review` and `manual` (issue #1629).
+The budget is under 30 minutes guide-only, and under 10 once a codemod covers
+the release's rename-level changes.
 
 - [ ] `cargo install autumn-cli --version <previous-version>`
 - [ ] `autumn new upgrade-probe && cd upgrade-probe && autumn setup`
 - [ ] Give the app something to break against: `autumn generate scaffold Post
   title:String body:Text published:bool`, `autumn migrate`, `cargo test`, and a
   `GET /posts` that responds. This is the green baseline.
-- [ ] Upgrade to the release candidate **following only
-  `docs/migrations/X.Y.Z.md`** — no changelog, no source reading, no asking the
-  author. If you have to look outside the guide, that is a gap in the guide:
-  fix the guide and restart from this step.
+- [ ] **Run the codemods first, before touching `Cargo.toml`.** The release
+  `autumn upgrade` migrates *from* is the one the probe app still records, so
+  bumping the dependency first leaves nothing in range and the command reports
+  "nothing to change" — which would make this gate pass for the wrong reason.
+  Install the candidate CLI, then `autumn upgrade` to read the preview diff and
+  the affected-site count, then `autumn upgrade --apply`. Note anything it
+  reports under `manual` — those are the sites the guide still has to carry.
+- [ ] Now bump `autumn-web` to the release candidate and `cargo check`.
+- [ ] Upgrade the rest **following only `docs/migrations/X.Y.Z.md`** — no
+  changelog, no source reading, no asking the author. If you have to look
+  outside the guide, that is a gap in the guide: fix the guide and restart from
+  this step. If a step you had to do by hand was a plain rename, that is a gap
+  in the *codemods*: add the migration to
+  `autumn-cli/src/upgrade/migrations.rs` and restart.
 - [ ] `cargo check`, `cargo test`, and every step in the guide's *How to verify*
   section pass.
 - [ ] Record the outcome in the guide's `### Guide-only upgrade walkthrough`
-  section: status, from → to versions, elapsed minutes, and any gap the
-  walk-through exposed. `check-migration-guides.sh` enforces this — a versioned
+  section (the heading keeps its historical name; the walk-through itself is
+  codemod-first): the `- **Codemod:**` invocation you ran first and what it covered,
+  then status, from → to versions, elapsed minutes, and any gap the
+  walk-through exposed. A guide shipping an `auto`/`review` codemod without the
+  codemod line fails the gate. `check-migration-guides.sh` enforces this — a versioned
   guide's status must **begin** with `performed YYYY-MM-DD`. `pending` is
   accepted only on the rolling `next.md` draft, and the one other accepted
   opening, `backfilled`, means "this guide was written after its release
@@ -294,7 +317,7 @@ Before pushing the release tag:
    `### Breaking Changes` heading) and links its migration guide.
 4. **Complete the [Migration Guide Gate](#migration-guide-gate)** — rename
    `docs/migrations/next.md`, repoint the changelog links, and perform and
-   record the guide-only upgrade walk-through.
+   record the codemod-first upgrade walk-through.
 5. **Run all gate scripts locally** to catch problems before CI sees the tag:
    ```bash
    ./scripts/check-crate-metadata.sh

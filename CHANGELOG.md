@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Codemods with `autumn upgrade` (#1629):** the new `autumn upgrade` command
+  applies each release's *mechanical* app-code migrations to your own Rust
+  source. For every release between the `autumn-web` version your `Cargo.toml`
+  records and the target, it rewrites that release's machine-applyable changes
+  — first shipped: 0.6.0's `with_pool` → `with_pool_untracked` repository
+  constructor rename. It writes nothing by default: a bare `autumn upgrade`
+  prints a per-file diff plus a count of affected sites, and `--apply` is the
+  explicit write step. Rewrites match whole tokens through a token-level parse
+  rather than a text substitution, so string literals, comments, same-named
+  locals and `with_pool_provider` are untouched, formatting and comments
+  survive byte-for-byte, and a second run is a no-op. Anything the tool cannot
+  safely reach — a call site inside a macro invocation or an attribute — is
+  reported with `file:line` under `manual` with a link to the guide section,
+  never guessed at. Every documented breaking change now carries an
+  `**Automation:**` confidence label (`auto` / `review` / `manual`) in its
+  migration guide, and `scripts/check-migration-guides.sh` fails a rename-level
+  break that has neither a shipped codemod nor a stated reason for staying
+  manual. See `docs/guide/upgrading.md`.
+  <!-- migration-guide-gate: describes tooling for breaking changes; the
+  command and the gate are both additive -->
+
 - **Declarative data-retention sweeps (#1342):** `#[repository(Model,
   retention(after = "30d", basis = created_at))]` — and the soft-delete
   `purge_deleted_after = "90d"` variant, composable with `after` — compiles to
