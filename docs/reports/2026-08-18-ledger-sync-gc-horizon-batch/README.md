@@ -171,15 +171,21 @@ pg_stat_statements, one `gc_tombstones` sweep per tier (fresh
 |---:|---:|---:|---:|---:|---:|---:|
 | 50   | 50   | **1** | 207  | 207  | 9,873   | 9,873   |
 | 250  | 250  | **1** | 1,027 | 1,027 | 50,664  | 50,664  |
-| 1000 | 1000 | **1** | 6,029 | 6,029 | 210,808 | 210,808 |
+| 1000 | 1000 | **1** | 6,029 | 6,029 | 210,832 | 210,784 |
 
 Statement count drops from exactly `N` (one per distinct scope) to exactly
 `1`, at every tier — the classic N+1 shape, confirmed at three sizes to rule
-out a fixture-specific coincidence. Buffers and WAL bytes are unchanged
-(same rows read/written either way, same total work — just one executor
-invocation instead of N). Idempotency: a replay sweep at the same `up_to`
-(nothing left to drop) issues **zero** horizon-upsert statements, both
-before and after.
+out a fixture-specific coincidence. Buffers are exactly unchanged at every
+tier (same rows read/written either way, same total work — just one
+executor invocation instead of N). WAL bytes match exactly at 50/250 scopes;
+at 1000 scopes they differ by 48 bytes (210,832 vs. 210,784, a 0.02%
+delta) — full-page-image jitter tied to checkpoint/dirty-buffer timing
+across runs, not a real difference in what's written (the row-level content
+is identical either way, per ✅ Equivalence below). Values above are the
+exact numbers recorded in `baseline/output.txt:17` and `after/output.txt:18`
+— not rounded or reconciled. Idempotency: a replay sweep at the same
+`up_to` (nothing left to drop) issues **zero** horizon-upsert statements,
+both before and after.
 
 This clears the impact floor on **elimination of an N+1**
 (`statements/sweep 1000→1` at the largest tier), which "needs no other
@@ -234,8 +240,10 @@ changes.
 
 ## 💸 Write cost
 
-None beyond the sweep's own writes (which are unchanged — see 📊
-Measurement: WAL bytes identical before/after). No index was added or
+None beyond the sweep's own writes (which are unchanged in substance — see 📊
+Measurement: WAL bytes match exactly at 50/250 scopes and within 0.02% at
+1000, the latter being run-to-run full-page-image jitter, not new write
+volume). No index was added or
 dropped; `autumn_sync_horizons_pkey` (the existing primary key on `scope`)
 already backs both the single-row and batched conflict-arbiter path. This is
 a pure statement-batching change on an existing write path, not a new write
