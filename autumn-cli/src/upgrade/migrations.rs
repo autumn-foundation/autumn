@@ -233,16 +233,59 @@ pub fn app_migrations() -> &'static [AppMigration] {
 }
 
 /// A `major.minor.patch` version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Version {
     pub major: u64,
     pub minor: u64,
     pub patch: u64,
+    /// Whether this is a pre-release of the triple (`0.7.0-rc.1`).
+    ///
+    /// A flag rather than the identifier, because the only comparison that has
+    /// to be right is pre-release against *stable*: every registry version is a
+    /// released one, so `rc.1` vs `rc.2` never decides which migrations apply.
+    /// Two pre-releases of the same triple therefore compare equal, and when
+    /// they are two workspace members racing to set the floor either answer
+    /// selects the same migrations.
+    pub prerelease: bool,
+}
+
+impl Version {
+    /// A released version.
+    #[must_use]
+    pub const fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+            prerelease: false,
+        }
+    }
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            // `0.7.0-rc.1` precedes `0.7.0`, so an app on the candidate is
+            // *behind* the release and still needs its migrations. Derived
+            // ordering would have put `false` first and inverted this.
+            .then_with(|| other.prerelease.cmp(&self.prerelease))
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if self.prerelease {
+            f.write_str("-pre")?;
+        }
+        Ok(())
     }
 }
 
@@ -266,16 +309,17 @@ pub fn parse_version_req(req: &str) -> Option<Version> {
     if req.starts_with('<') {
         return None;
     }
-    let core = req
+    // Build metadata is not part of the version; a pre-release suffix is, and
+    // it sorts *below* the release, so it is remembered rather than dropped.
+    let without_build = req
         .trim_start_matches(['=', '^', '~', '>'])
         .trim()
-        // Build metadata and a pre-release suffix both leave the release
-        // identity alone: 0.7.0-rc.1 is the 0.7.0 line for migration purposes.
         .split('+')
-        .next()?
-        .split('-')
-        .next()?
-        .trim();
+        .next()?;
+    let (core, prerelease) = without_build
+        .split_once('-')
+        .map_or((without_build, false), |(core, _)| (core, true));
+    let core = core.trim();
     if core.is_empty() {
         return None;
     }
@@ -295,9 +339,8 @@ pub fn parse_version_req(req: &str) -> Option<Version> {
         return None;
     }
     Some(Version {
-        major,
-        minor,
-        patch,
+        prerelease,
+        ..Version::new(major, minor, patch)
     })
 }
 
@@ -332,10 +375,14 @@ mod tests {
     use super::*;
 
     fn v(major: u64, minor: u64, patch: u64) -> Version {
+        Version::new(major, minor, patch)
+    }
+
+    /// A pre-release of the triple, e.g. `0.7.0-rc.1`.
+    fn pre(major: u64, minor: u64, patch: u64) -> Version {
         Version {
-            major,
-            minor,
-            patch,
+            prerelease: true,
+            ..Version::new(major, minor, patch)
         }
     }
 
@@ -358,9 +405,34 @@ mod tests {
     }
 
     #[test]
-    fn ignores_prerelease_and_build_metadata() {
-        assert_eq!(parse_version_req("0.7.0-rc.1"), Some(v(0, 7, 0)));
+    fn ignores_build_metadata_but_keeps_the_prerelease() {
         assert_eq!(parse_version_req("0.7.0+build.5"), Some(v(0, 7, 0)));
+        assert_eq!(parse_version_req("0.7.0-rc.1"), Some(pre(0, 7, 0)));
+        assert_eq!(parse_version_req("0.7.0-rc.1+build.5"), Some(pre(0, 7, 0)));
+    }
+
+    #[test]
+    fn a_prerelease_sorts_below_its_release() {
+        assert!(pre(0, 7, 0) < v(0, 7, 0), "0.7.0-rc.1 precedes 0.7.0");
+        assert!(v(0, 6, 0) < pre(0, 7, 0), "and still follows 0.6.0");
+        assert_ne!(pre(0, 7, 0), v(0, 7, 0));
+    }
+
+    #[test]
+    fn an_app_on_a_release_candidate_still_needs_that_releases_migrations() {
+        // Upgrading 0.7.0-rc.1 -> 0.7.0: the candidate is *behind* the release,
+        // so the release's migrations apply. Treating the two as equal selected
+        // nothing.
+        let ids = ids(&select_between(FIXTURE_REGISTRY, pre(0, 7, 0), v(0, 7, 0)));
+        assert_eq!(ids, vec!["0.7.0-c"]);
+    }
+
+    #[test]
+    fn targeting_a_release_candidate_does_not_select_the_release() {
+        // `--to 0.7.0-rc.1` must not pull in migrations registered for the
+        // finished 0.7.0.
+        let ids = ids(&select_between(FIXTURE_REGISTRY, v(0, 6, 0), pre(0, 7, 0)));
+        assert!(ids.is_empty(), "0.7.0 is not reached yet, got {ids:?}");
     }
 
     #[test]

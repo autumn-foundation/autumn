@@ -922,11 +922,7 @@ mod tests {
     };
 
     fn version(major: u64, minor: u64, patch: u64) -> Version {
-        Version {
-            major,
-            minor,
-            patch,
-        }
+        Version::new(major, minor, patch)
     }
 
     fn sample(outcome: Outcome) -> Report {

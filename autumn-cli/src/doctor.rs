@@ -2508,6 +2508,12 @@ pub fn read_autumn_web_version_at(root: &std::path::Path) -> Option<String> {
 ///
 /// An empty result means the manifest does not mention `autumn-web` at all.
 pub fn autumn_web_declarations_at(root: &std::path::Path) -> Vec<AutumnWebDependency> {
+    /// Every dependency-table kind Cargo reads. `dev-` and `build-` count: a
+    /// crate depending on autumn-web only for its tests or its `build.rs` still
+    /// has those sources scanned and rewritten, so it gets a vote on the
+    /// version.
+    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
     /// Whether this dependency entry is `autumn-web`, under either spelling.
     fn is_autumn_web(key: &str, entry: &toml::Value) -> bool {
         key == "autumn-web"
@@ -2550,20 +2556,22 @@ pub fn autumn_web_declarations_at(root: &std::path::Path) -> Vec<AutumnWebDepend
     };
 
     // Every dependency table Cargo reads: the package's own, the workspace's,
-    // and one per target predicate.
+    // and one per target predicate — in each of the three kinds.
     let mut tables: Vec<&toml::Value> = Vec::new();
-    tables.extend(table.get("dependencies"));
-    tables.extend(
-        table
-            .get("workspace")
-            .and_then(|workspace| workspace.get("dependencies")),
-    );
-    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+    for kind in KINDS {
+        tables.extend(table.get(kind));
         tables.extend(
-            targets
-                .values()
-                .filter_map(|target| target.get("dependencies")),
+            table
+                .get("workspace")
+                .and_then(|workspace| workspace.get(kind)),
         );
+    }
+    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            for kind in KINDS {
+                tables.extend(target.get(kind));
+            }
+        }
     }
 
     tables

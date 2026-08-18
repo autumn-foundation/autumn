@@ -1085,3 +1085,70 @@ fn an_aliased_path_dependency_is_still_ambiguous() {
         report(&output),
     );
 }
+
+#[test]
+fn a_dev_only_dependency_still_records_the_version() {
+    // A test-support crate depends on autumn-web only for its tests — and its
+    // `tests/` are scanned and rewritten, so it has to get a vote.
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dev-dependencies]\nautumn-web = \"0.5.0\"\n",
+    );
+    write(tmp.path(), "tests/repo.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(read(tmp.path(), "tests/repo.rs").contains("with_pool_untracked("));
+}
+
+#[test]
+fn an_older_dev_dependency_decides_the_floor_against_a_newer_normal_one() {
+    let tmp = TempDir::new().expect("tempdir");
+    write(
+        tmp.path(),
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"0.6.0\"\n\n\
+         [dev-dependencies]\nautumn-web = \"0.5.0\"\n",
+    );
+    write(tmp.path(), "tests/repo.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "tests/repo.rs").contains("with_pool_untracked("),
+        "the older dev-dependency must decide the floor:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn an_app_on_a_release_candidate_is_migrated_to_the_release() {
+    // Autumn ships release candidates (the migration-guide gate handles
+    // `## [0.7.0-rc.1]` sections), so this is a real upgrade path: the
+    // candidate precedes the release and still needs its migrations.
+    let tmp = app("0.5.0-rc.1");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(read(tmp.path(), "src/main.rs").contains("with_pool_untracked("));
+}
+
+#[test]
+fn an_app_on_the_release_candidate_of_the_target_still_gets_that_release() {
+    // 0.6.0-rc.1 -> 0.6.0: equal triples, but the candidate is behind.
+    let tmp = app("0.6.0-rc.1");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+
+    let output = run_upgrade(tmp.path(), &["--to", "0.6.0", "--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "a candidate of the target release is still behind it:\n{}",
+        stdout_of(&output)
+    );
+}
