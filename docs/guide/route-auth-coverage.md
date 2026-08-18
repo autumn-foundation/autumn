@@ -121,6 +121,21 @@ Add a guard (`#[secured]` / `#[authorize]`) or mark the route deliberately open 
 Fix it either way — add a guard, or add `#[public]` — and the gate goes
 green.
 
+### Static routes only classify via `#[public]`
+
+`#[static_get]` routes honor exactly one marker: `#[public]`. Stacking
+`#[secured]` or `#[authorize]` on one still compiles — the guard expands and
+runs on requests that fall through to the dynamic handler — but prerendered
+responses are served from the static output *without invoking the handler*,
+so no handler-body guard can be proven to cover every response the route
+serves. The audit therefore deliberately refuses to call such a route
+`gated`: it stays `unclassified`, fails the gate, and contributes no
+`authorization_policies` binding. That is the honest outcome, not a gap — a
+`gated` label here would claim a per-response guarantee the static serving
+path does not provide. A route that needs authentication or authorization
+should be a dynamic route (`#[get]`/`#[post]`/…); a static route that is
+deliberately open says so with `#[public]`.
+
 ## Running the audit
 
 ```bash
