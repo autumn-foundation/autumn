@@ -168,6 +168,8 @@ mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_engine;
 #[cfg(feature = "offline-sync")]
+mod offline_sync_gc_tombstones_batching_perf;
+#[cfg(feature = "offline-sync")]
 mod offline_sync_pg;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_push_batching_perf;
