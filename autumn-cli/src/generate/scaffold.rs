@@ -1724,24 +1724,31 @@ fn plan_scaffold_with_options_impl(
              trash route can use them; see docs/guide/generators.md."
         ));
     }
-    // Issue #1358: a `position` field on a `--sharded` scaffold gets the
-    // model field and the migration's maintenance triggers, but no
-    // `move_to`/`move_before`/`move_after`/`move_up`/`move_down` methods at
-    // all — `#[repository(..., sharded)]` rejects `position(...)` outright
-    // (see `autumn-macros`' `parse_repo_args`), so `render_repository_file`
-    // omits it entirely rather than emit a macro compile error. Every other
-    // gated-off variant (`--api`/`--live`/owner-scoped) still gets the
-    // repository methods, just not the HTML buttons — only sharded loses the
-    // methods too, so it gets its own, more pointed warning.
+    // Issue #1358: `position(...)` on `#[repository(..., sharded)]` is
+    // rejected outright by the macro (see `autumn-macros`' `parse_repo_args`)
+    // — a move only reaches the pool/shard it happens to be given — so
+    // `render_repository_file` was previously made to omit `position(...)`
+    // from a sharded scaffold's attribute entirely, generating the column
+    // and its migration triggers (insert-assign, delete-compact) with no
+    // `move_*` methods and only a warning. Codex review: that left a live
+    // gap — `delete_many`'s single-row-chunking fix for the batch-compaction
+    // race (see `autumn-macros`' `delete_chunk_size`) keys off
+    // `config.position`, which the sharded repository attribute no longer
+    // carries, so a sharded model's bulk delete keeps its 1000-row chunks
+    // even though the row-level compaction triggers are still installed and
+    // still vulnerable to the same multi-row-per-statement race. Reject the
+    // combination outright instead: no partial position support (column,
+    // triggers, but no working reorder or safe bulk-delete) is worth the
+    // silent corruption risk.
     if fields.iter().any(|f| f.kind.is_position()) && options_with_key.model.sharded {
-        plan.warn(format!(
-            "position field on --sharded {plural}: no move_to/move_before/move_after/\
-             move_up/move_down methods generated — a move only reaches the pool/shard it \
-             happens to be given, so #[repository(..., sharded)] rejects position(...) \
-             outright. The column, its migration triggers (insert-assign, delete-compact), \
-             and #[position] on the model are still generated; reorder within a single \
-             shard's table by hand for now."
-        ));
+        return Err(GenerateError::Config(format!(
+            "position field on --sharded {plural}: not supported. \
+             #[repository(..., sharded)] rejects position(...) outright — a move only \
+             reaches the pool/shard it happens to be given — and the migration's \
+             row-level compaction triggers are not safe against a sharded repository's \
+             bulk delete, which keeps its full-size chunks with no `position` metadata \
+             to know it must not. Drop the position field, or drop --sharded."
+        )));
     }
     // Smoke test under `tests/<snake>.rs`. Uses the same soft-delete-augmented
     // field list as the real migration (see `augment_fields_for_soft_delete`)

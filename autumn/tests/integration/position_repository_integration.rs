@@ -388,6 +388,7 @@ pub trait PositionTriggeredTaskRepository {}
 
 static TRIGGERED_SETUP_CELL: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
+#[allow(clippy::too_many_lines)]
 async fn setup_triggered_table(db: &TestDb) {
     TRIGGERED_SETUP_CELL
         .get_or_init(|| async {
@@ -536,10 +537,11 @@ async fn triggered_ranks(pool: &Pool, board_id: i64) -> Vec<i64> {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_inserts_never_produce_duplicate_or_gapped_positions() {
+    const N: usize = 30;
+
     let db = TestDb::shared().await;
     setup_triggered_table(db).await;
     let board_id = 2001;
-    const N: usize = 30;
 
     let mut handles = Vec::new();
     for i in 0..N {
@@ -657,10 +659,11 @@ async fn concurrent_insert_and_delete_never_leave_a_gap() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_move_to_and_delete_never_deadlock() {
+    const COUNT: usize = 6;
+
     let db = TestDb::shared().await;
     setup_triggered_table(db).await;
     let board_id = 2003;
-    const COUNT: usize = 6;
 
     let mut ids = Vec::with_capacity(COUNT);
     for i in 0..COUNT {

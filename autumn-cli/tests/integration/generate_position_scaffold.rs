@@ -241,22 +241,40 @@ fn i18n_scaffold_translates_reorder_buttons_and_flash() {
 #[test]
 fn sharded_scaffold_rejects_position() {
     // `position(...)` explicitly rejects `sharded` at macro-expansion time
-    // (see autumn-macros/src/repository.rs) — the scaffold's own emission
-    // must not produce a repository attribute combination that fails to
-    // compile with a confusing macro error. Confirm the CLI's cargo-check
-    // path would actually hit this: sharded scaffolds must not emit
-    // `position(...)` in the first place, matching how `reorder_enabled` is
-    // gated off for `--sharded`.
-    let (_tmp, project) = scaffold_project(
-        "pos-sharded",
-        &["title:String", "rank:position"],
-        &["--sharded", "--shard-key", "title"],
+    // (see autumn-macros/src/repository.rs): a move only reaches the
+    // pool/shard it happens to be given. An earlier version of this
+    // generator omitted `position(...)` from the sharded repository
+    // attribute and proceeded with just a warning, still emitting the
+    // column and migration triggers — but a Codex review round on issue
+    // #1358 caught that this left `delete_many`'s single-row-chunking fix
+    // for the batch-compaction race unable to see `config.position` (the
+    // sharded attribute no longer carries it), so a sharded model's bulk
+    // delete kept its full-size chunks against triggers still vulnerable to
+    // the same race. The combination is now rejected outright at generate
+    // time instead.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "pos-sharded"]);
+    let project = tmp.path().join("pos-sharded");
+    let stderr = run_autumn_err(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Task",
+            "title:String",
+            "rank:position",
+            "--sharded",
+            "--shard-key",
+            "title",
+        ],
     );
-    let repo = read(&project, "src/repositories/task.rs");
     assert!(
-        !repo.contains("position("),
-        "a sharded scaffold must not emit position(...) into #[repository(...)] \
-         (the macro rejects position + sharded): {repo}"
+        stderr.contains("position") && stderr.contains("sharded"),
+        "expected an error naming the position+sharded combination: {stderr}"
+    );
+    assert!(
+        !project.join("src/repositories/task.rs").exists(),
+        "a rejected scaffold must not partially generate files: {stderr}"
     );
 }
 

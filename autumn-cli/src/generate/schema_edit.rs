@@ -430,6 +430,24 @@ pub fn create_table_sql_with_metadata_and_id_for(
 ///
 /// Returns an empty string when `fields` has no `position` column (the
 /// common case), so a model without one gets byte-identical migration output.
+///
+/// Known limitation (Codex review, issue #1358): the function/trigger names
+/// this emits (`{table}_{position}_assign`, `_compact`, `_compact_soft`,
+/// `_rescope`, each with a `_trg` trigger-name counterpart) are NOT given
+/// [`unique_index_name`]'s truncate-and-hash treatment for Postgres's
+/// 63-byte (`NAMEDATALEN - 1`) identifier limit — a `table`/`position` pair
+/// long enough to make two of these names collide on truncation would fail
+/// the migration with a duplicate-object error (or, for the two trigger
+/// names, install one that shadows the other on the same table) rather
+/// than a clear "name too long" message. Applying the same treatment here
+/// would need the identical scheme reproduced bit-for-bit in
+/// `autumn-macros`' `position_impl_methods`, whose `move_to` embeds the
+/// SAME `{table}_{position}_assign` string as its `pg_advisory_xact_lock`
+/// key and must keep contending on the identical lock Postgres actually
+/// stored — a cross-crate synchronization this generator does not
+/// currently attempt for any other identifier. In practice this requires a
+/// `table`+`position` combined length in the high 40s of bytes, well past
+/// typical naming; out of scope for this slice.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn position_triggers_up_sql_for(
