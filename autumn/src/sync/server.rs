@@ -1520,14 +1520,25 @@ impl SyncBackend for PgSyncBackend {
                     let max = per_scope.entry(record.scope).or_insert(0);
                     *max = (*max).max(record.version);
                 }
-                for (scope, horizon) in per_scope {
+                // One statement for every scope touched by this sweep instead
+                // of one per scope: a sweep across a multi-tenant instance
+                // can touch hundreds/thousands of distinct scopes, and each
+                // was previously a separate round trip inside this same
+                // advisory-locked transaction. `UNNEST` fans the arrays back
+                // out into rows server-side, so the ON CONFLICT/GREATEST
+                // semantics are identical to issuing the loop above — this is
+                // a batching change, not a behavior change.
+                if !per_scope.is_empty() {
+                    let (scopes, horizons): (Vec<String>, Vec<Version>) =
+                        per_scope.into_iter().unzip();
                     sql_query(
-                        "INSERT INTO autumn_sync_horizons (scope, horizon) VALUES ($1, $2) \
+                        "INSERT INTO autumn_sync_horizons (scope, horizon) \
+                     SELECT * FROM UNNEST($1::TEXT[], $2::BIGINT[]) AS t(scope, horizon) \
                      ON CONFLICT (scope) DO UPDATE SET \
                      horizon = GREATEST(autumn_sync_horizons.horizon, excluded.horizon)",
                     )
-                    .bind::<Text, _>(&scope)
-                    .bind::<BigInt, _>(horizon)
+                    .bind::<Array<Text>, _>(scopes)
+                    .bind::<Array<BigInt>, _>(horizons)
                     .execute(conn)?;
                 }
                 Ok(removed as u64)
