@@ -641,7 +641,8 @@ async fn concurrent_move_to_and_delete_never_deadlock() {
         let delete_id = ids[delete_idx];
 
         let move_repo = PgPositionTriggeredTaskRepository::with_pool_untracked(db.pool());
-        let target = i64::try_from(round * 5).expect("fits i64") % i64::try_from(COUNT).expect("fits i64");
+        let target =
+            i64::try_from(round * 5).expect("fits i64") % i64::try_from(COUNT).expect("fits i64");
         let move_task = tokio::spawn(async move { move_repo.move_to(move_id, target).await });
 
         let delete_pool = db.pool();

@@ -207,11 +207,8 @@ fn i18n_scaffold_translates_reorder_buttons_and_flash() {
     // must route them through `t!(locale, "...")` like every other
     // generated label, or they'd be the one surface still hardcoding
     // English on an otherwise-translated scaffold.
-    let (_tmp, project) = scaffold_project(
-        "pos-i18n",
-        &["title:String", "rank:position"],
-        &["--i18n"],
-    );
+    let (_tmp, project) =
+        scaffold_project("pos-i18n", &["title:String", "rank:position"], &["--i18n"]);
     let routes = read(&project, "src/routes/tasks.rs");
     assert!(
         routes.contains("t!(locale, \"common.move_up\")"),
