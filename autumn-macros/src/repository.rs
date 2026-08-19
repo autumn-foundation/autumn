@@ -1680,10 +1680,12 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
     // `scoped_immediate_transaction` call.
     let move_method = |doc: proc_macro2::TokenStream,
                        sig: proc_macro2::TokenStream,
+                       pre_check: proc_macro2::TokenStream,
                        body: proc_macro2::TokenStream| {
         quote! {
             #doc
             pub async fn #sig -> ::autumn_web::AutumnResult<()> {
+                #pre_check
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
@@ -1739,51 +1741,8 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
             /// `position_impl_methods`'s doc comment for the locking scheme.
         },
         quote! { move_to(&self, id: i64, target: i64) },
+        quote! {},
         move_transaction_body(quote! { target.clamp(0, (__autumn_len - 1).max(0)) }),
-    );
-
-    let current_position_lookup = quote! {
-        async fn __autumn_position_of(&self, conn: &mut ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<::autumn_web::RuntimeConnection>, id: i64) -> ::autumn_web::AutumnResult<i64> {
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            #table_ident::table
-                .find(id)
-                .select(#table_ident::#position_ident)
-                #live_filter
-                .first(conn)
-                .await
-                .map_err(::autumn_web::AutumnError::from)
-        }
-    };
-
-    // Returns `(position, scope)` — `scope` is the real scope column's value
-    // when `position(scope = "...")` is declared, or the constant `0` when
-    // unscoped (so `move_before`/`move_after` can compare two rows' scopes
-    // uniformly without a runtime branch: `0 == 0` is always true).
-    let position_and_scope_lookup = scope_ident.as_ref().map_or_else(
-        || {
-            quote! {
-                async fn __autumn_position_and_scope_of(&self, conn: &mut ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<::autumn_web::RuntimeConnection>, id: i64) -> ::autumn_web::AutumnResult<(i64, i64)> {
-                    let __autumn_pos = self.__autumn_position_of(conn, id).await?;
-                    ::core::result::Result::Ok((__autumn_pos, 0i64))
-                }
-            }
-        },
-        |scope_ident| {
-            quote! {
-                async fn __autumn_position_and_scope_of(&self, conn: &mut ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<::autumn_web::RuntimeConnection>, id: i64) -> ::autumn_web::AutumnResult<(i64, i64)> {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    #table_ident::table
-                        .find(id)
-                        .select((#table_ident::#position_ident, #table_ident::#scope_ident))
-                        #live_filter
-                        .first(conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)
-                }
-            }
-        },
     );
 
     let move_up = move_method(
@@ -1792,6 +1751,7 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
             /// A no-op at the start of its scope.
         },
         quote! { move_up(&self, id: i64) },
+        quote! {},
         move_transaction_body(
             quote! { (__autumn_current - 1).clamp(0, (__autumn_len - 1).max(0)) },
         ),
@@ -1803,90 +1763,93 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
             /// A no-op at the end of its scope.
         },
         quote! { move_down(&self, id: i64) },
+        quote! {},
         move_transaction_body(
             quote! { (__autumn_current + 1).clamp(0, (__autumn_len - 1).max(0)) },
         ),
     );
     let move_up_down = quote! { #move_up #move_down };
 
-    let move_before_after = quote! {
-        /// Move this row to immediately before `other_id` within their
-        /// shared position scope. Both rows must be in the same scope — an
-        /// unlocked read checks this up front and returns `400 Bad Request`
-        /// on a mismatch, but the check and the actual move are not one
-        /// atomic step, so a concurrent `move_to`/scope change on `other_id`
-        /// between them is possible in principle. Harmless either way:
-        /// `move_to` re-derives `other_id`'s position from the same
-        /// row-locked read it uses for `id` and clamps the target into
-        /// `[0, len-1]`, so the worst case is landing at a slightly stale
-        /// index within the (still correct) scope, never a corrupt one.
-        pub async fn move_before(&self, id: i64, other_id: i64) -> ::autumn_web::AutumnResult<()> {
-            if id == other_id {
-                return ::core::result::Result::Ok(());
+    // Both `move_before`/`move_after` derive `other_id`'s position from the
+    // SAME `__autumn_locked` row set `move_transaction_body` already loads
+    // for `id` — not a separate, unlocked, external read — so there is no
+    // TOCTOU window for a concurrent mover to invalidate (Codex review,
+    // issue #1358: an earlier version read `other_id`'s position externally
+    // before entering the lock, so a concurrent move of `other_id` between
+    // that read and the transaction could land the row somewhere other than
+    // immediately before/after the requested neighbor). `__autumn_locked`
+    // is already filtered to `id`'s own scope, so "not found in it" also
+    // doubles as the cross-scope check — a stricter one, in fact: it
+    // catches `other_id` not existing or being soft-deleted the same way it
+    // catches a genuine cross-scope mismatch, where the previous external
+    // lookup surfaced those as a 404 instead of this 400. That's an
+    // intentional, minor behavior change: from the caller's perspective,
+    // "can't find `other_id` in my scope" reads the same regardless of
+    // which of the three caused it.
+    let other_target_lookup = |cmp_gt: proc_macro2::TokenStream,
+                               adjust: proc_macro2::TokenStream| {
+        quote! {
+            {
+                let ::core::option::Option::Some(&(_, __autumn_other)) =
+                    __autumn_locked.iter().find(|(rid, _)| *rid == other_id)
+                else {
+                    return ::core::result::Result::Err(::autumn_web::AutumnError::bad_request_msg(
+                        format!(
+                            "{} {other_id} is not in the same position scope as {id}",
+                            stringify!(#model_name)
+                        ),
+                    ));
+                };
+                if __autumn_current #cmp_gt __autumn_other {
+                    __autumn_other
+                } else {
+                    __autumn_other #adjust
+                }
             }
-            let mut conn = self.__autumn_acquire_conn().await?;
-            let (__autumn_current, __autumn_id_scope) =
-                self.__autumn_position_and_scope_of(&mut conn, id).await?;
-            let (__autumn_other, __autumn_other_scope) =
-                self.__autumn_position_and_scope_of(&mut conn, other_id).await?;
-            ::core::mem::drop(conn);
-            if __autumn_id_scope != __autumn_other_scope {
-                return ::core::result::Result::Err(::autumn_web::AutumnError::bad_request_msg(
-                    format!(
-                        "{} {other_id} is not in the same position scope as {id}",
-                        stringify!(#model_name)
-                    ),
-                ));
-            }
-            let __autumn_target = if __autumn_current > __autumn_other {
-                __autumn_other
-            } else {
-                __autumn_other - 1
-            };
-            self.move_to(id, __autumn_target).await
-        }
-
-        /// Move this row to immediately after `other_id` within their
-        /// shared position scope. Both rows must be in the same scope — an
-        /// unlocked read checks this up front and returns `400 Bad Request`
-        /// on a mismatch, but the check and the actual move are not one
-        /// atomic step, so a concurrent `move_to`/scope change on `other_id`
-        /// between them is possible in principle. Harmless either way:
-        /// `move_to` re-derives `other_id`'s position from the same
-        /// row-locked read it uses for `id` and clamps the target into
-        /// `[0, len-1]`, so the worst case is landing at a slightly stale
-        /// index within the (still correct) scope, never a corrupt one.
-        pub async fn move_after(&self, id: i64, other_id: i64) -> ::autumn_web::AutumnResult<()> {
-            if id == other_id {
-                return ::core::result::Result::Ok(());
-            }
-            let mut conn = self.__autumn_acquire_conn().await?;
-            let (__autumn_current, __autumn_id_scope) =
-                self.__autumn_position_and_scope_of(&mut conn, id).await?;
-            let (__autumn_other, __autumn_other_scope) =
-                self.__autumn_position_and_scope_of(&mut conn, other_id).await?;
-            ::core::mem::drop(conn);
-            if __autumn_id_scope != __autumn_other_scope {
-                return ::core::result::Result::Err(::autumn_web::AutumnError::bad_request_msg(
-                    format!(
-                        "{} {other_id} is not in the same position scope as {id}",
-                        stringify!(#model_name)
-                    ),
-                ));
-            }
-            let __autumn_target = if __autumn_current < __autumn_other {
-                __autumn_other
-            } else {
-                __autumn_other + 1
-            };
-            self.move_to(id, __autumn_target).await
         }
     };
 
+    let move_before = move_method(
+        quote! {
+            /// Move this row to immediately before `other_id` within their
+            /// shared position scope. A no-op if `id == other_id`; returns
+            /// `400 Bad Request` if `other_id` is not found in `id`'s scope
+            /// (not in the table, soft-deleted, or genuinely in a different
+            /// scope). Transaction-safe: `other_id`'s position is derived
+            /// from the same locked row set `id`'s is, inside the same
+            /// transaction — see `position_impl_methods`'s doc comment.
+        },
+        quote! { move_before(&self, id: i64, other_id: i64) },
+        quote! {
+            if id == other_id {
+                return ::core::result::Result::Ok(());
+            }
+        },
+        move_transaction_body(other_target_lookup(quote! { > }, quote! { - 1 })),
+    );
+
+    let move_after = move_method(
+        quote! {
+            /// Move this row to immediately after `other_id` within their
+            /// shared position scope. A no-op if `id == other_id`; returns
+            /// `400 Bad Request` if `other_id` is not found in `id`'s scope
+            /// (not in the table, soft-deleted, or genuinely in a different
+            /// scope). Transaction-safe: `other_id`'s position is derived
+            /// from the same locked row set `id`'s is, inside the same
+            /// transaction — see `position_impl_methods`'s doc comment.
+        },
+        quote! { move_after(&self, id: i64, other_id: i64) },
+        quote! {
+            if id == other_id {
+                return ::core::result::Result::Ok(());
+            }
+        },
+        move_transaction_body(other_target_lookup(quote! { < }, quote! { + 1 })),
+    );
+    let move_before_after = quote! { #move_before #move_after };
+
     quote! {
         #move_to
-        #current_position_lookup
-        #position_and_scope_lookup
         #move_up_down
         #move_before_after
     }
@@ -9700,6 +9663,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let update_many_body = {
+            // Codex review (issue #1358): unlike the hooks-enabled
+            // `update_many` (which already updates one row per statement —
+            // each gets its own individually derived `draft`), this path
+            // issues ONE `UPDATE ... WHERE id = ANY(chunk) SET <changes>`
+            // per chunk, applying the SAME changeset to every row in it. If
+            // `changes` reassigns a scoped position field's scope column,
+            // multiple same-scope rows can be rescoped in that single
+            // statement — the same per-row-trigger-sees-only-its-own-OLD
+            // batching race `delete_many`'s chunk-size fix closes, just via
+            // `rescope` instead of `compact`/`compact_soft`. Force
+            // single-row chunks whenever a position field exists so every
+            // `rescope` trigger firing sees a fully-settled table.
+            let update_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
             let vh_update_pair = if config.versioned {
                 let vh = vh_insert_ts(
                     table_name,
@@ -9876,7 +9852,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #vh_build_before_map_from_current
 
                             let mut updated = Vec::new();
-                            for chunk in ids.chunks(1000) {
+                            for chunk in ids.chunks(#update_chunk_size) {
                                 let chunk_updated = #update_expr_conn
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 #vh_update_pair
@@ -9895,7 +9871,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #vh_load_before_map_no_lock
 
                             let mut updated = Vec::new();
-                            for chunk in ids.chunks(1000) {
+                            for chunk in ids.chunks(#update_chunk_size) {
                                 let chunk_updated = #update_expr_conn
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 #vh_update_pair
