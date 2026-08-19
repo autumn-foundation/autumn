@@ -184,6 +184,8 @@ mod pdf;
 #[cfg(feature = "db")]
 mod pg_tls;
 #[cfg(feature = "db")]
+mod position_repository_integration;
+#[cfg(feature = "db")]
 mod preload_scoping;
 mod problem_details;
 #[cfg(feature = "redis")]

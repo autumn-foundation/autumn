@@ -984,6 +984,15 @@ fn plan_scaffold_with_options_impl(
             authorize_wiring
                 .then(|| owner_column.as_ref().map(|o| o.name.as_str()))
                 .flatten(),
+            // Issue #1358: `position(...)` is rejected outright by
+            // `#[repository(..., sharded)]` at macro-expansion time (a move
+            // only reaches the pool/shard it happens to be given — see
+            // autumn-macros' `parse_repo_args`), so a `--sharded` scaffold
+            // must never emit it, or the generated project fails to compile
+            // with a macro error instead of a clear generate-time one.
+            (!options_with_key.model.sharded)
+                .then(|| fields.iter().find(|f| f.kind.is_position()))
+                .flatten(),
         ),
     );
     let repo_mod_path = repos_dir.join("mod.rs");
@@ -1669,6 +1678,25 @@ fn plan_scaffold_with_options_impl(
         && !options_with_key.live_validation
         && !options_with_key.model.sharded
         && !owner_authorizes;
+    // Issue #1358: the position field's no-JS Move up / Move down index
+    // buttons + their `POST /{plural}/{id}/move_up`|`move_down` handlers.
+    // Must agree exactly with the `reorder_enabled` gate in
+    // `render_routes_file` (plus `--api`, which emits no HTML routes module
+    // at all), or main.rs would mount routes the module never emitted. Same
+    // restriction set as `trash_enabled` — scoped to the plain HTML index for
+    // this slice. `--api`/`--live`/`--live-validation`/owner-scoped scaffolds
+    // still get the repository's `move_*` methods (and, for `--api`, the
+    // ordered data), just not the HTML buttons. `--sharded` is different: the
+    // repository attribute omits `position(...)` entirely there (see the
+    // `render_repository_file` call above) because the macro itself rejects
+    // `position(...)` combined with `sharded` — a move only reaches the
+    // pool/shard it happens to be given.
+    let reorder_enabled = fields.iter().any(|f| f.kind.is_position())
+        && !options_with_key.api
+        && !options_with_key.live
+        && !options_with_key.live_validation
+        && !options_with_key.model.sharded
+        && !owner_authorizes;
     // A `--soft-delete` scaffold that lands on one of the gated-off variants
     // gets the data layer and the delete tunnel but NO way to see or recover
     // what it deleted — exactly the situation #1332 exists to remove. Say so at
@@ -1694,6 +1722,25 @@ fn plan_scaffold_with_options_impl(
             "--soft-delete: no Trash view generated for {plural} — {reason}. \
              The repository still has restore/purge/only_deleted, so a hand-written \
              trash route can use them; see docs/guide/generators.md."
+        ));
+    }
+    // Issue #1358: a `position` field on a `--sharded` scaffold gets the
+    // model field and the migration's maintenance triggers, but no
+    // `move_to`/`move_before`/`move_after`/`move_up`/`move_down` methods at
+    // all — `#[repository(..., sharded)]` rejects `position(...)` outright
+    // (see `autumn-macros`' `parse_repo_args`), so `render_repository_file`
+    // omits it entirely rather than emit a macro compile error. Every other
+    // gated-off variant (`--api`/`--live`/owner-scoped) still gets the
+    // repository methods, just not the HTML buttons — only sharded loses the
+    // methods too, so it gets its own, more pointed warning.
+    if fields.iter().any(|f| f.kind.is_position()) && options_with_key.model.sharded {
+        plan.warn(format!(
+            "position field on --sharded {plural}: no move_to/move_before/move_after/\
+             move_up/move_down methods generated — a move only reaches the pool/shard it \
+             happens to be given, so #[repository(..., sharded)] rejects position(...) \
+             outright. The column, its migration triggers (insert-assign, delete-compact), \
+             and #[position] on the model are still generated; reorder within a single \
+             shard's table by hand for now."
         ));
     }
     // Smoke test under `tests/<snake>.rs`. Uses the same soft-delete-augmented
@@ -1831,6 +1878,11 @@ fn plan_scaffold_with_options_impl(
         // this run emits is decided by `trash_enabled` alone, and the prune below
         // handles a re-run that dropped the flag.
         trash_enabled || for_revert,
+        // Same double-gate reasoning as `trash_enabled || for_revert` above:
+        // the DESTROY/revert path may not repeat the DSL token that turned
+        // `reorder_enabled` on, but a stale routes module still needs its
+        // mounted handlers claimed for cleanup.
+        reorder_enabled || for_revert,
         &validated_field_names,
         &sm_field_names,
         &rich_text_field_names,
@@ -2673,6 +2725,7 @@ fn render_repository_file(
     live: bool,
     searchable: bool,
     owner_column: Option<&str>,
+    position: Option<&Field>,
 ) -> String {
     let plural = pluralize(snake_name);
     let query_body = render_repository_queries(pascal_name, queries);
@@ -2701,6 +2754,17 @@ fn render_repository_file(
     // (no owner column, `--no-policy`, `--live`, `--sharded`) passes `None` and
     // the attr — and the scoped methods — are omitted.
     let owner_attr = owner_column.map_or(String::new(), |col| format!(", owner = {col}"));
+    // Issue #1358: a `position`/`position{{scope:col}}` DSL field wires
+    // `position(column = "...", scope = "...")` into the generated
+    // `#[repository(...)]` attribute, which is what actually generates the
+    // `move_to`/`move_before`/`move_after`/`move_up`/`move_down` methods —
+    // the DSL field alone only shapes the model struct and migration.
+    let position_attr = position.map_or(String::new(), |f| {
+        f.constraints.scope.as_deref().map_or_else(
+            || format!(", position(column = \"{}\")", f.name),
+            |scope| format!(", position(column = \"{}\", scope = \"{scope}\")", f.name),
+        )
+    });
     let sharded_note = if sharded {
         format!(
             "//!\n\
@@ -2807,7 +2871,7 @@ fn render_repository_file(
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{draft_ext_import}}};\n\
          use crate::schema::{plural};\n\
          \n\
-         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr}{owner_attr})]\n\
+         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr}{owner_attr}{position_attr})]\n\
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
          }}\n\
@@ -3678,6 +3742,19 @@ fn render_routes_file(
     // routes module at all), or `main.rs` would mount routes this module never
     // emitted.
     let trash_enabled = soft_delete && !live && !live_validation && !sharded && !owner_scoped_index;
+    // Issue #1358: must agree exactly with the matching gate in
+    // `plan_scaffold_with_options_impl` (plus `--api`, which emits no HTML
+    // routes module at all), or `main.rs` would mount routes this module
+    // never emitted. See that gate's comment for the full scope rationale.
+    // `fields` here is actually the caller's `form_fields` (params are named
+    // `fields`/`all_fields` but the call site passes `&form_fields,
+    // &fields`) — a `position` field is always excluded from it (it's
+    // DB-managed, so it's dropped from `metadata.defaults`-filtered form
+    // fields the same way `lock_version` is), so it must be looked up in
+    // `all_fields`, the actual full field list.
+    let position_field = all_fields.iter().find(|f| f.kind.is_position());
+    let reorder_enabled =
+        position_field.is_some() && !live && !live_validation && !sharded && !owner_scoped_index;
     // Issue #1332: once a Trash page exists, "{pascal_name} deleted" is no longer
     // what happened — the row moved somewhere the user can go and get it back,
     // and the flash is the only place that says so. Every scaffold that emits no
@@ -6199,6 +6276,61 @@ pub async fn purge(
         String::new()
     };
 
+    // Issue #1358: the position field's `move_up`/`move_down` no-JS button
+    // targets. Authorized identically to `edit_form`/`update` ("edit" action,
+    // record policy) since moving a row is a content mutation, not a
+    // deletion — reuses `edit_destroy_authz_params`/`authz_edit_call` rather
+    // than inventing a third authorization shape.
+    let reorder_section = if reorder_enabled {
+        format!(
+            r#"
+/// `POST /{plural}/{{{id_url_segment}}}/move_up` — move a {snake_name} one position toward the start of its list.
+#[secured]
+#[post("/{plural}/{{{id_url_segment}}}/move_up")]
+pub async fn move_up(
+    {locale_param}{id_param_decl},
+    mut db: {db_ty},
+    repo: Pg{pascal_name}Repository,
+    flash: Flash,{edit_destroy_authz_params}
+) -> AutumnResult<autumn_web::Redirect> {{
+    let row: {pascal_name} = {plural}::table
+        .{find_expr}
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(AutumnError::not_found)?;
+    {authz_edit_call}drop(db);
+    repo.move_up(row.id).await?;
+    flash.success("{pascal_name} moved").await;
+    Ok(autumn_web::Redirect::to(&paths::index()))
+}}
+
+/// `POST /{plural}/{{{id_url_segment}}}/move_down` — move a {snake_name} one position toward the end of its list.
+#[secured]
+#[post("/{plural}/{{{id_url_segment}}}/move_down")]
+pub async fn move_down(
+    {locale_param}{id_param_decl},
+    mut db: {db_ty},
+    repo: Pg{pascal_name}Repository,
+    flash: Flash,{edit_destroy_authz_params}
+) -> AutumnResult<autumn_web::Redirect> {{
+    let row: {pascal_name} = {plural}::table
+        .{find_expr}
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(AutumnError::not_found)?;
+    {authz_edit_call}drop(db);
+    repo.move_down(row.id).await?;
+    flash.success("{pascal_name} moved").await;
+    Ok(autumn_web::Redirect::to(&paths::index()))
+}}
+"#
+        )
+    } else {
+        String::new()
+    };
+
     // For non-live paths, generate the data_table columns and call. Both the
     // plain AND sharded index promote displayable `references` columns to
     // render the parent's label from a per-view label map (issue #1146,
@@ -6279,6 +6411,49 @@ pub async fn purge(
     } else {
         index_columns_labeled
     };
+    // Issue #1358: the position field's no-JS Move up / Move down buttons —
+    // each a tiny CSRF- and submit-token-protected `POST` form, following the
+    // exact pattern the trash view's Restore button uses (`csrf_input` +
+    // `submit_token_input` inside a bare `form method="post"`). Appended
+    // after the bulk-delete checkbox column (if also present) so both
+    // features compose without either one clobbering the other's insert.
+    let index_columns_labeled = if reorder_enabled {
+        let with_mut =
+            index_columns_labeled.replacen("    let columns:", "    let mut columns:", 1);
+        format!(
+            "{with_mut}    \
+             columns.push(autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{\n\
+             form action=(paths::move_up(row.id)) method=\"post\" {{\n\
+             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n\
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n\
+             (autumn_web::a11y::Button::new(\"Move up\").submit())\n\
+             }}\n\
+             form action=(paths::move_down(row.id)) method=\"post\" {{\n\
+             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n\
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n\
+             (autumn_web::a11y::Button::new(\"Move down\").submit())\n\
+             }}\n\
+             }}));\n"
+        )
+    } else {
+        index_columns_labeled
+    };
+    // Issue #1358: the plain index defaults `?sort=` to the position column
+    // when the caller requested none, so a reorderable list renders in its
+    // maintained order out of the box rather than primary-key order —
+    // `move_*` would otherwise silently have no visible effect on load.
+    // Applied only in the branch `reorder_enabled` targets (the same
+    // restriction set); the sharded/live/owner-scoped index branches keep
+    // their existing (unsorted) queries unchanged.
+    let default_sort_let = position_field.map_or_else(String::new, |pf| {
+        format!(
+            "    let list_query = if list_query.sort().is_none() {{\n        \
+             let __autumn_filters: Vec<(&str, &str)> = list_query.filters().collect();\n        \
+             ListQuery::new(Some(\"{}\"), list_query.direction(), &__autumn_filters)\n    \
+             }} else {{\n        list_query\n    }};\n",
+            pf.name
+        )
+    });
     // Issue #1312: the CSRF pair and the one-time submit-token pair (#1360) the
     // index/search handlers thread into `bulk_actions_form`'s hidden fields.
     // Injected after `flash: Flash,` in the signatures that render the bulk
@@ -6295,7 +6470,14 @@ pub async fn purge(
     // with an unreadable elided-tuple trait error. Destructuring in the pattern
     // keeps every use site in the body spelled exactly as before. Only under
     // the flag: the plain scaffold's signature stays byte-identical.
-    let bulk_csrf_params = if !bulk_delete_enabled {
+    // Issue #1358: the Move up/down buttons need the same CSRF + one-time
+    // submit-token pair as the bulk-delete form (a double-clicked move is
+    // exactly the double-submit `SubmitTokenLayer` guards against), so this
+    // gate — and the params it emits — are shared between the two features
+    // rather than duplicated. Reusing the identical 4-tuple (rather than a
+    // 2-tuple for reorder-only) means every emitted param is always actually
+    // used by at least one of the two forms, whichever combination is on.
+    let bulk_csrf_params = if !bulk_delete_enabled && !reorder_enabled {
         String::new()
     } else if labels.enabled() {
         "\n    (csrf, csrf_field, submit_token, submit_field): (Option<CsrfToken>, \
@@ -6686,7 +6868,7 @@ pub async fn index(
     repo: Pg{pascal_name}Repository,
     {index_db_param}flash: Flash,{bulk_csrf_params}
 ) -> AutumnResult<Markup> {{
-    let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
+{default_sort_let}    let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
     let pager_query = raw_query.as_deref().unwrap_or("");
 {export_href_let}{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
         h1 {{ {index_heading} }}
@@ -6928,6 +7110,14 @@ pub async fn index(
             names.push("trash".to_owned());
             names.push("restore".to_owned());
             names.push("purge".to_owned());
+        }
+        // Issue #1358: `paths::move_up(id)`/`paths::move_down(id)` back the
+        // index's per-row reorder buttons. Gated with the handlers, so a
+        // scaffold without a `position` field keeps its `paths!` block
+        // byte-identical.
+        if reorder_enabled {
+            names.push("move_up".to_owned());
+            names.push("move_down".to_owned());
         }
         if live {
             names.push("events".to_owned());
@@ -7594,7 +7784,7 @@ fn submit_token_input(submit_token: Option<&SubmitToken>, field: Option<&SubmitF
     }}
 }}
 {bulk_ids_parser}{attachment_read_back_helpers}{private_layout}
-{index_handler}{bulk_delete_fn}{export_csv_fn}{trash_section}{show_section}
+{index_handler}{bulk_delete_fn}{export_csv_fn}{trash_section}{reorder_section}{show_section}
 /// `GET /{plural}/new` — render the new-{snake_name} form.
 #[secured]
 #[get("/{plural}/new", name = "new")]
@@ -12262,7 +12452,12 @@ fn sql_sample_literal(kind: FieldKind) -> String {
         // a slug field's own `UNIQUE INDEX` would reject a second `'sample'`
         // row alongside whatever `enum_rejection_insert_sql` inserts.
         FieldKind::Slug => "'sample-slug'".to_owned(),
-        FieldKind::I32 | FieldKind::I64 | FieldKind::References => "1".to_owned(),
+        // `position` (issue #1358) is a plain `BIGINT NOT NULL` column like
+        // any other `i64`-shaped field — "1" satisfies it fine for a smoke
+        // test that isn't exercising the ordering invariant itself.
+        FieldKind::I32 | FieldKind::I64 | FieldKind::References | FieldKind::Position => {
+            "1".to_owned()
+        }
         FieldKind::Bool => "TRUE".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "1.0".to_owned(),
         // Scale-derived rather than a fixed "1.0": a tightly-scaled column
@@ -12528,7 +12723,10 @@ fn unique_sample_literal(kind: FieldKind) -> String {
         | FieldKind::RichText
         | FieldKind::Enum
         | FieldKind::Slug => "'dup_value'".to_owned(),
-        FieldKind::I32 | FieldKind::I64 => "424242".to_owned(),
+        // `position` can never be `:unique` (rejected in `parse_field`), so
+        // this arm is unreachable in practice — listed for exhaustiveness
+        // with the same literal as `I32`/`I64`.
+        FieldKind::I32 | FieldKind::I64 | FieldKind::Position => "424242".to_owned(),
         // Must be a real seeded row's id, not an arbitrary literal — a
         // `references` target column is FK-constrained against the stub
         // table `render_reference_stub_tables_sql` seeds exactly one row
@@ -12566,7 +12764,10 @@ fn unique_sample_literal_variant(kind: FieldKind) -> String {
         | FieldKind::RichText
         | FieldKind::Enum
         | FieldKind::Slug => "'dup_value_2'".to_owned(),
-        FieldKind::I32 | FieldKind::I64 => "424243".to_owned(),
+        // `position` can never be `:unique` (rejected in `parse_field`), so
+        // this arm is unreachable in practice — listed for exhaustiveness
+        // with the same literal as `I32`/`I64`.
+        FieldKind::I32 | FieldKind::I64 | FieldKind::Position => "424243".to_owned(),
         // The second stub row `render_reference_stub_tables_sql` seeds —
         // distinct from `unique_sample_literal`'s "1" for the same reason
         // that one must be a real seeded row's id, not an arbitrary literal.
@@ -12806,6 +13007,9 @@ fn main_route_entries(
     // Issue #1332: `true` under `--soft-delete` on the standard HTML path,
     // mounting the trash view and its restore/purge controls.
     trash: bool,
+    // Issue #1358: `true` when the model has a `position` field on the
+    // standard HTML path, mounting the two `move_up`/`move_down` controls.
+    reorder: bool,
     validated_field_names: &[String],
     sm_field_names: &[String],
     rich_text_field_names: &[String],
@@ -12857,6 +13061,12 @@ fn main_route_entries(
             entries.push(format!("routes::{plural}::trash"));
             entries.push(format!("routes::{plural}::restore"));
             entries.push(format!("routes::{plural}::purge"));
+        }
+        // Issue #1358: mount the reorder controls next to `destroy`, same
+        // reasoning as `bulk_delete`/`trash` above.
+        if reorder {
+            entries.push(format!("routes::{plural}::move_up"));
+            entries.push(format!("routes::{plural}::move_down"));
         }
         if live {
             entries.push(format!("routes::{plural}::events"));
@@ -16391,6 +16601,7 @@ async fn main() {
             false,
             false,
             None,
+            None,
         );
         assert!(
             rendered.contains("shard-aware"),
@@ -16414,6 +16625,7 @@ async fn main() {
             false,
             false,
             None,
+            None,
         );
         assert!(
             rendered.contains("control pool"),
@@ -16423,8 +16635,18 @@ async fn main() {
 
     #[test]
     fn repository_no_sharded_note_when_not_sharded() {
-        let rendered =
-            render_repository_file("Post", "post", &[], false, false, false, false, false, None);
+        let rendered = render_repository_file(
+            "Post",
+            "post",
+            &[],
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+        );
         assert!(
             !rendered.contains("shard-aware"),
             "non-sharded repository must not mention shard-aware: {rendered}"

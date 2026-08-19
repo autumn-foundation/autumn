@@ -1095,6 +1095,96 @@ no routes file, so there is no form to be inconsistent with, and
 editable, reusable slug rather than the primary key, so
 `WHERE slug = … AND lock_version = …` does not identify a stable row.)
 
+### User-orderable lists with `position`
+
+Declare a field with the `position` type and the scaffold wires a
+transaction-safe, race-safe reorderable list (issue #1358) — todo
+priorities, kanban columns, playlist tracks, form-builder fields — with
+**zero hand-written reindexing SQL**:
+
+```bash
+autumn generate scaffold Todo title:String rank:position
+```
+
+- The **column name is yours** (`rank` above) — `position` is the *type*
+  token, parsed the same way `String`/`i64`/`references` are; the field
+  itself is server-managed, like `lock_version`.
+- The **model** gets `#[position]`, so the column is excluded from
+  `NewTodo`/`UpdateTodo` entirely: a create/update payload can never set it
+  directly, which is what keeps the contiguous ordering from being hand-
+  edited into an inconsistent state.
+- The **migration** declares it `BIGINT NOT NULL DEFAULT 0` plus an index,
+  and adds two database triggers (issue #1358's "handle every insert/delete
+  path, not just the generated repository's" requirement):
+  - an insert trigger assigns the next contiguous value (`MAX(position) +
+    1`, or `0` for the first row) — every new row appends to the end of its
+    list;
+  - a delete trigger (and, under `--soft-delete`, a soft-delete trigger)
+    compacts the remaining rows so no gap is left.
+
+  The column's own `DEFAULT 0` is a placeholder only, immediately corrected
+  by the trigger inside the same statement/transaction as the insert — it
+  is never visible to a concurrent reader.
+- The **repository** (`#[repository(Todo, position(column = "rank"))]`)
+  gains five methods, each `O(rows shifted)` and transaction-safe:
+
+  ```rust,ignore
+  repo.move_to(id, 3).await?;        // absolute index, clamped to [0, len-1]
+  repo.move_before(id, other_id).await?;
+  repo.move_after(id, other_id).await?;
+  repo.move_up(id).await?;           // one step toward index 0 (no-op at the start)
+  repo.move_down(id).await?;         // one step away from index 0 (no-op at the end)
+  ```
+
+  `move_to` locks every row in the list (ordered by `id` — a fixed lock
+  order, so two concurrent moves on the same list serialize against each
+  other's first lock rather than deadlock), re-derives the row's current
+  position under that lock (a prior mover may have shifted it), clamps the
+  target, then shifts only the rows strictly between the old and new
+  position before setting this row's — never a full-table rewrite. This is
+  what makes the ordering safe under concurrent reorders: two browser tabs
+  dragging different rows at once still leave a valid, gapless `0..len-1`
+  permutation.
+- The **HTML index** orders by the position column and renders no-JS
+  **Move up / Move down** buttons per row — small `POST` forms, CSRF- and
+  one-time-submit-token-protected like the trash view's Restore button, so
+  a reorderable list works with JavaScript disabled.
+
+Scope the ordering to a parent with `{scope:col}` — a separate contiguous
+`0..len-1` sequence per distinct value of that column, so reordering one
+board's tasks never touches another board's:
+
+```bash
+autumn generate scaffold Task title:String board:references rank:position{scope:board_id}
+```
+
+The scope column must already be a `references` foreign key (the DSL
+rejects any other kind), and the migration's index becomes composite
+— `(board_id, rank)` — since every real query filters by scope first.
+
+**At most one `position` field per model.** `--default rank=<n>` is
+refused — a constant default would give every new row the same value,
+which is exactly the invariant this feature exists to maintain (compare
+`lock_version`, where a constant default is correct).
+
+**Not yet wired:** `tenant_scoped`, `versioned = true`, and `dependent(...)`
+repositories — `position(...)` is refused up front in combination with any
+of them (matching `retention(...)`'s own posture on the same three). A
+`--sharded` scaffold gets the column, migration triggers, and `#[position]`
+attribute, but no `move_*` methods and no HTML buttons — a move only
+reaches the pool/shard it happens to be given, so
+`#[repository(..., sharded)]` rejects `position(...)` outright; the
+generator prints a warning explaining why. `--api`/`--live`/
+`--live-validation`/owner-scoped scaffolds keep the `move_*` methods (and,
+for `--api`, the ordered data) but not the HTML buttons — reordering there
+needs a hand-written endpoint or client-side call against the repository
+method directly.
+
+**Restoring a soft-deleted row** does not renumber it back into the live
+sequence — it keeps the stale position it had when deleted, which can now
+collide with a position a live row has since taken. Out of scope for this
+slice; call `move_to` after restoring if you need it placed precisely.
+
 ### Export CSV from the list view
 
 Every standard HTML scaffold's index also ships a working **Export CSV**
