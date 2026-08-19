@@ -462,6 +462,56 @@ async fn setup_triggered_table(db: &TestDb) {
                  FOR EACH ROW EXECUTE FUNCTION position_triggered_tasks_rank_compact();",
             )
             .await;
+            // Mirrors `position_triggers_up_sql_for`'s Postgres `rescope`
+            // trigger exactly (Codex review finding for issue #1358): an
+            // ordinary `UPDATE` reassigning `board_id` must compact the old
+            // board's gap and append the row to the end of the new board,
+            // or moving a task to another board breaks the contiguous
+            // invariant (see `scope_reassignment_via_update_compacts_old_and_appends_to_new`
+            // below).
+            db.execute_sql(
+                "CREATE OR REPLACE FUNCTION position_triggered_tasks_rank_rescope() \
+                 RETURNS TRIGGER AS $$
+                 BEGIN
+                   IF hashtext(OLD.\"board_id\"::text) <= hashtext(NEW.\"board_id\"::text) THEN
+                     PERFORM pg_advisory_xact_lock(
+                         hashtext('position_triggered_tasks_rank_assign'), hashtext(OLD.\"board_id\"::text)
+                     );
+                     PERFORM pg_advisory_xact_lock(
+                         hashtext('position_triggered_tasks_rank_assign'), hashtext(NEW.\"board_id\"::text)
+                     );
+                   ELSE
+                     PERFORM pg_advisory_xact_lock(
+                         hashtext('position_triggered_tasks_rank_assign'), hashtext(NEW.\"board_id\"::text)
+                     );
+                     PERFORM pg_advisory_xact_lock(
+                         hashtext('position_triggered_tasks_rank_assign'), hashtext(OLD.\"board_id\"::text)
+                     );
+                   END IF;
+                   UPDATE \"position_triggered_tasks\" SET \"rank\" = \"rank\" - 1 \
+                   WHERE \"board_id\" = OLD.\"board_id\" AND \"rank\" > OLD.\"rank\";
+                   NEW.\"rank\" := COALESCE(
+                       (SELECT MAX(\"rank\") + 1 FROM \"position_triggered_tasks\" \
+                        WHERE \"board_id\" = NEW.\"board_id\"),
+                       0
+                   );
+                   RETURN NEW;
+                 END;
+                 $$ LANGUAGE plpgsql;",
+            )
+            .await;
+            db.execute_sql(
+                "DROP TRIGGER IF EXISTS position_triggered_tasks_rank_rescope_trg \
+                 ON \"position_triggered_tasks\";",
+            )
+            .await;
+            db.execute_sql(
+                "CREATE TRIGGER position_triggered_tasks_rank_rescope_trg \
+                 BEFORE UPDATE OF \"board_id\" ON \"position_triggered_tasks\" \
+                 FOR EACH ROW WHEN (NEW.\"board_id\" IS DISTINCT FROM OLD.\"board_id\") \
+                 EXECUTE FUNCTION position_triggered_tasks_rank_rescope();",
+            )
+            .await;
         })
         .await;
 }
@@ -685,5 +735,84 @@ async fn concurrent_move_to_and_delete_never_deadlock() {
         ranks, expected,
         "positions must remain an exact 0..len-1 permutation after concurrent move_to + \
          delete/re-insert rounds (no duplicates, no gaps), got: {ranks:?}"
+    );
+}
+
+/// Regression for a Codex review finding on issue #1358: an ordinary
+/// `UPDATE` reassigning a scoped row's scope FK (e.g. dragging a Kanban
+/// card to a different board via `board_id`) is not itself a `move_to`
+/// call, an insert, or a delete — nothing else in the generated code path
+/// would have compacted the row's old board or assigned it a fresh
+/// position in the new one. Seeds two boards through the real trigger,
+/// moves the middle row of board A to board B via a plain `diesel::update`,
+/// and asserts: board A compacts (no gap where the row used to be) and
+/// board B appends the row at the end (no duplicate position).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scope_reassignment_via_update_compacts_old_and_appends_to_new() {
+    let db = TestDb::shared().await;
+    setup_triggered_table(db).await;
+    let board_a = 2004;
+    let board_b = 2005;
+
+    let mut a_ids = Vec::new();
+    for i in 0..5 {
+        let mut conn = db.pool().get().await.expect("checkout connection");
+        let id: i64 = diesel::insert_into(position_triggered_tasks::table)
+            .values((
+                position_triggered_tasks::title.eq(format!("a-{i}")),
+                position_triggered_tasks::board_id.eq(board_a),
+            ))
+            .returning(position_triggered_tasks::id)
+            .get_result(&mut conn)
+            .await
+            .expect("seed board a");
+        a_ids.push(id);
+    }
+    for i in 0..3 {
+        let mut conn = db.pool().get().await.expect("checkout connection");
+        diesel::insert_into(position_triggered_tasks::table)
+            .values((
+                position_triggered_tasks::title.eq(format!("b-{i}")),
+                position_triggered_tasks::board_id.eq(board_b),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("seed board b");
+    }
+
+    let moved_id = a_ids[2]; // currently rank 2 in board A
+    let mut conn = db.pool().get().await.expect("checkout connection");
+    diesel::update(position_triggered_tasks::table.find(moved_id))
+        .set(position_triggered_tasks::board_id.eq(board_b))
+        .execute(&mut conn)
+        .await
+        .expect("reassign board_id must not error");
+
+    let mut a_ranks = triggered_ranks(&db.pool(), board_a).await;
+    a_ranks.sort_unstable();
+    assert_eq!(
+        a_ranks,
+        vec![0, 1, 2, 3],
+        "board A must compact to a contiguous 0..3 permutation after the row left: {a_ranks:?}"
+    );
+
+    let mut b_ranks = triggered_ranks(&db.pool(), board_b).await;
+    b_ranks.sort_unstable();
+    assert_eq!(
+        b_ranks,
+        vec![0, 1, 2, 3],
+        "board B must have the moved row appended at the end (no duplicate rank): {b_ranks:?}"
+    );
+    let moved_rank: i64 = position_triggered_tasks::table
+        .find(moved_id)
+        .select(position_triggered_tasks::rank)
+        .first(&mut conn)
+        .await
+        .expect("load moved row's rank");
+    assert_eq!(
+        moved_rank, 3,
+        "the moved row must land at the END of board B's sequence, not overwrite an \
+         existing rank"
     );
 }
