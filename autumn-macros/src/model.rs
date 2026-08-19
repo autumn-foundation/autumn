@@ -96,6 +96,18 @@ fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
                     "`#[unique]` takes no arguments; write a bare `#[unique]`",
                 ));
             }
+        } else if attr.path().is_ident("position") {
+            // Bare marker only (issue #1358): the column name and optional
+            // scope live in the generated `#[repository(..., position(column
+            // = "...", scope = "..."))]` attribute, not here — this marker's
+            // only job is excluding the field from `New{Model}`/`Update{Model}`
+            // (see `excluded_from_new`), the same way `#[lock_version]` does.
+            if !matches!(attr.meta, syn::Meta::Path(_)) {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "`#[position]` takes no arguments; write a bare `#[position]`",
+                ));
+            }
         } else if attr.path().is_ident("references") {
             // Bare `#[references]` is valid (target inferred from field name).
             if matches!(attr.meta, syn::Meta::Path(_)) {
@@ -2898,8 +2910,8 @@ fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
 }
 
 /// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`,
-/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`, `#[searchable]`,
-/// `#[state_machine]`) that shouldn't be on the query struct
+/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`, `#[position]`,
+/// `#[searchable]`, `#[state_machine]`) that shouldn't be on the query struct
 /// (they'd confuse Diesel derives).
 fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
@@ -2922,6 +2934,7 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // they never leak onto the Diesel derives; codegen is unchanged.
                 && !a.path().is_ident("unique")
                 && !a.path().is_ident("references")
+                && !a.path().is_ident("position")
         })
         .collect()
 }
@@ -3120,9 +3133,14 @@ fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
     }
     // `#[encrypted]` columns must flow through the `serialize_as` wrapper on
     // insert. Fields excluded from the insert (`#[id]`, `#[default]`,
-    // `#[lock_version]`) would instead get a raw database value, which the
-    // decrypting reader then rejects as a malformed envelope. Reject the combo.
-    if has_attr(field, "default") || has_attr(field, "lock_version") || has_attr(field, "id") {
+    // `#[lock_version]`, `#[position]`) would instead get a raw database
+    // value, which the decrypting reader then rejects as a malformed
+    // envelope. Reject the combo.
+    if has_attr(field, "default")
+        || has_attr(field, "lock_version")
+        || has_attr(field, "id")
+        || has_attr(field, "position")
+    {
         return Err(syn::Error::new_spanned(
             field,
             "`#[encrypted]` cannot be combined with `#[default]`, `#[lock_version]`, \
@@ -3897,14 +3915,23 @@ fn validate_factory_assoc_attrs(fields: &[&Field]) -> Option<TokenStream> {
     None
 }
 
-/// True if a field has `#[id]`, `#[default]`, or `#[lock_version]` — all
-/// three are excluded from the `NewX` insert type.
+/// True if a field has `#[id]`, `#[default]`, `#[lock_version]`, or
+/// `#[position]` — all four are excluded from the `NewX` insert type (and,
+/// via `fields_for_new`, from `UpdateX` too — `#[lock_version]` is the one
+/// exception, re-added to `UpdateX` separately as a plain required field).
 ///
 /// `#[lock_version]` fields are excluded because the DB column must carry a
 /// `DEFAULT 0` constraint; the initial version is always zero and is never
-/// supplied by the caller on insert.
+/// supplied by the caller on insert. `#[position]` fields (issue #1358) are
+/// excluded because the generated repository assigns the next contiguous
+/// value on insert and only ever changes it through `move_to`/`move_before`/
+/// `move_after`/`move_up`/`move_down` — never a direct create/update payload,
+/// which would let a caller silently break the contiguous invariant.
 fn excluded_from_new(field: &Field) -> bool {
-    has_attr(field, "id") || has_attr(field, "default") || has_attr(field, "lock_version")
+    has_attr(field, "id")
+        || has_attr(field, "default")
+        || has_attr(field, "lock_version")
+        || has_attr(field, "position")
 }
 
 /// Convert a `snake_case` identifier to `PascalCase`.
@@ -9969,6 +9996,101 @@ mod tests {
             pub id: i64
         };
         assert!(excluded_from_new(&field));
+    }
+
+    #[test]
+    fn position_attr_detected_by_has_attr() {
+        let field: syn::Field = syn::parse_quote! {
+            #[position]
+            pub rank: i64
+        };
+        assert!(has_attr(&field, "position"));
+    }
+
+    #[test]
+    fn position_field_is_excluded_from_new() {
+        let field: syn::Field = syn::parse_quote! {
+            #[position]
+            pub rank: i64
+        };
+        // A #[position] field must be absent from NewModel/UpdateModel — the
+        // generated repository assigns and maintains it entirely (#1358).
+        assert!(excluded_from_new(&field));
+    }
+
+    #[test]
+    fn position_bare_attribute_with_args_is_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[position(scope = "board_id")]
+            pub rank: i64
+        };
+        let err = validate_field_schema_markers(&field).unwrap_err();
+        assert!(
+            err.to_string().contains("position"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn position_attribute_is_stripped_from_the_diesel_struct() {
+        // `#[position]` is consumed by `#[model]`; re-emitting it onto the
+        // generated Diesel struct would fail with "cannot find attribute
+        // `position` in this scope".
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Task {
+                    #[id]
+                    pub id: i64,
+                    #[position]
+                    pub rank: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("# [position]"),
+            "the position attribute must not leak onto the emitted struct, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn position_field_excluded_from_new_and_update_structs() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Task {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    #[position]
+                    pub rank: i64,
+                }
+            },
+        )
+        .to_string();
+
+        let new_struct = generated
+            .split("struct NewTask")
+            .nth(1)
+            .expect("NewTask struct should be emitted");
+        let new_struct_body = &new_struct[..new_struct.find('}').unwrap_or(new_struct.len())];
+        assert!(
+            !new_struct_body.contains("rank"),
+            "NewTask must not contain the server-managed position field, got: {new_struct_body}"
+        );
+
+        let update_struct = generated
+            .split("struct UpdateTask")
+            .nth(1)
+            .expect("UpdateTask struct should be emitted");
+        let update_struct_body =
+            &update_struct[..update_struct.find('}').unwrap_or(update_struct.len())];
+        assert!(
+            !update_struct_body.contains("rank"),
+            "UpdateTask must not contain the server-managed position field, got: {update_struct_body}"
+        );
     }
 
     #[test]

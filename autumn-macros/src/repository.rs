@@ -238,6 +238,29 @@ struct RepoConfig {
     /// `None` (the default) emits nothing extra: every existing `#[repository]`
     /// is unaffected — retention is opt-in.
     retention: Option<RetentionSpec>,
+    /// `position` / `position(column = "...", scope = "...")` — ordered-list
+    /// support (issue #1358). `None` (the default) emits nothing extra.
+    /// `Some` generates `move_to`/`move_before`/`move_after`/`move_up`/
+    /// `move_down` inherent methods that maintain a contiguous `0..len-1`
+    /// ordering over `column` (default `"position"`), scoped to `scope` when
+    /// given (a sibling foreign-key column) or over the whole table
+    /// otherwise. Insert-time assignment and delete-time compaction are
+    /// handled by database triggers the migration emits (see
+    /// `autumn-cli`'s `position_triggers_up_sql_for`), not by this macro —
+    /// so they apply uniformly to every insert/delete path, not just the
+    /// generated repository's.
+    position: Option<PositionSpec>,
+}
+
+/// Parsed `position(...)` clause (issue #1358). See [`RepoConfig::position`].
+#[derive(Clone, Debug)]
+struct PositionSpec {
+    /// The `i64`/`BIGINT` ordering column. Defaults to `"position"` when the
+    /// bare `position` flag is used with no explicit `column = "..."`.
+    column: String,
+    /// The sibling foreign-key column (`i64`) this ordering is scoped to,
+    /// when given. `None` means a single sequence over the whole table.
+    scope: Option<String>,
 }
 
 /// Parsed `retention(...)` clause (issue #1342).
@@ -309,6 +332,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut validate_on_update_fetch = false;
     let mut owner_column: Option<String> = None;
     let mut retention: Option<RetentionSpec> = None;
+    let mut position: Option<PositionSpec> = None;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -613,12 +637,46 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                 every,
             });
             Ok(())
+        } else if meta.path.is_ident("position") {
+            // `position` (bare, column defaults to "position") or
+            // `position(column = "...", scope = "...")` (issue #1358).
+            if position.is_some() {
+                return Err(meta.error(
+                    "duplicate `position`/`position(...)`: #[repository(...)] may declare at \
+                     most one",
+                ));
+            }
+            let mut column: Option<String> = None;
+            let mut scope: Option<String> = None;
+            if meta.input.peek(syn::token::Paren) {
+                meta.parse_nested_meta(|nested| {
+                    if nested.path.is_ident("column") {
+                        let value: LitStr = nested.value()?.parse()?;
+                        column = Some(value.value());
+                        Ok(())
+                    } else if nested.path.is_ident("scope") {
+                        let value: LitStr = nested.value()?.parse()?;
+                        scope = Some(value.value());
+                        Ok(())
+                    } else {
+                        Err(nested.error(
+                            "expected `column = \"...\"` or `scope = \"...\"` inside \
+                             `position(...)`",
+                        ))
+                    }
+                })?;
+            }
+            position = Some(PositionSpec {
+                column: column.unwrap_or_else(|| "position".to_owned()),
+                scope,
+            });
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, owner = column, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), retention(after = \"...\", basis = column, purge_deleted_after = \"...\", batch_size = N, every = \"...\"), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, owner = column, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), retention(after = \"...\", basis = column, purge_deleted_after = \"...\", batch_size = N, every = \"...\"), position or position(column = \"...\", scope = \"...\"), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
             ))
         }
     })
@@ -746,6 +804,47 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             ));
         }
     }
+    if position.is_some() {
+        // Scoped down for this slice (issue #1358), mirroring retention(...)'s
+        // own incompatibility list above: the generated `move_*` methods open
+        // their own plain transaction and do not run the tenant/shard/version/
+        // hooks/cascade machinery those options add to the *generated CRUD*
+        // paths, so combining them would silently skip that machinery for a
+        // move rather than actually supporting it.
+        if sharded {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "position(...) does not support sharded repositories yet: a move only reaches \
+                 the pool it happens to be given. Remove `sharded`, or reorder within a single \
+                 shard's table by hand for now",
+            ));
+        }
+        if tenant_scoped {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "position(...) does not support tenant_scoped repositories yet: the generated \
+                 `move_*` methods do not add the tenant filter, so a move could read or shift \
+                 another tenant's rows. Remove `tenant_scoped`, or scope the ordering to a \
+                 tenant-owned parent column instead (`position(scope = \"...\")`) for now",
+            ));
+        }
+        if versioned {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "position(...) does not support versioned = true yet: a move does not write a \
+                 version-history entry the way delete_by_id/update do. Remove \
+                 `versioned = true`, or treat position moves as unaudited for now",
+            ));
+        }
+        if !dependents.is_empty() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "position(...) does not support dependent(...) yet: these are independent \
+                 concerns today (a move never deletes a row), but combining them is untested. \
+                 Remove `dependent(...)`, or file a follow-up if you need both",
+            ));
+        }
+    }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
     let generated_internal_hooks = false;
 
@@ -777,6 +876,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         validate_on_update_fetch,
         owner_column,
         retention,
+        position,
     })
 }
 
@@ -1423,6 +1523,338 @@ fn vh_insert_ts(
     }
 }
 
+/// Generate the `move_to`/`move_before`/`move_after`/`move_up`/`move_down`
+/// inherent methods for a `position(...)`-declaring repository (issue #1358).
+/// Empty `TokenStream` when `config.position` is `None`, so every existing
+/// repository's generated output is byte-for-byte unaffected.
+///
+/// `move_to` is the sole primitive that touches SQL; the other four compute
+/// an absolute target index (an unlocked read of the current/neighbor
+/// position — a benign race, since `move_to` itself re-reads under lock, see
+/// below) and delegate. All five run in one `scoped_immediate_transaction`
+/// each.
+///
+/// `move_to`'s algorithm: (1) look up the row's scope value (or `()` when
+/// unscoped); (2) lock every row in that scope, ordered by `id` — a FIXED
+/// global lock order, so two concurrent movers on the *same* scope serialize
+/// against each other's first lock rather than deadlock (they always attempt
+/// the same ascending-id order), while movers on *different* scopes never
+/// contend at all; (3) re-derive the row's current position from that locked
+/// set (a prior mover may have shifted it between step 1's unlocked read and
+/// step 2's lock) and clamp the requested target into `[0, len-1]`; (4) shift
+/// the rows strictly between `current` and `target` by one (toward `current`),
+/// then set this row's position to `target` — `O(rows shifted)`, not
+/// `O(table)`. A `soft_delete` repository additionally filters every query to
+/// live rows (`deleted_at IS NULL`), matching the migration's compaction
+/// triggers.
+#[allow(clippy::too_many_lines)]
+fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> TokenStream {
+    let Some(spec) = &config.position else {
+        return quote! {};
+    };
+    let model_name = &config.model_name;
+    let position_ident = format_ident!("{}", spec.column);
+    let scope_ident = spec.scope.as_ref().map(|s| format_ident!("{}", s));
+
+    let live_filter = if config.soft_delete {
+        quote! { .filter(#table_ident::deleted_at.is_null()) }
+    } else {
+        quote! {}
+    };
+
+    // `move_to`'s body, specialized at macro-expansion time for the scoped
+    // vs. unscoped case — the scope column identifier simply does not exist
+    // to reference in the unscoped case, so this can't be a runtime branch.
+    let (scope_lookup, scope_filter) = scope_ident.as_ref().map_or_else(
+        || (quote! {}, quote! {}),
+        |scope_ident| {
+            (
+                quote! {
+                    let __autumn_scope: i64 = #table_ident::table
+                        .find(id)
+                        .select(#table_ident::#scope_ident)
+                        #live_filter
+                        .first(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                },
+                quote! { .filter(#table_ident::#scope_ident.eq(__autumn_scope)) },
+            )
+        },
+    );
+
+    // Same advisory-lock key the migration's insert-assign/delete-compact
+    // triggers take (see `position_triggers_up_sql_for`) — taking it here
+    // too, before the row-locking `SELECT`, closes a deadlock between
+    // `move_to`'s fixed id-ordered row locks and the compaction trigger's
+    // position-ordered `UPDATE`. Postgres-only; a no-op on `SQLite`.
+    let position_lock_name = format!("{}_{}_assign", config.table_name, spec.column);
+    let position_lock_scope_arg = scope_ident.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |_| quote! { ::core::option::Option::Some(__autumn_scope) },
+    );
+    let position_advisory_lock = quote! {
+        ::autumn_web::__private::position_advisory_lock(conn, #position_lock_name, #position_lock_scope_arg)
+            .await
+            .map_err(::autumn_web::AutumnError::from)?;
+    };
+
+    // Shared transaction body for move_to/move_up/move_down, parameterized
+    // only on how `__autumn_target` is computed from `__autumn_current` (the
+    // row's position as of THIS transaction's own locked read) and
+    // `__autumn_len`. Codex review (issue #1358): move_up/move_down used to
+    // read the row's position in a separate, UNLOCKED query, compute an
+    // absolute target from it, then hand that stale absolute index to
+    // move_to — a TOCTOU window where a concurrent mover could change the
+    // row's real position between the read and move_to's own locked
+    // re-read, making the precomputed target land somewhere other than "one
+    // step" from the row's actual current position (including, in the
+    // wrong direction). Generating move_up/move_down as full standalone
+    // methods that compute their relative target from the SAME locked
+    // `__autumn_current` this body already reads removes the second,
+    // external read entirely — there is no longer a gap for another
+    // transaction to land in.
+    let move_transaction_body = |target_expr: proc_macro2::TokenStream| {
+        quote! {
+            #scope_lookup
+            #position_advisory_lock
+            let __autumn_locked: ::std::vec::Vec<(i64, i64)> = ::autumn_web::maybe_for_update!(
+                #table_ident::table
+                    #scope_filter
+                    #live_filter
+                    .select((#table_ident::id, #table_ident::#position_ident))
+                    .order(#table_ident::id.asc())
+            )
+            .load(conn)
+            .await
+            .map_err(::autumn_web::AutumnError::from)?;
+            let Some(&(_, __autumn_current)) =
+                __autumn_locked.iter().find(|(rid, _)| *rid == id)
+            else {
+                return ::core::result::Result::Err(::autumn_web::AutumnError::not_found_msg(
+                    format!("{} with id {id} not found", stringify!(#model_name)),
+                ));
+            };
+            let __autumn_len = __autumn_locked.len() as i64;
+            let __autumn_target = #target_expr;
+            if __autumn_target != __autumn_current {
+                if __autumn_target > __autumn_current {
+                    ::autumn_web::reexports::diesel::update(
+                        #table_ident::table
+                            #scope_filter
+                            #live_filter
+                            .filter(#table_ident::#position_ident.gt(__autumn_current))
+                            .filter(#table_ident::#position_ident.le(__autumn_target)),
+                    )
+                    .set(#table_ident::#position_ident.eq(#table_ident::#position_ident - 1))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                } else {
+                    ::autumn_web::reexports::diesel::update(
+                        #table_ident::table
+                            #scope_filter
+                            #live_filter
+                            .filter(#table_ident::#position_ident.ge(__autumn_target))
+                            .filter(#table_ident::#position_ident.lt(__autumn_current)),
+                    )
+                    .set(#table_ident::#position_ident.eq(#table_ident::#position_ident + 1))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                }
+                ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                    .set(#table_ident::#position_ident.eq(__autumn_target))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+            }
+            ::core::result::Result::Ok(())
+        }
+    };
+
+    // Wraps `body` (from `move_transaction_body`) in the retry-wrapped
+    // `pub async fn #sig` shell every move_* method shares: connection
+    // acquisition, the deadlock/serialization-failure retry loop (Codex
+    // review — see the doc comment on the loop below), and the
+    // `scoped_immediate_transaction` call.
+    let move_method = |doc: proc_macro2::TokenStream,
+                       sig: proc_macro2::TokenStream,
+                       pre_check: proc_macro2::TokenStream,
+                       body: proc_macro2::TokenStream| {
+        quote! {
+            #doc
+            pub async fn #sig -> ::autumn_web::AutumnResult<()> {
+                #pre_check
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                let mut conn = self.__autumn_acquire_conn().await?;
+                // Codex review (issue #1358): the advisory lock closes the
+                // id-order-vs-position-order row-lock deadlock between this
+                // method and the compaction triggers, but a genuinely
+                // concurrent delete/soft-delete can still win a row lock on
+                // one of this scope's rows BEFORE reaching its own
+                // trigger's advisory-lock attempt — a lock-type inversion
+                // (row lock then advisory lock, vs. this method's advisory
+                // lock then row locks) Postgres's deadlock detector
+                // resolves by aborting one side with `40P01`. Retry a
+                // bounded few times on that (or the `40001` serialization
+                // failure a stricter isolation level could raise) rather
+                // than surface a transient deadlock as a hard failure — the
+                // same classification `Db::tx_with` already relies on for
+                // its own retry loop.
+                let mut __autumn_attempt: u32 = 0;
+                loop {
+                let __autumn_move_result = ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(
+                    &mut *conn,
+                    |conn| {
+                        async move {
+                            #body
+                        }
+                        .scope_boxed()
+                    },
+                )
+                .await;
+                match __autumn_move_result {
+                    ::core::result::Result::Ok(()) => return ::core::result::Result::Ok(()),
+                    ::core::result::Result::Err(__autumn_move_err) => {
+                        if __autumn_attempt < 2
+                            && ::autumn_web::__private::is_retryable_txn_error(&__autumn_move_err)
+                        {
+                            __autumn_attempt += 1;
+                            continue;
+                        }
+                        return ::core::result::Result::Err(__autumn_move_err);
+                    }
+                }
+                }
+            }
+        }
+    };
+
+    let move_to = move_method(
+        quote! {
+            /// Move this row to absolute index `target` within its position
+            /// scope, clamped into `[0, len-1]`. Transaction-safe: see
+            /// `position_impl_methods`'s doc comment for the locking scheme.
+        },
+        quote! { move_to(&self, id: i64, target: i64) },
+        quote! {},
+        move_transaction_body(quote! { target.clamp(0, (__autumn_len - 1).max(0)) }),
+    );
+
+    let move_up = move_method(
+        quote! {
+            /// Move this row one position toward index 0 within its scope.
+            /// A no-op at the start of its scope.
+        },
+        quote! { move_up(&self, id: i64) },
+        quote! {},
+        move_transaction_body(
+            quote! { (__autumn_current - 1).clamp(0, (__autumn_len - 1).max(0)) },
+        ),
+    );
+
+    let move_down = move_method(
+        quote! {
+            /// Move this row one position away from index 0 within its scope.
+            /// A no-op at the end of its scope.
+        },
+        quote! { move_down(&self, id: i64) },
+        quote! {},
+        move_transaction_body(
+            quote! { (__autumn_current + 1).clamp(0, (__autumn_len - 1).max(0)) },
+        ),
+    );
+    let move_up_down = quote! { #move_up #move_down };
+
+    // Both `move_before`/`move_after` derive `other_id`'s position from the
+    // SAME `__autumn_locked` row set `move_transaction_body` already loads
+    // for `id` — not a separate, unlocked, external read — so there is no
+    // TOCTOU window for a concurrent mover to invalidate (Codex review,
+    // issue #1358: an earlier version read `other_id`'s position externally
+    // before entering the lock, so a concurrent move of `other_id` between
+    // that read and the transaction could land the row somewhere other than
+    // immediately before/after the requested neighbor). `__autumn_locked`
+    // is already filtered to `id`'s own scope, so "not found in it" also
+    // doubles as the cross-scope check — a stricter one, in fact: it
+    // catches `other_id` not existing or being soft-deleted the same way it
+    // catches a genuine cross-scope mismatch, where the previous external
+    // lookup surfaced those as a 404 instead of this 400. That's an
+    // intentional, minor behavior change: from the caller's perspective,
+    // "can't find `other_id` in my scope" reads the same regardless of
+    // which of the three caused it.
+    let other_target_lookup = |cmp_gt: proc_macro2::TokenStream,
+                               adjust: proc_macro2::TokenStream| {
+        quote! {
+            {
+                let ::core::option::Option::Some(&(_, __autumn_other)) =
+                    __autumn_locked.iter().find(|(rid, _)| *rid == other_id)
+                else {
+                    return ::core::result::Result::Err(::autumn_web::AutumnError::bad_request_msg(
+                        format!(
+                            "{} {other_id} is not in the same position scope as {id}",
+                            stringify!(#model_name)
+                        ),
+                    ));
+                };
+                if __autumn_current #cmp_gt __autumn_other {
+                    __autumn_other
+                } else {
+                    __autumn_other #adjust
+                }
+            }
+        }
+    };
+
+    let move_before = move_method(
+        quote! {
+            /// Move this row to immediately before `other_id` within their
+            /// shared position scope. A no-op if `id == other_id`; returns
+            /// `400 Bad Request` if `other_id` is not found in `id`'s scope
+            /// (not in the table, soft-deleted, or genuinely in a different
+            /// scope). Transaction-safe: `other_id`'s position is derived
+            /// from the same locked row set `id`'s is, inside the same
+            /// transaction — see `position_impl_methods`'s doc comment.
+        },
+        quote! { move_before(&self, id: i64, other_id: i64) },
+        quote! {
+            if id == other_id {
+                return ::core::result::Result::Ok(());
+            }
+        },
+        move_transaction_body(other_target_lookup(quote! { > }, quote! { - 1 })),
+    );
+
+    let move_after = move_method(
+        quote! {
+            /// Move this row to immediately after `other_id` within their
+            /// shared position scope. A no-op if `id == other_id`; returns
+            /// `400 Bad Request` if `other_id` is not found in `id`'s scope
+            /// (not in the table, soft-deleted, or genuinely in a different
+            /// scope). Transaction-safe: `other_id`'s position is derived
+            /// from the same locked row set `id`'s is, inside the same
+            /// transaction — see `position_impl_methods`'s doc comment.
+        },
+        quote! { move_after(&self, id: i64, other_id: i64) },
+        quote! {
+            if id == other_id {
+                return ::core::result::Result::Ok(());
+            }
+        },
+        move_transaction_body(other_target_lookup(quote! { < }, quote! { + 1 })),
+    );
+    let move_before_after = quote! { #move_before #move_after };
+
+    quote! {
+        #move_to
+        #move_up_down
+        #move_before_after
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     clippy::option_if_let_else,
@@ -1455,6 +1887,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &trait_def.vis;
     let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
     let tenant_extra = usize::from(config.tenant_scoped);
+    // Issue #1358: `move_to`/`move_before`/`move_after`/`move_up`/`move_down`.
+    // Empty when `position(...)` is not declared.
+    let position_impl_methods_ts = position_impl_methods(&config, &table_ident);
 
     // ── #1325 counter caches ────────────────────────────────────────────────
     //
@@ -7185,6 +7620,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let delete_many_body = {
+            // Codex review (issue #1358): the position insert-assign trigger
+            // takes its advisory lock, but the delete/soft-delete-compact
+            // triggers fire once PER ROW — each computing its shift from
+            // that row's own `OLD.position`. A single multi-row `DELETE ...
+            // WHERE id = ANY(chunk)` (or the soft-delete equivalent
+            // `UPDATE ... SET deleted_at = ...`) removes several rows from
+            // the SAME scope in one statement; their row-level triggers
+            // don't see each other's removals, so the relative shifts can
+            // under- or over-compact, leaving a gap or a duplicate rank.
+            // Forcing chunk size to 1 when a position field exists turns
+            // every chunk's delete/update into a single-row statement, so
+            // each trigger firing sees a fully-settled table and the
+            // existing single-row-safe compaction logic stays correct.
+            let delete_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
             let tenant_id_setup = if config.tenant_scoped {
                 quote! {
                     let tenant_id = if self.across_tenants {
@@ -7360,7 +7809,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let delete_execution = if config.versioned {
                 quote! {
                     let mut __vh_actually_deleted: ::std::collections::HashSet<i64> = ::std::collections::HashSet::new();
-                    for chunk in ids.chunks(1000) {
+                    for chunk in ids.chunks(#delete_chunk_size) {
                         #cc_before_delete_chunk
                         let chunk_deleted_ids = #delete_returning_expr
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -7372,7 +7821,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             } else {
                 quote! {
-                    for chunk in ids.chunks(1000) {
+                    for chunk in ids.chunks(#delete_chunk_size) {
                         #cc_before_delete_chunk
                         #delete_expr
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -9214,6 +9663,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let update_many_body = {
+            // Codex review (issue #1358): unlike the hooks-enabled
+            // `update_many` (which already updates one row per statement —
+            // each gets its own individually derived `draft`), this path
+            // issues ONE `UPDATE ... WHERE id = ANY(chunk) SET <changes>`
+            // per chunk, applying the SAME changeset to every row in it. If
+            // `changes` reassigns a scoped position field's scope column,
+            // multiple same-scope rows can be rescoped in that single
+            // statement — the same per-row-trigger-sees-only-its-own-OLD
+            // batching race `delete_many`'s chunk-size fix closes, just via
+            // `rescope` instead of `compact`/`compact_soft`. Force
+            // single-row chunks whenever a position field exists so every
+            // `rescope` trigger firing sees a fully-settled table.
+            let update_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
             let vh_update_pair = if config.versioned {
                 let vh = vh_insert_ts(
                     table_name,
@@ -9390,7 +9852,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #vh_build_before_map_from_current
 
                             let mut updated = Vec::new();
-                            for chunk in ids.chunks(1000) {
+                            for chunk in ids.chunks(#update_chunk_size) {
                                 let chunk_updated = #update_expr_conn
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 #vh_update_pair
@@ -9409,7 +9871,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #vh_load_before_map_no_lock
 
                             let mut updated = Vec::new();
-                            for chunk in ids.chunks(1000) {
+                            for chunk in ids.chunks(#update_chunk_size) {
                                 let chunk_updated = #update_expr_conn
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 #vh_update_pair
@@ -9426,6 +9888,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let delete_many_body = {
+            // See the identical comment in the hooks-enabled `delete_many_body`
+            // above (Codex review, issue #1358): force single-row chunks when
+            // a position field exists so the per-row delete/soft-delete-compact
+            // triggers never see more than one removal per statement.
+            let delete_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
             let vh_delete_load_before = if config.versioned {
                 // Soft-delete preload must mirror the actual delete filter so that
                 // already-deleted rows are not snapshotted as newly deleted.
@@ -9565,7 +10032,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
                 let loop_ts = quote! {
                     let mut __vh_actually_deleted: ::std::collections::HashSet<i64> = ::std::collections::HashSet::new();
-                    for chunk in ids.chunks(1000) {
+                    for chunk in ids.chunks(#delete_chunk_size) {
                         #cc_before_delete_chunk
                         let chunk_deleted_ids = #delete_returning_expr
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -9622,7 +10089,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 let loop_ts = quote! {
-                    for chunk in ids.chunks(1000) {
+                    for chunk in ids.chunks(#delete_chunk_size) {
                         #cc_before_delete_chunk
                         #delete_expr
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -17190,6 +17657,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #hook_support_methods
             #dependent_child_helper
             #retention_sweep_methods
+            #position_impl_methods_ts
 
             /// Returns a clone of this repository whose generated read
             /// methods are pinned to the primary pool for the rest of the

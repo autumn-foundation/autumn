@@ -13,7 +13,7 @@ use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, add_search_down_sql_for, add_search_up_sql_for,
     append_schema_table_with_id_for, create_table_sql_with_metadata_and_id_for, drop_table_sql,
-    link_models_into_seed_bin,
+    link_models_into_seed_bin, position_triggers_down_sql_for, position_triggers_up_sql_for,
 };
 use super::{GenerateError, detect_backend, ensure_project_root, read_or_empty};
 
@@ -377,6 +377,23 @@ fn plan_model_with_options_impl(
             format!("{up_sql}\n{search_up}"),
             format!("{search_down}{}", drop_table_sql(&table)),
         )
+    };
+    // Issue #1358: `position`-field maintenance triggers. Appended after the
+    // (optional) search scaffold, same reasoning as that block — these are
+    // independent DDL objects tied to the table, not the model struct/schema.rs
+    // surface. Empty string (byte-identical output) for the overwhelmingly
+    // common case of no `position` field.
+    let position_up = position_triggers_up_sql_for(backend, &table, &schema_fields);
+    let position_down = position_triggers_down_sql_for(backend, &table, &schema_fields);
+    let up_sql = if position_up.is_empty() {
+        up_sql
+    } else {
+        format!("{up_sql}\n{position_up}")
+    };
+    let down_sql = if position_down.is_empty() {
+        down_sql
+    } else {
+        format!("{position_down}{down_sql}")
     };
     plan.create(migration_dir.join("up.sql"), up_sql);
     plan.create(migration_dir.join("down.sql"), down_sql);
@@ -1755,6 +1772,25 @@ pub fn parse_model_metadata(
             .or_insert_with(|| "0".to_owned());
     }
 
+    // Issue #1358: a `position` column is likewise DB-managed and excluded
+    // from `New{Model}`/`Update{Model}` (`#[position]`), so the SQL column
+    // needs a `DEFAULT` too, or every create would fail the NOT NULL
+    // constraint before the repository's insert hook ever runs. `DEFAULT 0`
+    // is a placeholder only — the generated repository's insert hook
+    // overwrites it with the real next-in-scope value inside the same
+    // transaction as the insert (see `autumn-macros`' `position_after_insert`
+    // splice), the same two-step "DB default, then app-managed overwrite"
+    // shape `lock_version` uses above. Recording it here also drops the
+    // column from the scaffold's generated HTML form, same as `lock_version`.
+    for f in fields {
+        if f.kind.is_position() {
+            metadata
+                .defaults
+                .entry(f.name.clone())
+                .or_insert_with(|| "0".to_owned());
+        }
+    }
+
     // Full-text search's generated `search_page` (in the repository macro)
     // hardcodes an `i64`/`BigInt` primary key: it collects `SearchId { id: i64 }`
     // rows into a `Vec<i64>`, filters with `id.eq_any(&ids)`, and dedups through
@@ -2344,7 +2380,10 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
         | FieldKind::References
         // A slug's value is always auto-derived from its `from` field on
         // create (issue #1260), never a static default.
-        | FieldKind::Slug => Err(format!(
+        | FieldKind::Slug
+        // A position's value is always assigned by the repository on insert
+        // (issue #1358), never a static default.
+        | FieldKind::Position => Err(format!(
             "defaults for {} fields are not supported by `autumn generate` yet",
             field.rust_type()
         )),
@@ -2583,6 +2622,13 @@ fn render_model_file(
         // `DEFAULT 0` separately, so the migration still backfills the INSERT.
         if is_lock_version_column(f) {
             out.push_str("    #[lock_version]\n");
+        } else if f.kind.is_position() {
+            // Issue #1358: `#[position]` marks the column DB-managed
+            // (excluded from `New{Model}`/`Update{Model}`, like
+            // `#[lock_version]`) — the generated repository assigns and
+            // maintains its value entirely; see `excluded_from_new` in
+            // `autumn-macros`.
+            out.push_str("    #[position]\n");
         } else if metadata.defaults.contains_key(&f.name) {
             out.push_str("    #[default]\n");
         }
@@ -6089,6 +6135,50 @@ autumn-web = \"0.3\"\n";
             up.contains("lock_version INTEGER NOT NULL DEFAULT 0"),
             "got:\n{up}"
         );
+    }
+
+    #[test]
+    fn position_field_emits_position_attribute() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Task",
+            &["title:String".into(), "rank:position".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/task.rs")).unwrap();
+        assert!(
+            model.contains("#[position]\n    pub rank: i64,"),
+            "a `position` column must carry the framework's `#[position]` attribute so it is \
+             excluded from New/UpdateTask: {model}"
+        );
+    }
+
+    #[test]
+    fn position_column_gets_sql_default_zero() {
+        // `#[position]` excludes the column from `NewTask`, so the INSERT
+        // omits it — without a SQL DEFAULT every create would fail on the
+        // NOT NULL constraint before the repository's insert hook overwrites
+        // the placeholder with the real next-in-scope value.
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Task",
+            &["title:String".into(), "rank:position".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_tasks/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("rank BIGINT NOT NULL DEFAULT 0"), "got:\n{up}");
     }
 
     #[test]

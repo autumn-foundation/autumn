@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Ordered-list `position` field with transaction-safe reorder helpers
+  (#1358):** a new `position` DSL token (`rank:position`, or scoped to a
+  parent with `rank:position{scope:board_id}`) declares a user-orderable
+  list — todo priorities, kanban columns, playlist tracks — with zero
+  hand-written reindexing SQL. The column is server-managed (`#[position]`,
+  excluded from `New*`/`Update*`): database triggers assign the next
+  contiguous value on insert and compact the remaining rows on delete (or
+  soft-delete), so the `0..len-1` invariant holds for every insert/delete
+  path, not just the generated repository's. `#[repository(Model,
+  position(column = "rank"[, scope = "board_id"]))]` generates
+  transaction-safe `move_to(id, n)` / `move_before(id, other)` /
+  `move_after(id, other)` / `move_up(id)` / `move_down(id)` methods, each
+  `O(rows shifted)`, locking the scope's rows (ordered by `id`, a fixed
+  lock order that serializes concurrent movers on the same scope instead of
+  deadlocking them) before shifting. The HTML scaffold's index orders by
+  the position column and adds no-JS, CSRF-protected Move up/down buttons.
+  Not yet supported with `tenant_scoped`/`versioned`/`dependent(...)`/
+  `sharded` repositories (refused at macro-expansion time, matching
+  `retention(...)`'s posture on the same combinations). See
+  `docs/guide/generators.md`.
+
 - **Codemods with `autumn upgrade` (#1629):** the new `autumn upgrade` command
   applies each release's *mechanical* app-code migrations to your own Rust
   source. For every release between the `autumn-web` version your `Cargo.toml`

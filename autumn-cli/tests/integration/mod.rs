@@ -7,6 +7,7 @@ mod db_pull;
 mod deploy;
 mod generate_json_postgres;
 mod generate_lock_version_postgres;
+mod generate_position_scaffold;
 mod generate_references_postgres;
 mod generate_tauri_mobile;
 mod generate_tauri_mobile_offline;

@@ -44,6 +44,12 @@ pub struct FieldConstraints {
     /// generated model field. `String`/`Text` only, and never nullable — see
     /// [`EncryptedMode`]. `None` for an ordinary plaintext column.
     pub encrypted: Option<EncryptedMode>,
+    /// `scope:col` — the parent foreign-key column a `position` field's
+    /// contiguous ordering is scoped to (issue #1358), e.g.
+    /// `rank:position{scope:board_id}`. `position` only; `None` means the
+    /// position is a single sequence over the whole table. Never a
+    /// `#[validate]`/HTML5 constraint.
+    pub scope: Option<String>,
 }
 
 impl FieldConstraints {
@@ -57,6 +63,7 @@ impl FieldConstraints {
             && self.label.is_none()
             && self.from.is_none()
             && self.encrypted.is_none()
+            && self.scope.is_none()
     }
 }
 
@@ -471,6 +478,20 @@ pub enum FieldKind {
     /// `update`/`delete` routes resolve the record by this field instead of
     /// `id`.
     Slug,
+    /// `position` (optionally `position{scope:col}`) — a server-managed
+    /// contiguous ordering column (issue #1358), e.g. `rank:position` or,
+    /// scoped to a parent, `rank:position{scope:board_id}`. Storage-wise a
+    /// plain `i64`/`BIGINT` column (matching the default `i64` primary-key
+    /// convention), but never nullable — every row belongs somewhere in its
+    /// ordering — and never hand-assigned: the generated repository assigns
+    /// the next contiguous value on insert, compacts on delete, and exposes
+    /// `move_to`/`move_before`/`move_after`/`move_up`/`move_down` helpers, so
+    /// the field is excluded from the generated `New*`/`Update*` structs the
+    /// same way `id`/timestamps are. The optional [`FieldConstraints::scope`]
+    /// keeps a separate contiguous `0..len-1` sequence per distinct value of
+    /// the named column (typically a `references` foreign key). At most one
+    /// `position` field is allowed per model.
+    Position,
 }
 
 impl FieldKind {
@@ -486,8 +507,9 @@ impl FieldKind {
             // enum's real type name.
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "String",
             Self::I32 => "i32",
-            // `References` is always `i64`, matching the default `i64` PK convention.
-            Self::I64 | Self::References => "i64",
+            // `References` and `Position` are always `i64`, matching the
+            // default `i64` PK convention.
+            Self::I64 | Self::References | Self::Position => "i64",
             Self::Bool => "bool",
             Self::F32 => "f32",
             Self::F64 => "f64",
@@ -507,7 +529,7 @@ impl FieldKind {
         match self {
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "Text",
             Self::I32 => "Int4",
-            Self::I64 | Self::References => "Int8",
+            Self::I64 | Self::References | Self::Position => "Int8",
             Self::Bool => "Bool",
             Self::F32 => "Float4",
             Self::F64 => "Float8",
@@ -526,7 +548,7 @@ impl FieldKind {
         match self {
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "TEXT",
             Self::I32 => "INTEGER",
-            Self::I64 | Self::References => "BIGINT",
+            Self::I64 | Self::References | Self::Position => "BIGINT",
             Self::Bool => "BOOLEAN",
             Self::F32 => "REAL",
             Self::F64 => "DOUBLE PRECISION",
@@ -569,7 +591,7 @@ impl FieldKind {
     pub const fn sqlite_sql_type(self) -> &'static str {
         match self {
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "TEXT",
-            Self::I32 | Self::I64 | Self::References | Self::Bool => "INTEGER",
+            Self::I32 | Self::I64 | Self::References | Self::Position | Self::Bool => "INTEGER",
             Self::F32 | Self::F64 => "REAL",
             Self::Uuid => "TEXT",
             Self::NaiveDateTime | Self::DateTime => "TEXT",
@@ -643,7 +665,7 @@ impl FieldKind {
         match self {
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "Text",
             Self::I32 => "Int4",
-            Self::I64 | Self::References => "Int8",
+            Self::I64 | Self::References | Self::Position => "Int8",
             Self::Bool => "Bool",
             Self::F32 => "Float4",
             Self::F64 => "Float8",
@@ -740,6 +762,7 @@ impl FieldKind {
             Self::Enum => "enum{…}",
             Self::Decimal { .. } => "decimal{…}",
             Self::Slug => "slug{…}",
+            Self::Position => "position",
         }
     }
 
@@ -792,6 +815,19 @@ impl FieldKind {
     #[must_use]
     pub const fn is_decimal(self) -> bool {
         matches!(self, Self::Decimal { .. })
+    }
+
+    /// Returns `true` for a server-managed `position` ordering field (issue
+    /// #1358).
+    ///
+    /// Used by the model/migration/repository/scaffold generators to: exclude
+    /// the column from `New*`/`Update*` structs, emit its `NOT NULL BIGINT`
+    /// column plus auto-index, wire `position(column = "...", scope = "...")`
+    /// into the generated `#[repository(...)]` attribute, and order the
+    /// scaffold index view by it with Move up/down buttons.
+    #[must_use]
+    pub const fn is_position(self) -> bool {
+        matches!(self, Self::Position)
     }
 }
 
@@ -916,8 +952,8 @@ impl IdType {
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
-    enum{a,b,…}, decimal{precision,scale}, slug{from:col}, Option<…>, :unique, \
-    String{encrypted}, String{encrypted:deterministic}";
+    enum{a,b,…}, decimal{precision,scale}, slug{from:col}, position (optionally \
+    position{scope:col}), Option<…>, :unique, String{encrypted}, String{encrypted:deterministic}";
 
 /// The DSL field kinds that map to a working diesel `SQLite` conversion
 /// (issue #1614 AC #4; #1924) — the complement of the kinds
@@ -926,7 +962,7 @@ pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, 
 /// field kinds a `SQLite` app supports today.
 pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
     NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
-    slug{from:col}, Option<…>, :unique";
+    slug{from:col}, position (optionally position{scope:col}), Option<…>, :unique";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -945,6 +981,14 @@ pub const SQL_SUPPORTED_TYPES: &str = "text, varchar, bpchar (-> String), int4 (
 ///
 /// Returns `None` for types outside the documented surface so the caller can
 /// fail loudly with a column-named error rather than silently dropping it.
+///
+/// Like `jsonb` (which round-trips as a plain `FieldKind::Json`, losing the
+/// distinction from a hand-written `json` column), a `position` column has
+/// no distinguishing catalog type of its own — it's a plain `int4`/`int8`
+/// NOT NULL column plus an index and a pair of triggers. `db pull` therefore
+/// introspects it back as an ordinary [`FieldKind::I32`]/[`FieldKind::I64`],
+/// not [`FieldKind::Position`]; this is expected, not a bug — there is no
+/// SQL-level marker to recover the `position`-ness from.
 #[must_use]
 pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
     match udt_name {
@@ -1197,6 +1241,29 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     // existing `unique`-field `UNIQUE INDEX` and `find_by_slug` repository
     // machinery (issue #1032) for free, whether or not `:unique` was typed.
     let unique = unique || kind == FieldKind::Slug;
+
+    // A `position` field (issue #1358) can never be nullable — every row has
+    // a place in its ordering — and can never be `:unique` — the whole point
+    // is a dense, repository-maintained `0..len-1` sequence per scope, not a
+    // one-off distinct value.
+    if kind == FieldKind::Position {
+        if nullable {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `position` field cannot be nullable — every row has a place in its \
+                         ordering"
+                    .into(),
+            });
+        }
+        if unique {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `position` field cannot be `:unique` — the repository maintains a \
+                         dense `0..len-1` sequence per scope, not a one-off distinct value"
+                    .into(),
+            });
+        }
+    }
 
     // ── `{encrypted}` cross-checks (issue #1340) ────────────────────────────
     // The kind allowlist already ran in `set_encrypted_constraint`; what's left
@@ -1477,6 +1544,7 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
             match key.trim() {
                 "label" => set_label_constraint(&mut c, value.trim(), is_reference)?,
                 "from" => set_from_constraint(&mut c, value.trim(), is_slug)?,
+                "scope" => set_scope_constraint(&mut c, value.trim(), kind.is_position())?,
                 // The kind check runs FIRST: on `count:i64{encrypted:bogus}` the
                 // useful diagnosis is that `encrypted` doesn't apply to an
                 // `i64` at all, not that `bogus` isn't a mode.
@@ -1697,6 +1765,26 @@ fn set_from_constraint(c: &mut FieldConstraints, value: &str, is_slug: bool) -> 
     Ok(())
 }
 
+/// Set the `position` scope column (issue #1358), rejecting `scope` on a
+/// non-`position` field and a value that isn't a valid `snake_case`
+/// identifier.
+fn set_scope_constraint(
+    c: &mut FieldConstraints,
+    value: &str,
+    is_position: bool,
+) -> Result<(), String> {
+    if !is_position {
+        return Err("the `scope` constraint only applies to `position` fields".to_owned());
+    }
+    if !is_valid_ident(value) {
+        return Err(format!(
+            "position scope column '{value}' is not a valid snake_case identifier"
+        ));
+    }
+    c.scope = Some(value.to_owned());
+    Ok(())
+}
+
 /// Reject a `{encrypted}` modifier on any field kind the `#[encrypted]`
 /// attribute macro does not support (issue #1340).
 ///
@@ -1761,6 +1849,7 @@ fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
         }
         FieldKind::References => "label:col",
         FieldKind::Slug => "from:col",
+        FieldKind::Position => "scope:col",
         _ => "(none — this field type takes no constraint modifiers)",
     };
     format!(
@@ -1988,7 +2077,78 @@ pub fn parse_fields(tokens: &[String]) -> Result<Vec<Field>, GenerateError> {
         fields.push(field);
     }
     validate_slug_fields(tokens, &fields)?;
+    validate_position_fields(tokens, &fields)?;
     Ok(fields)
+}
+
+/// Cross-field validation for every `position`/`position{scope:...}` field in
+/// `fields` (issue #1358) — see [`parse_fields`]. Runs after every token has
+/// parsed individually, since `scope`'s target may be declared earlier OR
+/// later in the token list.
+fn validate_position_fields(tokens: &[String], fields: &[Field]) -> Result<(), GenerateError> {
+    let position_fields: Vec<(usize, &Field)> = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.kind.is_position())
+        .collect();
+    if let [(_, first), (second_idx, second), ..] = position_fields[..] {
+        return Err(GenerateError::InvalidField {
+            token: tokens[second_idx].clone(),
+            reason: format!(
+                "only one `position` field is supported per model — found both '{}' and '{}'",
+                first.name, second.name
+            ),
+        });
+    }
+    for (idx, position_field) in &position_fields {
+        let Some(scope) = position_field.constraints.scope.as_deref() else {
+            continue;
+        };
+        let token = tokens[*idx].clone();
+        let Some(source) = fields.iter().find(|f| f.name == scope) else {
+            return Err(GenerateError::InvalidField {
+                token,
+                reason: format!(
+                    "position field '{}' is scoped `scope:{scope}`, but no field named \
+                     '{scope}' is declared",
+                    position_field.name
+                ),
+            });
+        };
+        if !source.kind.is_reference() {
+            return Err(GenerateError::InvalidField {
+                token,
+                reason: format!(
+                    "position field '{}' is scoped `scope:{scope}`, but '{scope}' is a {} \
+                     field — position can only be scoped to a `references` foreign key",
+                    position_field.name,
+                    source.rust_type()
+                ),
+            });
+        }
+        // A nullable scope FK renders as `Option<i64>` at the Rust level,
+        // but the generated triggers/`move_to` compare the scope column via
+        // Postgres `hashtext(NEW."{scope}"::text)` / `"{scope}" = $1`
+        // equality, both of which are SQL-NULL-strict: a NULL scope value
+        // hashes to NULL (taking no advisory lock at all) and never equals
+        // itself in a `WHERE` filter, so every NULL-scoped row would
+        // silently get position 0 with no working compaction. Reject the
+        // combination outright rather than emit ordering that quietly
+        // breaks the moment a scope value is unset.
+        if source.nullable {
+            return Err(GenerateError::InvalidField {
+                token,
+                reason: format!(
+                    "position field '{}' is scoped `scope:{scope}`, but '{scope}' is nullable \
+                     (`Option<…>`) — a NULL scope value can't be locked or matched by the \
+                     generated triggers/`move_to`. Make '{scope}' non-nullable, or drop the \
+                     `references` field's `:null`.",
+                    position_field.name
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Cross-field validation for every `slug{from:...}` field in `fields`
@@ -2146,6 +2306,9 @@ fn atomic_type(ty: &str) -> Option<FieldKind> {
         // kind; there is no separate non-binary "json" storage distinction on
         // the Postgres side (the column is always `JSONB`).
         "json" | "Json" | "jsonb" | "Jsonb" => Some(FieldKind::Json),
+        // position (issue #1358): a server-managed contiguous ordering
+        // column, e.g. `rank:position` or `rank:position{scope:board_id}`.
+        "position" | "Position" => Some(FieldKind::Position),
         _ => {
             // Allow `Vec<u8>` as a synonym for `Bytea`.
             strip_wrapper(ty, "Vec").and_then(|inner| {
@@ -2630,6 +2793,74 @@ mod tests {
         let err = parse_fields(&tokens).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("slug"), "unexpected error: {msg}");
+    }
+
+    // ── position cross-field validation (issue #1358) ───────────────────────
+
+    #[test]
+    fn parse_fields_accepts_position_scoped_to_earlier_reference_field() {
+        let tokens = vec![
+            "board:references".into(),
+            "rank:position{scope:board_id}".into(),
+        ];
+        let fs = parse_fields(&tokens).unwrap();
+        assert_eq!(fs[1].constraints.scope.as_deref(), Some("board_id"));
+    }
+
+    #[test]
+    fn parse_fields_accepts_position_scoped_to_later_reference_field() {
+        // Declaration order shouldn't matter for the `scope` reference.
+        let tokens = vec![
+            "rank:position{scope:board_id}".into(),
+            "board:references".into(),
+        ];
+        assert!(parse_fields(&tokens).is_ok());
+    }
+
+    #[test]
+    fn parse_fields_rejects_position_scope_unknown_field() {
+        let tokens = vec!["rank:position{scope:board_id}".into()];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("board_id"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn parse_fields_rejects_position_scope_non_reference_field() {
+        let tokens = vec![
+            "board_id:i64".into(),
+            "rank:position{scope:board_id}".into(),
+        ];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("board_id"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn parse_fields_rejects_position_scope_nullable_reference_field() {
+        let tokens = vec![
+            "board:references?".into(),
+            "rank:position{scope:board_id}".into(),
+        ];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("board_id"), "unexpected error: {msg}");
+        assert!(msg.contains("nullable"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn parse_fields_rejects_more_than_one_position_field() {
+        let tokens = vec!["rank:position".into(), "rank2:position".into()];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("position"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn parse_fields_accepts_unscoped_position_field() {
+        let tokens = vec!["rank:position".into()];
+        let fs = parse_fields(&tokens).unwrap();
+        assert_eq!(fs[0].constraints.scope, None);
     }
 
     // ── RED: Attachment field kind ──────────────────────────────────────────
@@ -3472,6 +3703,88 @@ mod tests {
         let f = parse_field("email:String:unique").unwrap();
         assert!(f.unique);
         assert!(f.constraints.is_empty());
+    }
+
+    // ── `position` ordering field (issue #1358) ─────────────────────────────
+
+    #[test]
+    fn parse_position_field() {
+        let f = parse_field("rank:position").unwrap();
+        assert_eq!(f.name, "rank");
+        assert_eq!(f.kind, FieldKind::Position);
+        assert!(!f.nullable);
+        assert!(!f.unique);
+        assert_eq!(f.constraints.scope, None);
+        assert_eq!(f.rust_type(), "i64");
+        assert_eq!(f.sql_type(), "BIGINT");
+        assert_eq!(f.kind.sqlite_sql_type(), "INTEGER");
+    }
+
+    #[test]
+    fn parse_position_field_with_scope() {
+        let f = parse_field("rank:position{scope:board_id}").unwrap();
+        assert_eq!(f.kind, FieldKind::Position);
+        assert_eq!(f.constraints.scope.as_deref(), Some("board_id"));
+    }
+
+    #[test]
+    fn position_field_is_never_nullable() {
+        let err = parse_field("rank:Option<position>").unwrap_err();
+        assert!(
+            err.to_string().contains("position") && err.to_string().contains("nullable"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn position_field_rejects_unique_modifier() {
+        let err = parse_field("rank:position:unique").unwrap_err();
+        assert!(
+            err.to_string().contains("unique"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn scope_constraint_only_applies_to_position_fields() {
+        let err = parse_field("title:String{scope:board_id}").unwrap_err();
+        assert!(err.to_string().contains("scope"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn position_field_rejects_non_ident_scope_value() {
+        let err = parse_field("rank:position{scope:not a field}").unwrap_err();
+        assert!(err.to_string().contains("scope"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn position_field_rejects_empty_constraint_block() {
+        let err = parse_field("rank:position{}").unwrap_err();
+        assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn position_field_rejects_min_max_constraints() {
+        let err = parse_field("rank:position{min=0}").unwrap_err();
+        assert!(err.to_string().contains("min"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn position_field_accepts_pascal_case_token() {
+        let f = parse_field("rank:Position").unwrap();
+        assert_eq!(f.kind, FieldKind::Position);
+    }
+
+    #[test]
+    fn supported_types_documents_position() {
+        assert!(
+            SUPPORTED_TYPES.contains("position"),
+            "SUPPORTED_TYPES must list position"
+        );
+        assert!(
+            SQLITE_SUPPORTED_KINDS.contains("position"),
+            "SQLITE_SUPPORTED_KINDS must list position — it is a plain INTEGER column"
+        );
     }
 
     // ── `{encrypted}` at-rest column encryption (issue #1340) ───────────────

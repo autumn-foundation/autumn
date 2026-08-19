@@ -126,6 +126,78 @@ macro_rules! backend_select {
     };
 }
 
+/// Take the same transaction-scoped advisory lock the `position` (issue
+/// #1358) insert-assign/delete-compact triggers take, from generated
+/// `move_to`.
+///
+/// Closes a deadlock where `move_to`'s `SELECT ... FOR UPDATE ORDER BY id`
+/// row locks and a concurrent compaction trigger's `UPDATE ... WHERE
+/// position > $1` (which Postgres may satisfy via the `(scope, position)`
+/// index, i.e. **not** in `id` order) can lock the same rows in different
+/// orders.
+///
+/// `lock_name` is the literal `"{table}_{position}_assign"` string baked
+/// into the migration's trigger SQL (see
+/// `autumn-cli`'s `position_triggers_up_sql_for`); `scope` is the row's
+/// scope column value (`Some`) or `None` for an unscoped position column —
+/// mirroring the trigger's own `hashtext(NEW."{scope}"::text)` / literal
+/// `0` key2 exactly, so `move_to` and the triggers contend on the *same*
+/// advisory lock key and fully serialize against each other.
+///
+/// **Postgres**: takes `pg_advisory_xact_lock(hashtext(lock_name),
+/// hashtext(scope::text))` (or key2 `0` when unscoped) — released
+/// automatically at transaction end.
+/// **`SQLite`**: a no-op — `SQLite` has no advisory locks and no trigger
+/// counterpart takes one either; write-write correctness there rests on
+/// the database-level write lock `scoped_immediate_transaction` already
+/// acquires via `BEGIN IMMEDIATE`.
+///
+/// # Errors
+///
+/// Returns the underlying [`diesel::result::Error`] if the
+/// `pg_advisory_xact_lock` query fails (e.g. the connection was lost).
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+pub async fn position_advisory_lock(
+    conn: &mut crate::db::RuntimeConnection,
+    lock_name: &str,
+    scope: ::core::option::Option<i64>,
+) -> ::std::result::Result<(), diesel::result::Error> {
+    use crate::reexports::diesel_async::RunQueryDsl as _;
+    match scope {
+        ::core::option::Option::Some(scope_value) => {
+            diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+                .bind::<diesel::sql_types::Text, _>(lock_name)
+                .bind::<diesel::sql_types::Text, _>(scope_value.to_string())
+                .execute(conn)
+                .await?;
+        }
+        ::core::option::Option::None => {
+            diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1), 0)")
+                .bind::<diesel::sql_types::Text, _>(lock_name)
+                .execute(conn)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// `SQLite` arm of [`position_advisory_lock`] — a no-op. See the Postgres
+/// definition for the full contract.
+///
+/// # Errors
+///
+/// Never returns `Err` — kept `Result`-returning to match the Postgres
+/// arm's signature, since both are called from the same generated
+/// `move_to` body regardless of backend.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+pub async fn position_advisory_lock(
+    _conn: &mut crate::db::RuntimeConnection,
+    _lock_name: &str,
+    _scope: ::core::option::Option<i64>,
+) -> ::std::result::Result<(), diesel::result::Error> {
+    Ok(())
+}
+
 /// Where a generated repository routes its read-only methods (`find_by_id`,
 /// `find_all`, `count`, `paginate`, `cursor_page`, derived `find_by_*`,
 /// full-text-search reads, …).
