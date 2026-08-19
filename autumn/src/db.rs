@@ -2007,7 +2007,7 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// as `Unknown`. Worse: the wrapper type diesel-async uses to carry Postgres's
 /// error fields for an `Unknown`-kind error (`PostgresDbErrorWrapper`, private
 /// to diesel-async) implements only `DatabaseErrorInformation`, not
-/// `std::error::Error` — so [`source_chain_has_sqlstate`]'s downcast walk can
+/// `std::error::Error` — so `source_chain_has_sqlstate`'s downcast walk can
 /// **never** reach the real SQLSTATE for it; there is no structural path to a
 /// deadlock's code at all through this crate boundary. The only signal
 /// available is the message, so this checks it — but with an **exact**
