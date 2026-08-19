@@ -16,6 +16,8 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
+mod edge;
+mod edge_routes_macro;
 mod event;
 mod feature_flag;
 mod i18n;
@@ -923,6 +925,81 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn public(attr: TokenStream, item: TokenStream) -> TokenStream {
     public::public_macro(attr.into(), item.into()).into()
+}
+
+/// Declare a read-path route as eligible to run in the edge capsule (#1790).
+///
+/// `#[edge]` injects no runtime guard and does not rewrite the handler
+/// signature — it is a compile-time *marker*, like
+/// [`#[public]`](macro@public). The route macro reads it back and emits an
+/// extra `__autumn_edge_route_{name}()` companion returning an
+/// `autumn_edge::EdgeRoute`, while gating the native (`autumn_web`) companions
+/// behind `#[cfg(not(target_arch = "wasm32"))]` so the same handler source
+/// compiles for both the origin binary and the `wasm32-wasip1` capsule.
+/// Marking a handler makes it *eligible*; listing it in
+/// [`edge_routes!`](macro@edge_routes) is what puts it in the capsule.
+///
+/// # Forms
+///
+/// - `#[edge]` — the handler needs no platform seam
+/// - `#[edge(needs(kv))]` — the handler reads the edge key-value cache
+///   (`autumn_edge::EdgeCache`), which the host must provide; a request
+///   arriving at an edge without that capability falls through to the origin
+///
+/// # Restrictions
+///
+/// The edge lane is read-path only and carries no session, auth, or database
+/// state, so these are compile errors:
+///
+/// - a method other than `#[get]`;
+/// - combining with `#[secured]`, `#[authorize]`, `#[step_up]`, or
+///   `#[throttle]` (in either attribute order);
+/// - `#[static_get]` (already pre-rendered), `#[ws]`, or `#[oauth2_callback]`.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_edge::prelude::{EdgeCache, Path};
+/// use autumn_web::{edge, get};
+///
+/// #[get("/greet/{name}")]
+/// #[edge]
+/// async fn greet(name: Path<String>) -> String {
+///     format!("Hello, {name}!")
+/// }
+///
+/// #[get("/note/{id}")]
+/// #[edge(needs(kv))]
+/// async fn note(id: Path<String>, cache: EdgeCache) -> String {
+///     cache.get_string(&id).unwrap_or_else(|| "not cached".to_owned())
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn edge(attr: TokenStream, item: TokenStream) -> TokenStream {
+    edge::edge_macro(attr.into(), item.into()).into()
+}
+
+/// Collect `#[edge]` handlers into a `Vec<EdgeRoute>` (#1790).
+///
+/// The edge-lane counterpart of [`routes!`](macro@routes): each entry resolves
+/// to the handler's `__autumn_edge_route_{name}()` companion, so a handler that
+/// was never marked `#[edge]` fails to resolve rather than silently vanishing
+/// from the capsule.
+///
+/// ```ignore
+/// use autumn_web::{edge, edge_routes, get};
+///
+/// #[get("/greet")]
+/// #[edge]
+/// async fn greet() -> &'static str { "hi" }
+///
+/// pub fn edge_routes() -> Vec<autumn_edge::EdgeRoute> {
+///     edge_routes![greet]
+/// }
+/// ```
+#[proc_macro]
+pub fn edge_routes(input: TokenStream) -> TokenStream {
+    edge_routes_macro::edge_routes_macro(input.into()).into()
 }
 
 /// Require fresh ("step-up") authentication before a route handler runs.

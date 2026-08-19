@@ -53,6 +53,17 @@ pub fn route_macro(
         Err(err) => return err,
     };
 
+    // ── `#[edge]` opt-in (#1790) ────────────────────────────────
+    // Detected before any code is generated so an ineligible route fails with
+    // one purpose-written diagnostic instead of a wall of downstream type
+    // errors from the emitted edge companion.
+    let edge = crate::edge::detect(&input_fn);
+    if let Some(marking) = edge
+        && let Some(err) = reject_ineligible_edge_route(http_method, &input_fn, marking.span)
+    {
+        return err;
+    }
+
     let fn_name = &input_fn.sig.ident;
     let route_info_name = format_ident!("__autumn_route_info_{}", fn_name);
     let vis = &input_fn.vis;
@@ -140,6 +151,15 @@ pub fn route_macro(
         || fn_name.clone(),
         |_| format_ident!("__autumn_primitive_handler_{}", fn_name),
     );
+
+    // ── Edge lane codegen (#1790) ───────────────────────────────
+    // For an edge route every item that mentions `::autumn_web` is gated off
+    // the wasm32 target (autumn-web is never compiled for wasm), while the
+    // handler itself and the edge companion stay unconditional so one source
+    // file serves both the origin binary and the capsule. For every other
+    // route both values are empty and the expansion is unchanged.
+    let (native_cfg, edge_companion) = emit_edge_items(edge, fn_name, &handler_name, vis, &path);
+
     // ── OpenAPI metadata ────────────────────────────────────────
     let path_params = api_doc::extract_path_params(&path.value());
     let path_params_tokens = api_doc::emit_path_param_slice(&path_params);
@@ -198,6 +218,14 @@ pub fn route_macro(
 
     // ── Path helper ─────────────────────────────────────────────
     let path_helper = emit_path_helper(&path_helper_name, &path, &path_params);
+    // The alias re-exports the (possibly gated) helper, so it carries the same
+    // gate. An absent alias is an empty token stream — prefixing a `#[cfg]`
+    // onto nothing would emit a dangling attribute.
+    let fn_name_alias = if fn_name_alias.is_empty() {
+        fn_name_alias
+    } else {
+        quote! { #native_cfg #fn_name_alias }
+    };
 
     quote! {
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
@@ -206,6 +234,7 @@ pub fn route_macro(
         #input_fn
         #primitive_wrapper
 
+        #native_cfg
         #[doc(hidden)]
         #vis fn #route_info_name() -> ::autumn_web::Route {
             ::autumn_web::Route {
@@ -243,9 +272,106 @@ pub fn route_macro(
             }
         }
 
+        #native_cfg
         #path_helper
         #fn_name_alias
+
+        #edge_companion
     }
+}
+
+/// Compile error for `#[edge]` on a route the edge lane cannot serve.
+const EDGE_METHOD_ERROR: &str = "`#[edge]` is only supported on `#[get]` routes; \
+                                 the edge lane is read-path only (issue #1790)";
+
+/// Compile error for `#[edge]` stacked with an auth or rate guard.
+const EDGE_GUARD_ERROR: &str = "`#[edge]` cannot be combined with \
+                                `#[secured]`/`#[authorize]`/`#[step_up]`/`#[throttle]` — the edge \
+                                capsule has no session or auth state; serve this route from the \
+                                origin";
+
+/// Marker consts the auth/rate guards inject into a handler body. A guard that
+/// expanded *before* this route macro left one of these behind instead of an
+/// attribute, and missing it would ship a guarded route to the unauthenticated
+/// edge lane.
+const GUARD_MARKERS: &[&str] = &[
+    "__AUTUMN_SECURED_ROLES",
+    "__AUTUMN_SECURED_SCOPES",
+    "__AUTUMN_STEP_UP_MAX_AGE",
+    "__AUTUMN_THROTTLE_ROUTE_ID",
+    "__AUTUMN_AUTHORIZE_BINDINGS",
+];
+
+/// Reject an `#[edge]` route the edge lane cannot serve, spanning the error at
+/// the `#[edge]` attribute (or the handler name once it has expanded).
+fn reject_ineligible_edge_route(
+    http_method: &str,
+    input_fn: &syn::ItemFn,
+    span: Span,
+) -> Option<TokenStream> {
+    if http_method != "GET" {
+        return Some(syn::Error::new(span, EDGE_METHOD_ERROR).to_compile_error());
+    }
+    if has_auth_or_rate_guard(input_fn) {
+        return Some(syn::Error::new(span, EDGE_GUARD_ERROR).to_compile_error());
+    }
+    None
+}
+
+/// Whether an auth or rate guard is declared on the handler, in either
+/// attribute order: still a live attribute, or already expanded into the marker
+/// const it injects.
+fn has_auth_or_rate_guard(input_fn: &syn::ItemFn) -> bool {
+    has_secured_attr(input_fn)
+        || has_authorize_attr(input_fn)
+        || has_step_up_guard(input_fn)
+        || has_throttle_guard(input_fn)
+        || GUARD_MARKERS
+            .iter()
+            .any(|marker| crate::edge::stmts_have_marker(&input_fn.block.stmts, marker))
+}
+
+/// Build the wasm32 gate and the edge companion for an `#[edge]` route.
+///
+/// Returns two empty token streams for every other route, which keeps the
+/// expansion of a non-edge route byte-identical to what it was before the edge
+/// lane existed.
+fn emit_edge_items(
+    edge: Option<crate::edge::EdgeMarking>,
+    fn_name: &proc_macro2::Ident,
+    handler_name: &proc_macro2::Ident,
+    vis: &syn::Visibility,
+    path: &LitStr,
+) -> (TokenStream, TokenStream) {
+    let Some(marking) = edge else {
+        return (TokenStream::new(), TokenStream::new());
+    };
+
+    let needs = if marking.needs_kv {
+        quote! { &[::autumn_edge::EdgeCapability::Kv] }
+    } else {
+        quote! { &[] }
+    };
+    let edge_route_name = format_ident!("__autumn_edge_route_{}", fn_name);
+
+    (
+        quote! { #[cfg(not(target_arch = "wasm32"))] },
+        quote! {
+            #[doc(hidden)]
+            #vis fn #edge_route_name() -> ::autumn_edge::EdgeRoute {
+                ::autumn_edge::EdgeRoute {
+                    method: ::autumn_edge::reexports::http::Method::GET,
+                    path: #path,
+                    // The same handler axum mounts natively — including the
+                    // primitive-output wrapper when there is one — so the two
+                    // lanes cannot diverge on how a response is produced.
+                    handler: ::autumn_edge::edge_get(#handler_name),
+                    name: ::core::stringify!(#fn_name),
+                    needs: #needs,
+                }
+            }
+        },
+    )
 }
 
 /// Build the axum handler expression, applying interceptor layers in reverse
@@ -1254,6 +1380,446 @@ mod tests {
             update < publish,
             "the marker comes from the attribute above the route macro, so it precedes the \
              live attribute below it in source order: {generated}"
+        );
+    }
+
+    // ── `#[edge]` opt-in (#1790) ────────────────────────────────────────────
+
+    /// The edge companion is emitted last, so everything from its `fn` keyword
+    /// to the end of the stream *is* the companion. Comparing that slice across
+    /// two attribute stackings proves detection produced the same route, not
+    /// merely that both stackings emitted *something*.
+    fn edge_companion_fragment(generated: &str) -> &str {
+        let start = generated
+            .find("fn __autumn_edge_route_")
+            .unwrap_or_else(|| panic!("expansion should emit an edge companion: {generated}"));
+        &generated[start..]
+    }
+
+    #[test]
+    fn route_macro_edge_get_emits_edge_companion() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/greet" },
+            quote! {
+                #[edge]
+                async fn greet() -> &'static str { "hi" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("fn __autumn_edge_route_greet () -> :: autumn_edge :: EdgeRoute"),
+            "an #[edge] GET route must emit the edge companion: {generated}"
+        );
+        assert!(
+            generated.contains(":: autumn_edge :: edge_get (greet)"),
+            "the edge companion must adapt the handler through edge_get: {generated}"
+        );
+        assert!(
+            generated.contains(":: autumn_edge :: reexports :: http :: Method :: GET"),
+            "the edge companion must carry the GET method: {generated}"
+        );
+        assert!(
+            generated.contains("path : \"/greet\""),
+            "the edge companion must carry the route path: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_companion_mounts_the_primitive_wrapper() {
+        // A primitive-returning handler is mounted natively through a
+        // `.to_string()` wrapper (primitives are not `IntoResponse`). The edge
+        // companion must mount the *same* wrapper, or the two lanes would
+        // disagree about what the response body is — and `edge_get(stats)`
+        // would not even compile.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/stats" },
+            quote! {
+                #[edge]
+                async fn stats() -> usize { 42 }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(":: autumn_edge :: edge_get (__autumn_primitive_handler_stats)"),
+            "the edge companion must mount the primitive wrapper: {generated}"
+        );
+        // …and that wrapper is pure std, so it stays available on wasm32.
+        let wrapper = generated
+            .find("async fn __autumn_primitive_handler_stats")
+            .unwrap_or_else(|| panic!("the primitive wrapper must be emitted: {generated}"));
+        assert!(
+            !generated[..wrapper].contains("cfg"),
+            "the primitive wrapper references no autumn_web item, so it is not gated: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_cfg_gates_native_companions() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/posts/{id}" },
+            quote! {
+                #[edge]
+                async fn show(id: Path<String>) -> &'static str { "post" }
+            },
+        )
+        .to_string();
+
+        // Native companions reference `::autumn_web`, which never compiles for
+        // wasm32 — they must be gated off the edge target.
+        let gate = "# [cfg (not (target_arch = \"wasm32\"))]";
+        assert!(
+            generated.contains(&format!(
+                "{gate} # [doc (hidden)] fn __autumn_route_info_show"
+            )),
+            "the route-info companion must be gated off wasm32: {generated}"
+        );
+        assert!(
+            generated.contains(&format!(
+                "{gate} # [doc (hidden)] pub fn __autumn_path_show"
+            )),
+            "the path helper must be gated too — it calls ::autumn_web::paths: {generated}"
+        );
+        assert_eq!(
+            generated.matches(gate).count(),
+            2,
+            "exactly the two native companions are gated: {generated}"
+        );
+        // The handler itself and the edge companion stay unconditional.
+        assert!(
+            !edge_companion_fragment(&generated).contains("cfg"),
+            "the edge companion must not be gated: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_gates_the_path_helper_alias() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/greet", name = "greeting" },
+            quote! {
+                #[edge]
+                async fn greet() -> &'static str { "hi" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(
+                "# [cfg (not (target_arch = \"wasm32\"))] # [doc (hidden)] \
+                 pub use self :: __autumn_path_greeting as __autumn_path_greet ;"
+            ),
+            "the alias re-exports a gated helper, so it must be gated too: {generated}"
+        );
+        assert_eq!(
+            generated
+                .matches("# [cfg (not (target_arch = \"wasm32\"))]")
+                .count(),
+            3,
+            "route info + path helper + alias are all native-only: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_detection_is_identical_for_both_attribute_orders() {
+        // Ordering A: `#[get]` outermost, `#[edge]` still a live attribute.
+        let below = route_macro(
+            "GET",
+            "get",
+            quote! { "/greet" },
+            quote! {
+                #[edge]
+                async fn greet() -> &'static str { "hi" }
+            },
+        )
+        .to_string();
+
+        // Ordering B: `#[edge]` above `#[get]`, so it expanded first and left
+        // only the `__AUTUMN_EDGE` marker in the body.
+        let edged = crate::edge::edge_macro(
+            quote! {},
+            quote! { async fn greet() -> &'static str { "hi" } },
+        );
+        let above = route_macro("GET", "get", quote! { "/greet" }, edged).to_string();
+
+        assert_eq!(
+            edge_companion_fragment(&below),
+            edge_companion_fragment(&above),
+            "both stacking orders must produce the same edge route"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_needs_kv_populates_the_needs_slice() {
+        let edged = crate::edge::edge_macro(
+            quote! { needs(kv) },
+            quote! { async fn note() -> &'static str { "note" } },
+        );
+        let generated = route_macro("GET", "get", quote! { "/note" }, edged).to_string();
+
+        assert!(
+            generated.contains("needs : & [:: autumn_edge :: EdgeCapability :: Kv]"),
+            "needs(kv) must declare the Kv capability on the edge route: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_needs_kv_is_read_from_a_live_attribute_too() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/note" },
+            quote! {
+                #[edge(needs(kv))]
+                async fn note() -> &'static str { "note" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("needs : & [:: autumn_edge :: EdgeCapability :: Kv]"),
+            "a live #[edge(needs(kv))] attribute must declare the capability: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_without_needs_declares_no_capabilities() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/greet" },
+            quote! {
+                #[edge]
+                async fn greet() -> &'static str { "hi" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("needs : & []"),
+            "a bare #[edge] route must declare no capabilities: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_non_edge_expansion_is_untouched() {
+        // The edge work must be inert for every route that did not opt in:
+        // no cfg attribute, no edge companion, nothing.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/posts/{id}", name = "post_page" },
+            quote! {
+                async fn show(id: Path<String>) -> &'static str { "post" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("cfg"),
+            "a non-edge route must not gain a cfg attribute: {generated}"
+        );
+        assert!(
+            !generated.contains("__autumn_edge_route_"),
+            "a non-edge route must not gain an edge companion: {generated}"
+        );
+        assert!(
+            !generated.contains("autumn_edge"),
+            "a non-edge route must not reference autumn_edge at all: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_on_post_is_a_compile_error() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/items" },
+            quote! {
+                #[edge]
+                async fn create_item() -> &'static str { "created" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "#[edge] on a write-path route must be rejected: {generated}"
+        );
+        assert!(
+            generated.contains("only supported on"),
+            "the error must say the edge lane is GET-only: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_with_secured_attribute_is_a_compile_error() {
+        // Ordering A: both guards still live attributes below `#[get]`.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/dashboard" },
+            quote! {
+                #[edge]
+                #[secured]
+                async fn dashboard() -> &'static str { "dash" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "#[edge] + #[secured] must be rejected: {generated}"
+        );
+        assert!(
+            generated.contains("no session or auth state"),
+            "the error must explain why the edge lane cannot authenticate: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_with_expanded_secured_marker_is_a_compile_error() {
+        // Ordering B: `#[secured]` above `#[get]` (already expanded into
+        // markers), `#[edge]` still a live attribute below it.
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! {
+                #[edge]
+                async fn dashboard() -> &'static str { "dash" }
+            },
+        );
+        let generated = route_macro("GET", "get", quote! { "/dashboard" }, secured).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "an already-expanded #[secured] must still be detected: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_marker_buried_under_secured_wrapper_is_a_compile_error() {
+        // `#[edge]` above `#[secured]` above `#[get]`: edge expands first, then
+        // secured buries its marker inside `(async move { … }).await`. Losing
+        // the marker here would silently ship an authenticated route to the
+        // edge lane.
+        let edged = crate::edge::edge_macro(
+            quote! {},
+            quote! { async fn dashboard() -> &'static str { "dash" } },
+        );
+        let secured = crate::secured::secured_macro(quote! { "admin" }, edged);
+        let generated = route_macro("GET", "get", quote! { "/dashboard" }, secured).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a buried #[edge] marker must still be detected next to #[secured]: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_with_throttle_is_a_compile_error() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/search" },
+            quote! {
+                #[edge]
+                #[throttle(limit = 1, per = "60s", key = "ip")]
+                async fn search() -> &'static str { "results" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "#[edge] + #[throttle] must be rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_with_expanded_throttle_marker_is_a_compile_error() {
+        let throttled = crate::throttle::throttle_macro(
+            quote! { limit = 1, per = "60s", key = "ip" },
+            quote! {
+                #[edge]
+                async fn search() -> &'static str { "results" }
+            },
+        );
+        let generated = route_macro("GET", "get", quote! { "/search" }, throttled).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "an already-expanded #[throttle] must still be detected: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_with_step_up_is_a_compile_error() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/vault" },
+            quote! {
+                #[edge]
+                #[step_up]
+                async fn vault() -> &'static str { "secrets" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "#[edge] + #[step_up] must be rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_with_authorize_is_a_compile_error() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/notes/{id}" },
+            quote! {
+                #[edge]
+                #[authorize("read", resource = Note)]
+                async fn show_note(note: Note) -> &'static str { "note" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "#[edge] + #[authorize] must be rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_string_literal_edge_marker_is_not_an_edge_route() {
+        // Handler *text* that merely spells the marker const must not opt the
+        // route into the edge lane: the marker is decoded structurally.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/greet" },
+            quote! {
+                async fn greet() -> &'static str {
+                    let _ = "const __AUTUMN_EDGE: () = ();";
+                    "hi"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("__autumn_edge_route_"),
+            "a string literal must not be mistaken for the edge marker: {generated}"
         );
     }
 

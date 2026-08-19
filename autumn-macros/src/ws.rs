@@ -74,6 +74,17 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     if let Some(err) = reject_seo_argument(&attr) {
         return err;
     }
+    // `#[ws]` is not a `route_macro` path, so an `#[edge]` marker would sit
+    // inertly in the handler body and the author would believe the socket was
+    // edge-eligible. Say no instead (#1790).
+    if let Some(err) = crate::edge::reject_if_edge(
+        &item,
+        "`#[edge]` cannot be combined with `#[ws]`: a WebSocket upgrade holds a live \
+         connection against origin state, which the edge capsule has no way to serve. \
+         Serve this route from the origin.",
+    ) {
+        return err;
+    }
     let path = match parse::parse_route_path(attr) {
         Ok(p) => p,
         Err(err) => return err,
@@ -294,6 +305,44 @@ mod tests {
         assert!(
             generated.contains("does not accept a `seo(...)` argument"),
             "the error must explain why #[ws] rejects it: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_a_live_edge_attribute() {
+        // A socket cannot be served from the edge capsule. Without this the
+        // `#[edge]` marker would sit inertly in the body and the author would
+        // believe the route was edge-eligible (#1790).
+        let generated = ws_macro(
+            quote! { "/live" },
+            quote! {
+                #[edge]
+                async fn live() -> impl WsHandler { |socket| async move {} }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "#[edge] on a #[ws] route must be rejected: {generated}"
+        );
+        assert!(
+            generated.contains("WebSocket"),
+            "the error must explain why a socket cannot run at the edge: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_an_expanded_edge_marker() {
+        let edged = crate::edge::edge_macro(
+            quote! {},
+            quote! { async fn live() -> impl WsHandler { |socket| async move {} } },
+        );
+        let generated = ws_macro(quote! { "/live" }, edged).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "an already-expanded #[edge] must be rejected on #[ws] too: {generated}"
         );
     }
 
