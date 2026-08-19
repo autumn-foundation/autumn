@@ -8,12 +8,21 @@
 //!    fingerprinted URLs when pre-rendering HTML pages.
 //! 3. Run the binary with `AUTUMN_BUILD_STATIC=1` so the runtime renders
 //!    static routes to `dist/` instead of starting the HTTP server.
+//!
+//! Projects with `#[edge]` routes (issue #1790) get a fourth step between 2 and
+//! 3: a second `cargo build --target wasm32-wasip1 --release --bin edge-capsule`
+//! that emits the portable edge artifact. It sits *before* the static renderer
+//! so a project without `#[static_get]` routes still gets its capsule, and the
+//! `.wasm` is never copied into `dist/` or `static/` — it is a deploy artifact
+//! for the edge host, not a served asset.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
+
+use crate::edge_scan::{EdgeFn, EdgeScan};
 
 /// Build the `cargo build` command for the static pipeline.
 ///
@@ -56,6 +65,310 @@ fn build_cargo_command(
         (false, None) => {}
     }
     cargo
+}
+
+// ── Edge capsule (issue #1790) ───────────────────────────────────────────────
+
+/// The WASI target the edge capsule is compiled for.
+pub const EDGE_TARGET: &str = "wasm32-wasip1";
+
+/// Convention name of the `[[bin]]` target that hosts the edge capsule, and of
+/// the source file that declares it.
+const EDGE_BIN: &str = "edge-capsule";
+
+/// `--edge` was passed but the project has no edge routes to compile.
+const EDGE_NO_ROUTES_ERROR: &str =
+    "no #[edge] routes found; add #[edge] to a GET handler and register it with edge_routes![]";
+
+/// `--embed` bakes assets into the *native* binary and returns early; the edge
+/// lane has no equivalent in the first slice.
+const EDGE_EMBED_ERROR: &str =
+    "edge capsule build is not yet supported with --embed (issue #1790 first slice)";
+
+/// Remediation for a missing WASI target, quoted verbatim by doctor's
+/// `edge_target` check.
+pub const EDGE_TARGET_HINT: &str = "Run `rustup target add wasm32-wasip1`";
+
+/// What the edge step should do for one `autumn build` invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgePlan {
+    /// No edge routes (or an embed build without any): do nothing.
+    Skip,
+    /// Edge routes exist but this is a plain `--debug` build: print a note.
+    SkipDebug,
+    /// Compile the capsule.
+    Build,
+}
+
+/// Decide whether this invocation builds an edge capsule.
+///
+/// Pure so the whole flag matrix is unit-tested; `run` performs the printing and
+/// the exit. Evaluated **before** the native `cargo build` so a flag conflict
+/// costs milliseconds instead of a full compile.
+// Four booleans is exactly the decision table this function encodes; folding
+// them into a struct would only move the same four flags behind a
+// `struct_excessive_bools` allow.
+#[allow(clippy::fn_params_excessive_bools)]
+pub const fn plan_edge_step(
+    has_edge_routes: bool,
+    edge_flag: bool,
+    embed: bool,
+    debug: bool,
+) -> Result<EdgePlan, &'static str> {
+    if edge_flag && !has_edge_routes {
+        return Err(EDGE_NO_ROUTES_ERROR);
+    }
+    if !has_edge_routes {
+        return Ok(EdgePlan::Skip);
+    }
+    if embed {
+        return Err(EDGE_EMBED_ERROR);
+    }
+    if debug && !edge_flag {
+        return Ok(EdgePlan::SkipDebug);
+    }
+    Ok(EdgePlan::Build)
+}
+
+/// Build the `cargo build` command for the edge capsule.
+///
+/// Always `--release`: the capsule is a deploy artifact whose size and
+/// determinism matter, and a debug wasm build is neither smaller nor faster to
+/// iterate on. `--bin edge-capsule` selects the app's capsule entrypoint.
+fn build_edge_cargo_command(package: Option<&str>) -> Command {
+    let mut cargo = Command::new("cargo");
+    cargo.arg("build");
+    cargo.args(["--target", EDGE_TARGET]);
+    cargo.arg("--release");
+    cargo.args(["--bin", EDGE_BIN]);
+    if let Some(pkg) = package {
+        cargo.args(["-p", pkg]);
+    }
+    cargo
+}
+
+/// Grade the `rustc --print target-libdir --target wasm32-wasip1` probe.
+///
+/// `rustc` happily prints the libdir path for *any* known triple whether or not
+/// its standard library is installed, so a successful exit proves nothing on its
+/// own — the directory has to exist. Pure half of [`edge_target_installed`].
+pub const fn edge_target_installed_from_probe(probe_ok: bool, libdir_exists: bool) -> bool {
+    probe_ok && libdir_exists
+}
+
+/// Grade `rustup target list --installed` output — the fallback probe for
+/// toolchains where the `rustc` call cannot run.
+pub fn rustup_list_has_edge_target(stdout: &str) -> bool {
+    stdout.lines().any(|line| line.trim() == EDGE_TARGET)
+}
+
+/// Whether the `wasm32-wasip1` standard library is installed for the active
+/// toolchain. I/O half: runs `rustc`, falling back to `rustup` when `rustc`
+/// cannot be spawned.
+pub fn edge_target_installed() -> bool {
+    if let Ok(out) = Command::new("rustc")
+        .args(["--print", "target-libdir", "--target", EDGE_TARGET])
+        .output()
+    {
+        let libdir = String::from_utf8_lossy(&out.stdout);
+        return edge_target_installed_from_probe(
+            out.status.success(),
+            Path::new(libdir.trim()).is_dir(),
+        );
+    }
+    Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .is_ok_and(|out| {
+            out.status.success()
+                && rustup_list_has_edge_target(&String::from_utf8_lossy(&out.stdout))
+        })
+}
+
+/// The resolved edge-capsule bin target of the selected package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeCapsuleTarget {
+    /// `<target_directory>/wasm32-wasip1/release/edge-capsule.wasm`.
+    pub artifact: PathBuf,
+    /// Name of the package that owns the bin target.
+    pub package: String,
+}
+
+/// The exact `src/bin/edge-capsule.rs` an app needs, as printed by the
+/// missing-target error. `krate` is the package name in `use` form.
+fn edge_bin_snippet(krate: &str) -> String {
+    format!("fn main() {{\n    autumn_edge::serve({krate}::handlers::edge_routes());\n}}")
+}
+
+/// Locate the `edge-capsule` bin target in `cargo metadata` output.
+///
+/// Mirrors [`resolve_binary_from_metadata`]'s package selection (`-p <pkg>`, else
+/// every package whose manifest lives under the CWD) and works on the same JSON,
+/// so both resolvers agree about which package a build refers to.
+fn resolve_edge_capsule_from_metadata(
+    metadata: &serde_json::Value,
+    package: Option<&str>,
+    cwd: &Path,
+) -> Result<EdgeCapsuleTarget, String> {
+    let target_dir = metadata["target_directory"]
+        .as_str()
+        .ok_or("target_directory missing from cargo metadata")?;
+    let packages = metadata["packages"]
+        .as_array()
+        .ok_or("packages missing from cargo metadata")?;
+
+    let matching: Vec<_> = package.map_or_else(
+        || {
+            packages
+                .iter()
+                .filter(|pkg| {
+                    pkg["manifest_path"]
+                        .as_str()
+                        .and_then(|manifest| Path::new(manifest).parent())
+                        .is_some_and(|dir| dir.starts_with(cwd))
+                })
+                .collect()
+        },
+        |pkg_name| {
+            packages
+                .iter()
+                .filter(|pkg| pkg["name"].as_str() == Some(pkg_name))
+                .collect()
+        },
+    );
+
+    let owner = matching
+        .iter()
+        .find(|pkg| pkg_owns_bin(pkg, EDGE_BIN))
+        .and_then(|pkg| pkg["name"].as_str());
+
+    let Some(owner) = owner else {
+        // Name the package we *did* select so the author knows where the file
+        // goes, and print the file itself — this is the whole wiring.
+        let krate = matching
+            .first()
+            .and_then(|pkg| pkg["name"].as_str())
+            .or(package)
+            .unwrap_or("your_crate")
+            .replace('-', "_");
+        return Err(format!(
+            "this project has #[edge] routes but no `{EDGE_BIN}` binary target.\n\
+             Create src/bin/{EDGE_BIN}.rs:\n\n{}\n\n\
+             and declare `[[bin]] name = \"{EDGE_BIN}\"` if your package needs it.",
+            edge_bin_snippet(&krate)
+        ));
+    };
+
+    let mut artifact = PathBuf::from(target_dir);
+    artifact.push(EDGE_TARGET);
+    artifact.push("release");
+    artifact.push(format!("{EDGE_BIN}.wasm"));
+
+    Ok(EdgeCapsuleTarget {
+        artifact,
+        package: owner.to_owned(),
+    })
+}
+
+/// The `#[edge]` handlers that no `edge_routes![]` registers, formatted as a
+/// warning. Registering a handler that is *not* marked is not reported: it is a
+/// compile error (no `__autumn_edge_route_*` companion exists to collect).
+fn format_unregistered_warning(unregistered: &[&EdgeFn]) -> String {
+    let list = unregistered
+        .iter()
+        .map(|f| f.location())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\u{26A0} {} #[edge] handler(s) are not registered and will not be served at the edge: {list}\n  \
+         Add them to edge_routes![] in the list passed to autumn_edge::serve().",
+        unregistered.len()
+    )
+}
+
+/// The success line printed after the capsule compiles.
+fn format_edge_success(names: &[&str], artifact: &Path, size_bytes: Option<u64>) -> String {
+    let size = size_bytes.map_or_else(
+        || "size unknown".to_owned(),
+        |bytes| format!("{} KB", bytes.div_ceil(1024)),
+    );
+    format!(
+        "\u{1F342} Edge capsule: {} route(s) ({}) \u{2192} {} ({size})",
+        names.len(),
+        names.join(", "),
+        artifact.display(),
+    )
+}
+
+/// Compile the edge capsule: validate registrations, preflight the WASI target,
+/// resolve the bin target, run cargo, report the artifact.
+///
+/// Every failure exits 1 with a message that names the exact next action.
+fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>) {
+    let served: Vec<&str> = scan
+        .registered_fns()
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    if served.is_empty() {
+        eprintln!(
+            "\n\u{2717} found {} #[edge] handler(s) but none are registered with edge_routes![]; \
+             the capsule would serve nothing.\n  \
+             Register them (`edge_routes![{}]`) and pass the result to autumn_edge::serve() in \
+             src/bin/{EDGE_BIN}.rs.",
+            scan.functions.len(),
+            scan.names().join(", "),
+        );
+        std::process::exit(1);
+    }
+
+    let unregistered = scan.unregistered();
+    if !unregistered.is_empty() {
+        eprintln!("\n{}", format_unregistered_warning(&unregistered));
+    }
+
+    if !edge_target_installed() {
+        eprintln!(
+            "\n\u{2717} the `{EDGE_TARGET}` target is not installed, so the edge capsule cannot be \
+             compiled.\n  {EDGE_TARGET_HINT}"
+        );
+        std::process::exit(1);
+    }
+
+    let metadata = read_cargo_metadata();
+    let cwd = std::env::current_dir().expect("current dir");
+    let capsule =
+        resolve_edge_capsule_from_metadata(&metadata, package, &cwd).unwrap_or_else(|error| {
+            eprintln!("\n\u{2717} {error}");
+            std::process::exit(1);
+        });
+
+    eprintln!("\nCompiling edge capsule ({EDGE_TARGET}, release profile)...");
+    run_cargo_or_exit(build_edge_cargo_command(
+        package.or(Some(capsule.package.as_str())),
+    ));
+
+    let size = std::fs::metadata(&capsule.artifact).ok().map(|m| m.len());
+    eprintln!(
+        "\n{}",
+        format_edge_success(&served, &capsule.artifact, size)
+    );
+}
+
+/// Scan the project's sources for `#[edge]` routes.
+///
+/// Reads `<project>/src/**/*.rs` only — no cargo invocation — so it runs before
+/// anything is compiled. `-p`/`--bin` can select a workspace member whose
+/// sources live elsewhere, so those (and only those) cost one extra
+/// `cargo metadata --no-deps` read to find the member's directory.
+fn resolve_project_edge_scan(debug: bool, package: Option<&str>, bin: Option<&str>) -> EdgeScan {
+    let cwd = std::env::current_dir().expect("current dir");
+    let root = if package.is_some() || bin.is_some() {
+        find_binary(debug, package, bin).1.unwrap_or(cwd)
+    } else {
+        cwd
+    };
+    crate::edge_scan::resolve_edge_scan(&root)
 }
 
 /// Run a cargo command, exiting the process on failure.
@@ -153,6 +466,7 @@ fn apply_renderer_env(
 pub fn run(
     debug: bool,
     embed: bool,
+    edge: bool,
     package: Option<&str>,
     bin: Option<&str>,
     features: Option<&str>,
@@ -160,6 +474,25 @@ pub fn run(
     eprintln!("\u{1F342} autumn build\n");
 
     let profile = if debug { "dev" } else { "release" };
+
+    // ── Edge preflight (issue #1790) ─────────────────────────────────────────
+    // Deliberately BEFORE any cargo invocation: the scan is pure source reading,
+    // so a flag/scan conflict (`--edge` with nothing to compile, `--embed` with
+    // edge routes) is reported in milliseconds instead of after a full native
+    // build. The capsule itself is compiled much later — after the native build
+    // and fingerprinting — by `run_edge_capsule_build`.
+    let edge_scan = resolve_project_edge_scan(debug, package, bin);
+    let plan = plan_edge_step(!edge_scan.is_empty(), edge, embed, debug).unwrap_or_else(|error| {
+        eprintln!("\u{2717} {error}");
+        std::process::exit(1);
+    });
+    if plan == EdgePlan::SkipDebug {
+        eprintln!(
+            "note: {} #[edge] route(s) found; skipping the edge capsule in a debug build \
+             (pass --edge to build it)\n",
+            edge_scan.functions.len()
+        );
+    }
 
     // Embedding produces a self-contained release binary; it is not static-site
     // generation, so it skips the static renderer (which requires `#[static_get]`
@@ -189,6 +522,15 @@ pub fn run(
         );
         fingerprint_assets_in(&static_dir);
     }
+
+    // The edge capsule is built after the native binary and the fingerprint pass
+    // but INDEPENDENTLY of the static renderer below: an app with `#[edge]`
+    // routes and no `#[static_get]` routes must still get its capsule, and a
+    // static-render failure must not silently drop it.
+    if plan == EdgePlan::Build {
+        run_edge_capsule_build(&edge_scan, package);
+    }
+
     eprintln!("\nRunning static renderer...\n");
 
     let mut cmd = Command::new(&binary);
@@ -408,6 +750,19 @@ fn find_binary(
     package: Option<&str>,
     bin: Option<&str>,
 ) -> (PathBuf, Option<PathBuf>, Option<String>) {
+    let metadata = read_cargo_metadata();
+    let cwd = std::env::current_dir().expect("current dir");
+
+    resolve_binary_from_metadata(&metadata, debug, package, bin, &cwd).unwrap_or_else(|error| {
+        eprintln!("\u{2717} {error}");
+        std::process::exit(1);
+    })
+}
+
+/// Read `cargo metadata --no-deps` once, exiting with a clear message when the
+/// project's manifest cannot be read. Shared by the binary and edge-capsule
+/// target resolvers so both see the same workspace view.
+fn read_cargo_metadata() -> serde_json::Value {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
@@ -418,14 +773,7 @@ fn find_binary(
         std::process::exit(1);
     }
 
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("parse cargo metadata");
-    let cwd = std::env::current_dir().expect("current dir");
-
-    resolve_binary_from_metadata(&metadata, debug, package, bin, &cwd).unwrap_or_else(|error| {
-        eprintln!("\u{2717} {error}");
-        std::process::exit(1);
-    })
+    serde_json::from_slice(&output.stdout).expect("parse cargo metadata")
 }
 
 /// Return `true` when `pkg`'s target list contains a binary named `bin_name`.
@@ -642,6 +990,203 @@ mod tests {
             "--bin must be forwarded to cargo: {args:?}"
         );
         assert!(args.windows(2).any(|w| w == ["-p", "blog"]));
+    }
+
+    // ── Edge capsule (issue #1790) ───────────────────────────────────────────
+
+    fn edge_cargo_args(package: Option<&str>) -> Vec<String> {
+        build_edge_cargo_command(package)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn edge_cargo_command_targets_wasi_release_capsule_bin() {
+        let args = edge_cargo_args(None);
+        assert_eq!(
+            args,
+            vec![
+                "build",
+                "--target",
+                "wasm32-wasip1",
+                "--release",
+                "--bin",
+                "edge-capsule"
+            ],
+            "edge build must target wasm32-wasip1 in release: {args:?}"
+        );
+    }
+
+    #[test]
+    fn edge_cargo_command_forwards_package() {
+        let args = edge_cargo_args(Some("blog"));
+        assert!(args.windows(2).any(|w| w == ["-p", "blog"]), "{args:?}");
+        assert!(
+            args.windows(2).any(|w| w == ["--bin", "edge-capsule"]),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn edge_target_probe_requires_the_libdir_to_exist() {
+        // `rustc --print target-libdir` prints a path for any *known* triple,
+        // installed or not — only the directory's existence proves the std
+        // library is there.
+        assert!(edge_target_installed_from_probe(true, true));
+        assert!(!edge_target_installed_from_probe(true, false));
+        assert!(!edge_target_installed_from_probe(false, true));
+    }
+
+    #[test]
+    fn rustup_installed_list_is_parsed() {
+        assert!(rustup_list_has_edge_target(
+            "wasm32-wasip1\nx86_64-unknown-linux-gnu\n"
+        ));
+        assert!(!rustup_list_has_edge_target("x86_64-unknown-linux-gnu\n"));
+        // A near-miss triple must not count.
+        assert!(!rustup_list_has_edge_target("wasm32-wasip2\n"));
+    }
+
+    #[test]
+    fn edge_plan_release_build_with_routes_compiles_capsule() {
+        assert_eq!(
+            plan_edge_step(true, false, false, false),
+            Ok(EdgePlan::Build)
+        );
+    }
+
+    #[test]
+    fn edge_plan_debug_build_skips_with_a_note_unless_flagged() {
+        assert_eq!(
+            plan_edge_step(true, false, false, true),
+            Ok(EdgePlan::SkipDebug)
+        );
+        assert_eq!(plan_edge_step(true, true, false, true), Ok(EdgePlan::Build));
+    }
+
+    #[test]
+    fn edge_plan_without_routes_skips_silently() {
+        assert_eq!(
+            plan_edge_step(false, false, false, false),
+            Ok(EdgePlan::Skip)
+        );
+        assert_eq!(
+            plan_edge_step(false, false, true, false),
+            Ok(EdgePlan::Skip)
+        );
+    }
+
+    #[test]
+    fn edge_plan_flag_without_routes_is_an_actionable_error() {
+        assert_eq!(
+            plan_edge_step(false, true, false, false),
+            Err(EDGE_NO_ROUTES_ERROR)
+        );
+        assert!(EDGE_NO_ROUTES_ERROR.contains("edge_routes![]"));
+    }
+
+    #[test]
+    fn edge_plan_refuses_embed_with_edge_routes() {
+        assert_eq!(
+            plan_edge_step(true, false, true, false),
+            Err(EDGE_EMBED_ERROR)
+        );
+        assert_eq!(
+            plan_edge_step(true, true, true, false),
+            Err(EDGE_EMBED_ERROR)
+        );
+        assert!(EDGE_EMBED_ERROR.contains("--embed"));
+        assert!(EDGE_EMBED_ERROR.contains("#1790"));
+    }
+
+    fn capsule_metadata(with_capsule_bin: bool) -> serde_json::Value {
+        let mut targets = vec![serde_json::json!({"name": "blog", "kind": ["bin"]})];
+        if with_capsule_bin {
+            targets.push(serde_json::json!({"name": "edge-capsule", "kind": ["bin"]}));
+        }
+        serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "blog",
+                "manifest_path": "/projects/blog/Cargo.toml",
+                "targets": targets,
+            }]
+        })
+    }
+
+    #[test]
+    fn resolve_edge_capsule_points_at_the_wasm_artifact() {
+        let capsule = resolve_edge_capsule_from_metadata(
+            &capsule_metadata(true),
+            Some("blog"),
+            Path::new("/projects"),
+        )
+        .unwrap();
+        assert_eq!(
+            capsule.artifact,
+            PathBuf::from("/tmp/target/wasm32-wasip1/release/edge-capsule.wasm")
+        );
+        assert_eq!(capsule.package, "blog");
+    }
+
+    #[test]
+    fn resolve_edge_capsule_matches_by_cwd_without_package_flag() {
+        let capsule = resolve_edge_capsule_from_metadata(
+            &capsule_metadata(true),
+            None,
+            Path::new("/projects/blog"),
+        )
+        .unwrap();
+        assert_eq!(capsule.package, "blog");
+    }
+
+    #[test]
+    fn missing_capsule_bin_prints_the_file_to_create() {
+        let error = resolve_edge_capsule_from_metadata(
+            &capsule_metadata(false),
+            Some("blog"),
+            Path::new("/projects"),
+        )
+        .unwrap_err();
+        assert!(error.contains("src/bin/edge-capsule.rs"), "{error}");
+        assert!(error.contains("fn main() {"), "{error}");
+        assert!(
+            error.contains("autumn_edge::serve(blog::handlers::edge_routes());"),
+            "the snippet must name the resolved crate: {error}"
+        );
+    }
+
+    #[test]
+    fn edge_success_line_names_routes_artifact_and_size() {
+        let line = format_edge_success(
+            &["greet", "note"],
+            Path::new("/tmp/target/wasm32-wasip1/release/edge-capsule.wasm"),
+            Some(2048),
+        );
+        assert_eq!(
+            line,
+            "\u{1F342} Edge capsule: 2 route(s) (greet, note) \
+             \u{2192} /tmp/target/wasm32-wasip1/release/edge-capsule.wasm (2 KB)"
+        );
+    }
+
+    #[test]
+    fn edge_success_line_tolerates_an_unreadable_artifact() {
+        let line = format_edge_success(&["greet"], Path::new("edge-capsule.wasm"), None);
+        assert!(line.contains("(size unknown)"), "{line}");
+    }
+
+    #[test]
+    fn unregistered_warning_names_every_handler() {
+        let scan = crate::edge_scan::scan_sources(&[(
+            "src/routes.rs",
+            "#[edge]\nfn greet() {}\n#[edge]\nfn stats() {}\nfn wire() { edge_routes![greet]; }",
+        )]);
+        let warning = format_unregistered_warning(&scan.unregistered());
+        assert!(warning.contains("stats @ src/routes.rs:4"), "{warning}");
+        assert!(!warning.contains("greet @"), "{warning}");
+        assert!(warning.contains("edge_routes![]"), "{warning}");
     }
 
     fn expected_binary(path: &str) -> PathBuf {
