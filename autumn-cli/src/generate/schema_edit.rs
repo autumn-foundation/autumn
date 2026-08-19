@@ -5806,7 +5806,8 @@ mod tests {
         // (mirroring move_to's fixed id-ascending row-lock order) so two
         // rows swapping scopes concurrently can't deadlock each other.
         assert!(
-            rescope_fn.contains("hashtext(OLD.\"board_id\"::text) <= hashtext(NEW.\"board_id\"::text)"),
+            rescope_fn
+                .contains("hashtext(OLD.\"board_id\"::text) <= hashtext(NEW.\"board_id\"::text)"),
             "must lock old/new scope keys in a fixed order: {rescope_fn}"
         );
         assert!(
