@@ -1583,6 +1583,22 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
         },
     );
 
+    // Same advisory-lock key the migration's insert-assign/delete-compact
+    // triggers take (see `position_triggers_up_sql_for`) — taking it here
+    // too, before the row-locking `SELECT`, closes a deadlock between
+    // `move_to`'s fixed id-ordered row locks and the compaction trigger's
+    // position-ordered `UPDATE`. Postgres-only; a no-op on `SQLite`.
+    let position_lock_name = format!("{}_{}_assign", config.table_name, spec.column);
+    let position_lock_scope_arg = scope_ident.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |_| quote! { ::core::option::Option::Some(__autumn_scope) },
+    );
+    let position_advisory_lock = quote! {
+        ::autumn_web::__private::position_advisory_lock(conn, #position_lock_name, #position_lock_scope_arg)
+            .await
+            .map_err(::autumn_web::AutumnError::from)?;
+    };
+
     let move_to = quote! {
         /// Move this row to absolute index `target` within its position
         /// scope, clamped into `[0, len-1]`. Transaction-safe: see
@@ -1598,6 +1614,7 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
                 |conn| {
                     async move {
                         #scope_lookup
+                        #position_advisory_lock
                         let __autumn_locked: ::std::vec::Vec<(i64, i64)> = ::autumn_web::maybe_for_update!(
                             #table_ident::table
                                 #scope_filter
@@ -1724,8 +1741,19 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
 
     let move_before_after = quote! {
         /// Move this row to immediately before `other_id` within their
-        /// shared position scope. Both rows must be in the same scope.
+        /// shared position scope. Both rows must be in the same scope — an
+        /// unlocked read checks this up front and returns `400 Bad Request`
+        /// on a mismatch, but the check and the actual move are not one
+        /// atomic step, so a concurrent `move_to`/scope change on `other_id`
+        /// between them is possible in principle. Harmless either way:
+        /// `move_to` re-derives `other_id`'s position from the same
+        /// row-locked read it uses for `id` and clamps the target into
+        /// `[0, len-1]`, so the worst case is landing at a slightly stale
+        /// index within the (still correct) scope, never a corrupt one.
         pub async fn move_before(&self, id: i64, other_id: i64) -> ::autumn_web::AutumnResult<()> {
+            if id == other_id {
+                return ::core::result::Result::Ok(());
+            }
             let mut conn = self.__autumn_acquire_conn().await?;
             let (__autumn_current, __autumn_id_scope) =
                 self.__autumn_position_and_scope_of(&mut conn, id).await?;
@@ -1749,8 +1777,19 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
         }
 
         /// Move this row to immediately after `other_id` within their
-        /// shared position scope. Both rows must be in the same scope.
+        /// shared position scope. Both rows must be in the same scope — an
+        /// unlocked read checks this up front and returns `400 Bad Request`
+        /// on a mismatch, but the check and the actual move are not one
+        /// atomic step, so a concurrent `move_to`/scope change on `other_id`
+        /// between them is possible in principle. Harmless either way:
+        /// `move_to` re-derives `other_id`'s position from the same
+        /// row-locked read it uses for `id` and clamps the target into
+        /// `[0, len-1]`, so the worst case is landing at a slightly stale
+        /// index within the (still correct) scope, never a corrupt one.
         pub async fn move_after(&self, id: i64, other_id: i64) -> ::autumn_web::AutumnResult<()> {
+            if id == other_id {
+                return ::core::result::Result::Ok(());
+            }
             let mut conn = self.__autumn_acquire_conn().await?;
             let (__autumn_current, __autumn_id_scope) =
                 self.__autumn_position_and_scope_of(&mut conn, id).await?;

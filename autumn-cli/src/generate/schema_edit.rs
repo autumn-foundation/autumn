@@ -447,6 +447,18 @@ pub fn position_triggers_up_sql_for(
                     scope.map_or_else(|| "TRUE".to_owned(), |s| format!("\"{s}\" = NEW.\"{s}\""));
                 let scope_cond_old =
                     scope.map_or_else(|| "TRUE".to_owned(), |s| format!("\"{s}\" = OLD.\"{s}\""));
+                // The insert-assign trigger's `MAX(position)` scan must skip
+                // soft-deleted rows: a soft-deleted row's position is stale
+                // (excluded from the live compaction that ran when it was
+                // deleted — see `compact_soft` below), so counting it here
+                // would inflate the next assignment and leave a gap in the
+                // live sequence the very first time a live insert follows a
+                // soft delete.
+                let live_cond_new = if has_soft_delete {
+                    format!("{scope_cond_new} AND deleted_at IS NULL")
+                } else {
+                    scope_cond_new.clone()
+                };
                 // A transaction-scoped advisory lock, keyed by table+scope
                 // (a constant second key when unscoped, so every insert into
                 // the table serializes against every other). Without it,
@@ -470,7 +482,7 @@ pub fn position_triggers_up_sql_for(
                     "CREATE FUNCTION {table}_{position}_assign() RETURNS TRIGGER AS $$\n\
                      BEGIN\n  \
                      PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), {lock_key2});\n  \
-                     NEW.\"{position}\" := COALESCE((SELECT MAX(\"{position}\") + 1 FROM \"{table}\" WHERE {scope_cond_new}), 0);\n  \
+                     NEW.\"{position}\" := COALESCE((SELECT MAX(\"{position}\") + 1 FROM \"{table}\" WHERE {live_cond_new}), 0);\n  \
                      RETURN NEW;\n\
                      END;\n\
                      $$ LANGUAGE plpgsql;"
@@ -493,12 +505,28 @@ pub fn position_triggers_up_sql_for(
                     || "0".to_owned(),
                     |s| format!("hashtext(OLD.\"{s}\"::text)"),
                 );
+                // On a `--soft-delete` model this trigger only ever fires
+                // from `purge` — every row it hard-deletes was *already*
+                // soft-deleted (the scaffold's purge handler only reaches
+                // rows filtered to `deleted_at IS NOT NULL`), whose position
+                // was already excluded from the live sequence by
+                // `compact_soft` at the time it was soft-deleted. Running
+                // this compaction unconditionally would shift the live rows
+                // a SECOND time for the same removal, producing a duplicate
+                // live position. Skip entirely when `OLD.deleted_at` is set;
+                // on a non-soft-delete model there is no such column and
+                // this trigger is the only compaction path, so it always runs.
+                let (compact_guard_open, compact_guard_close) = if has_soft_delete {
+                    ("IF OLD.deleted_at IS NULL THEN\n    ", "\n  END IF;")
+                } else {
+                    ("", "")
+                };
                 let _ = writeln!(
                     out,
                     "CREATE FUNCTION {table}_{position}_compact() RETURNS TRIGGER AS $$\n\
                      BEGIN\n  \
-                     PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), {lock_key2_old});\n  \
-                     UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > OLD.\"{position}\";\n  \
+                     {compact_guard_open}PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), {lock_key2_old});\n    \
+                     UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > OLD.\"{position}\";{compact_guard_close}\n  \
                      RETURN OLD;\n\
                      END;\n\
                      $$ LANGUAGE plpgsql;"
@@ -533,15 +561,36 @@ pub fn position_triggers_up_sql_for(
                     scope.map_or_else(|| "1=1".to_owned(), |s| format!("\"{s}\" = new.\"{s}\""));
                 let scope_cond_old =
                     scope.map_or_else(|| "1=1".to_owned(), |s| format!("\"{s}\" = old.\"{s}\""));
+                // Same reasoning as the Postgres arm: skip soft-deleted rows
+                // when computing the next position, or a soft delete
+                // followed by a live insert leaves a gap in the live
+                // sequence.
+                let live_cond_new = if has_soft_delete {
+                    format!("{scope_cond_new} AND deleted_at IS NULL")
+                } else {
+                    scope_cond_new.clone()
+                };
                 let _ = writeln!(
                     out,
                     "CREATE TRIGGER \"{table}_{position}_assign\" AFTER INSERT ON \"{table}\" BEGIN\n  \
-                     UPDATE \"{table}\" SET \"{position}\" = (SELECT COALESCE(MAX(\"{position}\"), -1) + 1 FROM \"{table}\" WHERE {scope_cond_new} AND id != new.id) WHERE id = new.id;\n\
+                     UPDATE \"{table}\" SET \"{position}\" = (SELECT COALESCE(MAX(\"{position}\"), -1) + 1 FROM \"{table}\" WHERE {live_cond_new} AND id != new.id) WHERE id = new.id;\n\
                      END;"
                 );
+                // Same reasoning as the Postgres arm: on a `--soft-delete`
+                // model this only ever fires from `purge`, whose target was
+                // already soft-deleted and already compacted out of the live
+                // sequence by `compact_soft` — running this unconditionally
+                // would shift the live rows a second time for the same
+                // removal. SQLite triggers support a `WHEN` clause directly
+                // (unlike Postgres, no `IF`/`END IF` needed inside the body).
+                let compact_when = if has_soft_delete {
+                    " WHEN old.deleted_at IS NULL"
+                } else {
+                    ""
+                };
                 let _ = writeln!(
                     out,
-                    "CREATE TRIGGER \"{table}_{position}_compact\" AFTER DELETE ON \"{table}\" BEGIN\n  \
+                    "CREATE TRIGGER \"{table}_{position}_compact\" AFTER DELETE ON \"{table}\"{compact_when} BEGIN\n  \
                      UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > old.\"{position}\";\n\
                      END;"
                 );

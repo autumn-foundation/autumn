@@ -981,6 +981,14 @@ pub const SQL_SUPPORTED_TYPES: &str = "text, varchar, bpchar (-> String), int4 (
 ///
 /// Returns `None` for types outside the documented surface so the caller can
 /// fail loudly with a column-named error rather than silently dropping it.
+///
+/// Like `jsonb` (which round-trips as a plain `FieldKind::Json`, losing the
+/// distinction from a hand-written `json` column), a `position` column has
+/// no distinguishing catalog type of its own — it's a plain `int4`/`int8`
+/// NOT NULL column plus an index and a pair of triggers. `db pull` therefore
+/// introspects it back as an ordinary [`FieldKind::I32`]/[`FieldKind::I64`],
+/// not [`FieldKind::Position`]; this is expected, not a bug — there is no
+/// SQL-level marker to recover the `position`-ness from.
 #[must_use]
 pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
     match udt_name {
@@ -2115,6 +2123,27 @@ fn validate_position_fields(tokens: &[String], fields: &[Field]) -> Result<(), G
                      field — position can only be scoped to a `references` foreign key",
                     position_field.name,
                     source.rust_type()
+                ),
+            });
+        }
+        // A nullable scope FK renders as `Option<i64>` at the Rust level,
+        // but the generated triggers/`move_to` compare the scope column via
+        // Postgres `hashtext(NEW."{scope}"::text)` / `"{scope}" = $1`
+        // equality, both of which are SQL-NULL-strict: a NULL scope value
+        // hashes to NULL (taking no advisory lock at all) and never equals
+        // itself in a `WHERE` filter, so every NULL-scoped row would
+        // silently get position 0 with no working compaction. Reject the
+        // combination outright rather than emit ordering that quietly
+        // breaks the moment a scope value is unset.
+        if source.nullable {
+            return Err(GenerateError::InvalidField {
+                token,
+                reason: format!(
+                    "position field '{}' is scoped `scope:{scope}`, but '{scope}' is nullable \
+                     (`Option<…>`) — a NULL scope value can't be locked or matched by the \
+                     generated triggers/`move_to`. Make '{scope}' non-nullable, or drop the \
+                     `references` field's `:null`.",
+                    position_field.name
                 ),
             });
         }

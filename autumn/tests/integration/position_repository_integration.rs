@@ -429,6 +429,39 @@ async fn setup_triggered_table(db: &TestDb) {
                  FOR EACH ROW EXECUTE FUNCTION position_triggered_tasks_rank_assign();",
             )
             .await;
+            // Mirrors `position_triggers_up_sql_for`'s Postgres delete-compact
+            // trigger exactly, including taking the *same* advisory lock key
+            // as the assign trigger above — the two must fully serialize
+            // against each other, not just against their own kind, or a
+            // concurrent insert's unlocked `MAX(rank)` read can race a
+            // compaction shift and leave a gap (see
+            // `concurrent_insert_and_delete_never_leave_a_gap` below).
+            db.execute_sql(
+                "CREATE OR REPLACE FUNCTION position_triggered_tasks_rank_compact() \
+                 RETURNS TRIGGER AS $$
+                 BEGIN
+                   PERFORM pg_advisory_xact_lock(
+                       hashtext('position_triggered_tasks_rank_assign'),
+                       hashtext(OLD.\"board_id\"::text)
+                   );
+                   UPDATE \"position_triggered_tasks\" SET \"rank\" = \"rank\" - 1 \
+                   WHERE \"board_id\" = OLD.\"board_id\" AND \"rank\" > OLD.\"rank\";
+                   RETURN OLD;
+                 END;
+                 $$ LANGUAGE plpgsql;",
+            )
+            .await;
+            db.execute_sql(
+                "DROP TRIGGER IF EXISTS position_triggered_tasks_rank_compact_trg \
+                 ON \"position_triggered_tasks\";",
+            )
+            .await;
+            db.execute_sql(
+                "CREATE TRIGGER position_triggered_tasks_rank_compact_trg \
+                 AFTER DELETE ON \"position_triggered_tasks\" \
+                 FOR EACH ROW EXECUTE FUNCTION position_triggered_tasks_rank_compact();",
+            )
+            .await;
         })
         .await;
 }
@@ -553,5 +586,103 @@ async fn concurrent_insert_and_delete_never_leave_a_gap() {
         ranks,
         vec![0, 1, 2, 3, 4],
         "a concurrent insert and delete on the same scope must not leave a gap: {ranks:?}"
+    );
+}
+
+/// Regression for the deadlock the adversarial review round for issue #1358
+/// caught: `move_to`'s `SELECT ... FOR UPDATE ORDER BY id` locks every row in
+/// the scope in a *fixed id order*, but the delete-compact trigger's
+/// `UPDATE ... WHERE rank > $1` can lock the same rows via an index scan on
+/// `rank`, i.e. **not** in `id` order — so a concurrent `move_to` and delete
+/// on the same scope could lock rows in opposite orders and hit a genuine
+/// Postgres deadlock (error `40P01`, surfaced as a `500`). The fix has
+/// `move_to` take the same `pg_advisory_xact_lock` the triggers take, before
+/// its row-locking `SELECT`, so the two fully serialize instead of racing for
+/// row locks at all. Runs many rounds of a concurrent `move_to` + delete/
+/// re-insert pair on one scope through the real trigger-backed repository —
+/// deadlocked, either task would return `Err`, so asserting both succeed
+/// every round is itself the regression check; the final contiguous-
+/// permutation assertion additionally confirms the shared lock didn't trade
+/// deadlock-freedom for a correctness gap.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_move_to_and_delete_never_deadlock() {
+    let db = TestDb::shared().await;
+    setup_triggered_table(db).await;
+    let board_id = 2003;
+    const COUNT: usize = 6;
+
+    let mut ids = Vec::with_capacity(COUNT);
+    for i in 0..COUNT {
+        let mut conn = db.pool().get().await.expect("checkout connection");
+        let id: i64 = diesel::insert_into(position_triggered_tasks::table)
+            .values((
+                position_triggered_tasks::title.eq(format!("seed-{i}")),
+                position_triggered_tasks::board_id.eq(board_id),
+            ))
+            .returning(position_triggered_tasks::id)
+            .get_result(&mut conn)
+            .await
+            .expect("seed insert");
+        ids.push(id);
+    }
+
+    for round in 0_usize..20 {
+        let move_idx = round % ids.len();
+        let move_id = ids[move_idx];
+        // Never move and delete the *same* row in one round: if the delete
+        // commits first, `move_to`'s locked-set lookup for `move_id` would
+        // legitimately 404 — a test-harness race, not the deadlock this test
+        // exists to catch.
+        let mut delete_idx = (round * 3 + 1) % ids.len();
+        if delete_idx == move_idx {
+            delete_idx = (delete_idx + 1) % ids.len();
+        }
+        let delete_id = ids[delete_idx];
+
+        let move_repo = PgPositionTriggeredTaskRepository::with_pool_untracked(db.pool());
+        let target = i64::try_from(round * 5).expect("fits i64") % i64::try_from(COUNT).expect("fits i64");
+        let move_task = tokio::spawn(async move { move_repo.move_to(move_id, target).await });
+
+        let delete_pool = db.pool();
+        let delete_task = tokio::spawn(async move {
+            let mut conn = delete_pool.get().await.expect("checkout connection");
+            diesel::delete(position_triggered_tasks::table.find(delete_id))
+                .execute(&mut conn)
+                .await
+        });
+
+        move_task
+            .await
+            .expect("move_to task panicked")
+            .expect("move_to must not deadlock or otherwise error");
+        delete_task
+            .await
+            .expect("delete task panicked")
+            .expect("delete must not deadlock or otherwise error");
+
+        // Re-insert a replacement so the scope's row count (and therefore
+        // every later round's `target`/`delete_idx` arithmetic) stays
+        // stable across rounds.
+        let mut conn = db.pool().get().await.expect("checkout connection");
+        let new_id: i64 = diesel::insert_into(position_triggered_tasks::table)
+            .values((
+                position_triggered_tasks::title.eq(format!("round-{round}")),
+                position_triggered_tasks::board_id.eq(board_id),
+            ))
+            .returning(position_triggered_tasks::id)
+            .get_result(&mut conn)
+            .await
+            .expect("replacement insert");
+        ids[delete_idx] = new_id;
+    }
+
+    let mut ranks = triggered_ranks(&db.pool(), board_id).await;
+    ranks.sort_unstable();
+    let expected: Vec<i64> = (0..i64::try_from(COUNT).expect("fits i64")).collect();
+    assert_eq!(
+        ranks, expected,
+        "positions must remain an exact 0..len-1 permutation after concurrent move_to + \
+         delete/re-insert rounds (no duplicates, no gaps), got: {ranks:?}"
     );
 }

@@ -3755,6 +3755,26 @@ fn render_routes_file(
     let position_field = all_fields.iter().find(|f| f.kind.is_position());
     let reorder_enabled =
         position_field.is_some() && !live && !live_validation && !sharded && !owner_scoped_index;
+    // Issue #1358: the `position` field's no-JS Move up/down buttons and
+    // their flash message. `move_up`/`move_down` are shared chrome (same
+    // English on every resource, like `common.delete`); the flash bakes in
+    // the resource's own name, so it gets a per-resource key like
+    // `flash_created`/`flash_updated` below. Registered lazily, like
+    // `search_empty`/`search_box_placeholder` above: a scaffold with no
+    // position field never references these, so they must not be defined
+    // in `en.ftl` either, or `autumn i18n check` would flag them unused.
+    let (move_up_button, move_down_button, flash_moved) = if reorder_enabled {
+        (
+            labels.lit("common.move_up", "Move up"),
+            labels.lit("common.move_down", "Move down"),
+            labels.lit(
+                &format!("{snake_name}.flash.moved"),
+                &format!("{pascal_name} moved"),
+            ),
+        )
+    } else {
+        (String::new(), String::new(), String::new())
+    };
     // Issue #1332: once a Trash page exists, "{pascal_name} deleted" is no longer
     // what happened — the row moved somewhere the user can go and get it back,
     // and the flash is the only place that says so. Every scaffold that emits no
@@ -6301,7 +6321,7 @@ pub async fn move_up(
         .map_err(AutumnError::not_found)?;
     {authz_edit_call}drop(db);
     repo.move_up(row.id).await?;
-    flash.success("{pascal_name} moved").await;
+    flash.success({flash_moved}).await;
     Ok(autumn_web::Redirect::to(&paths::index()))
 }}
 
@@ -6322,7 +6342,7 @@ pub async fn move_down(
         .map_err(AutumnError::not_found)?;
     {authz_edit_call}drop(db);
     repo.move_down(row.id).await?;
-    flash.success("{pascal_name} moved").await;
+    flash.success({flash_moved}).await;
     Ok(autumn_web::Redirect::to(&paths::index()))
 }}
 "#
@@ -6423,15 +6443,15 @@ pub async fn move_down(
         format!(
             "{with_mut}    \
              columns.push(autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{\n\
-             form action=(paths::move_up(row.id)) method=\"post\" {{\n\
+             form action=(paths::move_up({route_key_display_expr})) method=\"post\" {{\n\
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n\
              (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n\
-             (autumn_web::a11y::Button::new(\"Move up\").submit())\n\
+             (autumn_web::a11y::Button::new({move_up_button}).submit())\n\
              }}\n\
-             form action=(paths::move_down(row.id)) method=\"post\" {{\n\
+             form action=(paths::move_down({route_key_display_expr})) method=\"post\" {{\n\
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n\
              (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n\
-             (autumn_web::a11y::Button::new(\"Move down\").submit())\n\
+             (autumn_web::a11y::Button::new({move_down_button}).submit())\n\
              }}\n\
              }}));\n"
         )
