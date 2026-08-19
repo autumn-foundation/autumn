@@ -2026,7 +2026,7 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// domain/validation error as a transient conflict, silently re-running a
 /// non-idempotent closure and delaying the response.
 #[cfg_attr(feature = "sqlite", allow(dead_code))]
-fn is_retryable_txn_error(err: &AutumnError) -> bool {
+pub fn is_retryable_txn_error(err: &AutumnError) -> bool {
     use tokio_postgres::error::SqlState;
 
     fn is_retryable_sqlstate(state: &SqlState) -> bool {

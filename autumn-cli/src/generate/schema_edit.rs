@@ -431,6 +431,7 @@ pub fn create_table_sql_with_metadata_and_id_for(
 /// Returns an empty string when `fields` has no `position` column (the
 /// common case), so a model without one gets byte-identical migration output.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn position_triggers_up_sql_for(
     backend: DatabaseBackend,
     table: &str,

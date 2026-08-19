@@ -1609,7 +1609,22 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
             use ::autumn_web::reexports::diesel_async::AsyncConnection;
             use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
             let mut conn = self.__autumn_acquire_conn().await?;
-            ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(
+            // Codex review (issue #1358): the advisory lock closes the
+            // id-order-vs-position-order row-lock deadlock between move_to
+            // and the compaction triggers, but a genuinely concurrent
+            // delete/soft-delete can still win a row lock on one of this
+            // scope's rows BEFORE reaching its own trigger's advisory-lock
+            // attempt — a lock-type inversion (row lock then advisory lock,
+            // vs. this method's advisory lock then row locks) Postgres's
+            // deadlock detector resolves by aborting one side with `40P01`.
+            // Retry a bounded few times on that (or the `40001` serialization
+            // failure a stricter isolation level could raise) rather than
+            // surface a transient deadlock as a hard failure — the same
+            // classification `Db::tx_with` already relies on for its own
+            // retry loop.
+            let mut __autumn_attempt: u32 = 0;
+            loop {
+            let __autumn_move_result = ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(
                 &mut *conn,
                 |conn| {
                     async move {
@@ -1671,7 +1686,20 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
                     .scope_boxed()
                 },
             )
-            .await
+            .await;
+            match __autumn_move_result {
+                ::core::result::Result::Ok(()) => return ::core::result::Result::Ok(()),
+                ::core::result::Result::Err(__autumn_move_err) => {
+                    if __autumn_attempt < 2
+                        && ::autumn_web::__private::is_retryable_txn_error(&__autumn_move_err)
+                    {
+                        __autumn_attempt += 1;
+                        continue;
+                    }
+                    return ::core::result::Result::Err(__autumn_move_err);
+                }
+            }
+            }
         }
     };
 
@@ -7587,6 +7615,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let delete_many_body = {
+            // Codex review (issue #1358): the position insert-assign trigger
+            // takes its advisory lock, but the delete/soft-delete-compact
+            // triggers fire once PER ROW — each computing its shift from
+            // that row's own `OLD.position`. A single multi-row `DELETE ...
+            // WHERE id = ANY(chunk)` (or the soft-delete equivalent
+            // `UPDATE ... SET deleted_at = ...`) removes several rows from
+            // the SAME scope in one statement; their row-level triggers
+            // don't see each other's removals, so the relative shifts can
+            // under- or over-compact, leaving a gap or a duplicate rank.
+            // Forcing chunk size to 1 when a position field exists turns
+            // every chunk's delete/update into a single-row statement, so
+            // each trigger firing sees a fully-settled table and the
+            // existing single-row-safe compaction logic stays correct.
+            let delete_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
             let tenant_id_setup = if config.tenant_scoped {
                 quote! {
                     let tenant_id = if self.across_tenants {
@@ -7762,7 +7804,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let delete_execution = if config.versioned {
                 quote! {
                     let mut __vh_actually_deleted: ::std::collections::HashSet<i64> = ::std::collections::HashSet::new();
-                    for chunk in ids.chunks(1000) {
+                    for chunk in ids.chunks(#delete_chunk_size) {
                         #cc_before_delete_chunk
                         let chunk_deleted_ids = #delete_returning_expr
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -7774,7 +7816,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             } else {
                 quote! {
-                    for chunk in ids.chunks(1000) {
+                    for chunk in ids.chunks(#delete_chunk_size) {
                         #cc_before_delete_chunk
                         #delete_expr
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -9828,6 +9870,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let delete_many_body = {
+            // See the identical comment in the hooks-enabled `delete_many_body`
+            // above (Codex review, issue #1358): force single-row chunks when
+            // a position field exists so the per-row delete/soft-delete-compact
+            // triggers never see more than one removal per statement.
+            let delete_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
             let vh_delete_load_before = if config.versioned {
                 // Soft-delete preload must mirror the actual delete filter so that
                 // already-deleted rows are not snapshotted as newly deleted.
@@ -9967,7 +10014,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
                 let loop_ts = quote! {
                     let mut __vh_actually_deleted: ::std::collections::HashSet<i64> = ::std::collections::HashSet::new();
-                    for chunk in ids.chunks(1000) {
+                    for chunk in ids.chunks(#delete_chunk_size) {
                         #cc_before_delete_chunk
                         let chunk_deleted_ids = #delete_returning_expr
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -10024,7 +10071,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 let loop_ts = quote! {
-                    for chunk in ids.chunks(1000) {
+                    for chunk in ids.chunks(#delete_chunk_size) {
                         #cc_before_delete_chunk
                         #delete_expr
                             .map_err(::autumn_web::AutumnError::from)?;

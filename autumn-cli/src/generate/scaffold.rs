@@ -3775,6 +3775,28 @@ fn render_routes_file(
     } else {
         (String::new(), String::new(), String::new())
     };
+    // Issue #1358: the plain index (and, for the same reason, the CSV
+    // export below) defaults `?sort=` to the position column when the
+    // caller requested none, so a reorderable list renders — and exports —
+    // in its maintained order out of the box rather than primary-key
+    // order — `move_*` would otherwise silently have no visible effect on
+    // load, and a Codex review round caught the export side specifically:
+    // without this, "Export CSV" from a no-`?sort=` position-ordered index
+    // silently downloaded a different row order than what was on screen,
+    // since `export_csv` parses its OWN `ListQuery` from the request
+    // rather than inheriting the index handler's default. Applied only in
+    // the branch `reorder_enabled` targets (the same restriction set); the
+    // sharded/live/owner-scoped index branches keep their existing
+    // (unsorted) queries unchanged.
+    let default_sort_let = position_field.map_or_else(String::new, |pf| {
+        format!(
+            "    let list_query = if list_query.sort().is_none() {{\n        \
+             let __autumn_filters: Vec<(&str, &str)> = list_query.filters().collect();\n        \
+             ListQuery::new(Some(\"{}\"), list_query.direction(), &__autumn_filters)\n    \
+             }} else {{\n        list_query\n    }};\n",
+            pf.name
+        )
+    });
     // Issue #1332: once a Trash page exists, "{pascal_name} deleted" is no longer
     // what happened — the row moved somewhere the user can go and get it back,
     // and the flash is the only place that says so. Every scaffold that emits no
@@ -5972,7 +5994,7 @@ mod attachment_read_back_tests {{
              repo: Pg{pascal_name}Repository,\n\
              ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
              use autumn_web::reexports::axum::response::IntoResponse as _;\n\
-             {owner_let}    \
+             {default_sort_let}{owner_let}    \
              let batch_size = autumn_web::pagination::MAX_PAGE_SIZE;\n    \
              let mut rows: Vec<{pascal_name}> = Vec::new();\n    \
              let mut page: u32 = 1;\n    \
@@ -6458,22 +6480,6 @@ pub async fn move_down(
     } else {
         index_columns_labeled
     };
-    // Issue #1358: the plain index defaults `?sort=` to the position column
-    // when the caller requested none, so a reorderable list renders in its
-    // maintained order out of the box rather than primary-key order —
-    // `move_*` would otherwise silently have no visible effect on load.
-    // Applied only in the branch `reorder_enabled` targets (the same
-    // restriction set); the sharded/live/owner-scoped index branches keep
-    // their existing (unsorted) queries unchanged.
-    let default_sort_let = position_field.map_or_else(String::new, |pf| {
-        format!(
-            "    let list_query = if list_query.sort().is_none() {{\n        \
-             let __autumn_filters: Vec<(&str, &str)> = list_query.filters().collect();\n        \
-             ListQuery::new(Some(\"{}\"), list_query.direction(), &__autumn_filters)\n    \
-             }} else {{\n        list_query\n    }};\n",
-            pf.name
-        )
-    });
     // Issue #1312: the CSRF pair and the one-time submit-token pair (#1360) the
     // index/search handlers thread into `bulk_actions_form`'s hidden fields.
     // Injected after `flash: Flash,` in the signatures that render the bulk

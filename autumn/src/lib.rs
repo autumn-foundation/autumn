@@ -568,6 +568,8 @@ pub mod ws;
 #[doc(hidden)]
 pub mod __private {
     #[cfg(feature = "db")]
+    pub use crate::db::is_retryable_txn_error;
+    #[cfg(feature = "db")]
     pub use crate::db::scoped_immediate_transaction;
     #[cfg(feature = "db")]
     pub use crate::db::scoped_transaction;
