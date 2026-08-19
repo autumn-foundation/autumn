@@ -320,6 +320,83 @@ pub fn plan_webhook(
     Ok(plan)
 }
 
+/// Plan builder for `autumn destroy webhook <provider> <Name>` (`autumn destroy`,
+/// issue #1048).
+///
+/// `destroy` mirrors `generate` argument-for-argument across this CLI, but the
+/// two overrides here are *recoverable*: the generated endpoint block records its
+/// own `path` and `secret_env` under the endpoint name, which is derived from
+/// `<Name>` alone. So rather than making the user remember flags from days ago,
+/// this adopts the recorded values whenever they are not passed again — without
+/// them, a webhook generated with `--path` would leave its `autumn.toml` block
+/// behind (the revert searches for the default route) and its handler would fail
+/// the divergence guard (the rendered content embeds the path).
+///
+/// An explicitly passed `--path`/`--secret-env` still wins, and a project with
+/// no recorded endpoint falls back to the same defaults `generate` uses.
+///
+/// # Errors
+///
+/// Same as [`plan_webhook`].
+pub fn plan_webhook_for_revert(
+    project_root: &Path,
+    provider: &str,
+    name: &str,
+    options: &WebhookOptions,
+) -> Result<Plan, GenerateError> {
+    plan_webhook(
+        project_root,
+        provider,
+        name,
+        &adopt_recorded_overrides(project_root, name, options),
+    )
+}
+
+/// Fill in `--path`/`--secret-env` from the `autumn.toml` endpoint recorded under
+/// this webhook's name, for any the caller did not pass.
+fn adopt_recorded_overrides(
+    project_root: &Path,
+    name: &str,
+    options: &WebhookOptions,
+) -> WebhookOptions {
+    if options.path.is_some() && options.secret_env.is_some() {
+        return options.clone();
+    }
+    let endpoint_name = snake(name);
+    let existing = read_or_empty(&project_root.join("autumn.toml"));
+    let Ok(doc) = existing.parse::<toml_edit::DocumentMut>() else {
+        return options.clone();
+    };
+    let recorded = doc
+        .get("security")
+        .and_then(|security| security.get("webhooks"))
+        .and_then(|webhooks| webhooks.get("endpoints"))
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .into_iter()
+        .flatten()
+        .find(|endpoint| {
+            endpoint.get("name").and_then(|value| value.as_str()) == Some(endpoint_name.as_str())
+        });
+    let Some(recorded) = recorded else {
+        return options.clone();
+    };
+
+    WebhookOptions {
+        path: options.path.clone().or_else(|| {
+            recorded
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        }),
+        secret_env: options.secret_env.clone().or_else(|| {
+            recorded
+                .get("secret_env")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        }),
+    }
+}
+
 /// Resolve one invocation's arguments into the [`EndpointSpec`] every renderer
 /// works from, validating each of them.
 ///
@@ -1982,6 +2059,79 @@ async fn main() {
             .unwrap();
         let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
         assert!(!toml.contains("[[security.webhooks.endpoints]]"), "{toml}");
+    }
+
+    #[test]
+    fn destroy_recovers_a_custom_path_and_secret_env_without_repeating_the_flags() {
+        // `autumn destroy webhook stripe Payments` is the documented invocation.
+        // Without recovering the recorded overrides it would look for the default
+        // route, leave the endpoint block behind, and refuse to remove a handler
+        // whose rendered content (which embeds the path) no longer matched.
+        let tmp = project();
+        let options = WebhookOptions {
+            path: Some("/hooks/pay".to_owned()),
+            secret_env: Some("PAY_SECRET".to_owned()),
+        };
+        plan_webhook(tmp.path(), "stripe", "Payments", &options)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        // …destroyed with no flags at all.
+        plan_webhook_for_revert(tmp.path(), "stripe", "Payments", &WebhookOptions::default())
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert!(
+            !toml.contains("[[security.webhooks.endpoints]]"),
+            "the endpoint block must be removed:\n{toml}"
+        );
+        assert!(
+            !toml.contains("/hooks/pay") && !toml.contains("PAY_SECRET"),
+            "no trace of the endpoint may remain:\n{toml}"
+        );
+        assert!(
+            !tmp.path().join("src/webhooks").exists(),
+            "the handler must be removed without --force"
+        );
+        let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(!main_rs.contains("payments_webhook"), "{main_rs}");
+    }
+
+    #[test]
+    fn an_explicit_flag_still_wins_over_the_recorded_endpoint() {
+        let tmp = project();
+        plan_webhook(
+            tmp.path(),
+            "stripe",
+            "Payments",
+            &WebhookOptions {
+                path: Some("/hooks/pay".to_owned()),
+                secret_env: None,
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        // A path that matches nothing recorded must not be silently replaced by
+        // the recorded one — destroy then correctly finds nothing to remove.
+        let adopted = adopt_recorded_overrides(
+            tmp.path(),
+            "Payments",
+            &WebhookOptions {
+                path: Some("/elsewhere".to_owned()),
+                secret_env: None,
+            },
+        );
+        assert_eq!(adopted.path.as_deref(), Some("/elsewhere"));
+        assert_eq!(
+            adopted.secret_env.as_deref(),
+            Some("STRIPE_WEBHOOK_SECRET"),
+            "the unspecified flag is still recovered"
+        );
     }
 
     #[test]

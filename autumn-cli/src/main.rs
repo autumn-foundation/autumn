@@ -4308,7 +4308,21 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             force,
         } => {
             let options = generate::webhook::WebhookOptions { path, secret_env };
-            let plan = generate::webhook::plan_webhook(&resolve_cwd(), &provider, &name, &options);
+            let project_root = resolve_cwd();
+            // `destroy` recovers a `--path`/`--secret-env` it was not given from
+            // the endpoint block `generate` recorded, so cleanup does not depend
+            // on the user repeating flags (issue #1366, Codex review).
+            let plan = match mode {
+                ApplyMode::Generate => {
+                    generate::webhook::plan_webhook(&project_root, &provider, &name, &options)
+                }
+                ApplyMode::Destroy => generate::webhook::plan_webhook_for_revert(
+                    &project_root,
+                    &provider,
+                    &name,
+                    &options,
+                ),
+            };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
             // Printed after the file list, and only for a real generate run:
             // `apply_plan` exits on failure, and neither a dry run nor a

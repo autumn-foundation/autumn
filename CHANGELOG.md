@@ -37,7 +37,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generate time rather than failing config validation at boot, regenerating with
   a changed path updates the endpoint block in place instead of stranding it, and
   `destroy` leaves hand-edited config (rotation variables, a Redis replay
-  backend) alone. See `docs/guide/generators.md`.
+  backend) alone — and recovers a generation-time `--path`/`--secret-env` from
+  the recorded endpoint block, so cleanup does not depend on repeating flags.
+  See `docs/guide/generators.md`.
+
+- **`autumn webhook sim` refreshes body-carried delivery IDs (#1366):** the
+  simulator already minted a fresh delivery ID per invocation for GitHub and
+  generic providers, which carry it in a header. Stripe and Slack read theirs
+  from the JSON body (`id` / `event_id`), so a payload with a fixed ID replayed:
+  the first simulation was accepted and every one after it answered `409
+  Conflict` for the length of the replay window. Both fields are now rewritten
+  before signing (the signature covers the exact bytes sent), and the substituted
+  ID is printed. A payload that is not a JSON object is left exactly as written.
 
 - **Ordered-list `position` field with transaction-safe reorder helpers
   (#1358):** a new `position` DSL token (`rank:position`, or scoped to a

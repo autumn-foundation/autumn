@@ -947,7 +947,9 @@ autumn generate webhook stripe Payments --dry-run
 ```
 
 Fire a signed test delivery at the running app without touching the provider —
-same four presets, a fresh delivery id per call:
+same four presets, and a fresh delivery id per call (for Stripe and Slack, whose
+replay key lives in the body, the simulator rewrites that field before signing,
+so repeated runs are new deliveries rather than `409 Conflict` replays):
 
 ```bash
 autumn webhook sim stripe http://localhost:3000/webhooks/stripe \
@@ -968,7 +970,9 @@ registry matches paths exactly, so a stale path would 500 every real delivery).
 
 `autumn destroy webhook <provider> <Name>` removes the handler, its route
 registration, and its `autumn.toml` block — including the shared replay block
-once the last endpoint is gone. Config you have since edited by hand (rotation
+once the last endpoint is gone. A `--path`/`--secret-env` used at generation
+time does not have to be repeated: destroy recovers both from the endpoint block
+recorded under the same name (an explicit flag still wins). Config you have since edited by hand (rotation
 variables in `previous_secret_envs`, a tightened `timestamp_tolerance_secs`, a
 Redis replay backend) is left in place rather than deleted.
 
