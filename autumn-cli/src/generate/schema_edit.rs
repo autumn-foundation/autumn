@@ -406,9 +406,11 @@ pub fn create_table_sql_with_metadata_and_id_for(
 /// always, plus soft-delete (a `deleted_at` transition from `NULL` to
 /// non-`NULL`) when `fields` declares a `deleted_at` column (the `--soft-delete`
 /// virtual field `generate::model` appends — see `append_soft_delete_field`)
-/// — and, for a scoped position field, compact the old scope and re-append
-/// at the end of the new one when an ordinary `UPDATE` reassigns the scope
-/// FK (e.g. dragging a Kanban card to a different board).
+/// — append a RESTORED row (the reverse `deleted_at` transition, reachable
+/// from the scaffold's Trash page) to the end of its live sequence — and,
+/// for a scoped position field, compact the old scope and re-append at the
+/// end of the new one when an ordinary `UPDATE` reassigns the scope FK
+/// (e.g. dragging a Kanban card to a different board).
 ///
 /// Implemented as database triggers rather than application-level repository
 /// hooks so the invariant holds for **every** insert/delete path (the
@@ -420,13 +422,15 @@ pub fn create_table_sql_with_metadata_and_id_for(
 /// `UPDATE`); `SQLite` triggers cannot mutate `NEW`, so its `AFTER INSERT`
 /// trigger corrects the just-inserted row with a single `UPDATE ... WHERE
 /// id = new.id`, still inside the same statement/transaction, so the
-/// placeholder is never visible outside it.
+/// placeholder is never visible outside it. The `restore` trigger mirrors
+/// this exactly (same advisory lock, same append-at-the-end `MAX + 1`
+/// read), just keyed off the `deleted_at` transition instead of `INSERT`.
 ///
 /// Compaction only shifts still-live rows (`deleted_at IS NULL` on the
-/// soft-delete branch) — a soft-deleted row's stale position is left
-/// untouched (restoring it can collide with a position now reused by a
-/// live row; this slice does not renumber on restore, see issue #1358's
-/// scope).
+/// soft-delete branch) — a restored row does not get its old position
+/// back (some other, still-live row may since have taken it); it is
+/// appended fresh at the end of its scope's live sequence instead, like
+/// any other row re-entering the live set.
 ///
 /// Returns an empty string when `fields` has no `position` column (the
 /// common case), so a model without one gets byte-identical migration output.
@@ -576,6 +580,37 @@ pub fn position_triggers_up_sql_for(
                         "CREATE TRIGGER {table}_{position}_compact_soft_trg AFTER UPDATE OF deleted_at ON \"{table}\" \
                          FOR EACH ROW EXECUTE FUNCTION {table}_{position}_compact_soft();"
                     );
+                    // Codex review: `compact_soft` only ever handles the
+                    // soft-delete transition (`deleted_at` NULL -> non-NULL).
+                    // The generated repository's `restore()` — reachable from
+                    // the scaffold's Trash page — performs the OPPOSITE
+                    // transition, and without a trigger of its own the
+                    // restored row re-enters the live set still carrying
+                    // whatever stale position it had when it was soft-deleted
+                    // — a position some other, still-live row may since have
+                    // taken, producing a duplicate. Mirrors the insert-assign
+                    // trigger exactly (same advisory lock key, same
+                    // append-at-the-end `MAX(position) + 1` read, now keyed
+                    // off `NEW`'s scope since a restore never itself changes
+                    // scope) rather than trying to recreate the row's old
+                    // position, which this slice does not attempt to
+                    // preserve across a soft-delete/restore round trip.
+                    let _ = writeln!(
+                        out,
+                        "CREATE FUNCTION {table}_{position}_restore() RETURNS TRIGGER AS $$\n\
+                         BEGIN\n  \
+                         PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), {lock_key2});\n  \
+                         NEW.\"{position}\" := COALESCE((SELECT MAX(\"{position}\") + 1 FROM \"{table}\" WHERE {live_cond_new}), 0);\n  \
+                         RETURN NEW;\n\
+                         END;\n\
+                         $$ LANGUAGE plpgsql;"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "CREATE TRIGGER {table}_{position}_restore_trg BEFORE UPDATE OF deleted_at ON \"{table}\" \
+                         FOR EACH ROW WHEN (OLD.deleted_at IS NOT NULL AND NEW.deleted_at IS NULL) \
+                         EXECUTE FUNCTION {table}_{position}_restore();"
+                    );
                 }
                 // Issue #1358 review: an ordinary `UPDATE` can reassign a
                 // scoped row's scope FK (e.g. dragging a Kanban card to a
@@ -677,6 +712,18 @@ pub fn position_triggers_up_sql_for(
                          UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > old.\"{position}\" AND deleted_at IS NULL;\n\
                          END;"
                     );
+                    // Same reasoning as the Postgres `restore` trigger above:
+                    // a restored row must be appended to the end of its
+                    // (unchanged) scope's live sequence, mirroring the
+                    // insert-assign trigger's own AFTER-the-fact correction
+                    // (SQLite can't mutate NEW directly either way).
+                    let _ = writeln!(
+                        out,
+                        "CREATE TRIGGER \"{table}_{position}_restore\" AFTER UPDATE OF deleted_at ON \"{table}\" \
+                         WHEN old.deleted_at IS NOT NULL AND new.deleted_at IS NULL BEGIN\n  \
+                         UPDATE \"{table}\" SET \"{position}\" = (SELECT COALESCE(MAX(\"{position}\"), -1) + 1 FROM \"{table}\" WHERE {live_cond_new} AND id != new.id) WHERE id = new.id;\n\
+                         END;"
+                    );
                 }
                 // Same reasoning as the Postgres `rescope` trigger above: an
                 // ordinary `UPDATE` reassigning a scoped row's scope FK must
@@ -752,6 +799,10 @@ pub fn position_triggers_down_sql_for(
             let _ = writeln!(
                 out,
                 "DROP FUNCTION IF EXISTS {table}_{position}_compact_soft() CASCADE;"
+            );
+            let _ = writeln!(
+                out,
+                "DROP FUNCTION IF EXISTS {table}_{position}_restore() CASCADE;"
             );
         }
         if f.constraints.scope.is_some() {
@@ -5895,6 +5946,48 @@ mod tests {
     }
 
     #[test]
+    fn position_triggers_postgres_soft_delete_adds_restore_trigger() {
+        // Codex review (issue #1358): compact_soft only ever handles the
+        // deletion direction; without a restore trigger a restored row
+        // re-enters the live set still carrying its stale pre-delete
+        // position, which some other live row may since have taken.
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["rank:position", "deleted_at:Option<NaiveDateTime>"]),
+        );
+        assert!(
+            up.contains("CREATE FUNCTION tasks_rank_restore() RETURNS TRIGGER"),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains(
+                "CREATE TRIGGER tasks_rank_restore_trg BEFORE UPDATE OF deleted_at ON \"tasks\""
+            ),
+            "must be BEFORE UPDATE so it can mutate NEW.rank directly: {up}"
+        );
+        assert!(
+            up.contains("WHEN (OLD.deleted_at IS NOT NULL AND NEW.deleted_at IS NULL)"),
+            "must only fire on the restore direction (compact_soft owns the other): {up}"
+        );
+        let restore_fn = up
+            .split("CREATE FUNCTION tasks_rank_restore()")
+            .nth(1)
+            .expect("restore function body");
+        let restore_fn = &restore_fn[..restore_fn.find("$$ LANGUAGE").unwrap_or(restore_fn.len())];
+        assert!(
+            restore_fn.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), 0)"),
+            "must take the same advisory lock as assign/compact: {restore_fn}"
+        );
+        assert!(
+            restore_fn.contains(
+                "NEW.\"rank\" := COALESCE((SELECT MAX(\"rank\") + 1 FROM \"tasks\" WHERE TRUE AND deleted_at IS NULL), 0);"
+            ),
+            "must append the restored row to the end of the live sequence: {restore_fn}"
+        );
+    }
+
+    #[test]
     fn position_triggers_postgres_down_drops_functions_with_cascade() {
         let down = position_triggers_down_sql_for(
             DatabaseBackend::Postgres,
@@ -5911,6 +6004,10 @@ mod tests {
         );
         assert!(
             down.contains("DROP FUNCTION IF EXISTS tasks_rank_compact_soft() CASCADE;"),
+            "got:\n{down}"
+        );
+        assert!(
+            down.contains("DROP FUNCTION IF EXISTS tasks_rank_restore() CASCADE;"),
             "got:\n{down}"
         );
         assert!(
@@ -6045,6 +6142,31 @@ mod tests {
         assert!(
             up.contains("WHEN old.deleted_at IS NULL AND new.deleted_at IS NOT NULL"),
             "got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_sqlite_soft_delete_adds_restore_trigger() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "tasks",
+            &fields(&["rank:position", "deleted_at:Option<NaiveDateTime>"]),
+        );
+        assert!(
+            up.contains(
+                "CREATE TRIGGER \"tasks_rank_restore\" AFTER UPDATE OF deleted_at ON \"tasks\""
+            ),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("WHEN old.deleted_at IS NOT NULL AND new.deleted_at IS NULL"),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains(
+                "UPDATE \"tasks\" SET \"rank\" = (SELECT COALESCE(MAX(\"rank\"), -1) + 1 FROM \"tasks\" WHERE 1=1 AND deleted_at IS NULL AND id != new.id) WHERE id = new.id;"
+            ),
+            "must append the restored row to the end of the live sequence: {up}"
         );
     }
 

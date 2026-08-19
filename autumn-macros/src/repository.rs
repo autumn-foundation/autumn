@@ -1599,109 +1599,148 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
             .map_err(::autumn_web::AutumnError::from)?;
     };
 
-    let move_to = quote! {
-        /// Move this row to absolute index `target` within its position
-        /// scope, clamped into `[0, len-1]`. Transaction-safe: see
-        /// `position_impl_methods`'s doc comment for the locking scheme.
-        pub async fn move_to(&self, id: i64, target: i64) -> ::autumn_web::AutumnResult<()> {
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            use ::autumn_web::reexports::diesel_async::AsyncConnection;
-            use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-            let mut conn = self.__autumn_acquire_conn().await?;
-            // Codex review (issue #1358): the advisory lock closes the
-            // id-order-vs-position-order row-lock deadlock between move_to
-            // and the compaction triggers, but a genuinely concurrent
-            // delete/soft-delete can still win a row lock on one of this
-            // scope's rows BEFORE reaching its own trigger's advisory-lock
-            // attempt — a lock-type inversion (row lock then advisory lock,
-            // vs. this method's advisory lock then row locks) Postgres's
-            // deadlock detector resolves by aborting one side with `40P01`.
-            // Retry a bounded few times on that (or the `40001` serialization
-            // failure a stricter isolation level could raise) rather than
-            // surface a transient deadlock as a hard failure — the same
-            // classification `Db::tx_with` already relies on for its own
-            // retry loop.
-            let mut __autumn_attempt: u32 = 0;
-            loop {
-            let __autumn_move_result = ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(
-                &mut *conn,
-                |conn| {
-                    async move {
-                        #scope_lookup
-                        #position_advisory_lock
-                        let __autumn_locked: ::std::vec::Vec<(i64, i64)> = ::autumn_web::maybe_for_update!(
-                            #table_ident::table
-                                #scope_filter
-                                #live_filter
-                                .select((#table_ident::id, #table_ident::#position_ident))
-                                .order(#table_ident::id.asc())
-                        )
-                        .load(conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                        let Some(&(_, __autumn_current)) =
-                            __autumn_locked.iter().find(|(rid, _)| *rid == id)
-                        else {
-                            return ::core::result::Result::Err(::autumn_web::AutumnError::not_found_msg(
-                                format!("{} with id {id} not found", stringify!(#model_name)),
-                            ));
-                        };
-                        let __autumn_len = __autumn_locked.len() as i64;
-                        let __autumn_target = target.clamp(0, (__autumn_len - 1).max(0));
-                        if __autumn_target != __autumn_current {
-                            if __autumn_target > __autumn_current {
-                                ::autumn_web::reexports::diesel::update(
-                                    #table_ident::table
-                                        #scope_filter
-                                        #live_filter
-                                        .filter(#table_ident::#position_ident.gt(__autumn_current))
-                                        .filter(#table_ident::#position_ident.le(__autumn_target)),
-                                )
-                                .set(#table_ident::#position_ident.eq(#table_ident::#position_ident - 1))
-                                .execute(conn)
-                                .await
-                                .map_err(::autumn_web::AutumnError::from)?;
-                            } else {
-                                ::autumn_web::reexports::diesel::update(
-                                    #table_ident::table
-                                        #scope_filter
-                                        #live_filter
-                                        .filter(#table_ident::#position_ident.ge(__autumn_target))
-                                        .filter(#table_ident::#position_ident.lt(__autumn_current)),
-                                )
-                                .set(#table_ident::#position_ident.eq(#table_ident::#position_ident + 1))
-                                .execute(conn)
-                                .await
-                                .map_err(::autumn_web::AutumnError::from)?;
-                            }
-                            ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                                .set(#table_ident::#position_ident.eq(__autumn_target))
-                                .execute(conn)
-                                .await
-                                .map_err(::autumn_web::AutumnError::from)?;
-                        }
-                        ::core::result::Result::Ok(())
-                    }
-                    .scope_boxed()
-                },
+    // Shared transaction body for move_to/move_up/move_down, parameterized
+    // only on how `__autumn_target` is computed from `__autumn_current` (the
+    // row's position as of THIS transaction's own locked read) and
+    // `__autumn_len`. Codex review (issue #1358): move_up/move_down used to
+    // read the row's position in a separate, UNLOCKED query, compute an
+    // absolute target from it, then hand that stale absolute index to
+    // move_to — a TOCTOU window where a concurrent mover could change the
+    // row's real position between the read and move_to's own locked
+    // re-read, making the precomputed target land somewhere other than "one
+    // step" from the row's actual current position (including, in the
+    // wrong direction). Generating move_up/move_down as full standalone
+    // methods that compute their relative target from the SAME locked
+    // `__autumn_current` this body already reads removes the second,
+    // external read entirely — there is no longer a gap for another
+    // transaction to land in.
+    let move_transaction_body = |target_expr: proc_macro2::TokenStream| {
+        quote! {
+            #scope_lookup
+            #position_advisory_lock
+            let __autumn_locked: ::std::vec::Vec<(i64, i64)> = ::autumn_web::maybe_for_update!(
+                #table_ident::table
+                    #scope_filter
+                    #live_filter
+                    .select((#table_ident::id, #table_ident::#position_ident))
+                    .order(#table_ident::id.asc())
             )
-            .await;
-            match __autumn_move_result {
-                ::core::result::Result::Ok(()) => return ::core::result::Result::Ok(()),
-                ::core::result::Result::Err(__autumn_move_err) => {
-                    if __autumn_attempt < 2
-                        && ::autumn_web::__private::is_retryable_txn_error(&__autumn_move_err)
-                    {
-                        __autumn_attempt += 1;
-                        continue;
-                    }
-                    return ::core::result::Result::Err(__autumn_move_err);
+            .load(conn)
+            .await
+            .map_err(::autumn_web::AutumnError::from)?;
+            let Some(&(_, __autumn_current)) =
+                __autumn_locked.iter().find(|(rid, _)| *rid == id)
+            else {
+                return ::core::result::Result::Err(::autumn_web::AutumnError::not_found_msg(
+                    format!("{} with id {id} not found", stringify!(#model_name)),
+                ));
+            };
+            let __autumn_len = __autumn_locked.len() as i64;
+            let __autumn_target = #target_expr;
+            if __autumn_target != __autumn_current {
+                if __autumn_target > __autumn_current {
+                    ::autumn_web::reexports::diesel::update(
+                        #table_ident::table
+                            #scope_filter
+                            #live_filter
+                            .filter(#table_ident::#position_ident.gt(__autumn_current))
+                            .filter(#table_ident::#position_ident.le(__autumn_target)),
+                    )
+                    .set(#table_ident::#position_ident.eq(#table_ident::#position_ident - 1))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                } else {
+                    ::autumn_web::reexports::diesel::update(
+                        #table_ident::table
+                            #scope_filter
+                            #live_filter
+                            .filter(#table_ident::#position_ident.ge(__autumn_target))
+                            .filter(#table_ident::#position_ident.lt(__autumn_current)),
+                    )
+                    .set(#table_ident::#position_ident.eq(#table_ident::#position_ident + 1))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
                 }
+                ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                    .set(#table_ident::#position_ident.eq(__autumn_target))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
             }
+            ::core::result::Result::Ok(())
+        }
+    };
+
+    // Wraps `body` (from `move_transaction_body`) in the retry-wrapped
+    // `pub async fn #sig` shell every move_* method shares: connection
+    // acquisition, the deadlock/serialization-failure retry loop (Codex
+    // review — see the doc comment on the loop below), and the
+    // `scoped_immediate_transaction` call.
+    let move_method = |doc: proc_macro2::TokenStream,
+                       sig: proc_macro2::TokenStream,
+                       body: proc_macro2::TokenStream| {
+        quote! {
+            #doc
+            pub async fn #sig -> ::autumn_web::AutumnResult<()> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                let mut conn = self.__autumn_acquire_conn().await?;
+                // Codex review (issue #1358): the advisory lock closes the
+                // id-order-vs-position-order row-lock deadlock between this
+                // method and the compaction triggers, but a genuinely
+                // concurrent delete/soft-delete can still win a row lock on
+                // one of this scope's rows BEFORE reaching its own
+                // trigger's advisory-lock attempt — a lock-type inversion
+                // (row lock then advisory lock, vs. this method's advisory
+                // lock then row locks) Postgres's deadlock detector
+                // resolves by aborting one side with `40P01`. Retry a
+                // bounded few times on that (or the `40001` serialization
+                // failure a stricter isolation level could raise) rather
+                // than surface a transient deadlock as a hard failure — the
+                // same classification `Db::tx_with` already relies on for
+                // its own retry loop.
+                let mut __autumn_attempt: u32 = 0;
+                loop {
+                let __autumn_move_result = ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(
+                    &mut *conn,
+                    |conn| {
+                        async move {
+                            #body
+                        }
+                        .scope_boxed()
+                    },
+                )
+                .await;
+                match __autumn_move_result {
+                    ::core::result::Result::Ok(()) => return ::core::result::Result::Ok(()),
+                    ::core::result::Result::Err(__autumn_move_err) => {
+                        if __autumn_attempt < 2
+                            && ::autumn_web::__private::is_retryable_txn_error(&__autumn_move_err)
+                        {
+                            __autumn_attempt += 1;
+                            continue;
+                        }
+                        return ::core::result::Result::Err(__autumn_move_err);
+                    }
+                }
+                }
             }
         }
     };
+
+    let move_to = move_method(
+        quote! {
+            /// Move this row to absolute index `target` within its position
+            /// scope, clamped into `[0, len-1]`. Transaction-safe: see
+            /// `position_impl_methods`'s doc comment for the locking scheme.
+        },
+        quote! { move_to(&self, id: i64, target: i64) },
+        move_transaction_body(quote! { target.clamp(0, (__autumn_len - 1).max(0)) }),
+    );
 
     let current_position_lookup = quote! {
         async fn __autumn_position_of(&self, conn: &mut ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<::autumn_web::RuntimeConnection>, id: i64) -> ::autumn_web::AutumnResult<i64> {
@@ -1747,25 +1786,28 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
         },
     );
 
-    let move_up_down = quote! {
-        /// Move this row one position toward index 0 within its scope.
-        /// A no-op at the start of its scope.
-        pub async fn move_up(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
-            let mut conn = self.__autumn_acquire_conn().await?;
-            let __autumn_current = self.__autumn_position_of(&mut conn, id).await?;
-            ::core::mem::drop(conn);
-            self.move_to(id, __autumn_current - 1).await
-        }
+    let move_up = move_method(
+        quote! {
+            /// Move this row one position toward index 0 within its scope.
+            /// A no-op at the start of its scope.
+        },
+        quote! { move_up(&self, id: i64) },
+        move_transaction_body(
+            quote! { (__autumn_current - 1).clamp(0, (__autumn_len - 1).max(0)) },
+        ),
+    );
 
-        /// Move this row one position away from index 0 within its scope.
-        /// A no-op at the end of its scope.
-        pub async fn move_down(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
-            let mut conn = self.__autumn_acquire_conn().await?;
-            let __autumn_current = self.__autumn_position_of(&mut conn, id).await?;
-            ::core::mem::drop(conn);
-            self.move_to(id, __autumn_current + 1).await
-        }
-    };
+    let move_down = move_method(
+        quote! {
+            /// Move this row one position away from index 0 within its scope.
+            /// A no-op at the end of its scope.
+        },
+        quote! { move_down(&self, id: i64) },
+        move_transaction_body(
+            quote! { (__autumn_current + 1).clamp(0, (__autumn_len - 1).max(0)) },
+        ),
+    );
+    let move_up_down = quote! { #move_up #move_down };
 
     let move_before_after = quote! {
         /// Move this row to immediately before `other_id` within their
