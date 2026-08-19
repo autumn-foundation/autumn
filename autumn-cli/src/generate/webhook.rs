@@ -10,9 +10,9 @@
 //! - `src/webhooks/mod.rs` — created or updated with `pub mod payments;`.
 //! - `src/main.rs` — `mod webhooks;` plus the route registered in `routes![…]`.
 //! - `autumn.toml` — a `[[security.webhooks.endpoints]]` stub (path, provider,
-//!   `secret_env`, replay protection on), the `[security.webhooks.replay]`
-//!   backend declaration, and the CSRF/CAPTCHA path exemptions the endpoint
-//!   needs in production.
+//!   `secret_env`, replay protection on) plus the `[security.webhooks.replay]`
+//!   backend declaration. Nothing else: the framework derives the endpoint's
+//!   CSRF/submit-token/CAPTCHA exemptions from that block on every boot.
 //! - `Cargo.toml` — `serde_json` plus the tokio dev-dependency features
 //!   `#[tokio::test]` needs.
 //!
@@ -74,7 +74,7 @@ impl Provider {
             "stripe" => Ok(Self::Stripe),
             "github" => Ok(Self::Github),
             "slack" => Ok(Self::Slack),
-            "generic" | "hmac" => Ok(Self::Generic),
+            "generic" => Ok(Self::Generic),
             other => Err(GenerateError::Config(format!(
                 "unsupported webhook provider {other:?} — supported presets are {}. Use \
                  `generic` for any provider that signs the raw body with HMAC-SHA256, then \
@@ -159,6 +159,20 @@ impl Provider {
         }
     }
 
+    /// A minimal payload for the `autumn webhook sim` line in the printed next
+    /// steps — shaped so the simulated delivery actually reaches a stub arm
+    /// (Stripe and Slack carry their event type and replay id in the body).
+    const fn sim_payload(self) -> &'static str {
+        match self {
+            Self::Stripe => r#"{"id":"evt_1","type":"payment_intent.succeeded"}"#,
+            Self::Github => r#"{"ref":"refs/heads/main"}"#,
+            Self::Slack => {
+                r#"{"event_id":"Ev1","type":"event_callback","event":{"type":"app_mention"}}"#
+            }
+            Self::Generic => r#"{"data":{}}"#,
+        }
+    }
+
     /// Where the provider's dashboard webhook should be pointed, for the
     /// printed next steps.
     const fn dashboard_hint(self) -> &'static str {
@@ -186,6 +200,9 @@ struct EndpointSpec {
     provider: Provider,
     /// Endpoint name in `autumn.toml` and in replay keys (snake-cased `<Name>`).
     name: String,
+    /// The `<Name>` argument exactly as the user typed it, so the generated
+    /// module can echo back the command that produced it.
+    display_name: String,
     /// Route path the handler and the endpoint config share.
     path: String,
     /// Environment variable supplying the signing secret.
@@ -199,9 +216,9 @@ struct EndpointSpec {
 /// # Errors
 ///
 /// Returns [`GenerateError`] when the project layout, resource name, provider
-/// preset, or `--path` override is invalid, when `src/main.rs` cannot be read,
-/// or when `autumn.toml` already configures a *different* endpoint on the same
-/// path (which would fail the framework's own duplicate-path validation at
+/// preset, `--path`, or `--secret-env` is invalid, when `src/main.rs` cannot be
+/// read, or when `autumn.toml` already configures a *different* endpoint on the
+/// same path (which would fail the framework's own duplicate-path validation at
 /// boot).
 pub fn plan_webhook(
     project_root: &Path,
@@ -210,24 +227,19 @@ pub fn plan_webhook(
     options: &WebhookOptions,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
-    validate_resource_name(name)?;
-    let provider = Provider::parse(provider)?;
+    let spec = resolve_spec(provider, name, options)?;
+    let snake_name = spec.name.clone();
 
-    let snake_name = snake(name);
-    let path = match options.path.as_deref() {
-        Some(path) => validate_route_path(path)?,
-        None => format!("/webhooks/{}", provider.as_str()),
-    };
-    let spec = EndpointSpec {
-        provider,
-        name: snake_name.clone(),
-        path,
-        secret_env: options
-            .secret_env
-            .clone()
-            .unwrap_or_else(|| provider.default_secret_env()),
-        handler_fn: format!("{snake_name}_webhook"),
-    };
+    // `src/webhooks.rs` and `src/webhooks/mod.rs` are two spellings of the same
+    // module: emitting the directory alongside an existing file is rustc E0761
+    // ("file for module found at both …"), which stops the whole project
+    // compiling. Say so instead of breaking the build.
+    if project_root.join("src").join("webhooks.rs").is_file() {
+        return Err(GenerateError::Config(
+            "src/webhooks.rs already exists, and this generator needs src/webhooks/ — rustc              rejects both spellings of one module (E0761). Move it to              src/webhooks/mod.rs first, then re-run."
+                .to_owned(),
+        ));
+    }
 
     let mut plan = Plan::new(project_root);
 
@@ -260,10 +272,18 @@ pub fn plan_webhook(
         ))
     })?;
     let route_entries = vec![format!("webhooks::{snake_name}::{}", spec.handler_fn)];
-    plan.modify(
-        main_path.clone(),
-        update_main_rs(&main_existing, &["webhooks"], &route_entries),
-    );
+    let updated_main = update_main_rs(&main_existing, &["webhooks"], &route_entries);
+    // `update_main_rs` can only splice into an existing `routes![…]`. A main.rs
+    // without one (hand-written router, or a builder that never called
+    // `.routes(…)`) would otherwise get the module declaration and no route —
+    // silently unreachable, and the signature checks would never run.
+    if !updated_main.contains(&route_entries[0]) {
+        plan.warn(format!(
+            "src/main.rs has no `routes![…]` list to register the handler in — add              `{}` to your router by hand, or the endpoint will not be mounted.",
+            route_entries[0]
+        ));
+    }
+    plan.modify(main_path.clone(), updated_main);
     // `mod webhooks;` is shared infrastructure (see
     // `emit::SHARED_MAIN_MODULE_NAMES`) — only this webhook's own route entry
     // is reverted here.
@@ -272,7 +292,7 @@ pub fn plan_webhook(
         entries: route_entries,
     });
 
-    // ── autumn.toml — endpoint stub, replay backend, path exemptions ──────
+    // ── autumn.toml — endpoint stub + replay backend ──────────────────────
     plan_autumn_toml(&mut plan, project_root, &spec)?;
 
     // ── Cargo.toml — serde_json + tokio test features ─────────────────────
@@ -297,33 +317,103 @@ pub fn plan_webhook(
         owner_dir: project_root.join("src").join("webhooks"),
     });
 
-    // ── Printed next steps (AC #5) ────────────────────────────────────────
-    plan.warn(format!(
-        "Set the signing secret before starting the app: add {}=… to `.env` (gitignored, \
-         auto-loaded in the dev/test profiles) or export it. autumn.toml references the \
-         variable via `secret_env`, so the secret itself is never committed — and the app \
-         refuses to start while a configured endpoint has no secret.",
-        spec.secret_env
-    ));
-    plan.warn(format!(
-        "Point {} at POST {} — the endpoint is registered from autumn.toml's \
-         `[[security.webhooks.endpoints]]`, so no builder wiring is needed.",
-        spec.provider.dashboard_hint(),
-        spec.path
-    ));
-    plan.warn(
-        "Production: replay protection defaults to the process-local `memory` backend, which \
-         production config validation rejects. Set [security.webhooks.replay] backend = \
-         \"redis\" (with a redis url) before deploying more than one replica."
-            .to_owned(),
-    );
-
     Ok(plan)
 }
 
-/// Validate a `--path` override: it must be an absolute route path and not the
-/// site root, matching `WebhookEndpointConfig::validate`'s own rule so a
-/// generated config can never fail at boot.
+/// Resolve one invocation's arguments into the [`EndpointSpec`] every renderer
+/// works from, validating each of them.
+///
+/// Shared by [`plan_webhook`] and [`next_steps`] so the plan and the printed
+/// instructions can never disagree about the path or the secret variable.
+///
+/// # Errors
+///
+/// Returns [`GenerateError`] when the name, provider preset, `--path`, or
+/// `--secret-env` is invalid.
+fn resolve_spec(
+    provider: &str,
+    name: &str,
+    options: &WebhookOptions,
+) -> Result<EndpointSpec, GenerateError> {
+    validate_resource_name(name)?;
+    let provider = Provider::parse(provider)?;
+    let snake_name = snake(name);
+    let path = match options.path.as_deref() {
+        Some(path) => validate_route_path(path)?,
+        None => format!("/webhooks/{}", provider.as_str()),
+    };
+    let secret_env = match options.secret_env.as_deref() {
+        Some(variable) => validate_secret_env(variable)?,
+        None => provider.default_secret_env(),
+    };
+    Ok(EndpointSpec {
+        provider,
+        name: snake_name.clone(),
+        display_name: name.to_owned(),
+        path,
+        secret_env,
+        handler_fn: format!("{snake_name}_webhook"),
+    })
+}
+
+/// The post-generation next steps, printed to stdout by `autumn generate
+/// webhook` after a successful, non-dry run (issue #1366 AC #5).
+///
+/// Deliberately not `plan.warn`: across the generator family that is for
+/// *conditional* advisories, and a clean run printing three stderr `Warning:`
+/// lines reads as three problems. The one genuine advisory here — an
+/// `autumn.toml` that could not be parsed — stays a warning.
+///
+/// `None` when the arguments do not resolve, in which case `plan_webhook`
+/// already failed with the reason.
+#[must_use]
+pub fn next_steps(provider: &str, name: &str, options: &WebhookOptions) -> Option<String> {
+    let spec = resolve_spec(provider, name, options).ok()?;
+    let EndpointSpec {
+        provider,
+        name,
+        path,
+        secret_env,
+        ..
+    } = &spec;
+    Some(format!(
+        "\nNext steps:\n\
+         \x20 1. Set the signing secret — the app refuses to start while a configured\n\
+         \x20    endpoint has none. Add {secret_env}=… to `.env` (gitignored, auto-loaded\n\
+         \x20    in dev/test) or export it; autumn.toml only names the variable, so the\n\
+         \x20    secret itself is never committed.\n\
+         \x20 2. Point {dashboard} at POST {path}. The endpoint is\n\
+         \x20    installed from autumn.toml's `[[security.webhooks.endpoints]]`, so there\n\
+         \x20    is no builder wiring to add.\n\
+         \x20 3. Try it locally without the provider:\n\
+         \x20      autumn webhook sim {slug} http://localhost:3000{path} \\\n\
+         \x20        --secret \"${secret_env}\" --payload '{payload}'\n\
+         \x20 4. Fill in the `on_*` stub functions in src/webhooks/{name}.rs.\n\
+         \x20 5. Before deploying: replay protection is on, and its default `memory`\n\
+         \x20    backend is process-local — production config validation rejects it. Set\n\
+         \x20    [security.webhooks.replay] backend = \"redis\" with a redis url (needs\n\
+         \x20    autumn-web's `redis` feature).\n",
+        dashboard = provider.dashboard_hint(),
+        slug = provider.as_str(),
+        payload = provider.sim_payload(),
+    ))
+}
+
+/// Validate a `--path` override.
+///
+/// Three separate concerns, all of them load-bearing:
+///
+/// 1. `WebhookEndpointConfig::validate` requires an absolute, non-root path, so
+///    anything else would fail the framework's own config validation at boot.
+/// 2. The value is interpolated into generated Rust source (`#[post("…")]` and
+///    the generated tests' `.post("…")`), so a quote, backslash, or control
+///    character would emit code that means something other than a path.
+/// 3. The webhook registry looks endpoints up by an **exact** path match
+///    (`WebhookRegistry::endpoint_for_path`), so an axum path parameter
+///    (`/hooks/{tenant}`) or wildcard would route requests to a handler whose
+///    extractor then cannot find its endpoint — a 500 on every real delivery,
+///    while the generated tests (which post the literal template) still pass.
+///    Rejecting it here is the only place that trap is visible.
 fn validate_route_path(path: &str) -> Result<String, GenerateError> {
     let trimmed = path.trim();
     if !trimmed.starts_with('/') || trimmed == "/" {
@@ -332,16 +422,52 @@ fn validate_route_path(path: &str) -> Result<String, GenerateError> {
              root (e.g. `--path /webhooks/stripe-billing`)"
         )));
     }
-    if trimmed.contains(char::is_whitespace) {
+    if let Some(bad) = trimmed.chars().find(|ch| !is_allowed_path_char(*ch)) {
         return Err(GenerateError::Config(format!(
-            "invalid webhook path {path:?}: route paths must not contain whitespace"
+            "invalid webhook path {path:?}: character {bad:?} is not allowed. Webhook endpoint \
+             paths are matched exactly — no path parameters (`{{tenant}}`) or wildcards — and \
+             the path is emitted into generated Rust source, so only unreserved URL path \
+             characters are accepted (e.g. `--path /webhooks/stripe-billing`)."
         )));
     }
     Ok(trimmed.to_owned())
 }
 
-/// Add the `autumn.toml` actions: the endpoint stub, the replay-backend
-/// declaration, and the CSRF/CAPTCHA exemptions for the route path.
+/// Whether `ch` is safe in a generated webhook route path: the RFC 3986
+/// unreserved and sub-delimiter path characters, minus the ones that would make
+/// the path a template (`{`, `}`, `*`) rather than a literal.
+fn is_allowed_path_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || "-._~/%:@!$&'()+,;=".contains(ch)
+}
+
+/// Validate a `--secret-env` override.
+///
+/// The value names an environment variable, and it is interpolated into
+/// generated Rust doc comments and into printed next steps. Restricting it to a
+/// C-identifier — what a POSIX shell can `export` in the first place — keeps it
+/// from carrying a newline or a quote into either sink.
+fn validate_secret_env(name: &str) -> Result<String, GenerateError> {
+    let trimmed = name.trim();
+    let valid = !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    if !valid {
+        return Err(GenerateError::Config(format!(
+            "invalid secret environment variable name {name:?}: it must be a non-empty \
+             identifier of ASCII letters, digits, and underscores, not starting with a digit \
+             (e.g. `--secret-env PARTNER_WEBHOOK_SECRET`)"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Add the `autumn.toml` actions: the endpoint stub and the replay-backend
+/// declaration.
 fn plan_autumn_toml(
     plan: &mut Plan,
     project_root: &Path,
@@ -350,6 +476,17 @@ fn plan_autumn_toml(
     let toml_path = project_root.join("autumn.toml");
     let existing = read_or_empty(&toml_path);
     reject_conflicting_endpoint(&existing, spec)?;
+
+    // A same-named endpoint the user has since tuned (extra keys, or filled-in
+    // rotation variables) is only partially owned by the generator from here on:
+    // regeneration refreshes the three keys it owns, and `destroy` will not
+    // delete the block at all. Say so once rather than surprising anyone.
+    if endpoint_diverges_from_stub(&existing, spec) {
+        plan.warn(format!(
+            "autumn.toml's {:?} webhook endpoint carries hand edits: generating refreshes only              its path/provider/secret_env, and `autumn destroy webhook` will leave the block in              place rather than delete your changes.",
+            spec.name
+        ));
+    }
 
     match upsert_webhook_endpoint(&existing, spec) {
         Some(updated) => {
@@ -361,16 +498,38 @@ fn plan_autumn_toml(
             });
         }
         None => {
-            // A config we cannot parse is left untouched rather than corrupted;
-            // the user gets the exact block to paste instead.
+            // Either the file does not parse, or `security.webhooks` uses an
+            // inline form this editing path cannot extend safely. Both leave the
+            // file untouched rather than risk corrupting it; the user gets the
+            // exact blocks to paste, replay backend included, so a hand-finished
+            // config still boots in production.
             plan.warn(format!(
-                "Could not parse {} — add this endpoint manually:\n{}",
+                "Could not edit {} (it does not parse, or `security.webhooks` uses an inline \
+                 form — convert `endpoints` to `[[security.webhooks.endpoints]]` table form). \
+                 Add this by hand:\n{}",
                 toml_path.display(),
-                manual_endpoint_block(spec)
+                manual_config_block(spec)
             ));
         }
     }
     Ok(())
+}
+
+/// Whether `autumn.toml` already holds a same-named endpoint that the generator
+/// no longer fully owns — it carries a key outside the set this generator emits,
+/// a filled-in `previous_secret_envs`, or `replay_protection = false`.
+fn endpoint_diverges_from_stub(existing: &str, spec: &EndpointSpec) -> bool {
+    let Ok(doc) = existing.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    doc.get("security")
+        .and_then(|security| security.get("webhooks"))
+        .and_then(|webhooks| webhooks.get("endpoints"))
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .into_iter()
+        .flatten()
+        .find(|endpoint| endpoint.get("name").and_then(|v| v.as_str()) == Some(spec.name.as_str()))
+        .is_some_and(|endpoint| !is_generated_endpoint_stub(endpoint))
 }
 
 /// Reject a second endpoint on a path some *other* endpoint already claims.
@@ -387,14 +546,36 @@ fn reject_conflicting_endpoint(existing: &str, spec: &EndpointSpec) -> Result<()
         .get("security")
         .and_then(|security| security.get("webhooks"))
         .and_then(|webhooks| webhooks.get("endpoints"))
-        .and_then(toml_edit::Item::as_array_of_tables)
     else {
         return Ok(());
     };
 
-    for endpoint in endpoints {
-        let name = endpoint.get("name").and_then(|v| v.as_str());
-        let path = endpoint.get("path").and_then(|v| v.as_str());
+    // Read both spellings: `[[security.webhooks.endpoints]]` table form (what
+    // this generator writes) and an inline `endpoints = [{ … }]` array, which the
+    // editing path below cannot extend but which still claims paths at boot.
+    let table_form = endpoints
+        .as_array_of_tables()
+        .into_iter()
+        .flatten()
+        .map(|endpoint| {
+            (
+                endpoint.get("name").and_then(|v| v.as_str()),
+                endpoint.get("path").and_then(|v| v.as_str()),
+            )
+        });
+    let inline_form = endpoints
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(toml_edit::Value::as_inline_table)
+        .map(|endpoint| {
+            (
+                endpoint.get("name").and_then(|v| v.as_str()),
+                endpoint.get("path").and_then(|v| v.as_str()),
+            )
+        });
+
+    for (name, path) in table_form.chain(inline_form) {
         if path == Some(spec.path.as_str()) && name != Some(spec.name.as_str()) {
             return Err(GenerateError::Config(format!(
                 "autumn.toml already configures webhook endpoint {:?} on path {:?}; two \
@@ -410,11 +591,14 @@ fn reject_conflicting_endpoint(existing: &str, spec: &EndpointSpec) -> Result<()
     Ok(())
 }
 
-/// The `[[security.webhooks.endpoints]]` block, as text, for the "could not
-/// parse autumn.toml" fallback.
-fn manual_endpoint_block(spec: &EndpointSpec) -> String {
+/// The config blocks, as text, for the "could not edit autumn.toml" fallback.
+///
+/// Includes the replay backend as well as the endpoint: an endpoint pasted
+/// without it would boot in dev and then fail production config validation.
+fn manual_config_block(spec: &EndpointSpec) -> String {
     format!(
-        "[[security.webhooks.endpoints]]\nname = \"{}\"\npath = \"{}\"\nprovider = \"{}\"\n\
+        "\n[security.webhooks.replay]\nbackend = \"memory\"  # production must use redis\n\n\
+         [[security.webhooks.endpoints]]\nname = \"{}\"\npath = \"{}\"\nprovider = \"{}\"\n\
          secret_env = \"{}\"\nreplay_protection = true\n",
         spec.name,
         spec.path,
@@ -423,9 +607,17 @@ fn manual_endpoint_block(spec: &EndpointSpec) -> String {
     )
 }
 
-/// Insert (idempotently) this webhook's `autumn.toml` configuration:
-/// `[security.webhooks.replay]`, the `[[security.webhooks.endpoints]]` entry,
-/// and the CSRF/CAPTCHA exemptions for its path.
+/// The first line of the comment block [`upsert_webhook_endpoint`] writes above
+/// `[security.webhooks.replay]`. Removal uses it to tell this generator's own
+/// decor apart from document trivia parked in front of it.
+const REPLAY_COMMENT_MARKER: &str = "\n# Replay-protection storage for signed webhooks.";
+
+/// The same, for the comment block above `[[security.webhooks.endpoints]]`.
+const ENDPOINT_COMMENT_MARKER: &str = "\n# Signed webhook intake generated by";
+
+/// Insert (idempotently) this webhook's `autumn.toml` configuration: the
+/// `[security.webhooks.replay]` backend declaration and the
+/// `[[security.webhooks.endpoints]]` entry.
 ///
 /// Edits are made through `toml_edit` so comments, key order, and hand-crafted
 /// array layout in the rest of the file survive untouched. Returns `None` when
@@ -434,6 +626,20 @@ fn upsert_webhook_endpoint(existing: &str, spec: &EndpointSpec) -> Option<String
     use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value, value};
 
     let mut doc = existing.parse::<DocumentMut>().ok()?;
+
+    // A new root table is appended AFTER the document's trailing trivia, so a
+    // file that ends in comments — `autumn new`'s own autumn.toml ends with the
+    // commented-out `[health]` probe paths and `[session]` block — would have
+    // them re-parented under our last inserted header. Uncommenting one would
+    // then silently set a key in the wrong table. Detach the trivia here and
+    // prepend it to the FIRST table this function inserts, which puts it back
+    // above everything generated and so still inside the table it documents.
+    // (Re-attaching it as trailing trivia instead would only move the problem to
+    // the last generated table.)
+    let mut pending_trailing = doc.trailing().as_str().unwrap_or_default().to_owned();
+    if !pending_trailing.is_empty() {
+        doc.set_trailing("");
+    }
 
     let security_missing = !doc.as_table().contains_key("security");
     let security = doc
@@ -459,11 +665,18 @@ fn upsert_webhook_endpoint(existing: &str, spec: &EndpointSpec) -> Option<String
     // ── [security.webhooks.replay] ────────────────────────────────────────
     if !webhooks.contains_key("replay") {
         let mut replay = Table::new();
+        // Deliberately points at redis only. There *is* an
+        // `allow_memory_in_production` escape hatch, but a developer meeting a
+        // hard boot failure at deploy time would take the one-line bool and
+        // silently lose cross-replica replay protection — so that caveat stays
+        // in the guide, where its single-replica precondition can be stated.
         replay.decor_mut().set_prefix(
-            "\n# Replay-protection storage for signed webhooks. \"memory\" is process-local:\n\
-             # fine for tests, development, and single-replica deployments, but production\n\
-             # config validation rejects it — switch to redis (or set\n\
-             # allow_memory_in_production = true) before running more than one replica.\n\
+            std::mem::take(&mut pending_trailing)
+                + REPLAY_COMMENT_MARKER
+                + " \"memory\" is process-local:\n\
+             # fine for tests and development, but production config validation rejects it,\n\
+             # so a deployed app must use redis (shared across every replica). The redis\n\
+             # backend needs autumn-web built with its `redis` feature:\n\
              #\n\
              # backend = \"redis\"\n\
              # [security.webhooks.replay.redis]\n\
@@ -478,19 +691,38 @@ fn upsert_webhook_endpoint(existing: &str, spec: &EndpointSpec) -> Option<String
         .entry("endpoints")
         .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()))
         .as_array_of_tables_mut()?;
-    let already_present = endpoints
-        .iter()
-        .any(|endpoint| endpoint.get("name").and_then(|v| v.as_str()) == Some(spec.name.as_str()));
-    if !already_present {
+    if let Some(existing_entry) = endpoints
+        .iter_mut()
+        .find(|entry| entry.get("name").and_then(|v| v.as_str()) == Some(spec.name.as_str()))
+    {
+        // Regeneration (`--force`) with a changed `--path`, `--secret-env`, or
+        // provider must not leave the old values behind: the handler would move
+        // while the config stayed put, and since the registry matches paths
+        // exactly, every real delivery would 500 with no failing test to show it.
+        // Only these three keys are refreshed — anything the user tuned
+        // (`timestamp_tolerance_secs`, extra headers, rotation variables) is
+        // theirs and is left alone.
+        existing_entry.insert("path", value(spec.path.as_str()));
+        existing_entry.insert("provider", value(spec.provider.as_str()));
+        existing_entry.insert("secret_env", value(spec.secret_env.as_str()));
+        if !existing_entry.contains_key("replay_protection") {
+            existing_entry.insert("replay_protection", value(true));
+        }
+    } else {
         let mut endpoint = Table::new();
-        endpoint.decor_mut().set_prefix(format!(
-            "\n# Signed webhook intake generated by `autumn generate webhook {} {}`.\n\
-             # The secret itself lives in the {} environment variable — never inline it here.\n\
-             # During rotation, add the previous value's variable to previous_secret_envs.\n",
-            spec.provider.as_str(),
-            spec.name,
-            spec.secret_env,
-        ));
+        // Static text: every dynamic value belongs in an escaped `value(…)` key
+        // below, never in decor, which `toml_edit` emits verbatim.
+        endpoint.decor_mut().set_prefix(
+            std::mem::take(&mut pending_trailing)
+                + "\n# Signed webhook intake generated by `autumn generate webhook`. The signing\n\
+             # secret lives in the secret_env variable below — never inline it here. During\n\
+             # rotation, add the previous value's variable to previous_secret_envs.\n\
+             #\n\
+             # This block is all the wiring the endpoint needs: Autumn installs the webhook\n\
+             # registry from it at startup, and derives the endpoint's CSRF, submit-token,\n\
+             # and CAPTCHA path exemptions from it on every boot (a provider callback\n\
+             # carries no browser session; its signature is its authentication).\n",
+        );
         endpoint.insert("name", value(spec.name.as_str()));
         endpoint.insert("path", value(spec.path.as_str()));
         endpoint.insert("provider", value(spec.provider.as_str()));
@@ -503,57 +735,106 @@ fn upsert_webhook_endpoint(existing: &str, spec: &EndpointSpec) -> Option<String
         endpoints.push(endpoint);
     }
 
-    // ── path exemptions ───────────────────────────────────────────────────
-    // The `prod` profile turns CSRF on via smart defaults, and a configured
-    // CAPTCHA challenges unauthenticated POSTs — either would reject a provider
-    // callback that (correctly) carries no browser session. Signature
-    // verification is this endpoint's authentication.
-    let security = doc.as_table_mut().get_mut("security")?.as_table_mut()?;
-    let csrf_missing = !security.contains_key("csrf");
-    let csrf = security
-        .entry("csrf")
-        .or_insert_with(|| Item::Table(Table::new()))
-        .as_table_mut()?;
-    if csrf_missing {
-        csrf.decor_mut().set_prefix(
-            "\n# Signed webhooks authenticate with a provider signature, not a browser\n\
-             # session, so their paths must be exempt from CSRF (the prod profile enables it).\n",
-        );
+    // Nothing was inserted (a fully idempotent re-run): put the trivia back
+    // exactly where it was.
+    if !pending_trailing.is_empty() {
+        doc.set_trailing(&pending_trailing);
     }
-    push_unique_str(
-        csrf.entry("exempt_paths")
-            .or_insert_with(|| Item::Value(Value::Array(Array::new())))
-            .as_array_mut()?,
-        &spec.path,
-    );
 
-    push_unique_str(
-        security
-            .entry("captcha_exempt_paths")
-            .or_insert_with(|| Item::Value(Value::Array(Array::new())))
-            .as_array_mut()?,
-        &spec.path,
-    );
-
+    // No CSRF/CAPTCHA `exempt_paths` entries are written here on purpose. The
+    // framework already derives both from `security.webhooks.endpoints` on every
+    // boot — `build_csrf_layer`, `build_submit_token_layer`, and
+    // `build_bot_protection_layer` each call `with_exempt_path(&endpoint.path)`
+    // for every configured endpoint — so a copy in `[security.csrf]
+    // exempt_paths` would add no protection while introducing a second source of
+    // truth that goes stale: change this block's `path` (or delete the block) and
+    // the derived exemption follows, but a literal copy would keep exempting the
+    // old path *and its whole subtree* from CSRF and CAPTCHA forever, with no
+    // signature check behind it (the registry matches paths exactly).
     Some(doc.to_string())
 }
 
-/// Append `value` to a TOML array unless it is already there.
-fn push_unique_str(array: &mut toml_edit::Array, value: &str) {
-    if array.iter().any(|item| item.as_str() == Some(value)) {
-        return;
+/// The keys [`upsert_webhook_endpoint`] emits into an endpoint table. An entry
+/// carrying anything else has been tuned by hand.
+const GENERATED_ENDPOINT_KEYS: &[&str] = &[
+    "name",
+    "path",
+    "provider",
+    "secret_env",
+    "previous_secret_envs",
+    "replay_protection",
+];
+
+/// Whether an endpoint table still looks exactly like a generated stub — no key
+/// outside [`GENERATED_ENDPOINT_KEYS`], no rotation variables filled in, and
+/// replay protection still on.
+///
+/// `autumn destroy` uses this to refuse to delete config the user has since made
+/// their own: `Plan::revert`'s divergence guard only covers whole `Create`d
+/// files, so an in-place TOML edit has to check for itself (the same posture
+/// `generate auth`'s stub removal takes).
+fn is_generated_endpoint_stub(endpoint: &toml_edit::Table) -> bool {
+    let unknown_key = endpoint
+        .iter()
+        .any(|(key, _)| !GENERATED_ENDPOINT_KEYS.contains(&key));
+    let rotation_filled = endpoint
+        .get("previous_secret_envs")
+        .and_then(toml_edit::Item::as_array)
+        .is_some_and(|envs| !envs.is_empty());
+    let replay_disabled = endpoint
+        .get("replay_protection")
+        .and_then(toml_edit::Item::as_bool)
+        == Some(false);
+    !unknown_key && !rotation_filled && !replay_disabled
+}
+
+/// Whether the replay table is still the untouched `backend = "memory"` stub
+/// this generator writes — so `destroy` never deletes a hand-configured redis
+/// backend on its way out.
+fn is_generated_replay_stub(replay: &toml_edit::Table) -> bool {
+    replay.len() == 1 && replay.get("backend").and_then(toml_edit::Item::as_str) == Some("memory")
+}
+
+/// Document trivia parked in a generated table's decor prefix by
+/// [`upsert_webhook_endpoint`] — the comments that trailed the file before this
+/// generator inserted anything.
+///
+/// Removing a `toml_edit` table takes its decor with it, so removal has to hand
+/// this text back to the document instead of deleting the user's comments along
+/// with the block.
+fn parked_trivia(prefix: &str) -> &str {
+    for marker in [REPLAY_COMMENT_MARKER, ENDPOINT_COMMENT_MARKER] {
+        if let Some(index) = prefix.find(marker) {
+            return &prefix[..index];
+        }
     }
-    array.push(value);
+    ""
+}
+
+/// The trivia parked in front of one table, as an owned `String`.
+fn parked_trivia_of(table: &toml_edit::Table) -> String {
+    parked_trivia(
+        table
+            .decor()
+            .prefix()
+            .and_then(toml_edit::RawString::as_str)
+            .unwrap_or_default(),
+    )
+    .to_owned()
 }
 
 /// Inverse of [`upsert_webhook_endpoint`] (`autumn destroy`, issue #1048).
 ///
-/// Removes the `[[security.webhooks.endpoints]]` entry this generator added
-/// (matched on both name and path, so a hand-added endpoint that merely shares
-/// a name is never touched), its CSRF/CAPTCHA path exemptions, and — once no
-/// endpoint is left — the `[security.webhooks.replay]` block, collapsing any
-/// table the removals leave empty. A no-op when the document does not parse or
-/// the entry is already gone.
+/// Removes the `[[security.webhooks.endpoints]]` entry this generator added —
+/// matched on name *and* path, and only while it still looks like an untouched
+/// stub ([`is_generated_endpoint_stub`]) — and, once no endpoint is left, the
+/// shared `[security.webhooks.replay]` block if that is still an untouched stub
+/// too, collapsing any table the removals leave empty and restoring any document
+/// trivia that was parked in front of them.
+///
+/// A no-op when the document does not parse or `[security]`/`webhooks` is
+/// absent. When the endpoint is already gone but an orphaned generated replay
+/// block remains, that block is still cleaned up.
 pub(super) fn remove_webhook_endpoint(existing: &str, name: &str, route_path: &str) -> String {
     let Ok(mut doc) = existing.parse::<toml_edit::DocumentMut>() else {
         return existing.to_owned();
@@ -566,74 +847,71 @@ pub(super) fn remove_webhook_endpoint(existing: &str, name: &str, route_path: &s
     else {
         return existing.to_owned();
     };
-
-    let mut removed = false;
-    if let Some(webhooks) = security
+    let Some(webhooks) = security
         .get_mut("webhooks")
         .and_then(toml_edit::Item::as_table_mut)
+    else {
+        return existing.to_owned();
+    };
+
+    // Trivia the removals would otherwise take with them, in document order.
+    let mut salvaged = String::new();
+
+    if let Some(endpoints) = webhooks
+        .get_mut("endpoints")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
     {
-        if let Some(endpoints) = webhooks
-            .get_mut("endpoints")
-            .and_then(toml_edit::Item::as_array_of_tables_mut)
-        {
-            let before = endpoints.len();
-            endpoints.retain(|endpoint| {
-                let matches_name = endpoint.get("name").and_then(|v| v.as_str()) == Some(name);
-                let matches_path =
-                    endpoint.get("path").and_then(|v| v.as_str()) == Some(route_path);
-                !(matches_name && matches_path)
-            });
-            removed = endpoints.len() < before;
-            if endpoints.is_empty() {
+        let ours = endpoints.iter().position(|endpoint| {
+            endpoint.get("name").and_then(|v| v.as_str()) == Some(name)
+                && endpoint.get("path").and_then(|v| v.as_str()) == Some(route_path)
+                && is_generated_endpoint_stub(endpoint)
+        });
+        match ours {
+            Some(index) => {
+                if let Some(endpoint) = endpoints.get(index) {
+                    salvaged.push_str(&parked_trivia_of(endpoint));
+                }
+                endpoints.remove(index);
+                if endpoints.is_empty() {
+                    webhooks.remove("endpoints");
+                }
+            }
+            // Not ours, hand-edited, or already destroyed: leave the endpoints
+            // alone. An orphaned replay stub below is still cleaned up.
+            None if !endpoints.is_empty() => return existing.to_owned(),
+            None => {
                 webhooks.remove("endpoints");
             }
         }
-        if !removed {
-            return existing.to_owned();
-        }
-        // The shared replay backend only exists to serve endpoints; with the
-        // last one gone it has nothing left to configure.
-        if !webhooks.contains_key("endpoints") {
+    }
+
+    // With no endpoint left, the shared replay backend has nothing to configure.
+    // Reached both after removing the last endpoint and when the user removed it
+    // by hand, so an orphaned stub never lingers.
+    if !webhooks.contains_key("endpoints") {
+        let generated_replay = webhooks
+            .get("replay")
+            .and_then(toml_edit::Item::as_table)
+            .filter(|replay| is_generated_replay_stub(replay))
+            .map(parked_trivia_of);
+        if let Some(trivia) = generated_replay {
+            salvaged.insert_str(0, &trivia);
             webhooks.remove("replay");
         }
-        if webhooks.is_empty() {
-            security.remove("webhooks");
-        }
     }
-
-    if !removed {
-        return existing.to_owned();
-    }
-
-    if let Some(csrf) = security
-        .get_mut("csrf")
-        .and_then(toml_edit::Item::as_table_mut)
-    {
-        let emptied = remove_from_array(csrf.get_mut("exempt_paths"), route_path);
-        if emptied {
-            csrf.remove("exempt_paths");
-        }
-        if csrf.is_empty() {
-            security.remove("csrf");
-        }
-    }
-    if remove_from_array(security.get_mut("captcha_exempt_paths"), route_path) {
-        security.remove("captcha_exempt_paths");
+    if webhooks.is_empty() {
+        security.remove("webhooks");
     }
     if security.is_empty() {
         doc.as_table_mut().remove("security");
     }
 
-    doc.to_string()
-}
+    if !salvaged.is_empty() {
+        let trailing = doc.trailing().as_str().unwrap_or_default().to_owned();
+        doc.set_trailing(salvaged + &trailing);
+    }
 
-/// Remove `value` from a TOML array item, reporting whether that left it empty.
-fn remove_from_array(item: Option<&mut toml_edit::Item>, value: &str) -> bool {
-    let Some(array) = item.and_then(toml_edit::Item::as_array_mut) else {
-        return false;
-    };
-    array.retain(|entry| entry.as_str() != Some(value));
-    array.is_empty()
+    doc.to_string()
 }
 
 // ── Template rendering ───────────────────────────────────────────────────────
@@ -643,10 +921,11 @@ fn remove_from_array(item: Option<&mut toml_edit::Item>, value: &str) -> bool {
 fn render_handler_file(spec: &EndpointSpec) -> String {
     let EndpointSpec {
         provider,
-        name,
+        display_name,
         path,
         secret_env,
         handler_fn,
+        ..
     } = spec;
     let label = provider.label();
     let dispatch = render_dispatch(spec);
@@ -655,7 +934,7 @@ fn render_handler_file(spec: &EndpointSpec) -> String {
 
     format!(
         r#"//! Signed inbound webhook intake for {label} — generated by
-//! `autumn generate webhook {provider_name} {name}`. Edit freely; once
+//! `autumn generate webhook {provider_name} {display_name}`. Edit freely; once
 //! generated this is ordinary application code.
 //!
 //! The `SignedWebhook` extractor verifies the provider signature against the
@@ -715,24 +994,16 @@ pub async fn {handler_fn}(webhook: SignedWebhook) -> AutumnResult<Json<serde_jso
 }
 
 /// Render the `match webhook.event_type()` dispatch skeleton.
+///
+/// Each stub arm carries its own `// TODO` marker so the work to do is visible
+/// at the dispatch site, not only in the stub function it delegates to.
 fn render_dispatch(spec: &EndpointSpec) -> String {
-    let arms = spec
-        .provider
-        .stub_events()
-        .iter()
-        .fold(String::new(), |mut out, event| {
-            let _ = writeln!(
-                out,
-                "        {event:?} => {}(&event).await?,",
-                stub_fn(event)
-            );
-            out
-        });
-
     // Slack wraps every Events API callback in an `event_callback` envelope, and
     // `event_type()` reports that envelope's type — so the inner event type is
-    // unwrapped here rather than matched directly.
+    // unwrapped and matched here, and the stubs receive the inner event object
+    // rather than the envelope.
     if spec.provider == Provider::Slack {
+        let arms = dispatch_arms(spec, 16, "inner_event");
         return format!(
             r#"    match event_type {{
         // Slack's one-time endpoint handshake: echo the challenge verbatim.
@@ -744,40 +1015,72 @@ fn render_dispatch(spec: &EndpointSpec) -> String {
             return Ok(Json(serde_json::json!({{ "challenge": challenge }})));
         }}
         "event_callback" => {{
-            let inner = event
-                .get("event")
-                .and_then(|inner| inner.get("type"))
+            // The envelope's `event` object is what the handlers care about.
+            let inner_event = event.get("event").unwrap_or(&event);
+            let inner_type = inner_event
+                .get("type")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
-            match inner {{
-{arms}                // Acknowledge and ignore: a 2xx tells Slack not to retry an
-                // event this app does not handle.
-                other => tracing::debug!(event_type = other, "unhandled Slack event — acknowledged"),
+            match inner_type {{
+{arms}                // Acknowledge and ignore: a 2xx tells Slack not to retry
+                // an event this app does not handle.
+                other => {{
+                    tracing::debug!(event_type = other, "unhandled Slack event — acknowledged")
+                }}
             }}
         }}
         // Acknowledge and ignore every other envelope type.
         _ => tracing::debug!(event_type, "unhandled Slack callback — acknowledged"),
     }}
-"#,
-            arms = arms.lines().fold(String::new(), |mut out, line| {
-                let _ = writeln!(out, "    {line}");
-                out
-            }),
+"#
         );
     }
 
+    let arms = dispatch_arms(spec, 8, "&event");
     format!(
         r#"    match event_type {{
 {arms}        // Acknowledge and ignore: returning 2xx stops the provider from
         // retrying an event this app does not handle.
-        _ => tracing::debug!(event_type, "unhandled webhook event — acknowledged and ignored"),
+        _ => tracing::debug!(
+            event_type,
+            "unhandled webhook event — acknowledged and ignored"
+        ),
     }}
 "#
     )
 }
 
+/// One `"<event>" => on_<event>(&<payload>).await?, // TODO` arm per stub event,
+/// indented by `indent` spaces (8 at the top level, 16 inside Slack's nested
+/// envelope match) so the emitted code is `rustfmt`-clean as written.
+fn dispatch_arms(spec: &EndpointSpec, indent: usize, payload: &str) -> String {
+    let pad = " ".repeat(indent);
+    spec.provider
+        .stub_events()
+        .iter()
+        .fold(String::new(), |mut out, event| {
+            // The marker goes ABOVE the arm, not trailing: `rustfmt` aligns
+            // trailing comments across adjacent arms, so the emitted file would
+            // not be format-clean as written.
+            let _ = writeln!(out, "{pad}// TODO: fill this in");
+            let _ = writeln!(
+                out,
+                "{pad}{event:?} => {}({payload}).await?,",
+                stub_fn(event),
+            );
+            out
+        })
+}
+
 /// Render one clearly-marked stub function per dispatched event type.
 fn render_event_stubs(spec: &EndpointSpec) -> String {
+    // Slack's stubs are handed the unwrapped inner event (see `render_dispatch`);
+    // every other preset's receive the whole verified payload.
+    let payload_doc = if spec.provider == Provider::Slack {
+        "`event` is the verified callback's inner event object"
+    } else {
+        "`event` is the verified payload"
+    };
     spec.provider
         .stub_events()
         .iter()
@@ -786,7 +1089,7 @@ fn render_event_stubs(spec: &EndpointSpec) -> String {
                 out,
                 r#"/// TODO: handle the `{event}` event.
 ///
-/// `event` is the verified payload. Keep this idempotent — the same delivery
+/// {payload_doc}. Keep this idempotent — the same delivery
 /// can arrive twice — and enqueue a job for anything slow.
 async fn {fn_name}(event: &serde_json::Value) -> AutumnResult<()> {{
     let _ = event; // TODO: remove once the payload is used.
@@ -831,7 +1134,7 @@ fn render_tests(spec: &EndpointSpec) -> String {
         ..
     } = spec;
     let provider = *provider;
-    let fixture = fixture_body(provider);
+    let body_const = render_body_const(fixture_body(provider));
     let signature_helper = signature_helper(provider);
     // Only the timestamped presets (Stripe, Slack) bind a request timestamp;
     // emitting an unused one for the others would warn on every build.
@@ -862,7 +1165,7 @@ mod tests {{
 
     /// A delivery shaped like the real thing. Replace it with a captured
     /// payload from your provider dashboard as you fill the handlers in.
-    const BODY: &str = {fixture};
+{body_const}
 
     fn test_config() -> AutumnConfig {{
         AutumnConfig {{
@@ -966,6 +1269,19 @@ fn render_test_cases(spec: &EndpointSpec) -> String {
     )
 }
 
+/// The `const BODY` declaration for the generated test module, wrapped onto a
+/// second line when the single-line form would pass 100 columns — so the emitted
+/// file is `rustfmt`-clean as written.
+fn render_body_const(fixture: &str) -> String {
+    const DECL: &str = "    const BODY: &str = ";
+    // +1 for the trailing `;`.
+    if DECL.len() + fixture.len() < 100 {
+        format!("{DECL}{fixture};")
+    } else {
+        format!("    const BODY: &str =\n        {fixture};")
+    }
+}
+
 /// The fixture request body used by every generated test.
 const fn fixture_body(provider: Provider) -> &'static str {
     match provider {
@@ -1040,25 +1356,47 @@ const fn invalid_signature_expr(provider: Provider) -> &'static str {
 /// The `.header(…)` lines a signed request needs, with `signature_expr`
 /// supplying the signature header's value.
 fn request_headers(provider: Provider, signature_expr: &str) -> String {
-    match provider {
-        Provider::Stripe => {
-            format!("            .header(\"stripe-signature\", {signature_expr})\n")
+    let signature = match provider {
+        Provider::Stripe => header_call("stripe-signature", signature_expr),
+        Provider::Github => header_call("x-hub-signature-256", signature_expr),
+        Provider::Slack => header_call("x-slack-signature", signature_expr),
+        Provider::Generic => header_call("x-webhook-signature", signature_expr),
+    };
+    let metadata = match provider {
+        // Stripe carries its event type and delivery id in the JSON body.
+        Provider::Stripe => String::new(),
+        Provider::Github => {
+            header_call("x-github-event", "\"push\"")
+                + &header_call(
+                    "x-github-delivery",
+                    "\"00000000-0000-0000-0000-000000000001\"",
+                )
         }
-        Provider::Github => format!(
-            "            .header(\"x-hub-signature-256\", {signature_expr})\n\
-             \x20           .header(\"x-github-event\", \"push\")\n\
-             \x20           .header(\"x-github-delivery\", \"00000000-0000-0000-0000-000000000001\")\n"
-        ),
-        Provider::Slack => format!(
-            "            .header(\"x-slack-signature\", {signature_expr})\n\
-             \x20           .header(\"x-slack-request-timestamp\", &timestamp.to_string())\n"
-        ),
-        Provider::Generic => format!(
-            "            .header(\"x-webhook-signature\", {signature_expr})\n\
-             \x20           .header(\"x-webhook-event\", \"example.created\")\n\
-             \x20           .header(\"x-webhook-delivery\", \"delivery-1\")\n"
-        ),
+        Provider::Slack => header_call("x-slack-request-timestamp", "&timestamp.to_string()"),
+        Provider::Generic => {
+            header_call("x-webhook-event", "\"example.created\"")
+                + &header_call("x-webhook-delivery", "\"delivery-1\"")
+        }
+    };
+    signature + &metadata
+}
+
+/// One `.header(name, value)` line in a generated test's request builder,
+/// wrapped across lines when `rustfmt` would wrap it anyway.
+///
+/// The trigger is `rustfmt`'s `fn_call_width` (60 by default, and this workspace
+/// does not override it): a call whose argument list is wider than that gets one
+/// argument per line, whatever the total column count. Emitting that shape up
+/// front is what keeps generated files format-clean as written.
+fn header_call(name: &str, value_expr: &str) -> String {
+    const FN_CALL_WIDTH: usize = 60;
+    let arguments = format!("\"{name}\", {value_expr}");
+    if arguments.chars().count() <= FN_CALL_WIDTH {
+        return format!("            .header({arguments})\n");
     }
+    format!(
+        "            .header(\n                \"{name}\",\n                {value_expr},\n            )\n"
+    )
 }
 
 #[cfg(test)]
@@ -1092,9 +1430,14 @@ async fn main() {
              [dev-dependencies]\ntokio = { version = \"1\", features = [\"macros\"] }\n",
         )
         .unwrap();
+        // Ends in a comment block, like `autumn new`'s own autumn.toml: the
+        // generator has to keep those comments attached to `[health]` rather
+        // than re-parenting them under a generated table, and `destroy` has to
+        // put them back rather than delete them with the block.
         fs::write(
             tmp.path().join("autumn.toml"),
-            "[server]\nhost = \"127.0.0.1\"\nport = 3000\n",
+            "[server]\nhost = \"127.0.0.1\"\nport = 3000\n\n[health]\npath = \"/health\"\n\
+             # live_path = \"/live\"\n# ready_path = \"/ready\"\n",
         )
         .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -1113,7 +1456,7 @@ async fn main() {
         .unwrap()
     }
 
-    // ── AC #1: post route + shipped extractor ────────────────────────────
+    // ── #1366 AC #1: post route + shipped extractor ────────────────────────────
 
     #[test]
     fn generated_handler_uses_post_route_and_signed_webhook_extractor() {
@@ -1139,7 +1482,7 @@ async fn main() {
         );
     }
 
-    // ── AC #2: event dispatch with stub arms + default ack-and-ignore ────
+    // ── #1366 AC #2: event dispatch with stub arms + default ack-and-ignore ────
 
     #[test]
     fn generated_handler_dispatches_on_event_type_with_stubs_and_default_arm() {
@@ -1161,7 +1504,7 @@ async fn main() {
         );
     }
 
-    // ── AC #3: provider presets ──────────────────────────────────────────
+    // ── #1366 AC #3: provider presets ──────────────────────────────────────────
 
     #[test]
     fn every_supported_provider_preset_generates_its_own_shape() {
@@ -1204,7 +1547,7 @@ async fn main() {
         assert!(message.contains("generic"), "{message}");
     }
 
-    // ── AC #4: autumn.toml endpoint stub ─────────────────────────────────
+    // ── #1366 AC #4: autumn.toml endpoint stub ─────────────────────────────────
 
     #[test]
     fn autumn_toml_gets_a_secret_env_endpoint_stub_with_replay_protection() {
@@ -1231,17 +1574,33 @@ async fn main() {
     }
 
     #[test]
-    fn autumn_toml_exempts_the_webhook_path_from_csrf() {
+    fn autumn_toml_writes_no_redundant_csrf_or_captcha_exemptions() {
+        // The framework derives the endpoint's CSRF / submit-token / CAPTCHA
+        // exemptions from `security.webhooks.endpoints` on every boot
+        // (`build_csrf_layer` and friends call `with_exempt_path` per endpoint),
+        // so a copy in `[security.csrf] exempt_paths` would add no protection
+        // while creating a second source of truth that goes stale — and a stale
+        // entry exempts the old path *and its whole subtree* forever.
         let tmp = project();
         generated(&tmp, "stripe", "Payments");
         let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+
         assert!(
-            toml.contains("[security.csrf]") && toml.contains("\"/webhooks/stripe\""),
-            "the prod profile enables CSRF, so the webhook path must be exempt:\n{toml}"
+            !toml.contains("exempt_paths"),
+            "path exemptions are derived from the endpoint block, not copied:\n{toml}"
         );
         assert!(
-            toml.contains("captcha_exempt_paths"),
-            "a configured CAPTCHA would challenge provider callbacks too:\n{toml}"
+            !toml.contains("captcha_exempt_paths"),
+            "path exemptions are derived from the endpoint block, not copied:\n{toml}"
+        );
+        assert_eq!(
+            toml.matches("\"/webhooks/stripe\"").count(),
+            1,
+            "the route path must appear exactly once — in the endpoint block:\n{toml}"
+        );
+        assert!(
+            toml.contains("CAPTCHA path exemptions from it on every boot"),
+            "the generated block should say the exemptions are automatic:\n{toml}"
         );
     }
 
@@ -1280,8 +1639,8 @@ async fn main() {
         );
         assert_eq!(
             toml.matches("\"/webhooks/stripe\"").count(),
-            3,
-            "one endpoint path + the csrf and captcha exemptions, no duplicates:\n{toml}"
+            1,
+            "the endpoint path must not be duplicated:\n{toml}"
         );
     }
 
@@ -1325,7 +1684,19 @@ async fn main() {
     #[test]
     fn an_invalid_path_override_is_rejected() {
         let tmp = project();
-        for bad in ["hooks/billing", "/"] {
+        for bad in [
+            "hooks/billing", // not absolute
+            "/",             // site root
+            "/hooks billing",
+            // Would break out of the generated `#[post("…")]` attribute.
+            "/a\")]pub fn evil(){}//",
+            "/hooks\\billing",
+            "/hooks\nbilling",
+            // Matched exactly by the registry: a path template would 500 on
+            // every real delivery while the generated tests still passed.
+            "/hooks/{tenant}/in",
+            "/hooks/*rest",
+        ] {
             let options = WebhookOptions {
                 path: Some(bad.to_owned()),
                 secret_env: None,
@@ -1335,9 +1706,48 @@ async fn main() {
                 "path {bad:?} must be rejected"
             );
         }
+        assert!(
+            !tmp.path().join("src/webhooks").exists(),
+            "a rejected invocation must write nothing"
+        );
     }
 
-    // ── AC #5: app wiring ────────────────────────────────────────────────
+    #[test]
+    fn an_invalid_secret_env_override_is_rejected() {
+        // `--secret-env` reaches generated Rust doc comments and printed next
+        // steps, and named a TOML comment before this was locked down: a newline
+        // could smuggle in a whole `[[security.webhooks.endpoints]]` block with a
+        // plaintext `secret = "…"` and replay protection off.
+        let tmp = project();
+        for bad in [
+            "",
+            "  ",
+            "1BAD",
+            "BAD-NAME",
+            "BAD NAME",
+            "BAD\"NAME",
+            "X\n\n[[security.webhooks.endpoints]]\nname = \"evil\"\nsecret = \"known\"\n# ",
+        ] {
+            let options = WebhookOptions {
+                path: None,
+                secret_env: Some(bad.to_owned()),
+            };
+            let Err(error) = plan_webhook(tmp.path(), "stripe", "Payments", &options) else {
+                panic!("secret env {bad:?} must be rejected");
+            };
+            assert!(
+                error.to_string().contains("secret environment variable"),
+                "unexpected error for {bad:?}: {error}"
+            );
+        }
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert!(
+            !toml.contains("secret ="),
+            "no plaintext secret may ever reach autumn.toml:\n{toml}"
+        );
+    }
+
+    // ── #1366 AC #5: app wiring ────────────────────────────────────────────────
 
     #[test]
     fn the_route_is_registered_in_main_rs_and_next_steps_are_printed() {
@@ -1345,13 +1755,26 @@ async fn main() {
         let plan =
             plan_webhook(tmp.path(), "stripe", "Payments", &WebhookOptions::default()).unwrap();
         assert!(
-            plan.warnings
-                .iter()
-                .any(|w| w.contains("STRIPE_WEBHOOK_SECRET")),
-            "the secret env var must be part of the printed next steps: {:?}",
+            plan.warnings.is_empty(),
+            "a clean run must print no warnings — next steps go to stdout: {:?}",
             plan.warnings
         );
         plan.execute(Flags::default()).unwrap();
+
+        let steps = next_steps("stripe", "Payments", &WebhookOptions::default())
+            .expect("resolvable arguments have next steps");
+        assert!(
+            steps.contains("STRIPE_WEBHOOK_SECRET"),
+            "the secret env var must be named in the next steps:\n{steps}"
+        );
+        assert!(
+            steps.contains("autumn webhook sim stripe"),
+            "the next steps should show how to fire a test delivery:\n{steps}"
+        );
+        assert!(
+            steps.contains("POST /webhooks/stripe"),
+            "the next steps should name the endpoint to register:\n{steps}"
+        );
 
         let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(main_rs.contains("mod webhooks;"), "{main_rs}");
@@ -1363,7 +1786,7 @@ async fn main() {
         assert!(mod_rs.contains("pub mod payments;"), "{mod_rs}");
     }
 
-    // ── AC #6: generated tests ───────────────────────────────────────────
+    // ── #1366 AC #6: generated tests ───────────────────────────────────────────
 
     #[test]
     fn generated_test_module_covers_valid_invalid_and_replayed_deliveries() {
@@ -1409,6 +1832,267 @@ async fn main() {
         assert!(
             cargo.contains("\"rt\"") && cargo.contains("\"macros\""),
             "#[tokio::test] needs the rt + macros dev features:\n{cargo}"
+        );
+    }
+
+    // ── config the framework can actually load ───────────────────────────
+
+    #[test]
+    fn the_generated_autumn_toml_deserializes_into_a_usable_webhook_config() {
+        // Nothing else proves the emitted keys are the ones the runtime reads:
+        // the generated Rust tests build their config inline, and no config
+        // struct in the tree uses `deny_unknown_fields`, so a typo'd key would
+        // deserialize to a default and silently never register the endpoint.
+        #[derive(serde::Deserialize)]
+        struct Root {
+            security: Security,
+        }
+        #[derive(serde::Deserialize)]
+        struct Security {
+            webhooks: autumn_web::webhook::WebhookConfig,
+        }
+
+        let tmp = project();
+        generated(&tmp, "stripe", "Payments");
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        let root: Root = toml::from_str(&toml).expect("generated autumn.toml must deserialize");
+        let webhooks = root.security.webhooks;
+        assert_eq!(webhooks.endpoints.len(), 1, "endpoint must be registered");
+        let endpoint = &webhooks.endpoints[0];
+        assert_eq!(endpoint.name, "payments");
+        assert_eq!(endpoint.path, "/webhooks/stripe");
+        assert_eq!(
+            endpoint.provider,
+            autumn_web::webhook::WebhookProvider::Stripe
+        );
+        assert_eq!(
+            endpoint.secret_env.as_deref(),
+            Some("STRIPE_WEBHOOK_SECRET")
+        );
+        assert!(endpoint.replay_protection, "replay protection must be on");
+        assert!(endpoint.secret.is_none(), "no inline secret may be written");
+        assert_eq!(
+            webhooks.replay.backend,
+            autumn_web::webhook::WebhookReplayBackend::Memory
+        );
+
+        // …and with the secret supplied, the registry the app installs at boot
+        // builds from exactly this config.
+        let mut with_secret = webhooks;
+        with_secret.endpoints[0].secret = Some("test-secret-32-bytes-long-enough".to_owned());
+        autumn_web::webhook::WebhookRegistry::from_config(&with_secret)
+            .expect("the generated endpoint must build a registry");
+    }
+
+    #[test]
+    fn generating_preserves_a_trailing_comment_block_in_autumn_toml() {
+        // `autumn new`'s autumn.toml ends in commented-out `[health]`/`[session]`
+        // keys. A new root table appended after them would re-parent those
+        // comments under the generated header, so uncommenting one would land the
+        // key in the wrong table.
+        let tmp = project();
+        let with_trailer = "[server]\nport = 3000\n\n[health]\npath = \"/health\"\n\
+                            # live_path = \"/live\"\n# ready_path = \"/ready\"\n";
+        fs::write(tmp.path().join("autumn.toml"), with_trailer).unwrap();
+        generated(&tmp, "stripe", "Payments");
+
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        let health = toml.find("[health]").expect("health table survives");
+        let live = toml.find("# live_path").expect("comment survives");
+        let endpoint = toml
+            .find("[[security.webhooks.endpoints]]")
+            .expect("endpoint added");
+        assert!(
+            live > health && live < endpoint,
+            "the [health] comment trailer must stay under [health]:\n{toml}"
+        );
+
+        // Uncommenting the trailing key must still parse as a health key.
+        let uncommented = toml.replace("# live_path", "live_path");
+        let parsed: toml::Value = toml::from_str(&uncommented).unwrap();
+        assert!(
+            parsed["health"].get("live_path").is_some(),
+            "uncommenting must set health.live_path, not a webhook key:\n{uncommented}"
+        );
+    }
+
+    #[test]
+    fn generating_over_existing_security_tables_leaves_them_alone() {
+        let tmp = project();
+        let existing = "[security]\ncaptcha_exempt_paths = [\"/hook\"]\n\n\
+                        [security.csrf]\nenabled = true\nexempt_paths = [\"/api/\"]\n\n\
+                        [security.webhooks.replay]\nbackend = \"redis\"\n\n\
+                        [security.webhooks.replay.redis]\nurl = \"redis://localhost:6379\"\n";
+        fs::write(tmp.path().join("autumn.toml"), existing).unwrap();
+        generated(&tmp, "github", "Repo");
+
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert!(toml.contains("enabled = true"), "{toml}");
+        assert!(toml.contains("exempt_paths = [\"/api/\"]"), "{toml}");
+        assert!(
+            toml.contains("backend = \"redis\""),
+            "a configured replay backend must survive:\n{toml}"
+        );
+        assert!(
+            !toml.contains("backend = \"memory\""),
+            "the replay stub must not be added over an existing one:\n{toml}"
+        );
+        assert!(toml.contains("[[security.webhooks.endpoints]]"), "{toml}");
+    }
+
+    // ── regeneration and destroy edge cases ──────────────────────────────
+
+    #[test]
+    fn regenerating_with_a_changed_path_updates_the_endpoint_block() {
+        // Otherwise the handler moves while the config stays put, and since the
+        // registry matches paths exactly, every real delivery 500s — with the
+        // generated tests (which build their own config) still green.
+        let tmp = project();
+        generated(&tmp, "stripe", "Payments");
+
+        let moved = WebhookOptions {
+            path: Some("/hooks/pay".to_owned()),
+            secret_env: Some("PAY_SECRET".to_owned()),
+        };
+        plan_webhook(tmp.path(), "stripe", "Payments", &moved)
+            .unwrap()
+            .execute(Flags {
+                force: true,
+                ..Flags::default()
+            })
+            .unwrap();
+
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert!(toml.contains("path = \"/hooks/pay\""), "{toml}");
+        assert!(toml.contains("secret_env = \"PAY_SECRET\""), "{toml}");
+        assert!(
+            !toml.contains("/webhooks/stripe"),
+            "the stale path must be gone:\n{toml}"
+        );
+        assert_eq!(
+            toml.matches("[[security.webhooks.endpoints]]").count(),
+            1,
+            "the entry must be updated, not duplicated:\n{toml}"
+        );
+
+        // …and destroy still finds it at its new path.
+        plan_webhook(tmp.path(), "stripe", "Payments", &moved)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert!(!toml.contains("[[security.webhooks.endpoints]]"), "{toml}");
+    }
+
+    #[test]
+    fn destroying_one_of_two_webhooks_keeps_the_other_working() {
+        let tmp = project();
+        generated(&tmp, "stripe", "Payments");
+        generated(&tmp, "github", "Repo");
+
+        plan_webhook(tmp.path(), "stripe", "Payments", &WebhookOptions::default())
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert!(!toml.contains("/webhooks/stripe"), "{toml}");
+        assert!(
+            toml.contains("name = \"repo\""),
+            "the sibling must survive:\n{toml}"
+        );
+        assert!(
+            toml.contains("[security.webhooks.replay]"),
+            "the shared replay block is still needed:\n{toml}"
+        );
+        assert!(tmp.path().join("src/webhooks/repo.rs").exists());
+        assert!(!tmp.path().join("src/webhooks/payments.rs").exists());
+        let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(main_rs.contains("mod webhooks;"), "{main_rs}");
+        assert!(
+            main_rs.contains("webhooks::repo::repo_webhook"),
+            "{main_rs}"
+        );
+        assert!(!main_rs.contains("payments_webhook"), "{main_rs}");
+    }
+
+    #[test]
+    fn destroy_leaves_a_hand_edited_endpoint_and_a_configured_replay_backend_alone() {
+        let tmp = project();
+        generated(&tmp, "stripe", "Payments");
+
+        // The two edits a real deployment makes: a rotation variable and a redis
+        // replay backend. Neither may be silently deleted by `destroy`.
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        let edited = toml
+            .replace(
+                "previous_secret_envs = []",
+                "previous_secret_envs = [\"STRIPE_WEBHOOK_SECRET_PREVIOUS\"]",
+            )
+            .replace("backend = \"memory\"", "backend = \"redis\"");
+        fs::write(tmp.path().join("autumn.toml"), &edited).unwrap();
+
+        plan_webhook(tmp.path(), "stripe", "Payments", &WebhookOptions::default())
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        let after = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert_eq!(
+            after, edited,
+            "hand-edited webhook config must survive destroy untouched"
+        );
+        assert!(
+            !tmp.path().join("src/webhooks").exists(),
+            "the generated code is still removed"
+        );
+    }
+
+    #[test]
+    fn destroy_cleans_up_a_replay_stub_orphaned_by_a_hand_removed_endpoint() {
+        let tmp = project();
+        generated(&tmp, "stripe", "Payments");
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        let endpoint_start = toml.find("# Signed webhook intake generated").unwrap();
+        fs::write(tmp.path().join("autumn.toml"), &toml[..endpoint_start]).unwrap();
+
+        plan_webhook(tmp.path(), "stripe", "Payments", &WebhookOptions::default())
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        let after = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert!(
+            !after.contains("[security.webhooks.replay]"),
+            "an orphaned replay stub must not linger:\n{after}"
+        );
+    }
+
+    #[test]
+    fn a_conflicting_src_webhooks_module_file_is_rejected() {
+        let tmp = project();
+        fs::write(tmp.path().join("src/webhooks.rs"), "// hand-written\n").unwrap();
+        let error = plan_webhook(tmp.path(), "stripe", "Payments", &WebhookOptions::default())
+            .expect_err("E0761 would break the whole build");
+        assert!(error.to_string().contains("src/webhooks.rs"), "{error}");
+    }
+
+    #[test]
+    fn a_main_rs_without_a_routes_list_warns_instead_of_silently_not_registering() {
+        let tmp = project();
+        fs::write(
+            tmp.path().join("src/main.rs"),
+            "#[autumn_web::main]\nasync fn main() {\n    autumn_web::app().run().await;\n}\n",
+        )
+        .unwrap();
+        let plan =
+            plan_webhook(tmp.path(), "stripe", "Payments", &WebhookOptions::default()).unwrap();
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("routes![")),
+            "an unroutable handler must be called out: {:?}",
+            plan.warnings
         );
     }
 

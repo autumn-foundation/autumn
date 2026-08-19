@@ -928,7 +928,8 @@ key_prefix = "myapp:webhooks:replay"
 `autumn generate webhook <provider> <Name>` (unreleased — trunk-dev, #1366)
 scaffolds the whole endpoint: the `#[post]` handler over `SignedWebhook`, an
 event-type dispatch skeleton, the `[[security.webhooks.endpoints]]` config
-(`secret_env`, replay protection on, CSRF/CAPTCHA path exemptions), and tests
+(`secret_env`, replay protection on — CSRF/submit-token/CAPTCHA exemptions are
+derived from that block by the framework, so none are written), and tests
 asserting 200/400/401/409 for valid/missing/wrong-signature/replayed
 deliveries. Presets: `stripe`, `github`, `slack`, `generic`.
 

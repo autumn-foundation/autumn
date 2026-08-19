@@ -3721,15 +3721,26 @@ fn generate_webhook_creates_all_expected_files() {
         autumn_toml.contains("replay_protection = true"),
         "replay protection must be on by default:\n{autumn_toml}"
     );
+    // No CSRF/CAPTCHA exemption copies: the framework derives those from the
+    // endpoint block on every boot, so a literal copy would only go stale.
     assert!(
-        autumn_toml.contains("[security.csrf]") && autumn_toml.contains("\"/webhooks/stripe\""),
-        "the webhook path must be exempt from CSRF (the prod profile enables it):\n{autumn_toml}"
+        !autumn_toml.contains("exempt_paths"),
+        "path exemptions are derived from the endpoint block, not copied:\n{autumn_toml}"
     );
 
-    // The printed next steps name the secret env var and the dashboard target.
+    // The printed next steps name the secret env var, the dashboard target, and
+    // how to fire a test delivery — on stdout, not as warnings.
     assert!(
-        stdout.contains("STRIPE_WEBHOOK_SECRET") || stderr.contains("STRIPE_WEBHOOK_SECRET"),
+        stdout.contains("Next steps:") && stdout.contains("STRIPE_WEBHOOK_SECRET"),
         "the secret env var must be part of the printed next steps:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("autumn webhook sim stripe"),
+        "the next steps should show how to fire a signed test delivery:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("Warning:"),
+        "a clean run must not print warnings:\n{stderr}"
     );
 }
 
@@ -3792,6 +3803,52 @@ fn generate_webhook_rejects_an_unknown_provider() {
         "got:\n{stderr}"
     );
     assert!(!project.join("src/webhooks").exists());
+}
+
+#[test]
+fn generate_webhook_rejects_hostile_path_and_secret_env_overrides() {
+    let (_tmp, project) = fresh_project("webhook-hostile-input");
+    let toml_before = fs::read_to_string(project.join("autumn.toml")).unwrap();
+
+    // A quote would break out of the generated `#[post("…")]` attribute.
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "webhook",
+            "stripe",
+            "Payments",
+            "--path",
+            "/a\")]pub fn evil(){}//",
+        ],
+    );
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+
+    // A newline in --secret-env used to smuggle a whole endpoint block, with a
+    // plaintext secret and replay protection off, into autumn.toml.
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "webhook",
+            "stripe",
+            "Payments",
+            "--secret-env",
+            "X\n\n[[security.webhooks.endpoints]]\nname = \"evil\"\npath = \"/evil\"\nprovider = \"generic\"\nsecret = \"attacker-known\"\nreplay_protection = false\n# ",
+        ],
+    );
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+    assert!(
+        stderr.contains("secret environment variable"),
+        "got:\n{stderr}"
+    );
+
+    assert!(!project.join("src/webhooks").exists());
+    assert_eq!(
+        fs::read_to_string(project.join("autumn.toml")).unwrap(),
+        toml_before,
+        "a rejected invocation must not touch autumn.toml"
+    );
 }
 
 #[test]

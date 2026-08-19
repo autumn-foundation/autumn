@@ -22,20 +22,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   references the signing secret by `secret_env` (never inline) with replay
   protection on. Provider presets `stripe`, `github`, `slack`, and `generic`
   map onto `WebhookProvider`, including the Slack Events API `event_callback`
-  envelope and its `url_verification` challenge handshake. Two production
-  footguns are handled rather than documented: the route path is added to
-  `[security.csrf] exempt_paths` / `security.captcha_exempt_paths` (a provider
-  callback carries no browser session, and the `prod` profile enables CSRF), and
-  `[security.webhooks.replay]` is written explicitly with Redis guidance, since
-  production validation rejects the process-local `memory` backend. The
+  envelope and its `url_verification` challenge handshake. The endpoint block is
+  all the wiring needed — Autumn installs the registry from it and derives the
+  path's CSRF/submit-token/CAPTCHA exemptions from it on every boot, so no
+  stale-prone copies are written — and `[security.webhooks.replay]` is emitted
+  explicitly with Redis guidance, since production validation rejects the
+  process-local `memory` backend for replay-protected endpoints. The
   generated `#[cfg(test)]` module signs a fixture delivery the way the provider
   does and asserts 200 / 400 / 401 / 409 for valid / missing-signature /
   wrong-signature / replayed deliveries — passing on first run with no manual
   edits beyond the handler bodies and the secret env var. `--path`,
   `--secret-env`, `--dry-run`, and `autumn destroy webhook` are all supported;
   a second endpoint on a path another endpoint already claims is refused at
-  generate time rather than failing config validation at boot. See
-  `docs/guide/generators.md`.
+  generate time rather than failing config validation at boot, regenerating with
+  a changed path updates the endpoint block in place instead of stranding it, and
+  `destroy` leaves hand-edited config (rotation variables, a Redis replay
+  backend) alone. See `docs/guide/generators.md`.
 
 - **Ordered-list `position` field with transaction-safe reorder helpers
   (#1358):** a new `position` DSL token (`rank:position`, or scoped to a

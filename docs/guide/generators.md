@@ -10,6 +10,7 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate task`               | A one-off operational `#[task]` skeleton under `tasks/`                         |
 | `autumn generate job`                | A `#[job]` background-job handler with args struct, `registered_jobs()` aggregator, and `.jobs(…)` wiring in `src/main.rs` |
 | `autumn generate channel`            | A real-time broadcast channel over the `Channels` API — an htmx SSE live view by default, or a raw `#[ws]` handler with `--ws` |
+| `autumn generate webhook`            | A signature-verified, replay-protected inbound provider webhook (Stripe/GitHub/Slack/generic) — handler, event dispatch, `autumn.toml` endpoint config, and tests |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
 | `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |
 | `autumn generate admin`              | An `AdminModel` adapter for an existing model, wired to `autumn-admin-plugin`   |
@@ -877,15 +878,17 @@ with clearly-marked stub functions to fill in and a default arm that
 acknowledges-and-ignores everything else (a 2xx stops the provider retrying an
 event the app does not handle):
 
-```rust
+```rust,ignore
 #[post("/webhooks/stripe")]
 pub async fn payments_webhook(webhook: SignedWebhook) -> AutumnResult<Json<serde_json::Value>> {
-    let event: serde_json::Value = webhook.json::<serde_json::Value>()?;
+    let event: serde_json::Value = webhook.json::<serde_json::Value>().map_err(|error| {
+        AutumnError::bad_request_msg(format!("invalid stripe webhook payload: {error}"))
+    })?;
     match webhook.event_type().unwrap_or("unknown") {
+        // TODO: fill this in
         "payment_intent.succeeded" => on_payment_intent_succeeded(&event).await?,
-        "customer.subscription.updated" => on_customer_subscription_updated(&event).await?,
-        "customer.subscription.deleted" => on_customer_subscription_deleted(&event).await?,
-        _ => tracing::debug!("unhandled webhook event — acknowledged and ignored"),
+        // …one arm and one `on_*` stub function per preset event…
+        _ => tracing::debug!(event_type, "unhandled webhook event — acknowledged and ignored"),
     }
     Ok(Json(serde_json::json!({ "received": true })))
 }
@@ -913,17 +916,22 @@ previous_secret_envs = []      # add the old variable here during rotation
 replay_protection = true
 ```
 
-Two things the generator handles that are easy to miss by hand: the route path
-is added to `[security.csrf] exempt_paths` and `security.captcha_exempt_paths`
-(a provider callback carries no browser session, and the `prod` profile enables
-CSRF automatically), and `[security.webhooks.replay]` is written explicitly with
-guidance to switch to Redis — production config validation rejects the
-process-local `memory` backend for replay-protected endpoints.
+That block is all the wiring the endpoint needs. Autumn installs the webhook
+registry from `[security.webhooks]` at startup, and derives the endpoint's CSRF,
+submit-token, and CAPTCHA path exemptions from the same block on every boot — a
+provider callback carries no browser session, and its signature is its
+authentication — so the generator deliberately writes **no** `exempt_paths`
+copies that could go stale when the path changes.
 
-The endpoint itself needs no builder wiring: Autumn installs the webhook
-registry from `[security.webhooks]` at startup. The generator prints the two
-remaining steps — set the secret env var (the app refuses to start while a
-configured endpoint has none) and point the provider dashboard at the path.
+`[security.webhooks.replay]` is written explicitly, with guidance to switch to
+Redis: production config validation rejects the process-local `memory` backend
+for replay-protected endpoints, so a deployed app must configure Redis (which
+needs `autumn-web`'s `redis` feature).
+
+The generator then prints the remaining steps: set the secret env var (the app
+refuses to start while a configured endpoint has none), point the provider
+dashboard at the path, fire a test delivery locally with `autumn webhook sim`,
+and fill in the `on_*` stubs.
 
 Useful flags:
 
@@ -938,6 +946,15 @@ autumn generate webhook generic Partner --secret-env PARTNER_WEBHOOK_SECRET
 autumn generate webhook stripe Payments --dry-run
 ```
 
+Fire a signed test delivery at the running app without touching the provider —
+same four presets, a fresh delivery id per call:
+
+```bash
+autumn webhook sim stripe http://localhost:3000/webhooks/stripe \
+  --secret "$STRIPE_WEBHOOK_SECRET" \
+  --payload '{"id":"evt_1","type":"payment_intent.succeeded"}'
+```
+
 The generated `#[cfg(test)]` module is a real assertion, not a stub: it signs a
 fixture delivery the way the provider does and asserts a valid signature is
 accepted (200), a missing signature header is rejected (400 — the request is
@@ -945,9 +962,15 @@ malformed), a well-formed but wrong signature is rejected (401), and a replayed
 delivery id is rejected (409). No Postgres or Docker required, so it runs on
 every `cargo test`.
 
+Re-running with `--force` and a different `--path`/`--secret-env` updates the
+existing endpoint block in place rather than leaving a stale one behind (the
+registry matches paths exactly, so a stale path would 500 every real delivery).
+
 `autumn destroy webhook <provider> <Name>` removes the handler, its route
-registration, and its `autumn.toml` block (including the exemptions, and the
-shared replay block once the last endpoint is gone).
+registration, and its `autumn.toml` block — including the shared replay block
+once the last endpoint is gone. Config you have since edited by hand (rotation
+variables in `previous_secret_envs`, a tightened `timestamp_tolerance_secs`, a
+Redis replay backend) is left in place rather than deleted.
 
 ### Slow live webhook verification
 
