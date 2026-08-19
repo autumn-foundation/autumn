@@ -2637,6 +2637,45 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate a signed, replay-protected inbound webhook endpoint for a
+    /// third-party provider (Stripe, GitHub, Slack, or a generic HMAC source).
+    ///
+    /// The handler takes the shipped `SignedWebhook` extractor — signature
+    /// verification, raw-body capture, timestamp tolerance, replay rejection,
+    /// and secret rotation are the framework's, never hand-rolled.
+    ///
+    /// Creates:
+    ///   - `src/webhooks/<snake>.rs` — `#[post]` handler, event dispatch, and tests
+    ///   - `src/webhooks/mod.rs`     — created/updated with `pub mod`
+    ///   - `src/main.rs`             — `mod webhooks;` + the route in `routes![...]`
+    ///   - `autumn.toml`             — endpoint stub, replay backend, exemptions
+    ///   - `Cargo.toml`              — `serde_json` + tokio test features
+    ///
+    /// Example:
+    ///
+    ///   autumn generate webhook stripe Payments
+    ///   autumn generate webhook github Repo --path /hooks/github
+    ///   autumn generate webhook stripe Payments --dry-run
+    #[command(verbatim_doc_comment)]
+    Webhook {
+        /// Provider preset: `stripe`, `github`, `slack`, or `generic`.
+        provider: String,
+        /// Endpoint name (`PascalCase` or `snake_case`, e.g. `Payments`).
+        name: String,
+        /// Route path for the endpoint (default: `/webhooks/<provider>`).
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// Environment variable holding the signing secret
+        /// (default: `<PROVIDER>_WEBHOOK_SECRET`).
+        #[arg(long, value_name = "VAR")]
+        secret_env: Option<String>,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate a system-test skeleton under `tests/system/`.
     ///
     /// The generated test is gated behind `#[cfg(feature = "system-tests")]` and
@@ -4258,6 +4297,22 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             force,
         } => {
             let plan = generate::inbound_mail::plan_inbound_mail(&resolve_cwd(), &name);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Webhook {
+            provider,
+            name,
+            path,
+            secret_env,
+            dry_run,
+            force,
+        } => {
+            let plan = generate::webhook::plan_webhook(
+                &resolve_cwd(),
+                &provider,
+                &name,
+                &generate::webhook::WebhookOptions { path, secret_env },
+            );
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::SystemTest {

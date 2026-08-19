@@ -38,6 +38,7 @@ pub mod task;
 pub mod tauri;
 pub mod tauri_mobile;
 pub mod teams;
+pub mod webhook;
 pub mod wizard;
 
 use std::path::{Path, PathBuf};

@@ -851,6 +851,115 @@ transports), and assert `cargo check --tests` passes with no hand-editing —
 plus one gate that actually runs the generated smoke test with `cargo test`
 to confirm it passes on first run.
 
+## `autumn generate webhook`
+
+For inbound provider callbacks — Stripe payment events, GitHub push/CI events,
+Slack Events API, or any provider that signs its body with HMAC-SHA256. The
+generator wires up the shipped `SignedWebhook` extractor; it never hand-rolls
+signature verification.
+
+```bash
+autumn generate webhook stripe Payments
+```
+
+Produces:
+
+```
+src/webhooks/payments.rs   # POST /webhooks/stripe: verified handler, event dispatch, tests
+src/webhooks/mod.rs        # pub mod payments; (created or appended)
+src/main.rs                # mod webhooks; + routes![...] entry added in place
+autumn.toml                # [[security.webhooks.endpoints]] + replay backend + path exemptions
+Cargo.toml                 # serde_json + tracing, and the tokio test features
+```
+
+The handler takes the extractor and dispatches on the provider's event type,
+with clearly-marked stub functions to fill in and a default arm that
+acknowledges-and-ignores everything else (a 2xx stops the provider retrying an
+event the app does not handle):
+
+```rust
+#[post("/webhooks/stripe")]
+pub async fn payments_webhook(webhook: SignedWebhook) -> AutumnResult<Json<serde_json::Value>> {
+    let event: serde_json::Value = webhook.json::<serde_json::Value>()?;
+    match webhook.event_type().unwrap_or("unknown") {
+        "payment_intent.succeeded" => on_payment_intent_succeeded(&event).await?,
+        "customer.subscription.updated" => on_customer_subscription_updated(&event).await?,
+        "customer.subscription.deleted" => on_customer_subscription_deleted(&event).await?,
+        _ => tracing::debug!("unhandled webhook event — acknowledged and ignored"),
+    }
+    Ok(Json(serde_json::json!({ "received": true })))
+}
+```
+
+Provider presets (`stripe`, `github`, `slack`, `generic`) map onto
+`WebhookProvider` and pick the route path, signature/event/delivery headers,
+and the stub event arms. The Slack preset also unwraps the Events API
+`event_callback` envelope — `event_type()` reports the envelope type, not the
+inner event — and answers Slack's `url_verification` handshake by echoing the
+challenge. `generic` covers any other provider: raw-body HMAC-SHA256 with
+`X-Webhook-Signature`/`X-Webhook-Event`/`X-Webhook-Delivery`.
+
+The `autumn.toml` block references the signing secret by environment variable
+(`secret_env`) — a plaintext secret is never written — and turns replay
+protection on:
+
+```toml
+[[security.webhooks.endpoints]]
+name = "payments"
+path = "/webhooks/stripe"
+provider = "stripe"
+secret_env = "STRIPE_WEBHOOK_SECRET"
+previous_secret_envs = []      # add the old variable here during rotation
+replay_protection = true
+```
+
+Two things the generator handles that are easy to miss by hand: the route path
+is added to `[security.csrf] exempt_paths` and `security.captcha_exempt_paths`
+(a provider callback carries no browser session, and the `prod` profile enables
+CSRF automatically), and `[security.webhooks.replay]` is written explicitly with
+guidance to switch to Redis — production config validation rejects the
+process-local `memory` backend for replay-protected endpoints.
+
+The endpoint itself needs no builder wiring: Autumn installs the webhook
+registry from `[security.webhooks]` at startup. The generator prints the two
+remaining steps — set the secret env var (the app refuses to start while a
+configured endpoint has none) and point the provider dashboard at the path.
+
+Useful flags:
+
+```bash
+# A second Stripe endpoint (two endpoints on one path fail config validation):
+autumn generate webhook stripe Billing --path /webhooks/stripe-billing
+
+# A distinct secret variable per endpoint:
+autumn generate webhook generic Partner --secret-env PARTNER_WEBHOOK_SECRET
+
+# Print the plan without writing:
+autumn generate webhook stripe Payments --dry-run
+```
+
+The generated `#[cfg(test)]` module is a real assertion, not a stub: it signs a
+fixture delivery the way the provider does and asserts a valid signature is
+accepted (200), a missing signature header is rejected (400 — the request is
+malformed), a well-formed but wrong signature is rejected (401), and a replayed
+delivery id is rejected (409). No Postgres or Docker required, so it runs on
+every `cargo test`.
+
+`autumn destroy webhook <provider> <Name>` removes the handler, its route
+registration, and its `autumn.toml` block (including the exemptions, and the
+shared replay block once the last endpoint is gone).
+
+### Slow live webhook verification
+
+```bash
+cargo test -p autumn-cli --test generate generated_webhook_cargo_checks -- --ignored --exact
+cargo test -p autumn-cli --test generate generated_webhook_tests_pass -- --ignored --exact
+```
+
+These scaffold a fresh project, generate all four presets, and assert `cargo
+check --tests` passes with no hand-editing — plus one gate that actually runs
+the generated tests to confirm they pass on first run.
+
 ## `autumn generate scaffold`
 
 Everything `model` produces, plus:

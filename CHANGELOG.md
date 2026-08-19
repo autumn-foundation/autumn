@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`autumn generate webhook` for signed, replay-safe provider intake
+  (#1366):** the `SignedWebhook` substrate has shipped since 0.4.0, but every
+  Stripe/GitHub/Slack integration still hand-rolled the route, the endpoint
+  config, the event dispatch, and the signature tests — security-sensitive
+  boilerplate (raw-body ordering, constant-time compare, replay window, secret
+  rotation) nobody should retype. One command now emits it: a
+  `#[post("/webhooks/<provider>")]` handler taking the shipped extractor (no
+  hand-rolled HMAC), an `event_type()` dispatch skeleton with marked stub
+  functions and an acknowledge-and-ignore default arm, the route registered in
+  `routes![…]`, and an `autumn.toml` `[[security.webhooks.endpoints]]` stub that
+  references the signing secret by `secret_env` (never inline) with replay
+  protection on. Provider presets `stripe`, `github`, `slack`, and `generic`
+  map onto `WebhookProvider`, including the Slack Events API `event_callback`
+  envelope and its `url_verification` challenge handshake. Two production
+  footguns are handled rather than documented: the route path is added to
+  `[security.csrf] exempt_paths` / `security.captcha_exempt_paths` (a provider
+  callback carries no browser session, and the `prod` profile enables CSRF), and
+  `[security.webhooks.replay]` is written explicitly with Redis guidance, since
+  production validation rejects the process-local `memory` backend. The
+  generated `#[cfg(test)]` module signs a fixture delivery the way the provider
+  does and asserts 200 / 400 / 401 / 409 for valid / missing-signature /
+  wrong-signature / replayed deliveries — passing on first run with no manual
+  edits beyond the handler bodies and the secret env var. `--path`,
+  `--secret-env`, `--dry-run`, and `autumn destroy webhook` are all supported;
+  a second endpoint on a path another endpoint already claims is refused at
+  generate time rather than failing config validation at boot. See
+  `docs/guide/generators.md`.
+
 - **Ordered-list `position` field with transaction-safe reorder helpers
   (#1358):** a new `position` DSL token (`rank:position`, or scoped to a
   parent with `rank:position{scope:board_id}`) declares a user-orderable
