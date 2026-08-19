@@ -955,7 +955,20 @@ so repeated runs are new deliveries rather than `409 Conflict` replays):
 autumn webhook sim stripe http://localhost:3000/webhooks/stripe \
   --secret "$STRIPE_WEBHOOK_SECRET" \
   --payload '{"id":"evt_1","type":"payment_intent.succeeded"}'
+
+# GitHub and generic carry the event type in a header, so name it explicitly —
+# the simulator's default (`sim.event`) matches no generated arm:
+autumn webhook sim github http://localhost:3000/webhooks/github \
+  --secret "$GITHUB_WEBHOOK_SECRET" \
+  --payload '{"ref":"refs/heads/main"}' --event push
 ```
+
+The printed command targets a generated stub arm, so a filled-in handler
+actually runs rather than falling through to acknowledge-and-ignore. A `409
+Conflict` on a repeat run is replay protection doing its job: for the
+header-signed providers the endpoint also keys on the signature, so a
+byte-identical payload is a duplicate delivery — vary `--payload`, or restart
+the app to clear an in-memory replay store.
 
 The generated `#[cfg(test)]` module is a real assertion, not a stub: it signs a
 fixture delivery the way the provider does and asserts a valid signature is

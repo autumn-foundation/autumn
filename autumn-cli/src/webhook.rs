@@ -94,7 +94,18 @@ fn fresh_sim_delivery_id(provider: WebhookProvider) -> String {
     format!("sim-{}-{}", provider.as_slug(), hex::encode(random))
 }
 
-pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
+/// The event type a simulated delivery announces when the caller does not pass
+/// one. Kept as the historical value so an existing `autumn webhook sim`
+/// invocation behaves exactly as before.
+const DEFAULT_SIM_EVENT_TYPE: &str = "sim.event";
+
+pub fn run_sim(
+    provider_str: &str,
+    url: &str,
+    secret: &str,
+    payload: &str,
+    event_type: Option<&str>,
+) {
     let provider = match WebhookProvider::from_str(provider_str) {
         Ok(p) => p,
         Err(e) => {
@@ -115,6 +126,15 @@ pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
         .duration_since(UNIX_EPOCH)
         .expect("system clock is set before Unix epoch")
         .as_secs();
+
+    // Stripe and Slack read the event type out of the payload (`type`), not a
+    // header, so an --event there would be silently dropped.
+    if event_type.is_some() && body_delivery_id_field(provider).is_some() {
+        eprintln!(
+            "⚠️  Warning: --event is ignored for {provider:?}: its event type comes from the \
+             payload's \"type\" field. Set it in --payload instead."
+        );
+    }
 
     // Refresh the body-carried delivery ID before signing: the signature covers
     // the exact bytes sent, and a reused ID would come back 409 Conflict.
@@ -140,7 +160,10 @@ pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
 
             req = req.header("X-Webhook-Signature", format!("sha256={signature_hex}"));
             req = req.header("X-Webhook-Delivery", fresh_sim_delivery_id(provider));
-            req = req.header("X-Webhook-Event", "sim.event");
+            req = req.header(
+                "X-Webhook-Event",
+                event_type.unwrap_or(DEFAULT_SIM_EVENT_TYPE),
+            );
         }
         WebhookProvider::Github => {
             let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
@@ -151,7 +174,10 @@ pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
 
             req = req.header("X-Hub-Signature-256", format!("sha256={signature_hex}"));
             req = req.header("X-GitHub-Delivery", fresh_sim_delivery_id(provider));
-            req = req.header("X-GitHub-Event", "sim.event");
+            req = req.header(
+                "X-GitHub-Event",
+                event_type.unwrap_or(DEFAULT_SIM_EVENT_TYPE),
+            );
         }
         WebhookProvider::Stripe => {
             // A payload with no top-level "id" used to be a 400
@@ -189,10 +215,56 @@ pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
         }
     }
 
-    handle_sim_response(req.send());
+    handle_sim_response(req.send(), provider);
 }
 
-fn handle_sim_response(result: Result<reqwest::blocking::Response, reqwest::Error>) {
+/// Cap on the response body echoed back on failure.
+///
+/// A dev-profile app answers with a full HTML error page — several hundred lines
+/// of inline CSS for one status code — which buried the actual diagnosis.
+const MAX_ECHOED_BODY_BYTES: usize = 600;
+
+/// Trim a response body down to something readable, dropping an HTML error page
+/// to its first line rather than dumping the stylesheet.
+fn summarize_body(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with('<') {
+        return format!(
+            "<{} bytes of HTML — the app is serving its error page; add `Accept: \
+             application/problem+json` or read the server log for detail>",
+            trimmed.len()
+        );
+    }
+    if trimmed.len() <= MAX_ECHOED_BODY_BYTES {
+        return trimmed.to_owned();
+    }
+    let cut = trimmed
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= MAX_ECHOED_BODY_BYTES)
+        .last()
+        .unwrap_or(0);
+    format!("{}… ({} bytes total)", &trimmed[..cut], trimmed.len())
+}
+
+/// The extra line a `409 Conflict` deserves: it is replay protection working, and
+/// what to do about it depends on where the provider carries its delivery ID.
+const fn replay_conflict_hint(provider: WebhookProvider) -> &'static str {
+    if body_delivery_id_field(provider).is_some() {
+        // These get a fresh body ID per invocation, so a 409 means the endpoint
+        // really has seen this delivery — most likely a hand-set ID.
+        "   409 is replay protection: this delivery ID was already accepted. The simulator          mints a fresh one per run, so check for a hand-set ID in the payload."
+    } else {
+        // The framework also keys replay on the signature for the header-signed
+        // providers, so a byte-identical signed body is itself a duplicate.
+        "   409 is replay protection: for header-signed providers the endpoint also keys on          the signature, so re-sending a byte-identical payload is a duplicate delivery. Vary          --payload (or restart the app to clear an in-memory replay store)."
+    }
+}
+
+fn handle_sim_response(
+    result: Result<reqwest::blocking::Response, reqwest::Error>,
+    provider: WebhookProvider,
+) {
     match result {
         Ok(response) => {
             let status = response.status();
@@ -201,12 +273,15 @@ fn handle_sim_response(result: Result<reqwest::blocking::Response, reqwest::Erro
                     if status.is_success() {
                         println!("✅ Response Status: {status}");
                         if !text.is_empty() {
-                            println!("📝 Response Body: {text}");
+                            println!("📝 Response Body: {}", summarize_body(&text));
                         }
                     } else {
                         eprintln!("❌ Webhook endpoint returned status: {status}");
+                        if status == reqwest::StatusCode::CONFLICT {
+                            eprintln!("{}", replay_conflict_hint(provider));
+                        }
                         if !text.is_empty() {
-                            eprintln!("Response Body: {text}");
+                            eprintln!("Response Body: {}", summarize_body(&text));
                         }
                         std::process::exit(1);
                     }
@@ -295,7 +370,7 @@ mod tests {
         });
 
         let url = format!("http://{addr}/webhook");
-        run_sim(provider, &url, "secret", r#"{"ok":true}"#);
+        run_sim(provider, &url, "secret", r#"{"ok":true}"#, None);
 
         handle.join().expect("capture server should finish")
     }
@@ -304,6 +379,14 @@ mod tests {
     /// check the body-carried delivery ID and verify the signature covers the
     /// bytes actually sent.
     fn capture_request(provider: &str, payload: &'static str) -> String {
+        capture_request_with_event(provider, payload, None)
+    }
+
+    fn capture_request_with_event(
+        provider: &str,
+        payload: &'static str,
+        event_type: Option<&str>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind webhook capture server");
         let addr = listener.local_addr().expect("capture server local addr");
 
@@ -346,7 +429,7 @@ mod tests {
         });
 
         let url = format!("http://{addr}/webhook");
-        run_sim(provider, &url, "secret", payload);
+        run_sim(provider, &url, "secret", payload, event_type);
 
         handle.join().expect("capture server should finish")
     }
@@ -367,6 +450,61 @@ mod tests {
                     .then(|| value.trim().to_owned())
             })
             .unwrap_or_else(|| panic!("missing {header} header in request:\n{request}"))
+    }
+
+    #[test]
+    fn a_dev_error_page_is_summarized_rather_than_dumped() {
+        let page = format!(
+            "<!DOCTYPE html><html><style>{}</style></html>",
+            "a".repeat(5_000)
+        );
+        let summary = summarize_body(&page);
+        assert!(summary.contains("bytes of HTML"), "{summary}");
+        assert!(
+            summary.len() < 300,
+            "the stylesheet must not be echoed: {summary}"
+        );
+
+        // A short JSON body is passed through untouched.
+        assert_eq!(
+            summarize_body(r#"{"received":true}"#),
+            r#"{"received":true}"#
+        );
+    }
+
+    #[test]
+    fn the_replay_conflict_hint_matches_where_the_delivery_id_lives() {
+        assert!(
+            replay_conflict_hint(WebhookProvider::Stripe).contains("fresh one per run"),
+            "body-keyed providers get a fresh ID, so a 409 means something else"
+        );
+        assert!(
+            replay_conflict_hint(WebhookProvider::Github).contains("signature"),
+            "header-signed providers also key replay on the signature"
+        );
+    }
+
+    #[test]
+    fn header_based_providers_announce_the_requested_event_type() {
+        // Without this the simulator only ever announced `sim.event`, which no
+        // real handler dispatches on — so a simulated delivery fell through to
+        // acknowledge-and-ignore and proved nothing about the user's handler.
+        let request =
+            capture_request_with_event("github", r#"{"ref":"refs/heads/main"}"#, Some("push"));
+        assert_eq!(header_value(&request, "X-GitHub-Event"), "push");
+
+        let request =
+            capture_request_with_event("generic", r#"{"ok":true}"#, Some("example.created"));
+        assert_eq!(header_value(&request, "X-Webhook-Event"), "example.created");
+    }
+
+    #[test]
+    fn an_omitted_event_type_keeps_the_historical_default() {
+        let request = capture_request("github", r#"{"ok":true}"#);
+        assert_eq!(
+            header_value(&request, "X-GitHub-Event"),
+            DEFAULT_SIM_EVENT_TYPE
+        );
     }
 
     #[test]

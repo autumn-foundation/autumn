@@ -1893,6 +1893,15 @@ enum WebhookCommands {
         /// The payload to send in the request body.
         #[arg(long)]
         payload: String,
+        /// Event type to announce, for the providers that carry it in a header
+        /// (github: `X-GitHub-Event`, generic: `X-Webhook-Event`).
+        ///
+        /// Defaults to `sim.event`, which no real handler dispatches on — pass
+        /// the event your handler expects (e.g. `--event push`) to exercise it.
+        /// Stripe and Slack read their event type from the payload's `type`
+        /// field instead, so this is ignored for those two.
+        #[arg(long, value_name = "TYPE")]
+        event: Option<String>,
     },
 }
 
@@ -3350,7 +3359,8 @@ fn run_command(command: Commands) {
             url,
             secret,
             payload,
-        }) => webhook::run_sim(&provider, &url, &secret, &payload),
+            event,
+        }) => webhook::run_sim(&provider, &url, &secret, &payload, event.as_deref()),
         Commands::Alert(AlertCommands::Test { channel }) => alert::run_test(channel.as_deref()),
         Commands::Console {
             profile,

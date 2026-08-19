@@ -50,6 +50,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before signing (the signature covers the exact bytes sent), and the substituted
   ID is printed. A payload that is not a JSON object is left exactly as written.
 
+- **`autumn webhook sim --event <TYPE>` (#1366):** the simulator hardcoded
+  `sim.event` as the announced event type for the header-carrying providers
+  (`X-GitHub-Event`, `X-Webhook-Event`), which matches no real dispatch arm — so
+  a simulated delivery always fell through to a handler's
+  acknowledge-and-ignore branch, proving nothing about the code under test.
+  `--event` now sets it (default unchanged), and `autumn generate webhook` prints
+  a matching flag for those presets. Stripe and Slack read their event type from
+  the payload's `type` field, so `--event` warns rather than silently doing
+  nothing there. A `409 Conflict` response now explains which replay key
+  rejected the delivery, and an HTML error page is summarized instead of dumped.
+
 - **Ordered-list `position` field with transaction-safe reorder helpers
   (#1358):** a new `position` DSL token (`rank:position`, or scoped to a
   parent with `rank:position{scope:board_id}`) declares a user-orderable

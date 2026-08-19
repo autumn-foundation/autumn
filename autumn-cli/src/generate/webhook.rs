@@ -173,6 +173,21 @@ impl Provider {
         }
     }
 
+    /// The `--event` argument the printed `autumn webhook sim` line needs, for
+    /// the presets whose event type travels in a header.
+    ///
+    /// Without it the simulator announces its default `sim.event`, which no
+    /// generated arm dispatches on — so the delivery would fall through to
+    /// acknowledge-and-ignore and prove nothing about the user's handler. Stripe
+    /// and Slack carry the type in the payload instead, so they need no flag.
+    const fn sim_event(self) -> Option<&'static str> {
+        match self {
+            Self::Github => Some("push"),
+            Self::Generic => Some("example.created"),
+            Self::Stripe | Self::Slack => None,
+        }
+    }
+
     /// Where the provider's dashboard webhook should be pointed, for the
     /// printed next steps.
     const fn dashboard_hint(self) -> &'static str {
@@ -462,9 +477,10 @@ pub fn next_steps(provider: &str, name: &str, options: &WebhookOptions) -> Optio
          \x20 2. Point {dashboard} at POST {path}. The endpoint is\n\
          \x20    installed from autumn.toml's `[[security.webhooks.endpoints]]`, so there\n\
          \x20    is no builder wiring to add.\n\
-         \x20 3. Try it locally without the provider:\n\
+         \x20 3. Try it locally without the provider — this reaches a stub arm, so a\n\
+         \x20    filled-in handler actually runs:\n\
          \x20      autumn webhook sim {slug} http://localhost:3000{path} \\\n\
-         \x20        --secret \"${secret_env}\" --payload '{payload}'\n\
+         \x20        --secret \"${secret_env}\" --payload '{payload}'{event_flag}\n\
          \x20 4. Fill in the `on_*` stub functions in src/webhooks/{name}.rs.\n\
          \x20 5. Before deploying: replay protection is on, and its default `memory`\n\
          \x20    backend is process-local — production config validation rejects it. Set\n\
@@ -473,6 +489,11 @@ pub fn next_steps(provider: &str, name: &str, options: &WebhookOptions) -> Optio
         dashboard = provider.dashboard_hint(),
         slug = provider.as_str(),
         payload = provider.sim_payload(),
+        event_flag = provider
+            .sim_event()
+            .map_or_else(String::new, |event| format!(
+                " \\\n           --event {event}"
+            )),
     ))
 }
 
@@ -1848,6 +1869,26 @@ async fn main() {
             steps.contains("autumn webhook sim stripe"),
             "the next steps should show how to fire a test delivery:\n{steps}"
         );
+        assert!(
+            steps.contains("payment_intent.succeeded"),
+            "the simulated delivery must reach a generated stub arm:\n{steps}"
+        );
+        assert!(
+            !steps.contains("--event"),
+            "stripe carries its event type in the payload:\n{steps}"
+        );
+
+        // The header-based presets need an explicit --event, or the simulator
+        // announces its default `sim.event` and the delivery falls through to
+        // the acknowledge-and-ignore arm, proving nothing about the handler.
+        for (provider, event) in [("github", "push"), ("generic", "example.created")] {
+            let steps = next_steps(provider, "Intake", &WebhookOptions::default())
+                .expect("resolvable arguments have next steps");
+            assert!(
+                steps.contains(&format!("--event {event}")),
+                "{provider}: the printed sim must target a generated arm:\n{steps}"
+            );
+        }
         assert!(
             steps.contains("POST /webhooks/stripe"),
             "the next steps should name the endpoint to register:\n{steps}"
