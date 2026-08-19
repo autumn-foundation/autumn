@@ -128,11 +128,13 @@ macro_rules! backend_select {
 
 /// Take the same transaction-scoped advisory lock the `position` (issue
 /// #1358) insert-assign/delete-compact triggers take, from generated
-/// `move_to` — closes a deadlock where `move_to`'s `SELECT ... FOR UPDATE
-/// ORDER BY id` row locks and a concurrent compaction trigger's `UPDATE ...
-/// WHERE position > $1` (which Postgres may satisfy via the `(scope,
-/// position)` index, i.e. **not** in `id` order) can lock the same rows in
-/// different orders.
+/// `move_to`.
+///
+/// Closes a deadlock where `move_to`'s `SELECT ... FOR UPDATE ORDER BY id`
+/// row locks and a concurrent compaction trigger's `UPDATE ... WHERE
+/// position > $1` (which Postgres may satisfy via the `(scope, position)`
+/// index, i.e. **not** in `id` order) can lock the same rows in different
+/// orders.
 ///
 /// `lock_name` is the literal `"{table}_{position}_assign"` string baked
 /// into the migration's trigger SQL (see
@@ -149,6 +151,11 @@ macro_rules! backend_select {
 /// counterpart takes one either; write-write correctness there rests on
 /// the database-level write lock `scoped_immediate_transaction` already
 /// acquires via `BEGIN IMMEDIATE`.
+///
+/// # Errors
+///
+/// Returns the underlying [`diesel::result::Error`] if the
+/// `pg_advisory_xact_lock` query fails (e.g. the connection was lost).
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 pub async fn position_advisory_lock(
     conn: &mut crate::db::RuntimeConnection,
@@ -176,6 +183,12 @@ pub async fn position_advisory_lock(
 
 /// `SQLite` arm of [`position_advisory_lock`] — a no-op. See the Postgres
 /// definition for the full contract.
+///
+/// # Errors
+///
+/// Never returns `Err` — kept `Result`-returning to match the Postgres
+/// arm's signature, since both are called from the same generated
+/// `move_to` body regardless of backend.
 #[cfg(all(feature = "db", feature = "sqlite"))]
 pub async fn position_advisory_lock(
     _conn: &mut crate::db::RuntimeConnection,

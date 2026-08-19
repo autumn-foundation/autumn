@@ -402,10 +402,13 @@ pub fn create_table_sql_with_metadata_and_id_for(
 
 /// Backend-aware `up.sql` triggers that maintain a `position` field's
 /// contiguous `0..len-1` ordering (issue #1358): assign the next value on
-/// insert, and compact the remaining rows' positions on delete — hard delete
+/// insert, compact the remaining rows' positions on delete — hard delete
 /// always, plus soft-delete (a `deleted_at` transition from `NULL` to
 /// non-`NULL`) when `fields` declares a `deleted_at` column (the `--soft-delete`
-/// virtual field `generate::model` appends — see `append_soft_delete_field`).
+/// virtual field `generate::model` appends — see `append_soft_delete_field`)
+/// — and, for a scoped position field, compact the old scope and re-append
+/// at the end of the new one when an ordinary `UPDATE` reassigns the scope
+/// FK (e.g. dragging a Kanban card to a different board).
 ///
 /// Implemented as database triggers rather than application-level repository
 /// hooks so the invariant holds for **every** insert/delete path (the
@@ -555,6 +558,59 @@ pub fn position_triggers_up_sql_for(
                          FOR EACH ROW EXECUTE FUNCTION {table}_{position}_compact_soft();"
                     );
                 }
+                // Issue #1358 review: an ordinary `UPDATE` can reassign a
+                // scoped row's scope FK (e.g. dragging a Kanban card to a
+                // different board via `board_id`) — nothing about `position`
+                // makes that column immutable. Without this trigger the row
+                // keeps its old position, leaving a gap in the old scope and
+                // usually a duplicate in the new one. `BEFORE UPDATE` (not
+                // `AFTER`) because only a `BEFORE` trigger can set `NEW`'s
+                // position; the compaction UPDATE and the append-to-new-scope
+                // assignment both run inside the same function/statement, so
+                // a hard crash mid-trigger can't leave one done without the
+                // other. Locks BOTH the old and new scope's advisory key —
+                // always in ascending-hash order, mirroring `move_to`'s
+                // fixed id-ascending row-lock order — so two rows swapping
+                // scopes concurrently can't deadlock each other; a rescope
+                // racing a plain insert/delete/move_to on either scope is
+                // still safe (same lock key, Postgres's deadlock detector
+                // aborts one side of any residual cycle rather than
+                // corrupting data). Skipped for soft-deleted rows on either
+                // side of the change (`compact_soft`/restore already own
+                // that transition) and for unscoped position fields (no
+                // scope column exists to reassign).
+                if let Some(scope_col) = scope {
+                    let rescope_when = if has_soft_delete {
+                        format!(
+                            "NEW.\"{scope_col}\" IS DISTINCT FROM OLD.\"{scope_col}\" AND \
+                             OLD.deleted_at IS NULL AND NEW.deleted_at IS NULL"
+                        )
+                    } else {
+                        format!("NEW.\"{scope_col}\" IS DISTINCT FROM OLD.\"{scope_col}\"")
+                    };
+                    let _ = writeln!(
+                        out,
+                        "CREATE FUNCTION {table}_{position}_rescope() RETURNS TRIGGER AS $$\n\
+                         BEGIN\n  \
+                         IF hashtext(OLD.\"{scope_col}\"::text) <= hashtext(NEW.\"{scope_col}\"::text) THEN\n    \
+                         PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), hashtext(OLD.\"{scope_col}\"::text));\n    \
+                         PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), hashtext(NEW.\"{scope_col}\"::text));\n  \
+                         ELSE\n    \
+                         PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), hashtext(NEW.\"{scope_col}\"::text));\n    \
+                         PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), hashtext(OLD.\"{scope_col}\"::text));\n  \
+                         END IF;\n  \
+                         UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > OLD.\"{position}\";\n  \
+                         NEW.\"{position}\" := COALESCE((SELECT MAX(\"{position}\") + 1 FROM \"{table}\" WHERE {live_cond_new}), 0);\n  \
+                         RETURN NEW;\n\
+                         END;\n\
+                         $$ LANGUAGE plpgsql;"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "CREATE TRIGGER {table}_{position}_rescope_trg BEFORE UPDATE OF \"{scope_col}\" ON \"{table}\" \
+                         FOR EACH ROW WHEN ({rescope_when}) EXECUTE FUNCTION {table}_{position}_rescope();"
+                    );
+                }
             }
             DatabaseBackend::Sqlite => {
                 let scope_cond_new =
@@ -603,6 +659,37 @@ pub fn position_triggers_up_sql_for(
                          END;"
                     );
                 }
+                // Same reasoning as the Postgres `rescope` trigger above: an
+                // ordinary `UPDATE` reassigning a scoped row's scope FK must
+                // compact the old scope's gap and append the row to the end
+                // of the new scope, or the contiguous invariant breaks on a
+                // common "move card to another board" operation. `SQLite`
+                // can't mutate `NEW` in a `BEFORE` trigger, so this runs
+                // `AFTER UPDATE` and corrects the already-written row with a
+                // follow-up `UPDATE ... WHERE id = new.id`, mirroring the
+                // `_assign` trigger's own after-the-fact correction. No
+                // locking needed — `SQLite` has none, and write-write
+                // correctness rests on `scoped_immediate_transaction`'s
+                // `BEGIN IMMEDIATE` the same way every other position
+                // trigger here does.
+                if let Some(scope_col) = scope {
+                    let rescope_when = if has_soft_delete {
+                        format!(
+                            "old.\"{scope_col}\" IS NOT new.\"{scope_col}\" AND \
+                             old.deleted_at IS NULL AND new.deleted_at IS NULL"
+                        )
+                    } else {
+                        format!("old.\"{scope_col}\" IS NOT new.\"{scope_col}\"")
+                    };
+                    let _ = writeln!(
+                        out,
+                        "CREATE TRIGGER \"{table}_{position}_rescope\" AFTER UPDATE OF \"{scope_col}\" ON \"{table}\" \
+                         WHEN {rescope_when} BEGIN\n  \
+                         UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > old.\"{position}\";\n  \
+                         UPDATE \"{table}\" SET \"{position}\" = (SELECT COALESCE(MAX(\"{position}\"), -1) + 1 FROM \"{table}\" WHERE {live_cond_new} AND id != new.id) WHERE id = new.id;\n\
+                         END;"
+                    );
+                }
             }
         }
     }
@@ -646,6 +733,12 @@ pub fn position_triggers_down_sql_for(
             let _ = writeln!(
                 out,
                 "DROP FUNCTION IF EXISTS {table}_{position}_compact_soft() CASCADE;"
+            );
+        }
+        if f.constraints.scope.is_some() {
+            let _ = writeln!(
+                out,
+                "DROP FUNCTION IF EXISTS {table}_{position}_rescope() CASCADE;"
             );
         }
     }
@@ -5667,6 +5760,100 @@ mod tests {
     }
 
     #[test]
+    fn position_triggers_postgres_scoped_adds_rescope_trigger() {
+        // Codex review finding (issue #1358): an ordinary UPDATE reassigning
+        // the scope FK (e.g. `board_id`) must compact the old scope's gap
+        // and append the row to the end of the new scope, or the
+        // contiguous invariant breaks on a "move card to another board"
+        // operation.
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["board:references", "rank:position{scope:board_id}"]),
+        );
+        assert!(
+            up.contains("CREATE FUNCTION tasks_rank_rescope() RETURNS TRIGGER"),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains(
+                "CREATE TRIGGER tasks_rank_rescope_trg BEFORE UPDATE OF \"board_id\" ON \"tasks\""
+            ),
+            "must be BEFORE UPDATE so it can mutate NEW.rank directly: {up}"
+        );
+        assert!(
+            up.contains("WHEN (NEW.\"board_id\" IS DISTINCT FROM OLD.\"board_id\")"),
+            "must only fire when the scope actually changes: {up}"
+        );
+        let rescope_fn = up
+            .split("CREATE FUNCTION tasks_rank_rescope()")
+            .nth(1)
+            .expect("rescope function body");
+        let rescope_fn = &rescope_fn[..rescope_fn.find("$$ LANGUAGE").unwrap_or(rescope_fn.len())];
+        assert!(
+            rescope_fn.contains(
+                "UPDATE \"tasks\" SET \"rank\" = \"rank\" - 1 WHERE \"board_id\" = OLD.\"board_id\" AND \"rank\" > OLD.\"rank\";"
+            ),
+            "must compact the old scope: {rescope_fn}"
+        );
+        assert!(
+            rescope_fn.contains(
+                "NEW.\"rank\" := COALESCE((SELECT MAX(\"rank\") + 1 FROM \"tasks\" WHERE \"board_id\" = NEW.\"board_id\"), 0);"
+            ),
+            "must append to the end of the new scope: {rescope_fn}"
+        );
+        // Both scope keys must be locked, in a fixed hash-ascending order
+        // (mirroring move_to's fixed id-ascending row-lock order) so two
+        // rows swapping scopes concurrently can't deadlock each other.
+        assert!(
+            rescope_fn.contains("hashtext(OLD.\"board_id\"::text) <= hashtext(NEW.\"board_id\"::text)"),
+            "must lock old/new scope keys in a fixed order: {rescope_fn}"
+        );
+        assert!(
+            rescope_fn.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), hashtext(OLD.\"board_id\"::text))")
+                && rescope_fn.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), hashtext(NEW.\"board_id\"::text))"),
+            "must lock BOTH the old and new scope's advisory key, same key as \
+             assign/compact so they fully serialize: {rescope_fn}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_unscoped_position_has_no_rescope_trigger() {
+        // No scope column exists to reassign on an unscoped position field.
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["rank:position"]),
+        );
+        assert!(
+            !up.contains("rescope"),
+            "an unscoped position field must not emit a rescope trigger: {up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_rescope_skips_soft_deleted_rows() {
+        // A soft-deleted row's scope is already excluded from both the old
+        // and new scope's live sequence — compact_soft/restore own that
+        // transition, not rescope.
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&[
+                "board:references",
+                "rank:position{scope:board_id}",
+                "deleted_at:Option<NaiveDateTime>",
+            ]),
+        );
+        assert!(
+            up.contains(
+                "WHEN (NEW.\"board_id\" IS DISTINCT FROM OLD.\"board_id\" AND OLD.deleted_at IS NULL AND NEW.deleted_at IS NULL)"
+            ),
+            "got:\n{up}"
+        );
+    }
+
+    #[test]
     fn position_triggers_postgres_soft_delete_adds_compaction_trigger() {
         let up = position_triggers_up_sql_for(
             DatabaseBackend::Postgres,
@@ -5704,6 +5891,23 @@ mod tests {
         );
         assert!(
             down.contains("DROP FUNCTION IF EXISTS tasks_rank_compact_soft() CASCADE;"),
+            "got:\n{down}"
+        );
+        assert!(
+            !down.contains("rescope"),
+            "unscoped position field must not emit a rescope function to drop: {down}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_down_drops_rescope_function_when_scoped() {
+        let down = position_triggers_down_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["board:references", "rank:position{scope:board_id}"]),
+        );
+        assert!(
+            down.contains("DROP FUNCTION IF EXISTS tasks_rank_rescope() CASCADE;"),
             "got:\n{down}"
         );
     }
@@ -5748,6 +5952,59 @@ mod tests {
         );
         assert!(
             up.contains("WHERE \"board_id\" = old.\"board_id\" AND \"rank\" > old.\"rank\";"),
+            "got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_sqlite_scoped_adds_rescope_trigger() {
+        // `SQLite` can't mutate NEW in a BEFORE trigger, so this must be
+        // AFTER UPDATE with a follow-up corrective UPDATE, mirroring the
+        // `_assign` trigger's own AFTER-INSERT correction.
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "tasks",
+            &fields(&["board:references", "rank:position{scope:board_id}"]),
+        );
+        assert!(
+            up.contains(
+                "CREATE TRIGGER \"tasks_rank_rescope\" AFTER UPDATE OF \"board_id\" ON \"tasks\""
+            ),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("WHEN old.\"board_id\" IS NOT new.\"board_id\""),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains(
+                "UPDATE \"tasks\" SET \"rank\" = \"rank\" - 1 WHERE \"board_id\" = old.\"board_id\" AND \"rank\" > old.\"rank\";"
+            ),
+            "must compact the old scope: {up}"
+        );
+        assert!(
+            up.contains(
+                "UPDATE \"tasks\" SET \"rank\" = (SELECT COALESCE(MAX(\"rank\"), -1) + 1 FROM \"tasks\" WHERE \"board_id\" = new.\"board_id\" AND id != new.id) WHERE id = new.id;"
+            ),
+            "must append to the end of the new scope: {up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_sqlite_rescope_skips_soft_deleted_rows() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "tasks",
+            &fields(&[
+                "board:references",
+                "rank:position{scope:board_id}",
+                "deleted_at:Option<NaiveDateTime>",
+            ]),
+        );
+        assert!(
+            up.contains(
+                "WHEN old.\"board_id\" IS NOT new.\"board_id\" AND old.deleted_at IS NULL AND new.deleted_at IS NULL"
+            ),
             "got:\n{up}"
         );
     }
