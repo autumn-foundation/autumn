@@ -201,6 +201,47 @@ fn api_scaffold_omits_reorder_buttons_but_keeps_repository_methods() {
 }
 
 #[test]
+fn i18n_scaffold_translates_reorder_buttons_and_flash() {
+    // The Move up/down buttons and the "moved" flash are generated Rust
+    // source, not covered by any autumn-web widget's own i18n — so `--i18n`
+    // must route them through `t!(locale, "...")` like every other
+    // generated label, or they'd be the one surface still hardcoding
+    // English on an otherwise-translated scaffold.
+    let (_tmp, project) = scaffold_project(
+        "pos-i18n",
+        &["title:String", "rank:position"],
+        &["--i18n"],
+    );
+    let routes = read(&project, "src/routes/tasks.rs");
+    assert!(
+        routes.contains("t!(locale, \"common.move_up\")"),
+        "expected the Move up button to look up its label via t!: {routes}"
+    );
+    assert!(
+        routes.contains("t!(locale, \"common.move_down\")"),
+        "expected the Move down button to look up its label via t!: {routes}"
+    );
+    assert!(
+        routes.contains("t!(locale, \"task.flash.moved\")"),
+        "expected the moved flash to look up its message via t!: {routes}"
+    );
+    assert!(
+        !routes.contains("\"Move up\"") && !routes.contains("\"Move down\""),
+        "the raw English button labels must not survive --i18n: {routes}"
+    );
+
+    let ftl = read(&project, "i18n/en.ftl");
+    assert!(
+        ftl.contains("common.move_up") && ftl.contains("common.move_down"),
+        "the shared Move up/down keys must be backfilled into en.ftl: {ftl}"
+    );
+    assert!(
+        ftl.contains("task.flash.moved"),
+        "the per-resource moved-flash key must be backfilled into en.ftl: {ftl}"
+    );
+}
+
+#[test]
 fn sharded_scaffold_rejects_position() {
     // `position(...)` explicitly rejects `sharded` at macro-expansion time
     // (see autumn-macros/src/repository.rs) — the scaffold's own emission

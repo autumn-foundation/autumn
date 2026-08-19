@@ -2837,6 +2837,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_fields_rejects_position_scope_nullable_reference_field() {
+        let tokens = vec![
+            "board:references?".into(),
+            "rank:position{scope:board_id}".into(),
+        ];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("board_id"), "unexpected error: {msg}");
+        assert!(msg.contains("nullable"), "unexpected error: {msg}");
+    }
+
+    #[test]
     fn parse_fields_rejects_more_than_one_position_field() {
         let tokens = vec!["rank:position".into(), "rank2:position".into()];
         let err = parse_fields(&tokens).unwrap_err();
