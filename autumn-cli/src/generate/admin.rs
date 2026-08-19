@@ -590,6 +590,11 @@ fn is_update_writable(
         && !options.readonly.contains(&field.name)
         && !is_lock_version_field(field, lock_version_field)
         && !is_default_readonly(field)
+        // Issue #1358: `#[position]` excludes the column from both
+        // `New{Model}` and `Update{Model}` entirely (like `#[lock_version]`
+        // excludes its own column) — referencing `new_row.<position_field>`
+        // here would fail to compile.
+        && !field.kind.is_position()
         && !matches!(field.kind, FieldKind::Bytea)
         // Issue #1340: an at-rest encrypted column is not updatable through the
         // admin. The plugin renders its edit control disabled and WITHOUT a
@@ -1708,6 +1713,33 @@ mod tests {
         assert!(admin.contains("..Default::default()"));
         assert!(admin.contains("let diesel_changeset = changes.__to_changeset()"));
         assert!(admin.contains(".set(&diesel_changeset)"));
+    }
+
+    #[test]
+    fn position_field_excluded_from_admin_update_body() {
+        // Issue #1358: `#[position]` excludes the column from `New{Model}`/
+        // `Update{Model}` entirely, the same way `#[lock_version]` does — a
+        // generated `new_row.rank`/`UpdatePost { rank: ... }` reference would
+        // fail to compile ("no field `rank` on type `NewTask`").
+        let tmp = project_with_model("task");
+        let plan = plan_admin(
+            tmp.path(),
+            "Task",
+            &["title:String".into(), "rank:position".into()],
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/task.rs")).unwrap();
+        assert!(
+            !admin.contains("new_row.rank") && !admin.contains("rank: Patch::Set"),
+            "a position field must never be referenced in the New/Update struct \
+             construction, both of which exclude it:\n{admin}"
+        );
+        assert!(
+            admin.contains("title: Patch::Set(new_row.title)"),
+            "the ordinary field must still be writable:\n{admin}"
+        );
     }
 
     #[test]

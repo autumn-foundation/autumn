@@ -447,10 +447,29 @@ pub fn position_triggers_up_sql_for(
                     scope.map_or_else(|| "TRUE".to_owned(), |s| format!("\"{s}\" = NEW.\"{s}\""));
                 let scope_cond_old =
                     scope.map_or_else(|| "TRUE".to_owned(), |s| format!("\"{s}\" = OLD.\"{s}\""));
+                // A transaction-scoped advisory lock, keyed by table+scope
+                // (a constant second key when unscoped, so every insert into
+                // the table serializes against every other). Without it,
+                // two concurrent `BEFORE INSERT`s under READ COMMITTED can
+                // both read the same `MAX(position)` before either commits
+                // and be assigned the same value — there is no UNIQUE
+                // constraint on `(scope, position)` to catch it (positions
+                // are only ever *maintained* uniquely, by these triggers and
+                // `move_to`'s own locking; nothing at the schema level
+                // enforces it, matching how `move_to` itself achieves
+                // exclusivity through locking rather than a constraint).
+                // `pg_advisory_xact_lock` auto-releases at commit/rollback,
+                // so it composes with the rest of the inserting transaction
+                // with no separate unlock statement.
+                let lock_key2 = scope.map_or_else(
+                    || "0".to_owned(),
+                    |s| format!("hashtext(NEW.\"{s}\"::text)"),
+                );
                 let _ = writeln!(
                     out,
                     "CREATE FUNCTION {table}_{position}_assign() RETURNS TRIGGER AS $$\n\
                      BEGIN\n  \
+                     PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), {lock_key2});\n  \
                      NEW.\"{position}\" := COALESCE((SELECT MAX(\"{position}\") + 1 FROM \"{table}\" WHERE {scope_cond_new}), 0);\n  \
                      RETURN NEW;\n\
                      END;\n\
@@ -461,10 +480,24 @@ pub fn position_triggers_up_sql_for(
                     "CREATE TRIGGER {table}_{position}_assign_trg BEFORE INSERT ON \"{table}\" \
                      FOR EACH ROW EXECUTE FUNCTION {table}_{position}_assign();"
                 );
+                // Same advisory lock key as the assign trigger, keyed by
+                // `OLD`'s scope value (unchanged from `NEW`'s for a row that
+                // isn't itself being re-scoped): without it, a concurrent
+                // insert's `SELECT MAX(position)` (a plain read, not
+                // row-locked) can run against a snapshot taken before this
+                // compaction's shift commits, computing a next-position that
+                // leaves a gap where the compacted range used to end. Taking
+                // the same lock here makes insert and delete-compaction on
+                // the same scope fully serialize, closing that window.
+                let lock_key2_old = scope.map_or_else(
+                    || "0".to_owned(),
+                    |s| format!("hashtext(OLD.\"{s}\"::text)"),
+                );
                 let _ = writeln!(
                     out,
                     "CREATE FUNCTION {table}_{position}_compact() RETURNS TRIGGER AS $$\n\
                      BEGIN\n  \
+                     PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), {lock_key2_old});\n  \
                      UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > OLD.\"{position}\";\n  \
                      RETURN OLD;\n\
                      END;\n\
@@ -481,6 +514,7 @@ pub fn position_triggers_up_sql_for(
                         "CREATE FUNCTION {table}_{position}_compact_soft() RETURNS TRIGGER AS $$\n\
                          BEGIN\n  \
                          IF OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL THEN\n    \
+                         PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), {lock_key2_old});\n    \
                          UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > OLD.\"{position}\" AND deleted_at IS NULL;\n  \
                          END IF;\n  \
                          RETURN NEW;\n\
@@ -5478,6 +5512,91 @@ mod tests {
         assert!(
             !up.contains("compact_soft"),
             "no deleted_at column, so no soft-delete trigger: {up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_assign_and_compact_share_an_advisory_lock() {
+        // Regression: without a shared lock, a concurrent insert's `SELECT
+        // MAX(position)` (a plain read) can compute against a snapshot
+        // taken before a concurrent delete's compaction shift commits,
+        // leaving a gap. Both triggers must take the SAME
+        // `pg_advisory_xact_lock` key so insert and delete-compaction on the
+        // same scope fully serialize.
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["rank:position"]),
+        );
+        let assign_fn = up
+            .split("CREATE FUNCTION tasks_rank_assign()")
+            .nth(1)
+            .expect("assign function body");
+        let assign_fn = &assign_fn[..assign_fn.find("$$ LANGUAGE").unwrap_or(assign_fn.len())];
+        assert!(
+            assign_fn.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), 0)"),
+            "the insert-assign trigger must take the advisory lock before reading MAX: {assign_fn}"
+        );
+        let advisory_pos = assign_fn.find("pg_advisory_xact_lock").unwrap();
+        let select_max_pos = assign_fn.find("SELECT MAX").unwrap();
+        assert!(
+            advisory_pos < select_max_pos,
+            "the lock must be acquired BEFORE the MAX(position) read, or a concurrent \
+             insert can still race in between: {assign_fn}"
+        );
+
+        let compact_fn = up
+            .split("CREATE FUNCTION tasks_rank_compact()")
+            .nth(1)
+            .expect("compact function body");
+        let compact_fn = &compact_fn[..compact_fn.find("$$ LANGUAGE").unwrap_or(compact_fn.len())];
+        assert!(
+            compact_fn.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), 0)"),
+            "the delete-compact trigger must take the SAME lock key as the assign \
+             trigger: {compact_fn}"
+        );
+        let advisory_pos = compact_fn.find("pg_advisory_xact_lock").unwrap();
+        let update_pos = compact_fn.find("UPDATE \"tasks\"").unwrap();
+        assert!(
+            advisory_pos < update_pos,
+            "the lock must be acquired BEFORE the compaction UPDATE: {compact_fn}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_soft_delete_compact_also_takes_the_advisory_lock() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["rank:position", "deleted_at:Option<NaiveDateTime>"]),
+        );
+        let compact_soft_fn = up
+            .split("CREATE FUNCTION tasks_rank_compact_soft()")
+            .nth(1)
+            .expect("compact_soft function body");
+        assert!(
+            compact_soft_fn.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), 0)"),
+            "the soft-delete compaction trigger must take the same advisory lock too: \
+             {compact_soft_fn}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_scoped_advisory_lock_keys_on_scope_value() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["board:references", "rank:position{scope:board_id}"]),
+        );
+        assert!(
+            up.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), hashtext(NEW.\"board_id\"::text))"),
+            "the assign trigger's lock must be scoped to board_id, not a table-wide \
+             constant, so unrelated boards never contend: {up}"
+        );
+        assert!(
+            up.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), hashtext(OLD.\"board_id\"::text))"),
+            "the compact trigger's lock must use the same scope key (from OLD, since it \
+             runs after the row is gone): {up}"
         );
     }
 

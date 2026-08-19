@@ -342,3 +342,216 @@ async fn concurrent_moves_never_produce_duplicate_or_gapped_positions() {
          (no duplicates, no gaps), got: {ranks:?}"
     );
 }
+
+// ── Insert-assign trigger concurrency (a separate, trigger-backed table) ───
+//
+// The tests above seed rows with an explicit `rank` (bypassing the insert
+// trigger entirely, since a hand-declared test schema has no migration to
+// install one) to isolate `move_*`'s own locking. This table instead
+// installs the real trigger SQL `position_triggers_up_sql_for` generates
+// (mirrored by hand here — `autumn` cannot depend on `autumn-cli`), so a
+// concurrent-*insert* property test exercises the actual insert-time
+// assignment path, including the `pg_advisory_xact_lock` fix for the race
+// two concurrent `BEFORE INSERT` triggers' un-locked `SELECT MAX(position)`
+// reads would otherwise hit (see `autumn-cli`'s `position_triggers_up_sql_for`
+// doc comment).
+
+mod triggered_schema {
+    autumn_web::reexports::diesel::table! {
+        position_triggered_tasks (id) {
+            id -> Int8,
+            title -> Text,
+            rank -> Int8,
+            board_id -> Int8,
+        }
+    }
+}
+
+use triggered_schema::position_triggered_tasks;
+
+#[autumn_web::model(table = "position_triggered_tasks")]
+pub struct PositionTriggeredTask {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[position]
+    pub rank: i64,
+    pub board_id: i64,
+}
+
+#[autumn_web::repository(
+    PositionTriggeredTask,
+    table = "position_triggered_tasks",
+    position(column = "rank", scope = "board_id")
+)]
+pub trait PositionTriggeredTaskRepository {}
+
+static TRIGGERED_SETUP_CELL: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+async fn setup_triggered_table(db: &TestDb) {
+    TRIGGERED_SETUP_CELL
+        .get_or_init(|| async {
+            db.execute_sql(
+                "CREATE TABLE IF NOT EXISTS position_triggered_tasks (
+                    id BIGSERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    rank BIGINT NOT NULL DEFAULT 0,
+                    board_id BIGINT NOT NULL
+                )",
+            )
+            .await;
+            db.execute_sql(
+                "CREATE OR REPLACE FUNCTION position_triggered_tasks_rank_assign() \
+                 RETURNS TRIGGER AS $$
+                 BEGIN
+                   PERFORM pg_advisory_xact_lock(
+                       hashtext('position_triggered_tasks_rank_assign'),
+                       hashtext(NEW.\"board_id\"::text)
+                   );
+                   NEW.\"rank\" := COALESCE(
+                       (SELECT MAX(\"rank\") + 1 FROM \"position_triggered_tasks\" \
+                        WHERE \"board_id\" = NEW.\"board_id\"),
+                       0
+                   );
+                   RETURN NEW;
+                 END;
+                 $$ LANGUAGE plpgsql;",
+            )
+            .await;
+            db.execute_sql(
+                "DROP TRIGGER IF EXISTS position_triggered_tasks_rank_assign_trg \
+                 ON \"position_triggered_tasks\";",
+            )
+            .await;
+            db.execute_sql(
+                "CREATE TRIGGER position_triggered_tasks_rank_assign_trg \
+                 BEFORE INSERT ON \"position_triggered_tasks\" \
+                 FOR EACH ROW EXECUTE FUNCTION position_triggered_tasks_rank_assign();",
+            )
+            .await;
+        })
+        .await;
+}
+
+async fn triggered_ranks(pool: &Pool, board_id: i64) -> Vec<i64> {
+    let mut conn = pool.get().await.expect("checkout connection");
+    position_triggered_tasks::table
+        .filter(position_triggered_tasks::board_id.eq(board_id))
+        .select(position_triggered_tasks::rank)
+        .load(&mut conn)
+        .await
+        .expect("load ranks")
+}
+
+/// Regression for the concurrent-insert race the review round for issue
+/// #1358 caught: without the advisory lock, two `BEFORE INSERT` triggers
+/// racing on the same scope could both read the same `MAX(rank)` (a plain,
+/// unlocked read) and be assigned the same value. Spawns many concurrent
+/// inserts into one scope, from separate connections, and asserts the
+/// stored positions are an exact `0..len-1` permutation — no duplicates, no
+/// gaps — regardless of how Postgres interleaved them.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_inserts_never_produce_duplicate_or_gapped_positions() {
+    let db = TestDb::shared().await;
+    setup_triggered_table(db).await;
+    let board_id = 2001;
+    const N: usize = 30;
+
+    let mut handles = Vec::new();
+    for i in 0..N {
+        let pool = db.pool();
+        handles.push(tokio::spawn(async move {
+            let mut conn = pool.get().await.expect("checkout connection");
+            diesel::insert_into(position_triggered_tasks::table)
+                .values((
+                    position_triggered_tasks::title.eq(format!("concurrent-{i}")),
+                    position_triggered_tasks::board_id.eq(board_id),
+                ))
+                .execute(&mut conn)
+                .await
+        }));
+    }
+    for handle in handles {
+        handle
+            .await
+            .expect("task panicked")
+            .expect("concurrent insert must not error");
+    }
+
+    let mut ranks = triggered_ranks(&db.pool(), board_id).await;
+    ranks.sort_unstable();
+    let expected: Vec<i64> = (0..i64::try_from(N).expect("fits i64")).collect();
+    assert_eq!(
+        ranks, expected,
+        "concurrent inserts into the same scope must still produce an exact 0..len-1 \
+         permutation (no duplicates, no gaps), got: {ranks:?}"
+    );
+}
+
+/// Regression for the same race's cross-operation form: a concurrent insert
+/// and a concurrent delete (of an unrelated row) on the same scope must not
+/// leave a gap — the insert-assign and delete-compact triggers share the
+/// same advisory lock key specifically so they fully serialize against each
+/// other, not just against their own kind.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_insert_and_delete_never_leave_a_gap() {
+    let db = TestDb::shared().await;
+    setup_triggered_table(db).await;
+    let board_id = 2002;
+
+    // Seed 5 rows (0..4) through the real trigger, then delete the middle one
+    // and insert a new one concurrently.
+    let mut seeded_ids = Vec::new();
+    for i in 0..5 {
+        let mut conn = db.pool().get().await.expect("checkout connection");
+        let id: i64 = diesel::insert_into(position_triggered_tasks::table)
+            .values((
+                position_triggered_tasks::title.eq(format!("seed-{i}")),
+                position_triggered_tasks::board_id.eq(board_id),
+            ))
+            .returning(position_triggered_tasks::id)
+            .get_result(&mut conn)
+            .await
+            .expect("seed insert");
+        seeded_ids.push(id);
+    }
+    let delete_id = seeded_ids[2]; // currently at rank 2
+
+    let delete_pool = db.pool();
+    let delete_task = tokio::spawn(async move {
+        let mut conn = delete_pool.get().await.expect("checkout connection");
+        diesel::delete(position_triggered_tasks::table.find(delete_id))
+            .execute(&mut conn)
+            .await
+    });
+    let insert_pool = db.pool();
+    let insert_task = tokio::spawn(async move {
+        let mut conn = insert_pool.get().await.expect("checkout connection");
+        diesel::insert_into(position_triggered_tasks::table)
+            .values((
+                position_triggered_tasks::title.eq("concurrent-new"),
+                position_triggered_tasks::board_id.eq(board_id),
+            ))
+            .execute(&mut conn)
+            .await
+    });
+    delete_task
+        .await
+        .expect("task panicked")
+        .expect("delete must not error");
+    insert_task
+        .await
+        .expect("task panicked")
+        .expect("insert must not error");
+
+    let mut ranks = triggered_ranks(&db.pool(), board_id).await;
+    ranks.sort_unstable();
+    // 5 seeded - 1 deleted + 1 inserted = 5 rows, still contiguous 0..4.
+    assert_eq!(
+        ranks,
+        vec![0, 1, 2, 3, 4],
+        "a concurrent insert and delete on the same scope must not leave a gap: {ranks:?}"
+    );
+}
