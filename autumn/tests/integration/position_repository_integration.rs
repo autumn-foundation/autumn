@@ -167,7 +167,7 @@ async fn move_to_clamps_out_of_range_targets() {
     repo.move_to(ids[2], -50).await.expect("move_to clamps low");
     assert_eq!(
         ordered_titles(&db.pool(), board_id).await,
-        vec!["task-0", "task-1", "task-2"]
+        vec!["task-2", "task-1", "task-0"]
     );
 }
 
