@@ -59,6 +59,22 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_m2m_helper_collision.rs");
 
+    // `#[commentable]` compile-time guards (#1367). The counter is maintained
+    // with `SET c = c + 1` and read back as `i64`, `commentable_id` is one
+    // column, the emitted `{Model}Comments` trait can only exist once, and the
+    // depth cap has to stay measurable by the runtime's recursive probe — each
+    // is a directed error rather than a runtime surprise.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_missing_counter_column.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_counter_not_i64.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_duplicate.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_composite_key.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_max_depth_too_large.rs");
+
     // Declarative reactions (#1362): every `#[votable(...)]` misuse is a
     // directed compile error rather than a runtime surprise on the first vote.
     // `by =` is required (no positional head); only one `#[votable]` per model
