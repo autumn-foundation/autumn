@@ -209,6 +209,9 @@ where
         if any_err
             .downcast_ref::<crate::tenant_cell::QuotaExceeded>()
             .is_some()
+            || any_err
+                .downcast_ref::<crate::tenant_cell::TenantAllocationError>()
+                .is_some()
         {
             status = StatusCode::SERVICE_UNAVAILABLE;
         }

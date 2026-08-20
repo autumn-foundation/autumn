@@ -37,6 +37,158 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+/// The safe, allocator-backed region for the allocation classes Autumn can
+/// enforce: owned byte buffers and UTF-8 strings created by this API.
+///
+/// This is deliberately not a global allocator.  Ordinary `Vec`, `String`,
+/// `Box`, third-party, and allocator-internal allocations remain outside this
+/// cooperative tracked-memory boundary.
+#[derive(Clone, Debug)]
+pub struct TenantArena {
+    cell: TenantCell,
+}
+
+impl TenantArena {
+    /// Allocate a zero-filled byte buffer owned by this tenant region.
+    ///
+    /// Reservation happens before allocation. Quota exhaustion therefore does
+    /// not allocate and does not mutate accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TenantAllocationError::Quota`] when the finite quota would be
+    /// exceeded, or [`TenantAllocationError::Allocator`] if the process
+    /// allocator rejects the reservation.
+    pub fn try_bytes(&self, len: usize) -> Result<TenantBytes, TenantAllocationError> {
+        let charge = self.cell.try_charge(len)?;
+        let mut value = Vec::new();
+        value
+            .try_reserve_exact(len)
+            .map_err(|error| TenantAllocationError::Allocator {
+                requested: len,
+                message: error.to_string(),
+            })?;
+        let excess_charge = (value.capacity() > len)
+            .then(|| self.cell.try_charge(value.capacity() - len))
+            .transpose()?;
+        value.resize(len, 0);
+        Ok(TenantBytes {
+            value,
+            charge,
+            excess_charge,
+        })
+    }
+
+    /// Copy `value` into an owned UTF-8 allocation in this tenant region.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TenantAllocationError::Quota`] when the finite quota would be
+    /// exceeded, or [`TenantAllocationError::Allocator`] if the process
+    /// allocator rejects the reservation.
+    pub fn try_string(&self, value: &str) -> Result<TenantString, TenantAllocationError> {
+        let charge = self.cell.try_charge(value.len())?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(value.len())
+            .map_err(|error| TenantAllocationError::Allocator {
+                requested: value.len(),
+                message: error.to_string(),
+            })?;
+        let excess_charge = (owned.capacity() > value.len())
+            .then(|| self.cell.try_charge(owned.capacity() - value.len()))
+            .transpose()?;
+        owned.push_str(value);
+        Ok(TenantString {
+            value: owned,
+            charge,
+            excess_charge,
+        })
+    }
+
+    /// Tenant accounting domain backing this arena.
+    #[must_use]
+    pub fn tenant_id(&self) -> &str {
+        self.cell.tenant_id()
+    }
+}
+
+/// A byte allocation whose ownership and accounting cannot be separated.
+#[derive(Debug)]
+pub struct TenantBytes {
+    value: Vec<u8>,
+    charge: Charge,
+    excess_charge: Option<Charge>,
+}
+
+impl TenantBytes {
+    /// Borrow the allocation.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.value
+    }
+    /// Mutably borrow the fixed-size allocation.
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.value
+    }
+    /// Number of quota bytes owned by this allocation.
+    #[must_use]
+    pub fn tracked_bytes(&self) -> usize {
+        self.charge.bytes() + self.excess_charge.as_ref().map_or(0, Charge::bytes)
+    }
+}
+
+/// A UTF-8 allocation whose ownership and accounting cannot be separated.
+#[derive(Debug)]
+pub struct TenantString {
+    value: String,
+    charge: Charge,
+    excess_charge: Option<Charge>,
+}
+
+impl TenantString {
+    /// Borrow the allocation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+    /// Number of quota bytes owned by this allocation.
+    #[must_use]
+    pub fn tracked_bytes(&self) -> usize {
+        self.charge.bytes() + self.excess_charge.as_ref().map_or(0, Charge::bytes)
+    }
+}
+
+/// Failure to reserve tenant quota or obtain memory from the process allocator.
+#[derive(Debug)]
+pub enum TenantAllocationError {
+    /// The tenant's finite cooperative quota was exhausted.
+    Quota(QuotaExceeded),
+    /// The system allocator rejected a reservation after quota was reserved.
+    Allocator { requested: usize, message: String },
+}
+
+impl From<QuotaExceeded> for TenantAllocationError {
+    fn from(value: QuotaExceeded) -> Self {
+        Self::Quota(value)
+    }
+}
+
+impl fmt::Display for TenantAllocationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Quota(error) => error.fmt(f),
+            Self::Allocator { requested, message } => write!(
+                f,
+                "allocator rejected tenant scratch reservation of {requested} bytes: {message}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TenantAllocationError {}
+
 /// Fixed bytes charged per scratch entry to cover the map's per-entry overhead:
 /// the `String` and `Vec` structs stored inline in the bucket array plus an
 /// amortized bucket slot / control byte. Charging this bounds the *number* of
@@ -318,6 +470,12 @@ impl TenantCell {
     #[must_use]
     pub fn tracked_bytes(&self) -> usize {
         self.inner.tracked_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Return the safe region used for supported tenant-owned scratch buffers.
+    #[must_use]
+    pub fn arena(&self) -> TenantArena {
+        TenantArena { cell: self.clone() }
     }
 
     /// The fixed per-entry overhead (bytes) charged against the quota for each
@@ -861,4 +1019,12 @@ pub fn current_tenant_cell() -> Option<Arc<TenantCell>> {
         .try_with(|h| h.as_ref().map(TenantCellHandle::cell))
         .ok()
         .flatten()
+}
+
+/// Return the current request's supported cooperative scratch-allocation
+/// region. Unlike a bare heap allocation, values returned by this region own
+/// their quota charge for their entire lifetime.
+#[must_use]
+pub fn current_tenant_arena() -> Option<TenantArena> {
+    current_tenant_cell().map(|cell| cell.arena())
 }

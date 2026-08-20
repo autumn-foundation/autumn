@@ -1,7 +1,8 @@
 # Per-Tenant Memory Cells
 
-Row-level tenancy scopes a tenant's *rows*; per-tenant memory cells bound a
-tenant's *in-process memory*. On top of the existing tenancy story, each
+Row-level tenancy scopes a tenant's *rows*; per-tenant memory cells account for
+a tenant's supported *cooperative tracked scratch memory*. They do **not** bound
+arbitrary in-process memory. On top of the existing tenancy story, each
 resolved tenant gets a `TenantCell` — a byte-accounting boundary with a soft
 quota and an owned scratch buffer — created lazily on the first request that
 touches tenant memory. Allocations that flow through the cell are tracked
@@ -9,9 +10,8 @@ against the tenant's quota; when the cell is evicted and dropped, Rust's
 ownership rules deterministically reclaim its tracked footprint.
 
 This is orthogonal to sharding. Sharding decides *which database* a tenant's
-rows live on; cells decide *how much process memory* a single tenant may hold
-before its own requests start failing. One noisy tenant can no longer allocate
-its way into every other tenant's latency.
+rows live on; cells decide how much memory allocated through the supported
+arena API a single tenant may retain before its own requests start failing.
 
 The whole cell is pure, safe Rust: it holds under the workspace-wide
 `#![forbid(unsafe_code)]`. It is an accounting cell, not a bounding allocator —
@@ -81,8 +81,20 @@ request, and `None` otherwise (so a route that runs outside a tenant context
 degrades gracefully). Calling it is what *materializes* the cell for the
 request — routes that never call it create no cell.
 
-`try_charge(n)` reserves `n` bytes against the quota and hands back a `Charge`
-RAII guard. The bytes stay tracked for exactly as long as you hold the guard:
+Prefer `current_tenant_arena()` and its typed, fallible `try_bytes` and
+`try_string` APIs. The returned value owns both its allocation and quota charge,
+so supported request scratch state cannot separate the two:
+
+```rust
+let arena = autumn_web::tenant_cell::current_tenant_arena()
+    .ok_or_else(|| AutumnError::service_unavailable_msg("tenant arena unavailable"))?;
+let mut scratch = arena.try_bytes(512 * 1024)?;
+scratch.as_mut_slice()[0] = 1;
+```
+
+`try_charge(n)` is a lower-level compatibility API. It reserves `n` bytes
+against the quota and hands back a `Charge` RAII guard. The bytes stay tracked
+for exactly as long as you hold the guard:
 drop it (or let it fall off the end of the handler) and they are released
 immediately. If the charge would exceed the quota it returns `QuotaExceeded`,
 which converts into `AutumnError` as an HTTP **503 Service Unavailable** — so a
@@ -138,12 +150,12 @@ async fn stash() -> AutumnResult<&'static str> {
 }
 ```
 
-## Quota isolation
+## Cooperative quota accounting (not hard isolation)
 
-A quota breach is scoped to the tenant that hit it. When a tenant is over
+A tracked quota breach is scoped to the tenant that hit it. When a tenant is over
 quota, only *its* over-budget request fails — with a 503 — and every other
-tenant has its own independent counter and is completely unaffected: a whale
-exhausting its cell degrades only its own traffic, not the process.
+tenant has its own independent counter. This is counter independence, not a
+claim that shared-process allocator pressure cannot affect other traffic.
 
 Where in the request that 503 lands depends on the API. `try_charge(n)?`
 reserves *before* you allocate: the quota is checked up front, so an over-quota
@@ -211,15 +223,23 @@ refresh simply re-applies the same configured value.
   can stay elevated after you insert then remove scratch entries, and re-inserting
   within the prior peak adds no new overhead (churn-safe).
 
-Everything tracked is deterministically reclaimed when the cell is dropped on
-eviction. What it is **not**: a measurement of the tenant's true process RSS.
+Everything owned by the arena is deterministically reclaimed after eviction and
+the final outstanding reference is dropped. The precise lifecycle and boundary
+are recorded in [ADR 0012](../adr/0012-cooperative-tenant-memory-boundary.md).
+What this is **not**: a measurement of the tenant's true process RSS.
 Allocator-internal fragmentation, size-class rounding, and any allocation a
 handler makes *outside* the cell's API (a bare `Box::new`, a `Vec` you build
 and never charge) are invisible to the counter by design. Charge through the
-cell for the memory you want bounded; the guarantee is that those tracked bytes
-are counted honestly and released deterministically.
+arena for supported scratch memory you want bounded; the guarantee is that
+those tracked bytes are counted honestly and released deterministically.
 
 ## Limitations and roadmap
+
+- **No hard memory isolation** — bare `Vec`, `String`, `Box`, collections,
+  request/response bodies, futures, stacks, database/TLS/plugin allocations,
+  allocator metadata, fragmentation, and native allocations are outside the
+  boundary. Use a process/container/VM when adversarial hard isolation is
+  required. `try_charge` is cooperative accounting, not allocation ownership.
 
 - **Config hot-reload** — resident cells already refresh their quota from
   `quota_bytes` on every access (see [Dynamic quota](#eviction-and-lifecycle)),

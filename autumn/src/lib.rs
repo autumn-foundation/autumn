@@ -681,7 +681,10 @@ pub use db::RuntimeBackend;
 /// See the [`error`] module for details.
 pub use error::{AutumnError, AutumnResult};
 
-pub use tenant_cell::{QuotaExceeded, TenantCell, TenantCellHandle, TenantCellRegistry};
+pub use tenant_cell::{
+    QuotaExceeded, TenantAllocationError, TenantArena, TenantBytes, TenantCell, TenantCellHandle,
+    TenantCellRegistry, TenantString,
+};
 
 /// Paginated list response wrapper with navigation metadata.
 ///

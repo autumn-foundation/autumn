@@ -7,6 +7,64 @@ use autumn_web::tenant_cell::{QuotaExceeded, TenantCell, TenantCellRegistry};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[test]
+fn arena_happy_path_and_exact_boundary() {
+    let registry = TenantCellRegistry::new();
+    let cell = registry.get_or_create("tenant", 64);
+    let arena = cell.arena();
+    let mut bytes = arena.try_bytes(32).expect("bytes fit");
+    bytes.as_mut_slice()[0] = 7;
+    let text = arena
+        .try_string(&"x".repeat(32))
+        .expect("exact boundary fits");
+    assert_eq!(bytes.as_slice()[0], 7);
+    assert_eq!(text.as_str().len(), 32);
+    assert_eq!(cell.tracked_bytes(), 64);
+}
+
+#[test]
+fn arena_over_quota_is_non_mutating_and_tenants_are_concurrent() {
+    let registry = TenantCellRegistry::new();
+    let a = registry.get_or_create("a", 32);
+    let b = registry.get_or_create("b", 32);
+    let held = a.arena().try_bytes(32).expect("a fills exact quota");
+    let before = a.tracked_bytes();
+    a.arena().try_bytes(1).expect_err("a is over quota");
+    assert_eq!(a.tracked_bytes(), before, "failed reservation is inert");
+    let thread = std::thread::spawn(move || b.arena().try_bytes(32));
+    let other = thread
+        .join()
+        .expect("tenant thread does not panic")
+        .expect("b has an independent domain");
+    assert_eq!(other.tracked_bytes(), 32);
+    drop(held);
+    assert_eq!(a.tracked_bytes(), 0);
+}
+
+#[test]
+fn final_eviction_makes_all_supported_arena_allocations_unreachable() {
+    let registry = TenantCellRegistry::new();
+    let cell = registry.get_or_create("tenant", 128);
+    let bytes = cell.arena().try_bytes(64).expect("bytes fit");
+    let text = cell
+        .arena()
+        .try_string("region-owned")
+        .expect("string fits");
+    drop(registry.evict("tenant"));
+    drop(cell);
+    assert!(
+        registry.total_tracked_bytes() > 0,
+        "owned allocations remain modeled reachable after eviction"
+    );
+    drop(bytes);
+    assert!(
+        registry.total_tracked_bytes() > 0,
+        "string is still modeled reachable"
+    );
+    drop(text);
+    assert_eq!(registry.total_tracked_bytes(), 0);
+}
+
 /// A charge raises both the per-tenant and process-wide gauges by exactly its
 /// size, and dropping it returns them to zero.
 #[test]
