@@ -179,7 +179,7 @@ pub struct CommentableSpec {
 impl CommentableSpec {
     /// Every identifier this spec splices into SQL, with the field it came
     /// from — the input to [`validate`](Self::validate).
-    fn idents(&self) -> [(&'static str, Option<&'static str>); 15] {
+    const fn idents(&self) -> [(&'static str, Option<&'static str>); 15] {
         [
             ("comments_table", Some(self.comments_table)),
             ("comment_pk", Some(self.comment_pk)),
@@ -783,7 +783,11 @@ fn nest(rows: Vec<Comment>) -> Vec<CommentNode> {
 /// Beyond it, the rest of the subtree is emitted flat at that level, by an
 /// iterative walk — visibly flattened beats a dropped comment, and beats a
 /// crashed worker.
-const MAX_NESTING: usize = RECURSION_GUARD as usize;
+/// Spelled as a literal rather than a cast of [`RECURSION_GUARD`]: the two have
+/// different types (one indexes SQL, one indexes a `Vec`) and every `as`
+/// between them is a truncation clippy is right to flag. They are pinned
+/// together by `the_macro_depth_ceiling_matches_the_recursion_guard`.
+const MAX_NESTING: usize = 1_000;
 
 /// Emit an entire subtree as one flat list at `depth`, iteratively.
 ///
@@ -795,7 +799,7 @@ fn flatten_subtree(
     positions: &[usize],
     depth: usize,
     children: &[Vec<usize>],
-    comments: &mut Vec<Option<Comment>>,
+    comments: &mut [Option<Comment>],
 ) -> Vec<CommentNode> {
     let mut pending: Vec<usize> = positions.iter().rev().copied().collect();
     let mut out = Vec::new();
@@ -818,7 +822,7 @@ fn build_nodes(
     positions: &[usize],
     depth: usize,
     children: &[Vec<usize>],
-    comments: &mut Vec<Option<Comment>>,
+    comments: &mut [Option<Comment>],
 ) -> Vec<CommentNode> {
     positions
         .iter()
@@ -1507,6 +1511,13 @@ impl Default for CommentsConfig {
 /// AppBuilder::new()
 ///     .nest("/comments", autumn_web::commentable::router(Default::default()))
 /// ```
+///
+/// # Panics
+///
+/// If two `#[commentable]` models claim the same `commentable_type`. There is
+/// no request-time answer that is not silently wrong — one model's rows would
+/// be probed against the other's table — so this fails at wiring time, where
+/// the fix (`#[commentable(type_name = "…")]`) is obvious.
 ///
 /// **Mount it behind whatever authentication and CSRF middleware your app
 /// already uses.** The `POST` handler reads the author's id from the session
