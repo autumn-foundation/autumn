@@ -33,6 +33,7 @@
 #![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
 
 use autumn_web::commentable::{CommentNode, commentable_spec_for, registered_commentable_types};
+use autumn_web::reexports::axum;
 use autumn_web::tenancy::CURRENT_TENANT;
 use diesel::sql_types::{BigInt, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -1155,4 +1156,316 @@ async fn a_tenant_scoped_repository_with_no_context_refuses_to_comment() {
         .await
         .expect_err("a tenant_scoped repository needs a tenant");
     assert_eq!(counter(&mut conn, "cmt_tenanted", acme).await, 0);
+}
+
+// ── The generic router ──────────────────────────────────────────────────────
+//
+// One pair of routes serves every registered model. Nothing else in the suite
+// exercises it, and it is the surface an app actually mounts.
+
+/// Minimal state exposing the pool to the `Db` extractor, so the real handlers
+/// run against a real database.
+#[derive(Clone)]
+struct RouterState {
+    pool: Pool<AsyncPgConnection>,
+}
+
+impl autumn_web::db::DbState for RouterState {
+    fn pool(&self) -> Option<&Pool<autumn_web::db::RuntimeConnection>> {
+        Some(&self.pool)
+    }
+}
+
+/// The comment router mounted the way an app mounts it.
+fn comment_app(
+    pool: Pool<AsyncPgConnection>,
+    config: autumn_web::commentable::CommentsConfig,
+) -> axum::Router {
+    axum::Router::new()
+        .nest("/comments", autumn_web::commentable::router(config))
+        .with_state(RouterState { pool })
+}
+
+/// Drive one request through the router and read back `(status, body)`.
+async fn call(
+    app: axum::Router,
+    mut request: axum::http::Request<axum::body::Body>,
+) -> (u16, String) {
+    use tower::ServiceExt as _;
+    // `Session` panics without the extension `SessionLayer` installs, so every
+    // request carries one — an empty session is the signed-out shape.
+    if request
+        .extensions()
+        .get::<autumn_web::session::Session>()
+        .is_none()
+    {
+        request
+            .extensions_mut()
+            .insert(autumn_web::session::Session::new_for_test(
+                "anonymous".to_owned(),
+                std::collections::HashMap::new(),
+            ));
+    }
+    let response = app.oneshot(request).await.expect("router response");
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn get(path: &str) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .uri(path)
+        .body(axum::body::Body::empty())
+        .expect("request")
+}
+
+/// A form `POST`, optionally carrying a session cookie the handler reads the
+/// author id from.
+fn form_post(path: &str, body: &str) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body.to_owned()))
+        .expect("request")
+}
+
+/// AC4/AC5: the router renders a thread for a registered model, keyed only on
+/// the path segment.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_renders_the_thread_for_any_registered_model() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    repo.add_comment(post, author, "first!", None)
+        .await
+        .expect("comment");
+
+    let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
+    let (status, body) = call(app, get(&format!("/comments/CmtPost/{post}"))).await;
+
+    assert_eq!(status, 200);
+    assert!(body.contains("first!"), "{body}");
+    // The router's own dom id — the one a host page must match, or the first
+    // htmx swap lands somewhere the next one cannot find.
+    assert!(
+        body.contains(&autumn_web::commentable::thread_dom_id("CmtPost", post)),
+        "{body}"
+    );
+    // Signed out: the thread renders, every form is gone.
+    assert!(!body.contains("<form"), "{body}");
+}
+
+/// The registry is the whole gate: a type no model claims cannot be reached.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_rejects_an_unregistered_commentable_type() {
+    let (pool, _container) = setup_pool().await;
+    let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
+    let (status, _) = call(app, get("/comments/NoSuchModel/1")).await;
+    assert_eq!(status, 404);
+}
+
+/// Posting without a session author is `401`, and writes nothing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_refuses_to_post_without_a_signed_in_author() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+
+    let app = comment_app(
+        pool.clone(),
+        autumn_web::commentable::CommentsConfig::default(),
+    );
+    let (status, _) = call(
+        app,
+        form_post(&format!("/comments/CmtPost/{post}"), "body=hi"),
+    )
+    .await;
+
+    assert_eq!(status, 401);
+    assert_eq!(row_count(&mut conn, "1 = 1").await, 0);
+    assert_eq!(counter(&mut conn, "cmt_posts", post).await, 0);
+}
+
+/// The record-level hook is what an app with private records must set: the
+/// router authorizes the tenant, never the record.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_honours_the_record_level_authorization_hook() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let open = seed_one_col(&mut conn, "cmt_posts", "title", "open").await;
+    let private = seed_one_col(&mut conn, "cmt_posts", "title", "private").await;
+    repo.add_comment(private, author, "secret", None)
+        .await
+        .expect("comment");
+
+    let config = autumn_web::commentable::CommentsConfig::default()
+        .authorize(move |access| Box::pin(async move { access.parent_id != private }));
+
+    let (status, body) = call(
+        comment_app(pool.clone(), config.clone()),
+        get(&format!("/comments/CmtPost/{open}")),
+    )
+    .await;
+    assert_eq!(status, 200, "an allowed record still renders: {body}");
+
+    let (status, body) = call(
+        comment_app(pool.clone(), config),
+        get(&format!("/comments/CmtPost/{private}")),
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "a refusal is 404, never 403 — no existence oracle"
+    );
+    assert!(!body.contains("secret"), "{body}");
+}
+
+/// A browser submits an *empty* hidden input as `reply_to=`. Reading that as
+/// malformed would 422 every top-level comment posted from the widget.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_reads_an_empty_reply_to_as_a_top_level_comment() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+
+    let config = autumn_web::commentable::CommentsConfig::default();
+    let app = comment_app(pool.clone(), config);
+    let (status, body) = call_with_author(
+        app,
+        form_post(
+            &format!("/comments/CmtPost/{post}"),
+            "body=hello+there&reply_to=&return_to=",
+        ),
+        author,
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("hello there"), "{body}");
+    assert_eq!(
+        row_count(&mut conn, "parent_id IS NULL").await,
+        1,
+        "an empty reply_to is a top-level comment, not a malformed one"
+    );
+    assert_eq!(counter(&mut conn, "cmt_posts", post).await, 1);
+}
+
+/// A `reply_to` that is not a number is a `400` — distinct from the `422` the
+/// depth and cross-record checks give.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_rejects_a_malformed_reply_to() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+
+    let app = comment_app(
+        pool.clone(),
+        autumn_web::commentable::CommentsConfig::default(),
+    );
+    let (status, _) = call_with_author(
+        app,
+        form_post(&format!("/comments/CmtPost/{post}"), "body=hi&reply_to=abc"),
+        author,
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(row_count(&mut conn, "1 = 1").await, 0);
+}
+
+/// A rejected body comes back as a rendered thread carrying the message, not
+/// as a bare error htmx would refuse to swap.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_re_renders_with_an_inline_error_when_the_body_is_rejected() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+
+    let app = comment_app(
+        pool.clone(),
+        autumn_web::commentable::CommentsConfig::default(),
+    );
+    let (status, body) = call_with_author(
+        app,
+        form_post(&format!("/comments/CmtPost/{post}"), "body=+++"),
+        author,
+    )
+    .await;
+
+    assert_eq!(status, 200, "the thread still renders: {body}");
+    assert!(body.contains(r#"role="alert""#), "{body}");
+    assert_eq!(row_count(&mut conn, "1 = 1").await, 0);
+}
+
+/// The no-JS round trip: a validated `return_to` redirects; a crafted one is
+/// ignored rather than followed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_redirects_a_non_htmx_submit_only_to_a_relative_path() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    let config = autumn_web::commentable::CommentsConfig::default();
+
+    let (status, _) = call_with_author(
+        comment_app(pool.clone(), config.clone()),
+        form_post(
+            &format!("/comments/CmtPost/{post}"),
+            "body=one&return_to=%2Fposts%2Fhello",
+        ),
+        author,
+    )
+    .await;
+    assert_eq!(status, 303, "a relative path is honoured");
+
+    let (status, _) = call_with_author(
+        comment_app(pool.clone(), config),
+        form_post(
+            &format!("/comments/CmtPost/{post}"),
+            // `/<TAB>/evil.example`: the URL parser strips the tab, so a
+            // CR/LF-only check would turn this into `//evil.example`.
+            "body=two&return_to=%2F%09%2Fevil.example",
+        ),
+        author,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a crafted return_to is ignored, not followed — the fragment is returned instead"
+    );
+    assert_eq!(counter(&mut conn, "cmt_posts", post).await, 2);
+}
+
+/// Drive a request as a signed-in author by pre-seeding the session the
+/// handler reads `user_id` from.
+async fn call_with_author(
+    app: axum::Router,
+    mut request: axum::http::Request<axum::body::Body>,
+    author_id: i64,
+) -> (u16, String) {
+    // The `Session` extractor reads the request extension `SessionLayer`
+    // would have installed, so seeding it here drives the real handler with a
+    // signed-in author and no cookie plumbing.
+    let mut data = std::collections::HashMap::new();
+    data.insert("user_id".to_owned(), author_id.to_string());
+    let session = autumn_web::session::Session::new_for_test("test-session".to_owned(), data);
+    request.extensions_mut().insert(session);
+    call(app, request).await
 }

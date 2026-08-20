@@ -328,7 +328,11 @@ fn plan_model_with_options_impl(
     // runtime with `relation "comments" does not exist`. `generate scaffold`
     // routes through its own copy of this because it owns the warnings; this is
     // the `generate model` path, which the scaffold does not reach.
-    if fields.iter().any(|f| f.kind.is_commentable()) {
+    // On the destroy path the field tokens are not repeated, so the
+    // declaration is recovered from the model file instead.
+    if fields.iter().any(|f| f.kind.is_commentable())
+        || (for_revert && super::commentable::model_declares_commentable(project_root, &snake_name))
+    {
         // On a revert the shared table stays as long as ANY other model still
         // declares `#[commentable]`: it is one table for all of them.
         let revert_would_orphan_another_model = for_revert

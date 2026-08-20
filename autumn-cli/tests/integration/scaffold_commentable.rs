@@ -88,7 +88,11 @@ fn commentable_emits_the_shared_polymorphic_comments_migration() {
     let dir = migration_ending_in(&project, "_create_comments").expect("comments migration");
     let up = fs::read_to_string(dir.join("up.sql")).expect("up.sql");
 
-    assert!(up.contains("CREATE TABLE IF NOT EXISTS comments"), "{up}");
+    assert!(up.contains("CREATE TABLE comments"), "{up}");
+    assert!(
+        !up.contains("CREATE TABLE IF NOT EXISTS"),
+        "a colliding `comments` table must fail the migration loudly, not no-op:\n{up}"
+    );
     assert!(up.contains("commentable_type TEXT NOT NULL"), "{up}");
     assert!(up.contains("commentable_id BIGINT NOT NULL"), "{up}");
     assert!(
@@ -273,5 +277,111 @@ fn only_one_commentable_token_per_model() {
     assert!(
         out.contains("commentable"),
         "the error must name the offending token:\n{out}"
+    );
+}
+
+/// `autumn destroy scaffold` must take the shared migration back out when the
+/// model it was added for is the last one that needs it.
+#[test]
+fn destroy_scaffold_removes_the_shared_comments_migration_it_created() {
+    let (_tmp, project) = scaffolded("cmt-destroy-app");
+    assert!(migration_ending_in(&project, "_create_comments").is_some());
+
+    run_autumn_ok(&project, &["destroy", "scaffold", "Post", "--force"]);
+
+    assert!(
+        migration_ending_in(&project, "_create_comments").is_none(),
+        "the migration this scaffold added must not be left behind"
+    );
+}
+
+/// …and must **not**, while another model still declares `#[commentable]`. The
+/// table is shared, so removing it with one model breaks every other one.
+#[test]
+fn destroy_scaffold_keeps_the_shared_migration_another_model_still_needs() {
+    let (_tmp, project) = scaffolded("cmt-destroy-shared-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Photo",
+            "caption:String",
+            "comments:commentable",
+        ],
+    );
+
+    run_autumn_ok(&project, &["destroy", "scaffold", "Post", "--force"]);
+
+    assert!(
+        migration_ending_in(&project, "_create_comments").is_some(),
+        "Photo is still commentable, so the shared table must survive"
+    );
+    let photo = fs::read_to_string(project.join("src/models/photo.rs")).expect("photo model");
+    assert!(photo.contains("#[commentable("), "{photo}");
+}
+
+/// The non-scaffold generator takes the same token, so it must bring the same
+/// shared table — otherwise the model compiles and fails at runtime with
+/// `relation "comments" does not exist`.
+#[test]
+fn generate_model_with_the_token_also_emits_the_shared_table() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "cmt-model-app"]);
+    let project = tmp.path().join("cmt-model-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "model",
+            "Post",
+            "title:String",
+            "comments:commentable",
+        ],
+    );
+
+    let dir = migration_ending_in(&project, "_create_comments")
+        .expect("`generate model` must emit the shared comments table too");
+    let up = fs::read_to_string(dir.join("up.sql")).expect("up.sql");
+    assert!(up.contains("commentable_type TEXT NOT NULL"), "{up}");
+
+    let model = fs::read_to_string(project.join("src/models/post.rs")).expect("model");
+    assert!(model.contains("#[commentable("), "{model}");
+    assert!(model.contains("pub comment_count: i64"), "{model}");
+}
+
+/// A `Comment` resource scaffolded the ordinary way produces a migration
+/// directory with the very same name. Detecting the shared table by *name*
+/// would make a later `comments:commentable` skip it — while reporting that it
+/// was reused — and every `add_comment` would then fail at runtime on the
+/// missing discriminator columns.
+#[test]
+fn a_scaffolded_comment_resource_does_not_suppress_the_shared_table() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "cmt-collide-app"]);
+    let project = tmp.path().join("cmt-collide-app");
+    run_autumn_ok(&project, &["generate", "scaffold", "Comment", "body:Text"]);
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "comments:commentable",
+        ],
+    );
+
+    let polymorphic = fs::read_dir(project.join("migrations"))
+        .expect("migrations dir")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            fs::read_to_string(entry.path().join("up.sql"))
+                .is_ok_and(|sql| sql.contains("commentable_type"))
+        })
+        .count();
+    assert_eq!(
+        polymorphic, 1,
+        "the polymorphic table must still be emitted alongside the Comment resource's own"
     );
 }

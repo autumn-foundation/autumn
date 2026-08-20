@@ -618,7 +618,7 @@ pub fn emit_commentable_items(
          - `404` when this record does not exist (or is soft-deleted).\n\
          - Any database error."
     );
-    let recompute_doc = format!(
+    let recompute_doc = concat!(
         "Rebuild this record's comment counter from the comments table, and \
          return the value written.\n\
          \n\

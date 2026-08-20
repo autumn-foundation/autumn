@@ -6010,6 +6010,51 @@ mod tests {
         );
     }
 
+    /// `from_thread` is the only bridge between the database rows and the
+    /// widget, and it carries three documented behaviours: the `user #{id}`
+    /// fallback, the RFC 3339 `datetime` attribute, and the recursive mapping.
+    #[cfg(feature = "db")]
+    #[test]
+    fn comment_view_from_thread_maps_names_timestamps_and_replies() {
+        use crate::commentable::{Comment, CommentNode};
+
+        fn node(id: i64, author_name: Option<&str>, replies: Vec<CommentNode>) -> CommentNode {
+            CommentNode {
+                comment: Comment {
+                    id,
+                    parent_id: None,
+                    author_id: 7,
+                    body: "b".to_owned(),
+                    created_at: chrono::DateTime::parse_from_rfc3339("2026-06-21T17:10:33Z")
+                        .expect("timestamp")
+                        .naive_utc(),
+                    author_name: author_name.map(str::to_owned),
+                },
+                depth: 0,
+                replies,
+            }
+        }
+
+        let views = CommentView::from_thread(&[node(
+            1,
+            Some("ada"),
+            vec![node(2, None, vec![node(3, Some("grace"), Vec::new())])],
+        )]);
+
+        assert_eq!(views[0].author, "ada");
+        // No `author_name` column declared (or a missing author): the id, not
+        // an invented name.
+        assert_eq!(views[0].replies[0].author, "user #7");
+        // Nesting survives to arbitrary depth.
+        assert_eq!(views[0].replies[0].replies[0].author, "grace");
+        assert_eq!(
+            views[0].datetime.as_deref(),
+            Some("2026-06-21T17:10:33Z"),
+            "a machine-readable timestamp for <time datetime=…>"
+        );
+        assert_eq!(views[0].timestamp, "2026-06-21 17:10");
+    }
+
     /// A signed-out visitor still reads the thread; the form is replaced by a
     /// prompt, and no node offers a reply.
     #[test]

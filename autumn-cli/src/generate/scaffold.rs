@@ -800,7 +800,11 @@ fn plan_scaffold_with_options_impl(
     // is left is the shared `comments` table. It is emitted at most once per
     // project — that is what makes adding comments to a SECOND model the DSL
     // token and nothing else.
-    if fields.iter().any(|f| f.kind.is_commentable()) {
+    // On the destroy path the field tokens are not repeated, so the
+    // declaration is recovered from the model file instead.
+    if fields.iter().any(|f| f.kind.is_commentable())
+        || (for_revert && super::commentable::model_declares_commentable(project_root, &snake_name))
+    {
         // On a revert, the shared table stays as long as ANY other model still
         // declares `#[commentable]` — it is one table for all of them, so
         // taking it out with this model would break every other one.

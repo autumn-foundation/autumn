@@ -16,9 +16,14 @@
 //! attaches to the same table under a different `commentable_type`. So this
 //! module first looks for an existing `*_create_comments` migration in the
 //! project and emits nothing when it finds one — which is what makes "add
-//! comments to a second model" the DSL token and nothing else. The SQL is
-//! additionally written with `IF NOT EXISTS`, so even a project that hand-rolled
-//! its own `comments` table earlier survives running the migration.
+//! comments to a second model" the DSL token and nothing else.
+//!
+//! The `CREATE TABLE` is deliberately **not** `IF NOT EXISTS`. A project that
+//! already has an unrelated `comments` table (a `Comment` resource scaffolded
+//! the ordinary way, say) is a real conflict the author has to resolve, and
+//! `IF NOT EXISTS` would turn it into a silent no-op whose only symptom is a
+//! `column "commentable_type" does not exist` at request time. Failing the
+//! migration says so at `migrate`, where it is fixable.
 
 use std::path::Path;
 
@@ -93,7 +98,7 @@ pub fn up_sql(backend: autumn_web::config::DatabaseBackend) -> String {
          -- is named by `#[commentable(by = ...)]` and this migration does not know which\n\
          -- table that is. Add `REFERENCES users(id)` (or your own author table) once it\n\
          -- exists -- it is worth having.\n\
-         CREATE TABLE IF NOT EXISTS {COMMENTS_TABLE} (\n\
+         CREATE TABLE {COMMENTS_TABLE} (\n\
          \x20   id {pk},\n\
          \x20   commentable_type TEXT NOT NULL,\n\
          \x20   commentable_id {big_int} NOT NULL,\n\
@@ -249,6 +254,24 @@ pub fn another_model_is_still_commentable(project_root: &Path, destroying_model:
         .is_ok_and(|src| src.matches("#[commentable").count() > 1)
 }
 
+/// Whether the generated model for `snake_name` declares `#[commentable]`.
+///
+/// `destroy scaffold Post` is typed without the field tokens the generate run
+/// carried, so the revert plan cannot learn from its arguments that this model
+/// brought the shared comments table. It can read the model file, which is
+/// still on disk when the plan is computed — the same "recover it from what was
+/// written" move the nested-resource revert makes.
+#[must_use]
+pub fn model_declares_commentable(project_root: &Path, snake_name: &str) -> bool {
+    let src = project_root.join("src");
+    if let Ok(per_file) =
+        std::fs::read_to_string(src.join("models").join(format!("{snake_name}.rs")))
+    {
+        return per_file.contains("#[commentable");
+    }
+    false
+}
+
 /// The app's author model, for `#[commentable(by = <Model>)]`.
 ///
 /// `by` is what lets the generated code resolve an author display name, and a
@@ -277,7 +300,11 @@ mod tests {
     #[test]
     fn up_sql_declares_the_polymorphic_key_and_the_threading_column() {
         let sql = up_sql(DatabaseBackend::Postgres);
-        assert!(sql.contains("CREATE TABLE IF NOT EXISTS comments"));
+        assert!(sql.contains("CREATE TABLE comments"));
+        assert!(
+            !sql.contains("CREATE TABLE IF NOT EXISTS"),
+            "a colliding table is a conflict to resolve, not a silent no-op"
+        );
         assert!(sql.contains("commentable_type TEXT NOT NULL"));
         assert!(sql.contains("commentable_id BIGINT NOT NULL"));
         assert!(sql.contains("parent_id BIGINT REFERENCES comments(id) ON DELETE CASCADE"));

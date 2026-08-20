@@ -64,7 +64,7 @@ table spelled for whichever one the project uses.
 One table, shared by every commentable model:
 
 ```sql
-CREATE TABLE IF NOT EXISTS comments (
+CREATE TABLE comments (
     id BIGSERIAL PRIMARY KEY,
     commentable_type TEXT NOT NULL,
     commentable_id BIGINT NOT NULL,
@@ -83,7 +83,9 @@ CREATE INDEX IF NOT EXISTS idx_comments_parent_id ON comments (parent_id);
 exactly that, plus `comment_count BIGINT NOT NULL DEFAULT 0` on the scaffolded
 model and the `#[commentable]` attribute. Run it again for a second model and
 it adds only the column and the attribute — the table is shared, and the
-generator will not recreate it.
+generator will not recreate it — and if the project already has an unrelated
+`comments` table, the migration fails loudly at `migrate` rather than no-opping
+into a runtime `column "commentable_type" does not exist`.
 
 ### Why `commentable_id` has no foreign key
 
