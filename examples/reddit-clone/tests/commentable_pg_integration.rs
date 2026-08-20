@@ -350,7 +350,7 @@ async fn deleting_a_comment_cascades_to_its_replies() {
         4
     );
 
-    let removed = posts.delete_comment(root.id).await.expect("delete");
+    let removed = posts.delete_comment(post, root.id).await.expect("delete");
     assert_eq!(removed, 3, "the root plus both descendants");
 
     let snapshot = counter_snapshot(&mut conn, "posts", Post::COMMENTABLE_TYPE, post).await;
@@ -396,5 +396,160 @@ async fn a_reply_cannot_be_grafted_onto_another_record() {
         .expect_err("an unknown parent must be rejected");
     assert_eq!(err.status().as_u16(), 404);
 
+    // …and the same guard on the delete path: a comment id alone is not
+    // authority over a comment, or any signed-in user could delete any comment
+    // on any record by walking ids.
+    let other_post = diesel::sql_query(
+        "INSERT INTO posts (title, slug, body, author_id, subreddit_id) \
+         VALUES ('other', 'other', 'b', $1, $2) RETURNING id",
+    )
+    .bind::<BigInt, _>(ada)
+    .bind::<BigInt, _>(sub)
+    .get_result::<IdRow>(&mut conn)
+    .await
+    .expect("seed second post")
+    .id;
+    let err = posts
+        .delete_comment(other_post, on_post.id)
+        .await
+        .expect_err("a comment on another record must not be deletable");
+    assert_eq!(err.status().as_u16(), 404);
+
     assert_eq!(total_comment_rows(&mut conn).await, 1);
+}
+
+/// AC6's repair half: the counter is rebuilt from the discriminator pair, so a
+/// drift introduced by a hand-written insert heals — and a *second* model's
+/// comments sharing the id are not counted.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn recompute_comment_count_heals_drift_without_counting_another_model() {
+    let (_pg, pool) = start_postgres().await;
+    let mut conn = pool.get().await.expect("conn");
+    setup_schema(&mut conn).await;
+    let ada = seed_user(&mut conn, "ada").await;
+    let sub = seed_subreddit(&mut conn, ada).await;
+    let post = seed_post(&mut conn, ada, sub).await;
+    assert_eq!(post, sub, "fixture relies on colliding ids");
+
+    let posts = PgPostRepository::with_pool_untracked(pool.clone());
+    let subreddits = PgSubredditRepository::with_pool_untracked(pool.clone());
+    posts
+        .add_comment(post, ada, "counted", None)
+        .await
+        .expect("post comment");
+    // A comment on the OTHER model with the same id. A recompute keyed on
+    // `commentable_id` alone would count this one too.
+    subreddits
+        .add_comment(sub, ada, "not counted", None)
+        .await
+        .expect("subreddit comment");
+
+    // Drift the counter behind the app's back, the way an import would.
+    diesel::sql_query("UPDATE posts SET comment_count = 99 WHERE id = $1")
+        .bind::<BigInt, _>(post)
+        .execute(&mut *conn)
+        .await
+        .expect("drift the counter");
+
+    assert_eq!(
+        posts
+            .recompute_comment_count(post)
+            .await
+            .expect("recompute"),
+        1
+    );
+    let snapshot = counter_snapshot(&mut conn, "posts", Post::COMMENTABLE_TYPE, post).await;
+    assert_eq!(snapshot.persisted, 1);
+    assert_eq!(snapshot.persisted, snapshot.ground_truth);
+    // Idempotent.
+    assert_eq!(
+        posts
+            .recompute_comment_count(post)
+            .await
+            .expect("recompute again"),
+        1
+    );
+}
+
+/// Deleting a post takes its comments with it. `commentable_id` carries no
+/// foreign key, so the cascade a polymorphic column cannot express is a trigger
+/// the migration installs — without it the rows would survive forever,
+/// unreachable and undeletable.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn deleting_a_parent_takes_its_comments_with_it() {
+    let (_pg, pool) = start_postgres().await;
+    let mut conn = pool.get().await.expect("conn");
+    setup_schema(&mut conn).await;
+    let ada = seed_user(&mut conn, "ada").await;
+    let sub = seed_subreddit(&mut conn, ada).await;
+    let post = seed_post(&mut conn, ada, sub).await;
+
+    let posts = PgPostRepository::with_pool_untracked(pool.clone());
+    let root = posts.add_comment(post, ada, "a", None).await.expect("root");
+    posts
+        .add_comment(post, ada, "a1", Some(root.id))
+        .await
+        .expect("reply");
+    assert_eq!(total_comment_rows(&mut conn).await, 2);
+
+    diesel::sql_query("DELETE FROM posts WHERE id = $1")
+        .bind::<BigInt, _>(post)
+        .execute(&mut *conn)
+        .await
+        .expect("delete the post");
+
+    assert_eq!(
+        total_comment_rows(&mut conn).await,
+        0,
+        "a deleted parent must not leave orphaned comments behind"
+    );
+}
+
+/// The migration has to carry existing `post_id` comments across, not just
+/// reshape the table for new ones. Every other suite applies it to an empty
+/// table, so the backfill is only ever exercised here.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_migration_backfills_existing_post_comments() {
+    let (_pg, pool) = start_postgres().await;
+    let mut conn = pool.get().await.expect("conn");
+    // Deliberately NOT `setup_schema`: the pre-migration schema first, then
+    // rows, then the migration.
+    if std::env::var("AUTUMN_TEST_PG_URL").is_ok() {
+        conn.batch_execute(
+            "DROP TABLE IF EXISTS post_tags, tags, comments, votes, \
+             live_feed_events, posts, subreddits, users CASCADE;",
+        )
+        .await
+        .expect("reset");
+    }
+    conn.batch_execute(CREATE_SCHEMA).await.expect("schema");
+    conn.batch_execute(ADD_AVATAR).await.expect("avatar");
+
+    let ada = seed_user(&mut conn, "ada").await;
+    let sub = seed_subreddit(&mut conn, ada).await;
+    let post = seed_post(&mut conn, ada, sub).await;
+    diesel::sql_query(
+        "INSERT INTO comments (body, author_id, post_id) VALUES ('old one', $1, $2), \
+         ('old two', $1, $2)",
+    )
+    .bind::<BigInt, _>(ada)
+    .bind::<BigInt, _>(post)
+    .execute(&mut *conn)
+    .await
+    .expect("seed pre-migration comments");
+
+    conn.batch_execute(POLYMORPHIC_COMMENTS)
+        .await
+        .expect("apply the polymorphic migration");
+
+    let posts = PgPostRepository::with_pool_untracked(pool.clone());
+    let thread = posts.comment_thread(post).await.expect("thread");
+    assert_eq!(
+        flatten(&thread),
+        vec![(0, "old one".to_owned()), (0, "old two".to_owned())],
+        "pre-migration comments must survive the re-key"
+    );
 }

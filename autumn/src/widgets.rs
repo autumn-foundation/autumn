@@ -1353,6 +1353,12 @@ pub struct CommentThread {
     /// a hidden `return_to` input. `None` leaves the handler to answer with the
     /// re-rendered fragment.
     return_to: Option<String>,
+    /// `maxlength` on the textarea, from the model's `max_body` — so an
+    /// over-long comment is refused in the browser rather than by a `422` htmx
+    /// would not even swap.
+    max_body_bytes: Option<usize>,
+    /// A rejection to show above the form, rendered `role="alert"`.
+    error: Option<String>,
 }
 
 #[cfg(feature = "maud")]
@@ -1384,7 +1390,46 @@ impl CommentThread {
             can_comment: true,
             sign_in_prompt: None,
             return_to: None,
+            max_body_bytes: None,
+            error: None,
         }
+    }
+
+    /// A thread whose depth and body caps come straight from the model's
+    /// `#[commentable]` declaration.
+    ///
+    /// Prefer this over [`new`](Self::new) plus hand-copied numbers: it is the
+    /// only spelling that cannot drift from the write path, which refuses a
+    /// reply past `max_depth` and a body past `max_body` with a `422` the UI
+    /// would otherwise have invited.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn from_spec(
+        dom_id: impl Into<String>,
+        action: impl Into<String>,
+        spec: &crate::commentable::CommentableSpec,
+    ) -> Self {
+        Self::new(dom_id, action)
+            .max_depth(usize::try_from(spec.max_depth).unwrap_or(usize::MAX))
+            .max_body_bytes(spec.max_body_bytes)
+    }
+
+    /// Cap the textarea at `bytes` characters via `maxlength`.
+    ///
+    /// HTML counts UTF-16 code units where the server counts bytes, so this is
+    /// an early, approximate guard — the server's check is still the one that
+    /// decides.
+    #[must_use]
+    pub const fn max_body_bytes(mut self, bytes: usize) -> Self {
+        self.max_body_bytes = Some(bytes);
+        self
+    }
+
+    /// Show a rejection above the form.
+    #[must_use]
+    pub fn error(mut self, error: impl Into<String>) -> Self {
+        self.error = Some(error.into());
+        self
     }
 
     /// Set the CSRF token embedded in every form.
@@ -1465,12 +1510,21 @@ impl CommentThread {
         self
     }
 
-    /// Render the thread read-only, with an optional prompt in place of the
-    /// form — the signed-out shape.
+    /// Render the thread read-only — the signed-out shape. The thread still
+    /// renders; every form disappears.
+    ///
+    /// Pair it with [`sign_in_prompt`](Self::sign_in_prompt) to say why.
     #[must_use]
-    pub fn read_only(mut self, prompt: Option<String>) -> Self {
+    pub const fn read_only(mut self) -> Self {
         self.can_comment = false;
-        self.sign_in_prompt = prompt;
+        self
+    }
+
+    /// What to show in place of the form when the thread is
+    /// [`read_only`](Self::read_only).
+    #[must_use]
+    pub fn sign_in_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.sign_in_prompt = Some(prompt.into());
         self
     }
 
@@ -1540,14 +1594,17 @@ pub fn comment_thread(cfg: &CommentThread, comments: &[CommentView]) -> maud::Ma
     // Every class is a plain string literal (never `format!`), so the
     // widget-CSS coverage gate can extract it and prove `widgets.css` backs it.
     maud::html! {
-        section id=(cfg.dom_id) class="autumn-comments" aria-label=(cfg.label) {
+        section id=(cfg.dom_id) class="autumn-comments" role="region" aria-label=(cfg.label) {
+            @if let Some(error) = &cfg.error {
+                p class="autumn-comments-error" role="alert" { (error) }
+            }
             @if comments.is_empty() {
                 p class="autumn-comments-empty" { (cfg.empty_text) }
             } @else {
                 (comment_list(cfg, comments, 0))
             }
             @if cfg.can_comment {
-                (comment_form(cfg, None))
+                (comment_form(cfg, None, None))
             } @else if let Some(prompt) = &cfg.sign_in_prompt {
                 p class="autumn-comments-prompt" { (prompt) }
             }
@@ -1556,10 +1613,14 @@ pub fn comment_thread(cfg: &CommentThread, comments: &[CommentView]) -> maud::Ma
 }
 
 /// One `<ol>` level of the thread.
+///
+/// The top level is `aria-live="polite"`, so an htmx swap — which replaces the
+/// whole region without moving focus — is announced rather than silent.
 #[cfg(feature = "maud")]
 fn comment_list(cfg: &CommentThread, comments: &[CommentView], depth: usize) -> maud::Markup {
+    let live = (depth == 0).then_some("polite");
     maud::html! {
-        ol class="autumn-comment-list" {
+        ol class="autumn-comment-list" aria-live=[live] {
             @for comment in comments {
                 (comment_node(cfg, comment, depth))
             }
@@ -1575,6 +1636,10 @@ fn comment_node(cfg: &CommentThread, comment: &CommentView, depth: usize) -> mau
     // form past it would be an invitation to a 422. `depth` is the parent's
     // level, and the reply lands one below.
     let can_reply = cfg.can_comment && depth < cfg.max_depth;
+    // Distinct accessible names per node. Without the author, every disclosure
+    // in a forty-comment thread announces the identical "Reply" and a screen
+    // reader user has no way to tell which one they are on.
+    let reply_label = format!("{} to {}", cfg.reply_label, comment.author);
     maud::html! {
         li id=(node_id) class="autumn-comment" {
             div class="autumn-comment-meta" {
@@ -1593,8 +1658,10 @@ fn comment_node(cfg: &CommentThread, comment: &CommentView, depth: usize) -> mau
             }
             @if can_reply {
                 details class="autumn-comment-reply" {
-                    summary class="autumn-comment-reply-toggle" { (cfg.reply_label) }
-                    (comment_form(cfg, Some(comment.id)))
+                    summary class="autumn-comment-reply-toggle" aria-label=(reply_label) {
+                        (cfg.reply_label)
+                    }
+                    (comment_form(cfg, Some(comment.id), Some(&comment.author)))
                 }
             }
             @if !comment.replies.is_empty() {
@@ -1606,7 +1673,11 @@ fn comment_node(cfg: &CommentThread, comment: &CommentView, depth: usize) -> mau
 
 /// The shared comment/reply form. `reply_to` distinguishes the two.
 #[cfg(feature = "maud")]
-fn comment_form(cfg: &CommentThread, reply_to: Option<i64>) -> maud::Markup {
+fn comment_form(
+    cfg: &CommentThread,
+    reply_to: Option<i64>,
+    reply_to_author: Option<&str>,
+) -> maud::Markup {
     let textarea_id = reply_to.map_or_else(
         || format!("{}-body", cfg.dom_id),
         |id| format!("{}-c{id}-body", cfg.dom_id),
@@ -1616,9 +1687,22 @@ fn comment_form(cfg: &CommentThread, reply_to: Option<i64>) -> maud::Markup {
     } else {
         &cfg.submit_label
     };
+    // Same reason as the disclosure's: one accessible name per form, so the
+    // textarea says which comment it replies to.
+    let field_label = reply_to_author.map_or_else(
+        || cfg.placeholder.clone(),
+        |author| format!("{} to {author}", cfg.reply_label),
+    );
+    let maxlength = cfg.max_body_bytes.map(|bytes| bytes.to_string());
+    // One sync scope for the whole thread, `replace`: two quick replies would
+    // otherwise race, and the older `outerHTML` response landing second would
+    // drop the newer comment from view. The commits are already ordered by the
+    // parent row lock; this orders the *responses*.
+    let hx_sync = format!("#{}:replace", cfg.dom_id);
     maud::html! {
         form class="autumn-comment-form" method="post" action=(cfg.action)
-            hx-post=(cfg.action) hx-target=(cfg.hx_target) hx-swap="outerHTML" {
+            hx-post=(cfg.action) hx-target=(cfg.hx_target) hx-swap="outerHTML"
+            hx-sync=(hx_sync) {
             @if let Some(token) = &cfg.csrf_token {
                 input type="hidden" name=(cfg.csrf_field) value=(token);
             }
@@ -1628,9 +1712,9 @@ fn comment_form(cfg: &CommentThread, reply_to: Option<i64>) -> maud::Markup {
             @if let Some(return_to) = &cfg.return_to {
                 input type="hidden" name="return_to" value=(return_to);
             }
-            label class="autumn-comment-label" for=(textarea_id) { (cfg.placeholder) }
+            label class="autumn-comment-label" for=(textarea_id) { (field_label) }
             textarea id=(textarea_id) class="autumn-comment-input" name=(cfg.body_field)
-                rows="3" required placeholder=(cfg.placeholder) {}
+                rows="3" required maxlength=[maxlength] placeholder=(cfg.placeholder) {}
             button type="submit" class="autumn-comment-submit" { (submit_label) }
         }
     }
@@ -5931,7 +6015,8 @@ mod tests {
     #[test]
     fn comment_thread_read_only_hides_every_form() {
         let cfg = CommentThread::new("c", "/comments/Post/1")
-            .read_only(Some("Sign in to comment.".to_owned()));
+            .read_only()
+            .sign_in_prompt("Sign in to comment.");
         let html = comment_thread(&cfg, &comment_fixture()).into_string();
         assert!(!html.contains("<form"));
         assert!(html.contains("Sign in to comment."));
@@ -5951,6 +6036,67 @@ mod tests {
             html.contains("<form"),
             "an empty thread still invites a first comment"
         );
+    }
+
+    /// Each node's reply affordance names the comment it replies to. Without
+    /// that, forty disclosures in a thread all announce the identical "Reply"
+    /// and a screen-reader user cannot tell which one they are on.
+    #[test]
+    fn comment_thread_gives_every_reply_control_a_distinct_accessible_name() {
+        let cfg = CommentThread::new("c", "/comments/Post/1");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert!(html.contains(r#"aria-label="Reply to ada""#), "{html}");
+        assert!(html.contains(r#"aria-label="Reply to grace""#), "{html}");
+        assert!(html.contains(r#"aria-label="Reply to hopper""#), "{html}");
+        // The textarea's own label says it too, so the form is identifiable
+        // without the disclosure.
+        assert!(html.contains(">Reply to ada</label>"), "{html}");
+        // The swap replaces the whole region without moving focus, so the list
+        // announces politely rather than silently.
+        assert!(html.contains(r#"aria-live="polite""#), "{html}");
+        assert!(html.contains(r#"role="region""#), "{html}");
+    }
+
+    /// Two quick replies would otherwise race, and the older `outerHTML`
+    /// response landing second would drop the newer comment from view.
+    #[test]
+    fn comment_thread_forms_share_one_htmx_sync_scope() {
+        let cfg = CommentThread::new("comments-post-42", "/comments/Post/42");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert_eq!(
+            html.matches(r##"hx-sync="#comments-post-42:replace""##)
+                .count(),
+            4,
+            "every form, so no pair of them can race:\n{html}"
+        );
+    }
+
+    /// The UI must not invite a body the write path would reject with a `422`
+    /// htmx would not even swap.
+    #[test]
+    fn comment_thread_caps_the_textarea_at_the_models_body_limit() {
+        let cfg = CommentThread::new("c", "/comments/Post/1").max_body_bytes(280);
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert_eq!(html.matches(r#"maxlength="280""#).count(), 4, "{html}");
+
+        // No cap declared, no attribute — the server still decides.
+        let plain = comment_thread(
+            &CommentThread::new("c", "/comments/Post/1"),
+            &comment_fixture(),
+        )
+        .into_string();
+        assert!(!plain.contains("maxlength"), "{plain}");
+    }
+
+    /// A rejected comment is shown, not swallowed: htmx does not swap a
+    /// non-2xx response, so the router re-renders with the message instead.
+    #[test]
+    fn comment_thread_renders_a_rejection_above_the_form() {
+        let cfg = CommentThread::new("c", "/comments/Post/1").error("Comment cannot be empty");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("Comment cannot be empty"), "{html}");
+        assert!(html.contains(r#"class="autumn-comments-error""#), "{html}");
     }
 
     /// `return_to` is the no-JS round trip: the host page names where to come

@@ -21,6 +21,11 @@ ALTER TABLE comments ALTER COLUMN commentable_id SET NOT NULL;
 -- reference two tables. The framework's write path probes and row-locks the
 -- parent before every insert instead, so an unknown parent is a 404 rather
 -- than a dangling row.
+--
+-- Dropping `post_id` also drops its ON DELETE CASCADE, so deleting a post
+-- would leave its comments behind: unreachable (the parent probe 404s) and
+-- undeletable. A trigger restores the cascade for every commentable model at
+-- once -- see `comments_delete_for_parent` below.
 DROP INDEX IF EXISTS idx_comments_post_id;
 ALTER TABLE comments DROP COLUMN post_id;
 
@@ -37,3 +42,22 @@ ALTER TABLE comments ADD COLUMN deleted_at TIMESTAMP;
 -- `Subreddit` costs exactly this one counter column plus the `#[commentable]`
 -- attribute -- no table, no routes, no queries.
 ALTER TABLE subreddits ADD COLUMN comment_count BIGINT NOT NULL DEFAULT 0;
+
+-- The cascade a polymorphic foreign key cannot express. One trigger function
+-- serves every commentable model; TG_ARGV[0] is the discriminator.
+CREATE OR REPLACE FUNCTION comments_delete_for_parent() RETURNS TRIGGER AS $$
+BEGIN
+    DELETE FROM comments
+     WHERE commentable_type = TG_ARGV[0]
+       AND commentable_id = OLD.id;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER posts_delete_comments
+    AFTER DELETE ON posts
+    FOR EACH ROW EXECUTE FUNCTION comments_delete_for_parent('Post');
+
+CREATE TRIGGER subreddits_delete_comments
+    AFTER DELETE ON subreddits
+    FOR EACH ROW EXECUTE FUNCTION comments_delete_for_parent('Subreddit');

@@ -557,7 +557,8 @@ use crate::models::PostComments as _;
 let c = posts.add_comment(post_id, author_id, "first!", None).await?;
 let r = posts.add_comment(post_id, author_id, "…", Some(c.id)).await?;  // reply
 let thread: Vec<CommentNode> = posts.comment_thread(post_id).await?;    // nested
-let removed: usize = posts.delete_comment(c.id).await?;                 // + subtree
+let removed: usize = posts.delete_comment(post_id, c.id).await?;        // + subtree
+let live: i64 = posts.recompute_comment_count(post_id).await?;          // drift repair
 ```
 
 `comment_thread` is ONE query whatever the depth (nested in Rust, stable
@@ -577,6 +578,13 @@ segment, so a third commentable model needs no route:
 .nest("/comments", autumn_web::commentable::router(Default::default()))
 // GET/POST /comments/{commentable_type}/{parent_id}
 ```
+
+The router authorizes the **tenant**, never the record — an app with private or
+role-gated records MUST set `CommentsConfig::authorize(|access| ...)`, or skip
+the router and call the helpers from its own authorized handlers. Build a host
+page's own thread with `commentable::thread_dom_id`/`thread_action`, or the
+router's re-render lands on a different element and every htmx swap after the
+first one misses.
 
 Render with the no-JS `comment_thread` widget (see the widgets section),
 threading the CSRF token and `return_to`. See `docs/guide/commentable.md` and

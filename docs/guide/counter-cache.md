@@ -29,13 +29,17 @@ That is the whole feature. `PgCommentRepository`'s `save`, `update`,
 `posts.comment_count` **inside the same transaction as the row mutation**, with a
 single atomic `UPDATE posts SET comment_count = comment_count + $1 WHERE id = $2`.
 
-> A complete runnable version lives in
-> [`examples/reddit-clone`](../../examples/reddit-clone): `Comment` carries
-> `#[belongs_to(Post, counter_cache)]` in
-> [`src/models.rs`](../../examples/reddit-clone/src/models.rs). The framework's
-> own [`autumn/tests/integration/model_counter_cache.rs`](../../autumn/tests/integration/model_counter_cache.rs)
+> The framework's own
+> [`autumn/tests/integration/model_counter_cache.rs`](../../autumn/tests/integration/model_counter_cache.rs)
 > is the canonical evidence — including 50 simultaneous comments on one post —
 > and is the suite CI's ignored-test sweep runs on every push.
+>
+> `examples/reddit-clone` used to carry the worked example here, on a
+> `Comment` model that `belongs_to` a `Post`. Comments there are now a
+> *polymorphic* association (#1367), which keeps `posts.comment_count` current
+> through this very mechanism but declares it with `#[commentable]` rather than
+> `#[belongs_to(..., counter_cache)]` — see
+> [Threaded Comments on Anything](commentable.md).
 
 ## The attribute
 

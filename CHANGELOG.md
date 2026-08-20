@@ -23,7 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over the generated repository, and an `inventory` registration — so
   `AppBuilder::nest("/comments", autumn_web::commentable::router(…))` serves
   **every** commentable model in the binary from one pair of routes, and adding
-  a third model needs no route, no query and no migration. `comment_thread` is
+  a third model needs no route, no query and no new table — just its own
+  `comment_count` column. `comment_thread` is
   one query whatever the nesting depth (the tree is assembled in Rust, never an
   N+1 walk) in stable `(created_at, id)` order; `delete_comment` cascades to the
   whole descendant subtree and is idempotent. `parent.comment_count` is

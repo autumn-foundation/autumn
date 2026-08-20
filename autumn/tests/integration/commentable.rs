@@ -33,6 +33,7 @@
 #![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
 
 use autumn_web::commentable::{CommentNode, commentable_spec_for, registered_commentable_types};
+use autumn_web::tenancy::CURRENT_TENANT;
 use diesel::sql_types::{BigInt, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -164,6 +165,101 @@ pub struct CmtUncounted {
 #[autumn_web::repository(CmtUncounted, table = "cmt_uncounteds")]
 pub trait CmtUncountedRepository {}
 
+diesel::table! {
+    cmt_tenanted (id) {
+        id -> Int8,
+        title -> Text,
+        tenant_id -> Text,
+        comment_count -> Int8,
+    }
+}
+
+/// A `tenant_id` column switches the parent probe to its tenant-scoped arm.
+#[autumn_web::model(table = "cmt_tenanted")]
+#[commentable(by = CmtUser, table = cmt_comments)]
+pub struct CmtTenanted {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub tenant_id: String,
+    #[default]
+    pub comment_count: i64,
+}
+
+#[autumn_web::repository(CmtTenanted, table = "cmt_tenanted", tenant_scoped)]
+pub trait CmtTenantedRepository {}
+
+diesel::table! {
+    cmt_softs (id) {
+        id -> Int8,
+        title -> Text,
+        comment_count -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+/// A soft-deleting **parent**: once it is gone it accepts no comments and
+/// reports no thread.
+#[autumn_web::model(table = "cmt_softs")]
+#[commentable(by = CmtUser, table = cmt_comments)]
+pub struct CmtSoft {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(CmtSoft, table = "cmt_softs", soft_delete)]
+pub trait CmtSoftRepository {}
+
+diesel::table! {
+    cmt_hards (id) {
+        id -> Int8,
+        title -> Text,
+        comment_count -> Int8,
+    }
+}
+
+/// `soft_delete = false`: the comments table has no `deleted_at`, so deleting a
+/// comment removes the rows outright. On a table whose `parent_id` cascades,
+/// that is the shape where a naive affected-row count under-reports.
+#[autumn_web::model(table = "cmt_hards")]
+#[commentable(by = CmtUser, table = cmt_hard_comments, soft_delete = false)]
+pub struct CmtHard {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+}
+
+#[autumn_web::repository(CmtHard, table = "cmt_hards")]
+pub trait CmtHardRepository {}
+
+diesel::table! {
+    cmt_capped_bodies (id) {
+        id -> Int8,
+        title -> Text,
+        comment_count -> Int8,
+    }
+}
+
+/// `max_body` in bytes, so the runtime cap is observable.
+#[autumn_web::model(table = "cmt_capped_bodies")]
+#[commentable(by = CmtUser, table = cmt_comments, max_body = 16)]
+pub struct CmtCappedBody {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+}
+
+#[autumn_web::repository(CmtCappedBody, table = "cmt_capped_bodies")]
+pub trait CmtCappedBodyRepository {}
+
 // ── DDL ─────────────────────────────────────────────────────────────────────
 
 const DDL: &[&str] = &[
@@ -181,6 +277,28 @@ const DDL: &[&str] = &[
      (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, \
       comment_count BIGINT NOT NULL DEFAULT 0 CHECK (comment_count <= 2))",
     "CREATE TABLE cmt_uncounteds (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+    "CREATE TABLE cmt_tenanted \
+     (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, tenant_id TEXT NOT NULL, \
+      comment_count BIGINT NOT NULL DEFAULT 0)",
+    "CREATE TABLE cmt_softs \
+     (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, \
+      comment_count BIGINT NOT NULL DEFAULT 0, deleted_at TIMESTAMP)",
+    "CREATE TABLE cmt_hards \
+     (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, \
+      comment_count BIGINT NOT NULL DEFAULT 0)",
+    "CREATE TABLE cmt_capped_bodies \
+     (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, \
+      comment_count BIGINT NOT NULL DEFAULT 0)",
+    // A SECOND comments table, with no `deleted_at` and a cascading self-FK —
+    // the `soft_delete = false` shape.
+    "CREATE TABLE cmt_hard_comments (\
+       id BIGSERIAL PRIMARY KEY, \
+       commentable_type TEXT NOT NULL, \
+       commentable_id BIGINT NOT NULL, \
+       parent_id BIGINT REFERENCES cmt_hard_comments(id) ON DELETE CASCADE, \
+       author_id BIGINT NOT NULL REFERENCES cmt_users(id), \
+       body TEXT NOT NULL, \
+       created_at TIMESTAMP NOT NULL DEFAULT NOW())",
     // The one shared, polymorphic comments table (AC1).
     "CREATE TABLE cmt_comments (\
        id BIGSERIAL PRIMARY KEY, \
@@ -256,6 +374,16 @@ async fn seed_one_col(conn: &mut AsyncPgConnection, table: &str, column: &str, v
     .await
     .unwrap_or_else(|e| panic!("seed {table}: {e}"))
     .id
+}
+
+async fn seed_tenanted(conn: &mut AsyncPgConnection, tenant: &str, title: &str) -> i64 {
+    diesel::sql_query("INSERT INTO cmt_tenanted (tenant_id, title) VALUES ($1, $2) RETURNING id")
+        .bind::<Text, _>(tenant)
+        .bind::<Text, _>(title)
+        .get_result::<IdRow>(conn)
+        .await
+        .expect("seed tenanted")
+        .id
 }
 
 async fn counter(conn: &mut AsyncPgConnection, table: &str, id: i64) -> i64 {
@@ -350,6 +478,7 @@ fn comment_helpers_are_generated() {
     assert_is_fn(<PgCmtPostRepository as CmtPostComments>::add_comment);
     assert_is_fn(<PgCmtPostRepository as CmtPostComments>::comment_thread);
     assert_is_fn(<PgCmtPostRepository as CmtPostComments>::delete_comment);
+    assert_is_fn(<PgCmtPostRepository as CmtPostComments>::recompute_comment_count);
     assert_is_fn(<PgCmtPhotoRepository as CmtPhotoComments>::add_comment);
 }
 
@@ -636,7 +765,7 @@ async fn delete_comment_cascades_to_descendants_and_decrements() {
     let b = repo.add_comment(post, author, "b", None).await.expect("b");
     assert_eq!(counter(&mut conn, "cmt_posts", post).await, 4);
 
-    let removed = repo.delete_comment(a.id).await.expect("delete");
+    let removed = repo.delete_comment(post, a.id).await.expect("delete");
     assert_eq!(removed, 3, "the root plus both descendants");
     assert_eq!(counter(&mut conn, "cmt_posts", post).await, 1);
 
@@ -646,7 +775,12 @@ async fn delete_comment_cascades_to_descendants_and_decrements() {
     assert_eq!(thread[0].comment.id, b.id);
 
     // Deleting again is a no-op — the counter must not run away.
-    assert_eq!(repo.delete_comment(a.id).await.expect("second delete"), 0);
+    assert_eq!(
+        repo.delete_comment(post, a.id)
+            .await
+            .expect("second delete"),
+        0
+    );
     assert_eq!(counter(&mut conn, "cmt_posts", post).await, 1);
 }
 
@@ -674,7 +808,10 @@ async fn a_parent_without_a_counter_column_still_threads() {
         flatten(&thread),
         vec![(0, "root".to_owned()), (1, "reply".to_owned())]
     );
-    assert_eq!(repo.delete_comment(root.id).await.expect("delete"), 2);
+    assert_eq!(
+        repo.delete_comment(target, root.id).await.expect("delete"),
+        2
+    );
 }
 
 /// Author display names come back with the thread when the model declares
@@ -711,4 +848,311 @@ async fn comment_thread_resolves_author_names() {
         .expect("x");
     let thread = shallow.comment_thread(target).await.expect("thread");
     assert_eq!(thread[0].comment.author_name, None);
+}
+
+// ── Branches the default fixtures never reach ───────────────────────────────
+
+/// `soft_delete = false` removes the rows outright — and the counter delta is
+/// the number of rows the subtree actually held.
+///
+/// This is the shape where inferring the delta from the statement's
+/// affected-row count is wrong: `parent_id` cascades, and `SQLite` excludes
+/// foreign-key-removed rows from `changes()`, so a three-row subtree would
+/// report one and leave the counter permanently two too high.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_hard_delete_comments_table_removes_the_subtree_outright() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtHardRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_hards", "title", "t").await;
+
+    let root = repo
+        .add_comment(target, author, "a", None)
+        .await
+        .expect("root");
+    let reply = repo
+        .add_comment(target, author, "a1", Some(root.id))
+        .await
+        .expect("reply");
+    repo.add_comment(target, author, "a1x", Some(reply.id))
+        .await
+        .expect("grandchild");
+    assert_eq!(counter(&mut conn, "cmt_hards", target).await, 3);
+
+    assert_eq!(
+        repo.delete_comment(target, root.id).await.expect("delete"),
+        3,
+        "the whole subtree, however the engine reports affected rows"
+    );
+    assert_eq!(counter(&mut conn, "cmt_hards", target).await, 0);
+    let remaining = diesel::sql_query("SELECT COUNT(*) AS count FROM cmt_hard_comments")
+        .get_result::<CountRow>(&mut conn)
+        .await
+        .expect("count")
+        .count;
+    assert_eq!(remaining, 0, "hard delete leaves nothing behind");
+}
+
+/// The body cap is enforced in **bytes**, as documented — a multi-byte body
+/// that is well under the cap in characters is still over it in bytes.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn add_comment_rejects_a_body_over_the_byte_cap() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtCappedBodyRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_capped_bodies", "title", "t").await;
+
+    repo.add_comment(target, author, "0123456789abcdef", None)
+        .await
+        .expect("exactly 16 bytes fits");
+
+    let err = repo
+        .add_comment(target, author, "0123456789abcdefg", None)
+        .await
+        .expect_err("17 bytes is over the cap");
+    assert_eq!(err.status().as_u16(), 422);
+
+    // 9 characters, 18 bytes: the cap counts bytes.
+    let err = repo
+        .add_comment(target, author, &"é".repeat(9), None)
+        .await
+        .expect_err("18 bytes is over the cap even at 9 characters");
+    assert_eq!(err.status().as_u16(), 422);
+
+    assert_eq!(counter(&mut conn, "cmt_capped_bodies", target).await, 1);
+}
+
+/// A soft-deleted parent accepts no comments and reports no thread.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_soft_deleted_parent_refuses_comments_and_reports_no_thread() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtSoftRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_softs", "title", "t").await;
+
+    repo.add_comment(target, author, "before", None)
+        .await
+        .expect("live parent accepts comments");
+
+    diesel::sql_query("UPDATE cmt_softs SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("soft delete the parent");
+
+    let err = repo
+        .add_comment(target, author, "after", None)
+        .await
+        .expect_err("a soft-deleted parent takes no comments");
+    assert_eq!(err.status().as_u16(), 404);
+    let err = repo
+        .comment_thread(target)
+        .await
+        .expect_err("nor reports a thread");
+    assert_eq!(err.status().as_u16(), 404);
+    assert_eq!(counter(&mut conn, "cmt_softs", target).await, 1);
+}
+
+/// The two 404s on the delete path: an unknown comment, and a comment that
+/// belongs to a **different record of the same model**. The second is what
+/// stops any signed-in user deleting any comment by walking ids.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_comment_refuses_an_unknown_or_foreign_comment() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let photos = PgCmtPhotoRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "a").await;
+    let other = seed_one_col(&mut conn, "cmt_posts", "title", "b").await;
+    let photo = seed_one_col(&mut conn, "cmt_photos", "caption", "c").await;
+
+    let comment = repo
+        .add_comment(post, author, "mine", None)
+        .await
+        .expect("comment");
+
+    let err = repo
+        .delete_comment(post, 9_999_999)
+        .await
+        .expect_err("an unknown comment id is not found");
+    assert_eq!(err.status().as_u16(), 404);
+
+    let err = repo
+        .delete_comment(other, comment.id)
+        .await
+        .expect_err("another record's comment is not this record's to delete");
+    assert_eq!(err.status().as_u16(), 404);
+
+    let err = photos
+        .delete_comment(photo, comment.id)
+        .await
+        .expect_err("another model's comment either");
+    assert_eq!(err.status().as_u16(), 404);
+
+    assert_eq!(counter(&mut conn, "cmt_posts", post).await, 1);
+    assert_eq!(
+        repo.delete_comment(post, comment.id).await.expect("delete"),
+        1
+    );
+}
+
+/// `comment_thread` on a parent that does not exist is a `404`, not an empty
+/// thread — otherwise a typo'd id renders a plausible-looking empty page.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn comment_thread_on_an_unknown_parent_is_not_found() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .comment_thread(9_999_999)
+        .await
+        .expect_err("an unknown parent has no thread");
+    assert_eq!(err.status().as_u16(), 404);
+}
+
+/// The repair path: a counter drifted by a hand-written write heals, and a
+/// second model's comments sharing the id are not counted.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn recompute_comment_count_rebuilds_from_the_discriminator_pair() {
+    let (pool, _container) = setup_pool().await;
+    let posts = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let photos = PgCmtPhotoRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "p").await;
+    let photo = seed_one_col(&mut conn, "cmt_photos", "caption", "c").await;
+    assert_eq!(post, photo, "fixture relies on colliding ids");
+
+    posts
+        .add_comment(post, author, "counted", None)
+        .await
+        .expect("post comment");
+    photos
+        .add_comment(photo, author, "not counted", None)
+        .await
+        .expect("photo comment");
+
+    diesel::sql_query("UPDATE cmt_posts SET comment_count = 99 WHERE id = $1")
+        .bind::<BigInt, _>(post)
+        .execute(&mut *conn)
+        .await
+        .expect("drift");
+
+    assert_eq!(posts.recompute_comment_count(post).await.expect("heal"), 1);
+    assert_eq!(counter(&mut conn, "cmt_posts", post).await, 1);
+    // Idempotent, and it never counted the photo's comment.
+    assert_eq!(posts.recompute_comment_count(post).await.expect("again"), 1);
+    assert_eq!(counter(&mut conn, "cmt_photos", photo).await, 1);
+}
+
+/// A model with no counter runs the same path and writes nothing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn recompute_is_a_no_op_without_a_counter_column() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtUncountedRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_uncounteds", "title", "t").await;
+    repo.add_comment(target, author, "x", None)
+        .await
+        .expect("comment");
+    assert_eq!(
+        repo.recompute_comment_count(target).await.expect("no-op"),
+        0
+    );
+}
+
+// ── Tenant isolation ────────────────────────────────────────────────────────
+
+/// A `tenant_scoped` repository must not reach another tenant's record — the
+/// comment write is a write to a row the caller only had to guess the id of.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_tenant_scoped_repository_cannot_comment_across_the_tenant_boundary() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let acme = seed_tenanted(&mut conn, "acme", "theirs").await;
+
+    // Inside `acme`, the record is reachable.
+    let comment = CURRENT_TENANT
+        .scope(Some("acme".to_owned()), async {
+            repo.add_comment(acme, author, "ours", None).await
+        })
+        .await
+        .expect("same-tenant comment");
+    assert_eq!(comment.body, "ours");
+
+    // From `globex`, it is `NotFound` before anything is written or read.
+    let err = CURRENT_TENANT
+        .scope(Some("globex".to_owned()), async {
+            repo.add_comment(acme, author, "theirs", None).await
+        })
+        .await
+        .expect_err("another tenant's record must be out of reach");
+    assert_eq!(err.status().as_u16(), 404);
+    let err = CURRENT_TENANT
+        .scope(Some("globex".to_owned()), async {
+            repo.comment_thread(acme).await
+        })
+        .await
+        .expect_err("nor readable");
+    assert_eq!(err.status().as_u16(), 404);
+
+    assert_eq!(counter(&mut conn, "cmt_tenanted", acme).await, 1);
+}
+
+/// `across_tenants()` opts out of the predicate entirely — the documented
+/// escape hatch. Branching on the *spec* rather than the resolved tenant would
+/// bind NULL here and 404 on a record that plainly exists.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn across_tenants_sees_every_tenants_thread() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let acme = seed_tenanted(&mut conn, "acme", "theirs").await;
+
+    CURRENT_TENANT
+        .scope(Some("acme".to_owned()), async {
+            repo.add_comment(acme, author, "ours", None).await
+        })
+        .await
+        .expect("same-tenant comment");
+
+    let thread = repo
+        .across_tenants()
+        .comment_thread(acme)
+        .await
+        .expect("across_tenants must not apply a tenant predicate");
+    assert_eq!(flatten(&thread), vec![(0, "ours".to_owned())]);
+}
+
+/// A `tenant_scoped` repository with no tenant context fails closed, before a
+/// connection is taken.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_tenant_scoped_repository_with_no_context_refuses_to_comment() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let acme = seed_tenanted(&mut conn, "acme", "theirs").await;
+
+    repo.add_comment(acme, author, "no context", None)
+        .await
+        .expect_err("a tenant_scoped repository needs a tenant");
+    assert_eq!(counter(&mut conn, "cmt_tenanted", acme).await, 0);
 }

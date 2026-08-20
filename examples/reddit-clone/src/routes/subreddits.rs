@@ -221,19 +221,25 @@ pub async fn show(
     // `main.rs` already mounts for `Post` serves this too, keyed on
     // `Subreddit::COMMENTABLE_TYPE`.
     let thread = repo.comment_thread(sub.id).await?;
-    let mut comment_config = CommentThread::new(
-        format!("comments-subreddit-{}", sub.id),
-        format!("/comments/{}/{}", Subreddit::COMMENTABLE_TYPE, sub.id),
+    let comments_config = autumn_web::commentable::CommentsConfig::default();
+    let mut comment_config = CommentThread::from_spec(
+        autumn_web::commentable::thread_dom_id(Subreddit::COMMENTABLE_TYPE, sub.id),
+        autumn_web::commentable::thread_action(
+            &comments_config,
+            Subreddit::COMMENTABLE_TYPE,
+            sub.id,
+        ),
+        Subreddit::commentable_spec(),
     )
     .label("Community discussion")
     .empty_text("No community discussion yet.")
-    .return_to(__autumn_path_show(&sub.slug))
-    .max_depth(usize::try_from(Subreddit::commentable_spec().max_depth).unwrap_or(5));
+    .return_to(__autumn_path_show(&sub.slug));
     if current_user.is_some() {
         comment_config = comment_config.csrf_token(csrf.token());
     } else {
-        comment_config =
-            comment_config.read_only(Some("Log in to join the discussion.".to_owned()));
+        comment_config = comment_config
+            .read_only()
+            .sign_in_prompt("Log in to join the discussion.");
     }
 
     // Consume the flash only after all fallible work above.

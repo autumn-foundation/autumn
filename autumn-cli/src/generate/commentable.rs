@@ -33,7 +33,40 @@ pub const COMMENTS_TABLE: &str = "comments";
 /// detect an existing one.
 const MIGRATION_SUFFIX: &str = "_create_comments";
 
-/// `up.sql` creating the polymorphic, threaded comments table.
+/// The backend-forked column spellings the shared comments table needs.
+///
+/// The scaffold's *own* migration is already backend-aware (issue #1614), so
+/// this one has to be too, or a `SQLite` project would take `comments:commentable`
+/// happily and then fail `diesel migration run` on `BIGSERIAL`. Mirrors
+/// [`super::auth`]'s `AuthDdl`, which forks the same three spellings for the same
+/// reason.
+struct CommentsDdl {
+    pk: &'static str,
+    big_int: &'static str,
+    ts: &'static str,
+    ts_not_null_default_now: &'static str,
+}
+
+impl CommentsDdl {
+    const fn for_backend(backend: autumn_web::config::DatabaseBackend) -> Self {
+        match backend {
+            autumn_web::config::DatabaseBackend::Postgres => Self {
+                pk: "BIGSERIAL PRIMARY KEY",
+                big_int: "BIGINT",
+                ts: "TIMESTAMP",
+                ts_not_null_default_now: "TIMESTAMP NOT NULL DEFAULT NOW()",
+            },
+            autumn_web::config::DatabaseBackend::Sqlite => Self {
+                pk: "INTEGER PRIMARY KEY AUTOINCREMENT",
+                big_int: "INTEGER",
+                ts: "TEXT",
+                ts_not_null_default_now: "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            },
+        }
+    }
+}
+
+/// `up.sql` creating the polymorphic, threaded comments table for `backend`.
 ///
 /// `commentable_id` deliberately carries **no** `REFERENCES`: a single column
 /// cannot reference two tables, which is the known trade-off of the polymorphic
@@ -41,7 +74,13 @@ const MIGRATION_SUFFIX: &str = "_create_comments";
 /// probes and row-locks the parent before inserting — so an unknown parent is a
 /// `404`, not a dangling row.
 #[must_use]
-pub fn up_sql() -> String {
+pub fn up_sql(backend: autumn_web::config::DatabaseBackend) -> String {
+    let CommentsDdl {
+        pk,
+        big_int,
+        ts,
+        ts_not_null_default_now,
+    } = CommentsDdl::for_backend(backend);
     format!(
         "-- Threaded, polymorphic comments (issue #1367).\n\
          --\n\
@@ -55,14 +94,14 @@ pub fn up_sql() -> String {
          -- table that is. Add `REFERENCES users(id)` (or your own author table) once it\n\
          -- exists -- it is worth having.\n\
          CREATE TABLE IF NOT EXISTS {COMMENTS_TABLE} (\n\
-         \x20   id BIGSERIAL PRIMARY KEY,\n\
+         \x20   id {pk},\n\
          \x20   commentable_type TEXT NOT NULL,\n\
-         \x20   commentable_id BIGINT NOT NULL,\n\
-         \x20   parent_id BIGINT REFERENCES {COMMENTS_TABLE}(id) ON DELETE CASCADE,\n\
-         \x20   author_id BIGINT NOT NULL,\n\
+         \x20   commentable_id {big_int} NOT NULL,\n\
+         \x20   parent_id {big_int} REFERENCES {COMMENTS_TABLE}(id) ON DELETE CASCADE,\n\
+         \x20   author_id {big_int} NOT NULL,\n\
          \x20   body TEXT NOT NULL,\n\
-         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW(),\n\
-         \x20   deleted_at TIMESTAMP\n\
+         \x20   created_at {ts_not_null_default_now},\n\
+         \x20   deleted_at {ts}\n\
          );\n\
          \n\
          -- Covers the thread read whole: its WHERE is the discriminator pair and its\n\
@@ -98,23 +137,51 @@ pub fn migration_dir_name(timestamp: &str) -> String {
     format!("{timestamp}2{MIGRATION_SUFFIX}")
 }
 
-/// Whether `project_root` already has a `*_create_comments` migration.
+/// Whether `project_root` already has a migration creating the **polymorphic**
+/// comments table.
 ///
 /// The table is shared, so the second (and third, and tenth) commentable model
-/// must not recreate it. A directory scan rather than a marker file because the
-/// migration is an ordinary directory the author may have renamed, moved, or
-/// hand-written — matching on the suffix finds all of those.
+/// must not recreate it. Detection is by `up.sql` **content**, not by the
+/// directory name: `autumn generate scaffold Comment body:Text` produces a
+/// directory called `{timestamp}_create_comments` too, and matching that name
+/// would make a later `comments:commentable` skip the shared table while
+/// cheerfully reporting it was reused — leaving every `add_comment` to fail at
+/// runtime with `42703 column "commentable_type" does not exist`. The
+/// discriminator column is the thing that actually distinguishes the two, so
+/// that is what is matched.
 #[must_use]
 pub fn already_migrated(project_root: &Path) -> bool {
+    !polymorphic_comment_migrations(project_root).is_empty()
+}
+
+/// Every migration directory under `project_root` whose `up.sql` creates the
+/// polymorphic comments table.
+#[must_use]
+pub fn polymorphic_comment_migrations(project_root: &Path) -> Vec<std::path::PathBuf> {
     let Ok(entries) = std::fs::read_dir(project_root.join("migrations")) else {
-        return false;
+        return Vec::new();
     };
-    entries.filter_map(Result::ok).any(|entry| {
-        entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.ends_with(MIGRATION_SUFFIX))
-    })
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|dir| {
+            std::fs::read_to_string(dir.join("up.sql")).is_ok_and(|sql| is_polymorphic_up_sql(&sql))
+        })
+        .collect()
+}
+
+/// Whether `up_sql` is (a copy of) the shared polymorphic comments migration.
+///
+/// Deliberately keyed on the two columns that make the table polymorphic rather
+/// than on an exact match: the author may have edited the file — added the
+/// `author_id` foreign key the header suggests, say — and it is still the same
+/// table.
+fn is_polymorphic_up_sql(up_sql: &str) -> bool {
+    let lowered = up_sql.to_ascii_lowercase();
+    lowered.contains(&format!("table if not exists {COMMENTS_TABLE}"))
+        || (lowered.contains(&format!("table {COMMENTS_TABLE}"))
+            && lowered.contains("commentable_type")
+            && lowered.contains("commentable_id"))
 }
 
 /// Push the shared comments migration onto `plan`, unless the project already
@@ -131,6 +198,7 @@ pub fn push_commentable_migration(
     plan: &mut Plan,
     project_root: &Path,
     timestamp: &str,
+    backend: autumn_web::config::DatabaseBackend,
     for_revert: bool,
 ) -> bool {
     // On a revert plan the directory is (by construction) already on disk from
@@ -142,9 +210,43 @@ pub fn push_commentable_migration(
     let dir = project_root
         .join("migrations")
         .join(migration_dir_name(timestamp));
-    plan.create(dir.join("up.sql"), up_sql());
+    plan.create(dir.join("up.sql"), up_sql(backend));
     plan.create(dir.join("down.sql"), down_sql());
     true
+}
+
+/// Whether **another** model in `project_root` still declares
+/// `#[commentable]`, ignoring `destroying_model`.
+///
+/// The comments table is shared, so `autumn destroy scaffold Post` in a project
+/// where `Photo` is also commentable must NOT take the migration with it —
+/// `Plan::revert` finds migration directories to remove from the plan's own
+/// `Create` actions, so without this guard destroying one model silently breaks
+/// every other one. Mirrors the `mail_unsubscribes_migration_still_needed_elsewhere`
+/// guard in [`super::emit`], which exists for the same reason.
+#[must_use]
+pub fn another_model_is_still_commentable(project_root: &Path, destroying_model: &str) -> bool {
+    let models_dir = project_root.join("src").join("models");
+    let destroying_file = format!("{destroying_model}.rs");
+
+    // Per-file layout (`src/models/<snake>.rs`), the one the generators emit.
+    if let Ok(entries) = std::fs::read_dir(&models_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            if entry.file_name().to_str() == Some(destroying_file.as_str()) {
+                continue;
+            }
+            if std::fs::read_to_string(entry.path()).is_ok_and(|src| src.contains("#[commentable"))
+            {
+                return true;
+            }
+        }
+    }
+
+    // Single-file layout (`src/models.rs`), which hand-written apps use. The
+    // file being destroyed from is the same file, so count declarations: more
+    // than one means somebody else still needs the table.
+    std::fs::read_to_string(project_root.join("src").join("models.rs"))
+        .is_ok_and(|src| src.matches("#[commentable").count() > 1)
 }
 
 /// The app's author model, for `#[commentable(by = <Model>)]`.
@@ -170,9 +272,11 @@ pub fn detect_author_model(project_root: &Path) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    use autumn_web::config::DatabaseBackend;
+
     #[test]
     fn up_sql_declares_the_polymorphic_key_and_the_threading_column() {
-        let sql = up_sql();
+        let sql = up_sql(DatabaseBackend::Postgres);
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS comments"));
         assert!(sql.contains("commentable_type TEXT NOT NULL"));
         assert!(sql.contains("commentable_id BIGINT NOT NULL"));
@@ -183,6 +287,25 @@ mod tests {
         // cannot reference two tables, and pretending otherwise would break the
         // second commentable model.
         assert!(!sql.contains("commentable_id BIGINT NOT NULL REFERENCES"));
+    }
+
+    /// A `SQLite` project takes the same token, so the shared table has to be
+    /// spelled for it too — `BIGSERIAL`/`NOW()` would fail `diesel migration
+    /// run` on the very first migrate.
+    #[test]
+    fn up_sql_is_spelled_for_sqlite_too() {
+        let sql = up_sql(DatabaseBackend::Sqlite);
+        assert!(!sql.contains("BIGSERIAL"), "{sql}");
+        assert!(!sql.contains("NOW()"), "{sql}");
+        assert!(sql.contains("INTEGER PRIMARY KEY AUTOINCREMENT"), "{sql}");
+        assert!(sql.contains("DEFAULT CURRENT_TIMESTAMP"), "{sql}");
+        // The polymorphic key and the threading self-FK are backend-independent.
+        assert!(sql.contains("commentable_type TEXT NOT NULL"), "{sql}");
+        assert!(sql.contains("commentable_id INTEGER NOT NULL"), "{sql}");
+        assert!(
+            sql.contains("parent_id INTEGER REFERENCES comments(id) ON DELETE CASCADE"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -224,14 +347,74 @@ mod tests {
         assert_eq!(detect_author_model(single.path()), Some("User"));
     }
 
+    /// Detection is by content, so a renamed directory still counts…
     #[test]
     fn already_migrated_finds_a_renamed_directory() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let migrations = tmp.path().join("migrations");
-        std::fs::create_dir_all(migrations.join("00000000000000_create_comments")).expect("mkdir");
+        let dir = tmp.path().join("migrations").join("0001_comments_v2");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("up.sql"), up_sql(DatabaseBackend::Postgres)).expect("write");
         assert!(already_migrated(tmp.path()));
 
         let empty = tempfile::tempdir().expect("tempdir");
         assert!(!already_migrated(empty.path()));
+    }
+
+    /// …and a `Comment` resource scaffolded the ordinary way does NOT, even
+    /// though it produces a directory with the very same name. Matching on the
+    /// name alone would skip the shared table and then fail at runtime on the
+    /// missing discriminator columns.
+    #[test]
+    fn a_scaffolded_comment_model_does_not_look_like_the_shared_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp
+            .path()
+            .join("migrations")
+            .join("20260820000000_create_comments");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (\n    id BIGSERIAL PRIMARY KEY,\n    \
+             body TEXT NOT NULL,\n    post_id BIGINT NOT NULL\n);\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "a post_id-keyed comments table is not the polymorphic one"
+        );
+    }
+
+    /// The shared migration must survive `destroy scaffold` while any other
+    /// model still declares `#[commentable]`.
+    #[test]
+    fn another_commentable_model_keeps_the_shared_migration_alive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("src").join("models");
+        std::fs::create_dir_all(&models).expect("mkdir");
+        std::fs::write(models.join("post.rs"), "#[commentable(by = User)]\n").expect("write");
+        assert!(
+            !another_model_is_still_commentable(tmp.path(), "post"),
+            "the model being destroyed does not count as another one"
+        );
+
+        std::fs::write(models.join("photo.rs"), "#[commentable(by = User)]\n").expect("write");
+        assert!(another_model_is_still_commentable(tmp.path(), "post"));
+
+        // Single-file layout: two declarations in one file.
+        let single = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(single.path().join("src")).expect("mkdir");
+        std::fs::write(
+            single.path().join("src").join("models.rs"),
+            "#[commentable(by = User)]\npub struct Post {}\n",
+        )
+        .expect("write");
+        assert!(!another_model_is_still_commentable(single.path(), "post"));
+        std::fs::write(
+            single.path().join("src").join("models.rs"),
+            "#[commentable(by = User)]\npub struct Post {}\n\
+             #[commentable(by = User)]\npub struct Photo {}\n",
+        )
+        .expect("write");
+        assert!(another_model_is_still_commentable(single.path(), "post"));
     }
 }

@@ -18,7 +18,7 @@
 //! which emits `Post::COMMENTABLE_TYPE`, `Post::commentable_spec()`, a
 //! `PostComments` trait (`add_comment` / `comment_thread` / `delete_comment`)
 //! blanket-implemented over the generated repository, and an [`inventory`]
-//! registration so [`router`] can serve the thread for *any* commentable model
+//! registration so [`router()`] can serve the thread for *any* commentable model
 //! without the app writing a route per model.
 //!
 //! # Why there is no foreign key on `commentable_id`
@@ -31,8 +31,8 @@
 //!
 //! # Counter maintenance
 //!
-//! `comment_count` is maintained by the [`counter_cache`](crate::counter_cache)
-//! mechanism (#1325) — the same atomic `UPDATE parent SET c = c + $1`, applied
+//! `comment_count` is maintained by the counter-cache mechanism (#1325) — the
+//! same atomic `UPDATE parent SET c = c + $1`, applied
 //! **inside** the comment's own transaction, so a reader never sees a comment
 //! whose count has not moved (or a count that moved without a comment). The
 //! delete path decrements by the number of rows the cascade actually removed,
@@ -42,11 +42,13 @@
 //!
 //! Every table/column name below arrives as a `&'static str` emitted by
 //! `#[commentable]` and validated at macro time to be a plain identifier.
-//! [`crate::counter_cache::is_plain_identifier`] re-checks that under
-//! `debug_assertions`, and every interpolated identifier is
-//! [quoted](crate::counter_cache::quote_ident) — the same convention the
-//! counter-cache and `dependent(restrict)` codegen already follow. Values
-//! (bodies, ids, the discriminator) are always **bound**, never formatted.
+//! [`CommentableSpec::validate`] re-checks that on **every** call — in release
+//! builds too, not just under `debug_assertions` — because the fields are
+//! public and a hand-built spec is otherwise the one way past the macro's
+//! guarantee. Every interpolated identifier is additionally quoted, the same
+//! convention the counter-cache and `dependent(restrict)` codegen follow.
+//! Values (bodies, ids, the discriminator) are always **bound**, never
+//! formatted.
 
 use diesel::sql_types::{BigInt, Nullable, Text, Timestamp};
 use diesel_async::RunQueryDsl as _;
@@ -88,14 +90,6 @@ const FOR_NO_KEY_UPDATE: &str = " FOR NO KEY UPDATE";
 #[cfg(feature = "sqlite")]
 const FOR_NO_KEY_UPDATE: &str = "";
 
-/// NULL-safe equality, for matching a tenant discriminator that may be NULL.
-/// Postgres spells it `IS NOT DISTINCT FROM`; `SQLite` spells the same operator
-/// `IS`.
-#[cfg(not(feature = "sqlite"))]
-const IS_NOT_DISTINCT_FROM: &str = "IS NOT DISTINCT FROM";
-#[cfg(feature = "sqlite")]
-const IS_NOT_DISTINCT_FROM: &str = "IS";
-
 /// The soft-delete marker column. Autumn's `soft_delete` convention is fixed,
 /// so the predicate is a constant rather than another spec field.
 const DELETED_AT: &str = "deleted_at";
@@ -124,6 +118,11 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 10_000;
 /// Framework plumbing; not constructed by hand. Every field is either a plain
 /// SQL identifier (spliced, quoted, into the statements below) or a bound
 /// value.
+///
+/// Deliberately **not** `#[non_exhaustive]`: `#[commentable]` expands to a
+/// struct literal in the *user's* crate, which a non-exhaustive type forbids.
+/// The protection that matters is [`validate`](Self::validate), which runs on
+/// every entry point in release builds too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommentableSpec {
     /// The shared comments table, e.g. `comments`.
@@ -178,28 +177,52 @@ pub struct CommentableSpec {
 }
 
 impl CommentableSpec {
-    /// Debug-only guard that every identifier this spec splices into SQL is a
-    /// plain identifier.
-    fn debug_assert_idents(&self) {
-        debug_assert!(
-            is_plain_identifier(self.comments_table)
-                && is_plain_identifier(self.comment_pk)
-                && is_plain_identifier(self.type_column)
-                && is_plain_identifier(self.id_column)
-                && is_plain_identifier(self.parent_column)
-                && is_plain_identifier(self.author_column)
-                && is_plain_identifier(self.body_column)
-                && is_plain_identifier(self.created_at_column)
-                && is_plain_identifier(self.parent_table)
-                && is_plain_identifier(self.parent_pk)
-                && self.counter_column.is_none_or(is_plain_identifier)
-                && self.parent_tenant_column.is_none_or(is_plain_identifier)
-                && self.author_table.is_none_or(is_plain_identifier)
-                && is_plain_identifier(self.author_pk)
-                && self.author_name_column.is_none_or(is_plain_identifier),
-            "commentable spec carries a non-identifier name; it would be spliced \
-             verbatim into SQL"
-        );
+    /// Every identifier this spec splices into SQL, with the field it came
+    /// from — the input to [`validate`](Self::validate).
+    fn idents(&self) -> [(&'static str, Option<&'static str>); 15] {
+        [
+            ("comments_table", Some(self.comments_table)),
+            ("comment_pk", Some(self.comment_pk)),
+            ("type_column", Some(self.type_column)),
+            ("id_column", Some(self.id_column)),
+            ("parent_column", Some(self.parent_column)),
+            ("author_column", Some(self.author_column)),
+            ("body_column", Some(self.body_column)),
+            ("created_at_column", Some(self.created_at_column)),
+            ("parent_table", Some(self.parent_table)),
+            ("parent_pk", Some(self.parent_pk)),
+            ("author_pk", Some(self.author_pk)),
+            ("counter_column", self.counter_column),
+            ("parent_tenant_column", self.parent_tenant_column),
+            ("author_table", self.author_table),
+            ("author_name_column", self.author_name_column),
+        ]
+    }
+
+    /// Reject a spec carrying a name that is not a plain SQL identifier,
+    /// **before** any of it reaches a `format!`ed statement.
+    ///
+    /// `#[commentable]` already validates every name at macro time, so this
+    /// never fires for a macro-built spec. It is not a `debug_assert` anyway:
+    /// the struct's fields are `pub`, so a downstream crate can construct one
+    /// from a configuration string, and a debug-only guard would be erased in
+    /// exactly the build where that matters. Returning an error rather than
+    /// panicking keeps a mistake in app wiring from taking the process down.
+    ///
+    /// # Errors
+    ///
+    /// [`AutumnError::internal_server_error_msg`] naming the offending field.
+    pub fn validate(&self) -> AutumnResult<()> {
+        for (field, value) in self.idents() {
+            let Some(value) = value else { continue };
+            if !is_plain_identifier(value) {
+                return Err(AutumnError::internal_server_error_msg(format!(
+                    "commentable spec field `{field}` is {value:?}, which is not a plain SQL \
+                     identifier; it would be spliced verbatim into generated SQL"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// `AND "deleted_at" IS NULL` for the comments table, or nothing.
@@ -298,6 +321,18 @@ struct ParentRow {
 }
 
 #[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    count: i64,
+}
+
+#[derive(diesel::QueryableByName)]
+struct IdRow {
+    #[diesel(sql_type = BigInt)]
+    id: i64,
+}
+
+#[derive(diesel::QueryableByName)]
 struct TargetRow {
     #[diesel(sql_type = Text)]
     commentable_type: String,
@@ -308,7 +343,7 @@ struct TargetRow {
 // ── Registry ────────────────────────────────────────────────────────────────
 
 /// One `#[commentable]` model's registration, submitted by the macro so
-/// [`router`] can dispatch on `commentable_type` alone.
+/// [`router()`] can dispatch on `commentable_type` alone.
 ///
 /// This is what makes AC5 true: adding comments to a second model is the
 /// attribute and nothing else — no route, no query, no registration call.
@@ -333,13 +368,31 @@ pub fn commentable_spec_for(type_name: &str) -> Option<&'static CommentableSpec>
 
 /// Every `commentable_type` registered in this binary, in unspecified order.
 ///
-/// Useful for a boot-time assertion or an admin page; [`router`] uses
+/// Useful for a boot-time assertion or an admin page; [`router()`] uses
 /// [`commentable_spec_for`] instead.
 #[must_use]
 pub fn registered_commentable_types() -> Vec<&'static str> {
     inventory::iter::<CommentableDescriptor>()
         .map(|descriptor| descriptor.type_name)
         .collect()
+}
+
+/// The first `commentable_type` claimed by two different models, if any.
+///
+/// `type_name` defaults to the model's bare Rust type name, so two
+/// `#[commentable]` models called `Post` in different modules — or a
+/// hand-written `type_name` collision — would share one discriminator.
+/// [`commentable_spec_for`] takes the first match, so the parent probe would
+/// run against one model's table while the rows were shared with the other's:
+/// `blog::Post` 5 and `shop::Post` 5 would render each other's threads.
+/// [`router()`] calls this at construction and panics, because there is no
+/// request-time answer that is not silently wrong.
+#[must_use]
+pub fn duplicate_commentable_type() -> Option<&'static str> {
+    let mut seen = std::collections::HashSet::new();
+    inventory::iter::<CommentableDescriptor>()
+        .find(|descriptor| !seen.insert(descriptor.type_name))
+        .map(|descriptor| descriptor.type_name)
 }
 
 // ── Write path ──────────────────────────────────────────────────────────────
@@ -380,7 +433,7 @@ pub async fn add_comment(
     reply_to: Option<i64>,
     tenant: Option<&str>,
 ) -> AutumnResult<Comment> {
-    spec.debug_assert_idents();
+    spec.validate()?;
     let body = body.trim();
     if body.is_empty() {
         return Err(AutumnError::unprocessable_msg("Comment cannot be empty"));
@@ -454,17 +507,20 @@ pub async fn add_comment(
 ///
 /// # Errors
 ///
-/// - `404` when `comment_id` names no comment of `parent_type`, or when its
-///   parent row is not visible to this caller.
+/// - `404` when `comment_id` names no comment on `(parent_type, parent_id)`, or
+///   when that record is not visible to this caller. The record is part of the
+///   check on purpose: without it, any comment id would be deletable from any
+///   record of the same model.
 /// - Any database error.
 pub async fn delete_comment(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
     parent_type: &str,
+    parent_id: i64,
     comment_id: i64,
     tenant: Option<&str>,
 ) -> AutumnResult<usize> {
-    spec.debug_assert_idents();
+    spec.validate()?;
     let spec = *spec;
     let parent_type = parent_type.to_owned();
     let tenant = tenant.map(str::to_owned);
@@ -490,13 +546,19 @@ pub async fn delete_comment(
             .await
             .optional_row()?;
 
-            let Some(target) = target.filter(|t| t.commentable_type == parent_type) else {
+            // Scoped to the RECORD, not merely to its model. Checking the
+            // discriminator alone would let anyone holding any comment id
+            // delete a comment on someone else's row — the mirror image of the
+            // cross-record `reply_to` graft `comment_depth` refuses.
+            let Some(target) = target
+                .filter(|t| t.commentable_type == parent_type && t.commentable_id == parent_id)
+            else {
                 return Err(AutumnError::not_found_msg("Comment not found"));
             };
 
             lock_parent(conn, &spec, target.commentable_id, tenant.as_deref()).await?;
 
-            let removed = delete_subtree(conn, &spec, comment_id).await?;
+            let removed = delete_subtree(conn, &spec, &parent_type, parent_id, comment_id).await?;
 
             if removed > 0
                 && let Some(counter_column) = spec.counter_column
@@ -513,6 +575,86 @@ pub async fn delete_comment(
             }
 
             Ok(removed)
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Rebuild `(parent_type, parent_id)`'s counter from the comments table and
+/// return the value written.
+///
+/// The repair half of the counter, mirroring
+/// [`counter_cache_recompute`](crate::counter_cache::counter_cache_recompute):
+/// counters drift when rows arrive by import, seed, or hand-written SQL, and
+/// they are deliberately not clamped, so a drifted one can go negative. This is
+/// idempotent — running it twice writes the same number.
+///
+/// Reaching for `counter_cache_recompute` with this feature's spec would be
+/// **wrong**: that helper keys on the foreign-key column alone, and
+/// `commentable_id` is shared across models, so it would count another model's
+/// comments that happen to share the id. This counts the discriminator pair.
+///
+/// Returns `0` for a parent that keeps no counter (`counter_cache = false`),
+/// having written nothing.
+///
+/// # Errors
+///
+/// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
+/// - Any database error.
+pub async fn recompute_comment_count(
+    conn: &mut RuntimeConnection,
+    spec: &CommentableSpec,
+    parent_type: &str,
+    parent_id: i64,
+    tenant: Option<&str>,
+) -> AutumnResult<i64> {
+    spec.validate()?;
+    let Some(counter_column) = spec.counter_column else {
+        probe_parent(conn, spec, parent_id, tenant, false).await?;
+        return Ok(0);
+    };
+
+    let spec = *spec;
+    let parent_type = parent_type.to_owned();
+    let tenant = tenant.map(str::to_owned);
+
+    scoped_immediate_transaction::<i64, AutumnError, _>(conn, |conn| {
+        async move {
+            lock_parent(conn, &spec, parent_id, tenant.as_deref()).await?;
+
+            let comments = quote_ident(spec.comments_table);
+            let type_column = quote_ident(spec.type_column);
+            let id_column = quote_ident(spec.id_column);
+            let parent_table = quote_ident(spec.parent_table);
+            let parent_pk = quote_ident(spec.parent_pk);
+            let counter = quote_ident(counter_column);
+            let live = spec.live_comments("c");
+
+            let truth: CountRow = diesel::sql_query(format!(
+                "SELECT COUNT(*) AS count FROM {comments} AS c \
+                 WHERE c.{type_column} = {} AND c.{id_column} = {}{live}",
+                ph(1),
+                ph(2),
+            ))
+            .bind::<Text, _>(&parent_type)
+            .bind::<BigInt, _>(parent_id)
+            .get_result::<CountRow>(conn)
+            .await
+            .map_err(AutumnError::from)?;
+
+            diesel::sql_query(format!(
+                "UPDATE {parent_table} SET {counter} = {} WHERE {parent_pk} = {}",
+                ph(1),
+                ph(2),
+            ))
+            .bind::<BigInt, _>(truth.count)
+            .bind::<BigInt, _>(parent_id)
+            .execute(conn)
+            .await
+            .map_err(AutumnError::from)?;
+
+            Ok(truth.count)
         }
         .scope_boxed()
     })
@@ -540,7 +682,7 @@ pub async fn comment_thread(
     parent_id: i64,
     tenant: Option<&str>,
 ) -> AutumnResult<Vec<CommentNode>> {
-    spec.debug_assert_idents();
+    spec.validate()?;
     probe_parent(conn, spec, parent_id, tenant, false).await?;
 
     let comments = quote_ident(spec.comments_table);
@@ -631,6 +773,46 @@ fn nest(rows: Vec<Comment>) -> Vec<CommentNode> {
     build_nodes(&roots, 0, &children, &mut comments)
 }
 
+/// The deepest level [`build_nodes`] will nest before flattening.
+///
+/// `#[commentable]` refuses a `max_depth` at or above [`RECURSION_GUARD`], so a
+/// framework-written thread never comes close. This bounds the *rendering*
+/// recursion against rows written some other way: `build_nodes`,
+/// `CommentView::from_thread` and the widget all walk the tree depth-first, and
+/// an unbounded chain would overflow the stack rather than raise an error.
+/// Beyond it, the rest of the subtree is emitted flat at that level, by an
+/// iterative walk — visibly flattened beats a dropped comment, and beats a
+/// crashed worker.
+const MAX_NESTING: usize = RECURSION_GUARD as usize;
+
+/// Emit an entire subtree as one flat list at `depth`, iteratively.
+///
+/// The escape hatch [`build_nodes`] takes at [`MAX_NESTING`]. Iterative on
+/// purpose: this is the path a malformed, arbitrarily deep chain reaches, and
+/// recursing here would reintroduce exactly the stack overflow the cap exists
+/// to prevent.
+fn flatten_subtree(
+    positions: &[usize],
+    depth: usize,
+    children: &[Vec<usize>],
+    comments: &mut Vec<Option<Comment>>,
+) -> Vec<CommentNode> {
+    let mut pending: Vec<usize> = positions.iter().rev().copied().collect();
+    let mut out = Vec::new();
+    while let Some(position) = pending.pop() {
+        let Some(comment) = comments[position].take() else {
+            continue;
+        };
+        out.push(CommentNode {
+            comment,
+            depth,
+            replies: Vec::new(),
+        });
+        pending.extend(children[position].iter().rev().copied());
+    }
+    out
+}
+
 /// Recursive half of [`nest`], depth-first over an already-acyclic index.
 fn build_nodes(
     positions: &[usize],
@@ -644,7 +826,15 @@ fn build_nodes(
             // `take` guarantees each row is emitted at most once even if the
             // index were somehow cyclic, which is what keeps this terminating.
             let comment = comments[position].take()?;
-            let replies = build_nodes(&children[position], depth + 1, children, comments);
+            let replies = if depth < MAX_NESTING {
+                build_nodes(&children[position], depth + 1, children, comments)
+            } else {
+                // At the cap, the rest of the subtree is emitted flat rather
+                // than dropped: a comment nobody can see is worse than one
+                // rendered at the wrong indent, and the caller asked for the
+                // whole thread.
+                flatten_subtree(&children[position], depth, children, comments)
+            };
             Some(CommentNode {
                 comment,
                 depth,
@@ -677,37 +867,45 @@ async fn probe_parent(
     };
     let lock_clause = if lock { FOR_NO_KEY_UPDATE } else { "" };
 
-    let found: Option<ParentRow> = if let Some(column) = spec.parent_tenant_column {
-        {
-            let sql = format!(
-                "SELECT {parent_pk} AS id FROM {parent_table} \
+    // Three-valued, exactly like `#[votable]`'s `__autumn_m2m_tenant_scope()`
+    // contract: the predicate is emitted only when the model HAS a tenant
+    // column AND this caller resolved a tenant. A repository that is not
+    // `tenant_scoped` — or one used through `across_tenants()` — passes `None`
+    // and must get the unscoped query. Branching on the spec alone would bind
+    // `NULL` into `IS NOT DISTINCT FROM`, which matches only untenanted rows,
+    // turning every call on a tenant-columned model into a 404.
+    let found: Option<ParentRow> =
+        if let (Some(column), Some(tenant)) = (spec.parent_tenant_column, tenant) {
+            {
+                let sql = format!(
+                    "SELECT {parent_pk} AS id FROM {parent_table} \
                  WHERE {parent_table}.{parent_pk} = {} \
-                   AND {parent_table}.{} {IS_NOT_DISTINCT_FROM} {}{live}{lock_clause}",
-                ph(1),
-                quote_ident(column),
-                ph(2),
-            );
-            diesel::sql_query(sql)
-                .bind::<BigInt, _>(parent_id)
-                .bind::<Nullable<Text>, _>(tenant)
-                .get_result::<ParentRow>(conn)
-                .await
-                .optional_row()?
-        }
-    } else {
-        {
-            let sql = format!(
-                "SELECT {parent_pk} AS id FROM {parent_table} \
+                   AND {parent_table}.{} = {}{live}{lock_clause}",
+                    ph(1),
+                    quote_ident(column),
+                    ph(2),
+                );
+                diesel::sql_query(sql)
+                    .bind::<BigInt, _>(parent_id)
+                    .bind::<Text, _>(tenant)
+                    .get_result::<ParentRow>(conn)
+                    .await
+                    .optional_row()?
+            }
+        } else {
+            {
+                let sql = format!(
+                    "SELECT {parent_pk} AS id FROM {parent_table} \
                  WHERE {parent_table}.{parent_pk} = {}{live}{lock_clause}",
-                ph(1),
-            );
-            diesel::sql_query(sql)
-                .bind::<BigInt, _>(parent_id)
-                .get_result::<ParentRow>(conn)
-                .await
-                .optional_row()?
-        }
-    };
+                    ph(1),
+                );
+                diesel::sql_query(sql)
+                    .bind::<BigInt, _>(parent_id)
+                    .get_result::<ParentRow>(conn)
+                    .await
+                    .optional_row()?
+            }
+        };
 
     if found.is_none() {
         return Err(AutumnError::not_found_msg("Comment target not found"));
@@ -768,9 +966,21 @@ async fn comment_depth(
         .await
         .map_err(AutumnError::from)?;
 
-    row.depth.ok_or_else(|| {
+    let depth = row.depth.ok_or_else(|| {
         AutumnError::unprocessable_msg("Cannot reply to that comment: it is not on this record")
-    })
+    })?;
+    // The CTE stops recursing at `RECURSION_GUARD`, so a chain longer than that
+    // reports exactly the guard rather than its real depth. Returning the
+    // truncated number would make `max_depth` unenforceable for any thread that
+    // got that deep; refusing is the only honest answer. `#[commentable]`
+    // rejects a `max_depth` at or above the guard, so this is reachable only
+    // through rows written outside the framework.
+    if depth >= RECURSION_GUARD {
+        return Err(AutumnError::unprocessable_msg(
+            "This thread is nested too deeply to reply to",
+        ));
+    }
+    Ok(depth)
 }
 
 /// Insert one comment and read it back.
@@ -854,50 +1064,92 @@ async fn insert_comment(
 
 /// Remove `comment_id` and its whole descendant subtree, returning how many
 /// rows actually moved — which is exactly the counter delta.
+///
+/// The subtree ids are **materialised first**, then deleted by id, and the
+/// delta is `ids.len()` rather than the statement's affected-row count. That is
+/// not belt-and-braces: `parent_id` carries `ON DELETE CASCADE`, and `SQLite`'s
+/// `changes()` excludes rows removed by a foreign-key action — so on the
+/// hard-delete path a three-row subtree would report `1`, leaving the counter
+/// permanently two too high with no recompute in sight. Counting the ids is the
+/// one measure both engines agree on.
+///
+/// The walk is confined to `(parent_type, parent_id)`. Nothing the framework
+/// writes can produce a cross-record `parent_id` chain (`comment_depth` refuses
+/// it), but no foreign key or `CHECK` enforces that, and an app that inserts
+/// comments with raw Diesel can. Without the predicate one parent's counter
+/// would absorb the whole span.
 async fn delete_subtree(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
+    parent_type: &str,
+    parent_id: i64,
     comment_id: i64,
 ) -> AutumnResult<usize> {
     let comments = quote_ident(spec.comments_table);
     let pk = quote_ident(spec.comment_pk);
     let parent_column = quote_ident(spec.parent_column);
+    let type_column = quote_ident(spec.type_column);
+    let id_column = quote_ident(spec.id_column);
     let deleted_at = quote_ident(DELETED_AT);
     let anchor_live = spec.live_comments("c");
     let descendant_live = spec.live_comments("d");
 
-    let cte = format!(
+    let ids: Vec<IdRow> = diesel::sql_query(format!(
         "WITH RECURSIVE __autumn_cmt_sub(id, depth) AS (\
            SELECT c.{pk}, CAST(0 AS BIGINT) FROM {comments} AS c \
-            WHERE c.{pk} = {}{anchor_live} \
+            WHERE c.{pk} = {} AND c.{type_column} = {} AND c.{id_column} = {}{anchor_live} \
            UNION ALL \
            SELECT d.{pk}, s.depth + 1 \
              FROM {comments} AS d JOIN __autumn_cmt_sub AS s ON d.{parent_column} = s.id \
-            WHERE s.depth < {RECURSION_GUARD}{descendant_live}\
-         ) ",
+            WHERE s.depth < {RECURSION_GUARD} \
+              AND d.{type_column} = {} AND d.{id_column} = {}{descendant_live}\
+         ) SELECT id FROM __autumn_cmt_sub",
         ph(1),
-    );
+        ph(2),
+        ph(3),
+        ph(4),
+        ph(5),
+    ))
+    .bind::<BigInt, _>(comment_id)
+    .bind::<Text, _>(parent_type)
+    .bind::<BigInt, _>(parent_id)
+    .bind::<Text, _>(parent_type)
+    .bind::<BigInt, _>(parent_id)
+    .load::<IdRow>(conn)
+    .await
+    .map_err(AutumnError::from)?;
 
-    let affected = if spec.soft_delete {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<i64> = ids.into_iter().map(|row| row.id).collect();
+    // Bound the `IN (…)` list: the ids are framework-produced `i64`s, never
+    // caller text, so they are formatted rather than bound — Postgres caps
+    // bind parameters at 65535 and a deep thread could exceed it.
+    let id_list = ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if spec.soft_delete {
         diesel::sql_query(format!(
-            "{cte}UPDATE {comments} SET {deleted_at} = {} \
-             WHERE {pk} IN (SELECT id FROM __autumn_cmt_sub) AND {deleted_at} IS NULL",
-            ph(2),
+            "UPDATE {comments} SET {deleted_at} = {} \
+             WHERE {pk} IN ({id_list}) AND {deleted_at} IS NULL",
+            ph(1),
         ))
-        .bind::<BigInt, _>(comment_id)
         .bind::<Timestamp, _>(chrono::Utc::now().naive_utc())
         .execute(conn)
         .await
+        .map_err(AutumnError::from)?;
     } else {
-        diesel::sql_query(format!(
-            "{cte}DELETE FROM {comments} WHERE {pk} IN (SELECT id FROM __autumn_cmt_sub)",
-        ))
-        .bind::<BigInt, _>(comment_id)
-        .execute(conn)
-        .await
-    };
+        diesel::sql_query(format!("DELETE FROM {comments} WHERE {pk} IN ({id_list})"))
+            .execute(conn)
+            .await
+            .map_err(AutumnError::from)?;
+    }
 
-    affected.map_err(AutumnError::from)
+    Ok(ids.len())
 }
 
 /// `Result<T, diesel::result::Error>` → `AutumnResult<Option<T>>`, mapping
@@ -990,6 +1242,46 @@ mod tests {
         assert!(nest(Vec::new()).is_empty());
     }
 
+    /// The open-redirect guard on `return_to`.
+    ///
+    /// The tab case is the one that matters: the WHATWG URL parser strips
+    /// ASCII tab, LF and CR from a URL *before* parsing, and `HeaderValue`
+    /// carries a tab happily — so a CR/LF-only check would let
+    /// `/\t/evil.example` through to the browser, which then reads it as
+    /// `//evil.example`.
+    #[cfg(all(feature = "db", feature = "maud"))]
+    #[test]
+    fn only_a_relative_single_slash_path_is_a_safe_return_target() {
+        for safe in [
+            "/",
+            "/r/rust/posts/hello",
+            "/posts?page=2",
+            "/posts#comment-7",
+        ] {
+            assert!(is_safe_return_path(safe), "{safe:?} should be safe");
+        }
+        for unsafe_path in [
+            "",
+            "//evil.example",
+            "https://evil.example",
+            "/\\evil.example",
+            "/a\\b",
+            "/\tevil",
+            "/\t/evil.example",
+            "/ok\r\nSet-Cookie: x=1",
+            "/ok\n",
+            "/with space",
+            "/\u{1}",
+            "/\u{7f}",
+            "evil.example",
+        ] {
+            assert!(
+                !is_safe_return_path(unsafe_path),
+                "{unsafe_path:?} must be refused"
+            );
+        }
+    }
+
     /// The identifier guard is what keeps a hand-constructed spec from
     /// smuggling SQL through `format!`.
     #[test]
@@ -999,18 +1291,99 @@ mod tests {
         assert!(!is_plain_identifier(""));
         assert!(!is_plain_identifier("1bad"));
     }
+
+    fn sample_spec() -> CommentableSpec {
+        CommentableSpec {
+            comments_table: "comments",
+            comment_pk: "id",
+            type_column: "commentable_type",
+            id_column: "commentable_id",
+            parent_column: "parent_id",
+            author_column: "author_id",
+            body_column: "body",
+            created_at_column: "created_at",
+            soft_delete: true,
+            parent_table: "posts",
+            parent_pk: "id",
+            parent_soft_delete: false,
+            counter_column: Some("comment_count"),
+            parent_tenant_column: None,
+            author_table: Some("users"),
+            author_pk: "id",
+            author_name_column: Some("username"),
+            max_depth: DEFAULT_MAX_DEPTH,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        }
+    }
+
+    /// A spec built by hand — the one way past the macro's guarantee — is
+    /// refused by `validate`, in release builds too. A `debug_assert` here
+    /// would be erased in exactly the build where it matters.
+    #[test]
+    fn validate_refuses_a_hand_built_spec_carrying_sql() {
+        let spec = sample_spec();
+        assert!(spec.validate().is_ok());
+
+        let mut smuggled = sample_spec();
+        smuggled.comments_table = "comments\"; DROP TABLE users --";
+        let err = smuggled
+            .validate()
+            .expect_err("a quoted name must be refused");
+        assert!(err.to_string().contains("comments_table"), "{err}");
+
+        let mut smuggled = sample_spec();
+        smuggled.counter_column = Some("count; DROP TABLE users");
+        let err = smuggled.validate().expect_err("an optional name too");
+        assert!(err.to_string().contains("counter_column"), "{err}");
+
+        // A `None` optional is not a name and must not be rejected.
+        let mut sparse = sample_spec();
+        sparse.counter_column = None;
+        sparse.author_table = None;
+        sparse.author_name_column = None;
+        assert!(sparse.validate().is_ok());
+    }
+
+    /// The macro's own `max_depth` ceiling must match the runtime's recursion
+    /// guard. The proc-macro crate cannot reference this constant, so the two
+    /// are kept in step here.
+    #[test]
+    fn the_macro_depth_ceiling_matches_the_recursion_guard() {
+        assert_eq!(RECURSION_GUARD, 1_000);
+        assert_eq!(MAX_NESTING, usize::try_from(RECURSION_GUARD).expect("fits"));
+        assert!(i64::from(DEFAULT_MAX_DEPTH) < RECURSION_GUARD);
+    }
+
+    /// A thread deeper than the render guard is flattened, not recursed into —
+    /// an unbounded chain would overflow the stack instead of raising.
+    #[test]
+    fn nest_stops_nesting_at_the_recursion_guard() {
+        let depth_beyond = i64::try_from(MAX_NESTING).expect("fits") + 10;
+        let rows: Vec<Comment> = (1..=depth_beyond)
+            .map(|id| comment(id, (id > 1).then_some(id - 1), &format!("c{id}")))
+            .collect();
+        let flat = flatten(&nest(rows));
+        let deepest = flat.iter().map(|(depth, _)| *depth).max().expect("nodes");
+        assert_eq!(deepest, MAX_NESTING);
+        assert_eq!(
+            flat.len(),
+            MAX_NESTING + 10,
+            "every comment still renders; only the nesting is capped"
+        );
+    }
 }
 
 // ── Generic router ──────────────────────────────────────────────────────────
 
-/// Configuration for the framework's generic comment [`router`].
+/// Configuration for the framework's generic comment [`router()`].
 ///
 /// The router serves **every** `#[commentable]` model in the binary from one
 /// pair of routes, dispatching on the `{commentable_type}` path segment through
 /// the [`inventory`] registry. That is what makes adding comments to a second
 /// model zero new routes and zero new queries.
 #[cfg(all(feature = "db", feature = "maud"))]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[non_exhaustive]
 pub struct CommentsConfig {
     /// Where the router is mounted, used to build each thread's form action.
     /// Must match the path passed to `nest`. Default `/comments`.
@@ -1025,6 +1398,85 @@ pub struct CommentsConfig {
     pub sign_in_prompt: String,
     /// `aria-label` of the rendered region.
     pub label: String,
+    /// Record-level authorization, called before **either** handler touches the
+    /// database.
+    ///
+    /// The router authorizes the *tenant* (through the spec's tenant column)
+    /// but knows nothing about a record's own visibility — it cannot, since it
+    /// dispatches on a string. Without a hook here, mounting the router makes
+    /// every registered model's threads world-readable by id and
+    /// world-commentable by any signed-in user, whatever the app's own
+    /// `Policy` says about the parent record.
+    ///
+    /// `None` (the default) allows everything, which is right for a forum or a
+    /// blog where the records are public anyway. **An app with private,
+    /// draft, or role-gated records must set this** — see
+    /// [`CommentsConfig::authorize`].
+    pub authorize: Option<CommentAuthorizer>,
+}
+
+/// The record-level authorization callback for [`CommentsConfig::authorize`].
+///
+/// Async because the interesting answers need the database: "is the viewer a
+/// member of this ticket's project" is not a decision a synchronous predicate
+/// over the request can make.
+#[cfg(all(feature = "db", feature = "maud"))]
+pub type CommentAuthorizer = std::sync::Arc<
+    dyn Fn(CommentAccess) -> futures::future::BoxFuture<'static, bool> + Send + Sync,
+>;
+
+/// What [`CommentsConfig::authorize`] is asked about.
+#[cfg(all(feature = "db", feature = "maud"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CommentAccess {
+    /// The `commentable_type` path segment, already proven to name a
+    /// registered model.
+    pub commentable_type: String,
+    /// The record's id, straight off the path and otherwise unvalidated.
+    pub parent_id: i64,
+    /// The signed-in author's id, or `None` for an anonymous reader.
+    pub viewer_id: Option<i64>,
+    /// `true` for the `POST` handler, `false` for the `GET` one — so a policy
+    /// can allow reading while refusing to accept a comment.
+    pub write: bool,
+}
+
+#[cfg(all(feature = "db", feature = "maud"))]
+impl std::fmt::Debug for CommentsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommentsConfig")
+            .field("mount_path", &self.mount_path)
+            .field("session_author_key", &self.session_author_key)
+            .field("sign_in_prompt", &self.sign_in_prompt)
+            .field("label", &self.label)
+            .field("authorize", &self.authorize.as_ref().map(|_| "<fn>"))
+            .finish()
+    }
+}
+
+#[cfg(all(feature = "db", feature = "maud"))]
+impl CommentsConfig {
+    /// Gate both handlers on a record-level check.
+    ///
+    /// ```rust,ignore
+    /// CommentsConfig::default().authorize(|access| Box::pin(async move {
+    ///     // e.g. re-use the app's own Policy for the parent record
+    ///     access.viewer_id.is_some() || !private(&access.commentable_type, access.parent_id)
+    /// }))
+    /// ```
+    ///
+    /// A refusal is a `404`, not a `403`: telling an unauthorized caller that
+    /// the record exists is an existence oracle, and it is the same answer they
+    /// get for a record in another tenant.
+    #[must_use]
+    pub fn authorize<F>(mut self, authorize: F) -> Self
+    where
+        F: Fn(CommentAccess) -> futures::future::BoxFuture<'static, bool> + Send + Sync + 'static,
+    {
+        self.authorize = Some(std::sync::Arc::new(authorize));
+        self
+    }
 }
 
 #[cfg(all(feature = "db", feature = "maud"))]
@@ -1035,6 +1487,7 @@ impl Default for CommentsConfig {
             session_author_key: "user_id".to_owned(),
             sign_in_prompt: "Sign in to join the discussion.".to_owned(),
             label: "Comments".to_owned(),
+            authorize: None,
         }
     }
 }
@@ -1065,6 +1518,16 @@ pub fn router<S>(config: CommentsConfig) -> axum::Router<S>
 where
     S: crate::db::DbState + Clone + Send + Sync + 'static,
 {
+    // Two models claiming one discriminator would render each other's threads
+    // and probe each other's tables. There is no request-time answer that is
+    // not silently wrong, so fail at wiring time, where the fix is obvious.
+    assert!(
+        duplicate_commentable_type().is_none(),
+        "two #[commentable] models share the commentable_type {:?}: the shared comments \
+         table cannot tell their rows apart. Give one of them \
+         `#[commentable(type_name = \"…\")]`.",
+        duplicate_commentable_type().unwrap_or_default(),
+    );
     axum::Router::new()
         .route(
             "/{commentable_type}/{parent_id}",
@@ -1089,17 +1552,66 @@ struct CommentSubmission {
     return_to: Option<String>,
 }
 
-/// The tenant this request is scoped to, when the model carries a tenant
-/// column and the tenancy middleware established one.
+/// The tenant this request is scoped to.
+///
+/// Fails closed, matching what a `tenant_scoped` repository does: when the
+/// model carries a tenant column but no tenancy context was established, the
+/// request is an error rather than a query against "the NULL tenant" — which
+/// would quietly serve every untenanted row to a caller the middleware never
+/// saw.
+///
+/// # Errors
+///
+/// [`AutumnError::internal_server_error_msg`] when the model is tenant-scoped
+/// and no tenant is in scope: that is a middleware wiring mistake, not
+/// something the caller can fix.
 #[cfg(all(feature = "db", feature = "maud"))]
-fn request_tenant(spec: &CommentableSpec) -> Option<String> {
+fn request_tenant(spec: &CommentableSpec) -> AutumnResult<Option<String>> {
     // A model with no tenant column emits no tenant predicate at all, so
     // reading the task-local would only ever produce a value nothing uses.
-    spec.parent_tenant_column?;
+    if spec.parent_tenant_column.is_none() {
+        return Ok(None);
+    }
     crate::tenancy::CURRENT_TENANT
         .try_with(Clone::clone)
         .ok()
         .flatten()
+        .map(Some)
+        .ok_or_else(|| {
+            AutumnError::internal_server_error_msg(
+                "This model is tenant-scoped but no tenant context was established for the \
+                 comment routes — mount them inside the tenancy middleware.",
+            )
+        })
+}
+
+/// Run [`CommentsConfig::authorize`], if the app set one.
+///
+/// A refusal is `404` for the same reason a foreign-tenant parent is: a `403`
+/// would confirm the record exists.
+#[cfg(all(feature = "db", feature = "maud"))]
+async fn authorize(
+    config: &CommentsConfig,
+    commentable_type: &str,
+    parent_id: i64,
+    viewer_id: Option<i64>,
+    write: bool,
+) -> AutumnResult<()> {
+    let Some(authorize) = config.authorize.as_ref() else {
+        return Ok(());
+    };
+    let allowed = authorize(CommentAccess {
+        commentable_type: commentable_type.to_owned(),
+        parent_id,
+        viewer_id,
+        write,
+    })
+    .await;
+    if allowed {
+        Ok(())
+    } else {
+        Err(AutumnError::not_found_msg("Comment target not found"))
+    }
 }
 
 /// Render the thread for one record.
@@ -1107,12 +1619,15 @@ fn request_tenant(spec: &CommentableSpec) -> Option<String> {
 async fn show_thread(
     axum::Extension(config): axum::Extension<std::sync::Arc<CommentsConfig>>,
     axum::extract::Path((commentable_type, parent_id)): axum::extract::Path<(String, i64)>,
+    axum::extract::Query(query): axum::extract::Query<ThreadQuery>,
     session: crate::session::Session,
     csrf: Option<crate::security::csrf::CsrfToken>,
     mut db: crate::db::Db,
 ) -> AutumnResult<maud::Markup> {
     let spec = resolve_spec(&commentable_type)?;
-    let tenant = request_tenant(spec);
+    let author_id = session_author(&session, &config).await;
+    authorize(&config, &commentable_type, parent_id, author_id, false).await?;
+    let tenant = request_tenant(spec)?;
     let thread = comment_thread(
         &mut db,
         spec,
@@ -1121,7 +1636,6 @@ async fn show_thread(
         tenant.as_deref(),
     )
     .await?;
-    let author_id = session_author(&session, &config).await;
     Ok(render(
         &config,
         spec,
@@ -1130,8 +1644,21 @@ async fn show_thread(
         &thread,
         csrf.as_ref(),
         author_id.is_some(),
+        query
+            .return_to
+            .as_deref()
+            .filter(|p| is_safe_return_path(p)),
         None,
     ))
+}
+
+/// `?return_to=` on the `GET` fragment, so a thread served by the router can
+/// round-trip a no-JS submit back to the page that embedded it.
+#[cfg(all(feature = "db", feature = "maud"))]
+#[derive(Debug, Default, serde::Deserialize)]
+struct ThreadQuery {
+    #[serde(default)]
+    return_to: Option<String>,
 }
 
 /// Post a comment (or a reply) and re-render the thread.
@@ -1151,6 +1678,7 @@ async fn post_comment(
     let author_id = session_author(&session, &config)
         .await
         .ok_or_else(|| AutumnError::unauthorized_msg("Sign in to comment"))?;
+    authorize(&config, &commentable_type, parent_id, Some(author_id), true).await?;
     // An empty hidden input means "top-level", not "malformed": the widget
     // renders `reply_to` only on the per-node forms.
     let reply_to = match submission.reply_to.as_deref().map(str::trim) {
@@ -1160,9 +1688,17 @@ async fn post_comment(
                 .map_err(|_| AutumnError::bad_request_msg("Invalid reply target"))?,
         ),
     };
-    let tenant = request_tenant(spec);
+    let tenant = request_tenant(spec)?;
+    // Only a relative, single-slash path is ever honoured, so a crafted
+    // `return_to` cannot become an open redirect — and the same validated value
+    // is echoed back into the re-rendered forms, so the NEXT no-JS submit still
+    // knows where to come back to.
+    let return_to = submission
+        .return_to
+        .as_deref()
+        .filter(|path| is_safe_return_path(path));
 
-    add_comment(
+    let outcome = add_comment(
         &mut db,
         spec,
         &commentable_type,
@@ -1172,15 +1708,21 @@ async fn post_comment(
         reply_to,
         tenant.as_deref(),
     )
-    .await?;
+    .await;
 
-    // No-JS path: send the browser back to the page it came from, when that
-    // page said where that is. Only a **relative, single-slash** path is
-    // honoured, so a crafted `return_to` cannot turn this into an open
-    // redirect.
-    if !htmx.is_htmx
-        && let Some(return_to) = submission.return_to.as_deref()
-        && is_safe_return_path(return_to)
+    // A rejected body is shown, not thrown. htmx does not swap a non-2xx
+    // response by default, so returning the error would make the button look
+    // broken; re-rendering the thread with the message above the form is the
+    // only feedback a no-JS visitor gets either.
+    let error = match outcome {
+        Ok(_) => None,
+        Err(err) if err.status() == http::StatusCode::UNPROCESSABLE_ENTITY => Some(err.to_string()),
+        Err(err) => return Err(err),
+    };
+
+    if error.is_none()
+        && !htmx.is_htmx
+        && let Some(return_to) = return_to
     {
         return Ok(crate::Redirect::to(return_to).into_response());
     }
@@ -1201,7 +1743,8 @@ async fn post_comment(
         &thread,
         csrf.as_ref(),
         true,
-        None,
+        return_to,
+        error,
     )
     .into_response())
 }
@@ -1210,13 +1753,20 @@ async fn post_comment(
 ///
 /// `//evil.example` and `https://evil.example` are browser-absolute; a
 /// backslash is normalised to `/` by some browsers, so it is rejected too.
+///
+/// **Every** byte at or below `0x20` is rejected, not just CR/LF. The WHATWG
+/// URL parser strips ASCII tab, LF and CR from a URL *before* parsing, and
+/// `HeaderValue` happily carries a tab — so `/\t/evil.example` would pass a
+/// CR/LF-only check, reach the browser intact, and be re-read as
+/// `//evil.example`. The same blanket check keeps `DEL` and the other control
+/// characters from reaching `HeaderValue::try_from`, which would otherwise turn
+/// a bad request into a `500`.
 #[cfg(all(feature = "db", feature = "maud"))]
 fn is_safe_return_path(path: &str) -> bool {
     path.starts_with('/')
         && !path.starts_with("//")
-        && !path.starts_with("/\\")
         && !path.contains('\\')
-        && !path.contains(['\r', '\n'])
+        && path.bytes().all(|byte| byte > 0x20 && byte != 0x7f)
 }
 
 /// Look a `commentable_type` up in the registry.
@@ -1248,23 +1798,50 @@ fn render(
     csrf: Option<&crate::security::csrf::CsrfToken>,
     can_comment: bool,
     return_to: Option<&str>,
+    error: Option<String>,
 ) -> maud::Markup {
-    let dom_id = format!("autumn-comments-{commentable_type}-{parent_id}");
-    let action = format!(
-        "{}/{commentable_type}/{parent_id}",
-        config.mount_path.trim_end_matches('/')
-    );
-    let mut widget = crate::widgets::CommentThread::new(dom_id, action)
-        .label(config.label.clone())
-        .max_depth(usize::try_from(spec.max_depth).unwrap_or(usize::MAX));
+    let mut widget = crate::widgets::CommentThread::from_spec(
+        thread_dom_id(commentable_type, parent_id),
+        thread_action(config, commentable_type, parent_id),
+        spec,
+    )
+    .label(config.label.clone());
     if let Some(csrf) = csrf {
         widget = widget.csrf_token(csrf.token());
     }
     if let Some(return_to) = return_to {
         widget = widget.return_to(return_to);
     }
+    if let Some(error) = error {
+        widget = widget.error(error);
+    }
     if !can_comment {
-        widget = widget.read_only(Some(config.sign_in_prompt.clone()));
+        widget = widget
+            .read_only()
+            .sign_in_prompt(config.sign_in_prompt.clone());
     }
     crate::widgets::comment_thread(&widget, &crate::widgets::CommentView::from_thread(thread))
+}
+
+/// The DOM id the router renders a thread into.
+///
+/// **A host page that embeds a thread itself must use this same id**, or the
+/// first htmx swap replaces its region with one carrying a different id and
+/// every later swap misses. [`crate::widgets::CommentThread::from_spec`] and
+/// this function together are what keep the two renders identical.
+#[cfg(all(feature = "db", feature = "maud"))]
+#[must_use]
+pub fn thread_dom_id(commentable_type: &str, parent_id: i64) -> String {
+    format!("autumn-comments-{commentable_type}-{parent_id}")
+}
+
+/// The form action the router serves, for a host page rendering its own
+/// thread.
+#[cfg(all(feature = "db", feature = "maud"))]
+#[must_use]
+pub fn thread_action(config: &CommentsConfig, commentable_type: &str, parent_id: i64) -> String {
+    format!(
+        "{}/{commentable_type}/{parent_id}",
+        config.mount_path.trim_end_matches('/')
+    )
 }

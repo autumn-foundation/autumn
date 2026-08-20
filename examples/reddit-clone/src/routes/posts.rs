@@ -686,19 +686,27 @@ pub async fn show(
     // this model's `commentable_type`. `return_to` is the no-JS round trip:
     // with htmx the reply swaps the thread in place, without it the browser
     // comes straight back to this page.
+    //
+    // The dom id and action come from the framework, not from here: the router
+    // re-renders this same region after every reply, and an id of our own
+    // devising would be replaced by the router's on the first htmx swap, so
+    // every later swap would miss.
     let post_path = __autumn_path_show(&sub.slug, &post.slug);
-    let mut comment_config = CommentThread::new(
-        format!("comments-post-{}", post.id),
-        format!("/comments/{}/{}", Post::COMMENTABLE_TYPE, post.id),
+    let comments_config = autumn_web::commentable::CommentsConfig::default();
+    let mut comment_config = CommentThread::from_spec(
+        autumn_web::commentable::thread_dom_id(Post::COMMENTABLE_TYPE, post.id),
+        autumn_web::commentable::thread_action(&comments_config, Post::COMMENTABLE_TYPE, post.id),
+        Post::commentable_spec(),
     )
     .label("Post comments")
     .empty_text("No comments yet. Start the conversation!")
-    .return_to(&post_path)
-    .max_depth(usize::try_from(Post::commentable_spec().max_depth).unwrap_or(5));
+    .return_to(&post_path);
     if current_user.is_some() {
         comment_config = comment_config.csrf_token(csrf.token());
     } else {
-        comment_config = comment_config.read_only(Some("Log in to comment.".to_owned()));
+        comment_config = comment_config
+            .read_only()
+            .sign_in_prompt("Log in to comment.");
     }
 
     let viewer_id = current_user_id

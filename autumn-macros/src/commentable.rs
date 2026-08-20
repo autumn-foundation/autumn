@@ -109,6 +109,11 @@ fn check_ident_value(key: &syn::Ident, value: &str, span: proc_macro2::Span) -> 
     ))
 }
 
+/// The exclusive upper bound on `max_depth`, mirroring the runtime's
+/// `RECURSION_GUARD`. The proc-macro crate cannot reference `autumn_web`, so
+/// the two are kept in step by a test in `autumn/tests/integration/commentable.rs`.
+const MAX_DEPTH_CEILING: u32 = 1_000;
+
 /// Every key `#[commentable(...)]` accepts, for the unknown-key diagnostic.
 const KNOWN_KEYS: &[&str] = &[
     "by",
@@ -311,9 +316,25 @@ pub fn parse_commentable_attr(
                     "`max_depth` in `#[commentable]` takes an integer",
                 )
             })?;
-            u32::try_from(raw).map_err(|_| {
+            let depth = u32::try_from(raw).map_err(|_| {
                 syn::Error::new(parsed.span, "`max_depth` in `#[commentable]` is too large")
-            })?
+            })?;
+            // The runtime measures depth with a `WITH RECURSIVE` CTE that stops
+            // at 1000. A `max_depth` at or above that could never be enforced —
+            // the probe would report the guard, not the real depth — so the cap
+            // would silently stop existing. Keep the two in step here, where
+            // the mistake has a span.
+            if depth >= MAX_DEPTH_CEILING {
+                return Err(syn::Error::new(
+                    parsed.span,
+                    format!(
+                        "`max_depth` in `#[commentable]` must be below {MAX_DEPTH_CEILING}: \
+                         the runtime's depth probe stops recursing there, so a larger cap \
+                         could not be enforced"
+                    ),
+                ));
+            }
+            depth
         }
     };
     let max_body_bytes = match pairs.get("max_body") {
@@ -499,6 +520,19 @@ pub fn emit_commentable_items(
     // trait. Omitting `by` is legitimate (a project whose author model lives
     // outside this crate, or which renders no names), and then there is
     // nothing to resolve.
+    // The counter is read back as `i64` and moved with `SET c = c + 1`, so
+    // anything else is a schema mismatch. `model.rs` rejects the spellings that
+    // are definitely wrong with a directed message; this is the guard that
+    // catches the rest — an alias, a fully-qualified path — by name resolution
+    // rather than token text, exactly as `#[votable]` does for its aggregate.
+    let counter_guard = spec.counter_column.as_ref().map(|column| {
+        let counter_ident = format_ident!("{column}");
+        quote! {
+            const _: fn(&#model_ident) -> i64 = |__autumn_commentable_model| {
+                __autumn_commentable_model.#counter_ident
+            };
+        }
+    });
     let author_guard = spec.author_model.as_ref().map(|author_model| {
         quote! {
             const _: ::core::marker::PhantomData<#author_model> = ::core::marker::PhantomData;
@@ -584,17 +618,42 @@ pub fn emit_commentable_items(
          - `404` when this record does not exist (or is soft-deleted).\n\
          - Any database error."
     );
+    let recompute_doc = format!(
+        "Rebuild this record's comment counter from the comments table, and \
+         return the value written.\n\
+         \n\
+         The repair half of the counter: counters drift when rows arrive by \
+         import, seed, or hand-written SQL, and they are deliberately not \
+         clamped, so a drifted one can go negative. Idempotent — running it \
+         twice writes the same number. Returns `0`, having written nothing, for \
+         a model that keeps no counter.\n\
+         \n\
+         Do **not** reach for `counter_cache_recompute` instead: it keys on the \
+         foreign-key column alone, and `commentable_id` is shared across \
+         models, so it would count another model's comments that happen to \
+         share the id.\n\
+         \n\
+         # Errors\n\
+         \n\
+         - `404` when this record does not exist (or is soft-deleted).\n\
+         - Any database error."
+    );
     let delete_doc = format!(
         "Delete `comment_id` **and every reply beneath it**, returning how many \
          comments were removed.\n\
+         \n\
+         `parent_id` is part of the lookup, not decoration: without it any \
+         comment id would be deletable from any record of this model — the \
+         mirror image of the cross-record `reply_to` graft `add_comment` \
+         refuses.\n\
          \n\
          {counter_note} The decrement is the number of rows the cascade \
          actually removed, so a repeat delete moves nothing.\n\
          \n\
          # Errors\n\
          \n\
-         - `404` when `comment_id` is not a comment on a record of this type, \
-         or that record is not visible.\n\
+         - `404` when `comment_id` is not a comment on **this** record, or the \
+         record is not visible.\n\
          - Any database error."
     );
 
@@ -623,6 +682,7 @@ pub fn emit_commentable_items(
 
     quote! {
         #pk_guard
+        #counter_guard
         #author_guard
 
         #[doc = #spec_doc]
@@ -697,9 +757,18 @@ pub fn emit_commentable_items(
             #[doc = #delete_doc]
             fn delete_comment(
                 &self,
+                parent_id: i64,
                 comment_id: i64,
             ) -> impl ::std::future::Future<
                 Output = ::autumn_web::AutumnResult<usize>
+            > + Send;
+
+            #[doc = #recompute_doc]
+            fn recompute_comment_count(
+                &self,
+                parent_id: i64,
+            ) -> impl ::std::future::Future<
+                Output = ::autumn_web::AutumnResult<i64>
             > + Send;
         }
 
@@ -755,6 +824,7 @@ pub fn emit_commentable_items(
 
             async fn delete_comment(
                 &self,
+                parent_id: i64,
                 comment_id: i64,
             ) -> ::autumn_web::AutumnResult<usize> {
                 #resolve_tenant
@@ -763,7 +833,24 @@ pub fn emit_commentable_items(
                     &mut *conn,
                     &#spec_static,
                     #type_name,
+                    parent_id,
                     comment_id,
+                    #tenant_arg,
+                )
+                .await
+            }
+
+            async fn recompute_comment_count(
+                &self,
+                parent_id: i64,
+            ) -> ::autumn_web::AutumnResult<i64> {
+                #resolve_tenant
+                let mut conn = self.__autumn_m2m_write_conn().await?;
+                ::autumn_web::commentable::recompute_comment_count(
+                    &mut *conn,
+                    &#spec_static,
+                    #type_name,
+                    parent_id,
                     #tenant_arg,
                 )
                 .await

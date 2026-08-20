@@ -801,12 +801,20 @@ fn plan_scaffold_with_options_impl(
     // project — that is what makes adding comments to a SECOND model the DSL
     // token and nothing else.
     if fields.iter().any(|f| f.kind.is_commentable()) {
-        let emitted = super::commentable::push_commentable_migration(
-            &mut plan,
-            project_root,
-            timestamp,
-            for_revert,
-        );
+        // On a revert, the shared table stays as long as ANY other model still
+        // declares `#[commentable]` — it is one table for all of them, so
+        // taking it out with this model would break every other one.
+        let backend = super::detect_backend(project_root);
+        let revert_would_orphan_another_model = for_revert
+            && super::commentable::another_model_is_still_commentable(project_root, &snake_name);
+        let emitted = !revert_would_orphan_another_model
+            && super::commentable::push_commentable_migration(
+                &mut plan,
+                project_root,
+                timestamp,
+                backend,
+                for_revert,
+            );
         if !for_revert {
             if emitted {
                 plan.warn(format!(

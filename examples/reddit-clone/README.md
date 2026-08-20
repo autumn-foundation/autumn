@@ -157,7 +157,8 @@ curl http://localhost:3000/api/posts/1
 ```
 src/
   main.rs           # App builder, route + task + job + WS registration, migrations
-  models.rs         # #[model] structs: User, Subreddit, Post, Comment, Vote
+  models.rs         # #[model] structs: User, Subreddit (commentable), Post
+                    #   (votable + commentable), Tag, Vote
   schema.rs         # Diesel table definitions
   repositories.rs   # #[repository] with derived queries and API generation
   hooks.rs          # MutationHooks for post lifecycle (auto-slug)

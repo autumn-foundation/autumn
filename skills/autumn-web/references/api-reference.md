@@ -282,7 +282,8 @@ use autumn_web::commentable::{Comment, CommentNode};
 async fn add_comment(&self, parent_id: i64, author_id: i64, body: &str,
                      reply_to: Option<i64>) -> AutumnResult<Comment>;
 async fn comment_thread(&self, parent_id: i64) -> AutumnResult<Vec<CommentNode>>;
-async fn delete_comment(&self, comment_id: i64) -> AutumnResult<usize>;
+async fn delete_comment(&self, parent_id: i64, comment_id: i64) -> AutumnResult<usize>;
+async fn recompute_comment_count(&self, parent_id: i64) -> AutumnResult<i64>;
 
 pub struct Comment { pub id: i64, pub parent_id: Option<i64>, pub author_id: i64,
                      pub body: String, pub created_at: chrono::NaiveDateTime,
@@ -299,9 +300,17 @@ polymorphic column has no foreign key, so the probe is the referential check),
 enforces `max_depth` (default 5) and same-record `reply_to`, and moves
 `comment_count` with the #1325 counter-cache primitive in the same transaction.
 `comment_thread` is one query at any depth; `delete_comment` cascades to the
-descendant subtree and is idempotent. `autumn_web::commentable::router(cfg)`
-serves `GET`/`POST /{commentable_type}/{parent_id}` for every registered model
-from a single mount. See `docs/guide/commentable.md`.
+descendant subtree and is idempotent, and takes `parent_id` so a comment id
+alone is never authority over a comment on another record.
+`recompute_comment_count` is the drift repair (`counter_cache_recompute` would
+be WRONG here — it keys on the fk column alone, which is shared across models).
+Like `react()`, all four take their own pooled connection — never hold a `Db`
+extractor across one. `autumn_web::commentable::router(cfg)` serves
+`GET`/`POST /{commentable_type}/{parent_id}` for every registered model from a
+single mount; it authorizes the **tenant**, never the record, so an app with
+private records must set `CommentsConfig::authorize(...)`. Build a host page's
+own thread with `commentable::thread_dom_id`/`thread_action` so the router's
+re-render lands on the same element. See `docs/guide/commentable.md`.
 
 **(unreleased)** — `#[votable]` reaction helpers (#1362): declaring
 `#[votable(by = User, aggregate = sum|count)]` on a `#[model]` emits a
@@ -559,7 +568,10 @@ Per-primitive setters (in addition to the shared set):
   off and swaps in place when htmx is present. Bodies are escaped and split on
   blank lines into `<p>`s; never HTML. `dom_id` is interpolated into the
   default `hx-target` selector and into each node's id, so build it yourself.
-  CSS hooks `.autumn-comments` / `.autumn-comments-empty` /
+  Every form shares one `hx-sync="#{dom_id}:replace"` scope so two quick replies
+  cannot race, the list is `aria-live="polite"`, and each reply control is named
+  for the comment it answers. CSS hooks `.autumn-comments` /
+  `.autumn-comments-error` / `.autumn-comments-empty` /
   `.autumn-comments-prompt` / `.autumn-comment-list` / `.autumn-comment` /
   `.autumn-comment-meta` / `.autumn-comment-author` / `.autumn-comment-time` /
   `.autumn-comment-body` / `.autumn-comment-reply` /

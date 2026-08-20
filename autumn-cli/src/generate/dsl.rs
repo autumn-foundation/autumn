@@ -1002,7 +1002,8 @@ impl IdType {
 pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
     enum{a,b,…}, decimal{precision,scale}, slug{from:col}, position (optionally \
-    position{scope:col}), Option<…>, :unique, String{encrypted}, String{encrypted:deterministic}";
+    position{scope:col}), commentable, Option<…>, :unique, String{encrypted}, \
+    String{encrypted:deterministic}";
 
 /// The DSL field kinds that map to a working diesel `SQLite` conversion
 /// (issue #1614 AC #4; #1924) — the complement of the kinds
@@ -1011,7 +1012,7 @@ pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, 
 /// field kinds a `SQLite` app supports today.
 pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
     NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
-    slug{from:col}, position (optionally position{scope:col}), Option<…>, :unique";
+    slug{from:col}, position (optionally position{scope:col}), commentable, Option<…>, :unique";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -1943,14 +1944,14 @@ fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
         FieldKind::References => "label:col",
         FieldKind::Slug => "from:col",
         FieldKind::Position => "scope:col",
-        // `commentable` takes no `{…}` modifiers at all: the token declares a
-        // whole feature, configured on the model attribute rather than here.
-        FieldKind::Commentable => "",
         _ => "(none — this field type takes no constraint modifiers)",
     };
+    // Reported by the DSL token the author actually typed (`commentable`),
+    // not by the Rust type it happens to lower to (`i64`) — the latter reads
+    // like a different field entirely.
     format!(
-        "unknown constraint '{token}' for {} fields; supported: {accepted}",
-        kind.rust_type()
+        "unknown constraint '{token}' for `{}` fields; supported: {accepted}",
+        kind.dsl_token()
     )
 }
 
