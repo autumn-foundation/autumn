@@ -17,6 +17,10 @@ use quote::{ToTokens as _, format_ident, quote};
 use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
 
+use crate::commentable::{
+    emit_commentable_items, is_commentable_attr, resolve_commentable,
+};
+
 /// Parsed `#[model(...)]` attribute arguments.
 ///
 /// `managed` is a declarative-schema opt-in marker (#1975, Decision 4). It is
@@ -5020,12 +5024,22 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
+    // `#[commentable(by = ..., ...)]` (#1367) — the polymorphic association
+    // kind. Resolved here beside `#[votable]`; emitted below, once `all_fields`
+    // is known (the counter column must name a real `i64` field, and the
+    // parent's soft-delete / tenant columns are projected into the spec).
+    let commentable = match resolve_commentable(name, outer_attrs) {
+        Ok(spec) => spec,
+        Err(err) => return err.to_compile_error(),
+    };
+
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
         .filter(|a| {
             !a.path().is_ident("searchable")
                 && !is_association_attr(a)
                 && !is_votable_attr(a)
+                && !is_commentable_attr(a)
                 && !a.path().is_ident("shard_key")
         })
         .collect();
@@ -5183,6 +5197,109 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 has_deleted_at,
                 has_tenant_id,
                 pk_ident,
+            )
+        }
+    };
+
+    // ── Polymorphic comments (#[commentable], #1367) ────────────────────────
+    // Validated on the same terms as `#[votable]`'s aggregate column: the
+    // maintained counter must name a real `i64` field, or the mistake only
+    // surfaces as a runtime `42703 column "comment_count" does not exist` on
+    // the very first comment.
+    let commentable_items = match commentable {
+        None => TokenStream::new(),
+        Some(ref spec) => {
+            if let Some(counter_column) = spec.counter_column.as_deref() {
+                let counter_field = all_fields
+                    .iter()
+                    .find(|f| f.ident.as_ref().is_some_and(|i| i == counter_column));
+                let Some(counter_field) = counter_field else {
+                    return syn::Error::new(
+                        spec.span,
+                        format!(
+                            "commentable counter column `{counter_column}` not found on \
+                             model `{name}`; add the field (e.g. `#[default] pub \
+                             {counter_column}: i64`), point the attribute at an \
+                             existing one with `#[commentable(..., counter_cache = \
+                             <field>)]`, or opt out with `#[commentable(..., \
+                             counter_cache = false)]`"
+                        ),
+                    )
+                    .to_compile_error();
+                };
+                // Two layers, exactly like `#[votable]`: a directed error for
+                // the spellings that are definitely wrong, and the generated
+                // `const` guard below for everything else — so
+                // `std::primitive::i64` and honest aliases still compile.
+                let counter_ty = counter_field.ty.to_token_stream().to_string();
+                let definitely_not_i64: &[&str] = &[
+                    "i8", "i16", "i32", "i128", "u8", "u16", "u32", "u64", "u128", "usize",
+                    "isize", "f32", "f64", "bool", "String",
+                ];
+                if definitely_not_i64.contains(&counter_ty.as_str())
+                    || counter_ty.starts_with("Option <")
+                {
+                    return syn::Error::new_spanned(
+                        &counter_field.ty,
+                        format!(
+                            "commentable counter column `{counter_column}` on model \
+                             `{name}` must be `i64` (BIGINT), found `{counter_ty}`; the \
+                             counter is maintained with `SET c = c + 1` and read back \
+                             as an `i64` — widen the column and the field"
+                        ),
+                    )
+                    .to_compile_error();
+                }
+            }
+            let cmt_has_deleted_at = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
+            let cmt_has_tenant_id = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "tenant_id"));
+            // A composite key cannot back a polymorphic parent: `commentable_id`
+            // is ONE column, so a two-`#[id]` model has no single value to store
+            // there. Reject rather than silently keying on the first component.
+            let cmt_id_fields: Vec<&syn::Ident> = all_fields
+                .iter()
+                .filter(|f| has_attr(f, "id"))
+                .filter_map(|f| f.ident.as_ref())
+                .collect();
+            if cmt_id_fields.len() > 1 {
+                let listed = cmt_id_fields
+                    .iter()
+                    .map(|i| format!("`{i}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return syn::Error::new(
+                    spec.span,
+                    format!(
+                        "`#[commentable]` requires a single `i64` primary key: model \
+                         `{name}` declares a composite key ({listed}), and \
+                         `commentable_id` is one column — it cannot address a \
+                         composite-keyed row"
+                    ),
+                )
+                .to_compile_error();
+            }
+            let cmt_pk_ident = all_fields
+                .iter()
+                .find(|f| has_attr(f, "id"))
+                .or_else(|| {
+                    all_fields.iter().find(|f| match &f.ty {
+                        syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                        _ => false,
+                    })
+                })
+                .and_then(|f| f.ident.as_ref());
+            emit_commentable_items(
+                name,
+                vis,
+                spec,
+                &table_name,
+                cmt_has_deleted_at,
+                cmt_has_tenant_id,
+                cmt_pk_ident,
             )
         }
     };
@@ -7749,6 +7866,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // ── Votable reactions (#[votable], #1362) ───────────────────────────
         #votable_items
+
+        // ── Polymorphic comments (#[commentable], #1367) ────────────────────
+        #commentable_items
     }
 }
 

@@ -291,6 +291,12 @@ pub mod sharding;
 #[cfg(feature = "db")]
 pub(crate) mod counter_cache;
 
+/// Threaded, polymorphic comments — autumn's fifth association kind (#1367).
+/// See [`commentable`] for the `#[commentable]` attribute, the repository
+/// helpers, and the registry-driven generic router.
+#[cfg(feature = "db")]
+pub mod commentable;
+
 #[cfg(feature = "db")]
 pub mod repository;
 #[cfg(feature = "db")]

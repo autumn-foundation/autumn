@@ -219,13 +219,14 @@ impl<T: Sized + 'static> AutumnCounterCaches for T {}
 /// Whether `s` is a plain SQL/Rust identifier: ASCII alphanumerics and
 /// underscores, not starting with a digit, non-empty.
 ///
-/// Module-private: the whole module is `pub(crate)`, so a `pub(crate)` here
-/// would be redundant.
+/// `pub(crate)` because [`crate::commentable`] (#1367) builds its polymorphic
+/// statements to the same identifier-safety contract and must apply the same
+/// backstop — one definition, so the two can never drift apart.
 ///
 /// Names reaching the `format!`ed SQL below are macro-emitted and already
 /// validated at macro time; this is the run-time backstop for that invariant.
 #[must_use]
-fn is_plain_identifier(s: &str) -> bool {
+pub(crate) fn is_plain_identifier(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with(|c: char| c.is_ascii_digit())
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -253,7 +254,7 @@ fn debug_assert_spec_idents<M: 'static>(spec: &CounterCacheSpec<M>) {
 /// interpolates table and column names. Safe to apply unconditionally: the names
 /// are validated plain identifiers, so none of them contains the `"` that would
 /// otherwise let a hand-built spec escape the quotes.
-fn quote_ident(ident: &str) -> String {
+pub(crate) fn quote_ident(ident: &str) -> String {
     format!("\"{ident}\"")
 }
 
