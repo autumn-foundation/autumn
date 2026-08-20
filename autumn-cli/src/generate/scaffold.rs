@@ -658,7 +658,10 @@ fn plan_scaffold_with_options_impl(
             &options_with_key.model,
         )?
     };
-    let metadata = parse_model_metadata(&fields, &options_with_key.model)?;
+    let mut metadata = parse_model_metadata(&fields, &options_with_key.model)?;
+    // Issue #1367: see `model::plan_model` — `by` is emitted only when the
+    // author model it names is really there.
+    metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
     // A `--default field=value` column is dropped from `form_fields` (see
     // below) and therefore from the generated `New{Pascal}` insert struct
     // entirely (it's set at the SQL `DEFAULT` level instead) — a slug can't
@@ -788,6 +791,53 @@ fn plan_scaffold_with_options_impl(
                     &n.parent_pascal,
                 );
             }
+        }
+    }
+
+    // ── Polymorphic comments (issue #1367) ─────────────────────────────────
+    // A `comments:commentable` token is already a column on this model (the
+    // counter-cache source) and an attribute on the generated `#[model]`; what
+    // is left is the shared `comments` table. It is emitted at most once per
+    // project — that is what makes adding comments to a SECOND model the DSL
+    // token and nothing else.
+    if fields.iter().any(|f| f.kind.is_commentable()) {
+        let emitted = super::commentable::push_commentable_migration(
+            &mut plan,
+            project_root,
+            timestamp,
+            for_revert,
+        );
+        if !for_revert {
+            if emitted {
+                plan.warn(format!(
+                    "Added the shared `{table}` table. Every `#[commentable]` model \
+                     attaches to it, so later models need no migration of their own. \
+                     Mount the framework's comment routes once, e.g. \
+                     `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))`, \
+                     and render a thread with \
+                     `autumn_web::widgets::comment_thread`.",
+                    table = super::commentable::COMMENTS_TABLE,
+                ));
+            } else {
+                plan.warn(format!(
+                    "Reusing the existing `{table}` table — the polymorphic comments table \
+                     is shared across every `#[commentable]` model, so no migration was \
+                     added for {pascal_name}.",
+                    table = super::commentable::COMMENTS_TABLE,
+                ));
+            }
+            plan.warn(match super::commentable::detect_author_model(project_root) {
+                Some(author) => format!(
+                    "`#[commentable(by = {author}, ...)]` on the generated model names this \
+                     app's author model. Add `author_name = <column>` to render display \
+                     names instead of `user #id`."
+                ),
+                None => "This project has no `User` model, so the generated \
+                     `#[commentable]` names no author model. Add `by = <AuthorModel>` \
+                     (and `author_name = <column>`) once you have one — until then \
+                     threads render authors as `user #id`."
+                    .to_owned(),
+            });
         }
     }
 
@@ -12488,9 +12538,13 @@ fn sql_sample_literal(kind: FieldKind) -> String {
         // `position` (issue #1358) is a plain `BIGINT NOT NULL` column like
         // any other `i64`-shaped field — "1" satisfies it fine for a smoke
         // test that isn't exercising the ordering invariant itself.
-        FieldKind::I32 | FieldKind::I64 | FieldKind::References | FieldKind::Position => {
-            "1".to_owned()
-        }
+        // `commentable` (issue #1367) is likewise a plain `BIGINT NOT NULL`
+        // counter column at the storage level.
+        FieldKind::I32
+        | FieldKind::I64
+        | FieldKind::References
+        | FieldKind::Position
+        | FieldKind::Commentable => "1".to_owned(),
         FieldKind::Bool => "TRUE".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "1.0".to_owned(),
         // Scale-derived rather than a fixed "1.0": a tightly-scaled column
@@ -12756,10 +12810,12 @@ fn unique_sample_literal(kind: FieldKind) -> String {
         | FieldKind::RichText
         | FieldKind::Enum
         | FieldKind::Slug => "'dup_value'".to_owned(),
-        // `position` can never be `:unique` (rejected in `parse_field`), so
-        // this arm is unreachable in practice — listed for exhaustiveness
-        // with the same literal as `I32`/`I64`.
-        FieldKind::I32 | FieldKind::I64 | FieldKind::Position => "424242".to_owned(),
+        // `position`/`commentable` can never be `:unique` (both rejected in
+        // `parse_field`), so these arms are unreachable in practice — listed
+        // for exhaustiveness with the same literal as `I32`/`I64`.
+        FieldKind::I32 | FieldKind::I64 | FieldKind::Position | FieldKind::Commentable => {
+            "424242".to_owned()
+        }
         // Must be a real seeded row's id, not an arbitrary literal — a
         // `references` target column is FK-constrained against the stub
         // table `render_reference_stub_tables_sql` seeds exactly one row
@@ -12800,7 +12856,9 @@ fn unique_sample_literal_variant(kind: FieldKind) -> String {
         // `position` can never be `:unique` (rejected in `parse_field`), so
         // this arm is unreachable in practice — listed for exhaustiveness
         // with the same literal as `I32`/`I64`.
-        FieldKind::I32 | FieldKind::I64 | FieldKind::Position => "424243".to_owned(),
+        FieldKind::I32 | FieldKind::I64 | FieldKind::Position | FieldKind::Commentable => {
+            "424243".to_owned()
+        }
         // The second stub row `render_reference_stub_tables_sql` seeds —
         // distinct from `unique_sample_literal`'s "1" for the same reason
         // that one must be a real seeded row's id, not an arbitrary literal.

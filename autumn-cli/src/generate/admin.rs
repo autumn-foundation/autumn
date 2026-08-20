@@ -517,7 +517,14 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         // maintains it on insert/delete/move) and excluded from the
         // generated `New*`/`Update*` structs entirely, so it is not
         // directly editable either way.
-        FieldKind::Bytea | FieldKind::Attachment | FieldKind::Position => "AdminFieldKind::Hidden",
+        // `commentable` (issue #1367) is hidden for the same reason as
+        // `position`: the framework maintains the comment counter inside each
+        // comment's own transaction, so an editable admin field would only
+        // ever let an operator desynchronise it from the comments table.
+        FieldKind::Bytea
+        | FieldKind::Attachment
+        | FieldKind::Position
+        | FieldKind::Commentable => "AdminFieldKind::Hidden",
         // `json`/`jsonb` (issue #1341) uses the admin panel's existing
         // `AdminFieldKind::Json`: a monospace textarea whose submission is
         // coerced back to a real JSON value by `coerce_form_value` before the

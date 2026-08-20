@@ -27,13 +27,16 @@ use crate::model::{infer_table_name, pascal_to_snake};
 
 /// A resolved `#[commentable(...)]` declaration.
 ///
-/// Every field except `by` has a convention-derived default, so the canonical
-/// declaration is the one-liner `#[commentable(by = User)]` → a shared
+/// Every field has a convention-derived default, so the canonical declaration
+/// is the one-liner `#[commentable(by = User)]` → a shared
 /// `comments(commentable_type, commentable_id, parent_id, author_id, body)`
 /// table maintaining `posts.comment_count`.
 pub struct CommentableSpec {
-    /// The author model named by `by = <Model>` (e.g. `User`).
-    pub author_model: syn::Ident,
+    /// The author model named by `by = <Model>` (e.g. `User`), when the
+    /// declaration names one. `None` is fine — the comments table stores a
+    /// bare `i64` author id — but then nothing resolves a display name, so
+    /// `author_name` requires either `by` or an explicit `author_table`.
+    pub author_model: Option<syn::Ident>,
     /// The discriminator value stored in `commentable_type`. Defaults to the
     /// model's own Rust type name.
     pub type_name: String,
@@ -238,15 +241,6 @@ pub fn parse_commentable_attr(
         }
     }
 
-    let Some(author_model) = author_model else {
-        return Err(syn::Error::new(
-            span,
-            "`#[commentable]` requires `by = <AuthorModel>` (e.g. \
-             `#[commentable(by = User)]`): every comment has an author, and the \
-             model named here supplies the `author_id` foreign key's table",
-        ));
-    };
-
     // Every name-shaped value reaches generated SQL, so validate each one at
     // the point it is read rather than trusting the loop above.
     let ident_value = |key: &str, default: &str| -> syn::Result<String> {
@@ -260,7 +254,22 @@ pub fn parse_commentable_attr(
         }
     };
 
-    let author_table_default = infer_table_name(&author_model);
+    // `by` is what supplies the author table a display-name lookup joins
+    // against. Without it (and without an explicit `author_table`) there is
+    // nothing to join, so `author_name` has no meaning — say so rather than
+    // silently rendering `user #id` forever.
+    let author_table_default = author_model.as_ref().map_or_else(String::new, infer_table_name);
+    if let Some(parsed) = pairs.get("author_name")
+        && author_table_default.is_empty()
+        && !pairs.contains_key("author_table")
+    {
+        return Err(syn::Error::new(
+            parsed.span,
+            "`author_name` in `#[commentable]` needs a table to read the name \
+             from: add `by = <AuthorModel>` (whose table is derived by \
+             convention) or `author_table = <table>`",
+        ));
+    }
     let counter_column = match pairs.get("counter_cache") {
         Some(parsed) if parsed.boolean == Some(false) => None,
         Some(parsed) if parsed.boolean == Some(true) => Some("comment_count".to_owned()),
@@ -476,11 +485,18 @@ pub fn emit_commentable_items(
     // would compile silently. Force its name resolution, exactly as
     // `#[votable]`'s `by` does — and deliberately name-resolution only, since
     // `by` accepts hand-written author structs that implement no framework
-    // trait.
-    let author_model = &spec.author_model;
-    let author_guard = quote! {
-        const _: ::core::marker::PhantomData<#author_model> = ::core::marker::PhantomData;
-    };
+    // trait. Omitting `by` is legitimate (a project whose author model lives
+    // outside this crate, or which renders no names), and then there is
+    // nothing to resolve.
+    let author_guard = spec.author_model.as_ref().map(|author_model| {
+        quote! {
+            const _: ::core::marker::PhantomData<#author_model> = ::core::marker::PhantomData;
+        }
+    });
+    let author_model_name = spec
+        .author_model
+        .as_ref()
+        .map_or_else(|| "<unset>".to_owned(), ToString::to_string);
 
     let spec_doc = format!(
         "The polymorphic comment binding for `{model_ident}`: the shared \
@@ -504,7 +520,7 @@ pub fn emit_commentable_items(
     );
     let trait_doc = format!(
         "Threaded, polymorphic comment helpers for `{model_ident}`'s \
-         `#[commentable(by = {author_model})]` declaration: the shared \
+         `#[commentable(by = {author_model_name})]` declaration: the shared \
          `{comments_table}` table, discriminated as `{type_name:?}`."
     );
     let counter_note = spec.counter_column.as_ref().map_or_else(

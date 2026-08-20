@@ -60,9 +60,20 @@ pub struct ModelMetadata {
     /// field is searchable.
     search_language: Option<String>,
     searchable: Vec<(String, char)>,
+    /// The author model `#[commentable(by = ...)]` should name (issue #1367),
+    /// detected from the project by
+    /// [`super::commentable::detect_author_model`]. `None` emits a bare
+    /// `#[commentable]`, which compiles — naming a model that does not exist
+    /// would not.
+    commentable_author: Option<String>,
 }
 
 impl ModelMetadata {
+    /// Record the author model `#[commentable(by = ...)]` will name.
+    pub fn set_commentable_author(&mut self, author: Option<&str>) {
+        self.commentable_author = author.map(str::to_owned);
+    }
+
     #[must_use]
     pub fn has_validator_rules(&self) -> bool {
         !self.validations.is_empty()
@@ -195,7 +206,11 @@ fn plan_model_with_options_impl(
     }
     let pascal_name = pascal(name);
     validate_enum_field_collisions(&pascal_name, &fields)?;
-    let metadata = parse_model_metadata(&fields, options)?;
+    let mut metadata = parse_model_metadata(&fields, options)?;
+    // Issue #1367: `#[commentable(by = ...)]` may only name a model that
+    // actually exists in this project — naming a missing one would be a
+    // compile error in a file the author did not write.
+    metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
 
     // Determine the target app's database backend so the emitted DDL / diesel
     // schema is backend-aware (SQLite foundation, issue #1614). Full-text search
@@ -1782,8 +1797,14 @@ pub fn parse_model_metadata(
     // splice), the same two-step "DB default, then app-managed overwrite"
     // shape `lock_version` uses above. Recording it here also drops the
     // column from the scaffold's generated HTML form, same as `lock_version`.
+    //
+    // Issue #1367: a `commentable` counter column is the same shape — DB
+    // managed, `#[default]` on the model, `DEFAULT 0` in SQL — except that the
+    // overwrite comes from the framework's comment write path rather than an
+    // insert hook. `NOT NULL DEFAULT 0` is load-bearing rather than tidy: the
+    // maintenance is `SET c = c + 1`, and `NULL + 1` is `NULL`.
     for f in fields {
-        if f.kind.is_position() {
+        if f.kind.is_server_managed() {
             metadata
                 .defaults
                 .entry(f.name.clone())
@@ -2383,7 +2404,11 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
         | FieldKind::Slug
         // A position's value is always assigned by the repository on insert
         // (issue #1358), never a static default.
-        | FieldKind::Position => Err(format!(
+        | FieldKind::Position
+        // A commentable counter always starts at 0 and is thereafter moved by
+        // the framework (issue #1367); the migration's own `DEFAULT 0` is the
+        // only default it may have.
+        | FieldKind::Commentable => Err(format!(
             "defaults for {} fields are not supported by `autumn generate` yet",
             field.rust_type()
         )),
@@ -2588,7 +2613,39 @@ fn render_model_file(
             out.push('\n');
         }
     }
+    // Struct-level `#[commentable(...)]` (issue #1367) — emitted by the
+    // `comments:commentable` DSL token. It is what brings the repository's
+    // `add_comment`/`comment_thread`/`delete_comment` helpers into existence
+    // and registers this model with the framework's generic comment router.
+    //
+    // `by = User` is the convention `autumn generate auth` produces; a project
+    // whose author model is named differently changes that one word. No
+    // `author_name` is emitted on purpose: the generated `User` carries an
+    // `email`, and defaulting a *public* display name to it would leak
+    // addresses into every rendered thread.
+    if fields.iter().any(|f| f.kind.is_commentable()) {
+        out.push_str(
+            "// Threaded, polymorphic comments (#1367): one shared `comments` table,\n\
+             // keyed on `(commentable_type, commentable_id)`, attaches to any number of\n\
+             // models. Point `by` at this app's author model, and add\n\
+             // `author_name = <column>` to render display names instead of `user #id`.\n",
+        );
+    }
     out.push_str("#[autumn_web::model]\n");
+    // `#[commentable]` is consumed by `#[model]`, so it must sit BELOW it —
+    // attribute macros are applied top-down, and above it the compiler would
+    // report `cannot find attribute commentable in this scope`.
+    if let Some(counter) = fields.iter().find(|f| f.kind.is_commentable()) {
+        let by = metadata
+            .commentable_author
+            .as_deref()
+            .map_or_else(String::new, |author| format!("by = {author}, "));
+        let _ = writeln!(
+            out,
+            "#[commentable({by}counter_cache = {})]",
+            counter.name
+        );
+    }
     // Struct-level `#[searchable(language = "…")]` (issue #1319) opts the model
     // into full-text search; the per-field `#[searchable(weight = "…")]` below
     // declare which columns feed the `search_vector` and at what rank weight.
