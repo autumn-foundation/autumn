@@ -618,8 +618,9 @@ pub fn emit_commentable_items(
          - `404` when this record does not exist (or is soft-deleted).\n\
          - Any database error."
     );
-    let recompute_doc = concat!(
-        "Rebuild this record's comment counter from the comments table, and \
+    // A plain literal, not `format!`/`concat!`: nothing is interpolated, and
+    // clippy rightly objects to either wrapper.
+    let recompute_doc = "Rebuild this record's comment counter from the comments table, and \
          return the value written.\n\
          \n\
          The repair half of the counter: counters drift when rows arrive by \
@@ -636,8 +637,7 @@ pub fn emit_commentable_items(
          # Errors\n\
          \n\
          - `404` when this record does not exist (or is soft-deleted).\n\
-         - Any database error."
-    );
+         - Any database error.";
     let delete_doc = format!(
         "Delete `comment_id` **and every reply beneath it**, returning how many \
          comments were removed.\n\
