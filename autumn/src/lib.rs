@@ -122,6 +122,22 @@ pub mod current;
 pub mod db;
 pub mod dotenv;
 pub mod download;
+/// The edge capsule's read lane (issue #1790), re-exported from `autumn-edge`.
+///
+/// [`EdgeRoute`](autumn_edge::EdgeRoute), [`EdgeCache`](autumn_edge::EdgeCache),
+/// [`EdgeKv`](autumn_edge::EdgeKv) and the capsule runtime live in their own
+/// crate because that crate — and only that crate — also compiles for
+/// `wasm32-wasip1`. Re-exporting it here means an origin-side app that already
+/// depends on `autumn-web` can name the seam without a second manifest entry.
+///
+/// Origin-side glue lives in [`edge_support`]; wire it up with
+/// [`AppBuilder::with_edge_kv`](app::AppBuilder::with_edge_kv).
+#[cfg(feature = "edge")]
+pub use autumn_edge as edge;
+#[cfg(feature = "edge")]
+pub mod edge_support;
+#[cfg(feature = "edge")]
+pub use edge_support::CacheEdgeKv;
 pub mod encryption;
 pub mod entropy;
 pub mod error;
@@ -1320,6 +1336,60 @@ pub use autumn_macros::static_routes;
 /// }
 /// ```
 pub use autumn_macros::static_get;
+
+/// Mark a read-path `GET` route as eligible for the edge capsule (#1790).
+///
+/// A compile-time marker, like [`public`]: it injects no runtime guard and
+/// leaves the handler signature alone. The route macro reads it back and emits
+/// an extra `__autumn_edge_route_{name}()` companion returning an
+/// `autumn_edge::EdgeRoute`, while gating the native companions behind
+/// `#[cfg(not(target_arch = "wasm32"))]` — so one handler source compiles for
+/// both the origin binary and the `wasm32-wasip1` capsule.
+///
+/// Marking a handler makes it *eligible*; [`edge_routes!`](macro@edge_routes)
+/// is what puts it in the capsule. Use `#[edge(needs(kv))]` when the handler
+/// reads the mediated key/value seam, and install that seam at the origin with
+/// `AppBuilder::with_edge_kv` (the `edge` feature).
+///
+/// The edge lane is read-path only, so a non-`GET` method, a `#[secured]` /
+/// `#[authorize]` / `#[step_up]` / `#[throttle]` guard, or `#[static_get]` are
+/// all compile errors. This macro is available with or without the `edge`
+/// feature — the feature is what wires the origin-side seam, not what allows a
+/// route to be marked.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_edge::prelude::{EdgeCache, Path};
+/// use autumn_web::{edge, get};
+///
+/// #[get("/greet/{name}")]
+/// #[edge]
+/// async fn greet(Path(name): Path<String>) -> String {
+///     format!("Hello, {name}!")
+/// }
+/// ```
+pub use autumn_macros::edge;
+
+/// Collect `#[edge]` handlers into a `Vec<EdgeRoute>` (#1790).
+///
+/// The edge-lane counterpart of [`routes!`](macro@routes): each entry resolves
+/// to the handler's `__autumn_edge_route_{name}()` companion, so a handler that
+/// was never marked [`#[edge]`](macro@edge) fails to resolve rather than
+/// silently vanishing from the capsule.
+///
+/// ```rust,ignore
+/// use autumn_web::{edge, edge_routes, get};
+///
+/// #[get("/greet")]
+/// #[edge]
+/// async fn greet() -> &'static str { "hi" }
+///
+/// pub fn capsule_routes() -> Vec<autumn_edge::EdgeRoute> {
+///     edge_routes![greet]
+/// }
+/// ```
+pub use autumn_macros::edge_routes;
 
 /// Turn a plain state enum into a statically-verified lifecycle.
 ///

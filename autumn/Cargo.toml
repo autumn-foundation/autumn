@@ -206,8 +206,21 @@ tls = ["dep:tokio-rustls", "dep:x509-parser", "dep:rustls", "dep:rustls-pki-type
 # placeholder), both pinned to `ring` so no second crypto backend enters the
 # graph.
 acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
+# Origin-side half of the edge capsule (issue #1790). Adds the `autumn_web::edge`
+# re-export of the `autumn-edge` crate, the `CacheEdgeKv` adapter that projects
+# the app's `Cache` onto the `EdgeKv` seam, and `AppBuilder::with_edge_kv`, which
+# installs the `EdgeCache` extension app-wide so an `#[edge]` handler serves
+# identically from the origin binary and from the wasm capsule.
+#
+# Additive and host-only: autumn-web is never compiled for wasm32 (the capsule
+# links `autumn-edge` alone), so this feature adds no target-conditional
+# dependency and changes nothing about the default build. The `#[edge]` /
+# `edge_routes!` macros are re-exported unconditionally — a route can be *marked*
+# without this feature; the feature is what wires the seam at the origin.
+edge = ["dep:autumn-edge"]
 
 [dependencies]
+autumn-edge = { version = "0.6.0", path = "../autumn-edge", optional = true }
 autumn-macros = { version = "0.6.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
@@ -403,7 +416,7 @@ features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
-  "reporting", "csv", "embed-assets", "offline-sync", "pdf",
+  "reporting", "csv", "embed-assets", "offline-sync", "pdf", "edge",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
