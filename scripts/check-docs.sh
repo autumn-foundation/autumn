@@ -48,6 +48,12 @@ cargo doc -p autumn-web --no-deps \
   --features "$AUTUMN_WEB_DOCS_FEATURES" \
   --no-default-features 2>&1
 
+# autumn-edge's docs.rs metadata declares `all-features = true` (the `host`
+# feature carries the reference host's API surface), so mirror that here.
+echo ""
+echo "==> autumn-edge (all features)"
+cargo doc -p autumn-edge --no-deps --all-features 2>&1
+
 # All other publishable crates: use their default features (no
 # [package.metadata.docs.rs] section means docs.rs uses defaults).
 for crate in autumn-macros autumn-cli autumn-admin-plugin autumn-storage-s3 autumn-cache-redis autumn-search; do

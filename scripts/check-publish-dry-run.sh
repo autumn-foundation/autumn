@@ -34,6 +34,7 @@ die() {
 CRATES=(
   autumn-macros
   autumn-schema-core
+  autumn-edge
   autumn-web
   autumn-cli
   autumn-admin-plugin
