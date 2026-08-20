@@ -80,6 +80,24 @@ pub enum DeployError {
     /// Remote execution of the first deploy failed.
     #[error("deploy execution failed: {0}")]
     Exec(String),
+
+    /// A multi-host rollout stopped mid-fleet (issue #1621, AC-3).
+    #[error(
+        "fleet rollout halted at {failed_host} during `{failed_step}` — the remaining hosts were \
+         not touched"
+    )]
+    FleetHalted {
+        /// Host the rollout stopped on.
+        failed_host: String,
+        /// Label of the step that failed on it.
+        failed_step: &'static str,
+        /// Hosts whose candidate was rolled back (their previous release still serves).
+        rolled_back: Vec<String>,
+        /// Hosts whose first-deploy candidate was torn down (nothing serves there).
+        torn_down: Vec<String>,
+        /// Hosts left running the NEW release, in rollout order.
+        still_on_new: Vec<String>,
+    },
 }
 
 /// Which `autumn deploy` subcommand to run.
@@ -360,16 +378,11 @@ fn deploy_host_list(cfg: &DeployConfig) -> Result<Vec<String>, String> {
 ///
 /// The list is never empty and is always in declaration (rollout) order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// Reachable from the unit tests today; the rollout driver that consumes it lands
-// in a later slice of #1621, so the non-test binary build is allowed not to use
-// it yet (mirroring `exec::run_ops`'s test-only reachability).
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct ResolvedFleet {
     /// The resolved targets, in rollout order. Guaranteed non-empty.
     pub hosts: Vec<ResolvedDeployConfig>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ResolvedFleet {
     /// Resolve a [`DeployConfig`] into an ordered fleet against the project name.
     ///
@@ -383,6 +396,13 @@ impl ResolvedFleet {
     /// when neither `host` nor `hosts` configures a target, or when
     /// [`ResolvedDeployConfig::resolve`] rejects the shared shape (e.g.
     /// `[deploy.tls] enabled = true` with no `host`).
+    // `deploy up` deliberately does NOT come through here: it resolves the shared
+    // shape itself and builds the fleet with [`Self::from_targets`], so a config
+    // with no target at all still reaches — and fails at — the PREFLIGHT report
+    // (`ssh_reachability`), byte-identically to pre-#1621, instead of being
+    // rejected earlier here with a different message and no report. This is the
+    // seam the read-only fleet surfaces (`status`, `maintenance`) use.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn resolve(cfg: &DeployConfig, project_name: &str) -> Result<Self, String> {
         let addresses = deploy_host_list(cfg)?;
         if addresses.is_empty() {
@@ -396,15 +416,36 @@ impl ResolvedFleet {
 
         // Resolve the shared shape ONCE, then vary only `host`.
         let shared = ResolvedDeployConfig::resolve(cfg, project_name)?;
-        let hosts = addresses
-            .into_iter()
-            .map(|host| ResolvedDeployConfig {
-                host: Some(host),
-                ..shared.clone()
-            })
-            .collect();
+        Ok(Self::from_targets(&shared, &addresses))
+    }
 
-        Ok(Self { hosts })
+    /// Build a fleet from an ALREADY-resolved shared config plus the ordered
+    /// address list from [`deploy_host_list`].
+    ///
+    /// The elements differ only in `host`, so a one-entry list is byte-for-byte
+    /// today's single-server deploy **by construction**. An empty or single-entry
+    /// list keeps `shared` verbatim — including a `None` host — so a config with no
+    /// target still flows into the normal preflight report rather than being
+    /// special-cased here.
+    #[must_use]
+    pub fn from_targets(shared: &ResolvedDeployConfig, addresses: &[String]) -> Self {
+        if addresses.len() <= 1 {
+            return Self {
+                hosts: vec![ResolvedDeployConfig {
+                    host: addresses.first().cloned().or_else(|| shared.host.clone()),
+                    ..shared.clone()
+                }],
+            };
+        }
+        Self {
+            hosts: addresses
+                .iter()
+                .map(|host| ResolvedDeployConfig {
+                    host: Some(host.clone()),
+                    ..shared.clone()
+                })
+                .collect(),
+        }
     }
 
     /// Whether this fleet is a single server — the shape every pre-#1621 config
@@ -1054,6 +1095,7 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
             run_up(
                 &load_runtime_config(&resolved)?,
                 &resolved,
+                &host_list,
                 &media_cfg,
                 &ffmpeg_bin,
             )
@@ -1407,7 +1449,29 @@ fn resolve_writable_db_url(db: &autumn_web::config::DatabaseConfig) -> Option<&s
 
 /// Collect all preflight graders for the resolved config against the loaded
 /// runtime configuration.
+///
+/// Exactly ONE of the four graders is host-specific (`ssh_reachability`); the
+/// other three grade the project, not the target. The split is made explicit by
+/// [`collect_project_preflight`] so a fleet can run the host grader per host and
+/// the project graders once ([`collect_fleet_preflight`]) without re-deriving —
+/// and so a single-host run keeps this exact order and text.
 fn collect_preflight(
+    config: &AutumnConfig,
+    resolved: &ResolvedDeployConfig,
+) -> Vec<PreflightCheck> {
+    let mut checks = vec![grade_ssh_reachability(
+        resolved.host.as_deref(),
+        resolved.ssh_port,
+        SSH_PROBE_TIMEOUT,
+    )];
+    checks.extend(collect_project_preflight(config, resolved));
+    checks
+}
+
+/// The preflight graders that are fleet-wide by nature: they grade the project's
+/// signing secret, database URL and pending migrations, none of which vary per
+/// host. A fleet runs these ONCE (issue #1621, AC-7).
+fn collect_project_preflight(
     config: &AutumnConfig,
     resolved: &ResolvedDeployConfig,
 ) -> Vec<PreflightCheck> {
@@ -1422,11 +1486,6 @@ fn collect_preflight(
         || config.database.replica_url.is_some()
         || config.database.has_shards();
     vec![
-        grade_ssh_reachability(
-            resolved.host.as_deref(),
-            resolved.ssh_port,
-            SSH_PROBE_TIMEOUT,
-        ),
         // Grade the signing secret against the SAME profile that will be written
         // to the host env file (`AUTUMN_ENV=<resolved.profile>`, default `prod`),
         // not the local CLI runtime profile (`config.profile`, dev/None on a dev
@@ -1452,6 +1511,35 @@ fn collect_preflight(
         ),
         grade_migrate_check(Path::new(MIGRATIONS_DIR)),
     ]
+}
+
+/// Preflight for a whole fleet: `ssh_reachability` **per host**, then the three
+/// project-wide graders **once** (issue #1621, AC-7).
+///
+/// A single-host fleet returns exactly [`collect_preflight`]'s vector, so its
+/// report is byte-identical to pre-#1621 (AC-1). For a real fleet the per-host
+/// rows are distinguished by the grader's own detail text, which already names the
+/// host (`SSH port reachable at web-2:22`) — the structured `scope` field that
+/// `doctor --json` will also carry lands with the CLI-surface slice.
+///
+/// The probes run SERIALLY here: they are a bounded TCP connect each, the report
+/// must come out in declaration order, and threading them would put a `Sync` bound
+/// on machinery the `RefCell`-based recording fake cannot satisfy. Parallelising
+/// the pure TCP graders is a later, isolated change.
+fn collect_fleet_preflight(config: &AutumnConfig, fleet: &ResolvedFleet) -> Vec<PreflightCheck> {
+    let Some(shared) = fleet.hosts.first() else {
+        return Vec::new();
+    };
+    if fleet.is_single() {
+        return collect_preflight(config, shared);
+    }
+    let mut checks: Vec<PreflightCheck> = fleet
+        .hosts
+        .iter()
+        .map(|cfg| grade_ssh_reachability(cfg.host.as_deref(), cfg.ssh_port, SSH_PROBE_TIMEOUT))
+        .collect();
+    checks.extend(collect_project_preflight(config, shared));
+    checks
 }
 
 /// Whether the active profile is production, matching the exact rule the app boot
@@ -1978,35 +2066,55 @@ fn refuse_unprovable_proxy_options(marker: &exec::ProxyOptionsMarker) -> Result<
     }
 }
 
-// Linear deploy orchestrator; the added MediaMTX host-prep step (#1974 Slice 7)
-// tips it one line over the threshold, and it reads clearest as one sequence.
-#[allow(clippy::too_many_lines)]
+/// Perform a real deploy of the whole configured fleet (issue #1607, Slices 1–3;
+/// issue #1621).
+///
+/// Runs the same preflight as `check` — for EVERY configured host — and aborts
+/// before touching any server if anything fails (AC-6/AC-7). It then mints ONE
+/// release id for the whole run, probes every host read-only, plans the rollout,
+/// and replaces the hosts ONE AT A TIME in `[deploy] hosts` order.
+///
+/// A single-host config is a one-host fleet: same ops, same output, same errors as
+/// before #1621. The prologue here is the part that is fleet-wide by nature
+/// (preflight, release id, release binary, env file, manifests, port validation);
+/// everything host-shaped lives in [`run_up_with`], which takes those results as
+/// data so the rollout loop is unit-testable against per-host fakes with no host,
+/// no filesystem and no clock.
 fn run_up(
     config: &AutumnConfig,
     resolved: &ResolvedDeployConfig,
+    hosts: &[String],
     media_cfg: &media::MediaMtxHostConfig,
     ffmpeg_bin: &str,
 ) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy up\n");
 
-    // Fail fast: run the full preflight and abort BEFORE any remote call.
-    let checks = collect_preflight(config, resolved);
+    // The rollout targets, in declaration order. A single-host config resolves to
+    // a one-host fleet whose only element IS today's `resolved`, so everything
+    // below is the pre-#1621 sequence at N = 1.
+    let fleet = ResolvedFleet::from_targets(resolved, hosts);
+
+    // Fail fast: run the full preflight and abort BEFORE any remote call. Every
+    // host is graded here, so an unreachable host in position 3 is reported before
+    // host 1 is touched.
+    let checks = collect_fleet_preflight(config, &fleet);
     let failed = report_preflight(&checks);
     if failed > 0 {
         return Err(DeployError::PreflightFailed(failed));
     }
 
-    // Host presence is guaranteed by the passing ssh_reachability grader above.
-    let target = exec::SshTarget::from_resolved(resolved)
-        .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
     let binary = resolve_release_binary(resolved)?;
     let env_file = build_env_file(config, resolved);
     // Locate the project config manifest(s) to upload so the deployed app loads
     // the intended config rather than silent built-in defaults (#1952), and print
     // a loud line either confirming the upload or warning when there is no
-    // autumn.toml to ship.
+    // autumn.toml to ship. The same bytes go to every host.
     let manifests = locate_manifest_uploads(resolved);
     eprintln!("{}", manifest_preflight_notice(&manifests));
+    // Exactly ONE release id per fleet run (#1621): every host's `current` symlink
+    // then resolves to the same release, so drift reporting is meaningful and a
+    // rollback has a single target. Minting per host would give un-comparable
+    // version identities and permanent reported drift.
     let release_id = default_release_id();
     let public_port = config.server.port;
     // kamal-proxy `run` binds 443 for its HTTPS listener BY DEFAULT (regardless of
@@ -2018,55 +2126,171 @@ fn run_up(
     validate_public_port(public_port).map_err(DeployError::Config)?;
     let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs)
         .with_tls_host(resolved.tls_host.clone());
-    let executor = exec::SshExecutor::new(target);
-    // MediaMTX host preflight (#1974 Slice 7) — non-mutating doctor checks run
-    // BEFORE the app deploy so a bad media host fails fast without anything being
-    // written. The MUTATING provisioning (write config/unit + restart) is deferred
-    // until after the app cutover succeeds (below) so a rolled-back app deploy
-    // never touches the host MediaMTX unit. No-op unless enabled (see fn).
-    check_media_host_preflight(media_cfg, ffmpeg_bin, &executor)?;
+
+    run_up_with(
+        &FleetUpInput {
+            fleet: &fleet,
+            proxy: &proxy,
+            checks: &checks,
+            env_file: &env_file,
+            binary: &binary,
+            manifests: &manifests,
+            release_id: &release_id,
+            public_port,
+            media_cfg,
+            ffmpeg_bin,
+            writable_db_configured: resolve_writable_db_url(&config.database).is_some(),
+        },
+        // Host presence is guaranteed by the passing ssh_reachability grader above,
+        // so this `None` arm is unreachable in practice; it keeps the pre-#1621
+        // error verbatim rather than panicking on an invariant proved elsewhere.
+        |cfg| {
+            exec::SshTarget::from_resolved(cfg)
+                .map(exec::SshExecutor::new)
+                .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
+        },
+    )
+}
+
+/// Everything the fleet rollout loop needs, already resolved by [`run_up`].
+///
+/// Every field is either fleet-wide by construction (`release_id`, `env_file`,
+/// `binary`, `manifests`, `public_port` — the same bytes reach every host) or the
+/// fleet itself. Passing them as data rather than re-deriving them inside the loop
+/// is what makes the loop testable: nothing here reads the clock, the filesystem,
+/// or a socket.
+struct FleetUpInput<'a, P: ProxyController> {
+    /// The rollout targets, in order. Never empty.
+    fleet: &'a ResolvedFleet,
+    /// The proxy controller. kamal-proxy is PER HOST (it binds that host's public
+    /// port); it is not a fleet load balancer, so one controller value describes
+    /// every host's local proxy.
+    proxy: &'a P,
+    /// The preflight results the per-host executor gates on.
+    checks: &'a [PreflightCheck],
+    /// The secret env-file body, byte-identical on every host.
+    env_file: &'a exec::Secret,
+    /// Local path to the release binary uploaded to every host.
+    binary: &'a Path,
+    /// Config manifests uploaded into every host's release dir.
+    manifests: &'a [exec::ManifestUpload],
+    /// The ONE release id for this run.
+    release_id: &'a str,
+    /// The app's public port, fronted by each host's proxy.
+    public_port: u16,
+    /// `MediaMTX` host provisioning config.
+    media_cfg: &'a media::MediaMtxHostConfig,
+    /// Resolved `FFmpeg` binary path for the media preflight.
+    ffmpeg_bin: &'a str,
+    /// Whether a writable database URL is configured — the fleet warns loudly when
+    /// it is and the rollout schedules no migration at all.
+    writable_db_configured: bool,
+}
+
+/// One host's read-only probe result: everything the rollout needs to know about
+/// that host, decided BEFORE any host is touched.
+struct HostProbeState {
+    /// First deploy vs redeploy.
+    mode: fleet::HostMode,
+    /// That host's own blue/green slot layout.
+    slots: exec::SlotPlan,
+    /// Whether that host's live-slot marker drifted and must be repaired as the
+    /// first op of its sequence.
+    repair: bool,
+    /// Proxy options the durability re-register must preserve on that host (#2074).
+    reregister_options: exec::ProxyServiceOptions,
+    /// Operator-facing description of the path this host takes.
+    banner: String,
+}
+
+/// Probe ONE host read-only and apply every fail-closed refusal to it.
+///
+/// This runs for EVERY host before the first host is mutated (issue #1621, §4.3),
+/// which is what makes a fleet rollout all-or-nothing at the refusal level: a
+/// drifted host in position 3 refuses the rollout while hosts 1 and 2 are still
+/// serving their old releases, instead of being discovered after two cutovers.
+///
+/// The refusals themselves are the UNCHANGED single-host guards; the only fleet
+/// addition is that their messages name the host when there is more than one (a
+/// single-host deploy keeps the exact pre-#1621 text).
+fn probe_host_for_up<E, P>(
+    cfg: &ResolvedDeployConfig,
+    input: &FleetUpInput<'_, P>,
+    executor: &E,
+) -> Result<HostProbeState, DeployError>
+where
+    E: exec::DeployExecutor,
+    P: ProxyController,
+{
+    let host = cfg.host.as_deref().unwrap_or_default();
+    let single = input.fleet.is_single();
+    // Host attribution is carried in the MESSAGE, never in an op label: labels are
+    // `&'static str` and are load-bearing for the auto-rollback boundary lookup and
+    // for every exact-vector test (#1621).
+    let scoped = |message: String| {
+        if single {
+            message
+        } else {
+            format!("host {host}: {message}")
+        }
+    };
 
     // Fail closed on kamal-proxy CLI-surface drift BEFORE any cutover (#2053): the
     // controller consumes an UNPINNED kamal-proxy from host bootstrap, so a
     // renamed/removed subcommand or flag on `kamal-proxy deploy` would otherwise
     // break a real cutover with no warning. A compatible binary passes silently;
     // an incompatible one aborts here (read-only `--help` probe, nothing mutated).
-    exec::probe_proxy_compat(&proxy, &executor).map_err(|e| DeployError::Exec(e.to_string()))?;
-
-    let release_dir = format!("{}/{release_id}", resolved.releases_dir());
+    exec::probe_proxy_compat(input.proxy, executor)
+        .map_err(|e| DeployError::Exec(scoped(e.to_string())))?;
 
     // Probe the target to choose first-deploy vs zero-downtime redeploy. The same
     // round-trip also captures `kamal-proxy list` so a drifted live-slot marker
     // can be reconciled against the live proxy before slot-selection (#1938).
-    let probe = exec::probe_deploy_state(resolved, &executor)
-        .map_err(|e| DeployError::Exec(e.to_string()))?;
+    let probe = exec::probe_deploy_state(cfg, executor)
+        .map_err(|e| DeployError::Exec(scoped(e.to_string())))?;
 
-    let (ops, teardown, banner, is_first) = match probe.mode {
-        exec::DeployMode::First => {
-            let plan = exec::SlotPlan::first(public_port);
-            let unit = render_app_unit(
-                resolved,
-                &release_dir,
-                plan.candidate_port,
-                plan.candidate_slot,
-            );
-            let ops = exec::first_deploy_ops(
-                resolved,
-                &proxy,
-                &unit,
-                env_file,
-                &binary,
-                &manifests,
-                &release_id,
-                &plan,
-            );
-            // First-deploy teardown must also unlink `current` and clear the
-            // live-slot marker that first_deploy_ops creates — otherwise a failed
-            // first deploy leaves them behind and the next `deploy up` wrongly
-            // takes the redeploy path with nothing serving.
-            let teardown = exec::first_deploy_teardown_ops(resolved, &release_id, &plan);
-            (ops, teardown, "first deploy".to_owned(), true)
+    // Refuse a release-dir collision (#1621, §4.9). The release id has one-second
+    // granularity, so a fast retry re-uses it; re-uploading into the dir
+    // `shared/previous-release` still points at would make the "previous release"
+    // hold the NEW binary and roll FORWARD on the next rollback. Nothing detects
+    // that afterwards, so it is refused before anything is written.
+    match exec::probe_release_dir(cfg, input.release_id, executor)
+        .map_err(|e| DeployError::Exec(scoped(e.to_string())))?
+    {
+        exec::ReleaseDirState::Absent => {}
+        exec::ReleaseDirState::Present => {
+            return Err(DeployError::Config(scoped(format!(
+                "release directory {}/{} already exists — a previous run of this release \
+                 id already wrote into it, and re-uploading would put the NEW binary in \
+                 the directory `shared/previous-release` points at (so a rollback would \
+                 roll FORWARD). Wait a second and re-run `autumn deploy up`, or remove \
+                 that directory if you are certain it is stale. Tracked in #1621.",
+                cfg.releases_dir(),
+                input.release_id,
+            ))));
         }
+        exec::ReleaseDirState::Unreadable => {
+            return Err(DeployError::Config(scoped(format!(
+                "cannot verify whether release directory {}/{} already exists (the probe \
+                 returned neither sentinel), so a release-id collision cannot be ruled \
+                 out and the deploy is refused rather than risk overwriting the release \
+                 `shared/previous-release` points at. Tracked in #1621.",
+                cfg.releases_dir(),
+                input.release_id,
+            ))));
+        }
+    }
+
+    match probe.mode {
+        exec::DeployMode::First => Ok(HostProbeState {
+            mode: fleet::HostMode::from_deploy_mode(&probe.mode),
+            slots: exec::SlotPlan::first(input.public_port),
+            repair: false,
+            // A first deploy registers the NEW config's options; there is no old
+            // release whose options could need preserving.
+            reregister_options: input.proxy.proxy_service_options(),
+            banner: "first deploy".to_owned(),
+        }),
         exec::DeployMode::Redeploy { live_slot } => {
             // Pre-flight refuse (#2073): the reboot-durability restart-refresh (#2070)
             // re-execs `kamal-proxy run` on the public port and re-registers the
@@ -2079,14 +2303,14 @@ fn run_up(
             // (captured in the deploy-start probe) — so the live release keeps serving.
             // A live-safe port change is future work (Option C, #2073). No installed
             // unit → first-deploy shape (allowed); an unreadable unit → fail closed.
-            refuse_concurrent_public_port_change(&probe.installed_proxy_port, public_port)
-                .map_err(DeployError::Config)?;
+            refuse_concurrent_public_port_change(&probe.installed_proxy_port, input.public_port)
+                .map_err(|message| DeployError::Config(scoped(message)))?;
             // Pre-flight refuse (#2074): if the `shared/proxy-options` marker is present
             // but unreadable, we cannot prove the OLD release's TLS/host, so a concurrent
             // `deploy.tls.host` change can't be safely preserved across the durability
             // restart — fail closed BEFORE any op runs, so the live release keeps serving.
             refuse_unprovable_proxy_options(&probe.last_proxy_options)
-                .map_err(DeployError::Config)?;
+                .map_err(|message| DeployError::Config(scoped(message)))?;
             // Choose the options the durability-refresh re-register carries for the
             // still-live OLD release (#2074). PRESERVE the marker's recorded options
             // when known; on an ABSENT marker fall back to the NEW config (proceed as
@@ -2097,7 +2321,7 @@ fn run_up(
             // Unreadable case is already refused above, so it never reaches here.
             let reregister_options = match &probe.last_proxy_options {
                 exec::ProxyOptionsMarker::Options(old) => old.clone(),
-                _ => proxy.proxy_service_options(),
+                _ => input.proxy.proxy_service_options(),
             };
             // Reconcile the (possibly stale) live-slot marker against the live
             // proxy before choosing the candidate slot. On an UNAMBIGUOUS
@@ -2108,80 +2332,283 @@ fn run_up(
             let reconcile = exec::reconcile_live_slot(
                 live_slot,
                 &probe.proxy_list,
-                &resolved.service_name,
-                public_port,
+                &cfg.service_name,
+                input.public_port,
             );
             if let Some(warn) = &reconcile.warn {
                 // Loud + observable: drift is surfaced, not silently papered over.
                 // (autumn-cli installs no tracing subscriber, so the deploy module
                 // reports operator-facing state via eprintln! throughout.)
-                eprintln!("\u{26A0}\u{FE0F}  {warn}");
+                eprintln!("\u{26A0}\u{FE0F}  {}", scoped(warn.clone()));
             }
-            let plan = exec::SlotPlan::redeploy(public_port, reconcile.live_slot);
-            let unit = render_app_unit(
-                resolved,
-                &release_dir,
-                plan.candidate_port,
-                plan.candidate_slot,
+            let slots = exec::SlotPlan::redeploy(input.public_port, reconcile.live_slot);
+            let banner = format!(
+                "zero-downtime redeploy ({} \u{2192} {})",
+                slots.live_slot, slots.candidate_slot
             );
-            let mut ops = exec::cutover_ops(
-                resolved,
-                &proxy,
-                &unit,
-                env_file,
-                &binary,
-                &manifests,
-                &release_id,
-                &plan,
-                &reregister_options,
-                // #1621: the single-host path IS a one-host fleet, and a one-host
-                // fleet's only host carries the migration — so this is today's
-                // sequence, unchanged. The fleet driver (next slice) is what varies
-                // this per host.
-                exec::MigrateStep::Run,
-            );
-            // Repair the drifted marker as an early op — before the cutover's
-            // record-previous-release reads it — so the on-disk marker matches the
-            // proxy truth even if the rest of the deploy is later interrupted.
-            if reconcile.repair {
-                ops.insert(
-                    0,
-                    exec::live_slot_marker_repair_op(resolved, plan.live_slot, public_port),
-                );
-            }
-            let teardown = exec::candidate_teardown_ops(resolved, &release_id, &plan);
-            (
-                ops,
-                teardown,
-                format!(
-                    "zero-downtime redeploy ({} \u{2192} {})",
-                    plan.live_slot, plan.candidate_slot
-                ),
-                false,
-            )
+            Ok(HostProbeState {
+                mode: fleet::HostMode::from_deploy_mode(&probe.mode),
+                slots,
+                repair: reconcile.repair,
+                reregister_options,
+                banner,
+            })
         }
-    };
+    }
+}
 
-    eprintln!(
-        "Deploying release {release_id} to {} ({banner})\u{2026}\n",
-        resolved.host.as_deref().unwrap_or_default()
-    );
-    let result = if is_first {
-        exec::execute_first_deploy(&checks, &ops, &teardown, &executor)
+/// Drive the rollout: probe every host, plan, then replace the hosts ONE AT A TIME
+/// (issue #1621, AC-2/AC-3/AC-4).
+///
+/// The executor factory is injected (generic, never `dyn`, and with no `Send`/`Sync`
+/// bound) so a test can drive the whole loop — probe, plan, per-host execute — with
+/// one scripted fake per host. Production hands it an `SshExecutor` per target.
+///
+/// Structure that is load-bearing rather than stylistic:
+///
+/// - **Every host is probed before ANY host is mutated.** All the fail-closed
+///   refusals live in that phase, so a drifted host in position 3 refuses the whole
+///   rollout with hosts 1 and 2 untouched.
+/// - **Each host's ops are executed by their OWN `execute_*` call.** Two hosts' op
+///   vectors are never concatenated: `execute_with_teardown` resolves the
+///   auto-rollback boundary with the FIRST matching label, so a flat vector would
+///   classify every later host's pre-flip failure as post-boundary and silently
+///   disable teardown.
+/// - **A failure HALTS the rollout.** Hosts after the failing one are never
+///   touched. Compensating the hosts that already cut over is the next slice; the
+///   typed [`DeployError::FleetHalted`] already names them.
+#[allow(clippy::too_many_lines)]
+fn run_up_with<E, P, F>(input: &FleetUpInput<'_, P>, make_executor: F) -> Result<(), DeployError>
+where
+    E: exec::DeployExecutor,
+    P: ProxyController,
+    F: Fn(&ResolvedDeployConfig) -> Result<E, DeployError>,
+{
+    let fleet = input.fleet;
+    let single = fleet.is_single();
+    let total = fleet.hosts.len();
+
+    // ONE executor per host, built up front and reused for that host's read-only
+    // probe AND its execution.
+    let executors = fleet
+        .hosts
+        .iter()
+        .map(&make_executor)
+        .collect::<Result<Vec<E>, DeployError>>()?;
+
+    // MediaMTX host preflight (#1974 Slice 7) — non-mutating doctor checks run
+    // BEFORE the app deploy so a bad media host fails fast without anything being
+    // written. The MUTATING provisioning (write config/unit + restart) is deferred
+    // until after the app cutover succeeds (below) so a rolled-back app deploy
+    // never touches the host MediaMTX unit. No-op unless enabled (see fn).
+    //
+    // Single-host only for now: `provision_media_host` has no teardown/rollback
+    // path, so fanning it out would leave N media daemons on identical ports with
+    // divergent recording sets and nothing to undo them with. Until the fleet-wide
+    // refusal lands a fleet therefore provisions NO media and prints nothing new.
+    //
+    // slice 5: refusal — a media-enabled fleet (`[media.mediamtx] enabled` with
+    // more than one host) must be REFUSED in the prologue, alongside the sqlite and
+    // TLS fleet refusals, rather than silently skipped here.
+    if single {
+        check_media_host_preflight(input.media_cfg, input.ffmpeg_bin, &executors[0])?;
+    }
+
+    // ── ALL-HOSTS PROBE (read-only, serial, rollout order) ───────────────────
+    // Nothing anywhere in the fleet is mutated by this phase.
+    let probes = fleet
+        .hosts
+        .iter()
+        .zip(&executors)
+        .map(|(cfg, executor)| probe_host_for_up(cfg, input, executor))
+        .collect::<Result<Vec<HostProbeState>, DeployError>>()?;
+
+    let modes: Vec<fleet::HostMode> = probes.iter().map(|probe| probe.mode).collect();
+    let plan = fleet::plan_fleet(fleet, &modes).map_err(|e| DeployError::Config(e.to_string()))?;
+
+    if !single {
+        for line in
+            fleet::fleet_rollout_lines(&plan, input.release_id, input.writable_db_configured)
+        {
+            eprintln!("{line}");
+        }
+        eprintln!();
+    }
+
+    // ── EXECUTION (serial, one host at a time, rollout order) ────────────────
+    let mut outcomes = vec![fleet::HostOutcome::Untouched; total];
+    for (index, host_plan) in plan.hosts.iter().enumerate() {
+        let cfg = &fleet.hosts[index];
+        let state = &probes[index];
+        let executor = &executors[index];
+
+        let release_dir = format!("{}/{}", cfg.releases_dir(), input.release_id);
+        let unit = render_app_unit(
+            cfg,
+            &release_dir,
+            state.slots.candidate_port,
+            state.slots.candidate_slot,
+        );
+        let mut ops = fleet::host_ops(
+            host_plan,
+            &fleet::HostOpsInput {
+                cfg,
+                proxy: input.proxy,
+                unit: &unit,
+                env_file: input.env_file,
+                binary_local: input.binary,
+                manifests: input.manifests,
+                release_id: input.release_id,
+                slots: &state.slots,
+                reregister_options: &state.reregister_options,
+            },
+        );
+        // Repair the drifted marker as an early op — before the cutover's
+        // record-previous-release reads it — so the on-disk marker matches the
+        // proxy truth even if the rest of the deploy is later interrupted.
+        if state.repair {
+            ops.insert(
+                0,
+                exec::live_slot_marker_repair_op(cfg, state.slots.live_slot, input.public_port),
+            );
+        }
+        // First-deploy teardown must also unlink `current` and clear the live-slot
+        // marker that first_deploy_ops creates — otherwise a failed first deploy
+        // leaves them behind and the next `deploy up` wrongly takes the redeploy
+        // path with nothing serving.
+        let teardown = match host_plan.mode {
+            fleet::HostMode::First => {
+                exec::first_deploy_teardown_ops(cfg, input.release_id, &state.slots)
+            }
+            fleet::HostMode::Redeploy => {
+                exec::candidate_teardown_ops(cfg, input.release_id, &state.slots)
+            }
+        };
+
+        if single {
+            eprintln!(
+                "Deploying release {} to {} ({})\u{2026}\n",
+                input.release_id, host_plan.host, state.banner,
+            );
+        } else {
+            eprintln!(
+                "[{}/{total} {}] deploying release {} ({})\u{2026}",
+                index + 1,
+                host_plan.host,
+                input.release_id,
+                state.banner,
+            );
+        }
+
+        let result = match host_plan.mode {
+            fleet::HostMode::First => {
+                exec::execute_first_deploy(input.checks, &ops, &teardown, executor)
+            }
+            fleet::HostMode::Redeploy => {
+                exec::execute_redeploy(input.checks, &ops, &teardown, executor)
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                outcomes[index] = fleet::HostOutcome::Serving;
+                if !single {
+                    if host_plan.migrate == exec::MigrateStep::Run {
+                        eprintln!("\u{26A0}\u{FE0F}  {}", fleet::FLEET_SCHEMA_MOVED_NOTE);
+                    }
+                    eprintln!(
+                        "\u{2705} [{}/{total} {}] serving {}\n",
+                        index + 1,
+                        host_plan.host,
+                        input.release_id,
+                    );
+                }
+            }
+            Err(err) => {
+                outcomes[index] = fleet::classify_failure(&err);
+                // A one-host fleet keeps today's error verbatim: the per-host
+                // executor already told the whole story, and inventing a fleet
+                // vocabulary for one host would change pre-#1621 output.
+                if single {
+                    return Err(DeployError::Exec(err.to_string()));
+                }
+                let failed_step = fleet::failed_step_label(&err);
+                eprintln!(
+                    "\n\u{274C} rollout halted at {} (`{failed_step}`) \u{2014} the remaining \
+                     hosts were not touched.\n",
+                    host_plan.host,
+                );
+                // Print the per-host state on the way out: a halted rollout is
+                // exactly when the operator has no other source of truth.
+                for line in fleet::fleet_summary_lines(&plan, &outcomes, input.release_id) {
+                    eprintln!("{line}");
+                }
+                return Err(fleet_halted(
+                    &plan,
+                    &outcomes,
+                    host_plan.host.clone(),
+                    failed_step,
+                ));
+            }
+        }
+    }
+
+    // App deploy is committed on every host here: the cutovers succeeded and there
+    // is no longer a rollback path. Only NOW provision the host MediaMTX unit
+    // (write config/unit + restart) — deferring the mutation past this point means
+    // a failed/rolled-back app deploy above never wrote or restarted MediaMTX
+    // (#1974 Slice 7). No-op unless enabled (see fn).
+    if single {
+        let executor = &executors[0];
+        provision_media_host(input.media_cfg, executor)?;
+    }
+
+    if single {
+        eprintln!("\n\u{2705} Deploy complete. Roll back with `autumn deploy rollback`.");
     } else {
-        exec::execute_redeploy(&checks, &ops, &teardown, &executor)
-    };
-    result.map_err(|e| DeployError::Exec(e.to_string()))?;
-
-    // App deploy is committed here: the cutover succeeded and there is no longer a
-    // rollback path. Only NOW provision the host MediaMTX unit (write config/unit +
-    // restart) — deferring the mutation past this point means a failed/rolled-back
-    // app deploy above never wrote or restarted MediaMTX (#1974 Slice 7). No-op
-    // unless enabled (see fn).
-    provision_media_host(media_cfg, &executor)?;
-
-    eprintln!("\n\u{2705} Deploy complete. Roll back with `autumn deploy rollback`.");
+        for line in fleet::fleet_summary_lines(&plan, &outcomes, input.release_id) {
+            eprintln!("{line}");
+        }
+        eprintln!(
+            "\n\u{2705} Fleet deploy complete \u{2014} all {total} hosts serving {}.",
+            input.release_id,
+        );
+    }
     Ok(())
+}
+
+/// Build the typed halt error from the recorded per-host outcomes (issue #1621,
+/// AC-3).
+///
+/// Secrets discipline: every field is a host name or a `&'static str` op label —
+/// never a shell line, a remote path, or a formatted driver error (a migration
+/// failure's source can embed the database URL).
+fn fleet_halted(
+    plan: &fleet::FleetPlan,
+    outcomes: &[fleet::HostOutcome],
+    failed_host: String,
+    failed_step: &'static str,
+) -> DeployError {
+    let named = |want: fn(&fleet::HostOutcome) -> bool| -> Vec<String> {
+        plan.hosts
+            .iter()
+            .zip(outcomes)
+            .filter(|(_, outcome)| want(outcome))
+            .map(|(host, _)| host.host.clone())
+            .collect()
+    };
+    DeployError::FleetHalted {
+        failed_host,
+        failed_step,
+        rolled_back: named(|o| matches!(o, fleet::HostOutcome::RolledBack { .. })),
+        torn_down: named(|o| matches!(o, fleet::HostOutcome::TornDown { .. })),
+        still_on_new: named(|o| {
+            matches!(
+                o,
+                fleet::HostOutcome::Serving | fleet::HostOutcome::LiveOnNew { .. }
+            )
+        }),
+    }
 }
 
 /// Perform a real on-demand rollback (issue #1607, Slice 3, AC-4).
@@ -4201,9 +4628,16 @@ mod tests {
         // gate, migrations) and leaves the OLD release serving, and there is
         // deliberately no media teardown — so writing/restarting the host MediaMTX
         // unit BEFORE the app is committed would strand a rolled-back release
-        // against a moved media daemon. We assert the `run_up` source order: the
-        // non-mutating preflight precedes the app deploy, and `provision_media_host`
-        // is invoked only after the committing `result.map_err(...)?` line.
+        // against a moved media daemon. We assert the source order of the `up`
+        // path: the non-mutating preflight precedes the rollout loop, and
+        // `provision_media_host` is invoked only after that loop has run every
+        // host to completion.
+        //
+        // #1621 re-anchored the middle marker. `run_up` is now a fleet-shaped
+        // driver (`run_up` prologue + `run_up_with` loop), so the commit point is
+        // no longer a single `result.map_err(...)?` line but the per-host execution
+        // LOOP — a strictly stronger statement: provisioning must follow the last
+        // host's cutover, not merely one host's.
         let src = include_str!("deploy.rs");
         let up_body = src
             .split("fn run_up(")
@@ -4212,26 +4646,25 @@ mod tests {
             .expect("run_up body present");
 
         let preflight_at = up_body
-            .find("check_media_host_preflight(media_cfg")
-            .expect("preflight call present in run_up");
-        // The app deploy is executed via execute_first_deploy/execute_redeploy and
-        // committed by this `result.map_err(...)?` line; a failed deploy returns
-        // here (after the teardown-on-failure) before anything below runs.
+            .find("check_media_host_preflight(input.media_cfg")
+            .expect("preflight call present on the up path");
+        // The per-host cutovers happen inside this loop; a failed host returns from
+        // inside it (after the per-host teardown) before anything below runs.
         let commit_at = up_body
-            .find("result.map_err(|e| DeployError::Exec(e.to_string()))?;")
-            .expect("app deploy commit line present in run_up");
+            .find("for (index, host_plan) in plan.hosts.iter().enumerate()")
+            .expect("per-host execution loop present on the up path");
         let provision_at = up_body
-            .find("provision_media_host(media_cfg, &executor)?;")
-            .expect("deferred provisioning call present in run_up");
+            .find("provision_media_host(input.media_cfg, executor)?;")
+            .expect("deferred provisioning call present on the up path");
 
         assert!(
             preflight_at < commit_at,
-            "media preflight must precede the app deploy commit",
+            "media preflight must precede the per-host execution loop",
         );
         assert!(
             commit_at < provision_at,
-            "MediaMTX provisioning must run only AFTER the app deploy commits — so a \
-             rolled-back app deploy (which returns at the commit line) never reaches it",
+            "MediaMTX provisioning must run only AFTER every host's cutover commits — so a \
+             rolled-back or halted rollout (which returns from inside the loop) never reaches it",
         );
 
         // The preflight itself is non-mutating: it runs the doctor checks but must
@@ -4253,9 +4686,544 @@ mod tests {
         // And the mutating provisioning is reachable only on the post-commit path.
         let after_commit = &up_body[commit_at..];
         assert!(
-            after_commit.contains("provision_media_host(media_cfg, &executor)?;"),
-            "provisioning must sit on the post-commit path (unreachable when the app \
-             deploy errors out at the commit line)",
+            after_commit.contains("provision_media_host(input.media_cfg, executor)?;"),
+            "provisioning must sit on the post-commit path (unreachable when a host's \
+             deploy errors out inside the rollout loop)",
+        );
+    }
+
+    // ── Fleet rollout driver (issue #1621, slice 3) ──────────────────────────
+    //
+    // These drive the WHOLE loop — prologue probe → plan → per-host execute —
+    // against one strict recording fake per host, through the `run_up_with` seam.
+    // Nothing here contacts a host, resolves a binary, or reads the filesystem:
+    // every filesystem-coupled prologue step (preflight, binary resolution,
+    // manifest location, release-id minting) is resolved by `run_up` and handed in
+    // as data, which is what makes the rollout itself unit-testable.
+
+    /// The read-only probe labels a rollout is allowed to run before (and without)
+    /// mutating anything. Enumerated here, not imported, so a new mutating op can
+    /// never quietly join the allowlist: the "zero mutations" assertions below are
+    /// only as strong as this list is short.
+    const READ_ONLY_PROBES: [&str; 3] =
+        ["proxy-compat-probe", "detect-current", "probe-release-dir"];
+
+    /// The exact ordered `Run` labels of today's single-host zero-downtime
+    /// redeploy — the same vector `redeploy_produces_exact_zero_downtime_sequence`
+    /// (`exec.rs`) pins, restated here so a fleet host's sequence is asserted
+    /// against the protected contract and not merely against itself.
+    const REDEPLOY_RUN_LABELS: [&str; 13] = [
+        "proxy-snapshot-unit",
+        "proxy-install",
+        "proxy-restart-if-changed",
+        "prepare-dirs",
+        "daemon-reload",
+        "start-candidate",
+        "migrate",
+        "readiness-gate",
+        "proxy-flip",
+        "commit-markers",
+        "record-proxy-options",
+        "drain-old",
+        "prune",
+    ];
+
+    const FLEET_RELEASE_ID: &str = "20260714T120000Z";
+    const FLEET_PUBLIC_PORT: u16 = 3000;
+
+    fn fleet_of(hosts: &[&str]) -> ResolvedFleet {
+        ResolvedFleet::resolve(
+            &DeployConfig {
+                hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("a well-formed fleet resolves")
+    }
+
+    /// Probe stdout for a host already serving on the blue slot. The unit/options
+    /// delimiters are deliberately absent, so the installed proxy port and the
+    /// proxy-options marker both degrade to `Absent` — "nothing to conflict with",
+    /// the shape a legacy host presents.
+    fn redeploy_probe() -> String {
+        "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n".to_owned()
+    }
+
+    /// Probe stdout for a host with nothing installed yet.
+    fn first_deploy_probe() -> String {
+        "first\n---autumn-kamal-proxy-list---\n".to_owned()
+    }
+
+    /// Probe stdout whose `shared/proxy-options` marker is PRESENT but unparseable
+    /// (no tab field) — the fail-closed `#2074` shape.
+    fn unreadable_proxy_options_probe() -> String {
+        "redeploy:blue\t3001\n\
+         ---autumn-kamal-proxy-list---\n\
+         ---autumn-kamal-proxy-unit---\n\
+         --http-port 3000\n\
+         ---autumn-kamal-proxy-options---\n\
+         garbage\n"
+            .to_owned()
+    }
+
+    /// A `kamal-proxy deploy --help` capture carrying every flag the cutover uses,
+    /// so the compat probe passes.
+    fn compatible_deploy_help() -> &'static str {
+        "Usage:\n  kamal-proxy deploy SERVICE [flags]\n\nFlags:\n  \
+         --target host:port\n  --health-check-path string\n  --host strings\n  \
+         --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n  \
+         --force\n"
+    }
+
+    fn fleet_manifests() -> Vec<exec::ManifestUpload> {
+        vec![exec::ManifestUpload {
+            local: PathBuf::from("/local/autumn.toml"),
+            remote_basename: "autumn.toml".to_owned(),
+        }]
+    }
+
+    /// Script one host as a healthy redeploy: compatible proxy, serving on blue,
+    /// no release-dir collision.
+    fn script_redeploy(
+        recorder: fleet::test_support::FleetRecorder,
+        host: &str,
+    ) -> fleet::test_support::FleetRecorder {
+        recorder
+            .script(host, "proxy-compat-probe", compatible_deploy_help())
+            .script(host, "detect-current", redeploy_probe())
+            .script(host, "probe-release-dir", "absent")
+    }
+
+    /// Build a driver input over `fleet` with every fleet-wide value fixed, so the
+    /// per-host op vectors are byte-comparable against the single-host builders.
+    struct FleetFixture {
+        env_file: exec::Secret,
+        manifests: Vec<exec::ManifestUpload>,
+        proxy: proxy::KamalProxyController,
+        media_cfg: media::MediaMtxHostConfig,
+        binary: PathBuf,
+    }
+
+    impl FleetFixture {
+        fn new() -> Self {
+            Self {
+                env_file: exec::Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=topsecret\n"),
+                manifests: fleet_manifests(),
+                proxy: proxy::KamalProxyController::new(60),
+                media_cfg: media::MediaMtxHostConfig::default(),
+                binary: PathBuf::from("/local/target/release/myapp"),
+            }
+        }
+
+        fn input<'a>(
+            &'a self,
+            fleet: &'a ResolvedFleet,
+        ) -> FleetUpInput<'a, proxy::KamalProxyController> {
+            FleetUpInput {
+                fleet,
+                proxy: &self.proxy,
+                checks: &[],
+                env_file: &self.env_file,
+                binary: &self.binary,
+                manifests: &self.manifests,
+                release_id: FLEET_RELEASE_ID,
+                public_port: FLEET_PUBLIC_PORT,
+                media_cfg: &self.media_cfg,
+                ffmpeg_bin: "ffmpeg",
+                writable_db_configured: true,
+            }
+        }
+
+        /// The exact ordered calls today's SINGLE-host `run_up` would record for
+        /// `cfg` on the given path — built from the same unchanged per-host
+        /// builders, driven through the same plain recording fake.
+        fn todays_calls(
+            &self,
+            cfg: &ResolvedDeployConfig,
+            mode: fleet::HostMode,
+            migrate: exec::MigrateStep,
+        ) -> Vec<exec::test_support::RecordedCall> {
+            let slots = match mode {
+                fleet::HostMode::First => exec::SlotPlan::first(FLEET_PUBLIC_PORT),
+                fleet::HostMode::Redeploy => {
+                    exec::SlotPlan::redeploy(FLEET_PUBLIC_PORT, exec::SLOT_BLUE)
+                }
+            };
+            let release_dir = format!("{}/{FLEET_RELEASE_ID}", cfg.releases_dir());
+            let unit = render_app_unit(
+                cfg,
+                &release_dir,
+                slots.candidate_port,
+                slots.candidate_slot,
+            );
+            let ops = match mode {
+                fleet::HostMode::First => exec::first_deploy_ops(
+                    cfg,
+                    &self.proxy,
+                    &unit,
+                    self.env_file.clone(),
+                    &self.binary,
+                    &self.manifests,
+                    FLEET_RELEASE_ID,
+                    &slots,
+                ),
+                fleet::HostMode::Redeploy => exec::cutover_ops(
+                    cfg,
+                    &self.proxy,
+                    &unit,
+                    self.env_file.clone(),
+                    &self.binary,
+                    &self.manifests,
+                    FLEET_RELEASE_ID,
+                    &slots,
+                    &self.proxy.proxy_service_options(),
+                    migrate,
+                ),
+            };
+            let recorder = exec::test_support::RecordingExecutor::new();
+            exec::run_ops(&ops, &recorder).expect("the recording fake never fails");
+            recorder.calls()
+        }
+    }
+
+    #[test]
+    fn fleet_halted_carries_only_host_names_and_static_labels() {
+        // #1621: `FleetHalted` is the one error type that describes partial fleet
+        // state, so it is the one most tempting to enrich with "context". Every
+        // field is a host name or a `&'static str` op label — never a shell line, a
+        // remote path, or a formatted source error (a failed migration's driver
+        // error can embed the database URL, which is exactly why
+        // `apply_pending_or_exit` redacts it).
+        let err = fleet_halted(
+            &fleet::FleetPlan {
+                hosts: vec![
+                    fleet::HostPlan {
+                        host: "web-a".to_owned(),
+                        mode: fleet::HostMode::Redeploy,
+                        migrate: exec::MigrateStep::Run,
+                    },
+                    fleet::HostPlan {
+                        host: "web-b".to_owned(),
+                        mode: fleet::HostMode::Redeploy,
+                        migrate: exec::MigrateStep::Skip,
+                    },
+                ],
+            },
+            &[
+                fleet::HostOutcome::Serving,
+                fleet::HostOutcome::RolledBack {
+                    failed_step: "migrate",
+                },
+            ],
+            "web-b".to_owned(),
+            "migrate",
+        );
+
+        let rendered = format!("{err}\n{err:?}");
+        assert!(
+            rendered.contains("web-b") && rendered.contains("migrate"),
+            "the halt must name the failing host and step: {rendered}"
+        );
+        for secret in [
+            "postgres://",
+            "topsecret",
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+            "systemd-run",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "FleetHalted must never carry `{secret}`: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_of_one_matches_todays_single_host_sequence() {
+        // #1621 (AC-1, T1.6 / plan P1). The hard invariant: a one-host fleet runs
+        // the SAME ops, in the same order, with the same rendered shell, as the
+        // pre-fleet single-host path — proven differentially against the unchanged
+        // per-host builders, not against a remembered vector.
+        let fleet = fleet_of(&["203.0.113.10"]);
+        let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "203.0.113.10");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect("a scripted one-host fleet deploys cleanly");
+
+        // (a) the exact protected label vector, behind the read-only prologue.
+        let expected_labels: Vec<&'static str> = READ_ONLY_PROBES
+            .iter()
+            .copied()
+            .chain(REDEPLOY_RUN_LABELS)
+            .collect();
+        assert_eq!(
+            recorder.run_labels_for("203.0.113.10"),
+            expected_labels,
+            "a one-host fleet must run today's exact zero-downtime sequence"
+        );
+
+        // (b) and byte-for-byte the same calls (shells, upload paths, modes) as the
+        // single-host builders produce — the differential form of AC-1.
+        let observed = recorder.calls_for("203.0.113.10");
+        let (probes, mutating) = observed.split_at(READ_ONLY_PROBES.len());
+        assert_eq!(
+            probes
+                .iter()
+                .filter_map(exec::test_support::RecordedCall::run_label)
+                .collect::<Vec<_>>(),
+            READ_ONLY_PROBES.to_vec(),
+            "the rollout prologue must be read-only probes only"
+        );
+        assert_eq!(
+            mutating,
+            fixture
+                .todays_calls(
+                    &fleet.hosts[0],
+                    fleet::HostMode::Redeploy,
+                    exec::MigrateStep::Run
+                )
+                .as_slice(),
+            "a one-host fleet's ops must be byte-identical to today's single-host ops"
+        );
+    }
+
+    #[test]
+    fn fleet_of_one_first_deploy_matches_todays_single_host_sequence() {
+        // #1621 (AC-1, T1.6): the same differential proof on the first-deploy path,
+        // which carries NO migrate op — an all-first-deploy fleet migrates nowhere,
+        // exactly today's documented single-host limitation.
+        let fleet = fleet_of(&["203.0.113.10"]);
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script(
+                "203.0.113.10",
+                "proxy-compat-probe",
+                compatible_deploy_help(),
+            )
+            .script("203.0.113.10", "detect-current", first_deploy_probe())
+            .script("203.0.113.10", "probe-release-dir", "absent");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect("a scripted one-host first deploy runs cleanly");
+
+        let observed = recorder.calls_for("203.0.113.10");
+        let (_, mutating) = observed.split_at(READ_ONLY_PROBES.len());
+        assert_eq!(
+            mutating,
+            fixture
+                .todays_calls(
+                    &fleet.hosts[0],
+                    fleet::HostMode::First,
+                    exec::MigrateStep::Skip
+                )
+                .as_slice(),
+            "a one-host first deploy must be byte-identical to today's single-host first deploy"
+        );
+        assert!(
+            !recorder.run_labels_for("203.0.113.10").contains(&"migrate"),
+            "the first-deploy path carries no migrate op"
+        );
+    }
+
+    #[test]
+    fn rolling_order_replaces_hosts_strictly_in_sequence() {
+        // #1621 (AC-2, T1.11). The whole safety claim of a rolling deploy is an
+        // ORDERING claim: host k+1 is not touched until host k has cut over, so the
+        // rest of the fleet keeps serving throughout. Asserted on the fleet-wide
+        // tape, which is the only structure that can express it.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_redeploy(recorder, host);
+        }
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect("a scripted three-host fleet rolls out cleanly");
+
+        // (a) each host runs its OWN complete redeploy vector; only the first
+        // carries the fleet's single migration.
+        for (index, host) in hosts.iter().enumerate() {
+            let expected: Vec<&'static str> = READ_ONLY_PROBES
+                .iter()
+                .copied()
+                .chain(
+                    REDEPLOY_RUN_LABELS
+                        .iter()
+                        .copied()
+                        .filter(|l| index == 0 || *l != "migrate"),
+                )
+                .collect();
+            assert_eq!(
+                recorder.run_labels_for(host),
+                expected,
+                "{host} must run the full per-host sequence ({}the migration)",
+                if index == 0 { "with " } else { "without " }
+            );
+        }
+
+        // (b) strict sequencing: host k+1's first MUTATING op comes after host k's
+        // proxy-flip. (Read-only probes all run up front, before any host is
+        // touched — that is the all-hosts preflight probe, not a mutation.)
+        for pair in hosts.windows(2) {
+            let (previous, next) = (pair[0], pair[1]);
+            let flip = recorder
+                .index_of(previous, "proxy-flip")
+                .unwrap_or_else(|| panic!("{previous} must cut over"));
+            let first_mutation = recorder
+                .first_mutating(next, &READ_ONLY_PROBES)
+                .unwrap_or_else(|| panic!("{next} must be deployed"));
+            assert!(
+                flip < first_mutation,
+                "{next} must not be touched until {previous} has cut over: \
+                 {previous}'s proxy-flip at {flip}, {next}'s first mutation at {first_mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_marker_on_any_host_aborts_before_any_mutation() {
+        // #1621 (AC-7, T1.17). Every per-host fail-closed refusal is evaluated for
+        // ALL hosts BEFORE the first host is touched. Host 3's `shared/proxy-options`
+        // marker is present but unparseable (#2074), so the whole rollout is
+        // refused — with hosts 1 and 2 untouched, still serving their old releases.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in ["web-a", "web-b"] {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder = recorder
+            .script("web-c", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-c", "detect-current", unreadable_proxy_options_probe())
+            .script("web-c", "probe-release-dir", "absent");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("an unprovable proxy-options marker must refuse the rollout");
+        let message = err.to_string();
+        assert!(
+            message.contains("web-c"),
+            "the refusal must name the offending HOST, got: {message}"
+        );
+        assert!(
+            message.contains("proxy-options") && message.contains("#2074"),
+            "the refusal must keep the single-host #2074 message, got: {message}"
+        );
+
+        let mutating = recorder.mutating(&READ_ONLY_PROBES);
+        assert!(
+            mutating.is_empty(),
+            "a refused rollout must mutate NOTHING anywhere in the fleet, got: {mutating:?}"
+        );
+    }
+
+    #[test]
+    fn existing_release_dir_on_any_host_refuses_the_rollout() {
+        // #1621 (AC-3, T1.19). The release id has one-second granularity, so a fast
+        // retry can reuse it. Re-uploading into a dir `shared/previous-release`
+        // still points at would make the "previous release" hold the NEW binary and
+        // roll FORWARD. Refuse before touching anything, naming the host.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in ["web-a", "web-c"] {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder = recorder
+            .script("web-b", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-b", "detect-current", redeploy_probe())
+            .script("web-b", "probe-release-dir", "present");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("an existing release dir must refuse the rollout");
+        let message = err.to_string();
+        assert!(
+            message.contains("web-b") && message.contains(FLEET_RELEASE_ID),
+            "the refusal must name the host and the colliding release, got: {message}"
+        );
+
+        let mutating = recorder.mutating(&READ_ONLY_PROBES);
+        assert!(
+            mutating.is_empty(),
+            "a refused rollout must mutate NOTHING anywhere in the fleet, got: {mutating:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_host_halts_the_rollout_and_leaves_later_hosts_untouched() {
+        // #1621 (AC-3). Host 2's readiness gate fails — a PRE-boundary failure, so
+        // its candidate is torn down by the existing per-host auto-rollback and its
+        // old release keeps serving. The rollout then HALTS: host 3 is never
+        // touched. Host 1 is left on the new release; compensating it back is the
+        // next slice's job, and the typed error already names it as such.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder = recorder.fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        match &err {
+            DeployError::FleetHalted {
+                failed_host,
+                failed_step,
+                rolled_back,
+                torn_down,
+                still_on_new,
+            } => {
+                assert_eq!(failed_host, "web-b", "the halt must name the failing host");
+                assert_eq!(
+                    *failed_step, "readiness-gate",
+                    "the halt must name the failing step"
+                );
+                assert_eq!(
+                    rolled_back,
+                    &vec!["web-b".to_owned()],
+                    "a pre-boundary failure rolls the failing host's candidate back"
+                );
+                assert!(
+                    torn_down.is_empty(),
+                    "a redeploy host is rolled back, not torn down: {torn_down:?}"
+                );
+                assert_eq!(
+                    still_on_new,
+                    &vec!["web-a".to_owned()],
+                    "the already-cut-over hosts must be named so they can be compensated"
+                );
+            }
+            other => panic!("expected a fleet halt, got: {other:?}"),
+        }
+
+        // Host 1 completed its cutover.
+        assert!(
+            recorder.run_labels_for("web-a").contains(&"prune"),
+            "web-a must have completed its cutover"
+        );
+        // Host 2 stopped at the readiness gate and tore its candidate down.
+        let web_b = recorder.run_labels_for("web-b");
+        assert!(
+            web_b.contains(&"readiness-gate")
+                && !web_b.contains(&"proxy-flip")
+                && web_b.contains(&"teardown-candidate-unit")
+                && web_b.contains(&"teardown-candidate-dir"),
+            "web-b must fail at the gate, never flip, and tear its candidate down: {web_b:?}"
+        );
+        // Host 3 was probed in the all-hosts prologue and then never touched.
+        let web_c: Vec<_> = recorder
+            .mutating(&READ_ONLY_PROBES)
+            .into_iter()
+            .filter(|(host, _)| host == "web-c")
+            .collect();
+        assert!(
+            web_c.is_empty(),
+            "the rollout must halt: web-c must be mutated in no way, got: {web_c:?}"
         );
     }
 }

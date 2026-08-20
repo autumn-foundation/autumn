@@ -1779,6 +1779,65 @@ pub fn probe_deploy_state(
     })
 }
 
+/// Sentinel [`probe_release_dir`] prints when `{releases_dir}/{release_id}` already
+/// exists on the host.
+const RELEASE_DIR_PRESENT: &str = "present";
+
+/// Sentinel [`probe_release_dir`] prints when the release dir is free.
+const RELEASE_DIR_ABSENT: &str = "absent";
+
+/// Whether this run's release dir already exists on a host (issue #1621, §4.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseDirState {
+    /// The release dir is free — the normal case.
+    Absent,
+    /// The release dir already exists: a previous run of THIS release id already
+    /// wrote into it. Refused (see [`probe_release_dir`]).
+    Present,
+    /// The probe printed neither sentinel, so the dir's state cannot be proved.
+    /// **Fails closed** — the collision below is destructive and silent.
+    Unreadable,
+}
+
+/// Read-only probe: does `{releases_dir}/{release_id}` already exist on this host?
+/// (issue #1621, §4.9.)
+///
+/// `release_id` is a UTC timestamp with **one-second granularity**
+/// (`default_release_id`), and exactly ONE id is minted per fleet run. A fast
+/// retry within the same second therefore re-uses the id and would upload a NEW
+/// binary into the release dir `shared/previous-release` still points at — so the
+/// host's "previous release" would hold the new binary and a rollback would roll
+/// *forward*, silently. There is no marker that can detect this after the fact,
+/// so the deploy refuses up front, before anything is written.
+///
+/// It is deliberately its OWN round-trip rather than a fifth section on
+/// [`probe_deploy_state`]: that probe's shell is pinned by exact-content tests and
+/// its sections are all about the *live* release, while this one is about the
+/// *candidate* dir and must fail closed rather than degrade to `Absent`.
+///
+/// # Errors
+///
+/// Returns the executor's error if the probe command cannot run.
+pub fn probe_release_dir(
+    cfg: &ResolvedDeployConfig,
+    release_id: &str,
+    exec: &impl DeployExecutor,
+) -> Result<ReleaseDirState, DeployExecError> {
+    let release_dir = format!("{}/{release_id}", cfg.releases_dir());
+    let shell = format!(
+        "if [ -d {dir} ]; then printf '%s' '{RELEASE_DIR_PRESENT}'; \
+         else printf '%s' '{RELEASE_DIR_ABSENT}'; fi",
+        dir = shell_quote(&release_dir),
+    );
+    let out = exec.run(&RemoteCommand::new("probe-release-dir", shell))?;
+    Ok(match out.stdout.trim() {
+        RELEASE_DIR_PRESENT => ReleaseDirState::Present,
+        RELEASE_DIR_ABSENT => ReleaseDirState::Absent,
+        // Fail closed: an unexpected capture cannot prove the dir is free.
+        _ => ReleaseDirState::Unreadable,
+    })
+}
+
 /// Fail closed on reverse-proxy CLI-surface drift BEFORE any cutover (issue #2053).
 ///
 /// The proxy controller ([`KamalProxyController`](super::proxy::KamalProxyController))
@@ -2371,83 +2430,177 @@ impl DeployExecutor for SshExecutor {
     }
 }
 
+/// The recording executor fake, shared across the deploy module's test suites.
+///
+/// Lives outside `mod tests` (and is `pub(crate)`) so the fleet rollout driver's
+/// tests can drive N of these — one per host — against the SAME fake as the
+/// single-host op-sequence tests, instead of growing a third near-duplicate copy
+/// (issue #1621, plan §9.2). `#[cfg(test)]`, so nothing here reaches a release
+/// build.
 #[cfg(test)]
-mod tests {
-    use super::*;
+// In this bin-only crate `deploy` is a private module, so clippy flags every
+// `pub(crate)` here as redundant; they are kept to document the intended
+// visibility (crate-internal test support) rather than widening to `pub`.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod test_support {
+    use super::{CommandOutput, DeployExecError, DeployExecutor, Path, RemoteCommand};
     use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// The fleet-wide `(host, call)` tape shared by every host's executor in one
+    /// rollout — the structure cross-host ordering assertions read.
+    pub(crate) type FleetTape = Rc<RefCell<Vec<(String, RecordedCall)>>>;
+
+    /// Command labels whose **stdout is parsed** by the caller, i.e. the read-only
+    /// probes. An unscripted probe is the single most dangerous silent hole in this
+    /// fake: `run` returns `Ok` with EMPTY stdout for anything unscripted, and
+    /// [`super::probe_deploy_state`] reads an empty section as
+    /// [`super::DeployMode::First`] / `Absent`. A fleet test that forgets to script
+    /// host N's probe would therefore exercise the first-deploy branch and still
+    /// pass. [`RecordingExecutor::strict`] turns that into a loud panic.
+    pub(crate) const PROBE_LABELS: [&str; 4] = [
+        "proxy-compat-probe",
+        "detect-current",
+        "probe-release-dir",
+        "resolve-previous",
+    ];
+
+    /// One recorded executor call. Uploads carry no local path: op building is
+    /// pure, so the local path is an input the assertions never need.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum RecordedCall {
+        /// A `run` call.
+        Run {
+            /// The op's stable `&'static str` label.
+            label: &'static str,
+            /// The rendered remote shell line.
+            shell: String,
+        },
+        /// An `upload` call (a `UploadFile` or a staged `WriteFile`).
+        Upload {
+            /// Remote destination path.
+            remote_path: String,
+            /// Requested mode, when the op set one.
+            mode: Option<u32>,
+        },
+    }
+
+    impl RecordedCall {
+        /// The label of a `Run` call, or `None` for an upload.
+        pub(crate) const fn run_label(&self) -> Option<&'static str> {
+            match self {
+                Self::Run { label, .. } => Some(*label),
+                Self::Upload { .. } => None,
+            }
+        }
+    }
 
     /// A recording fake executor: it records every `run`/`upload` call in order
     /// and returns scripted outputs, so tests assert the exact remote-command
     /// sequence (and env-file mode) without a live host.
     #[derive(Default)]
-    struct RecordingExecutor {
+    pub(crate) struct RecordingExecutor {
         calls: RefCell<Vec<RecordedCall>>,
         /// Labels whose `run` should return a scripted failure (e.g. to simulate
         /// a readiness-gate timeout).
         fail_labels: Vec<&'static str>,
         /// Scripted stdout returned for a given command label.
         stdout_by_label: Vec<(&'static str, String)>,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum RecordedCall {
-        Run {
-            label: &'static str,
-            shell: String,
-        },
-        Upload {
-            remote_path: String,
-            mode: Option<u32>,
-        },
+        /// #1621: the host this executor targets, recorded onto the shared fleet
+        /// tape. Empty for the single-host fakes, which never set a tape.
+        host: String,
+        /// #1621: a tape shared by every host's executor in one fleet run, so
+        /// CROSS-host interleaving ("host B's first mutating op came after host A's
+        /// `proxy-flip`") is assertable — something a per-host call list cannot
+        /// express.
+        tape: Option<FleetTape>,
+        /// #1621: panic on an unscripted [`PROBE_LABELS`] entry instead of
+        /// silently returning empty stdout.
+        strict: bool,
     }
 
     impl RecordingExecutor {
-        fn new() -> Self {
+        /// A fake that scripts nothing and fails nothing.
+        pub(crate) fn new() -> Self {
             Self::default()
         }
 
-        fn failing_on(label: &'static str) -> Self {
+        /// A fake whose `run` fails for `label`.
+        pub(crate) fn failing_on(label: &'static str) -> Self {
             Self {
                 fail_labels: vec![label],
                 ..Self::default()
             }
         }
 
+        /// Chainable sibling of [`Self::failing_on`], so one fake can fail on more
+        /// than one label (a fleet script needs per-host failure injection).
+        pub(crate) fn failing(mut self, label: &'static str) -> Self {
+            self.fail_labels.push(label);
+            self
+        }
+
         /// Script the stdout returned for a given command label (used to drive
-        /// [`probe_deploy_state`]'s first-vs-redeploy probe).
-        fn with_stdout(mut self, label: &'static str, stdout: impl Into<String>) -> Self {
+        /// [`super::probe_deploy_state`]'s first-vs-redeploy probe).
+        pub(crate) fn with_stdout(
+            mut self,
+            label: &'static str,
+            stdout: impl Into<String>,
+        ) -> Self {
             self.stdout_by_label.push((label, stdout.into()));
             self
         }
 
-        fn calls(&self) -> Vec<RecordedCall> {
+        /// Fail LOUDLY (panic) on an unscripted read-only probe label instead of
+        /// returning empty stdout, which every probe parser degrades to
+        /// "absent / first deploy" (issue #1621, plan §9.2).
+        pub(crate) fn strict(mut self) -> Self {
+            self.strict = true;
+            self
+        }
+
+        /// Record this executor's calls onto a fleet-wide `tape` under `host`, in
+        /// addition to its own per-host list.
+        pub(crate) fn recording_as(mut self, host: impl Into<String>, tape: FleetTape) -> Self {
+            self.host = host.into();
+            self.tape = Some(tape);
+            self
+        }
+
+        /// Every recorded call, in order.
+        pub(crate) fn calls(&self) -> Vec<RecordedCall> {
             self.calls.borrow().clone()
         }
 
         /// Labels of the recorded `Run` calls, in order (upload calls excluded).
-        fn run_labels(&self) -> Vec<&'static str> {
+        pub(crate) fn run_labels(&self) -> Vec<&'static str> {
             self.calls
                 .borrow()
                 .iter()
-                .filter_map(|c| match c {
-                    RecordedCall::Run { label, .. } => Some(*label),
-                    RecordedCall::Upload { .. } => None,
-                })
+                .filter_map(RecordedCall::run_label)
                 .collect()
         }
 
         /// The shell recorded for the first `Run` with `label`, if any.
-        fn shell_for(&self, label: &str) -> Option<String> {
+        pub(crate) fn shell_for(&self, label: &str) -> Option<String> {
             self.calls.borrow().iter().find_map(|c| match c {
                 RecordedCall::Run { label: l, shell } if *l == label => Some(shell.clone()),
                 _ => None,
             })
         }
+
+        /// Push one call onto the per-host list and, when set, the fleet tape.
+        fn record(&self, call: RecordedCall) {
+            if let Some(tape) = &self.tape {
+                tape.borrow_mut().push((self.host.clone(), call.clone()));
+            }
+            self.calls.borrow_mut().push(call);
+        }
     }
 
     impl DeployExecutor for RecordingExecutor {
         fn run(&self, cmd: &RemoteCommand) -> Result<CommandOutput, DeployExecError> {
-            self.calls.borrow_mut().push(RecordedCall::Run {
+            self.record(RecordedCall::Run {
                 label: cmd.label,
                 shell: cmd.shell.clone(),
             });
@@ -2457,14 +2610,26 @@ mod tests {
                     message: "scripted failure".to_owned(),
                 });
             }
-            let stdout = self
+            let scripted = self
                 .stdout_by_label
                 .iter()
                 .find(|(l, _)| *l == cmd.label)
-                .map(|(_, out)| out.clone())
-                .unwrap_or_default();
+                .map(|(_, out)| out.clone());
+            assert!(
+                !(self.strict && scripted.is_none() && PROBE_LABELS.contains(&cmd.label)),
+                "unscripted probe `{}`{}: this fake would return EMPTY stdout, which every \
+                 probe parser degrades to \"absent / first deploy\" — script it with \
+                 `.with_stdout(\"{}\", …)` (issue #1621)",
+                cmd.label,
+                if self.host.is_empty() {
+                    String::new()
+                } else {
+                    format!(" on host {}", self.host)
+                },
+                cmd.label,
+            );
             Ok(CommandOutput {
-                stdout,
+                stdout: scripted.unwrap_or_default(),
                 stderr: String::new(),
             })
         }
@@ -2475,13 +2640,19 @@ mod tests {
             remote_path: &str,
             mode: Option<u32>,
         ) -> Result<(), DeployExecError> {
-            self.calls.borrow_mut().push(RecordedCall::Upload {
+            self.record(RecordedCall::Upload {
                 remote_path: remote_path.to_owned(),
                 mode,
             });
             Ok(())
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{RecordedCall, RecordingExecutor};
+    use super::*;
 
     fn resolved() -> ResolvedDeployConfig {
         ResolvedDeployConfig::resolve(
@@ -4315,6 +4486,98 @@ mod tests {
                 .installed_proxy_port,
             InstalledProxyPort::Unreadable,
             "a present unit with no readable --http-port fails closed as Unreadable"
+        );
+    }
+
+    #[test]
+    fn probe_release_dir_is_read_only_and_fails_closed() {
+        // #1621 (§4.9): the release id has one-second granularity and exactly one
+        // is minted per run, so a fast retry re-uses it. Uploading into a release
+        // dir `shared/previous-release` still points at would put the NEW binary
+        // behind the "previous release" and make a rollback roll FORWARD — silently
+        // and undetectably. So the deploy probes for the collision up front.
+        let cfg = resolved();
+
+        let absent = RecordingExecutor::new().with_stdout("probe-release-dir", "absent");
+        assert_eq!(
+            probe_release_dir(&cfg, RELEASE_ID, &absent).unwrap(),
+            ReleaseDirState::Absent,
+            "a free release dir is the normal case"
+        );
+
+        // The probe is READ-ONLY: a `[ -d … ]` test and two printfs, nothing else,
+        // aimed at this run's release dir.
+        let shell = absent.shell_for("probe-release-dir").expect("probe ran");
+        assert_eq!(
+            shell,
+            format!(
+                "if [ -d '{RELEASE_DIR}' ]; then printf '%s' 'present'; \
+                     else printf '%s' 'absent'; fi"
+            ),
+            "the collision probe must be a read-only directory test",
+        );
+        assert_eq!(
+            absent.run_labels(),
+            vec!["probe-release-dir"],
+            "the probe runs exactly one command and mutates nothing"
+        );
+
+        let present = RecordingExecutor::new().with_stdout("probe-release-dir", "present\n");
+        assert_eq!(
+            probe_release_dir(&cfg, RELEASE_ID, &present).unwrap(),
+            ReleaseDirState::Present,
+            "an existing release dir is reported"
+        );
+
+        // Neither sentinel → we cannot PROVE the dir is free, and the failure mode
+        // is destructive, so fail closed rather than degrade to Absent.
+        let garbled = RecordingExecutor::new().with_stdout("probe-release-dir", "bash: -c: line 0");
+        assert_eq!(
+            probe_release_dir(&cfg, RELEASE_ID, &garbled).unwrap(),
+            ReleaseDirState::Unreadable,
+            "an unexpected capture must fail closed, never degrade to Absent"
+        );
+        let empty = RecordingExecutor::new();
+        assert_eq!(
+            probe_release_dir(&cfg, RELEASE_ID, &empty).unwrap(),
+            ReleaseDirState::Unreadable,
+            "empty output must fail closed (the trap every other probe degrades on)"
+        );
+    }
+
+    #[test]
+    fn strict_recording_executor_refuses_to_fake_an_unscripted_probe() {
+        // #1621 (plan §9.2): the fake returns Ok+EMPTY stdout for anything
+        // unscripted, and every probe parser reads empty as "absent / first
+        // deploy". A fleet test that forgot to script host N's probe would
+        // therefore exercise the first-deploy branch and PASS. Strict mode turns
+        // that silent hole into a panic.
+        let cfg = resolved();
+        let strict = RecordingExecutor::new().strict();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = probe_deploy_state(&cfg, &strict);
+        }));
+        assert!(
+            panicked.is_err(),
+            "an unscripted probe must fail loudly under strict mode"
+        );
+
+        // A scripted probe is unaffected, and non-probe labels never need scripting.
+        let scripted = RecordingExecutor::new()
+            .strict()
+            .with_stdout("detect-current", "first\n");
+        assert_eq!(
+            probe_deploy_state(&cfg, &scripted).unwrap().mode,
+            DeployMode::First,
+            "strict mode changes nothing for a scripted probe"
+        );
+        assert!(
+            run_ops(
+                &[DeployOp::Run(RemoteCommand::new("prune", "true"))],
+                &RecordingExecutor::new().strict()
+            )
+            .is_ok(),
+            "strict mode only guards labels whose stdout is parsed"
         );
     }
 
