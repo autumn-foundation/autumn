@@ -158,11 +158,20 @@ impl std::error::Error for QueryError {}
 
 impl de::Error for QueryError {
     /// The catch-all serde uses for a `#[serde(deserialize_with)]` helper's own
-    /// message. Its content is out of our hands, so it is bounded and stripped
-    /// rather than trusted; the shaped constructors below intercept the serde
-    /// messages that would otherwise embed request text verbatim.
-    fn custom<T: fmt::Display>(msg: T) -> Self {
-        Self::msg(sanitize_message(&msg.to_string()))
+    /// message — **discarded**, not bounded.
+    ///
+    /// A helper is free to write `E::custom(format!("invalid token {value}"))`,
+    /// and this module cannot audit what it interpolates. Truncating and
+    /// control-stripping such a message still surfaces the leading 160
+    /// characters of it into the 400 body and every error reporter, which does
+    /// not satisfy the module's guarantee that an error never echoes a
+    /// submitted value — a query parameter can hold a secret. So the content is
+    /// dropped entirely and replaced with a fixed message; the field path is
+    /// attached separately and is derived from the target type, not the
+    /// request. A handler wanting a specific user-facing message should
+    /// validate after extraction, where it controls what the response says.
+    fn custom<T: fmt::Display>(_msg: T) -> Self {
+        Self::msg("a value was rejected by a custom deserializer".to_owned())
     }
 
     /// `invalid type: string "SUPERSECRET", expected u32` — serde's default
@@ -242,24 +251,6 @@ fn quoted_list(expected: &'static [&'static str]) -> String {
         .map(|name| format!("`{name}`"))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// Bound and clean a message serde built for us.
-///
-/// Only reachable through [`de::Error::custom`], i.e. a `deserialize_with`
-/// helper's own text. The shaped constructors above already keep request text
-/// out of every message serde's derive generates.
-fn sanitize_message(raw: &str) -> String {
-    const MAX: usize = 160;
-    let mut out: String = raw
-        .chars()
-        .take(MAX)
-        .map(|c| if c.is_control() { '.' } else { c })
-        .collect();
-    if raw.chars().nth(MAX).is_some() {
-        out.push('…');
-    }
-    out
 }
 
 /// Bound and clean attacker-supplied key text before it reaches an error
@@ -1424,6 +1415,46 @@ mod tests {
 
         // The SAME spelling twice is still a genuine duplicate.
         assert!(from_query_str::<Args>("tags[0]=a&tags[0]=b").is_err());
+    }
+
+    #[test]
+    fn a_custom_deserializer_message_is_discarded_not_merely_bounded() {
+        // Codex P1: a `deserialize_with` helper can interpolate the submitted
+        // value into its own message. Truncating that still surfaces the first
+        // 160 characters, so the content is dropped outright.
+        fn picky<'de, D>(deserializer: D) -> Result<String, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let raw = String::deserialize(deserializer)?;
+            Err(serde::de::Error::custom(format!("invalid token {raw}")))
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Guarded {
+            #[serde(deserialize_with = "picky")]
+            #[allow(
+                dead_code,
+                reason = "the helper always errors; the field is never built"
+            )]
+            token: String,
+        }
+
+        let err = from_query_str::<Guarded>("token=SUPERSECRET").expect_err("helper rejects");
+        let rendered = err.to_string();
+        assert!(!rendered.contains("SUPERSECRET"), "leaked: {rendered}");
+        assert!(
+            !rendered.contains("invalid token"),
+            "retained content: {rendered}"
+        );
+        // The field path still identifies *where* the failure was; it comes
+        // from the target type, not from the request.
+        assert!(rendered.contains("token"), "{rendered}");
+
+        // A secret longer than the old 160-char bound is equally absent.
+        let long = "S3CRET".repeat(60);
+        let err = from_query_str::<Guarded>(&format!("token={long}")).expect_err("helper rejects");
+        assert!(!err.to_string().contains("S3CRET"), "{err}");
     }
 
     #[test]

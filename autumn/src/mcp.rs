@@ -2209,8 +2209,20 @@ fn encode_query_arg(
                 .iter()
                 .all(|item| !matches!(item, Value::Array(_) | Value::Object(_)));
             if all_scalar {
-                for item in items {
-                    out.push(key, query_scalar(item))?;
+                if let [only] = items.as_slice() {
+                    // Repeated keys carry a sequence only from the *second*
+                    // occurrence on: one `tags=only` pair is indistinguishable
+                    // from a scalar, so `deserialize_any` (an untyped
+                    // `serde_json::Value` target) would yield `"only"` for the
+                    // `["only"]` the caller sent — and the field would turn
+                    // back into an array on gaining a second element. The
+                    // explicit position pins the kind. A typed `Vec` target
+                    // decodes either form identically.
+                    out.push(&format!("{key}[0]"), query_scalar(only))?;
+                } else {
+                    for item in items {
+                        out.push(key, query_scalar(item))?;
+                    }
                 }
             } else {
                 for (index, item) in items.iter().enumerate() {
@@ -2233,10 +2245,23 @@ fn encode_query_arg(
         // the target, so it refuses the shape rather than dispatch a value the
         // caller did not ask for. Mixed keys are fine: the named one forces the
         // decoder to promote the whole node to a map.
+        // A `null` field emits no pair, so it cannot disambiguate anything: it
+        // is invisible to the decoder. Judging the shape on *declared* keys let
+        // `{"0": 5, "kind": null}` through, which reaches the wire as the bare
+        // `counts[0]=5` this arm exists to refuse. So the check runs over the
+        // fields that actually emit. An all-null object is left to fall through
+        // to the collapse check below, which describes it better.
         Value::Object(fields)
-            if fields
-                .keys()
-                .all(|field| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit())) =>
+            if {
+                let mut emitting = fields
+                    .iter()
+                    .filter(|(_, value)| !value.is_null())
+                    .peekable();
+                emitting.peek().is_some()
+                    && emitting.all(|(field, _)| {
+                        !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit())
+                    })
+            } =>
         {
             return Err(format!(
                 "query argument `{key}` is an object whose field names are all numeric; a \
@@ -2891,6 +2916,51 @@ mod tests {
         let err = encode_query_arg("counts", &json!({ "": 1 }), 1, &mut pairs)
             .expect_err("an empty field name is inexpressible");
         assert!(err.contains("may not be empty"), "{err}");
+    }
+
+    #[test]
+    fn a_singleton_scalar_array_keeps_its_container_kind() {
+        // Codex P2: one repeated key is indistinguishable from a scalar, so a
+        // one-element array must use the explicit position instead.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("tags", &json!(["only"]), 1, &mut pairs).expect("encodes");
+        assert_eq!(
+            pairs.pairs,
+            vec![("tags[0]".to_owned(), "only".to_owned())],
+            "a singleton must pin its kind"
+        );
+
+        // Two or more still use the repeated-key (OpenAPI form/explode) shape.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("tags", &json!(["a", "b"]), 1, &mut pairs).expect("encodes");
+        assert_eq!(
+            pairs.pairs,
+            vec![
+                ("tags".to_owned(), "a".to_owned()),
+                ("tags".to_owned(), "b".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_numeric_object_check_ignores_fields_that_emit_nothing() {
+        // Codex P2: a `null` field emits no pair, so it cannot disambiguate —
+        // judging on declared keys let this reach the wire as bare `counts[0]=5`.
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("counts", &json!({ "0": 5, "kind": null }), 1, &mut pairs)
+            .expect_err("the null field cannot disambiguate");
+        assert!(err.contains("all numeric"), "{err}");
+
+        // A named field that *does* emit still disambiguates, as before.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("counts", &json!({ "0": 5, "kind": "x" }), 1, &mut pairs)
+            .expect("an emitting named key resolves the shape");
+
+        // An all-null object keeps its own, more specific collapse error.
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("counts", &json!({ "0": null }), 1, &mut pairs)
+            .expect_err("an all-null object carries no value");
+        assert!(err.contains("carries no value"), "{err}");
     }
 
     #[test]
