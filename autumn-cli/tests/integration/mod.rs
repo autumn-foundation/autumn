@@ -5,6 +5,7 @@ mod console;
 mod db;
 mod db_pull;
 mod deploy;
+mod edge;
 mod generate_json_postgres;
 mod generate_lock_version_postgres;
 mod generate_position_scaffold;

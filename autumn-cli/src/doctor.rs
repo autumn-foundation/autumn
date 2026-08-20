@@ -7119,6 +7119,28 @@ pub fn run(opts: DoctorOptions) {
         check_model_private_columns_impl(&found)
     }));
 
+    // 16. Edge capsule toolchain (issue #1790): a project with `#[edge]` routes
+    //     needs the wasm32-wasip1 std library installed or `autumn build` cannot
+    //     emit the capsule. Both the source scan and the toolchain probe run
+    //     inside the task so they overlap with the other checks.
+    tasks.push(Box::new(|| {
+        let scan = crate::edge_scan::resolve_edge_scan(std::path::Path::new("."));
+        // Probe the toolchain only when the answer can matter: a project with no
+        // #[edge] routes must not pay for a `rustc` spawn on every doctor run.
+        let installed = !scan.is_empty() && crate::build::edge_target_installed();
+        check_edge_target_impl(&scan, installed)
+    }));
+
+    // 17. Edge route wiring (issue #1790): an `#[edge]` handler that also
+    //     carries an auth guard fails the build, an unregistered one is never
+    //     served at the edge, and a missing `src/bin/edge-capsule.rs` leaves
+    //     nothing to compile.
+    tasks.push(Box::new(|| {
+        let scan = crate::edge_scan::resolve_edge_scan(std::path::Path::new("."));
+        let capsule_bin_exists = std::path::Path::new(EDGE_CAPSULE_BIN).exists();
+        check_edge_routes_impl(&scan, capsule_bin_exists)
+    }));
+
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
     #[allow(clippy::needless_collect)]
     let handles: Vec<thread::JoinHandle<CheckResult>> =
@@ -8066,11 +8088,251 @@ fn parse_pub_field_name(line: &str) -> Option<String> {
     Some(name.to_owned())
 }
 
+// ─── Edge capsule preflight (#1790) ──────────────────────────────────────────
+
+/// The `src/bin/edge-capsule.rs` an app with `#[edge]` routes needs.
+const EDGE_CAPSULE_BIN: &str = "src/bin/edge-capsule.rs";
+
+/// Whether the project can compile its `#[edge]` routes at all: the
+/// `wasm32-wasip1` standard library has to be installed for the active
+/// toolchain, or `autumn build` cannot emit the edge capsule.
+///
+/// Pure and injectable: `scan` is the pre-resolved source scan and
+/// `target_installed` the pre-resolved toolchain probe (both resolved inside the
+/// task closure in [`run`]).
+pub fn check_edge_target_impl(
+    scan: &crate::edge_scan::EdgeScan,
+    target_installed: bool,
+) -> CheckResult {
+    const NAME: &str = "edge_target";
+    if scan.is_empty() {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some("no #[edge] routes".into()),
+            hint: None,
+        };
+    }
+    if target_installed {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "{} #[edge] route(s); the {} target is installed",
+                scan.functions.len(),
+                crate::build::EDGE_TARGET,
+            )),
+            hint: None,
+        };
+    }
+    let mut files: Vec<&str> = scan.functions.iter().map(|f| f.file.as_str()).collect();
+    files.sort_unstable();
+    files.dedup();
+    CheckResult {
+        name: NAME,
+        status: CheckStatus::Fail,
+        detail: Some(format!(
+            "{} #[edge] route(s) in {} need the {} target, which is not installed",
+            scan.functions.len(),
+            files.join(", "),
+            crate::build::EDGE_TARGET,
+        )),
+        hint: Some(crate::build::EDGE_TARGET_HINT),
+    }
+}
+
+/// Whether the project's `#[edge]` routes are wired the way the capsule needs.
+///
+/// Reported in precedence order, worst first, so the single line always names
+/// the most urgent problem:
+/// 1. an `#[edge]` handler that also carries an auth/rate-limit guard — the
+///    `#[edge]` macro rejects that pair, so this is a build failure caught
+///    before the build;
+/// 2. a marked handler no `edge_routes![]` registers — it compiles, but the
+///    capsule never serves it;
+/// 3. edge routes with no `src/bin/edge-capsule.rs` — nothing to compile into.
+///
+/// Pure and injectable: `capsule_bin_exists` is resolved by the caller.
+pub fn check_edge_routes_impl(
+    scan: &crate::edge_scan::EdgeScan,
+    capsule_bin_exists: bool,
+) -> CheckResult {
+    const NAME: &str = "edge_routes";
+    if scan.is_empty() {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some("no #[edge] routes".into()),
+            hint: None,
+        };
+    }
+
+    let guarded = scan.guarded();
+    if !guarded.is_empty() {
+        let lines: Vec<String> = guarded
+            .iter()
+            .map(|f| format!("{} also carries #[{}]", f.location(), f.guards.join("]/#[")))
+            .collect();
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Fail,
+            detail: Some(lines.join("\n")),
+            hint: Some(
+                "Remove #[edge] or the conflicting attribute: edge routes are unauthenticated \
+                 read-path routes served without origin middleware — the capsule has no session, \
+                 auth, or rate-limit state, and #[intercept] layers do not run there.",
+            ),
+        };
+    }
+
+    let unregistered = scan.unregistered();
+    if !unregistered.is_empty() {
+        let lines: Vec<String> = unregistered
+            .iter()
+            .map(|f| format!("{} is not registered", f.location()))
+            .collect();
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Warn,
+            detail: Some(lines.join("\n")),
+            hint: Some(
+                "Add the handler to edge_routes![] and pass it to the edge-capsule bin; \
+                 an unregistered #[edge] route is only ever served by the origin.",
+            ),
+        };
+    }
+
+    if !capsule_bin_exists {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{} #[edge] route(s) registered but {EDGE_CAPSULE_BIN} is missing",
+                scan.functions.len()
+            )),
+            hint: Some(
+                "Create src/bin/edge-capsule.rs calling autumn_edge::serve(...) with your \
+                 edge_routes![] list so `autumn build` can compile the capsule.",
+            ),
+        };
+    }
+
+    CheckResult {
+        name: NAME,
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "{} #[edge] route(s) registered with edge_routes![]",
+            scan.registered_fns().len()
+        )),
+        hint: None,
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Edge capsule preflight (#1790) ───────────────────────────────────────
+
+    fn edge_scan_of(src: &str) -> crate::edge_scan::EdgeScan {
+        crate::edge_scan::scan_sources(&[("src/routes.rs", src)])
+    }
+
+    /// One marked, registered, guard-free handler — the healthy shape.
+    fn healthy_edge_scan() -> crate::edge_scan::EdgeScan {
+        edge_scan_of("#[edge]\nfn greet() {}\nfn wire() { edge_routes![greet]; }")
+    }
+
+    #[test]
+    fn edge_target_passes_without_edge_routes() {
+        let scan = edge_scan_of("#[get(\"/\")]\nfn home() {}");
+        // Passes whether or not the wasm target happens to be installed.
+        for installed in [true, false] {
+            let r = check_edge_target_impl(&scan, installed);
+            assert_eq!(r.status, CheckStatus::Pass);
+            assert_eq!(r.detail.as_deref(), Some("no #[edge] routes"));
+            assert!(r.hint.is_none());
+        }
+    }
+
+    #[test]
+    fn edge_target_passes_when_installed() {
+        let r = check_edge_target_impl(&healthy_edge_scan(), true);
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert!(r.detail.unwrap().contains("wasm32-wasip1"));
+    }
+
+    #[test]
+    fn edge_target_fails_with_rustup_hint_when_missing() {
+        let r = check_edge_target_impl(&healthy_edge_scan(), false);
+        assert_eq!(r.status, CheckStatus::Fail);
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("1 #[edge] route(s)"), "{detail}");
+        assert!(detail.contains("src/routes.rs"), "{detail}");
+        assert_eq!(r.hint, Some("Run `rustup target add wasm32-wasip1`"));
+    }
+
+    #[test]
+    fn edge_routes_passes_without_edge_routes() {
+        let r = check_edge_routes_impl(&edge_scan_of("fn home() {}"), false);
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert_eq!(r.detail.as_deref(), Some("no #[edge] routes"));
+    }
+
+    #[test]
+    fn edge_routes_passes_when_registered_with_a_capsule_bin() {
+        let r = check_edge_routes_impl(&healthy_edge_scan(), true);
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert!(r.detail.unwrap().contains("1 #[edge] route(s) registered"));
+    }
+
+    #[test]
+    fn edge_routes_warns_on_an_unregistered_handler() {
+        let scan = edge_scan_of("#[edge]\nfn greet() {}");
+        let r = check_edge_routes_impl(&scan, true);
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(
+            r.detail.unwrap().contains("greet @ src/routes.rs:2"),
+            "the warning must name the handler and its location"
+        );
+        assert!(r.hint.unwrap().contains("edge_routes![]"));
+    }
+
+    #[test]
+    fn edge_routes_fails_on_an_auth_guarded_handler() {
+        // The `#[edge]` macro rejects this pair; doctor catches it pre-build.
+        let scan =
+            edge_scan_of("#[edge]\n#[secured]\nfn dash() {}\nfn wire() { edge_routes![dash]; }");
+        let r = check_edge_routes_impl(&scan, true);
+        assert_eq!(r.status, CheckStatus::Fail);
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("dash @ src/routes.rs:3"), "{detail}");
+        assert!(detail.contains("#[secured]"), "{detail}");
+        assert!(r.hint.unwrap().contains("unauthenticated read-path"));
+    }
+
+    #[test]
+    fn edge_routes_guard_failure_outranks_registration_warning() {
+        // Both problems present: the build-breaking one must be reported.
+        let scan = edge_scan_of("#[edge]\n#[authorize(\"admin\")]\nfn dash() {}");
+        assert_eq!(
+            check_edge_routes_impl(&scan, false).status,
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn edge_routes_warns_when_the_capsule_bin_is_missing() {
+        let r = check_edge_routes_impl(&healthy_edge_scan(), false);
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(
+            r.detail.unwrap().contains("src/bin/edge-capsule.rs"),
+            "the warning must name the file to create"
+        );
+        assert!(r.hint.unwrap().contains("autumn_edge::serve"));
+    }
 
     #[test]
     fn offsite_backup_pass_when_unconfigured() {

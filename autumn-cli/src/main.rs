@@ -18,6 +18,7 @@ mod dev;
 mod dev_loop_bench;
 mod dev_loop_scaling;
 mod doctor;
+mod edge_scan;
 mod experiments;
 mod export;
 mod flags;
@@ -357,6 +358,13 @@ enum Commands {
         /// `autumn-web/managed-pg-bundled` are active throughout all build steps.
         #[arg(long, value_name = "FEATURES")]
         features: Option<String>,
+        /// Also compile the `#[edge]` routes into a `wasm32-wasip1` edge
+        /// capsule. Release builds do this automatically when the project has
+        /// `#[edge]` routes; pass `--edge` to build it from a `--debug` build
+        /// too (the capsule itself is always compiled in release profile).
+        /// Errors when the project has no `#[edge]` routes.
+        #[arg(long)]
+        edge: bool,
     },
     /// Start the dev server with hot reload (watch mode)
     Dev {
@@ -3069,9 +3077,11 @@ fn run_command(command: Commands) {
             bin,
             embed,
             features,
+            edge,
         } => build::run(
             debug,
             embed,
+            edge,
             package.as_deref(),
             bin.as_deref(),
             features.as_deref(),
@@ -4971,6 +4981,7 @@ mod tests {
                 bin: None,
                 embed: false,
                 features: None,
+                edge: false,
             }
         ));
     }
@@ -4986,6 +4997,21 @@ mod tests {
                 bin: None,
                 embed: false,
                 features: None,
+                edge: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_build_edge_flag() {
+        let cli = Cli::try_parse_from(["autumn", "build", "--edge"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Build {
+                debug: false,
+                embed: false,
+                edge: true,
+                ..
             }
         ));
     }

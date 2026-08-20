@@ -60,6 +60,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the payload's `type` field, so `--event` warns rather than silently doing
   nothing there. A `409 Conflict` response now explains which replay key
   rejected the delivery, and an HTML error page is summarized instead of dumped.
+- **Edge WASM capsule, first slice (#1790):** mark a read-path handler
+  `#[edge]`, register it with `edge_routes![]`, and a single `autumn build`
+  emits a portable `wasm32-wasip1` **edge capsule** alongside the native binary
+  — one codebase, no vendor SDK, no rewrite. The capsule runs the same `axum`
+  router over the same handler source at the CDN edge; the origin binary stays
+  the authority and still mounts every edge route, so anything the edge cannot
+  serve — a write method, an unknown path, an unmediated capability, a panic —
+  becomes a typed `fallthrough` the host forwards upstream, with no
+  author-written glue. One platform seam is mediated: `EdgeCache` over the new
+  `EdgeKv` trait reads the app's own cache at the origin
+  (`AppBuilder::with_edge_kv`, the new non-default `edge` feature) and performs
+  a host round trip at the edge, so `#[edge(needs(kv))]` handlers compile
+  unchanged for both substrates. Refusals are compile-time and actionable: a
+  native-only extractor fails the `EdgeHandler` bound with a diagnostic naming
+  the fix, and `#[edge]` on a non-GET route or alongside
+  `#[secured]`/`#[authorize]`/`#[step_up]`/`#[throttle]`/`#[static_get]` is a
+  spanned error. `autumn doctor` gains `edge_target` and `edge_routes`. The
+  byte-identity claim is proven, not asserted: `examples/edge-greeting` drives
+  one request corpus through the native lane, a real wasm artifact and the full
+  origin app in the new unfiltered `edge-conformance` CI job. The
+  `autumn-edge` crate, its wire protocol and its host API are **experimental**.
+  See `docs/guide/edge.md`.
 
 - **Ordered-list `position` field with transaction-safe reorder helpers
   (#1358):** a new `position` DSL token (`rank:position`, or scoped to a

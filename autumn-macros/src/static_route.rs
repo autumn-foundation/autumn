@@ -107,6 +107,16 @@ impl Parse for StaticGetAttrs {
 ///    `::autumn_web::static_gen::StaticRouteMeta`.
 #[allow(clippy::too_many_lines)]
 pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // `#[edge]` would be inert here and silently so: the page is rendered at
+    // build time and served from the CDN already (#1790).
+    if let Some(err) = crate::edge::reject_if_edge(
+        &item,
+        "a `#[static_get]` route is already pre-rendered and served CDN-side; \
+         `#[edge]` adds nothing",
+    ) {
+        return err;
+    }
+
     let attrs: StaticGetAttrs = match syn::parse2(attr) {
         Ok(a) => a,
         Err(err) => return err.to_compile_error(),
@@ -427,6 +437,60 @@ mod tests {
         assert!(
             generated.contains("compile_error"),
             "a second seo(...) argument must be a compile error on static routes: {generated}"
+        );
+    }
+
+    // ── `#[edge]` is meaningless on a pre-rendered route (#1790) ────────────
+
+    #[test]
+    fn static_get_rejects_a_live_edge_attribute() {
+        let generated = static_get_macro(
+            quote! { "/about" },
+            quote! {
+                #[edge]
+                async fn about() -> &'static str { "about" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("compile_error"),
+            "#[edge] on a #[static_get] route must be rejected: {generated}"
+        );
+        assert!(
+            generated.contains("already pre-rendered"),
+            "the error must explain that the page is already served CDN-side: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_an_expanded_edge_marker() {
+        // `#[edge]` written above `#[static_get]`, so it expanded first and
+        // left only the `__AUTUMN_EDGE` marker in the body.
+        let edged = crate::edge::edge_macro(
+            quote! {},
+            quote! { async fn about() -> &'static str { "about" } },
+        );
+        let generated = static_get_macro(quote! { "/about" }, edged).to_string();
+        assert!(
+            generated.contains("compile_error"),
+            "an already-expanded #[edge] must be rejected on #[static_get] too: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_without_edge_is_untouched() {
+        let generated = static_get_macro(
+            quote! { "/about" },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("compile_error"),
+            "an ordinary static route must still compile: {generated}"
+        );
+        assert!(
+            !generated.contains("autumn_edge"),
+            "an ordinary static route must not reference autumn_edge: {generated}"
         );
     }
 

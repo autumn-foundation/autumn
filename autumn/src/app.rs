@@ -1943,6 +1943,60 @@ impl AppBuilder {
         self
     }
 
+    /// Provide the key/value seam an `#[edge]` handler reads at the origin
+    /// (issue #1790).
+    ///
+    /// An `#[edge(needs(kv))]` handler takes an
+    /// [`EdgeCache`](autumn_edge::EdgeCache) extractor. At the edge the capsule
+    /// runtime injects that handle per request; at the origin this method does,
+    /// installing it as an app-wide extension layer so the *same handler
+    /// source* serves from both substrates. Without it the extractor declines
+    /// with an actionable `500` naming this call.
+    ///
+    /// Most apps pass [`CacheEdgeKv`](crate::CacheEdgeKv) over the cache they
+    /// already run, so anything the origin publishes with
+    /// [`cache::insert_cached`](crate::cache::insert_cached) is visible to the
+    /// edge lane; any other [`EdgeKv`](autumn_edge::EdgeKv) works just as well.
+    ///
+    /// # Not a database
+    ///
+    /// The seam is a non-authoritative, read-only replica (ADR-0004 category
+    /// 2): a miss is always a legal answer and staleness is expected. Routes
+    /// whose correctness depends on a fresh, authoritative read belong on the
+    /// origin — see [`edge_support`](crate::edge_support).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    ///
+    /// use autumn_web::CacheEdgeKv;
+    /// use autumn_web::cache::{Cache, MokaCache};
+    /// use autumn_web::edge::EdgeKv;
+    /// use autumn_web::prelude::*;
+    ///
+    /// # #[get("/health")] async fn health() -> &'static str { "ok" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// let cache = Arc::new(MokaCache::new(1_024, None)) as Arc<dyn Cache>;
+    ///
+    /// autumn_web::app()
+    ///     .routes(routes![health])
+    ///     .with_edge_kv(Arc::new(CacheEdgeKv::new(cache)) as Arc<dyn EdgeKv>)
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[cfg(feature = "edge")]
+    #[must_use]
+    pub fn with_edge_kv(self, kv: Arc<dyn autumn_edge::EdgeKv>) -> Self {
+        // `EdgeCache::layer` hands back a ready-made `axum::Extension`, which is
+        // itself a `tower::Layer` and therefore an `IntoAppLayer` — the same
+        // plumbing `install_i18n_bundle_layer` uses. No adapter needed, and the
+        // injection type stays an implementation detail of `autumn-edge`.
+        self.layer(autumn_edge::EdgeCache::layer(kv))
+    }
+
     /// Register an [`ErrorReporter`](crate::reporting::ErrorReporter) for
     /// unhandled panics and 5xx responses.
     ///

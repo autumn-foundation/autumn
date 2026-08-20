@@ -425,8 +425,12 @@ where
         // Self-exclusion: don't record requests to the inspector's own subtree.
         // Use exact match or subtree prefix ("/prefix/") to avoid false-excluding
         // unrelated routes that share the same string prefix (e.g. "/_autumn/inspector").
-        let is_inspector = path == self.inspector_path_prefix
-            || path.starts_with(&format!("{}/", self.inspector_path_prefix));
+        // `strip_prefix` + a boundary check gets the same semantics as
+        // `format!("{prefix}/")` + `starts_with` without allocating a String
+        // on every request.
+        let is_inspector = path
+            .strip_prefix(self.inspector_path_prefix.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
         if is_inspector {
             let fut = self.inner.call(req);
             return Box::pin(fut);

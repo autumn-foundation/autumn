@@ -25,6 +25,19 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/static_get_params_no_placeholders.rs");
     t.compile_fail("tests/compile-fail/static_get_seo_unknown_key.rs");
 
+    // Edge-lane refusals (#1790). Always available: `#[edge]` is re-exported
+    // unconditionally (a route can be *marked* without the `edge` feature), and
+    // each of these is rejected inside the route macro before any code is
+    // emitted, so the fixtures never name `autumn_edge` and compile the same way
+    // with or without the feature. The edge lane is read-path only, carries no
+    // session or auth state, and adds nothing to a page that is already
+    // pre-rendered CDN-side.
+    t.compile_fail("tests/compile-fail/edge_on_post.rs");
+    t.compile_fail("tests/compile-fail/edge_with_secured.rs");
+    t.compile_fail("tests/compile-fail/edge_with_intercept.rs");
+    t.compile_fail("tests/compile-fail/edge_with_extension.rs");
+    t.compile_fail("tests/compile-fail/edge_on_static_get.rs");
+
     // Lifecycle macro failures (always available — the `lifecycle` macro is not
     // feature-gated). Firing an undeclared transition, leaving a terminal
     // state, starting from a non-initial state, or naming an unknown initial

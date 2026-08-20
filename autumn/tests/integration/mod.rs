@@ -53,6 +53,12 @@ mod directory_shard_router;
 mod distributed_lock;
 mod download;
 mod duplicate_route_detection;
+// The origin-side half of the edge capsule (#1790). `cache-moka` supplies the
+// concrete `Cache` the `CacheEdgeKv` adapter is proven against; the wasm half
+// of the parity claim lives in the example crate's conformance suite, which
+// needs the `wasm32-wasip1` target and must never be swept in here.
+#[cfg(all(feature = "edge", feature = "cache-moka"))]
+mod edge_native;
 #[cfg(all(feature = "embed-assets", feature = "i18n"))]
 mod embed_assets_integration;
 #[cfg(feature = "db")]

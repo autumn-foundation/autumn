@@ -97,11 +97,32 @@ The concrete definition of "breaking" matches the Rust API guidelines and the
   excluded.
 - Debug output (`Debug` impls). Useful for logs, not parsable.
 - Private modules (`pub(crate)`, `pub(super)`) and the `tests` modules.
+- **The edge capsule lane (issue #1790).** The `autumn-edge` crate, the
+  `#[edge]` / `edge_routes![]` macro surface, `AppBuilder::with_edge_kv`, the
+  capsule **wire protocol** (`WIRE_VERSION`, its NDJSON frames) and the
+  reference **host API** (`autumn_edge::host`) are experimental and may change
+  in any release. The protocol carries a version field precisely so a host and
+  an artifact built from different Autumn versions degrade to origin-serving
+  instead of guessing.
 
 When in doubt: if `cargo doc --no-deps` doesn't list it, it is not part of
 the public API.
 
 [`AppBuilder::run`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html
+
+### The edge capsule's byte-identity claim
+
+The edge lane promises that a request the capsule serves gets the same status,
+the same body bytes and the same headers (after the documented
+[projection](docs/guide/edge.md#byte-identity-what-is-actually-guaranteed)) as
+the origin binary would give — **for the origin binary and the edge artifact of
+the same build**. It is a statement about two compilations of one source tree
+agreeing with each other, proven per build by the `edge-conformance` CI job.
+
+It is explicitly *not* a promise across versions. Rendered bytes are already
+excluded from SemVer above, and that exclusion applies to both lanes equally: a
+release may change what a handler renders, so long as it changes the origin and
+the capsule together. Rebuild both from the same tree and deploy them together.
 
 ## What counts as a breaking change
 
