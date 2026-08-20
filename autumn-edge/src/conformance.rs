@@ -29,6 +29,11 @@ use crate::wire::{
 /// middleware stack produces and the edge lane structurally cannot. Growing
 /// this list weakens the guarantee, so it is one constant rather than a
 /// per-test allowance.
+///
+/// `set-cookie` qualifies because the exclusion cannot mask a handler-set
+/// cookie: the wire runtime *declines* any edge response carrying one (cookies
+/// are origin-only session state), so on the edge side the header never
+/// exists — only the origin's session middleware produces it.
 pub const VOLATILE_HEADERS: &[&str] = &[
     "content-security-policy",
     "date",

@@ -301,6 +301,19 @@ where
         // serves the request with the value intact.
         let mut headers = Vec::with_capacity(response.headers().len());
         for (name, value) in response.headers() {
+            // Cookies are session state, and sessions are origin-only: a
+            // cached edge response carrying `set-cookie` would smear one
+            // client's cookie across every client behind the CDN. Declining
+            // lets the origin — which owns cookie semantics — serve it.
+            if name.as_str().eq_ignore_ascii_case("set-cookie") {
+                return EdgeOutcome::fallthrough(
+                    FallthroughReason::CapsuleError,
+                    format!(
+                        "the handler for {uri} set a cookie; cookies are session state, which \
+                         is origin-only — the edge lane never sets cookies"
+                    ),
+                );
+            }
             let Ok(text) = std::str::from_utf8(value.as_bytes()) else {
                 return EdgeOutcome::fallthrough(
                     FallthroughReason::CapsuleError,

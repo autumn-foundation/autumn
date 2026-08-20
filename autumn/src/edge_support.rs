@@ -36,8 +36,10 @@
 // `examples/edge-greeting` is a workspace member whose native build enables
 // `autumn-web/edge`, and cargo unifies features across the graph.
 //
-// It nevertheless carries no `autumn-panic-gate:` marker and no
-// `scripts/check-panic-gate.sh` manifest entry, on purpose. That script counts a
+// It nevertheless carries no panic-gate marker comment and no
+// `scripts/check-panic-gate.sh` manifest entry, on purpose. (Not even a
+// *mention* of the marker tag: the gate's reverse-manifest scan greps for the
+// literal tag text, so naming it here would enroll this module.) That script counts a
 // non-default feature as linted only when an enforcing
 // `cargo clippy -p autumn-web --features "…" -- -D warnings` lane names it, and
 // none does (nor should one — the workspace lane already covers this module).

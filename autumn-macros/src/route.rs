@@ -301,6 +301,13 @@ const EDGE_INTERCEPT_ERROR: &str = "`#[edge]` cannot be combined with `#[interce
                                     not carried into the edge capsule, so the two lanes would \
                                     serve different bytes; serve this route from the origin";
 
+/// Compile error for an `#[edge]` handler taking `Extension<T>`.
+const EDGE_EXTENSION_ERROR: &str = "`#[edge]` handlers cannot take `Extension<...>` — the \
+                                    capsule installs no request extensions (the `EdgeCache` seam \
+                                    is the one mediated capability), so a missing extension \
+                                    would be served as a 500 instead of falling through; use \
+                                    `EdgeCache`, or serve this route from the origin";
+
 /// Marker consts the auth/rate guards inject into a handler body. A guard that
 /// expanded *before* this route macro left one of these behind instead of an
 /// attribute, and missing it would ship a guarded route to the unauthenticated
@@ -333,7 +340,36 @@ fn reject_ineligible_edge_route(
     if has_interceptors {
         return Some(syn::Error::new(span, EDGE_INTERCEPT_ERROR).to_compile_error());
     }
+    if has_extension_param(input_fn) {
+        return Some(syn::Error::new(span, EDGE_EXTENSION_ERROR).to_compile_error());
+    }
     None
+}
+
+/// Whether any parameter's type names `Extension` — `Extension<T>`,
+/// `axum::Extension<T>`, or nested as `Option<Extension<T>>`.
+///
+/// `Extension` satisfies axum's `Handler<_, EdgeState>` bound for *any* state,
+/// so the type system alone cannot keep it out of the edge lane; this
+/// syntactic check is the enforcement point. A type alias that hides the name
+/// is not resolved — the same recognition limit every source-level check in
+/// this crate documents.
+fn has_extension_param(input_fn: &syn::ItemFn) -> bool {
+    input_fn.sig.inputs.iter().any(|arg| {
+        let syn::FnArg::Typed(pat_type) = arg else {
+            return false;
+        };
+        tokens_contain_ident(&quote! { #pat_type }, "Extension")
+    })
+}
+
+/// Whether `stream` contains `needle` as an exact identifier, at any nesting.
+fn tokens_contain_ident(stream: &TokenStream, needle: &str) -> bool {
+    stream.clone().into_iter().any(|tree| match tree {
+        proc_macro2::TokenTree::Ident(ident) => ident == needle,
+        proc_macro2::TokenTree::Group(group) => tokens_contain_ident(&group.stream(), needle),
+        _ => false,
+    })
 }
 
 /// Whether an auth or rate guard is declared on the handler, in either
@@ -1788,6 +1824,73 @@ mod tests {
         assert!(
             generated.contains("compile_error"),
             "an expanded #[edge] marker + live #[intercept] must be rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_with_extension_param_is_a_compile_error() {
+        // `Extension<T>` satisfies the Handler bound for any state, so the
+        // type system cannot keep it out of the capsule; the macro must.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/tenant" },
+            quote! {
+                #[edge]
+                async fn tenant(ext: Extension<TenantConfig>) -> String { ext.name() }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "#[edge] + Extension<T> must be rejected: {generated}"
+        );
+        assert!(
+            generated.contains("installs no request extensions"),
+            "the error must explain the missing-extension 500 hazard: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_with_nested_extension_param_is_a_compile_error() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/tenant" },
+            quote! {
+                #[edge]
+                async fn tenant(ext: Option<axum::Extension<TenantConfig>>) -> String { greet() }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a nested Extension extractor must be rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_cache_param_is_not_mistaken_for_an_extension() {
+        // EdgeCache is delivered through an extension internally, but the
+        // parameter type the author writes never names `Extension`.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/note/{key}" },
+            quote! {
+                #[edge(needs(kv))]
+                async fn note(Path(key): Path<String>, cache: EdgeCache) -> String {
+                    cache.get_string(&key).unwrap_or_default()
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("compile_error"),
+            "EdgeCache must stay accepted: {generated}"
         );
     }
 

@@ -61,6 +61,20 @@ async fn garbled_optout() -> (
     )
 }
 
+/// A handler that tries to set a cookie — session state the edge lane must
+/// decline rather than let a CDN cache smear across clients.
+async fn cookie_setter() -> (
+    http::StatusCode,
+    [(&'static str, &'static str); 1],
+    &'static str,
+) {
+    (
+        http::StatusCode::OK,
+        [("Set-Cookie", "bucket=a")],
+        "assigned",
+    )
+}
+
 /// A handler whose response header value is valid HTTP but not valid UTF-8 —
 /// it cannot cross the JSON wire byte-faithfully, so the runtime must decline
 /// rather than serve a lossily rewritten value the origin would never send.
@@ -87,6 +101,13 @@ fn routes() -> Vec<EdgeRoute> {
             path: "/latin1",
             handler: edge_get(latin1_header),
             name: "latin1_header",
+            needs: &[],
+        },
+        EdgeRoute {
+            method: http::Method::GET,
+            path: "/cookie",
+            handler: edge_get(cookie_setter),
+            name: "cookie_setter",
             needs: &[],
         },
         EdgeRoute {
@@ -232,6 +253,19 @@ fn head_is_served_by_the_get_router_with_an_empty_body_and_gets_content_length()
         "HEAD must advertise the GET body's content-length"
     );
     assert_eq!(header(head_response, "x-edge-lane"), Some("edge"));
+}
+
+#[test]
+fn a_cookie_setting_handler_is_a_fallthrough_not_a_cacheable_session_leak() {
+    let frames = drive(&[request_line(EdgeRequest::get("/cookie"), &[])]);
+
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    let (reason, detail) = expect_fallthrough(&frames[0]);
+    assert_eq!(reason, FallthroughReason::CapsuleError);
+    assert!(
+        detail.contains("cookie") && detail.contains("origin-only"),
+        "the decline must name the cookie hazard: {detail}"
+    );
 }
 
 #[test]

@@ -147,6 +147,7 @@ lane could not honour:
 | `#[post]` / `#[put]` / `#[delete]` + `#[edge]` | the edge lane is read-path only; the origin is the authority for every write |
 | `#[secured]` / `#[authorize]` / `#[step_up]` / `#[throttle]` + `#[edge]` | the capsule has no session, no auth state, and no shared rate counter |
 | `#[intercept(...)]` + `#[edge]` | interceptor layers are origin-only tower middleware; the capsule mounts the bare handler, so the two lanes would serve different bytes |
+| an `Extension<T>` parameter + `#[edge]` | the capsule installs no request extensions (`EdgeCache` is the one mediated seam); a missing extension would be served as a 500 instead of falling through |
 | `#[static_get]` + `#[edge]` | the route is already pre-rendered and served CDN-side; a capsule adds nothing |
 | `#[ws]` / `#[oauth2_callback]` + `#[edge]` | neither is a read-path GET |
 | `#[edge(needs(db))]` | `kv` is the only capability the host mediates today |
@@ -347,6 +348,10 @@ A host implementation you can read top to bottom lives in
   wall-clock or instruction limit the same way.
 - **Fallthrough details never leak.** A declining response's body is a message
   for a developer; it is not forwarded, and neither is the sentinel header.
+- **No cookies from the edge.** A handler response carrying `set-cookie` is
+  declined at the wire (a `capsule_error` fallthrough): cookies are session
+  state, sessions are origin-only, and a cached edge response with a cookie
+  would smear one client's state across everyone behind the CDN.
 - **The artifact is a program, not an asset.** `autumn build` never copies the
   `.wasm` into `dist/` or `static/`, and you should not either: publishing it as
   a static asset would serve your capsule to browsers instead of running it at

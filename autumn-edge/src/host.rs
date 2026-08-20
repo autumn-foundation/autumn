@@ -45,7 +45,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use wasmi::{Caller, Config, Engine, Linker, Module, Store};
+use wasmi::{Caller, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 use crate::kv::EdgeKv;
 use crate::route::EdgeCapability;
@@ -102,6 +102,16 @@ impl std::error::Error for EdgeHostError {}
 /// forever. Exhaustion is reported as a [`FallthroughReason::CapsuleError`]
 /// naming the budget, so the origin serves the request.
 pub const FUEL_BUDGET: u64 = 1_000_000_000;
+
+/// Linear-memory ceiling for one request's guest instance, in bytes (256 MiB).
+///
+/// Fuel bounds computation; this bounds allocation. Without it a single
+/// `memory.grow` could demand gigabytes from the host allocator and kill the
+/// process instead of producing a fallthrough. When the ceiling is hit the
+/// grow fails inside the guest (its allocator then aborts, which traps) or
+/// instantiation is refused — both surface as a
+/// [`FallthroughReason::CapsuleError`], never as a dead host.
+pub const MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// A compiled edge capsule, ready to serve requests.
 ///
@@ -185,6 +195,7 @@ impl EdgeArtifact {
         store
             .set_fuel(FUEL_BUDGET)
             .map_err(|err| EdgeHostError::Host(format!("could not set the fuel budget: {err}")))?;
+        store.limiter(|state| &mut state.limits);
         let mut linker = <Linker<HostState<'_>>>::new(&self.engine);
         define_wasi_shim(&mut linker)?;
 
@@ -261,6 +272,9 @@ struct HostState<'kv> {
     terminal: Option<EdgeOutcome>,
     /// Fixed-seed PRNG state, so `random_get` is reproducible.
     random_state: u64,
+    /// Resource ceilings ([`MEMORY_BUDGET_BYTES`]) the store's limiter answers
+    /// from — wasmi queries it on every `memory.grow` and at instantiation.
+    limits: StoreLimits,
 }
 
 impl<'kv> HostState<'kv> {
@@ -277,6 +291,9 @@ impl<'kv> HostState<'kv> {
             kv_provided,
             terminal: None,
             random_state: Self::RANDOM_SEED,
+            limits: StoreLimitsBuilder::new()
+                .memory_size(MEMORY_BUDGET_BYTES)
+                .build(),
         }
     }
 
@@ -771,6 +788,35 @@ mod tests {
         };
         assert_eq!(reason, FallthroughReason::CapsuleError);
         assert!(detail.contains("execution budget"), "{detail}");
+    }
+
+    #[test]
+    fn a_memory_hungry_module_is_refused_instead_of_killing_the_host() {
+        // A hand-assembled module declaring a 4097-page (256 MiB + 64 KiB)
+        // linear memory — one page over MEMORY_BUDGET_BYTES — with an empty
+        // `_start`. The store limiter must refuse it at instantiation and the
+        // refusal must surface as a fallthrough, not an allocation-death.
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // preamble
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
+            0x03, 0x02, 0x01, 0x00, // function: [type 0]
+            0x05, 0x04, 0x01, 0x00, 0x81, 0x20, // memory: min 4097 pages
+            0x07, 0x0a, 0x01, 0x06, b'_', b's', b't', b'a', b'r', b't', 0x00,
+            0x00, // export "_start" fn 0
+            0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // code: empty body
+        ];
+        let artifact = EdgeArtifact::from_bytes(&wasm).expect("valid module");
+        let kv = InMemoryEdgeKv::new();
+
+        let outcome = artifact
+            .run(&EdgeRequest::get("/hog"), &[], &kv)
+            .expect("host setup succeeds");
+
+        let EdgeOutcome::Fallthrough { reason, detail } = outcome else {
+            panic!("expected a fallthrough");
+        };
+        assert_eq!(reason, FallthroughReason::CapsuleError);
+        assert!(detail.contains("instantiated"), "{detail}");
     }
 
     #[test]
