@@ -725,6 +725,77 @@ fn deploy_check_respects_explicit_autumn_dotenv_off() {
     );
 }
 
+/// The single fleet-wide migrate-placement sentence `deploy plan` prints for a
+/// multi-host `[deploy] hosts` (issue #1621, AC-4). Kept in sync by hand with
+/// `deploy::fleet::FLEET_MIGRATE_PLACEMENT_NOTE`; the unit-level drift guard is
+/// `fleet_plan_matches_fleet_ops_sequence`.
+const MIGRATE_PLACEMENT_NOTE: &str =
+    "runs once, on the first host still on a previous release, before its cutover";
+
+#[test]
+fn deploy_plan_renders_the_fleet_rollout_order_and_one_migrate_note() {
+    // #1621 (AC-4, T2.2): `deploy plan` is offline — it contacts no host, so it
+    // cannot know which hosts are first deploys. It therefore prints the rollout
+    // ORDER (declaration order, the documented contract) plus the migrate
+    // placement as a single fleet-wide RULE, never a per-host line.
+    let dir =
+        project("hosts = [\"web-1.example.com\", \"web-2.example.com\", \"web-3.example.com\"]\n");
+    let (stdout, stderr, code) = run_autumn(dir.path(), &["deploy", "plan"], &[]);
+    assert_eq!(
+        code,
+        Some(0),
+        "deploy plan should succeed for a fleet\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let first = stdout
+        .find("web-1.example.com")
+        .unwrap_or_else(|| panic!("web-1 must be listed\nstdout:\n{stdout}"));
+    let second = stdout
+        .find("web-2.example.com")
+        .unwrap_or_else(|| panic!("web-2 must be listed\nstdout:\n{stdout}"));
+    let third = stdout
+        .find("web-3.example.com")
+        .unwrap_or_else(|| panic!("web-3 must be listed\nstdout:\n{stdout}"));
+    assert!(
+        first < second && second < third,
+        "the fleet plan must list hosts in declaration (rollout) order\nstdout:\n{stdout}"
+    );
+
+    assert_eq!(
+        stdout.matches(MIGRATE_PLACEMENT_NOTE).count(),
+        1,
+        "the fleet plan must carry exactly one migrate-placement note\nstdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn deploy_plan_output_is_identical_for_host_and_a_single_entry_hosts_list() {
+    // #1621 (AC-1, differential half of T2.1): a one-entry `hosts` list IS today's
+    // single-server deploy. The two projects differ by exactly the `[deploy]` host
+    // spelling, so any fleet-specific divergence in `deploy plan` — an extra
+    // section, a reordered line, a changed byte — shows up here. Stronger than a
+    // checked-in golden fixture: it can never go stale and depends on nothing
+    // about the machine it runs on.
+    let scalar = project("host = \"203.0.113.10\"\n");
+    let list = project("hosts = [\"203.0.113.10\"]\n");
+
+    let (scalar_out, scalar_err, scalar_code) = run_autumn(scalar.path(), &["deploy", "plan"], &[]);
+    let (list_out, list_err, list_code) = run_autumn(list.path(), &["deploy", "plan"], &[]);
+
+    assert_eq!(
+        scalar_code, list_code,
+        "exit codes must match\n`host` stderr:\n{scalar_err}\n`hosts` stderr:\n{list_err}"
+    );
+    assert_eq!(
+        scalar_out, list_out,
+        "`deploy plan` stdout must be byte-identical under both spellings"
+    );
+    assert_eq!(
+        scalar_err, list_err,
+        "`deploy plan` stderr must be byte-identical under both spellings"
+    );
+}
+
 #[test]
 fn deploy_help_lists_subcommands() {
     let dir = tempfile::tempdir().expect("temp dir");

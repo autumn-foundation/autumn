@@ -23,6 +23,10 @@
 //! shared with `autumn doctor`.
 
 pub mod exec;
+// #1621: the fleet planning layer is crate-internal — every item is `pub(crate)`
+// and only `deploy` (and, later, its rollout driver) consumes it, so the module
+// itself stays private rather than joining the `pub mod` siblings above.
+mod fleet;
 pub mod media;
 pub mod proxy;
 
@@ -1016,10 +1020,11 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
     // #1621: refuse a malformed host spelling — `host` AND `hosts` together, a
     // blank entry, a duplicate entry — before ANY other work, so the operator sees
     // one actionable message instead of a preflight report graded against a target
-    // list we could not make sense of. The resolved list itself is consumed by
-    // `ResolvedFleet` (the rollout driver lands in a later slice); here only the
-    // refusal matters, and the single-host path below is deliberately untouched.
-    deploy_host_list(&deploy_cfg).map_err(DeployError::Config)?;
+    // list we could not make sense of. The ordered list is the rollout order and
+    // is rendered by `plan`; the rollout DRIVER that consumes it via
+    // `ResolvedFleet` lands in a later slice, so the single-host paths below are
+    // deliberately untouched.
+    let host_list = deploy_host_list(&deploy_cfg).map_err(DeployError::Config)?;
     let resolved = ResolvedDeployConfig::resolve(&deploy_cfg, &resolve_project_name())
         .map_err(DeployError::Config)?;
 
@@ -1035,7 +1040,7 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
         // uploads runtime VALUES, so it needs no reload under the target profile.
         DeployAction::Plan => {
             let (media_cfg, _ffmpeg_bin) = load_media_host_config(&resolved)?;
-            print_plan(&resolved, &media_cfg);
+            print_plan(&resolved, &host_list, &media_cfg);
             Ok(())
         }
         // `check`/`rollback`/`up` grade and (for `up`) upload the signing secret
@@ -1521,7 +1526,19 @@ fn run_check(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(
     }
 }
 
-fn print_plan(resolved: &ResolvedDeployConfig, media_cfg: &media::MediaMtxHostConfig) {
+/// Print the `deploy plan` dry-run: the rendered slot unit, the ordered per-host
+/// steps, the fleet rollout section (multi-host only), and the `MediaMTX` section
+/// (media-enabled only).
+///
+/// `hosts` is the ordered target list from [`deploy_host_list`] — the rollout
+/// order. When it holds at most one entry, nothing fleet-specific is printed, so
+/// single-host output stays byte-identical to pre-#1621 (AC-1); the differential
+/// proof is `deploy_plan_output_is_identical_for_host_and_a_single_entry_hosts_list`.
+fn print_plan(
+    resolved: &ResolvedDeployConfig,
+    hosts: &[String],
+    media_cfg: &media::MediaMtxHostConfig,
+) {
     println!("\u{1F342} autumn deploy plan (dry-run)\n");
     println!("systemd unit ({}.service):\n", resolved.service_name);
     println!("{}", render_systemd_unit(resolved));
@@ -1529,6 +1546,15 @@ fn print_plan(resolved: &ResolvedDeployConfig, media_cfg: &media::MediaMtxHostCo
     println!("Deploy steps (zero-downtime):");
     for (i, step) in build_deploy_plan(resolved).iter().enumerate() {
         println!("  {}. [{}] {}", i + 1, step.label, step.description);
+    }
+
+    // Fleet rollout (issue #1621, AC-4): the steps above are what EACH host runs;
+    // this section is the order they run in and where the single fleet-wide
+    // migration lands. Printed only for a real fleet.
+    if hosts.len() > 1 {
+        for line in fleet::fleet_plan_lines(hosts) {
+            println!("{line}");
+        }
     }
 
     // MediaMTX host provisioning (issue #1974, Slice 7): only when the
@@ -2108,6 +2134,11 @@ fn run_up(
                 &release_id,
                 &plan,
                 &reregister_options,
+                // #1621: the single-host path IS a one-host fleet, and a one-host
+                // fleet's only host carries the migration — so this is today's
+                // sequence, unchanged. The fleet driver (next slice) is what varies
+                // this per host.
+                exec::MigrateStep::Run,
             );
             // Repair the drifted marker as an early op — before the cutover's
             // record-previous-release reads it — so the on-disk marker matches the
@@ -3644,6 +3675,114 @@ mod tests {
         assert!(
             pos("readiness-gate") < pos("drain-rolled-back-slot"),
             "the former-live slot is drained last, after the /ready re-probe"
+        );
+    }
+
+    #[test]
+    fn fleet_plan_matches_fleet_ops_sequence() {
+        // #1621 (AC-4, T1.26): the forward twin of
+        // `rollback_plan_matches_rollback_ops_sequence`. `build_deploy_plan` and the
+        // fleet section it is printed with are DESCRIPTIVE — nothing links them to
+        // `exec::cutover_ops` at compile time — so this guards the three claims the
+        // printed fleet plan actually makes against the ops that really run.
+        let fleet = ResolvedFleet::resolve(&fleet_cfg(&["web-a", "web-b", "web-c"]), "myapp")
+            .expect("a well-formed fleet resolves");
+        let modes = [
+            fleet::HostMode::Redeploy,
+            fleet::HostMode::Redeploy,
+            fleet::HostMode::Redeploy,
+        ];
+        let plan = fleet::plan_fleet(&fleet, &modes).expect("a well-formed fleet plans");
+
+        // (1) HOST ORDERING. The rendered section, the executable plan and the
+        // resolved fleet all agree on declaration order — the documented rollout
+        // contract.
+        let hosts: Vec<String> = fleet
+            .hosts
+            .iter()
+            .map(|h| h.host.clone().unwrap_or_default())
+            .collect();
+        let planned: Vec<String> = plan.hosts.iter().map(|h| h.host.clone()).collect();
+        assert_eq!(
+            planned, hosts,
+            "the executable fleet plan must keep declaration order"
+        );
+        let rendered = fleet::fleet_plan_lines(&hosts).join("\n");
+        let mut previous = 0usize;
+        for host in &hosts {
+            let at = rendered
+                .find(host.as_str())
+                .unwrap_or_else(|| panic!("{host} must be named in the plan:\n{rendered}"));
+            assert!(
+                at >= previous,
+                "the printed fleet plan must list hosts in rollout order:\n{rendered}"
+            );
+            previous = at;
+        }
+
+        // (2) SINGLE MIGRATE. The section promises the migration runs once; the real
+        // flattened op labels must carry exactly one `migrate`, before the first
+        // cutover boundary anywhere in the fleet.
+        let flat = fleet::test_support::fleet_op_labels(&fleet, &plan);
+        assert_eq!(
+            flat.iter().filter(|l| **l == "migrate").count(),
+            1,
+            "the plan promises one migration; the ops must schedule one: {flat:?}"
+        );
+        assert_eq!(
+            rendered
+                .matches(fleet::FLEET_MIGRATE_PLACEMENT_NOTE)
+                .count(),
+            1,
+            "the migrate placement is one fleet-wide note, not a per-host line:\n{rendered}"
+        );
+        let migrate = flat
+            .iter()
+            .position(|l| *l == "migrate")
+            .expect("the fleet migrates");
+        let boundary = flat
+            .iter()
+            .position(|l| *l == "proxy-flip" || *l == "proxy-route")
+            .expect("the fleet cuts over");
+        assert!(
+            migrate < boundary,
+            "the plan's `[migrate] < [cutover]` claim must hold in the real ops: \
+             migrate at {migrate}, boundary at {boundary}, labels: {flat:?}"
+        );
+
+        // (3) STEP-LABEL SUBSET. Every printed step label either names a real
+        // executed op or is one of the four deliberately MECHANISM-NEUTRAL labels
+        // (`build` is local, `upload` executes as `upload-binary`, `cutover` as
+        // `proxy-flip`, `drain` as `drain-old`). Partitioning — rather than a bare
+        // `contains` — means a NEW plan step forces a deliberate decision here
+        // instead of silently drifting away from the ops.
+        let step_labels: Vec<&str> = build_deploy_plan(&fleet.hosts[0])
+            .iter()
+            .map(|s| s.label)
+            .collect();
+        let (executed, neutral): (Vec<&str>, Vec<&str>) =
+            step_labels.iter().partition(|l| flat.contains(l));
+        assert_eq!(
+            executed,
+            vec!["migrate", "start-candidate", "readiness-gate", "prune"],
+            "these printed steps must name real executed ops: {step_labels:?} vs {flat:?}"
+        );
+        assert_eq!(
+            neutral,
+            vec!["build", "upload", "cutover", "drain"],
+            "only the documented mechanism-neutral plan labels may be absent from \
+             the ops: {step_labels:?} vs {flat:?}"
+        );
+        // The plan's last step is `prune`, and so is the fleet's last real op.
+        assert_eq!(
+            step_labels.last().copied(),
+            Some("prune"),
+            "the printed plan ends with prune"
+        );
+        assert_eq!(
+            flat.last().copied(),
+            Some("prune"),
+            "the fleet's last host ends with prune: {flat:?}"
         );
     }
 

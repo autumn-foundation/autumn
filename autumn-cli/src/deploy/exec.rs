@@ -570,6 +570,45 @@ impl SlotPlan {
     }
 }
 
+/// Whether a cutover runs the pending-migration one-shot (issue #1621, AC-4).
+///
+/// A fleet's schema is **fleet-wide**, so a rollout migrates exactly once. A naive
+/// per-host loop would run the `AUTUMN_MIGRATE=1` one-shot on every host: the
+/// Postgres session advisory lock (`autumn/src/migrate.rs`) keeps that *correct*,
+/// but hosts 2..N each pay the lock wait and, far worse, a migration failing on
+/// host 2 **after** host 1 has already cut over is precisely the mixed-version
+/// fleet #1621 forbids. So the fleet driver schedules the migration on ONE host
+/// and builds every other host's cutover with [`Self::Skip`].
+///
+/// The op stays **inside** [`cutover_ops`] rather than being hoisted into a fleet
+/// pre-phase: in its historical position (between `start-candidate` and
+/// `readiness-gate`) it sits PRE-boundary relative to `proxy-flip`, so a failed
+/// migration keeps the entire existing, already-tested auto-rollback path for free
+/// — [`execute_with_teardown`] runs `candidate_teardown_ops`, the old release keeps
+/// serving, and the caller gets `CandidateRolledBack { failed_step: "migrate" }`.
+/// A standalone pre-phase would have to re-implement candidate teardown from
+/// scratch for zero gain.
+///
+/// This is an **enum, not a `bool`**, deliberately: Phase 2 of #1621 (role-based
+/// rollout — a designated migrator host, worker roles) needs to express more than
+/// yes/no and must not force a second signature break on [`cutover_ops`], the
+/// most exact-vector-asserted builder in the deploy path.
+///
+/// [`first_deploy_ops`] takes no such parameter: a first deploy has **never** run
+/// migrations (a documented single-host limitation), and keeping it byte-identical
+/// is what lets the one-entry-`hosts` fleet stay indistinguishable from today's
+/// single-server deploy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrateStep {
+    /// Run the pending-migration one-shot before the flip — today's behavior, in
+    /// today's exact position.
+    Run,
+    /// Omit ONLY the migrate op; every other step keeps its identity and relative
+    /// position (the cutover boundary in particular). Used for every host in a
+    /// fleet run except the one that carries the migration.
+    Skip,
+}
+
 /// Build the ordered FIRST-deploy operation sequence (Slice 1 + proxy front).
 ///
 /// Pure — performs no I/O; `release_id` and the [`SlotPlan`] are injected for
@@ -723,7 +762,11 @@ pub fn first_deploy_ops(
 /// 6. start the candidate via `enable` + `restart` (old release untouched;
 ///    restart, not `enable --now`, so an already-active slot relaunches the
 ///    freshly written unit — see the op's comment),
-/// 7. run pending migrations BEFORE cutover (`AUTUMN_MIGRATE=1` one-shot),
+/// 7. run pending migrations BEFORE cutover (`AUTUMN_MIGRATE=1` one-shot) — the
+///    ONLY step this builder parameterises: `migrate` is [`MigrateStep::Run`] for
+///    a single-host deploy and for the one fleet host that carries the migration,
+///    and [`MigrateStep::Skip`] for every other fleet host (issue #1621, AC-4).
+///    `Skip` omits this op and nothing else,
 /// 8. bounded `/ready` poll on the candidate's separate loopback port,
 /// 9. health-gated proxy flip old→candidate (THE cutover),
 /// 10. commit the state markers as ONE atomic remote op (#1938): record the
@@ -748,6 +791,7 @@ pub fn cutover_ops(
     release_id: &str,
     plan: &SlotPlan,
     reregister_options: &ProxyServiceOptions,
+    migrate: MigrateStep,
 ) -> Vec<DeployOp> {
     let release_dir = format!("{}/{release_id}", cfg.releases_dir());
     let remote_binary = format!("{release_dir}/{}", cfg.app_name);
@@ -838,10 +882,20 @@ pub fn cutover_ops(
                  systemctl restart {candidate_unit}.service"
             ),
         )),
-        // Migrations run BEFORE the flip. `systemd-run --wait` returns the
-        // child's exit status, so a failed migration surfaces a non-zero error
-        // that stops run_ops before the flip — old release still serving (AC-3).
-        DeployOp::Run(release_migrate_command(cfg, &release_dir)),
+    ]);
+    // Migrations run BEFORE the flip. `systemd-run --wait` returns the child's
+    // exit status, so a failed migration surfaces a non-zero error that stops
+    // run_ops before the flip — old release still serving (AC-3).
+    //
+    // #1621: this is the ONE op a fleet parameterises. The position is unchanged
+    // (between `start-candidate` and `readiness-gate`, i.e. PRE-boundary, so the
+    // existing candidate-teardown path still covers a failed migration), and
+    // `MigrateStep::Skip` omits ONLY this op — hosts 2..N of a fleet, whose shared
+    // schema the first redeploying host already migrated. See [`MigrateStep`].
+    if matches!(migrate, MigrateStep::Run) {
+        ops.push(DeployOp::Run(release_migrate_command(cfg, &release_dir)));
+    }
+    ops.extend([
         DeployOp::Run(RemoteCommand::new(
             "readiness-gate",
             readiness_poll_shell(plan.candidate_port, cfg.readiness_timeout_secs),
@@ -2491,6 +2545,13 @@ mod tests {
     /// the redeploy path refuses a concurrent `server.port` change at pre-flight
     /// (#2073), so the public port is unchanged and derived == actual.
     fn sample_cutover_ops(env: Secret) -> Vec<DeployOp> {
+        sample_cutover_ops_with(env, MigrateStep::Run)
+    }
+
+    /// [`sample_cutover_ops`] with an explicit [`MigrateStep`] (issue #1621), so the
+    /// fleet's skip-the-migrate-op parameterisation is assertable while every
+    /// existing exact-vector call site keeps building today's `Run` sequence.
+    fn sample_cutover_ops_with(env: Secret, migrate: MigrateStep) -> Vec<DeployOp> {
         let cfg = resolved();
         let plan = SlotPlan::redeploy(3000, SLOT_BLUE);
         let unit = super::super::render_app_unit(
@@ -2514,6 +2575,7 @@ mod tests {
                 tls: false,
                 host: None,
             },
+            migrate,
         )
     }
 
@@ -2800,6 +2862,50 @@ mod tests {
             "commit the markers before draining the old release"
         );
         assert!(pos("drain-old") < pos("prune"), "drain before prune");
+    }
+
+    #[test]
+    fn cutover_ops_skip_omits_only_the_migrate_op() {
+        // #1621 (AC-4): a fleet's schema is fleet-wide, so it migrates EXACTLY
+        // ONCE — hosts 2..N build their cutover with `MigrateStep::Skip`. Skipping
+        // must remove the `migrate` op and NOTHING else: the boundary label
+        // (`proxy-flip`) keeps its identity and every other step keeps its relative
+        // position, or `execute_with_teardown`'s boundary lookup (and with it the
+        // per-host auto-rollback the fleet driver depends on) would silently change
+        // meaning on every host after the first.
+        //
+        // The assertion is differential — `Skip`'s vector is derived from `Run`'s —
+        // so it can never drift from the exact vector pinned by
+        // `redeploy_produces_exact_zero_downtime_sequence`.
+        let labels = |ops: &[DeployOp]| ops.iter().map(DeployOp::label).collect::<Vec<_>>();
+        let run = labels(&sample_cutover_ops_with(
+            Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"),
+            MigrateStep::Run,
+        ));
+        let skip = labels(&sample_cutover_ops_with(
+            Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"),
+            MigrateStep::Skip,
+        ));
+
+        assert_eq!(
+            run.iter().filter(|l| **l == "migrate").count(),
+            1,
+            "MigrateStep::Run must emit exactly one migrate op, got: {run:?}"
+        );
+        let expected: Vec<&'static str> = run.iter().copied().filter(|l| *l != "migrate").collect();
+        assert_eq!(
+            skip, expected,
+            "MigrateStep::Skip must be MigrateStep::Run minus exactly the `migrate` \
+             op\n  run:  {run:?}\n  skip: {skip:?}"
+        );
+        assert!(
+            !skip.contains(&"migrate"),
+            "a skipped cutover must carry no migrate op, got: {skip:?}"
+        );
+        assert!(
+            skip.contains(&"proxy-flip"),
+            "skipping the migration must not disturb the cutover boundary, got: {skip:?}"
+        );
     }
 
     #[test]
