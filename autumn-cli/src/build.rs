@@ -135,7 +135,10 @@ pub const fn plan_edge_step(
 /// Always `--release`: the capsule is a deploy artifact whose size and
 /// determinism matter, and a debug wasm build is neither smaller nor faster to
 /// iterate on. `--bin edge-capsule` selects the app's capsule entrypoint.
-fn build_edge_cargo_command(package: Option<&str>) -> Command {
+/// `features` is the same set the native build received: a feature-gated edge
+/// route must be compiled into both lanes or the capsule would silently lack
+/// (or fail to compile) a route the origin serves.
+fn build_edge_cargo_command(package: Option<&str>, features: Option<&str>) -> Command {
     let mut cargo = Command::new("cargo");
     cargo.arg("build");
     cargo.args(["--target", EDGE_TARGET]);
@@ -143,6 +146,9 @@ fn build_edge_cargo_command(package: Option<&str>) -> Command {
     cargo.args(["--bin", EDGE_BIN]);
     if let Some(pkg) = package {
         cargo.args(["-p", pkg]);
+    }
+    if let Some(extra) = features {
+        cargo.args(["--features", extra]);
     }
     cargo
 }
@@ -304,7 +310,7 @@ fn format_edge_success(names: &[&str], artifact: &Path, size_bytes: Option<u64>)
 /// resolve the bin target, run cargo, report the artifact.
 ///
 /// Every failure exits 1 with a message that names the exact next action.
-fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>) {
+fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>, features: Option<&str>) {
     let served: Vec<&str> = scan
         .registered_fns()
         .iter()
@@ -346,6 +352,7 @@ fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>) {
     eprintln!("\nCompiling edge capsule ({EDGE_TARGET}, release profile)...");
     run_cargo_or_exit(build_edge_cargo_command(
         package.or(Some(capsule.package.as_str())),
+        features,
     ));
 
     let size = std::fs::metadata(&capsule.artifact).ok().map(|m| m.len());
@@ -439,7 +446,7 @@ fn apply_renderer_env(
     cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
     // When --bin selects a workspace member without -p, use the resolved package
     // name so the renderer shares that member's cluster, not the workspace root's.
-    let effective_pkg = package.or_else(|| bin.and(resolved_pkg));
+    let effective_pkg = effective_package(package, bin, resolved_pkg);
     if let Some(pg) = crate::serve::managed_pg_env(effective_pkg) {
         cmd.env(crate::serve::MANAGED_PG_DATA_DIR_ENV, &pg.data_dir);
         if let Some(url) = pg.attach_url {
@@ -460,6 +467,21 @@ fn apply_renderer_env(
             cmd.current_dir(dir);
         }
     }
+}
+
+/// The package a `-p`-less invocation actually selected.
+///
+/// `-p <package>` always wins; otherwise `--bin <app>` in a multi-package
+/// workspace resolves to the package owning that bin (via [`find_binary`]),
+/// and everything downstream — the renderer's cluster, the edge capsule's
+/// package selection — must follow that resolution rather than falling back
+/// to "whichever workspace member matches first".
+fn effective_package<'a>(
+    package: Option<&'a str>,
+    bin: Option<&'a str>,
+    resolved_pkg: Option<&'a str>,
+) -> Option<&'a str> {
+    package.or_else(|| bin.and(resolved_pkg))
 }
 
 /// Run the static build pipeline.
@@ -528,7 +550,13 @@ pub fn run(
     // routes and no `#[static_get]` routes must still get its capsule, and a
     // static-render failure must not silently drop it.
     if plan == EdgePlan::Build {
-        run_edge_capsule_build(&edge_scan, package);
+        // `--bin <app>` without `-p` must build *that* app's capsule, not the
+        // first workspace member owning an edge-capsule bin.
+        run_edge_capsule_build(
+            &edge_scan,
+            effective_package(package, bin, resolved_pkg.as_deref()),
+            features,
+        );
     }
 
     eprintln!("\nRunning static renderer...\n");
@@ -945,6 +973,53 @@ mod tests {
     }
 
     #[test]
+    fn edge_cargo_command_forwards_the_native_builds_features() {
+        // A feature-gated edge route must be compiled into both lanes: the
+        // capsule build receives exactly the feature set the native build got.
+        let cmd = build_edge_cargo_command(Some("blog"), Some("blog/extra-routes"));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--features", "blog/extra-routes"]),
+            "the capsule build must receive the native build's features: {args:?}"
+        );
+        assert!(args.windows(2).any(|w| w == ["-p", "blog"]));
+        assert!(args.windows(2).any(|w| w == ["--target", EDGE_TARGET]));
+    }
+
+    #[test]
+    fn edge_cargo_command_omits_features_when_none_were_requested() {
+        let cmd = build_edge_cargo_command(None, None);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a == "--features"),
+            "no --features flag without a request: {args:?}"
+        );
+    }
+
+    #[test]
+    fn effective_package_prefers_p_and_falls_back_to_the_bins_owner() {
+        // -p always wins.
+        assert_eq!(
+            effective_package(Some("blog"), Some("app"), Some("wiki")),
+            Some("blog")
+        );
+        // --bin without -p follows find_binary's package resolution.
+        assert_eq!(
+            effective_package(None, Some("app"), Some("wiki")),
+            Some("wiki")
+        );
+        // No --bin means the resolution is irrelevant (cwd semantics apply).
+        assert_eq!(effective_package(None, None, Some("wiki")), None);
+    }
+
+    #[test]
     fn extra_features_forwarded_to_cargo() {
         // Non-embed: only the extra feature is added.
         let args = cargo_args(
@@ -995,7 +1070,7 @@ mod tests {
     // ── Edge capsule (issue #1790) ───────────────────────────────────────────
 
     fn edge_cargo_args(package: Option<&str>) -> Vec<String> {
-        build_edge_cargo_command(package)
+        build_edge_cargo_command(package, None)
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
