@@ -1,5 +1,6 @@
 use autumn_web::storage::Blob;
 
+use crate::repositories::{PgCommentRepository, PgVoteRepository};
 use crate::schema::{comments, posts, subreddits, tags, users, votes};
 
 // Manual model -- password_hash should never be auto-exposed via API.
@@ -63,7 +64,13 @@ pub struct Subreddit {
 #[autumn_web::model]
 #[belongs_to(User, fk = author_id)]
 #[belongs_to(Subreddit)]
-#[has_many(Comment)]
+#[has_many(Comment, dependent = destroy)]
+// Votes have no deletion hooks or counter-cache leg of their own: `Post::score`
+// belongs to the row being removed. A bulk delete is therefore both safe and
+// preferable. Matching the nullable FK against this post's non-null id deletes
+// only post-targeted votes; comment votes have `post_id = NULL` and are reached
+// through their comment when the comments are destroyed.
+#[has_many(Vote, fk = "post_id", name = post_votes, dependent = delete_all)]
 #[has_many(Tag, through = post_tags)]
 #[votable(by = User, aggregate = sum)]
 pub struct Post {

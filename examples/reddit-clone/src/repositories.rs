@@ -15,10 +15,10 @@
 
 use crate::hooks::PostHooks;
 use crate::models::{
-    NewPost, NewSubreddit, NewVote, Post, PostDraftExt, Subreddit, UpdatePost, UpdateSubreddit,
-    UpdateVote, Vote,
+    Comment, NewComment, NewPost, NewSubreddit, NewVote, Post, PostDraftExt, Subreddit,
+    UpdateComment, UpdatePost, UpdateSubreddit, UpdateVote, Vote,
 };
-use crate::schema::{posts, subreddits, votes};
+use crate::schema::{comments, posts, subreddits, votes};
 
 #[autumn_web::repository(Subreddit, api = "/api/subreddits")]
 pub trait SubredditRepository {
@@ -56,6 +56,13 @@ pub trait PostRepository {
     /// SELECT * FROM posts WHERE author_id = $1
     fn find_by_author_id(author_id: i64) -> Vec<Post>;
 }
+
+// Required by `Post`'s model-declared `dependent = destroy`: resolving the
+// typed child repository (rather than issuing a bulk SQL delete) makes every
+// comment travel through the repository lifecycle, including its Post counter
+// cache, while remaining inside the parent's delete transaction.
+#[autumn_web::repository(Comment)]
+pub trait CommentRepository {}
 
 // Typed grouped aggregate (#1364): `sum_value_grouped_by_post_id` rolls the
 // votes table up to `SUM(value) GROUP BY post_id`, returning one
