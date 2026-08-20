@@ -364,17 +364,17 @@ fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>, features: Opti
 
 /// Scan the project's sources for `#[edge]` routes.
 ///
-/// Reads `<project>/src/**/*.rs` only — no cargo invocation — so it runs before
-/// anything is compiled. `-p`/`--bin` can select a workspace member whose
-/// sources live elsewhere, so those (and only those) cost one extra
-/// `cargo metadata --no-deps` read to find the member's directory.
+/// Always scans the manifest directory of the package [`find_binary`] resolves
+/// — the same package every later step (fingerprinting, the static renderer,
+/// the capsule build) operates on. Scanning the bare CWD instead would silently
+/// miss a member's edge routes when `autumn build` runs from a virtual
+/// workspace root, where `find_binary` picks a member but `<root>/src` does not
+/// exist. Costs one `cargo metadata --no-deps` read; resolution failures
+/// (e.g. a library-only project) surface here, before the native compile,
+/// instead of after it.
 fn resolve_project_edge_scan(debug: bool, package: Option<&str>, bin: Option<&str>) -> EdgeScan {
     let cwd = std::env::current_dir().expect("current dir");
-    let root = if package.is_some() || bin.is_some() {
-        find_binary(debug, package, bin).1.unwrap_or(cwd)
-    } else {
-        cwd
-    };
+    let root = find_binary(debug, package, bin).1.unwrap_or(cwd);
     crate::edge_scan::resolve_edge_scan(&root)
 }
 

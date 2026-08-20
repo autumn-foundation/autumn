@@ -340,6 +340,11 @@ A host implementation you can read top to bottom lives in
   resolving `fd_prestat_*`, and no socket import. There is no filesystem and no
   network; the only way out is the dialogue. The conformance suite asserts the
   artifact's import list against that allowlist, so it stays true.
+- **Bounded execution.** The reference host meters every request with a wasmi
+  fuel budget (`autumn_edge::host::FUEL_BUDGET`, ~10⁹ instructions): a capsule
+  stuck in a loop becomes a `capsule_error` fallthrough — the origin serves the
+  request — instead of a hung host. Any production shim should impose its own
+  wall-clock or instruction limit the same way.
 - **Fallthrough details never leak.** A declining response's body is a message
   for a developer; it is not forwarded, and neither is the sentinel header.
 - **The artifact is a program, not an asset.** `autumn build` never copies the

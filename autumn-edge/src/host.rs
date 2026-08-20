@@ -45,7 +45,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use wasmi::{Caller, Engine, Linker, Module, Store};
+use wasmi::{Caller, Config, Engine, Linker, Module, Store};
 
 use crate::kv::EdgeKv;
 use crate::route::EdgeCapability;
@@ -93,6 +93,16 @@ impl fmt::Display for EdgeHostError {
 
 impl std::error::Error for EdgeHostError {}
 
+/// Fuel budget for one request's guest execution (roughly one unit per
+/// instruction).
+///
+/// Sized for headroom, not precision: rendering a page costs on the order of
+/// millions of instructions, so a billion-unit budget is ~100× slack for any
+/// honest handler while still bounding a runaway loop to seconds instead of
+/// forever. Exhaustion is reported as a [`FallthroughReason::CapsuleError`]
+/// naming the budget, so the origin serves the request.
+pub const FUEL_BUDGET: u64 = 1_000_000_000;
+
 /// A compiled edge capsule, ready to serve requests.
 ///
 /// Compilation happens once in [`from_bytes`](EdgeArtifact::from_bytes);
@@ -119,7 +129,12 @@ impl EdgeArtifact {
     ///
     /// Returns [`EdgeHostError::Load`] if the bytes are not a valid module.
     pub fn from_bytes(wasm: &[u8]) -> Result<Self, EdgeHostError> {
-        let engine = Engine::default();
+        // Fuel metering bounds every guest execution: a capsule that loops
+        // forever must become a fallthrough, not a hung host. The counting
+        // itself does not change what a well-behaved capsule computes.
+        let mut config = Config::default();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config);
         let module =
             Module::new(&engine, wasm).map_err(|err| EdgeHostError::Load(err.to_string()))?;
         Ok(Self { engine, module })
@@ -164,6 +179,12 @@ impl EdgeArtifact {
         state.stdin.extend(line.as_bytes());
 
         let mut store = Store::new(&self.engine, state);
+        // Set before instantiation: data-segment init and the start section
+        // burn fuel too. Exhaustion at any point traps the guest; the check
+        // after `_start` translates it into a deterministic fallthrough.
+        store
+            .set_fuel(FUEL_BUDGET)
+            .map_err(|err| EdgeHostError::Host(format!("could not set the fuel budget: {err}")))?;
         let mut linker = <Linker<HostState<'_>>>::new(&self.engine);
         define_wasi_shim(&mut linker)?;
 
@@ -188,10 +209,24 @@ impl EdgeArtifact {
         };
 
         let trap = start.call(&mut store, ()).err();
+        let fuel_exhausted = trap
+            .as_ref()
+            .and_then(wasmi::Error::as_trap_code)
+            .is_some_and(|code| matches!(code, wasmi::core::TrapCode::OutOfFuel));
         let state = store.into_data();
 
         if let Some(outcome) = state.terminal.clone() {
             return Ok(outcome);
+        }
+        if fuel_exhausted {
+            return Ok(capsule_error(
+                &state,
+                &format!(
+                    "the capsule exceeded its execution budget of {FUEL_BUDGET} fuel units \
+                     without answering — a runaway loop falls through to the origin instead \
+                     of hanging the host"
+                ),
+            ));
         }
         let detail = trap.map_or_else(
             || "the capsule exited without answering".to_owned(),
@@ -707,6 +742,35 @@ mod tests {
         };
         assert_eq!(reason, FallthroughReason::CapsuleError);
         assert!(detail.contains("_start"), "{detail}");
+    }
+
+    #[test]
+    fn a_runaway_loop_exhausts_its_fuel_and_falls_through() {
+        // A hand-assembled module whose `_start` is `loop { br 0 }`: without
+        // fuel metering this call would never return. Sections: type
+        // `() -> ()`, one function, the `_start` export, and a body of
+        // `loop(void) br 0 end end`.
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // preamble
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
+            0x03, 0x02, 0x01, 0x00, // function: [type 0]
+            0x07, 0x0a, 0x01, 0x06, b'_', b's', b't', b'a', b'r', b't', 0x00,
+            0x00, // export "_start" fn 0
+            0x0a, 0x09, 0x01, 0x07, 0x00, 0x03, 0x40, 0x0c, 0x00, 0x0b,
+            0x0b, // code: loop br 0
+        ];
+        let artifact = EdgeArtifact::from_bytes(&wasm).expect("valid module");
+        let kv = InMemoryEdgeKv::new();
+
+        let outcome = artifact
+            .run(&EdgeRequest::get("/spin"), &[], &kv)
+            .expect("host setup succeeds");
+
+        let EdgeOutcome::Fallthrough { reason, detail } = outcome else {
+            panic!("expected a fallthrough");
+        };
+        assert_eq!(reason, FallthroughReason::CapsuleError);
+        assert!(detail.contains("execution budget"), "{detail}");
     }
 
     #[test]
