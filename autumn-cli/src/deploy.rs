@@ -82,22 +82,50 @@ pub enum DeployError {
     Exec(String),
 
     /// A multi-host rollout stopped mid-fleet (issue #1621, AC-3).
-    #[error(
-        "fleet rollout halted at {failed_host} during `{failed_step}` — the remaining hosts were \
-         not touched"
-    )]
-    FleetHalted {
-        /// Host the rollout stopped on.
-        failed_host: String,
-        /// Label of the step that failed on it.
-        failed_step: &'static str,
-        /// Hosts whose candidate was rolled back (their previous release still serves).
-        rolled_back: Vec<String>,
-        /// Hosts whose first-deploy candidate was torn down (nothing serves there).
-        torn_down: Vec<String>,
-        /// Hosts left running the NEW release, in rollout order.
-        still_on_new: Vec<String>,
-    },
+    ///
+    /// **Boxed deliberately.** The payload is seven fields (160 bytes) and
+    /// `DeployError` is the `Err` type of essentially every function in this
+    /// module, so inlining it would make each of ~30 `Result`s carry the halt
+    /// report on its happy path — which `clippy::result_large_err` (armed by the
+    /// workspace's `-D warnings` gate) refuses, correctly. One allocation on the
+    /// rarest path is the right trade.
+    #[error("{0}")]
+    FleetHalted(Box<FleetHalt>),
+}
+
+/// The partial-fleet state a halted rollout leaves behind (issue #1621, AC-3).
+///
+/// Every field is a host name or a `&'static str` op label — never a shell line, a
+/// remote path, or a formatted driver error (a failed migration's source can embed
+/// the database URL). The lists describe the FINAL state, after any automatic
+/// compensation: a host whose rollback failed stays in `still_on_new`, which is the
+/// whole point of reporting them.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "fleet rollout halted at {failed_host} during `{failed_step}` — the remaining hosts were \
+     not touched, and any migration that already ran was NOT rolled back (automatic \
+     compensation restores binaries only)"
+)]
+pub struct FleetHalt {
+    /// Host the rollout stopped on.
+    pub failed_host: String,
+    /// Label of the step that failed on it.
+    pub failed_step: &'static str,
+    /// Hosts whose previous release is serving again — either their own
+    /// pre-boundary teardown or the fleet's compensating rollback.
+    pub rolled_back: Vec<String>,
+    /// Hosts left with nothing installed — either a torn-down first-deploy
+    /// candidate or a first deploy the fleet compensated away.
+    pub torn_down: Vec<String>,
+    /// Hosts left running the NEW release, in rollout order.
+    pub still_on_new: Vec<String>,
+    /// Hosts that cut over but whose post-cutover housekeeping failed, with the
+    /// step label. Recorded even when the host was later compensated, because the
+    /// debris (an unwritten `shared/proxy-options` marker in particular) outlives
+    /// the rollback and fails the NEXT deploy closed.
+    pub degraded: Vec<(String, &'static str)>,
+    /// Hosts the fleet deliberately did NOT roll back, with the reason.
+    pub manual: Vec<(String, &'static str)>,
 }
 
 /// Which `autumn deploy` subcommand to run.
@@ -2140,6 +2168,9 @@ fn run_up(
             media_cfg,
             ffmpeg_bin,
             writable_db_configured: resolve_writable_db_url(&config.database).is_some(),
+            // AC-3's default: a halted rollout compensates the hosts that already
+            // cut over rather than leaving the fleet on two versions.
+            auto_rollback: true,
         },
         // Host presence is guaranteed by the passing ssh_reachability grader above,
         // so this `None` arm is unreachable in practice; it keeps the pre-#1621
@@ -2185,6 +2216,13 @@ struct FleetUpInput<'a, P: ProxyController> {
     /// Whether a writable database URL is configured — the fleet warns loudly when
     /// it is and the rollout schedules no migration at all.
     writable_db_configured: bool,
+    /// Whether a halted rollout automatically compensates the hosts that already
+    /// cut over (issue #1621, §4.7). `true` in production; `false` is halt-and-freeze
+    /// — the rollout stops and reports, leaving every host exactly as it is for
+    /// inspection. The operator-facing `--no-rollback` flag that sets it lands with
+    /// the fleet CLI surface; today it is an internal seam so the freeze path is
+    /// tested, not dead.
+    auto_rollback: bool,
 }
 
 /// One host's read-only probe result: everything the rollout needs to know about
@@ -2374,9 +2412,22 @@ where
 ///   auto-rollback boundary with the FIRST matching label, so a flat vector would
 ///   classify every later host's pre-flip failure as post-boundary and silently
 ///   disable teardown.
-/// - **A failure HALTS the rollout.** Hosts after the failing one are never
-///   touched. Compensating the hosts that already cut over is the next slice; the
-///   typed [`DeployError::FleetHalted`] already names them.
+/// - **A failure HALTS the rollout, then compensates** (issue #1621, §4.6/§4.7).
+///   Hosts after the failing one are never touched, and the hosts that already cut
+///   over are rolled back in reverse order so the fleet converges on ONE version —
+///   binaries only; a migration that already ran is never undone. The one exception
+///   is a post-boundary HOUSEKEEPING failure (`record-proxy-options`, `drain-old`,
+///   `prune`): the host is live and healthy on the new release, so the rollout
+///   warns, marks it degraded, and CONTINUES. A rollout whose only failures are
+///   housekeeping therefore succeeds (`Ok`) with degraded hosts named in the state
+///   table — rolling a whole fleet back because an `rm -rf` of old release dirs
+///   failed would be a self-inflicted outage.
+///
+/// **N = 1 is exempt from all of it.** A single-host config takes the pre-#1621
+/// path verbatim: the raw executor error, no fleet vocabulary, no state table, no
+/// compensation (there is no other host to converge with, and its own boundary
+/// teardown already ran). That is AC-1, and it is why the `single` branches below
+/// are not cosmetic.
 #[allow(clippy::too_many_lines)]
 fn run_up_with<E, P, F>(input: &FleetUpInput<'_, P>, make_executor: F) -> Result<(), DeployError>
 where
@@ -2437,6 +2488,14 @@ where
 
     // ── EXECUTION (serial, one host at a time, rollout order) ────────────────
     let mut outcomes = vec![fleet::HostOutcome::Untouched; total];
+    // Housekeeping debris is recorded OUTSIDE the outcome slot: a degraded host that
+    // is later compensated becomes `CompensatedRollback`, and the failed
+    // `record-proxy-options` that will fail its NEXT deploy closed must survive that
+    // overwrite.
+    let mut degraded: Vec<(String, &'static str)> = Vec::new();
+    // Set when the rollout stops. Compensation runs after the loop, not inside it,
+    // so the compensation set is computed from the FINAL per-host outcomes.
+    let mut halt: Option<(String, &'static str)> = None;
     for (index, host_plan) in plan.hosts.iter().enumerate() {
         let cfg = &fleet.hosts[index];
         let state = &probes[index];
@@ -2525,32 +2584,63 @@ where
                 }
             }
             Err(err) => {
-                outcomes[index] = fleet::classify_failure(&err);
                 // A one-host fleet keeps today's error verbatim: the per-host
                 // executor already told the whole story, and inventing a fleet
-                // vocabulary for one host would change pre-#1621 output.
+                // vocabulary for one host would change pre-#1621 output. This
+                // returns BEFORE any classification, degrade-and-continue or
+                // compensation, so N = 1 is byte-identical on every failure shape,
+                // post-boundary ones included.
                 if single {
                     return Err(DeployError::Exec(err.to_string()));
                 }
                 let failed_step = fleet::failed_step_label(&err);
+                outcomes[index] = fleet::classify_host_outcome(&err);
+                // Post-boundary housekeeping: the proxy is already serving the new
+                // release on this host and only bookkeeping failed. Warn, record the
+                // debris, and keep rolling — the alternative is an outage caused by
+                // a failed `rm -rf` (#1621, §4.6).
+                if let fleet::HostOutcome::Degraded { label } = outcomes[index] {
+                    degraded.push((host_plan.host.clone(), label));
+                    eprintln!(
+                        "\u{26A0}\u{FE0F}  [{}/{total} {}] serving {} \u{2014} but `{label}` \
+                         failed AFTER the cutover. Traffic is healthy, so the rollout \
+                         continues; repair this host (a redeploy does) before the next \
+                         deploy, which will refuse it.\n",
+                        index + 1,
+                        host_plan.host,
+                        input.release_id,
+                    );
+                    continue;
+                }
                 eprintln!(
                     "\n\u{274C} rollout halted at {} (`{failed_step}`) \u{2014} the remaining \
                      hosts were not touched.\n",
                     host_plan.host,
                 );
-                // Print the per-host state on the way out: a halted rollout is
-                // exactly when the operator has no other source of truth.
-                for line in fleet::fleet_summary_lines(&plan, &outcomes, input.release_id) {
-                    eprintln!("{line}");
-                }
-                return Err(fleet_halted(
-                    &plan,
-                    &outcomes,
-                    host_plan.host.clone(),
-                    failed_step,
-                ));
+                halt = Some((host_plan.host.clone(), failed_step));
+                break;
             }
         }
+    }
+
+    if let Some((failed_host, failed_step)) = halt {
+        if input.auto_rollback {
+            compensate_fleet(input, &plan, &probes, &executors, &mut outcomes);
+        }
+        // Print the per-host state on the way out — AFTER compensation, so the table
+        // describes where the fleet actually IS, and even when the compensating
+        // rollback itself failed. That is precisely the case where the operator has
+        // no other source of truth.
+        for line in fleet::fleet_summary_lines(&plan, &outcomes, input.release_id) {
+            eprintln!("{line}");
+        }
+        return Err(fleet_halted(
+            &plan,
+            &outcomes,
+            &degraded,
+            failed_host,
+            failed_step,
+        ));
     }
 
     // App deploy is committed on every host here: the cutovers succeeded and there
@@ -2569,12 +2659,214 @@ where
         for line in fleet::fleet_summary_lines(&plan, &outcomes, input.release_id) {
             eprintln!("{line}");
         }
-        eprintln!(
-            "\n\u{2705} Fleet deploy complete \u{2014} all {total} hosts serving {}.",
-            input.release_id,
-        );
+        // Every host serves the new release either way; a degraded host is live and
+        // healthy, so this is a success — but claiming an unqualified "complete"
+        // when a host's `record-proxy-options` never landed would hide the thing
+        // that fails its NEXT deploy closed.
+        if degraded.is_empty() {
+            eprintln!(
+                "\n\u{2705} Fleet deploy complete \u{2014} all {total} hosts serving {}.",
+                input.release_id,
+            );
+        } else {
+            eprintln!(
+                "\n\u{26A0}\u{FE0F}  Fleet deploy complete \u{2014} all {total} hosts serve {}, \
+                 but {} finished with post-cutover housekeeping failures (above). Repair \
+                 them before the next deploy.",
+                input.release_id,
+                degraded.len(),
+            );
+        }
     }
     Ok(())
+}
+
+/// Compensate a halted rollout: undo every host that is already on the new release,
+/// in strict REVERSE rollout order (issue #1621, §4.7, AC-3).
+///
+/// Three rules are load-bearing:
+///
+/// 1. **Best-effort CONTINUE.** A failed rollback on host j does not stop host j-1.
+///    Stopping would leave MORE hosts on the new release — a bigger mixed fleet,
+///    which is the harm AC-3 names.
+/// 2. **Never swallowed.** Each host's result is recorded into its outcome slot and
+///    reported. This deliberately does NOT reuse [`exec::run_ops`]'s teardown
+///    sibling `run_teardown`, whose `let _ = …` is right for cleanup that must not
+///    mask a real failure and actively dangerous at fleet scale.
+/// 3. **Binaries only.** [`exec::rollback_ops`] and
+///    [`exec::first_deploy_teardown_ops`] contain no `migrate` op by construction,
+///    so a migration that already ran stays applied. The summary says so out loud.
+///
+/// Nothing here is new machinery: a redeploy host is compensated with exactly the
+/// on-demand `autumn deploy rollback` primitives, and a completed FIRST deploy with
+/// the first-deploy teardown (it has no previous release to return to).
+fn compensate_fleet<E, P>(
+    input: &FleetUpInput<'_, P>,
+    plan: &fleet::FleetPlan,
+    probes: &[HostProbeState],
+    executors: &[E],
+    outcomes: &mut [fleet::HostOutcome],
+) where
+    E: exec::DeployExecutor,
+    P: ProxyController,
+{
+    let modes: Vec<fleet::HostMode> = plan.hosts.iter().map(|host| host.mode).collect();
+    let actions = fleet::fleet_rollback_set(outcomes, &modes);
+    if actions.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "\u{21A9}\u{FE0F}  Compensating {} host(s) in reverse rollout order \u{2014} BINARIES \
+         only; a migration that already ran is NOT rolled back.\n",
+        actions.len(),
+    );
+    for action in actions {
+        let index = match action {
+            fleet::RollbackAction::Rollback(index)
+            | fleet::RollbackAction::Teardown(index)
+            | fleet::RollbackAction::Manual(index, _) => index,
+        };
+        let cfg = &input.fleet.hosts[index];
+        let host = plan.hosts[index].host.as_str();
+        outcomes[index] = match action {
+            fleet::RollbackAction::Rollback(_) => {
+                eprintln!(
+                    "\u{21A9}\u{FE0F}  [{host}] rolling back to the previous release\u{2026}"
+                );
+                compensate_rollback(cfg, input, &executors[index])
+            }
+            fleet::RollbackAction::Teardown(_) => {
+                eprintln!(
+                    "\u{21A9}\u{FE0F}  [{host}] removing this run's first deploy \
+                     (no previous release to return to)\u{2026}"
+                );
+                compensate_teardown(cfg, input, &probes[index].slots, &executors[index])
+            }
+            fleet::RollbackAction::Manual(_, reason) => {
+                for line in fleet::manual_recovery_lines(cfg, reason) {
+                    eprintln!("{line}");
+                }
+                // An ambiguous-marker host already describes itself more precisely
+                // than "manual" does; keep the specific state.
+                if matches!(outcomes[index], fleet::HostOutcome::AmbiguousMarkers) {
+                    fleet::HostOutcome::AmbiguousMarkers
+                } else {
+                    fleet::HostOutcome::Manual { reason }
+                }
+            }
+        };
+        eprintln!();
+    }
+}
+
+/// Roll ONE host back to its previous release, with the target-dir precheck
+/// (issue #1621, §4.7).
+///
+/// Every refusal fails CLOSED to [`fleet::HostOutcome::Manual`]: the host stays on
+/// the new release and is reported, which is strictly better than flipping it at a
+/// release dir we cannot prove exists — that failure lands post-boundary, with no
+/// teardown, turning one broken host into two.
+fn compensate_rollback<E, P>(
+    cfg: &ResolvedDeployConfig,
+    input: &FleetUpInput<'_, P>,
+    executor: &E,
+) -> fleet::HostOutcome
+where
+    E: exec::DeployExecutor,
+    P: ProxyController,
+{
+    let target = match exec::resolve_rollback_target(cfg, input.public_port, executor) {
+        Ok(target) => target,
+        // The host records no previous release (a first deploy clears the marker,
+        // and a host deployed before the marker existed simply has none).
+        Err(exec::DeployExecError::NoPreviousRelease) => {
+            return manual_outcome(cfg, fleet::MANUAL_NO_PREVIOUS_RELEASE);
+        }
+        // The probe itself could not run: we know nothing, so we change nothing.
+        Err(_) => {
+            return manual_outcome(cfg, fleet::MANUAL_ROLLBACK_TARGET_UNPROVABLE);
+        }
+    };
+    match exec::probe_rollback_target_dir(&target.release_dir, executor) {
+        Ok(exec::ReleaseDirState::Present) => {}
+        Ok(exec::ReleaseDirState::Absent) => {
+            return manual_outcome(cfg, fleet::MANUAL_ROLLBACK_TARGET_MISSING);
+        }
+        Ok(exec::ReleaseDirState::Unreadable) | Err(_) => {
+            return manual_outcome(cfg, fleet::MANUAL_ROLLBACK_TARGET_UNPROVABLE);
+        }
+    }
+
+    let ops = exec::rollback_ops(cfg, input.proxy, &target);
+    // Same teardown as the on-demand rollback: a failure at or before the
+    // health-gated flip disables the slot it just restarted, so the host is left
+    // serving what it was serving when compensation started.
+    let teardown = exec::rollback_teardown_ops(cfg, &target);
+    match exec::execute_rollback(input.checks, &ops, &teardown, executor) {
+        Ok(()) => fleet::HostOutcome::CompensatedRollback,
+        Err(err) => {
+            let failed_step = fleet::failed_step_label(&err);
+            eprintln!(
+                "\u{274C} [{}] the compensating rollback FAILED at `{failed_step}` \u{2014} this \
+                 host is still on {}. The remaining hosts are still compensated.",
+                cfg.host.as_deref().unwrap_or_default(),
+                input.release_id,
+            );
+            fleet::HostOutcome::CompensationFailed { failed_step }
+        }
+    }
+}
+
+/// Remove ONE host's just-completed FIRST deploy (issue #1621, §4.7).
+///
+/// A first deploy has no `shared/previous-release` marker, so there is nothing to
+/// roll back to: the honest compensation is the first-deploy teardown, which stops
+/// the slot unit, removes this run's release dir, and clears the `current` symlink
+/// and slot markers — leaving the host in the nothing-installed state that makes
+/// the next `deploy up` correctly take the First path again.
+///
+/// Driven through [`exec::run_ops`], not `run_teardown`: at fleet scale a silently
+/// swallowed cleanup failure is how a host ends up half-removed with nobody told.
+///
+/// **Known residue:** [`ProxyController`] has no deregister op, so this host's
+/// kamal-proxy still holds a route for the service pointing at the stopped slot —
+/// its public port answers 502 rather than refusing the connection until it is
+/// deployed again. Removing the route needs a new controller method (and its own
+/// exact-vector tests); the state table names the host so this is never a surprise.
+fn compensate_teardown<E, P>(
+    cfg: &ResolvedDeployConfig,
+    input: &FleetUpInput<'_, P>,
+    slots: &exec::SlotPlan,
+    executor: &E,
+) -> fleet::HostOutcome
+where
+    E: exec::DeployExecutor,
+    P: ProxyController,
+{
+    let ops = exec::first_deploy_teardown_ops(cfg, input.release_id, slots);
+    match exec::run_ops(&ops, executor) {
+        Ok(()) => fleet::HostOutcome::CompensatedTeardown,
+        Err(err) => {
+            let failed_step = fleet::failed_step_label(&err);
+            eprintln!(
+                "\u{274C} [{}] removing the first deploy FAILED at `{failed_step}` \u{2014} this \
+                 host is still on {}. The remaining hosts are still compensated.",
+                cfg.host.as_deref().unwrap_or_default(),
+                input.release_id,
+            );
+            fleet::HostOutcome::CompensationFailed { failed_step }
+        }
+    }
+}
+
+/// Decline the automatic rollback for one host, print the by-hand recovery block,
+/// and record the reason.
+fn manual_outcome(cfg: &ResolvedDeployConfig, reason: &'static str) -> fleet::HostOutcome {
+    for line in fleet::manual_recovery_lines(cfg, reason) {
+        eprintln!("{line}");
+    }
+    fleet::HostOutcome::Manual { reason }
 }
 
 /// Build the typed halt error from the recorded per-host outcomes (issue #1621,
@@ -2583,9 +2875,19 @@ where
 /// Secrets discipline: every field is a host name or a `&'static str` op label —
 /// never a shell line, a remote path, or a formatted driver error (a migration
 /// failure's source can embed the database URL).
+///
+/// The lists describe the FINAL state, so this must be built after compensation:
+/// a host the fleet rolled back is `rolled_back`, and a host whose rollback FAILED
+/// stays in `still_on_new` — reporting the attempt instead of the result is how an
+/// operator ends up believing a mixed fleet converged.
+///
+/// `degraded` is passed in rather than derived, because a degraded host that was
+/// later compensated no longer carries that state in its outcome slot and its
+/// housekeeping debris outlives the rollback.
 fn fleet_halted(
     plan: &fleet::FleetPlan,
     outcomes: &[fleet::HostOutcome],
+    degraded: &[(String, &'static str)],
     failed_host: String,
     failed_step: &'static str,
 ) -> DeployError {
@@ -2597,18 +2899,46 @@ fn fleet_halted(
             .map(|(host, _)| host.host.clone())
             .collect()
     };
-    DeployError::FleetHalted {
+    DeployError::FleetHalted(Box::new(FleetHalt {
         failed_host,
         failed_step,
-        rolled_back: named(|o| matches!(o, fleet::HostOutcome::RolledBack { .. })),
-        torn_down: named(|o| matches!(o, fleet::HostOutcome::TornDown { .. })),
+        rolled_back: named(|o| {
+            matches!(
+                o,
+                fleet::HostOutcome::RolledBack { .. } | fleet::HostOutcome::CompensatedRollback
+            )
+        }),
+        torn_down: named(|o| {
+            matches!(
+                o,
+                fleet::HostOutcome::TornDown { .. } | fleet::HostOutcome::CompensatedTeardown
+            )
+        }),
         still_on_new: named(|o| {
             matches!(
                 o,
-                fleet::HostOutcome::Serving | fleet::HostOutcome::LiveOnNew { .. }
+                fleet::HostOutcome::Serving
+                    | fleet::HostOutcome::Degraded { .. }
+                    | fleet::HostOutcome::LiveOnNew { .. }
+                    | fleet::HostOutcome::AmbiguousMarkers
+                    | fleet::HostOutcome::Manual { .. }
+                    | fleet::HostOutcome::CompensationFailed { .. }
             )
         }),
-    }
+        degraded: degraded.to_vec(),
+        manual: plan
+            .hosts
+            .iter()
+            .zip(outcomes)
+            .filter_map(|(host, outcome)| match outcome {
+                fleet::HostOutcome::AmbiguousMarkers => {
+                    Some((host.host.clone(), fleet::MANUAL_AMBIGUOUS_MARKERS))
+                }
+                fleet::HostOutcome::Manual { reason } => Some((host.host.clone(), *reason)),
+                _ => None,
+            })
+            .collect(),
+    }))
 }
 
 /// Perform a real on-demand rollback (issue #1607, Slice 3, AC-4).
@@ -4648,8 +4978,10 @@ mod tests {
         let preflight_at = up_body
             .find("check_media_host_preflight(input.media_cfg")
             .expect("preflight call present on the up path");
-        // The per-host cutovers happen inside this loop; a failed host returns from
-        // inside it (after the per-host teardown) before anything below runs.
+        // The per-host cutovers happen inside this loop. A failed host breaks out of
+        // it and returns from the halt block immediately below — after its own
+        // teardown and after any fleet compensation (#1621 slice 4) — so nothing
+        // past that point runs.
         let commit_at = up_body
             .find("for (index, host_plan) in plan.hosts.iter().enumerate()")
             .expect("per-host execution loop present on the up path");
@@ -4664,7 +4996,8 @@ mod tests {
         assert!(
             commit_at < provision_at,
             "MediaMTX provisioning must run only AFTER every host's cutover commits — so a \
-             rolled-back or halted rollout (which returns from inside the loop) never reaches it",
+             rolled-back or halted rollout (which returns from the loop's halt path) never \
+             reaches it",
         );
 
         // The preflight itself is non-mutating: it runs the doctor checks but must
@@ -4688,7 +5021,7 @@ mod tests {
         assert!(
             after_commit.contains("provision_media_host(input.media_cfg, executor)?;"),
             "provisioning must sit on the post-commit path (unreachable when a host's \
-             deploy errors out inside the rollout loop)",
+             deploy errors out and the rollout halts)",
         );
     }
 
@@ -4730,6 +5063,17 @@ mod tests {
 
     const FLEET_RELEASE_ID: &str = "20260714T120000Z";
     const FLEET_PUBLIC_PORT: u16 = 3000;
+
+    /// The halt report inside a [`DeployError::FleetHalted`], or a panic naming
+    /// what came instead. Every fleet-failure test asserts on the same shape, so
+    /// unwrapping it once keeps those assertions about the FLEET rather than about
+    /// the boxing.
+    fn fleet_halt_of(err: &DeployError) -> &FleetHalt {
+        match err {
+            DeployError::FleetHalted(halt) => halt,
+            other => panic!("expected a fleet halt, got: {other:?}"),
+        }
+    }
 
     fn fleet_of(hosts: &[&str]) -> ResolvedFleet {
         ResolvedFleet::resolve(
@@ -4795,6 +5139,68 @@ mod tests {
             .script(host, "probe-release-dir", "absent")
     }
 
+    /// Script one host as a healthy FIRST deploy.
+    fn script_first_deploy(
+        recorder: fleet::test_support::FleetRecorder,
+        host: &str,
+    ) -> fleet::test_support::FleetRecorder {
+        recorder
+            .script(host, "proxy-compat-probe", compatible_deploy_help())
+            .script(host, "detect-current", first_deploy_probe())
+            .script(host, "probe-release-dir", "absent")
+    }
+
+    /// The release a compensated redeploy host rolls BACK to — the blue release it
+    /// was serving before this run flipped it to green.
+    const PREVIOUS_RELEASE_DIR: &str = "/srv/autumn/myapp/releases/20260101T000000Z";
+
+    /// Script the two read-only probes a compensating rollback runs on a host: the
+    /// previous-release marker, and the §4.7 precheck that the dir it names still
+    /// exists. `target_dir` is the precheck's answer (`present`/`absent`/garbage).
+    fn script_compensation(
+        recorder: fleet::test_support::FleetRecorder,
+        host: &str,
+        target_dir: &'static str,
+    ) -> fleet::test_support::FleetRecorder {
+        recorder
+            .script(
+                host,
+                "resolve-previous",
+                format!("prev:{PREVIOUS_RELEASE_DIR}\tblue\t3001"),
+            )
+            .script(host, "probe-rollback-target", target_dir)
+    }
+
+    /// The ordered `Run` labels of a compensating rollback on one host: the two
+    /// read-only probes, then the unchanged on-demand `rollback_ops` sequence
+    /// (`write-target-unit` is an upload, so it is not a `Run`).
+    const COMPENSATION_RUN_LABELS: [&str; 8] = [
+        "resolve-previous",
+        "probe-rollback-target",
+        "daemon-reload",
+        "restart-previous",
+        "proxy-flip",
+        "commit-markers",
+        "readiness-gate",
+        "drain-rolled-back-slot",
+    ];
+
+    /// The `Run` labels a host records for a full redeploy plus the compensating
+    /// rollback that followed it.
+    fn redeploy_then_compensated(migrated: bool) -> Vec<&'static str> {
+        READ_ONLY_PROBES
+            .iter()
+            .copied()
+            .chain(
+                REDEPLOY_RUN_LABELS
+                    .iter()
+                    .copied()
+                    .filter(|label| migrated || *label != "migrate"),
+            )
+            .chain(COMPENSATION_RUN_LABELS)
+            .collect()
+    }
+
     /// Build a driver input over `fleet` with every fleet-wide value fixed, so the
     /// per-host op vectors are byte-comparable against the single-host builders.
     struct FleetFixture {
@@ -4816,6 +5222,7 @@ mod tests {
             }
         }
 
+        /// The production shape: a halt compensates the hosts that already cut over.
         fn input<'a>(
             &'a self,
             fleet: &'a ResolvedFleet,
@@ -4832,6 +5239,20 @@ mod tests {
                 media_cfg: &self.media_cfg,
                 ffmpeg_bin: "ffmpeg",
                 writable_db_configured: true,
+                auto_rollback: true,
+            }
+        }
+
+        /// Halt-and-freeze: stop at the first failure and change nothing else, for
+        /// inspection (#1621, §4.7 — the internal seam behind the `--no-rollback`
+        /// flag the fleet CLI surface adds).
+        fn input_frozen<'a>(
+            &'a self,
+            fleet: &'a ResolvedFleet,
+        ) -> FleetUpInput<'a, proxy::KamalProxyController> {
+            FleetUpInput {
+                auto_rollback: false,
+                ..self.input(fleet)
             }
         }
 
@@ -4911,11 +5332,12 @@ mod tests {
                 ],
             },
             &[
-                fleet::HostOutcome::Serving,
-                fleet::HostOutcome::RolledBack {
-                    failed_step: "migrate",
-                },
+                fleet::HostOutcome::Degraded { label: "prune" },
+                fleet::HostOutcome::AmbiguousMarkers,
             ],
+            // #1621 slice 4: the degraded log and the manual list are the two
+            // richest new fields, so the secrets assertion below covers them too.
+            &[("web-a".to_owned(), "prune")],
             "web-b".to_owned(),
             "migrate",
         );
@@ -4924,6 +5346,19 @@ mod tests {
         assert!(
             rendered.contains("web-b") && rendered.contains("migrate"),
             "the halt must name the failing host and step: {rendered}"
+        );
+        assert!(
+            rendered.contains("prune") && rendered.contains("web-a"),
+            "the degraded log must name the host and the housekeeping label: {rendered}"
+        );
+        assert!(
+            rendered.contains(fleet::MANUAL_AMBIGUOUS_MARKERS),
+            "an ambiguous-marker host must be reported as needing a human: {rendered}"
+        );
+        assert!(
+            rendered.contains("NOT rolled back"),
+            "the halt must state that the schema did not come back with the binaries: \
+             {rendered}"
         );
         for secret in [
             "postgres://",
@@ -5156,8 +5591,15 @@ mod tests {
         // #1621 (AC-3). Host 2's readiness gate fails — a PRE-boundary failure, so
         // its candidate is torn down by the existing per-host auto-rollback and its
         // old release keeps serving. The rollout then HALTS: host 3 is never
-        // touched. Host 1 is left on the new release; compensating it back is the
-        // next slice's job, and the typed error already names it as such.
+        // touched. Host 1 is left on the new release and NAMED, so the operator can
+        // reverse it.
+        //
+        // #1621 slice 4 pins this against the HALT-AND-FREEZE seam (`auto_rollback:
+        // false`, the internal form of `--no-rollback`): freezing is exactly the
+        // "stop and let me look" behaviour, so it must keep reporting partial state
+        // truthfully. The default path — which compensates web-a instead of leaving
+        // it forward — is
+        // `a_pre_boundary_failure_rolls_the_already_cut_over_hosts_back`.
         let hosts = ["web-a", "web-b", "web-c"];
         let fleet = fleet_of(&hosts);
         let mut recorder = fleet::test_support::FleetRecorder::new();
@@ -5167,39 +5609,41 @@ mod tests {
         recorder = recorder.fail("web-b", "readiness-gate");
         let fixture = FleetFixture::new();
 
-        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
-            .expect_err("a mid-rollout failure must halt the rollout");
+        let err = run_up_with(&fixture.input_frozen(&fleet), |cfg| {
+            Ok(recorder.executor(cfg))
+        })
+        .expect_err("a mid-rollout failure must halt the rollout");
 
-        match &err {
-            DeployError::FleetHalted {
-                failed_host,
-                failed_step,
-                rolled_back,
-                torn_down,
-                still_on_new,
-            } => {
-                assert_eq!(failed_host, "web-b", "the halt must name the failing host");
-                assert_eq!(
-                    *failed_step, "readiness-gate",
-                    "the halt must name the failing step"
-                );
-                assert_eq!(
-                    rolled_back,
-                    &vec!["web-b".to_owned()],
-                    "a pre-boundary failure rolls the failing host's candidate back"
-                );
-                assert!(
-                    torn_down.is_empty(),
-                    "a redeploy host is rolled back, not torn down: {torn_down:?}"
-                );
-                assert_eq!(
-                    still_on_new,
-                    &vec!["web-a".to_owned()],
-                    "the already-cut-over hosts must be named so they can be compensated"
-                );
-            }
-            other => panic!("expected a fleet halt, got: {other:?}"),
-        }
+        let halt = fleet_halt_of(&err);
+        assert!(
+            halt.degraded.is_empty() && halt.manual.is_empty(),
+            "a clean pre-boundary halt needs no degraded/manual rows: {:?} / {:?}",
+            halt.degraded,
+            halt.manual
+        );
+        assert_eq!(
+            halt.failed_host, "web-b",
+            "the halt must name the failing host"
+        );
+        assert_eq!(
+            halt.failed_step, "readiness-gate",
+            "the halt must name the failing step"
+        );
+        assert_eq!(
+            halt.rolled_back,
+            vec!["web-b".to_owned()],
+            "a pre-boundary failure rolls the failing host's candidate back"
+        );
+        assert!(
+            halt.torn_down.is_empty(),
+            "a redeploy host is rolled back, not torn down: {:?}",
+            halt.torn_down
+        );
+        assert_eq!(
+            halt.still_on_new,
+            vec!["web-a".to_owned()],
+            "the already-cut-over hosts must be named so they can be compensated"
+        );
 
         // Host 1 completed its cutover.
         assert!(
@@ -5224,6 +5668,478 @@ mod tests {
         assert!(
             web_c.is_empty(),
             "the rollout must halt: web-c must be mutated in no way, got: {web_c:?}"
+        );
+    }
+
+    // ── Fleet compensation (issue #1621, slice 4, §4.6-4.7) ──────────────────
+
+    #[test]
+    fn a_pre_boundary_failure_rolls_the_already_cut_over_hosts_back() {
+        // #1621 (AC-3, T1.13 case a). Host 2's readiness gate fails BEFORE its flip,
+        // so its own auto-rollback tears the candidate down and its old release
+        // keeps serving — but host 1 has already cut over. Left alone, the fleet
+        // runs two versions at rest, which is the exact failure AC-3 forbids. So the
+        // rollout compensates host 1 with the UNCHANGED on-demand rollback
+        // primitives, and host 3 — never reached — stays untouched.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder =
+            script_compensation(recorder, "web-a", "present").fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        // Host 1 ran its full cutover and then the full rollback sequence — the same
+        // ops `autumn deploy rollback` runs, in the same order, nothing invented.
+        assert_eq!(
+            recorder.run_labels_for("web-a"),
+            redeploy_then_compensated(true),
+            "web-a must be rolled back with the on-demand rollback primitives"
+        );
+        assert!(
+            recorder
+                .mutating(&READ_ONLY_PROBES)
+                .iter()
+                .all(|(host, _)| host != "web-c"),
+            "web-c was never reached, so compensation must not touch it either"
+        );
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(
+            halt.rolled_back,
+            vec!["web-a".to_owned(), "web-b".to_owned()],
+            "both the compensated host and the self-torn-down host are back on their \
+             previous release"
+        );
+        assert!(
+            halt.still_on_new.is_empty() && halt.torn_down.is_empty() && halt.manual.is_empty(),
+            "the fleet converged: nothing left forward, nothing manual — got {:?} / {:?} / {:?}",
+            halt.still_on_new,
+            halt.torn_down,
+            halt.manual
+        );
+    }
+
+    #[test]
+    fn a_post_boundary_functional_failure_compensates_newest_first_including_itself() {
+        // #1621 (AC-3, T1.13 case b). Host 2's ssh transport drops during `drain-old`
+        // — AFTER its flip, so traffic already moved and no teardown ran. That host
+        // IS on the new release, so the compensation set includes it, and the order
+        // is strictly newest-cutover-first: undoing from the newest end shrinks the
+        // mixed window instead of widening it.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder = script_compensation(recorder, "web-a", "present");
+        recorder =
+            script_compensation(recorder, "web-b", "present").transport_fail("web-b", "drain-old");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a post-boundary failure must halt the rollout");
+
+        // Reverse order, asserted on the fleet-wide tape: `restart-previous` belongs
+        // only to `rollback_ops`, so it is the unambiguous marker of each host's
+        // compensation.
+        let web_b = recorder
+            .index_of("web-b", "restart-previous")
+            .expect("web-b must be compensated — it is live on the new release");
+        let web_a = recorder
+            .index_of("web-a", "restart-previous")
+            .expect("web-a must be compensated");
+        assert!(
+            web_b < web_a,
+            "compensation must run in REVERSE rollout order: web-b's rollback at \
+             {web_b}, web-a's at {web_a}"
+        );
+        assert!(
+            recorder.index_of("web-c", "restart-previous").is_none(),
+            "web-c never cut over, so it must not be rolled back"
+        );
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_host, "web-b");
+        assert_eq!(
+            halt.failed_step, "ssh-transport",
+            "a dropped transport attributes to the transport, never to a fabricated \
+             step label"
+        );
+        assert_eq!(
+            halt.rolled_back,
+            vec!["web-a".to_owned(), "web-b".to_owned()],
+            "the post-boundary host is compensated TOO — it is on the new release"
+        );
+        assert!(
+            halt.still_on_new.is_empty(),
+            "the fleet must converge on one version: {:?}",
+            halt.still_on_new
+        );
+    }
+
+    #[test]
+    fn a_completed_first_deploy_is_compensated_by_teardown_not_rollback() {
+        // #1621 (AC-3, T1.13 case c). A first-deploy host has no
+        // `shared/previous-release` marker, so there is nothing to roll back TO:
+        // `resolve_rollback_target` would fail. Its honest compensation is the
+        // first-deploy teardown, which returns it to nothing-installed — the state
+        // that makes the next `deploy up` correctly take the First path again. A
+        // half-installed host an LB may already be probing is worse than a clean
+        // absence.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_first_deploy(recorder, "web-a");
+        recorder = script_redeploy(recorder, "web-b").fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        let web_a = recorder.run_labels_for("web-a");
+        for teardown in [
+            "teardown-candidate-unit",
+            "teardown-candidate-dir",
+            "teardown-current-symlink",
+            "teardown-slot-markers",
+        ] {
+            assert!(
+                web_a.contains(&teardown),
+                "a compensated first deploy must run `{teardown}`: {web_a:?}"
+            );
+        }
+        assert!(
+            !web_a.contains(&"resolve-previous") && !web_a.contains(&"restart-previous"),
+            "a first-deploy host has no previous release, so it must never be sent \
+             through the rollback primitives: {web_a:?}"
+        );
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(
+            halt.torn_down,
+            vec!["web-a".to_owned()],
+            "the compensated first deploy is reported as torn down, not rolled back"
+        );
+        assert_eq!(
+            halt.rolled_back,
+            vec!["web-b".to_owned()],
+            "the failing redeploy host's own candidate teardown still stands"
+        );
+        assert!(
+            halt.still_on_new.is_empty(),
+            "nothing may be left on the new release"
+        );
+    }
+
+    #[test]
+    fn a_failed_compensation_does_not_stop_the_earlier_hosts() {
+        // #1621 (AC-3, T1.13 case d). Host 3 fails post-boundary; compensation runs
+        // c → b → a and host 2's rollback fails at `restart-previous`. Stopping there
+        // would leave MORE hosts on the new release — a BIGGER mixed fleet — so the
+        // driver continues to host 1 and reports host 2 honestly. This is the one
+        // place the repo's `let _ = run_one(..)` teardown idiom must NOT be reused:
+        // a swallowed compensation failure is how a fleet silently stays mixed.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder = script_compensation(recorder, "web-a", "present");
+        recorder =
+            script_compensation(recorder, "web-b", "present").fail("web-b", "restart-previous");
+        recorder =
+            script_compensation(recorder, "web-c", "present").transport_fail("web-c", "drain-old");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a post-boundary failure must halt the rollout");
+
+        // Host 2's rollback failed at or before the flip, so its restarted slot was
+        // disabled again and it is still serving the NEW release.
+        let web_b = recorder.run_labels_for("web-b");
+        assert!(
+            web_b.contains(&"restart-previous")
+                && !web_b
+                    .iter()
+                    .skip_while(|l| **l != "restart-previous")
+                    .any(|l| *l == "commit-markers")
+                && web_b.contains(&"teardown-rollback-slot"),
+            "web-b's rollback must fail before its flip and disable the slot it \
+             restarted: {web_b:?}"
+        );
+        // …and host 1 is still compensated afterwards.
+        let web_a = recorder
+            .index_of("web-a", "restart-previous")
+            .expect("web-a must still be compensated after web-b's rollback failed");
+        let web_b_attempt = recorder
+            .index_of("web-b", "restart-previous")
+            .expect("web-b's rollback was attempted");
+        assert!(
+            web_b_attempt < web_a,
+            "the failed rollback must not stop the earlier host: web-b at \
+             {web_b_attempt}, web-a at {web_a}"
+        );
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(
+            halt.rolled_back,
+            vec!["web-a".to_owned(), "web-c".to_owned()],
+            "every host whose compensation SUCCEEDED is reported as rolled back"
+        );
+        assert_eq!(
+            halt.still_on_new,
+            vec!["web-b".to_owned()],
+            "a host whose compensation failed is still on the new release and must be \
+             named as such — reporting the attempt instead of the result is how an \
+             operator believes a mixed fleet converged"
+        );
+    }
+
+    #[test]
+    fn a_missing_rollback_target_dir_declines_the_rollback() {
+        // #1621 (AC-3, T1.13 case e / §4.7). `prune` runs per host, so hosts with
+        // divergent deploy history legitimately retain different release sets: the
+        // previous-release marker can name a dir this host no longer has. Flipping
+        // at it anyway starts a unit whose ExecStart points nowhere, passes systemd,
+        // and fails the readiness gate POST-boundary with no teardown — one broken
+        // host becomes two. So the precheck declines, and the host is reported.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in ["web-a", "web-b"] {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder = script_compensation(recorder, "web-a", "absent").fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        let web_a = recorder.run_labels_for("web-a");
+        assert!(
+            web_a.contains(&"probe-rollback-target"),
+            "the precheck must actually run: {web_a:?}"
+        );
+        assert!(
+            !web_a.contains(&"restart-previous") && !web_a.contains(&"drain-rolled-back-slot"),
+            "a declined rollback must run NO rollback ops: {web_a:?}"
+        );
+        assert_eq!(
+            web_a.iter().filter(|label| **label == "proxy-flip").count(),
+            1,
+            "the declined host must keep exactly its cutover flip — zero further \
+             flips: {web_a:?}"
+        );
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(
+            halt.manual,
+            vec![("web-a".to_owned(), fleet::MANUAL_ROLLBACK_TARGET_MISSING)],
+            "the declined host must be reported with its reason"
+        );
+        assert_eq!(
+            halt.still_on_new,
+            vec!["web-a".to_owned()],
+            "a host that was NOT rolled back is still on the new release"
+        );
+        assert_eq!(
+            halt.rolled_back,
+            vec!["web-b".to_owned()],
+            "the failing host's own teardown still stands"
+        );
+    }
+
+    #[test]
+    fn a_commit_markers_failure_is_never_auto_rolled_back() {
+        // #1621 (§4.6, T1.15). `commit-markers` writes previous-release + `current` +
+        // live-slot as ONE remote transaction. A failure inside it can leave any
+        // subset applied, so `resolve_rollback_target` may name the WRONG release —
+        // rolling back could move that host FORWARD, or onto a release it never
+        // served. Fail closed: halt, do not touch that host, print the by-hand
+        // recovery. Earlier hosts are still compensated.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in ["web-a", "web-b"] {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder =
+            script_compensation(recorder, "web-a", "present").fail("web-b", "commit-markers");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("an ambiguous-marker failure must halt the rollout");
+
+        let web_b = recorder.run_labels_for("web-b");
+        for rollback_op in [
+            "resolve-previous",
+            "probe-rollback-target",
+            "restart-previous",
+            "drain-rolled-back-slot",
+        ] {
+            assert!(
+                !web_b.contains(&rollback_op),
+                "an ambiguous-marker host must see ZERO rollback-flavoured ops, got \
+                 `{rollback_op}`: {web_b:?}"
+            );
+        }
+        assert_eq!(
+            recorder.run_labels_for("web-a"),
+            redeploy_then_compensated(true),
+            "the earlier host is still compensated"
+        );
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_step, "commit-markers");
+        assert_eq!(
+            halt.manual,
+            vec![("web-b".to_owned(), fleet::MANUAL_AMBIGUOUS_MARKERS)],
+            "the ambiguous host must be reported as needing a human"
+        );
+        assert_eq!(
+            halt.still_on_new,
+            vec!["web-b".to_owned()],
+            "it was not rolled back, so it is still on the new release"
+        );
+        assert_eq!(halt.rolled_back, vec!["web-a".to_owned()]);
+    }
+
+    #[test]
+    fn a_housekeeping_failure_degrades_the_host_and_continues_the_rollout() {
+        // #1621 (§4.6, T1.15). `prune` runs AFTER the flip: the proxy is already
+        // serving the new release, so a failed `rm -rf` of old release dirs affects
+        // no traffic at all. Rolling three hosts back over it would be a
+        // self-inflicted outage. The rollout warns, marks the host degraded, and
+        // CONTINUES — and the deploy SUCCEEDS, because every host really is serving
+        // the new release.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder = recorder.fail("web-b", "prune");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect("a post-cutover housekeeping failure must not fail the rollout");
+
+        assert_eq!(
+            recorder.run_labels_for("web-c"),
+            READ_ONLY_PROBES
+                .iter()
+                .copied()
+                .chain(
+                    REDEPLOY_RUN_LABELS
+                        .iter()
+                        .copied()
+                        .filter(|label| *label != "migrate")
+                )
+                .collect::<Vec<_>>(),
+            "the rollout must CONTINUE past a degraded host"
+        );
+        let web_b = recorder.run_labels_for("web-b");
+        assert!(
+            web_b.contains(&"prune")
+                && !web_b.contains(&"teardown-candidate-unit")
+                && !web_b.contains(&"restart-previous"),
+            "a degraded host is live and healthy: nothing may be torn down or rolled \
+             back on it: {web_b:?}"
+        );
+        assert!(
+            recorder.positions_of("resolve-previous").is_empty(),
+            "a rollout that only degraded must compensate NOTHING anywhere"
+        );
+    }
+
+    #[test]
+    fn compensation_never_touches_the_schema() {
+        // #1621 (AC-3, T1.12). Auto-rollback is BINARY-ONLY. `rollback_ops` and
+        // `first_deploy_teardown_ops` contain no `migrate` op by construction, and
+        // that must stay true as they evolve: `rolling_deploy_blocked` grades
+        // `up.sql` only, so an automatic `migrate down` would run exactly the SQL
+        // nothing reviews, unattended, mid-flip. The error text says so too, because
+        // an operator watching binaries go back will otherwise assume the schema did.
+        let hosts = ["web-a", "web-b"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder = script_compensation(recorder, "web-a", "present");
+        recorder =
+            script_compensation(recorder, "web-b", "present").transport_fail("web-b", "drain-old");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a post-boundary failure must halt the rollout");
+
+        // Exactly one `migrate` in the WHOLE run — the fleet's single scheduled one,
+        // on the first host's cutover — and none of it after compensation began.
+        let migrations = recorder.positions_of("migrate");
+        assert_eq!(
+            migrations.len(),
+            1,
+            "the fleet migrates once and compensation adds none: {migrations:?}"
+        );
+        let compensation_started = recorder
+            .positions_of("resolve-previous")
+            .first()
+            .copied()
+            .expect("compensation ran");
+        assert!(
+            migrations[0] < compensation_started,
+            "the only migration must predate compensation: migrate at {}, compensation \
+             from {compensation_started}",
+            migrations[0]
+        );
+        assert!(
+            err.to_string().contains("NOT rolled back"),
+            "the halt must state that the schema did not come back with the binaries: {err}"
+        );
+    }
+
+    #[test]
+    fn a_single_host_failure_keeps_todays_error_and_compensates_nothing() {
+        // #1621 (AC-1). N = 1 is exempt from the whole fleet vocabulary: a
+        // single-host deploy that fails must return the pre-#1621 error verbatim —
+        // no classification, no degrade-and-continue, no compensation, no state
+        // table. `prune` is the sharpest case: in a FLEET it degrades and the deploy
+        // succeeds, while for one host it must stay exactly today's failure.
+        let fleet = fleet_of(&["203.0.113.10"]);
+        let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "203.0.113.10")
+            .fail("203.0.113.10", "prune");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a single-host post-boundary failure must still fail the deploy");
+
+        match &err {
+            DeployError::Exec(message) => assert_eq!(
+                *message,
+                exec::DeployExecError::CommandFailed {
+                    label: "prune",
+                    message: "scripted failure".to_owned(),
+                }
+                .to_string(),
+                "the single-host path must surface the raw executor error verbatim"
+            ),
+            other => panic!("N = 1 must never produce fleet vocabulary, got: {other:?}"),
+        }
+        assert_eq!(
+            recorder.run_labels_for("203.0.113.10"),
+            READ_ONLY_PROBES
+                .iter()
+                .copied()
+                .chain(REDEPLOY_RUN_LABELS)
+                .collect::<Vec<_>>(),
+            "the one host runs today's exact sequence and nothing more — no \
+             compensation, no extra probe"
         );
     }
 }

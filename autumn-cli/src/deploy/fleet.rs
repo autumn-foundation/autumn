@@ -320,19 +320,27 @@ pub(crate) fn fleet_plan_lines(hosts: &[String]) -> Vec<String> {
 /// or halt — because a halted rollout is exactly the moment an operator has no
 /// other source of truth about which host is running what.
 ///
-/// The variants are deliberately the ones the EXISTING per-host executor already
-/// distinguishes, so nothing is inferred: [`exec::execute_with_teardown`] returns
-/// `CandidateRolledBack`/`FirstDeployTornDown` **only** for a failure at or before
-/// the go-live boundary (traffic never moved, the candidate was cleaned up), and
-/// the raw error otherwise (the host is live on the new release). The finer
-/// post-boundary classification — housekeeping vs ambiguous-markers vs functional —
-/// and the fleet-wide compensation it drives land with the next slice.
+/// The first five variants are deliberately the ones the EXISTING per-host
+/// executor already distinguishes, so nothing is inferred:
+/// [`exec::execute_with_teardown`] returns `CandidateRolledBack`/`FirstDeployTornDown`
+/// **only** for a failure at or before the go-live boundary (traffic never moved,
+/// the candidate was cleaned up), and the raw error otherwise (the host is live on
+/// the new release). [`classify_post_boundary`] then refines that raw
+/// "live on the new release" case by the failing LABEL, and the compensation
+/// variants record what the fleet driver did about it afterwards.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HostOutcome {
     /// The rollout halted before this host was reached. Nothing was mutated on it.
     Untouched,
     /// The host is serving the new release.
     Serving,
+    /// A post-boundary HOUSEKEEPING failure ([`PostBoundaryClass::Housekeeping`]):
+    /// the host is live and healthy on the new release, and only bookkeeping that
+    /// does not touch traffic failed. The rollout CONTINUES past it (§4.6).
+    Degraded {
+        /// Label of the housekeeping step that failed.
+        label: &'static str,
+    },
     /// A pre-boundary failure on a REDEPLOY host: the candidate was torn down and
     /// this host's previous release is still serving.
     RolledBack {
@@ -345,12 +353,190 @@ pub(crate) enum HostOutcome {
         /// Label of the step that failed.
         failed_step: &'static str,
     },
-    /// A post-boundary failure: traffic has already moved, so this host IS running
-    /// the new release even though the deploy reported failure.
+    /// A post-boundary FUNCTIONAL failure: traffic has already moved, so this host
+    /// IS running the new release even though the deploy reported failure.
     LiveOnNew {
         /// Label of the step that failed.
         failed_step: &'static str,
     },
+    /// A post-boundary failure at `commit-markers`
+    /// ([`PostBoundaryClass::Ambiguous`]): the host is on the new release AND its
+    /// marker triple is mid-transaction, so it is **never** rolled back
+    /// automatically — [`exec::resolve_rollback_target`] could resolve the wrong
+    /// release. Fails closed to a manual recovery.
+    AmbiguousMarkers,
+    /// Fleet compensation rolled this host back to its previous release.
+    CompensatedRollback,
+    /// Fleet compensation removed this host's just-completed FIRST deploy, so it is
+    /// back to nothing-installed (see [`RollbackAction::Teardown`]).
+    CompensatedTeardown,
+    /// Fleet compensation was attempted on this host and FAILED — it is still on
+    /// the new release. Never swallowed: the failing step is named.
+    CompensationFailed {
+        /// Label of the compensation step that failed.
+        failed_step: &'static str,
+    },
+    /// Fleet compensation was deliberately NOT attempted on this host: it is still
+    /// on the new release and needs a human (see the `MANUAL_*` reasons).
+    Manual {
+        /// Why the automatic rollback was declined — a `&'static str`, never a
+        /// shell line or a driver message.
+        reason: &'static str,
+    },
+}
+
+/// How bad a POST-boundary failure is (issue #1621, §4.6).
+///
+/// "Post-boundary" means [`exec::execute_with_teardown`] returned the RAW executor
+/// error rather than one of its two clean-failure variants: the go-live op already
+/// succeeded, no teardown ran, and the host **is** on the new release. What to do
+/// about that depends entirely on WHICH step failed, and the three answers are
+/// materially different — which is why this is a classification and not a boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostBoundaryClass {
+    /// The host is live and healthy; only bookkeeping failed. **Warn and continue**
+    /// the rollout — rolling a whole fleet back because an `rm -rf` of old release
+    /// dirs failed on host 3 is a self-inflicted outage.
+    Housekeeping,
+    /// The marker triple is mid-transaction. **Halt, and never auto-roll-back this
+    /// host** — the rollback target cannot be trusted.
+    Ambiguous,
+    /// The host is live on the new release and something that matters failed.
+    /// **Halt and compensate**, including this host.
+    Functional,
+}
+
+/// Post-boundary labels that do not affect traffic (issue #1621, §4.6).
+///
+/// All three run strictly AFTER `proxy-flip`, so the proxy is already serving the
+/// new release when they run:
+///
+/// - `record-proxy-options` — writes the `shared/proxy-options` marker. Its failure
+///   is invisible today and fails the NEXT deploy closed
+///   (`refuse_unprovable_proxy_options`), which is exactly why it must be surfaced
+///   rather than swallowed.
+/// - `drain-old` — disables the now-idle old slot unit. Two slots running is
+///   untidy, not an outage.
+/// - `prune` — removes old release dirs. Disk hygiene.
+pub(crate) const HOUSEKEEPING_LABELS: [&str; 3] = ["record-proxy-options", "drain-old", "prune"];
+
+/// The one post-boundary label whose failure makes a host's rollback target
+/// unprovable: `commit-markers` writes previous-release + `current` + live-slot as
+/// ONE remote transaction, so a failure inside it can leave any subset applied.
+pub(crate) const AMBIGUOUS_MARKERS_LABEL: &str = "commit-markers";
+
+/// Classify a POST-boundary failure by its op label (issue #1621, §4.6, T1.15).
+///
+/// Unknown labels fall through to [`PostBoundaryClass::Functional`] — the
+/// fail-closed direction. A future op added after the boundary is then treated as
+/// mattering until someone deliberately adds it to [`HOUSEKEEPING_LABELS`], rather
+/// than being silently waved through as harmless.
+pub(crate) fn classify_post_boundary(label: &str) -> PostBoundaryClass {
+    if HOUSEKEEPING_LABELS.contains(&label) {
+        PostBoundaryClass::Housekeeping
+    } else if label == AMBIGUOUS_MARKERS_LABEL {
+        PostBoundaryClass::Ambiguous
+    } else {
+        PostBoundaryClass::Functional
+    }
+}
+
+/// Why an automatic rollback was declined at `commit-markers`.
+pub(crate) const MANUAL_AMBIGUOUS_MARKERS: &str =
+    "release markers left mid-transaction by `commit-markers`";
+
+/// Why an automatic rollback was declined by the target-dir precheck (§4.7).
+pub(crate) const MANUAL_ROLLBACK_TARGET_MISSING: &str = "rollback target release dir missing";
+
+/// Why an automatic rollback was declined when the target-dir probe proved nothing.
+pub(crate) const MANUAL_ROLLBACK_TARGET_UNPROVABLE: &str =
+    "rollback target release dir could not be verified";
+
+/// Why an automatic rollback was declined when the host records no previous release.
+pub(crate) const MANUAL_NO_PREVIOUS_RELEASE: &str = "no previous release recorded to roll back to";
+
+/// What the fleet does to ONE host when compensating a halted rollout (issue
+/// #1621, §4.7).
+///
+/// The `usize` is the host's index in rollout order, which is index-parallel to
+/// `FleetPlan::hosts` / `ResolvedFleet::hosts` / the probe list — the same
+/// convention the driver uses everywhere, and the reason no host name appears here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RollbackAction {
+    /// Roll this host back to its previous release with the EXISTING on-demand
+    /// rollback primitives ([`exec::resolve_rollback_target`] →
+    /// [`exec::rollback_ops`] → [`exec::execute_rollback`]).
+    Rollback(usize),
+    /// Remove this host's just-completed FIRST deploy
+    /// ([`exec::first_deploy_teardown_ops`]).
+    ///
+    /// A first deploy has no `shared/previous-release` marker, so there is nothing
+    /// to roll back TO: the honest compensation is to return the host to
+    /// nothing-installed, which is also the state that makes the next `deploy up`
+    /// correctly take the First path again. A half-installed host an external load
+    /// balancer may already be probing is worse than a clean absence.
+    ///
+    /// **Known gap (documented, not fixed here):** [`ProxyController`] exposes no
+    /// deregister op, so the host's kamal-proxy still holds a route for the service
+    /// pointing at the (now stopped) slot port — that host's public port answers
+    /// 502 instead of connection-refused until it is deployed again. Removing the
+    /// route needs a new `ProxyController` method and its own exact-vector tests;
+    /// it is tracked as follow-up work, and the state table names the host so the
+    /// operator is never surprised by it.
+    Teardown(usize),
+    /// Do NOT touch this host automatically; report it and the reason.
+    Manual(usize, &'static str),
+}
+
+/// The compensation set for a halted rollout — **pure**, in strict REVERSE rollout
+/// order (issue #1621, §4.7, AC-3).
+///
+/// Reverse order is not cosmetic: the hosts that cut over LAST are the ones that
+/// have been serving the new release for the shortest time, and undoing them first
+/// shrinks the mixed window from the newest end. Every host that is on the new
+/// release is in the set, including the host that failed post-boundary and
+/// including hosts marked [`HostOutcome::Degraded`] — a degraded host is live and
+/// healthy on the NEW release, so leaving it there while every other host returns
+/// to the old one is precisely the mixed-version fleet AC-3 forbids. (Its
+/// housekeeping debris is still reported: the driver records it independently of
+/// this outcome slot.)
+///
+/// Hosts that are already clean ([`HostOutcome::RolledBack`] /
+/// [`HostOutcome::TornDown`] — their own per-host teardown ran) and hosts that were
+/// never reached are absent. `modes` decides rollback-vs-teardown per host; the
+/// function is total, so a short `modes` slice simply yields a shorter set rather
+/// than panicking mid-rollout.
+pub(crate) fn fleet_rollback_set(
+    outcomes: &[HostOutcome],
+    modes: &[HostMode],
+) -> Vec<RollbackAction> {
+    outcomes
+        .iter()
+        .zip(modes)
+        .enumerate()
+        .rev()
+        .filter_map(|(index, (outcome, mode))| match outcome {
+            // On the new release: compensate by this host's deploy path.
+            HostOutcome::Serving | HostOutcome::Degraded { .. } | HostOutcome::LiveOnNew { .. } => {
+                Some(match mode {
+                    HostMode::First => RollbackAction::Teardown(index),
+                    HostMode::Redeploy => RollbackAction::Rollback(index),
+                })
+            }
+            // On the new release, but its rollback target cannot be trusted.
+            HostOutcome::AmbiguousMarkers => {
+                Some(RollbackAction::Manual(index, MANUAL_AMBIGUOUS_MARKERS))
+            }
+            // Already clean, never reached, or already compensated.
+            HostOutcome::Untouched
+            | HostOutcome::RolledBack { .. }
+            | HostOutcome::TornDown { .. }
+            | HostOutcome::CompensatedRollback
+            | HostOutcome::CompensatedTeardown
+            | HostOutcome::CompensationFailed { .. }
+            | HostOutcome::Manual { .. } => None,
+        })
+        .collect()
 }
 
 /// The step label to attribute a failure to — always a `&'static str` op label, so
@@ -396,6 +582,26 @@ pub(crate) const fn classify_failure(err: &exec::DeployExecError) -> HostOutcome
     }
 }
 
+/// The outcome the fleet driver records for one failed host: [`classify_failure`]
+/// (did traffic move?) refined by [`classify_post_boundary`] (how bad is it?).
+///
+/// Kept as its own function — rather than folded into [`classify_failure`] —
+/// because the two questions have different inputs and different failure modes.
+/// `classify_failure` reads the executor's TYPED error and is the discriminator
+/// AC-3 turns on; this one reads a LABEL and encodes a policy about which
+/// post-cutover steps matter. A pre-boundary outcome passes through untouched: the
+/// executor already tore that candidate down, so there is nothing left to classify.
+pub(crate) fn classify_host_outcome(err: &exec::DeployExecError) -> HostOutcome {
+    match classify_failure(err) {
+        HostOutcome::LiveOnNew { failed_step } => match classify_post_boundary(failed_step) {
+            PostBoundaryClass::Housekeeping => HostOutcome::Degraded { label: failed_step },
+            PostBoundaryClass::Ambiguous => HostOutcome::AmbiguousMarkers,
+            PostBoundaryClass::Functional => HostOutcome::LiveOnNew { failed_step },
+        },
+        clean => clean,
+    }
+}
+
 /// The loud line printed when a fleet rollout schedules no migration at all.
 ///
 /// [`exec::first_deploy_ops`] carries no migrate op (a first deploy has never run
@@ -409,6 +615,61 @@ pub(crate) const FLEET_NO_MIGRATION_NOTE: &str = "no host in this fleet is on a 
 /// The one-line reminder printed once, after the fleet's single migration lands.
 pub(crate) const FLEET_SCHEMA_MOVED_NOTE: &str = "the schema has moved; from here an automatic rollback restores BINARIES only — \
      it never rolls a migration back";
+
+/// The line the summary prints once a fleet rollout has actually COMPENSATED hosts
+/// after a migration ran (issue #1621, §4.7, T1.12).
+///
+/// The compensation op vectors are [`exec::rollback_ops`] /
+/// [`exec::first_deploy_teardown_ops`], neither of which contains a `migrate` op by
+/// construction — so the binaries went back and the schema did not. That asymmetry
+/// is the single most dangerous thing about an automatic fleet rollback, so it is
+/// stated out loud rather than left to be inferred from the absence of a line.
+/// (`rolling_deploy_blocked` grades `up.sql` only, so an automatic `migrate down`
+/// would run exactly the SQL nothing reviews, unattended, mid-flip.)
+pub(crate) const FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE: &str = "the compensating rollback restored BINARIES only — the migration that already ran was \
+     NOT rolled back; confirm the schema still fits the release now serving";
+
+/// Whether this rollout moved the schema, judged conservatively (issue #1621).
+///
+/// True when the plan scheduled a migration AND the host carrying it was reached at
+/// all. It deliberately does NOT try to prove the one-shot itself succeeded: the
+/// only signal available is the failing step label, and a pre-boundary failure
+/// *after* `migrate` (a readiness timeout, say) moves the schema and still rolls
+/// the candidate back. Erring toward "the schema moved" costs one line of output;
+/// erring the other way lets an operator roll binaries back believing the schema
+/// came with them.
+pub(crate) fn schema_moved(plan: &FleetPlan, outcomes: &[HostOutcome]) -> bool {
+    plan.hosts.iter().zip(outcomes).any(|(host, outcome)| {
+        host.migrate == MigrateStep::Run && !matches!(outcome, HostOutcome::Untouched)
+    })
+}
+
+/// The exact by-hand recovery instructions for a host the fleet deliberately did
+/// NOT roll back (issue #1621, §4.7/§8.2).
+///
+/// Printed for every [`RollbackAction::Manual`], because "we did not touch it" is
+/// only useful next to "here is what to look at". The command is read-only and
+/// carries nothing secret: an SSH user, a host, and the two marker paths the deploy
+/// already prints on every run. It does NOT tell the operator to run
+/// `autumn deploy rollback`: with a `[deploy] hosts` fleet that command has no
+/// single target today (per-host targeting lands with the fleet CLI surface), and
+/// printing a command that cannot work is worse than printing none.
+pub(crate) fn manual_recovery_lines(cfg: &ResolvedDeployConfig, reason: &str) -> Vec<String> {
+    let host = cfg.host.as_deref().unwrap_or_default();
+    let shared = cfg.shared_dir();
+    vec![
+        format!("  \u{2757} {host}: NOT rolled back automatically \u{2014} {reason}."),
+        format!(
+            "     inspect: ssh {user}@{host} 'cat {shared}/previous-release {shared}/live-slot; \
+             ls {releases}'",
+            user = cfg.user,
+            releases = cfg.releases_dir(),
+        ),
+        "     the previous-release marker names the release dir, slot and port this host \
+         should return to; restore it by hand before deploying the fleet again."
+            .to_owned(),
+    ]
+}
 
 /// The `deploy up` fleet header: rollout order, each host's probed mode, and where
 /// the single fleet-wide migration lands (issue #1621, §8.1).
@@ -481,6 +742,14 @@ pub(crate) fn fleet_summary_lines(
         let state = match outcome {
             HostOutcome::Untouched => "untouched (not reached)".to_owned(),
             HostOutcome::Serving => format!("serving {release_id}"),
+            // Live and healthy on the new release: only bookkeeping failed. The
+            // remedy is named because a failed `record-proxy-options` makes the NEXT
+            // deploy of this host fail closed.
+            HostOutcome::Degraded { label } => format!(
+                "serving {release_id} \u{2014} DEGRADED: `{label}` failed after the cutover; \
+                 traffic is fine, but repair it (a redeploy of this host does) before the \
+                 next deploy refuses it"
+            ),
             // Traffic already moved before the failure, so this host IS on the new
             // release — saying only "failed" would be the dangerous half-truth.
             HostOutcome::LiveOnNew { failed_step } => {
@@ -488,16 +757,40 @@ pub(crate) fn fleet_summary_lines(
                     "serving {release_id} \u{2014} but `{failed_step}` failed AFTER the cutover"
                 )
             }
+            HostOutcome::AmbiguousMarkers => format!(
+                "serving {release_id} \u{2014} `{AMBIGUOUS_MARKERS_LABEL}` failed AFTER the \
+                 cutover, so the release markers are mid-transaction and this host was NOT \
+                 rolled back automatically"
+            ),
+            HostOutcome::Manual { reason } => {
+                format!("serving {release_id} \u{2014} NOT rolled back automatically: {reason}")
+            }
             HostOutcome::RolledBack { failed_step } => {
                 format!("previous release still serving (rolled back at `{failed_step}`)")
             }
             HostOutcome::TornDown { failed_step } => {
                 format!("NOTHING serving (first deploy torn down at `{failed_step}`)")
             }
+            HostOutcome::CompensatedRollback => {
+                "previous release restored (rolled back by the fleet)".to_owned()
+            }
+            HostOutcome::CompensatedTeardown => {
+                "NOTHING serving (the fleet removed this host's new first deploy; its proxy \
+                 still holds the route until the next deploy)"
+                    .to_owned()
+            }
+            HostOutcome::CompensationFailed { failed_step } => format!(
+                "serving {release_id} \u{2014} the compensating rollback FAILED at \
+                 `{failed_step}`"
+            ),
         };
         let marker = match outcome {
             HostOutcome::Serving => "\u{2705}",
             HostOutcome::Untouched => "\u{2013}",
+            HostOutcome::Degraded { .. } => "\u{26A0}\u{FE0F} ",
+            HostOutcome::CompensatedRollback | HostOutcome::CompensatedTeardown => {
+                "\u{21A9}\u{FE0F} "
+            }
             _ => "\u{274C}",
         };
         lines.push(format!(
@@ -512,7 +805,12 @@ pub(crate) fn fleet_summary_lines(
         .filter(|(_, outcome)| {
             matches!(
                 outcome,
-                HostOutcome::Serving | HostOutcome::LiveOnNew { .. }
+                HostOutcome::Serving
+                    | HostOutcome::Degraded { .. }
+                    | HostOutcome::LiveOnNew { .. }
+                    | HostOutcome::AmbiguousMarkers
+                    | HostOutcome::Manual { .. }
+                    | HostOutcome::CompensationFailed { .. }
             )
         })
         .map(|(host, _)| host.host.as_str())
@@ -523,6 +821,22 @@ pub(crate) fn fleet_summary_lines(
             on_new.join(", "),
         ));
         lines.push(format!("  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_MOVED_NOTE}"));
+    }
+    // Say the binaries-only truth once the fleet has ACTUALLY undone hosts: at that
+    // point the operator is looking at a fleet back on the old release with a schema
+    // that is not.
+    let compensated = outcomes.iter().any(|outcome| {
+        matches!(
+            outcome,
+            HostOutcome::CompensatedRollback
+                | HostOutcome::CompensatedTeardown
+                | HostOutcome::CompensationFailed { .. }
+        )
+    });
+    if compensated && schema_moved(plan, outcomes) {
+        lines.push(format!(
+            "  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE}"
+        ));
     }
     lines
 }
@@ -548,6 +862,7 @@ pub(crate) mod test_support {
         host: String,
         stdout: Vec<(&'static str, String)>,
         fail: Vec<&'static str>,
+        transport_fail: Vec<&'static str>,
     }
 
     /// A fleet-shaped recording fake: ONE
@@ -608,6 +923,15 @@ pub(crate) mod test_support {
             self
         }
 
+        /// Make one host's `label` fail as a dropped SSH TRANSPORT rather than a
+        /// remote non-zero exit — the shape that carries no op label and so
+        /// classifies as a FUNCTIONAL post-boundary failure (see
+        /// [`RecordingExecutor::transport_failing`]).
+        pub(crate) fn transport_fail(mut self, host: &str, label: &'static str) -> Self {
+            self.entry(host).transport_fail.push(label);
+            self
+        }
+
         /// The executor factory the fleet driver is injected with: one strict,
         /// tape-sharing fake per host.
         pub(crate) fn executor(&self, cfg: &ResolvedDeployConfig) -> RecordingExecutor {
@@ -621,6 +945,9 @@ pub(crate) mod test_support {
                 }
                 for label in &script.fail {
                     exec = exec.failing(label);
+                }
+                for label in &script.transport_fail {
+                    exec = exec.transport_failing(label);
                 }
             }
             exec
@@ -650,6 +977,20 @@ pub(crate) mod test_support {
             self.tape.borrow().iter().position(|(h, call)| {
                 h == host && !call.run_label().is_some_and(|l| read_only.contains(&l))
             })
+        }
+
+        /// Global tape positions of every `Run` of `label`, on ANY host — the query
+        /// "did this label ever run again, and when relative to that one?" that
+        /// compensation assertions need (a compensated host runs `proxy-flip`
+        /// twice: once to cut over, once to come back).
+        pub(crate) fn positions_of(&self, label: &str) -> Vec<usize> {
+            self.tape
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, call))| call.run_label() == Some(label))
+                .map(|(index, _)| index)
+                .collect()
         }
 
         /// Global index of the first `Run` of `label` on `host`.
@@ -1223,6 +1564,312 @@ mod tests {
             none.contains("NOTHING serving"),
             "a torn-down first deploy leaves nothing serving and must say so:\n{none}"
         );
+    }
+
+    #[test]
+    fn classify_post_boundary_separates_housekeeping_from_functional_failures() {
+        // #1621 (AC-3, T1.15 / §4.6). After the go-live boundary the host IS on the
+        // new release, so "it failed" is not enough to decide anything: the three
+        // answers below are materially different, and getting them wrong in either
+        // direction is an outage — roll a fleet back because `prune` failed and you
+        // caused one; auto-roll-back on mid-transaction markers and you may restore
+        // the WRONG release.
+        for label in ["record-proxy-options", "drain-old", "prune"] {
+            assert_eq!(
+                classify_post_boundary(label),
+                PostBoundaryClass::Housekeeping,
+                "`{label}` runs after the flip and does not touch traffic, so the rollout \
+                 must continue"
+            );
+        }
+        assert_eq!(
+            classify_post_boundary("commit-markers"),
+            PostBoundaryClass::Ambiguous,
+            "`commit-markers` writes the marker triple as one transaction — a failure \
+             inside it leaves the rollback target unprovable, so it must fail closed"
+        );
+        // Fail closed on anything unknown: a NEW op added after the boundary is
+        // treated as mattering until someone deliberately lists it as housekeeping.
+        for label in ["proxy-flip", "some-future-post-flip-op", ""] {
+            assert_eq!(
+                classify_post_boundary(label),
+                PostBoundaryClass::Functional,
+                "an unrecognised post-boundary label (`{label}`) must fail closed to \
+                 Functional, never be waved through as housekeeping"
+            );
+        }
+    }
+
+    #[test]
+    fn a_post_boundary_housekeeping_failure_degrades_instead_of_halting() {
+        // #1621 (§4.6): the composition the driver actually calls. A pre-boundary
+        // outcome passes through untouched (the executor already tore the candidate
+        // down); a post-boundary raw error is refined by its label.
+        let boxed = || {
+            Box::new(exec::DeployExecError::CommandFailed {
+                label: "prune",
+                message: "scripted".to_owned(),
+            })
+        };
+        assert_eq!(
+            classify_host_outcome(&exec::DeployExecError::CommandFailed {
+                label: "prune",
+                message: "scripted".to_owned(),
+            }),
+            HostOutcome::Degraded { label: "prune" },
+            "a failed `prune` leaves the host live and healthy on the new release"
+        );
+        assert_eq!(
+            classify_host_outcome(&exec::DeployExecError::CommandFailed {
+                label: "commit-markers",
+                message: "scripted".to_owned(),
+            }),
+            HostOutcome::AmbiguousMarkers,
+            "a failed `commit-markers` must never be auto-rolled-back"
+        );
+        assert_eq!(
+            classify_host_outcome(&exec::DeployExecError::CommandFailed {
+                label: "some-future-post-flip-op",
+                message: "scripted".to_owned(),
+            }),
+            HostOutcome::LiveOnNew {
+                failed_step: "some-future-post-flip-op"
+            },
+            "an unknown post-boundary failure halts and compensates"
+        );
+        assert_eq!(
+            classify_host_outcome(&exec::DeployExecError::CandidateRolledBack {
+                failed_step: "readiness-gate",
+                source: boxed(),
+            }),
+            HostOutcome::RolledBack {
+                failed_step: "readiness-gate"
+            },
+            "a pre-boundary outcome is already clean and must pass through unrefined"
+        );
+    }
+
+    #[test]
+    fn the_compensation_set_is_the_reverse_of_the_rollout_order() {
+        // #1621 (AC-3, T1.13 / §4.7). Everything on the NEW release is compensated,
+        // newest cutover first; everything already clean or never reached is left
+        // alone. Mode decides HOW: a redeploy host rolls back to its previous
+        // release, a first-deploy host has no previous release and is torn down.
+        let actions = fleet_rollback_set(
+            &[
+                HostOutcome::Serving,
+                HostOutcome::Serving,
+                HostOutcome::LiveOnNew {
+                    failed_step: "record-live-slot",
+                },
+                HostOutcome::Untouched,
+            ],
+            &[
+                HostMode::Redeploy,
+                HostMode::First,
+                HostMode::Redeploy,
+                HostMode::Redeploy,
+            ],
+        );
+        assert_eq!(
+            actions,
+            vec![
+                RollbackAction::Rollback(2),
+                RollbackAction::Teardown(1),
+                RollbackAction::Rollback(0),
+            ],
+            "compensation runs strictly newest-first, includes the post-boundary host \
+             itself, skips the unreached host, and tears down (not rolls back) a first \
+             deploy"
+        );
+    }
+
+    #[test]
+    fn a_degraded_host_is_still_compensated_when_the_fleet_rolls_back() {
+        // #1621 (§4.7): a degraded host is live and HEALTHY on the new release —
+        // that is exactly why it must come back with everyone else. Leaving it
+        // forward while hosts 1..k return to the old release is the mixed-version
+        // fleet AC-3 forbids. (Its housekeeping debris is reported separately, from
+        // the driver's own record, so compensating it does not erase the warning.)
+        let actions = fleet_rollback_set(
+            &[
+                HostOutcome::Degraded { label: "prune" },
+                HostOutcome::LiveOnNew {
+                    failed_step: "record-live-slot",
+                },
+            ],
+            &[HostMode::Redeploy, HostMode::Redeploy],
+        );
+        assert_eq!(
+            actions,
+            vec![RollbackAction::Rollback(1), RollbackAction::Rollback(0)],
+            "a degraded host must not be stranded on the new release"
+        );
+    }
+
+    #[test]
+    fn clean_and_ambiguous_hosts_are_never_auto_rolled_back() {
+        // #1621 (§4.7): the two "hands off" cases. A host whose own pre-boundary
+        // teardown ran is already back where it started — touching it again would
+        // roll it back PAST the release it is serving. A host whose markers are
+        // mid-transaction cannot be resolved safely, so it fails closed to Manual.
+        let actions = fleet_rollback_set(
+            &[
+                HostOutcome::RolledBack {
+                    failed_step: "readiness-gate",
+                },
+                HostOutcome::TornDown {
+                    failed_step: "readiness-gate",
+                },
+                HostOutcome::AmbiguousMarkers,
+            ],
+            &[HostMode::Redeploy, HostMode::First, HostMode::Redeploy],
+        );
+        assert_eq!(
+            actions,
+            vec![RollbackAction::Manual(2, MANUAL_AMBIGUOUS_MARKERS)],
+            "only the ambiguous host is reported, and never touched"
+        );
+        assert!(
+            fleet_rollback_set(&[], &[]).is_empty(),
+            "an empty fleet compensates nothing"
+        );
+    }
+
+    #[test]
+    fn the_summary_reports_degraded_compensated_and_manual_hosts() {
+        // #1621 (§8.2): after a compensated halt the state table is the operator's
+        // only source of truth, so every distinct state must render as itself —
+        // "rolled back by the fleet" is a very different sentence from "rolled back
+        // at `readiness-gate`", and a degraded host must not read as a failure.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c", "web-d"]);
+        let plan = plan_fleet(
+            &fleet,
+            &[
+                HostMode::Redeploy,
+                HostMode::Redeploy,
+                HostMode::First,
+                HostMode::Redeploy,
+            ],
+        )
+        .expect("a well-formed fleet plans");
+        let rendered = fleet_summary_lines(
+            &plan,
+            &[
+                HostOutcome::CompensatedRollback,
+                HostOutcome::Degraded { label: "prune" },
+                HostOutcome::CompensatedTeardown,
+                HostOutcome::AmbiguousMarkers,
+            ],
+            "20260714T120000Z",
+        )
+        .join("\n");
+
+        assert!(
+            rendered.contains("previous release restored"),
+            "a fleet-compensated host must say so, not borrow the per-host wording:\n\
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("DEGRADED") && rendered.contains("prune"),
+            "a degraded host must name the housekeeping step that failed:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("NOTHING serving") && rendered.contains("still holds the route"),
+            "a torn-down first deploy must state the proxy-route residue:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("mid-transaction") && rendered.contains("NOT rolled back"),
+            "an ambiguous host must say it was deliberately left alone:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE),
+            "a compensated fleet whose migration ran must state that the schema did NOT \
+             come back with the binaries:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_schema_note_tracks_whether_the_migration_host_was_reached() {
+        // #1621 (T1.12): the note is conservative by design — it fires whenever the
+        // migrating host was REACHED, because the only evidence available is a step
+        // label and a pre-boundary failure after `migrate` still moves the schema.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let migrating = plan_fleet(&fleet, &[HostMode::Redeploy, HostMode::Redeploy])
+            .expect("a well-formed fleet plans");
+        assert!(
+            schema_moved(
+                &migrating,
+                &[
+                    HostOutcome::RolledBack {
+                        failed_step: "readiness-gate"
+                    },
+                    HostOutcome::Untouched
+                ]
+            ),
+            "a pre-boundary failure AFTER `migrate` still moved the schema"
+        );
+        assert!(
+            !schema_moved(
+                &migrating,
+                &[HostOutcome::Untouched, HostOutcome::Untouched]
+            ),
+            "an unreached migrating host migrated nothing"
+        );
+        let first_only = plan_fleet(&fleet, &[HostMode::First, HostMode::First])
+            .expect("a well-formed fleet plans");
+        assert!(
+            !schema_moved(&first_only, &[HostOutcome::Serving, HostOutcome::Serving]),
+            "an all-first-deploy fleet schedules no migration at all"
+        );
+        // A compensated fleet that never migrated must not claim a schema it does
+        // not have.
+        let rendered = fleet_summary_lines(
+            &first_only,
+            &[
+                HostOutcome::CompensatedTeardown,
+                HostOutcome::CompensatedTeardown,
+            ],
+            "20260714T120000Z",
+        )
+        .join("\n");
+        assert!(
+            !rendered.contains(FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE),
+            "no migration ran, so there is no schema statement to make:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn manual_recovery_lines_name_the_markers_and_carry_no_secret() {
+        // #1621 (§8.2): "we did not touch it" is only useful next to "here is what
+        // to look at". The command is read-only, works today, and quotes nothing but
+        // the SSH user, the host and the marker paths the deploy already prints.
+        let cfg = &fleet_of(&["web-b"]).hosts[0];
+        let rendered = manual_recovery_lines(cfg, MANUAL_AMBIGUOUS_MARKERS).join("\n");
+
+        assert!(
+            rendered.contains("web-b") && rendered.contains(MANUAL_AMBIGUOUS_MARKERS),
+            "the block must name the host and the reason:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("previous-release") && rendered.contains("live-slot"),
+            "the block must name both markers a human has to reconcile:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("autumn deploy rollback"),
+            "`deploy rollback` has no single target under `[deploy] hosts` today, so the \
+             manual block must not promise it:\n{rendered}"
+        );
+        for secret in [
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+            "postgres://",
+            "topsecret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "manual recovery output must never carry `{secret}`:\n{rendered}"
+            );
+        }
     }
 
     #[test]

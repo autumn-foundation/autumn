@@ -1824,16 +1824,56 @@ pub fn probe_release_dir(
     exec: &impl DeployExecutor,
 ) -> Result<ReleaseDirState, DeployExecError> {
     let release_dir = format!("{}/{release_id}", cfg.releases_dir());
+    probe_dir_state("probe-release-dir", &release_dir, exec)
+}
+
+/// Read-only probe: does the release dir a fleet compensation is about to roll a
+/// host back TO still exist? (issue #1621, §4.7.)
+///
+/// The same `[ -d … ]` shell as [`probe_release_dir`] under a DISTINCT label, so a
+/// tape can tell the two apart and the strict test fake can require it to be
+/// scripted. It is a separate call rather than a flag because it asks the opposite
+/// question about the opposite directory: the deploy refuses when this run's
+/// candidate dir is PRESENT, while compensation refuses when the rollback target is
+/// ABSENT.
+///
+/// It exists because `prune` runs per host and hosts with divergent deploy history
+/// legitimately retain different sets: `resolve_rollback_target` can name a dir a
+/// later prune already removed. Rolling back to it anyway would write a slot unit
+/// whose `ExecStart` points nowhere, start it successfully as far as systemd is
+/// concerned, and then fail the readiness gate — POST-boundary, with no teardown,
+/// turning a one-host incident into a two-host one. Missing → the caller declines
+/// the automatic rollback and reports the host.
+///
+/// # Errors
+///
+/// Returns the executor's error if the probe command cannot run.
+pub fn probe_rollback_target_dir(
+    release_dir: &str,
+    exec: &impl DeployExecutor,
+) -> Result<ReleaseDirState, DeployExecError> {
+    probe_dir_state("probe-rollback-target", release_dir, exec)
+}
+
+/// The shared read-only `[ -d … ]` directory probe behind [`probe_release_dir`] and
+/// [`probe_rollback_target_dir`]: two printf sentinels, nothing else, and any other
+/// capture fails closed to [`ReleaseDirState::Unreadable`] (an empty capture is the
+/// exact trap every other probe in this file degrades on).
+fn probe_dir_state(
+    label: &'static str,
+    dir: &str,
+    exec: &impl DeployExecutor,
+) -> Result<ReleaseDirState, DeployExecError> {
     let shell = format!(
         "if [ -d {dir} ]; then printf '%s' '{RELEASE_DIR_PRESENT}'; \
          else printf '%s' '{RELEASE_DIR_ABSENT}'; fi",
-        dir = shell_quote(&release_dir),
+        dir = shell_quote(dir),
     );
-    let out = exec.run(&RemoteCommand::new("probe-release-dir", shell))?;
+    let out = exec.run(&RemoteCommand::new(label, shell))?;
     Ok(match out.stdout.trim() {
         RELEASE_DIR_PRESENT => ReleaseDirState::Present,
         RELEASE_DIR_ABSENT => ReleaseDirState::Absent,
-        // Fail closed: an unexpected capture cannot prove the dir is free.
+        // Fail closed: an unexpected capture cannot prove the dir's state.
         _ => ReleaseDirState::Unreadable,
     })
 }
@@ -2265,14 +2305,15 @@ fn execute_with_teardown(
 ///
 /// The deploy/rollback entrypoints drive their sequences through
 /// [`execute_with_teardown`] (which adds boundary-aware teardown on failure); this
-/// plain driver is the un-gated form used by the pure-sequence tests, so it is
-/// allowed to be unused in the non-test binary build.
+/// plain driver is the un-gated form, used by the pure-sequence tests and by the
+/// fleet compensation path (issue #1621, §4.7), which tears a completed first
+/// deploy down and must **report** a failed step rather than swallow it the way
+/// [`run_teardown`] deliberately does.
 ///
 /// # Errors
 ///
 /// Returns the first [`DeployExecError`] produced by the executor (or by staging
 /// a local temp file for a [`DeployOp::WriteFile`]).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_ops(ops: &[DeployOp], exec: &impl DeployExecutor) -> Result<(), DeployExecError> {
     for op in ops {
         run_one(op, exec)?;
@@ -2458,10 +2499,11 @@ pub(crate) mod test_support {
     /// [`super::DeployMode::First`] / `Absent`. A fleet test that forgets to script
     /// host N's probe would therefore exercise the first-deploy branch and still
     /// pass. [`RecordingExecutor::strict`] turns that into a loud panic.
-    pub(crate) const PROBE_LABELS: [&str; 4] = [
+    pub(crate) const PROBE_LABELS: [&str; 5] = [
         "proxy-compat-probe",
         "detect-current",
         "probe-release-dir",
+        "probe-rollback-target",
         "resolve-previous",
     ];
 
@@ -2504,6 +2546,13 @@ pub(crate) mod test_support {
         /// Labels whose `run` should return a scripted failure (e.g. to simulate
         /// a readiness-gate timeout).
         fail_labels: Vec<&'static str>,
+        /// #1621: labels whose `run` should fail as a TRANSPORT error — ssh itself
+        /// could not be launched — rather than as a remote non-zero exit. The
+        /// distinction matters to the fleet: [`super::DeployExecError::Spawn`]
+        /// carries no op label, so it classifies as a FUNCTIONAL post-boundary
+        /// failure (fail closed) where a `CommandFailed` on the same step might be
+        /// mere housekeeping.
+        transport_fail_labels: Vec<&'static str>,
         /// Scripted stdout returned for a given command label.
         stdout_by_label: Vec<(&'static str, String)>,
         /// #1621: the host this executor targets, recorded onto the shared fleet
@@ -2537,6 +2586,19 @@ pub(crate) mod test_support {
         /// than one label (a fleet script needs per-host failure injection).
         pub(crate) fn failing(mut self, label: &'static str) -> Self {
             self.fail_labels.push(label);
+            self
+        }
+
+        /// Make one host's `label` fail as a TRANSPORT error (the ssh process could
+        /// not be launched) instead of a remote non-zero exit (#1621).
+        ///
+        /// This is the only realistic way to produce a FUNCTIONAL post-boundary
+        /// failure against today's op set: every op after `proxy-flip` is either
+        /// housekeeping or `commit-markers`, so the "the host is live on the new
+        /// release and something that matters broke" case arrives as a dropped
+        /// transport rather than a labelled remote failure.
+        pub(crate) fn transport_failing(mut self, label: &'static str) -> Self {
+            self.transport_fail_labels.push(label);
             self
         }
 
@@ -2604,6 +2666,12 @@ pub(crate) mod test_support {
                 label: cmd.label,
                 shell: cmd.shell.clone(),
             });
+            if self.transport_fail_labels.contains(&cmd.label) {
+                return Err(DeployExecError::Spawn {
+                    program: "ssh".to_owned(),
+                    source: std::io::Error::other("scripted transport failure"),
+                });
+            }
             if self.fail_labels.contains(&cmd.label) {
                 return Err(DeployExecError::CommandFailed {
                     label: cmd.label,
@@ -4542,6 +4610,56 @@ mod tests {
             probe_release_dir(&cfg, RELEASE_ID, &empty).unwrap(),
             ReleaseDirState::Unreadable,
             "empty output must fail closed (the trap every other probe degrades on)"
+        );
+    }
+
+    #[test]
+    fn probe_rollback_target_dir_is_read_only_and_distinctly_labelled() {
+        // #1621 (§4.7): before a fleet compensation flips a host back, it proves the
+        // release dir it is about to point at still exists — `prune` runs per host,
+        // so the previous-release marker can legitimately name a dir this host no
+        // longer has. Rolling back to a removed dir writes a unit whose ExecStart
+        // points nowhere, starts "successfully", and then fails the readiness gate
+        // POST-boundary with no teardown: a second broken host.
+        let previous = "/srv/autumn/myapp/releases/20260101T000000Z";
+
+        let present = RecordingExecutor::new().with_stdout("probe-rollback-target", "present");
+        assert_eq!(
+            probe_rollback_target_dir(previous, &present).unwrap(),
+            ReleaseDirState::Present,
+            "a retained rollback target is the normal case"
+        );
+        assert_eq!(
+            present
+                .shell_for("probe-rollback-target")
+                .expect("probe ran"),
+            format!(
+                "if [ -d '{previous}' ]; then printf '%s' 'present'; \
+                 else printf '%s' 'absent'; fi"
+            ),
+            "the target probe must be the same read-only directory test",
+        );
+        assert_eq!(
+            present.run_labels(),
+            vec!["probe-rollback-target"],
+            "the probe runs exactly one command, under its OWN label so a tape can \
+             tell it apart from the candidate-dir collision probe, and mutates nothing"
+        );
+
+        let absent = RecordingExecutor::new().with_stdout("probe-rollback-target", "absent\n");
+        assert_eq!(
+            probe_rollback_target_dir(previous, &absent).unwrap(),
+            ReleaseDirState::Absent,
+            "a pruned rollback target must be reported so the caller declines"
+        );
+        // Fail closed in the SAME direction as every other probe: proving nothing is
+        // not proving it is there.
+        let garbled =
+            RecordingExecutor::new().with_stdout("probe-rollback-target", "bash: -c: line 0");
+        assert_eq!(
+            probe_rollback_target_dir(previous, &garbled).unwrap(),
+            ReleaseDirState::Unreadable,
+            "an unexpected capture must fail closed, never degrade to Present"
         );
     }
 
