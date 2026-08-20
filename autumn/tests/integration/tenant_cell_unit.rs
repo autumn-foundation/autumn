@@ -147,6 +147,46 @@ fn eviction_reclaims_to_zero() {
     );
 }
 
+/// Eviction ends cache residency, not the tenant's accounting lifetime. An
+/// in-flight owner forces a subsequent lookup to rejoin the same quota counter
+/// and scratch domain until every owner has gone away.
+#[test]
+fn eviction_does_not_split_a_live_tenant_accounting_domain() {
+    let registry = TenantCellRegistry::new();
+    let old = registry.get_or_create("t", 1_000);
+    old.scratch_insert("shared", vec![7; 100])
+        .expect("initial scratch allocation fits");
+    let initial = old.tracked_bytes();
+    let old_charge = old.try_charge(600).expect("initial charge fits");
+    let in_flight = Arc::clone(&old);
+
+    let evicted = registry.evict("t").expect("tenant was resident");
+    assert_eq!(registry.len(), 0, "eviction removes cache residency");
+
+    let replacement = registry.get_or_create("t", 1_000);
+    assert_eq!(
+        replacement.scratch_get("shared"),
+        Some(vec![7; 100]),
+        "the replacement must use the still-live scratch domain"
+    );
+    let remaining = 1_000 - initial - old_charge.bytes();
+    replacement
+        .try_charge(remaining + 1)
+        .expect_err("old and new requests share one aggregate tenant quota");
+    assert_eq!(replacement.tracked_bytes(), initial + 600);
+
+    drop(old_charge);
+    drop(old);
+    drop(in_flight);
+    drop(evicted);
+    let final_resident = registry
+        .evict("t")
+        .expect("resurrected cell remains resident until explicitly evicted");
+    drop(replacement);
+    drop(final_resident);
+    assert_eq!(registry.total_tracked_bytes(), 0);
+}
+
 /// Density smoke test: 1000 concurrent cells each holding a small buffer track
 /// exactly, and evicting all of them reclaims everything.
 #[test]
