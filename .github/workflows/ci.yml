@@ -543,3 +543,49 @@ jobs:
         env:
           RUSTFLAGS: "--cfg loom_models"
           LOOM_MAX_PREEMPTIONS: "3"
+
+  # Edge capsule conformance (issue #1790). The proof behind AC-2: the
+  # `edge-greeting` fixture is compiled BOTH ways — natively and to a real
+  # `wasm32-wasip1` artifact — and a shared request corpus is driven through
+  # the native edge lane, the wasm capsule (via the pure-Rust `wasmi` host in
+  # `autumn-edge`, so there is no runtime to install), and the full origin app.
+  # Status, headers and body bytes are compared; every fallthrough is checked
+  # against the answer the origin actually gives.
+  #
+  # Its own job because it is the only lane that installs a second target, and
+  # NOT path-filtered on purpose: byte-identity between the origin and the edge
+  # is a property of the whole framework — a change to the router, a middleware,
+  # a macro or a dependency is exactly what could break it, and none of those
+  # live under `examples/`. The tests are `#[ignore]`d (they need the target),
+  # so `cargo test --workspace` in the `test` job compiles them and skips them;
+  # this job is the only place they run.
+  edge-conformance:
+    name: Edge capsule conformance (wasm32-wasip1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Build the edge capsule
+        # Ahead of the suite (which builds it too) so a wasm-only compile break
+        # reports as a build failure rather than as a conformance failure.
+        run: cargo build -p edge-greeting --target wasm32-wasip1 --release --bin edge-capsule
+      - name: Nothing native may reach the capsule
+        # `autumn-edge`'s manifest guard asserts this at the source level (one
+        # `default-features = true` on axum would undo it); this asserts it on
+        # the RESOLVED graph for the artifact that actually ships, where a
+        # transitive default feature could still drag a runtime in.
+        # `--edges normal` excludes dev-dependencies: the conformance suite's
+        # tokio and wasmi are native-only and never enter a capsule.
+        run: |
+          if cargo tree -p edge-greeting --target wasm32-wasip1 --edges normal \
+            | grep -Ei 'tokio|hyper|mio|autumn-web'; then
+            echo "::error::the capsule's wasm32-wasip1 graph must contain no native runtime and no autumn-web"
+            exit 1
+          fi
+      - name: Run the origin/edge conformance suite
+        # `--test-threads=1`: the suite installs a process-global panic hook
+        # around the deliberately-panicking `/boom` handler.
+        run: cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture
