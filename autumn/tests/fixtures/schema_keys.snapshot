@@ -130,6 +130,7 @@ deploy
 deploy.app_dir
 deploy.app_name
 deploy.host
+deploy.hosts
 deploy.keep_releases
 deploy.profile
 deploy.readiness_timeout_secs

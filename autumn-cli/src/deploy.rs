@@ -47,8 +47,13 @@ const DEPLOY_HOST_MISSING_DETAIL: &str = "no target host configured";
 
 /// Remediation hint for a missing/blank `[deploy] host`. Shared so every surface
 /// (offline `doctor`, online `deploy check`) points at the same fix.
-const DEPLOY_HOST_MISSING_HINT: &str =
-    "Set `[deploy] host` in autumn.toml to your server's SSH-reachable address";
+///
+/// #1621 EXTENDED this text with the fleet spelling rather than replacing it: the
+/// literal substring `` `[deploy] host` `` is asserted by
+/// `deploy_check_fails_fast_without_host` and quoted in operator runbooks, so it
+/// must survive verbatim.
+const DEPLOY_HOST_MISSING_HINT: &str = "Set `[deploy] host` in autumn.toml to your server's SSH-reachable address \
+     (or `[deploy] hosts = [\"<address>\", …]` to deploy a fleet)";
 
 /// Errors surfaced by `autumn deploy`.
 #[derive(Debug, thiserror::Error)]
@@ -266,6 +271,143 @@ impl ResolvedDeployConfig {
     #[must_use]
     pub fn current_symlink(&self) -> String {
         format!("{}/current", self.app_dir)
+    }
+}
+
+/// Validate the `[deploy]` host spelling(s) and return the ordered target list
+/// (issue #1621, AC-1).
+///
+/// Accepts either the historical scalar `[deploy] host` or the fleet list
+/// `[deploy] hosts`, never both, and returns the trimmed addresses **in
+/// declaration order** — the order of `hosts` IS the rollout order, so nothing
+/// here may sort or regroup it. An empty result means neither spelling configured
+/// a target; that is a valid state at rest (`deploy plan` renders without one and
+/// the `ssh_reachability` grader reports it), so it is NOT an error here.
+///
+/// Every rule fails closed BEFORE any remote command runs and names the offending
+/// key/index/value, matching the house style of the other deploy refusals.
+///
+/// # Errors
+///
+/// Returns a message when `host` and `hosts` are both configured, when a `hosts`
+/// entry is blank, or when a `hosts` entry repeats (compared after trimming).
+fn deploy_host_list(cfg: &DeployConfig) -> Result<Vec<String>, String> {
+    let host = cfg
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty());
+
+    // 1. Mutual exclusion. With both set the rollout order is ambiguous, so name
+    //    BOTH keys and let the operator delete one.
+    if host.is_some() && !cfg.hosts.is_empty() {
+        return Err(
+            "`[deploy] host` and `[deploy] hosts` are mutually exclusive: keep the \
+             single-server `[deploy] host = \"<address>\"` or the fleet list \
+             `[deploy] hosts = [\"<address>\", …]` in autumn.toml, not both (#1621)"
+                .to_owned(),
+        );
+    }
+
+    if cfg.hosts.is_empty() {
+        return Ok(host.map(str::to_owned).into_iter().collect());
+    }
+
+    // 2. A blank entry would resolve to a hostless SSH target and blow up
+    //    mid-rollout, with earlier hosts already cut over. The index is 0-based so
+    //    the operator can find the line in a long list.
+    let mut hosts: Vec<String> = Vec::with_capacity(cfg.hosts.len());
+    for (index, entry) in cfg.hosts.iter().enumerate() {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return Err(format!(
+                "`[deploy] hosts` entry {index} is blank: every fleet entry must be an \
+                 SSH-reachable hostname or IP (#1621)"
+            ));
+        }
+
+        // 3. A duplicate deploys the same machine twice: the second pass sees its
+        //    OWN new release as live, ping-pongs the blue/green slots and corrupts
+        //    the previous-release chain a fleet rollback depends on. Compared after
+        //    trimming; DNS aliases are a documented limitation (same as
+        //    `migrate`'s `reject_duplicate_target_urls`).
+        if hosts.iter().any(|seen| seen == trimmed) {
+            return Err(format!(
+                "`[deploy] hosts` lists `{trimmed}` more than once: each fleet host must \
+                 appear exactly once — deploying the same server twice corrupts its \
+                 previous-release chain (#1621)"
+            ));
+        }
+        hosts.push(trimmed.to_owned());
+    }
+
+    Ok(hosts)
+}
+
+/// An ordered fleet of deploy targets, each a fully-resolved
+/// [`ResolvedDeployConfig`] (issue #1621, AC-1).
+///
+/// The elements differ **only** in `host`: the shared shape (the `app_name` →
+/// `app_dir` → `service_name` chain, the TLS-requires-host rejection, profile
+/// trimming) is resolved ONCE through [`ResolvedDeployConfig::resolve`] and then
+/// cloned per host. That is what makes a one-entry `hosts` list byte-for-byte the
+/// historical single-server deploy *by construction* rather than by review —
+/// everything below `exec::SshTarget::from_resolved` keeps working unchanged.
+///
+/// The list is never empty and is always in declaration (rollout) order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+// Reachable from the unit tests today; the rollout driver that consumes it lands
+// in a later slice of #1621, so the non-test binary build is allowed not to use
+// it yet (mirroring `exec::run_ops`'s test-only reachability).
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ResolvedFleet {
+    /// The resolved targets, in rollout order. Guaranteed non-empty.
+    pub hosts: Vec<ResolvedDeployConfig>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ResolvedFleet {
+    /// Resolve a [`DeployConfig`] into an ordered fleet against the project name.
+    ///
+    /// Validation runs first, in the documented order (mutual exclusion → blank
+    /// entry → duplicate entry → no target at all), so a malformed fleet is
+    /// refused before any host is touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when [`deploy_host_list`] rejects the host spelling(s),
+    /// when neither `host` nor `hosts` configures a target, or when
+    /// [`ResolvedDeployConfig::resolve`] rejects the shared shape (e.g.
+    /// `[deploy.tls] enabled = true` with no `host`).
+    pub fn resolve(cfg: &DeployConfig, project_name: &str) -> Result<Self, String> {
+        let addresses = deploy_host_list(cfg)?;
+        if addresses.is_empty() {
+            // 4. Neither spelling configured a target. Reuse the shared
+            //    missing-host strings so `deploy check`, `doctor` and this seam
+            //    report the case identically.
+            return Err(format!(
+                "{DEPLOY_HOST_MISSING_DETAIL}: {DEPLOY_HOST_MISSING_HINT}"
+            ));
+        }
+
+        // Resolve the shared shape ONCE, then vary only `host`.
+        let shared = ResolvedDeployConfig::resolve(cfg, project_name)?;
+        let hosts = addresses
+            .into_iter()
+            .map(|host| ResolvedDeployConfig {
+                host: Some(host),
+                ..shared.clone()
+            })
+            .collect();
+
+        Ok(Self { hosts })
+    }
+
+    /// Whether this fleet is a single server — the shape every pre-#1621 config
+    /// resolves to, and the one that must behave identically to today.
+    #[must_use]
+    pub const fn is_single(&self) -> bool {
+        self.hosts.len() == 1
     }
 }
 
@@ -871,6 +1013,13 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
     let ambient_config = AutumnConfig::load_lenient_unknown_roots()
         .map_err(|e| DeployError::Config(e.to_string()))?;
     let deploy_cfg = ambient_config.deploy.unwrap_or_default();
+    // #1621: refuse a malformed host spelling — `host` AND `hosts` together, a
+    // blank entry, a duplicate entry — before ANY other work, so the operator sees
+    // one actionable message instead of a preflight report graded against a target
+    // list we could not make sense of. The resolved list itself is consumed by
+    // `ResolvedFleet` (the rollout driver lands in a later slice); here only the
+    // refusal matters, and the single-host path below is deliberately untouched.
+    deploy_host_list(&deploy_cfg).map_err(DeployError::Config)?;
     let resolved = ResolvedDeployConfig::resolve(&deploy_cfg, &resolve_project_name())
         .map_err(DeployError::Config)?;
 
@@ -2297,6 +2446,270 @@ mod tests {
                 "error should name the section and the missing key, got: {err}",
             );
         }
+    }
+
+    // ── fleet host list (#1621) ───────────────────────────────────
+
+    /// A `[deploy]` config carrying only the fleet list, so the fleet tests read
+    /// as the TOML an operator would write.
+    fn fleet_cfg(hosts: &[&str]) -> DeployConfig {
+        DeployConfig {
+            hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
+            ..DeployConfig::default()
+        }
+    }
+
+    #[test]
+    fn fleet_resolve_keeps_declaration_order_as_the_rollout_order() {
+        // #1621 (AC-1/AC-2): the order of `[deploy] hosts` IS the rollout order —
+        // it is a documented contract, not an implementation detail, so resolution
+        // must never sort or dedupe-reorder it.
+        let fleet = ResolvedFleet::resolve(&fleet_cfg(&["web-3", "web-1", "web-2"]), "myapp")
+            .expect("a well-formed fleet resolves");
+        let hosts: Vec<Option<&str>> = fleet.hosts.iter().map(|h| h.host.as_deref()).collect();
+        assert_eq!(
+            hosts,
+            vec![Some("web-3"), Some("web-1"), Some("web-2")],
+            "fleet resolution must preserve declaration order, got: {hosts:?}"
+        );
+        assert!(
+            !fleet.is_single(),
+            "a 3-host fleet must not report as single-host, got: {:?}",
+            fleet.hosts.len()
+        );
+    }
+
+    #[test]
+    fn fleet_resolve_rejects_host_and_hosts_set_together_naming_both_keys() {
+        // #1621 (AC-1): the two spellings are mutually exclusive — with both set
+        // the rollout order is ambiguous, so this fails closed BEFORE any remote
+        // command runs, naming both keys so the operator knows what to delete.
+        let cfg = DeployConfig {
+            host: Some("203.0.113.10".to_owned()),
+            hosts: vec!["web-1.example.com".to_owned()],
+            ..DeployConfig::default()
+        };
+        let err = ResolvedFleet::resolve(&cfg, "myapp")
+            .expect_err("host + hosts together must be rejected");
+        assert!(
+            err.contains("[deploy] host") && err.contains("[deploy] hosts"),
+            "the mutual-exclusion error must name BOTH keys, got: {err}"
+        );
+        assert!(
+            err.contains("#1621"),
+            "fail-closed refusals cite the tracking issue, got: {err}"
+        );
+    }
+
+    #[test]
+    fn fleet_resolve_rejects_a_blank_hosts_entry_naming_its_index() {
+        // #1621 (AC-1): a blank entry would resolve to a hostless SSH target and
+        // fail mid-rollout with hosts already cut over. The index is 0-based and
+        // named so the operator can find the offending line in a long list.
+        for (index, hosts) in [
+            (0_usize, vec![String::new(), "web-2".to_owned()]),
+            (1, vec!["web-1".to_owned(), "   ".to_owned()]),
+            (
+                2,
+                vec!["web-1".to_owned(), "web-2".to_owned(), "\t".to_owned()],
+            ),
+        ] {
+            let cfg = DeployConfig {
+                hosts,
+                ..DeployConfig::default()
+            };
+            let err = ResolvedFleet::resolve(&cfg, "myapp")
+                .expect_err("a blank hosts entry must be rejected");
+            assert!(
+                err.contains("[deploy] hosts") && err.contains(&format!("{index}")),
+                "the blank-entry error must name the key and the 0-based index {index}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_resolve_rejects_duplicate_hosts_after_trimming_naming_the_value() {
+        // #1621 (AC-1/AC-3): deploying the same machine twice makes the second
+        // pass see its OWN new release as live, ping-pongs the blue/green slots and
+        // corrupts the previous-release chain a fleet rollback depends on. Trim
+        // first so `"web-1"` and `" web-1 "` are recognised as the same host.
+        // (Literal duplicates only — DNS aliases are a documented limitation.)
+        let cfg = fleet_cfg(&["web-1.example.com", "web-2", " web-1.example.com "]);
+        let err = ResolvedFleet::resolve(&cfg, "myapp")
+            .expect_err("a duplicate hosts entry must be rejected");
+        assert!(
+            err.contains("web-1.example.com"),
+            "the duplicate error must name the repeated value, got: {err}"
+        );
+        assert!(
+            err.contains("[deploy] hosts"),
+            "the duplicate error must name the config key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn fleet_resolve_without_any_host_keeps_the_deploy_host_message() {
+        // #1621 (AC-1): with neither key set the operator sees the SAME
+        // missing-host text as before, EXTENDED to mention the fleet spelling. The
+        // literal substring "[deploy] host" is asserted by
+        // `deploy_check_fails_fast_without_host` and quoted in operator runbooks,
+        // so it must survive the extension verbatim.
+        let err = ResolvedFleet::resolve(&DeployConfig::default(), "myapp")
+            .expect_err("no host and no hosts must be rejected");
+        assert!(
+            err.contains("[deploy] host"),
+            "the missing-target error must keep the historical `[deploy] host` \
+             substring, got: {err}"
+        );
+        assert!(
+            err.contains("hosts"),
+            "the missing-target error must also offer the fleet spelling, got: {err}"
+        );
+
+        // A blank scalar host is the same case as an absent one.
+        let blank = DeployConfig {
+            host: Some("   ".to_owned()),
+            ..DeployConfig::default()
+        };
+        let blank_err = ResolvedFleet::resolve(&blank, "myapp")
+            .expect_err("a blank host must be rejected like an absent one");
+        assert!(
+            blank_err.contains("[deploy] host"),
+            "a blank host must report the missing-target message, got: {blank_err}"
+        );
+    }
+
+    #[test]
+    fn single_entry_hosts_resolves_to_the_same_view_as_host() {
+        // #1621 (AC-1, proof P5): a one-entry `hosts` list is byte-for-byte the
+        // historical single-server deploy. Value equality against
+        // `ResolvedDeployConfig::resolve` of the equivalent `host` config is the
+        // structural guarantee — everything below `SshTarget::from_resolved` then
+        // behaves identically by construction.
+        let single = DeployConfig {
+            host: Some("203.0.113.10".to_owned()),
+            app_name: Some("shop".to_owned()),
+            user: "deploy".to_owned(),
+            ssh_port: 2222,
+            readiness_timeout_secs: 90,
+            keep_releases: 5,
+            profile: "staging".to_owned(),
+            ..DeployConfig::default()
+        };
+        let fleet_cfg = DeployConfig {
+            host: None,
+            hosts: vec!["203.0.113.10".to_owned()],
+            ..single.clone()
+        };
+
+        let expected =
+            ResolvedDeployConfig::resolve(&single, "myapp").expect("single host resolves");
+        let fleet =
+            ResolvedFleet::resolve(&fleet_cfg, "myapp").expect("single-entry fleet resolves");
+        assert!(
+            fleet.is_single(),
+            "a one-entry hosts list must report as single-host, got {} hosts",
+            fleet.hosts.len()
+        );
+        assert_eq!(
+            fleet.hosts[0], expected,
+            "a one-entry `hosts` list must resolve to exactly the `host` view; \
+             fleet: {:?}, single: {expected:?}",
+            fleet.hosts[0]
+        );
+    }
+
+    #[test]
+    fn fleet_resolve_trims_each_host_like_the_single_host_path() {
+        // #1621 (AC-1): `ResolvedDeployConfig::resolve` trims the scalar `host`,
+        // so the fleet list must trim each entry identically — otherwise a stray
+        // space produces a different SSH target under the two spellings.
+        let padded = fleet_cfg(&["  203.0.113.10  "]);
+        let fleet = ResolvedFleet::resolve(&padded, "myapp").expect("padded fleet resolves");
+        let expected = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("  203.0.113.10  ".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("padded single host resolves");
+        assert_eq!(
+            fleet.hosts[0], expected,
+            "each fleet entry must be trimmed exactly like the scalar host, got: {:?}",
+            fleet.hosts[0]
+        );
+    }
+
+    #[test]
+    fn fleet_resolve_shares_the_single_host_defaults_and_tls_validation() {
+        // #1621 (AC-1): the fleet resolves the SHARED shape once through
+        // `ResolvedDeployConfig::resolve`, so the app_name → app_dir →
+        // service_name chain and the TLS-requires-host rejection are literally the
+        // same code — they cannot drift between the two spellings.
+        let fleet = ResolvedFleet::resolve(&fleet_cfg(&["web-1", "web-2"]), "myapp")
+            .expect("a well-formed fleet resolves");
+        for host in &fleet.hosts {
+            assert_eq!(host.app_name, "myapp", "got: {host:?}");
+            assert_eq!(host.app_dir, "/srv/autumn/myapp", "got: {host:?}");
+            assert_eq!(host.service_name, "myapp", "got: {host:?}");
+            assert_eq!(host.profile, "prod", "got: {host:?}");
+        }
+
+        // `[deploy.tls] enabled` without a host is rejected for a fleet exactly as
+        // it is for a single server — before any host is touched.
+        let cfg = DeployConfig {
+            hosts: vec!["web-1".to_owned(), "web-2".to_owned()],
+            tls: autumn_web::config::DeployTlsConfig {
+                enabled: true,
+                host: None,
+            },
+            ..DeployConfig::default()
+        };
+        let err = ResolvedFleet::resolve(&cfg, "myapp")
+            .expect_err("enabled TLS without a host must be rejected for a fleet too");
+        assert!(
+            err.contains("[deploy.tls]") && err.contains("host"),
+            "the fleet must reuse the single-host TLS rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn fleet_of_one_renders_todays_unit() {
+        // #1621 (AC-1, proof P7): the rendered systemd unit — the artifact that
+        // actually lands on the server — must be byte-identical under both
+        // spellings. This is the observable downstream of P5.
+        let single = DeployConfig {
+            host: Some("203.0.113.10".to_owned()),
+            app_name: Some("shop".to_owned()),
+            user: "deploy".to_owned(),
+            ..DeployConfig::default()
+        };
+        let fleet_spelling = DeployConfig {
+            host: None,
+            hosts: vec!["203.0.113.10".to_owned()],
+            ..single.clone()
+        };
+
+        let today = ResolvedDeployConfig::resolve(&single, "shop").expect("single host resolves");
+        let fleet =
+            ResolvedFleet::resolve(&fleet_spelling, "shop").expect("single-entry fleet resolves");
+
+        let release_dir = "/srv/autumn/shop/releases/20240101120000";
+        let today_unit = render_app_unit(&today, release_dir, 3001, "blue");
+        let fleet_unit = render_app_unit(&fleet.hosts[0], release_dir, 3001, "blue");
+        assert_eq!(
+            fleet_unit, today_unit,
+            "a one-entry fleet must render today's slot unit verbatim;\nfleet:\n{fleet_unit}\ntoday:\n{today_unit}"
+        );
+
+        // The `current`-symlink renderer stays in lockstep too.
+        let today_service = render_systemd_unit(&today);
+        let fleet_service = render_systemd_unit(&fleet.hosts[0]);
+        assert_eq!(
+            fleet_service, today_service,
+            "a one-entry fleet must render today's service unit verbatim;\nfleet:\n{fleet_service}\ntoday:\n{today_service}"
+        );
     }
 
     #[test]

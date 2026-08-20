@@ -72,6 +72,11 @@ fn deploy_plan_prints_unit_and_steps() {
 fn deploy_check_fails_fast_without_host() {
     // A bare [deploy] table has no host; check must fail with an actionable
     // message naming the key to set, and exit non-zero.
+    //
+    // #1621: the fleet spelling (`[deploy] hosts`) EXTENDS this message rather
+    // than replacing it — the literal `[deploy] host` substring is quoted in
+    // operator runbooks, so it must survive verbatim while the message also
+    // offers the fleet alternative.
     let dir = project("");
     let (stdout, stderr) = run_autumn_fail(dir.path(), &["deploy", "check"], &[]);
     let combined = format!("{stdout}{stderr}");
@@ -82,6 +87,65 @@ fn deploy_check_fails_fast_without_host() {
     assert!(
         combined.contains("[deploy] host"),
         "check should name the config key\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("hosts"),
+        "check should also offer the #1621 fleet spelling\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_rejects_host_and_hosts_configured_together() {
+    // #1621 (AC-1): `[deploy] host` and `[deploy] hosts` are mutually exclusive —
+    // with both set there is no unambiguous rollout order, so the CLI refuses
+    // before any remote work, naming BOTH keys so the operator knows which one to
+    // delete.
+    let dir = project("host = \"203.0.113.10\"\nhosts = [\"web-1.example.com\"]\n");
+    let (stdout, stderr) = run_autumn_fail(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("[deploy] host"),
+        "the refusal must name the legacy key\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("[deploy] hosts"),
+        "the refusal must name the fleet key\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_rejects_a_blank_hosts_entry() {
+    // #1621 (AC-1): a blank fleet entry is a typo that would otherwise resolve to
+    // a hostless SSH target mid-rollout. The refusal names the 0-based index so
+    // the operator can find the offending line.
+    let dir = project("hosts = [\"web-1.example.com\", \"  \"]\n");
+    let (stdout, stderr) = run_autumn_fail(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("[deploy] hosts"),
+        "the refusal must name the fleet key\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains('1'),
+        "the refusal must name the 0-based index of the blank entry\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_rejects_duplicate_hosts_entries() {
+    // #1621 (AC-1/AC-3): deploying the same machine twice corrupts its blue/green
+    // previous-release chain, which a fleet rollback depends on. Duplicates are
+    // compared after trimming and the repeated value is named.
+    let dir = project("hosts = [\"web-1.example.com\", \" web-1.example.com \"]\n");
+    let (stdout, stderr) = run_autumn_fail(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("web-1.example.com"),
+        "the refusal must name the repeated host\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("[deploy] hosts"),
+        "the refusal must name the fleet key\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 
