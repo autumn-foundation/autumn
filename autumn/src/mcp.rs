@@ -2129,12 +2129,16 @@ fn encode_query_arg(
             "query argument key exceeds {MAX_QUERY_BYTES} bytes"
         ));
     }
+    let is_container = matches!(value, Value::Array(_) | Value::Object(_));
+    let before = out.pairs.len();
     match value {
-        Value::Null => Ok(()),
-        Value::Array(items) if items.is_empty() => Err(format!(
-            "query argument `{key}` is an empty array; a query string cannot express an \
-             empty sequence — omit the argument, or move the field to a JSON body"
-        )),
+        Value::Null => {}
+        Value::Array(items) if items.is_empty() => {
+            return Err(format!(
+                "query argument `{key}` is an empty array; a query string cannot express an \
+                 empty sequence — omit the argument, or move the field to a JSON body"
+            ));
+        }
         Value::Array(items) => {
             if let Some(position) = items.iter().position(Value::is_null) {
                 return Err(format!(
@@ -2154,12 +2158,13 @@ fn encode_query_arg(
                     encode_query_arg(&format!("{key}[{index}]"), item, depth + 1, out)?;
                 }
             }
-            Ok(())
         }
-        Value::Object(fields) if fields.is_empty() => Err(format!(
-            "query argument `{key}` is an empty object; a query string cannot express an \
-             empty object — omit the argument, or move the field to a JSON body"
-        )),
+        Value::Object(fields) if fields.is_empty() => {
+            return Err(format!(
+                "query argument `{key}` is an empty object; a query string cannot express an \
+                 empty object — omit the argument, or move the field to a JSON body"
+            ));
+        }
         Value::Object(fields) => {
             for (field, nested) in fields {
                 if field.is_empty() || field.contains('[') || field.contains(']') {
@@ -2171,10 +2176,22 @@ fn encode_query_arg(
                 }
                 encode_query_arg(&format!("{key}[{field}]"), nested, depth + 1, out)?;
             }
-            Ok(())
         }
-        scalar => out.push(key, query_scalar(scalar)),
+        scalar => out.push(key, query_scalar(scalar))?,
     }
+    // A container every one of whose leaves is `null` emits no pair at all.
+    // Left alone it would vanish — and inside an array the decoder would then
+    // compact the gap, shortening the sequence. That is the same silent
+    // alteration the empty-container and null-element checks above prevent, so
+    // it is refused here rather than dispatched. A `null` **field** is exempt by
+    // construction: it is not a container, so it stays the absent marker.
+    if is_container && out.pairs.len() == before {
+        return Err(format!(
+            "query argument `{key}` carries no value; a query string cannot express a \
+             container whose every field is null — omit it, or move the field to a JSON body"
+        ));
+    }
+    Ok(())
 }
 
 /// Replace a single `{name}` / `{name:regex}` capture in a path template.
@@ -2637,13 +2654,28 @@ mod tests {
 
     #[test]
     fn encode_query_arg_omits_null_fields_rather_than_stringifying_them() {
+        // A null argument is the documented "absent" marker: no pair, no error.
         let mut pairs = QueryPairs::new();
         encode_query_arg("page", &json!(null), 1, &mut pairs).expect("null");
-        encode_query_arg("filter", &json!({ "status": null }), 1, &mut pairs).expect("null field");
         assert!(
             pairs.pairs.is_empty(),
-            "a null field renders no pair: {:?}",
+            "a null argument renders no pair: {:?}",
             pairs.pairs
+        );
+
+        // The same holds for a null field alongside a carried one — only a
+        // container that collapses ENTIRELY is refused (see the collapse test).
+        let mut pairs = QueryPairs::new();
+        encode_query_arg(
+            "filter",
+            &json!({ "status": null, "kind": "a" }),
+            1,
+            &mut pairs,
+        )
+        .expect("null field beside a carried one");
+        assert_eq!(
+            pairs.pairs,
+            vec![("filter[kind]".to_owned(), "a".to_owned())]
         );
     }
 
@@ -2676,6 +2708,33 @@ mod tests {
                 "{label} must be refused, not silently dropped"
             );
         }
+    }
+
+    #[test]
+    fn encode_query_arg_refuses_containers_that_collapse_to_nothing() {
+        // Codex P2: every field of an element being null emits no pair, so the
+        // element would vanish and the decoder would compact the gap — the same
+        // silent shortening a direct null element is already refused for.
+        let mut pairs = QueryPairs::new();
+        assert!(
+            encode_query_arg(
+                "items",
+                &json!([{ "note": null }, { "note": "x" }]),
+                1,
+                &mut pairs
+            )
+            .is_err(),
+            "an all-null element must not silently shorten the sequence"
+        );
+
+        // Same one level up, for an object-typed field.
+        let mut pairs = QueryPairs::new();
+        assert!(encode_query_arg("filter", &json!({ "note": null }), 1, &mut pairs).is_err());
+
+        // A `null` FIELD is still the documented absent marker, not a collapse.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("filter", &json!({ "a": 1, "b": null }), 1, &mut pairs).expect("partial");
+        assert_eq!(pairs.pairs, vec![("filter[a]".to_owned(), "1".to_owned())]);
     }
 
     #[test]

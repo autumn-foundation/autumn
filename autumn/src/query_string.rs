@@ -157,9 +157,109 @@ impl fmt::Display for QueryError {
 impl std::error::Error for QueryError {}
 
 impl de::Error for QueryError {
+    /// The catch-all serde uses for a `#[serde(deserialize_with)]` helper's own
+    /// message. Its content is out of our hands, so it is bounded and stripped
+    /// rather than trusted; the shaped constructors below intercept the serde
+    /// messages that would otherwise embed request text verbatim.
     fn custom<T: fmt::Display>(msg: T) -> Self {
-        Self::msg(msg.to_string())
+        Self::msg(sanitize_message(&msg.to_string()))
     }
+
+    /// `invalid type: string "SUPERSECRET", expected u32` — serde's default
+    /// renders the **value**. Report the shape only.
+    fn invalid_type(unexp: de::Unexpected<'_>, exp: &dyn de::Expected) -> Self {
+        Self::msg(format!(
+            "invalid type: {}, expected {exp}",
+            unexpected_shape(&unexp)
+        ))
+    }
+
+    /// Same reasoning as [`Self::invalid_type`]: the value is the secret-bearing
+    /// half of the message.
+    fn invalid_value(unexp: de::Unexpected<'_>, exp: &dyn de::Expected) -> Self {
+        Self::msg(format!(
+            "invalid value: {}, expected {exp}",
+            unexpected_shape(&unexp)
+        ))
+    }
+
+    /// serde renders the rejected variant name, which is request text. The
+    /// `expected` list is compile-time and safe to keep.
+    fn unknown_variant(variant: &str, expected: &'static [&'static str]) -> Self {
+        let _ = variant;
+        Self::msg(format!(
+            "unknown variant, expected one of {}",
+            quoted_list(expected)
+        ))
+    }
+
+    /// `#[serde(deny_unknown_fields)]` feeds the submitted key here, which is
+    /// both attacker-chosen and unbounded.
+    fn unknown_field(field: &str, expected: &'static [&'static str]) -> Self {
+        let _ = field;
+        Self::msg(format!(
+            "unknown field, expected one of {}",
+            quoted_list(expected)
+        ))
+    }
+
+    // `missing_field` and `duplicate_field` take a `&'static str` that can only
+    // come from the target struct, so their defaults are safe as-is.
+}
+
+/// Name a [`de::Unexpected`]'s shape without reproducing its value.
+const fn unexpected_shape(unexp: &de::Unexpected<'_>) -> &'static str {
+    match unexp {
+        de::Unexpected::Bool(_) => "a boolean",
+        de::Unexpected::Unsigned(_) | de::Unexpected::Signed(_) => "an integer",
+        de::Unexpected::Float(_) => "a float",
+        de::Unexpected::Char(_) => "a character",
+        de::Unexpected::Str(_) => "a string",
+        de::Unexpected::Bytes(_) => "a byte string",
+        de::Unexpected::Unit => "a unit value",
+        de::Unexpected::Option => "an optional value",
+        de::Unexpected::NewtypeStruct => "a newtype struct",
+        de::Unexpected::Seq => "a sequence",
+        de::Unexpected::Map => "an object",
+        de::Unexpected::Enum => "an enum",
+        de::Unexpected::UnitVariant => "a unit variant",
+        de::Unexpected::NewtypeVariant => "a newtype variant",
+        de::Unexpected::TupleVariant => "a tuple variant",
+        de::Unexpected::StructVariant => "a struct variant",
+        // `Other` carries a borrowed description that may be built from request
+        // text, so it gets the same treatment as everything else here.
+        de::Unexpected::Other(_) => "a value",
+    }
+}
+
+/// Render a compile-time `expected` list for an error message.
+fn quoted_list(expected: &'static [&'static str]) -> String {
+    if expected.is_empty() {
+        return "no variants".to_owned();
+    }
+    expected
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Bound and clean a message serde built for us.
+///
+/// Only reachable through [`de::Error::custom`], i.e. a `deserialize_with`
+/// helper's own text. The shaped constructors above already keep request text
+/// out of every message serde's derive generates.
+fn sanitize_message(raw: &str) -> String {
+    const MAX: usize = 160;
+    let mut out: String = raw
+        .chars()
+        .take(MAX)
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect();
+    if raw.chars().nth(MAX).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 /// Bound and clean attacker-supplied key text before it reaches an error
@@ -336,6 +436,12 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
         let next = segments.get(position.saturating_add(1));
         match segment {
             Segment::Key(name) => {
+                // A container that has so far only seen positions is not
+                // necessarily a sequence: `?filter[0]=zero&filter[name]=value`
+                // is a perfectly good dynamic object, and which it is only
+                // becomes knowable when a named key arrives. Promote rather
+                // than declare a conflict.
+                promote_to_map(node);
                 let Node::Map(entries) = node else {
                     return poison(node, conflict(base, segments, position, "an object"));
                 };
@@ -343,31 +449,64 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
                     .entry((*name).to_owned())
                     .or_insert_with(|| empty_for(next));
             }
-            Segment::Index(index) => {
-                let Node::Seq(entries) = node else {
-                    return poison(node, conflict(base, segments, position, "a sequence"));
-                };
-                node = entries.entry(*index).or_insert_with(|| empty_for(next));
-            }
-            Segment::Append => {
-                let Node::Seq(entries) = node else {
-                    return poison(node, conflict(base, segments, position, "a sequence"));
-                };
-                // `k[]` appends after the highest position seen so far, so
-                // repeated appends stay in submission order even when mixed
-                // with explicit indices.
-                let index = entries
-                    .keys()
-                    .next_back()
-                    .map_or(0, |last| last.saturating_add(1));
-                node = entries.entry(index).or_insert_with(|| empty_for(next));
-            }
+            // A position addressed on an already-promoted map keeps its decimal
+            // key, so the two orderings of the same query agree.
+            Segment::Index(index) => match node {
+                Node::Seq(entries) => {
+                    node = entries.entry(*index).or_insert_with(|| empty_for(next));
+                }
+                Node::Map(entries) => {
+                    node = entries
+                        .entry(index.to_string())
+                        .or_insert_with(|| empty_for(next));
+                }
+                other => {
+                    return poison(other, conflict(base, segments, position, "a sequence"));
+                }
+            },
+            // `k[]` appends after the highest position seen so far, so repeated
+            // appends stay in submission order even when mixed with explicit
+            // indices.
+            Segment::Append => match node {
+                Node::Seq(entries) => {
+                    let index = entries
+                        .keys()
+                        .next_back()
+                        .map_or(0, |last| last.saturating_add(1));
+                    node = entries.entry(index).or_insert_with(|| empty_for(next));
+                }
+                Node::Map(entries) => {
+                    let index = entries
+                        .keys()
+                        .filter_map(|key| key.parse::<usize>().ok())
+                        .max()
+                        .map_or(0, |last| last.saturating_add(1));
+                    node = entries
+                        .entry(index.to_string())
+                        .or_insert_with(|| empty_for(next));
+                }
+                other => {
+                    return poison(other, conflict(base, segments, position, "a sequence"));
+                }
+            },
         }
     }
 
     match node {
         Node::Scalar(values) => values.push(value),
         _ => poison(node, conflict(base, segments, segments.len(), "a value")),
+    }
+}
+
+/// Turn a positional node into a named one, rendering each index as its decimal
+/// key, so a container that mixes `k[0]=` and `k[name]=` stays usable.
+fn promote_to_map(node: &mut Node) {
+    if let Node::Seq(entries) = node {
+        let promoted = std::mem::take(entries)
+            .into_iter()
+            .map(|(index, child)| (index.to_string(), child))
+            .collect();
+        *node = Node::Map(promoted);
     }
 }
 
@@ -1204,6 +1343,66 @@ mod tests {
         assert!(
             from_query_str::<Args>("tags[99999999999999999999]=a&tags[99999999999999999999]=b")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn serde_generated_errors_never_echo_request_text() {
+        // Codex P1: serde builds its own messages for these cases and the
+        // defaults embed the submitted text. All three must stay redacted.
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum Sort {
+            Asc,
+        }
+        #[derive(Debug, Deserialize)]
+        struct Sorted {
+            #[allow(dead_code)]
+            sort: Sort,
+        }
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Strict {
+            #[allow(dead_code)]
+            q: String,
+        }
+        // `invalid type` renders the value in serde's default message.
+        #[derive(Debug, Deserialize)]
+        struct Nested {
+            #[allow(dead_code)]
+            filter: std::collections::HashMap<String, String>,
+        }
+
+        let err = from_query_str::<Sorted>("sort=SUPERSECRET").expect_err("unknown variant");
+        assert!(!err.to_string().contains("SUPERSECRET"), "{err}");
+        let err = from_query_str::<Strict>("q=x&SUPERSECRET=1").expect_err("unknown field");
+        assert!(!err.to_string().contains("SUPERSECRET"), "{err}");
+        let err =
+            from_query_str::<Nested>("filter[a]=x&filter=SUPERSECRET").expect_err("shape conflict");
+        assert!(!err.to_string().contains("SUPERSECRET"), "{err}");
+    }
+
+    #[test]
+    fn a_container_may_mix_numeric_and_named_keys() {
+        // Codex P2: `filter[0]=zero&filter[name]=value` is a valid dynamic
+        // object; classifying `0` as a position must not poison it.
+        #[derive(Debug, Deserialize)]
+        struct Dynamic {
+            filter: std::collections::HashMap<String, String>,
+        }
+        let out: Dynamic = from_query_str("filter[0]=zero&filter[name]=value").expect("decodes");
+        assert_eq!(out.filter.get("0").map(String::as_str), Some("zero"));
+        assert_eq!(out.filter.get("name").map(String::as_str), Some("value"));
+
+        // The reverse submission order agrees.
+        let out: Dynamic = from_query_str("filter[name]=value&filter[0]=zero").expect("decodes");
+        assert_eq!(out.filter.get("0").map(String::as_str), Some("zero"));
+        assert_eq!(out.filter.get("name").map(String::as_str), Some("value"));
+
+        // Promotion does not disturb a purely positional container.
+        assert_eq!(
+            args("tags[0]=a&tags[1]=b").tags.unwrap(),
+            vec!["a".to_owned(), "b".to_owned()]
         );
     }
 
