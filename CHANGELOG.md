@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed cooperative tenant scratch arena:** `TenantArena::try_bytes` and
+  `try_string` now bind each supported scratch allocation to its RAII quota
+  charge, propagate quota exhaustion as HTTP 503, and retain ownership safely
+  through eviction until final reclamation. ADR 0012 and a Verus lifecycle
+  specification precisely reject hard-isolation/RSS claims: ordinary Rust,
+  framework, third-party, stack, allocator, and native allocations remain
+  outside this cooperative tracked-memory boundary.
+
 - **`autumn generate webhook` for signed, replay-safe provider intake
   (#1366):** the `SignedWebhook` substrate has shipped since 0.4.0, but every
   Stripe/GitHub/Slack integration still hand-rolled the route, the endpoint
@@ -5764,4 +5772,3 @@ To opt out of the generated `page` method: implement your own list handler using
 - Commit CHANGELOG.md back to trunk on release([6b5eb82](https://github.com/madmax983/autumn/commit/6b5eb82b27d3932880f21b3cc3afc0fc29fa8790))
 - Add codecov, dependabot, and changelog tooling for v0.1 (#9)([db0d670](https://github.com/madmax983/autumn/commit/db0d6705c6379880fd51c48ae728824530cce5cb))
 - Update sprint status — Sprint 2 complete (13/12 pts)([07e0738](https://github.com/madmax983/autumn/commit/07e07387190401f4208f4a3eca1298bcaef5e856))
-
