@@ -90,8 +90,7 @@ impl fmt::Debug for EdgeCache {
 ///
 /// The response carries the [`FALLTHROUGH_SENTINEL`] header so the capsule
 /// runtime converts it into
-/// [`FallthroughReason::MissingCapability`](crate::wire::FallthroughReason::MissingCapability)
-/// instead of serving a broken page.
+/// [`FallthroughReason::MissingCapability`] instead of serving a broken page.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EdgeCacheUnavailable;

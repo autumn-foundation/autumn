@@ -127,9 +127,19 @@ pub const MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// [`FallthroughReason::CapsuleError`].
 pub const STDOUT_LINE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
+/// Scratch-buffer size for host-side copies of guest-supplied ranges (64 KiB).
+///
+/// An in-bounds `fd_write` iovec or `random_get` length can legitimately span
+/// the guest's whole linear memory, but the host must never mirror it in one
+/// allocation — a few concurrent requests doing so would exhaust host memory
+/// that no guest-side limit accounts for. Copies run through a buffer of this
+/// size instead, and the output budgets apply per chunk, so a runaway write
+/// fails long before its full length is copied.
+const HOST_IO_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Cap on accumulated guest stderr, in bytes (1 MiB).
 ///
-/// Stderr is diagnostics: only [`STDERR_EXCERPT`] characters ever reach a
+/// Stderr is diagnostics: only `STDERR_EXCERPT` (512) characters ever reach a
 /// fallthrough detail, so bytes past this cap are silently dropped rather
 /// than failing the write — a panicking guest should never be punished for
 /// being chatty while it dies.
@@ -564,18 +574,13 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                     let Some((pointer, length)) = iovec(&caller, memory, iovs, index) else {
                         return errno::INVAL;
                     };
-                    // Bounds-check BEFORE allocating: `length` is guest-chosen,
-                    // and a `u32::MAX` iovec must fail with EINVAL, not size a
-                    // host allocation. A range beyond the guest's linear
-                    // memory can never be read anyway.
+                    // Bounds-check BEFORE any copy: `length` is guest-chosen,
+                    // and a `u32::MAX` iovec must fail with EINVAL. A range
+                    // beyond the guest's linear memory can never be read.
                     let in_bounds = pointer
                         .checked_add(length)
                         .is_some_and(|end| end <= memory.data_size(&caller));
                     if !in_bounds {
-                        return errno::INVAL;
-                    }
-                    let mut chunk = vec![0u8; length];
-                    if memory.read(&caller, pointer, &mut chunk).is_err() {
                         return errno::INVAL;
                     }
                     let Ok(written) = u32::try_from(length) else {
@@ -586,14 +591,31 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                     };
                     total = sum;
 
-                    let state = caller.data_mut();
-                    if fd == 2 {
-                        state.write_stderr(&chunk);
-                    } else if !state.write_stdout(&chunk) {
-                        // A single stdout line has outgrown any honest frame:
-                        // fail the write so the guest aborts and the request
-                        // falls through, instead of growing host memory.
-                        return errno::NOSPC;
+                    // Copy through a bounded scratch buffer: even an in-bounds
+                    // iovec can span the guest's whole 256 MiB memory, and the
+                    // host must never mirror it in one allocation. The output
+                    // budgets kick in per chunk, so a runaway write fails long
+                    // before its full length is copied.
+                    let mut offset = 0usize;
+                    while offset < length {
+                        let step = HOST_IO_CHUNK_BYTES.min(length.saturating_sub(offset));
+                        let mut chunk = vec![0u8; step];
+                        let Some(at) = pointer.checked_add(offset) else {
+                            return errno::INVAL;
+                        };
+                        if memory.read(&caller, at, &mut chunk).is_err() {
+                            return errno::INVAL;
+                        }
+                        let state = caller.data_mut();
+                        if fd == 2 {
+                            state.write_stderr(&chunk);
+                        } else if !state.write_stdout(&chunk) {
+                            // A single stdout line has outgrown any honest
+                            // frame: fail the write so the guest aborts and
+                            // the request falls through.
+                            return errno::NOSPC;
+                        }
+                        offset = offset.saturating_add(step);
                     }
                 }
 
@@ -629,12 +651,22 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                 if !in_bounds {
                     return errno::INVAL;
                 }
-                let bytes: Vec<u8> = {
-                    let state = caller.data_mut();
-                    (0..len).map(|_| state.next_random_byte()).collect()
-                };
-                if memory.write(&mut caller, pointer, &bytes).is_err() {
-                    return errno::INVAL;
+                // Chunked like `fd_write`: an in-bounds `len` can span the
+                // whole guest memory, and the host buffer must stay bounded.
+                let mut offset = 0usize;
+                while offset < len {
+                    let step = HOST_IO_CHUNK_BYTES.min(len.saturating_sub(offset));
+                    let bytes: Vec<u8> = {
+                        let state = caller.data_mut();
+                        (0..step).map(|_| state.next_random_byte()).collect()
+                    };
+                    let Some(at) = pointer.checked_add(offset) else {
+                        return errno::INVAL;
+                    };
+                    if memory.write(&mut caller, at, &bytes).is_err() {
+                        return errno::INVAL;
+                    }
+                    offset = offset.saturating_add(step);
                 }
                 errno::SUCCESS
             },

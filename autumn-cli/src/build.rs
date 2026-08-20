@@ -898,8 +898,14 @@ fn resolve_binary_from_metadata(
             } else {
                 pkg["targets"].as_array()?.iter().find_map(|t| {
                     let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
-                    if is_bin {
-                        t["name"].as_str().map(String::from)
+                    let name = t["name"].as_str()?;
+                    // The edge capsule is a companion target, never the app:
+                    // without this skip, metadata ordering could hand the
+                    // capsule bin to the static renderer, which would launch
+                    // it as the origin binary. Selecting it stays possible via
+                    // --bin or default-run — both explicit choices.
+                    if is_bin && name != EDGE_BIN {
+                        Some(name.to_owned())
                     } else {
                         None
                     }
@@ -1365,6 +1371,44 @@ mod tests {
             Path::new("/projects"),
         );
         assert!(result.unwrap_err().contains("package 'hello'"));
+    }
+
+    #[test]
+    fn resolve_binary_never_falls_back_to_the_edge_capsule() {
+        // Metadata orders `edge-capsule` first; the implicit fallback must
+        // still pick the app's own bin — launching the capsule as the static
+        // renderer would block on stdin instead of rendering.
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "greeting",
+                "manifest_path": "/projects/greeting/Cargo.toml",
+                "targets": [
+                    { "name": "edge-capsule", "kind": ["bin"], "src_path": "/projects/greeting/src/bin/edge-capsule.rs" },
+                    { "name": "greeting", "kind": ["bin"], "src_path": "/projects/greeting/src/main.rs" }
+                ]
+            }]
+        });
+        let (bin, _, _) = resolve_binary_from_metadata(
+            &metadata,
+            true,
+            Some("greeting"),
+            None,
+            Path::new("/projects"),
+        )
+        .unwrap();
+        assert_eq!(bin, expected_binary("/tmp/target/debug/greeting"));
+
+        // Explicitly asking for the capsule bin still works.
+        let (bin, _, _) = resolve_binary_from_metadata(
+            &metadata,
+            true,
+            Some("greeting"),
+            Some("edge-capsule"),
+            Path::new("/projects"),
+        )
+        .unwrap();
+        assert_eq!(bin, expected_binary("/tmp/target/debug/edge-capsule"));
     }
 
     #[test]
