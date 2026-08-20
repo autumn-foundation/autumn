@@ -620,6 +620,7 @@ dependencies = [
  "aes-gcm",
  "allocation-counter",
  "ammonia",
+ "autumn-edge",
  "autumn-macros",
  "axum",
  "base64 0.22.1",
@@ -2897,6 +2898,16 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "edge-greeting"
+version = "0.1.0"
+dependencies = [
+ "autumn-edge",
+ "autumn-web",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
