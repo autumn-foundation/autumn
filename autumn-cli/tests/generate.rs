@@ -3672,6 +3672,312 @@ fn generated_channel_smoke_test_passes() {
     );
 }
 
+// ── autumn generate webhook integration tests (issue #1366) ───────────────────
+
+#[test]
+fn generate_webhook_creates_all_expected_files() {
+    let (_tmp, project) = fresh_project("webhook-app");
+    let (stdout, stderr) = run_autumn(&project, &["generate", "webhook", "stripe", "Payments"]);
+    assert!(
+        stdout.contains("Created") && stdout.contains("payments.rs"),
+        "output should list the created handler: {stdout}"
+    );
+
+    assert!(project.join("src/webhooks/payments.rs").is_file());
+    assert!(project.join("src/webhooks/mod.rs").is_file());
+
+    let handler = fs::read_to_string(project.join("src/webhooks/payments.rs")).unwrap();
+    assert!(
+        handler.contains("#[post(\"/webhooks/stripe\")]"),
+        "handler must own the provider route path:\n{handler}"
+    );
+    assert!(
+        handler.contains("webhook: SignedWebhook"),
+        "handler must take the shipped extractor:\n{handler}"
+    );
+    assert!(
+        handler.contains("webhook.event_type()")
+            && handler.contains("\"payment_intent.succeeded\""),
+        "handler must dispatch on the event type:\n{handler}"
+    );
+
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main_rs.contains("mod webhooks;"), "got:\n{main_rs}");
+    assert!(
+        main_rs.contains("webhooks::payments::payments_webhook"),
+        "the route must be registered in routes![...]:\n{main_rs}"
+    );
+
+    let autumn_toml = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    assert!(
+        autumn_toml.contains("[[security.webhooks.endpoints]]"),
+        "got:\n{autumn_toml}"
+    );
+    assert!(
+        autumn_toml.contains("secret_env = \"STRIPE_WEBHOOK_SECRET\""),
+        "the endpoint must reference a secret env var, never an inline secret:\n{autumn_toml}"
+    );
+    assert!(
+        autumn_toml.contains("replay_protection = true"),
+        "replay protection must be on by default:\n{autumn_toml}"
+    );
+    // No CSRF/CAPTCHA exemption copies: the framework derives those from the
+    // endpoint block on every boot, so a literal copy would only go stale.
+    assert!(
+        !autumn_toml.contains("exempt_paths"),
+        "path exemptions are derived from the endpoint block, not copied:\n{autumn_toml}"
+    );
+
+    // The printed next steps name the secret env var, the dashboard target, and
+    // how to fire a test delivery — on stdout, not as warnings.
+    assert!(
+        stdout.contains("Next steps:") && stdout.contains("STRIPE_WEBHOOK_SECRET"),
+        "the secret env var must be part of the printed next steps:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("autumn webhook sim stripe"),
+        "the next steps should show how to fire a signed test delivery:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("Warning:"),
+        "a clean run must not print warnings:\n{stderr}"
+    );
+}
+
+#[test]
+fn generate_webhook_supports_every_provider_preset() {
+    let (_tmp, project) = fresh_project("webhook-presets");
+    for (provider, name, snake) in [
+        ("stripe", "Payments", "payments"),
+        ("github", "Repo", "repo"),
+        ("slack", "Events", "events"),
+        ("generic", "Partner", "partner"),
+    ] {
+        run_autumn(&project, &["generate", "webhook", provider, name]);
+        let handler = fs::read_to_string(project.join(format!("src/webhooks/{snake}.rs"))).unwrap();
+        assert!(
+            handler.contains(&format!("#[post(\"/webhooks/{provider}\")]")),
+            "{provider}: wrong route path:\n{handler}"
+        );
+    }
+    let autumn_toml = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    assert_eq!(
+        autumn_toml
+            .matches("[[security.webhooks.endpoints]]")
+            .count(),
+        4,
+        "each preset must add its own endpoint:\n{autumn_toml}"
+    );
+}
+
+#[test]
+fn generate_webhook_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("webhook-dry-run");
+    let toml_before = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    let (stdout, _stderr) = run_autumn(
+        &project,
+        &["generate", "webhook", "stripe", "Payments", "--dry-run"],
+    );
+
+    assert!(stdout.contains("Dry run"), "got:\n{stdout}");
+    assert!(stdout.contains("Would create"), "got:\n{stdout}");
+    assert!(
+        !project.join("src/webhooks").exists(),
+        "--dry-run must not write any file"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("autumn.toml")).unwrap(),
+        toml_before,
+        "--dry-run must not touch autumn.toml"
+    );
+}
+
+#[test]
+fn generate_webhook_rejects_an_unknown_provider() {
+    let (_tmp, project) = fresh_project("webhook-bad-provider");
+    let (_stdout, stderr, code) =
+        run_autumn_failing(&project, &["generate", "webhook", "twilio", "Sms"]);
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+    assert!(
+        stderr.contains("twilio") && stderr.contains("generic"),
+        "got:\n{stderr}"
+    );
+    assert!(!project.join("src/webhooks").exists());
+}
+
+#[test]
+fn generate_webhook_rejects_hostile_path_and_secret_env_overrides() {
+    let (_tmp, project) = fresh_project("webhook-hostile-input");
+    let toml_before = fs::read_to_string(project.join("autumn.toml")).unwrap();
+
+    // A quote would break out of the generated `#[post("…")]` attribute.
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "webhook",
+            "stripe",
+            "Payments",
+            "--path",
+            "/a\")]pub fn evil(){}//",
+        ],
+    );
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+
+    // A newline in --secret-env used to smuggle a whole endpoint block, with a
+    // plaintext secret and replay protection off, into autumn.toml.
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "webhook",
+            "stripe",
+            "Payments",
+            "--secret-env",
+            "X\n\n[[security.webhooks.endpoints]]\nname = \"evil\"\npath = \"/evil\"\nprovider = \"generic\"\nsecret = \"attacker-known\"\nreplay_protection = false\n# ",
+        ],
+    );
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+    assert!(
+        stderr.contains("secret environment variable"),
+        "got:\n{stderr}"
+    );
+
+    assert!(!project.join("src/webhooks").exists());
+    assert_eq!(
+        fs::read_to_string(project.join("autumn.toml")).unwrap(),
+        toml_before,
+        "a rejected invocation must not touch autumn.toml"
+    );
+}
+
+#[test]
+fn generate_webhook_rejects_a_second_endpoint_on_the_same_path() {
+    let (_tmp, project) = fresh_project("webhook-dup-path");
+    run_autumn(&project, &["generate", "webhook", "stripe", "Payments"]);
+    let (_stdout, stderr, code) =
+        run_autumn_failing(&project, &["generate", "webhook", "stripe", "Billing"]);
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+    assert!(
+        stderr.contains("/webhooks/stripe") && stderr.contains("--path"),
+        "the duplicate-path error must suggest --path:\n{stderr}"
+    );
+
+    // …and the override succeeds.
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "webhook",
+            "stripe",
+            "Billing",
+            "--path",
+            "/webhooks/stripe-billing",
+        ],
+    );
+    let handler = fs::read_to_string(project.join("src/webhooks/billing.rs")).unwrap();
+    assert!(
+        handler.contains("#[post(\"/webhooks/stripe-billing\")]"),
+        "got:\n{handler}"
+    );
+}
+
+#[test]
+fn destroy_webhook_removes_the_generated_files_and_config() {
+    let (_tmp, project) = fresh_project("webhook-destroy");
+    let toml_before = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    run_autumn(&project, &["generate", "webhook", "stripe", "Payments"]);
+    run_autumn(&project, &["destroy", "webhook", "stripe", "Payments"]);
+
+    assert!(
+        !project.join("src/webhooks").exists(),
+        "the handler module must be gone"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("autumn.toml")).unwrap(),
+        toml_before,
+        "autumn.toml must be restored exactly"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before,
+        "src/main.rs must be restored exactly"
+    );
+}
+
+/// Slow end-to-end check: scaffold a fresh project, generate every provider
+/// preset, and `cargo check --tests` it — the acceptance-criterion proof that
+/// generated webhook code compiles with no hand-editing.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_webhook_cargo_checks() {
+    let (_tmp, project) = fresh_project("webhook-build");
+    patch_generated_cargo_toml(&project);
+
+    for (provider, name) in [
+        ("stripe", "Payments"),
+        ("github", "Repo"),
+        ("slack", "Events"),
+        ("generic", "Partner"),
+    ] {
+        run_autumn(&project, &["generate", "webhook", provider, name]);
+    }
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated webhooks failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow end-to-end check: actually RUN the generated webhook tests. This is the
+/// acceptance-criterion proof that a valid signature is accepted, a
+/// missing/invalid signature is rejected, and a replayed delivery is rejected —
+/// on first run, with no manual edits beyond the ones the issue allows.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: builds and runs a fresh project's test suite — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_webhook_tests_pass() {
+    let (_tmp, project) = fresh_project("webhook-smoke");
+    patch_generated_cargo_toml(&project);
+
+    for (provider, name) in [
+        ("stripe", "Payments"),
+        ("github", "Repo"),
+        ("slack", "Events"),
+        ("generic", "Partner"),
+    ] {
+        run_autumn(&project, &["generate", "webhook", provider, name]);
+    }
+
+    let test_run = Command::new("cargo")
+        .args(["test", "webhooks::"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&test_run.stdout);
+    assert!(
+        test_run.status.success(),
+        "generated webhook tests failed:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&test_run.stderr),
+    );
+    assert!(
+        stdout.contains("16 passed"),
+        "expected all four presets' four cases to pass; got:\n{stdout}"
+    );
+}
+
 // ── autumn generate auth integration tests ────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]

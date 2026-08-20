@@ -1901,6 +1901,15 @@ enum WebhookCommands {
         /// The payload to send in the request body.
         #[arg(long)]
         payload: String,
+        /// Event type to announce, for the providers that carry it in a header
+        /// (github: `X-GitHub-Event`, generic: `X-Webhook-Event`).
+        ///
+        /// Defaults to `sim.event`, which no real handler dispatches on — pass
+        /// the event your handler expects (e.g. `--event push`) to exercise it.
+        /// Stripe and Slack read their event type from the payload's `type`
+        /// field instead, so this is ignored for those two.
+        #[arg(long, value_name = "TYPE")]
+        event: Option<String>,
     },
 }
 
@@ -2645,6 +2654,45 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate a signed, replay-protected inbound webhook endpoint for a
+    /// third-party provider (Stripe, GitHub, Slack, or a generic HMAC source).
+    ///
+    /// The handler takes the shipped `SignedWebhook` extractor — signature
+    /// verification, raw-body capture, timestamp tolerance, replay rejection,
+    /// and secret rotation are the framework's, never hand-rolled.
+    ///
+    /// Creates:
+    ///   - `src/webhooks/<snake>.rs` — `#[post]` handler, event dispatch, and tests
+    ///   - `src/webhooks/mod.rs`     — created/updated with `pub mod`
+    ///   - `src/main.rs`             — `mod webhooks;` + the route in `routes![...]`
+    ///   - `autumn.toml`             — endpoint stub, replay backend, exemptions
+    ///   - `Cargo.toml`              — `serde_json` + tokio test features
+    ///
+    /// Example:
+    ///
+    ///   autumn generate webhook stripe Payments
+    ///   autumn generate webhook github Repo --path /hooks/github
+    ///   autumn generate webhook stripe Payments --dry-run
+    #[command(verbatim_doc_comment)]
+    Webhook {
+        /// Provider preset: `stripe`, `github`, `slack`, or `generic`.
+        provider: String,
+        /// Endpoint name (`PascalCase` or `snake_case`, e.g. `Payments`).
+        name: String,
+        /// Route path for the endpoint (default: `/webhooks/<provider>`).
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// Environment variable holding the signing secret
+        /// (default: `<PROVIDER>_WEBHOOK_SECRET`).
+        #[arg(long, value_name = "VAR")]
+        secret_env: Option<String>,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate a system-test skeleton under `tests/system/`.
     ///
     /// The generated test is gated behind `#[cfg(feature = "system-tests")]` and
@@ -3321,7 +3369,8 @@ fn run_command(command: Commands) {
             url,
             secret,
             payload,
-        }) => webhook::run_sim(&provider, &url, &secret, &payload),
+            event,
+        }) => webhook::run_sim(&provider, &url, &secret, &payload, event.as_deref()),
         Commands::Alert(AlertCommands::Test { channel }) => alert::run_test(channel.as_deref()),
         Commands::Console {
             profile,
@@ -4269,6 +4318,41 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let plan = generate::inbound_mail::plan_inbound_mail(&resolve_cwd(), &name);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Webhook {
+            provider,
+            name,
+            path,
+            secret_env,
+            dry_run,
+            force,
+        } => {
+            let options = generate::webhook::WebhookOptions { path, secret_env };
+            let project_root = resolve_cwd();
+            // `destroy` recovers a `--path`/`--secret-env` it was not given from
+            // the endpoint block `generate` recorded, so cleanup does not depend
+            // on the user repeating flags (issue #1366, Codex review).
+            let plan = match mode {
+                ApplyMode::Generate => {
+                    generate::webhook::plan_webhook(&project_root, &provider, &name, &options)
+                }
+                ApplyMode::Destroy => generate::webhook::plan_webhook_for_revert(
+                    &project_root,
+                    &provider,
+                    &name,
+                    &options,
+                ),
+            };
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+            // Printed after the file list, and only for a real generate run:
+            // `apply_plan` exits on failure, and neither a dry run nor a
+            // destroy has next steps to take (issue #1366 AC #5).
+            if mode == ApplyMode::Generate
+                && !dry_run
+                && let Some(steps) = generate::webhook::next_steps(&provider, &name, &options)
+            {
+                println!("{steps}");
+            }
         }
         GenerateCommands::SystemTest {
             name,
@@ -7298,6 +7382,87 @@ mod tests {
     }
 
     // ── autumn generate channel tests ──────────────────────────────────────
+
+    #[test]
+    fn parse_generate_webhook_defaults() {
+        let cli =
+            Cli::try_parse_from(["autumn", "generate", "webhook", "stripe", "Payments"]).unwrap();
+        let Commands::Generate(GenerateCommands::Webhook {
+            provider,
+            name,
+            path,
+            secret_env,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate webhook");
+        };
+        assert_eq!(provider, "stripe");
+        assert_eq!(name, "Payments");
+        assert!(path.is_none(), "--path defaults to /webhooks/<provider>");
+        assert!(
+            secret_env.is_none(),
+            "--secret-env defaults to <PROVIDER>_WEBHOOK_SECRET"
+        );
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_webhook_with_path_and_secret_env() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "webhook",
+            "generic",
+            "Partner",
+            "--path",
+            "/hooks/partner",
+            "--secret-env",
+            "PARTNER_WEBHOOK_SECRET",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Webhook {
+            provider,
+            path,
+            secret_env,
+            dry_run,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected generate webhook");
+        };
+        assert_eq!(provider, "generic");
+        assert_eq!(path.as_deref(), Some("/hooks/partner"));
+        assert_eq!(secret_env.as_deref(), Some("PARTNER_WEBHOOK_SECRET"));
+        assert!(dry_run);
+    }
+
+    #[test]
+    fn parse_generate_webhook_requires_both_provider_and_name() {
+        assert!(
+            Cli::try_parse_from(["autumn", "generate", "webhook", "stripe"]).is_err(),
+            "the endpoint name is required"
+        );
+        assert!(
+            Cli::try_parse_from(["autumn", "generate", "webhook"]).is_err(),
+            "the provider preset is required"
+        );
+    }
+
+    #[test]
+    fn parse_destroy_webhook() {
+        let cli =
+            Cli::try_parse_from(["autumn", "destroy", "webhook", "stripe", "Payments"]).unwrap();
+        let Commands::Destroy(GenerateCommands::Webhook { provider, name, .. }) = cli.command
+        else {
+            panic!("expected destroy webhook");
+        };
+        assert_eq!(provider, "stripe");
+        assert_eq!(name, "Payments");
+    }
 
     #[test]
     fn parse_generate_channel_with_pascal_name() {

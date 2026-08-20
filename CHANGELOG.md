@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`autumn generate webhook` for signed, replay-safe provider intake
+  (#1366):** the `SignedWebhook` substrate has shipped since 0.4.0, but every
+  Stripe/GitHub/Slack integration still hand-rolled the route, the endpoint
+  config, the event dispatch, and the signature tests — security-sensitive
+  boilerplate (raw-body ordering, constant-time compare, replay window, secret
+  rotation) nobody should retype. One command now emits it: a
+  `#[post("/webhooks/<provider>")]` handler taking the shipped extractor (no
+  hand-rolled HMAC), an `event_type()` dispatch skeleton with marked stub
+  functions and an acknowledge-and-ignore default arm, the route registered in
+  `routes![…]`, and an `autumn.toml` `[[security.webhooks.endpoints]]` stub that
+  references the signing secret by `secret_env` (never inline) with replay
+  protection on. Provider presets `stripe`, `github`, `slack`, and `generic`
+  map onto `WebhookProvider`, including the Slack Events API `event_callback`
+  envelope and its `url_verification` challenge handshake. The endpoint block is
+  all the wiring needed — Autumn installs the registry from it and derives the
+  path's CSRF/submit-token/CAPTCHA exemptions from it on every boot, so no
+  stale-prone copies are written — and `[security.webhooks.replay]` is emitted
+  explicitly with Redis guidance, since production validation rejects the
+  process-local `memory` backend for replay-protected endpoints. The
+  generated `#[cfg(test)]` module signs a fixture delivery the way the provider
+  does and asserts 200 / 400 / 401 / 409 for valid / missing-signature /
+  wrong-signature / replayed deliveries — passing on first run with no manual
+  edits beyond the handler bodies and the secret env var. `--path`,
+  `--secret-env`, `--dry-run`, and `autumn destroy webhook` are all supported;
+  a second endpoint on a path another endpoint already claims is refused at
+  generate time rather than failing config validation at boot, regenerating with
+  a changed path updates the endpoint block in place instead of stranding it, and
+  `destroy` leaves hand-edited config (rotation variables, a Redis replay
+  backend) alone — and recovers a generation-time `--path`/`--secret-env` from
+  the recorded endpoint block, so cleanup does not depend on repeating flags.
+  See `docs/guide/generators.md`.
+
+- **`autumn webhook sim` refreshes body-carried delivery IDs (#1366):** the
+  simulator already minted a fresh delivery ID per invocation for GitHub and
+  generic providers, which carry it in a header. Stripe and Slack read theirs
+  from the JSON body (`id` / `event_id`), so a payload with a fixed ID replayed:
+  the first simulation was accepted and every one after it answered `409
+  Conflict` for the length of the replay window. Both fields are now rewritten
+  before signing (the signature covers the exact bytes sent), and the substituted
+  ID is printed. A payload that is not a JSON object is left exactly as written.
+
+- **`autumn webhook sim --event <TYPE>` (#1366):** the simulator hardcoded
+  `sim.event` as the announced event type for the header-carrying providers
+  (`X-GitHub-Event`, `X-Webhook-Event`), which matches no real dispatch arm — so
+  a simulated delivery always fell through to a handler's
+  acknowledge-and-ignore branch, proving nothing about the code under test.
+  `--event` now sets it (default unchanged), and `autumn generate webhook` prints
+  a matching flag for those presets. Stripe and Slack read their event type from
+  the payload's `type` field, so `--event` warns rather than silently doing
+  nothing there. A `409 Conflict` response now explains which replay key
+  rejected the delivery, and an HTML error page is summarized instead of dumped.
 - **Edge WASM capsule, first slice (#1790):** mark a read-path handler
   `#[edge]`, register it with `edge_routes![]`, and a single `autumn build`
   emits a portable `wasm32-wasip1` **edge capsule** alongside the native binary

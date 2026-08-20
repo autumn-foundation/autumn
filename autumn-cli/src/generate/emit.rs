@@ -153,6 +153,16 @@ pub enum Revert {
     /// Remove the `[auth.webauthn]` stub block `autumn generate auth
     /// --passkeys` appended to `path` (`autumn.toml`).
     AuthWebauthnStub { path: PathBuf },
+    /// Remove the `[[security.webhooks.endpoints]]` entry `autumn generate
+    /// webhook` added to `path` (`autumn.toml`) — matched on both `name` and
+    /// `route_path`, so a hand-written endpoint that merely shares a name
+    /// survives — along with its CSRF/CAPTCHA path exemptions and, once no
+    /// endpoint is left, the shared `[security.webhooks.replay]` block.
+    WebhookEndpointStub {
+        path: PathBuf,
+        name: String,
+        route_path: String,
+    },
     /// Remove `/{plural}/{segment}` from `[security.submit_token]
     /// exempt_paths` in `path` (`autumn.toml`) — a submit-token exemption
     /// `autumn generate scaffold` appended — dropping the block if that empties
@@ -226,6 +236,7 @@ impl Revert {
             | Self::PwaMainRsInjection { path }
             | Self::AuthOAuthProviderStubs { path, .. }
             | Self::AuthWebauthnStub { path }
+            | Self::WebhookEndpointStub { path, .. }
             | Self::SubmitTokenValidateExempt { path, .. }
             | Self::RememberMiddleware { path }
             | Self::SeedBinLinks { path, .. }
@@ -258,6 +269,7 @@ impl Revert {
             | Self::PwaMainRsInjection { .. }
             | Self::AuthOAuthProviderStubs { .. }
             | Self::AuthWebauthnStub { .. }
+            | Self::WebhookEndpointStub { .. }
             | Self::SubmitTokenValidateExempt { .. }
             | Self::NestedChildSection { .. }
             | Self::I18nFtlKeys { .. }
@@ -378,6 +390,9 @@ impl Revert {
                 super::auth::remove_oauth_provider_stubs(content, providers)
             }
             Self::AuthWebauthnStub { .. } => super::auth::remove_webauthn_stub(content),
+            Self::WebhookEndpointStub {
+                name, route_path, ..
+            } => super::webhook::remove_webhook_endpoint(content, name, route_path),
             Self::SubmitTokenValidateExempt {
                 plural, segment, ..
             } => super::scaffold::remove_submit_token_exempt_from_toml(content, plural, segment),
@@ -1692,6 +1707,10 @@ const SHARED_MAIN_MODULE_NAMES: &[&str] = &[
     "jobs",
     "mailers",
     "inbound_mailers",
+    // `autumn generate webhook` (issue #1366) — directory-backed like the
+    // entries above, so `shared_module_backing_path_exists` treats it as
+    // orphaned once `src/webhooks/` is gone.
+    "webhooks",
     "policies",
     // A fixed single-file module (`src/notifications.rs`, no directory) —
     // `shared_module_backing_path_exists` already handles that shape.

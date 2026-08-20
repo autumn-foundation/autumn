@@ -10,6 +10,7 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate task`               | A one-off operational `#[task]` skeleton under `tasks/`                         |
 | `autumn generate job`                | A `#[job]` background-job handler with args struct, `registered_jobs()` aggregator, and `.jobs(…)` wiring in `src/main.rs` |
 | `autumn generate channel`            | A real-time broadcast channel over the `Channels` API — an htmx SSE live view by default, or a raw `#[ws]` handler with `--ws` |
+| `autumn generate webhook`            | A signature-verified, replay-protected inbound provider webhook (Stripe/GitHub/Slack/generic) — handler, event dispatch, `autumn.toml` endpoint config, and tests |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
 | `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |
 | `autumn generate admin`              | An `AdminModel` adapter for an existing model, wired to `autumn-admin-plugin`   |
@@ -850,6 +851,154 @@ These scaffold a fresh project, run `autumn generate channel` (both
 transports), and assert `cargo check --tests` passes with no hand-editing —
 plus one gate that actually runs the generated smoke test with `cargo test`
 to confirm it passes on first run.
+
+## `autumn generate webhook`
+
+For inbound provider callbacks — Stripe payment events, GitHub push/CI events,
+Slack Events API, or any provider that signs its body with HMAC-SHA256. The
+generator wires up the shipped `SignedWebhook` extractor; it never hand-rolls
+signature verification.
+
+```bash
+autumn generate webhook stripe Payments
+```
+
+Produces:
+
+```
+src/webhooks/payments.rs   # POST /webhooks/stripe: verified handler, event dispatch, tests
+src/webhooks/mod.rs        # pub mod payments; (created or appended)
+src/main.rs                # mod webhooks; + routes![...] entry added in place
+autumn.toml                # [[security.webhooks.endpoints]] + replay backend + path exemptions
+Cargo.toml                 # serde_json + tracing, and the tokio test features
+```
+
+The handler takes the extractor and dispatches on the provider's event type,
+with clearly-marked stub functions to fill in and a default arm that
+acknowledges-and-ignores everything else (a 2xx stops the provider retrying an
+event the app does not handle):
+
+```rust,ignore
+#[post("/webhooks/stripe")]
+pub async fn payments_webhook(webhook: SignedWebhook) -> AutumnResult<Json<serde_json::Value>> {
+    let event: serde_json::Value = webhook.json::<serde_json::Value>().map_err(|error| {
+        AutumnError::bad_request_msg(format!("invalid stripe webhook payload: {error}"))
+    })?;
+    match webhook.event_type().unwrap_or("unknown") {
+        // TODO: fill this in
+        "payment_intent.succeeded" => on_payment_intent_succeeded(&event).await?,
+        // …one arm and one `on_*` stub function per preset event…
+        _ => tracing::debug!(event_type, "unhandled webhook event — acknowledged and ignored"),
+    }
+    Ok(Json(serde_json::json!({ "received": true })))
+}
+```
+
+Provider presets (`stripe`, `github`, `slack`, `generic`) map onto
+`WebhookProvider` and pick the route path, signature/event/delivery headers,
+and the stub event arms. The Slack preset also unwraps the Events API
+`event_callback` envelope — `event_type()` reports the envelope type, not the
+inner event — and answers Slack's `url_verification` handshake by echoing the
+challenge. `generic` covers any other provider: raw-body HMAC-SHA256 with
+`X-Webhook-Signature`/`X-Webhook-Event`/`X-Webhook-Delivery`.
+
+The `autumn.toml` block references the signing secret by environment variable
+(`secret_env`) — a plaintext secret is never written — and turns replay
+protection on:
+
+```toml
+[[security.webhooks.endpoints]]
+name = "payments"
+path = "/webhooks/stripe"
+provider = "stripe"
+secret_env = "STRIPE_WEBHOOK_SECRET"
+previous_secret_envs = []      # add the old variable here during rotation
+replay_protection = true
+```
+
+That block is all the wiring the endpoint needs. Autumn installs the webhook
+registry from `[security.webhooks]` at startup, and derives the endpoint's CSRF,
+submit-token, and CAPTCHA path exemptions from the same block on every boot — a
+provider callback carries no browser session, and its signature is its
+authentication — so the generator deliberately writes **no** `exempt_paths`
+copies that could go stale when the path changes.
+
+`[security.webhooks.replay]` is written explicitly, with guidance to switch to
+Redis: production config validation rejects the process-local `memory` backend
+for replay-protected endpoints, so a deployed app must configure Redis (which
+needs `autumn-web`'s `redis` feature).
+
+The generator then prints the remaining steps: set the secret env var (the app
+refuses to start while a configured endpoint has none), point the provider
+dashboard at the path, fire a test delivery locally with `autumn webhook sim`,
+and fill in the `on_*` stubs.
+
+Useful flags:
+
+```bash
+# A second Stripe endpoint (two endpoints on one path fail config validation):
+autumn generate webhook stripe Billing --path /webhooks/stripe-billing
+
+# A distinct secret variable per endpoint:
+autumn generate webhook generic Partner --secret-env PARTNER_WEBHOOK_SECRET
+
+# Print the plan without writing:
+autumn generate webhook stripe Payments --dry-run
+```
+
+Fire a signed test delivery at the running app without touching the provider —
+same four presets, and a fresh delivery id per call (for Stripe and Slack, whose
+replay key lives in the body, the simulator rewrites that field before signing,
+so repeated runs are new deliveries rather than `409 Conflict` replays):
+
+```bash
+autumn webhook sim stripe http://localhost:3000/webhooks/stripe \
+  --secret "$STRIPE_WEBHOOK_SECRET" \
+  --payload '{"id":"evt_1","type":"payment_intent.succeeded"}'
+
+# GitHub and generic carry the event type in a header, so name it explicitly —
+# the simulator's default (`sim.event`) matches no generated arm:
+autumn webhook sim github http://localhost:3000/webhooks/github \
+  --secret "$GITHUB_WEBHOOK_SECRET" \
+  --payload '{"ref":"refs/heads/main"}' --event push
+```
+
+The printed command targets a generated stub arm, so a filled-in handler
+actually runs rather than falling through to acknowledge-and-ignore. A `409
+Conflict` on a repeat run is replay protection doing its job: for the
+header-signed providers the endpoint also keys on the signature, so a
+byte-identical payload is a duplicate delivery — vary `--payload`, or restart
+the app to clear an in-memory replay store.
+
+The generated `#[cfg(test)]` module is a real assertion, not a stub: it signs a
+fixture delivery the way the provider does and asserts a valid signature is
+accepted (200), a missing signature header is rejected (400 — the request is
+malformed), a well-formed but wrong signature is rejected (401), and a replayed
+delivery id is rejected (409). No Postgres or Docker required, so it runs on
+every `cargo test`.
+
+Re-running with `--force` and a different `--path`/`--secret-env` updates the
+existing endpoint block in place rather than leaving a stale one behind (the
+registry matches paths exactly, so a stale path would 500 every real delivery).
+
+`autumn destroy webhook <provider> <Name>` removes the handler, its route
+registration, and its `autumn.toml` block — including the shared replay block
+once the last endpoint is gone. A `--path`/`--secret-env` used at generation
+time does not have to be repeated: destroy recovers both from the endpoint block
+recorded under the same name (an explicit flag still wins). Config you have since edited by hand (rotation
+variables in `previous_secret_envs`, a tightened `timestamp_tolerance_secs`, a
+Redis replay backend) is left in place rather than deleted.
+
+### Slow live webhook verification
+
+```bash
+cargo test -p autumn-cli --test generate generated_webhook_cargo_checks -- --ignored --exact
+cargo test -p autumn-cli --test generate generated_webhook_tests_pass -- --ignored --exact
+```
+
+These scaffold a fresh project, generate all four presets, and assert `cargo
+check --tests` passes with no hand-editing — plus one gate that actually runs
+the generated tests to confirm they pass on first run.
 
 ## `autumn generate scaffold`
 
