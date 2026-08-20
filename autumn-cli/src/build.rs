@@ -469,13 +469,14 @@ fn apply_renderer_env(
     }
 }
 
-/// The package a `-p`-less invocation actually selected.
+/// The package a `-p`-less invocation actually selected, for the renderer.
 ///
 /// `-p <package>` always wins; otherwise `--bin <app>` in a multi-package
 /// workspace resolves to the package owning that bin (via [`find_binary`]),
-/// and everything downstream — the renderer's cluster, the edge capsule's
-/// package selection — must follow that resolution rather than falling back
-/// to "whichever workspace member matches first".
+/// and the renderer's cluster selection must follow that resolution. A
+/// selector-free invocation keeps `None` here — the renderer's historical
+/// workspace-root semantics — while the edge capsule build follows
+/// `find_binary`'s resolution unconditionally (see the call in [`run`]).
 fn effective_package<'a>(
     package: Option<&'a str>,
     bin: Option<&'a str>,
@@ -550,13 +551,12 @@ pub fn run(
     // routes and no `#[static_get]` routes must still get its capsule, and a
     // static-render failure must not silently drop it.
     if plan == EdgePlan::Build {
-        // `--bin <app>` without `-p` must build *that* app's capsule, not the
-        // first workspace member owning an edge-capsule bin.
-        run_edge_capsule_build(
-            &edge_scan,
-            effective_package(package, bin, resolved_pkg.as_deref()),
-            features,
-        );
+        // Follow find_binary's package resolution unconditionally — with or
+        // without a selector. The capsule must belong to the member whose
+        // sources were scanned, not whichever workspace member happens to own
+        // an edge-capsule bin; if the resolved member lacks the bin, the
+        // missing-target error (naming that member) is the correct answer.
+        run_edge_capsule_build(&edge_scan, package.or(resolved_pkg.as_deref()), features);
     }
 
     eprintln!("\nRunning static renderer...\n");

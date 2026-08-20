@@ -523,6 +523,16 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                     let Some((pointer, length)) = iovec(&caller, memory, iovs, index) else {
                         return errno::INVAL;
                     };
+                    // Bounds-check BEFORE allocating: `length` is guest-chosen,
+                    // and a `u32::MAX` iovec must fail with EINVAL, not size a
+                    // host allocation. A range beyond the guest's linear
+                    // memory can never be read anyway.
+                    let in_bounds = pointer
+                        .checked_add(length)
+                        .is_some_and(|end| end <= memory.data_size(&caller));
+                    if !in_bounds {
+                        return errno::INVAL;
+                    }
                     let mut chunk = vec![0u8; length];
                     if memory.read(&caller, pointer, &mut chunk).is_err() {
                         return errno::INVAL;
@@ -566,6 +576,15 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                 else {
                     return errno::INVAL;
                 };
+                // Same bounds-before-allocate rule as `fd_write`: the write
+                // below would reject an out-of-range destination, but only
+                // after this buffer was already sized by the guest's `len`.
+                let in_bounds = pointer
+                    .checked_add(len)
+                    .is_some_and(|end| end <= memory.data_size(&caller));
+                if !in_bounds {
+                    return errno::INVAL;
+                }
                 let bytes: Vec<u8> = {
                     let state = caller.data_mut();
                     (0..len).map(|_| state.next_random_byte()).collect()

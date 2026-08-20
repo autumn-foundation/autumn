@@ -75,6 +75,17 @@ async fn cookie_setter() -> (
     )
 }
 
+/// The `Extension` smuggling shape the `#[edge]` macro cannot see: an alias
+/// hides the extractor's name from the token-level refusal, so the runtime's
+/// missing-extension net has to catch it.
+#[derive(Clone)]
+struct Smuggled;
+type Alias = axum::Extension<Smuggled>;
+
+async fn aliased_extension(_ext: Alias) -> &'static str {
+    "never reached: the capsule installs no extensions"
+}
+
 /// A handler whose response header value is valid HTTP but not valid UTF-8 —
 /// it cannot cross the JSON wire byte-faithfully, so the runtime must decline
 /// rather than serve a lossily rewritten value the origin would never send.
@@ -108,6 +119,13 @@ fn routes() -> Vec<EdgeRoute> {
             path: "/cookie",
             handler: edge_get(cookie_setter),
             name: "cookie_setter",
+            needs: &[],
+        },
+        EdgeRoute {
+            method: http::Method::GET,
+            path: "/smuggled",
+            handler: edge_get(aliased_extension),
+            name: "aliased_extension",
             needs: &[],
         },
         EdgeRoute {
@@ -253,6 +271,22 @@ fn head_is_served_by_the_get_router_with_an_empty_body_and_gets_content_length()
         "HEAD must advertise the GET body's content-length"
     );
     assert_eq!(header(head_response, "x-edge-lane"), Some("edge"));
+}
+
+#[test]
+fn an_aliased_extension_extractor_falls_through_instead_of_serving_axums_500() {
+    // Also pins axum's rejection wording: if an axum upgrade rephrases
+    // "Missing request extension", this test fails at upgrade time instead of
+    // the net silently going dead.
+    let frames = drive(&[request_line(EdgeRequest::get("/smuggled"), &[])]);
+
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    let (reason, detail) = expect_fallthrough(&frames[0]);
+    assert_eq!(reason, FallthroughReason::CapsuleError);
+    assert!(
+        detail.contains("request extension") && detail.contains("origin-only"),
+        "the decline must name the missing-extension hazard: {detail}"
+    );
 }
 
 #[test]

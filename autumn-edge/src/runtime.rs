@@ -360,6 +360,23 @@ where
             }
         };
 
+        // Safety net behind the `#[edge]` macro's `Extension<…>` refusal: an
+        // alias can smuggle the extractor past that token-level check, and the
+        // capsule installs no request extensions, so axum answers with this
+        // 500. Declining is safe even if a handler deliberately produced the
+        // same bytes — a fallthrough re-runs the identical handler at the
+        // origin, which serves whatever it genuinely returns.
+        if status == 500 && body.starts_with(b"Missing request extension") {
+            return EdgeOutcome::fallthrough(
+                FallthroughReason::CapsuleError,
+                format!(
+                    "the handler for {uri} required a request extension the capsule does not \
+                     install; extensions are origin-only — use the `EdgeCache` seam, or serve \
+                     this route from the origin"
+                ),
+            );
+        }
+
         EdgeOutcome::Served(EdgeResponse {
             status,
             headers: canonicalize_headers(&headers),
