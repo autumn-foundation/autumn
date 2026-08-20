@@ -671,7 +671,10 @@ resource "aws_ecs_task_definition" "app" {
       ]
 
       environment = local.container_environment
-      secrets     = local.container_secrets
+      # A public bootstrap image must not receive production credentials.
+      # Deploys copy the secret references from the non-running migration
+      # task definition only when registering the trusted real app image.
+      secrets     = []
 
       logConfiguration = {
         logDriver = "awslogs"

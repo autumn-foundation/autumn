@@ -197,7 +197,9 @@ jobs:
           NEW_DEF=$(aws ecs describe-task-definition --task-definition "$APP_TASK_FAMILY" \
             --query 'taskDefinition' | \
             jq --arg IMAGE "$ECR_REPOSITORY_URL:$IMAGE_TAG" \
+               --argjson SECRETS "$(aws ecs describe-task-definition --task-definition "$MIGRATE_TASK_FAMILY" --query 'taskDefinition.containerDefinitions[0].secrets' --output json)" \
               '.containerDefinitions[0].image = $IMAGE |
+               .containerDefinitions[0].secrets = $SECRETS |
                del(.containerDefinitions[0].entryPoint, .containerDefinitions[0].command) |
                del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
                    .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)')
@@ -206,6 +208,7 @@ jobs:
           echo "arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
         env:
           APP_TASK_FAMILY: ${{ vars.APP_TASK_FAMILY }}
+          MIGRATE_TASK_FAMILY: ${{ vars.MIGRATE_TASK_FAMILY }}
           ECR_REPOSITORY_URL: ${{ vars.ECR_REPOSITORY_URL }}
           IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
 

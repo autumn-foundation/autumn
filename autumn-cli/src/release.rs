@@ -3650,7 +3650,7 @@ previous_secrets = []
         );
         assert!(
             service_block
-                .contains("ignore_changes = [source_configuration, health_check_configuration]"),
+                .contains("ignore_changes = [source_configuration, instance_configuration, health_check_configuration]"),
             "the App Runner service must ignore source_configuration drift once CI/the manual \
              walkthrough deploys the real image: {service_block}"
         );
@@ -3704,7 +3704,7 @@ previous_secrets = []
             .expect("main.tf must declare the App Runner service");
         assert!(
             service_block
-                .contains("ignore_changes = [source_configuration, health_check_configuration]"),
+                .contains("ignore_changes = [source_configuration, instance_configuration, health_check_configuration]"),
             "the App Runner service must ignore health_check_configuration drift alongside \
              source_configuration: {service_block}"
         );
@@ -3733,13 +3733,29 @@ previous_secrets = []
     }
 
     #[test]
-    fn aws_app_runner_service_waits_for_secret_versions_before_starting() {
-        // runtime_environment_secrets only references the secret
-        // CONTAINERS (aws_secretsmanager_secret.*.arn), so Terraform's
-        // implicit dependency graph doesn't wait for the *_version
-        // resources that actually write the secret values — without an
-        // explicit depends_on, the service can start (and fail to resolve
-        // AUTUMN_DATABASE__PRIMARY_URL) before RDS-derived value exists.
+    fn aws_app_runner_public_bootstrap_has_no_production_secrets_or_runtime_role() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let service = content
+            .split("resource \"aws_apprunner_service\" \"this\"")
+            .nth(1)
+            .expect("main.tf must declare the App Runner service");
+        assert!(!service.contains("runtime_environment_secrets ="));
+        let instance = service
+            .split("instance_configuration {")
+            .nth(1)
+            .and_then(|block| block.split('}').next())
+            .expect("service must configure its bootstrap instance size");
+        assert!(!instance.contains("instance_role_arn"));
+
+        let outputs = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        assert!(outputs.contains("output \"apprunner_instance_role_arn\""));
+    }
+
+    #[test]
+    fn aws_app_runner_public_bootstrap_does_not_wait_for_or_access_secrets() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
@@ -3748,16 +3764,9 @@ previous_secrets = []
             .split("resource \"aws_apprunner_service\" \"this\"")
             .nth(1)
             .expect("main.tf must declare aws_apprunner_service.this");
-        for dep in [
-            "aws_secretsmanager_secret_version.database_url",
-            "aws_secretsmanager_secret_version.signing_secret",
-        ] {
-            assert!(
-                service_block.contains(dep),
-                "aws_apprunner_service.this must depend on {dep}, not just the secret \
-                 container it references by ARN: {service_block}"
-            );
-        }
+        assert!(!service_block.contains("aws_iam_role_policy.apprunner_instance_secrets"));
+        assert!(!service_block.contains("aws_secretsmanager_secret_version.database_url"));
+        assert!(!service_block.contains("aws_secretsmanager_secret_version.signing_secret"));
     }
 
     #[test]
@@ -4155,6 +4164,24 @@ previous_secrets = []
             "the ECS service must ignore task_definition drift so CI-registered revisions \
              aren't reverted by a later `terraform apply`: {service_block}"
         );
+    }
+
+    #[test]
+    fn aws_ecs_public_app_bootstrap_has_no_secrets_and_deploy_restores_them() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, true).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let app = content
+            .split("resource \"aws_ecs_task_definition\" \"app\"")
+            .nth(1)
+            .and_then(|block| block.split("\nresource").next())
+            .expect("main.tf must declare the app task definition");
+        assert!(app.contains("secrets     = []"));
+
+        let workflow = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        assert!(workflow.contains("--argjson SECRETS"));
+        assert!(workflow.contains(".containerDefinitions[0].secrets = $SECRETS"));
     }
 
     #[test]

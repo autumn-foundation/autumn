@@ -42,6 +42,11 @@ output "apprunner_access_role_arn" {
   value       = aws_iam_role.apprunner_access.arn
 }
 
+output "apprunner_instance_role_arn" {
+  description = "Secret-reading runtime role for the real application image. The bootstrap image deliberately receives no instance role; the deploy walkthrough attaches this role during cutover."
+  value       = aws_iam_role.apprunner_instance.arn
+}
+
 # `aws apprunner update-service --source-configuration` REPLACES the image
 # configuration wholesale, not merges it — the deploy walkthrough's cutover
 # call must therefore re-supply RuntimeEnvironmentSecrets explicitly (using
