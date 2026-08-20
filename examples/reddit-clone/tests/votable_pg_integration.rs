@@ -68,6 +68,10 @@ use testcontainers_modules::postgres::Postgres;
 
 const CREATE_SCHEMA: &str = include_str!("../migrations/20260419000000_create_reddit/up.sql");
 const ADD_AVATAR: &str = include_str!("../migrations/20260427000000_add_user_avatar/up.sql");
+// Comments became polymorphic in #1367; `Subreddit::as_select()` and any
+// insert into `comments` need the reshaped table.
+const POLYMORPHIC_COMMENTS: &str =
+    include_str!("../migrations/20260820000000_polymorphic_comments/up.sql");
 
 #[derive(diesel::QueryableByName)]
 struct CountRow {
@@ -131,6 +135,9 @@ async fn setup_schema(conn: &mut AsyncPgConnection) {
     conn.batch_execute(ADD_AVATAR)
         .await
         .expect("add users.avatar column");
+    conn.batch_execute(POLYMORPHIC_COMMENTS)
+        .await
+        .expect("make comments polymorphic");
 }
 
 /// Seed `n` users, one subreddit, and one post per title. Returns the user ids.
@@ -400,7 +407,10 @@ async fn leaderboard_grouped_aggregate_still_works_after_react() {
     // into a post's score nor collide with `votes_unique_post` (a Postgres
     // unique constraint treats NULLs as distinct). The same rows also prove the
     // leaderboard's `IS NOT NULL` group guard still excludes comment votes.
-    diesel::sql_query("INSERT INTO comments (post_id, author_id, body) VALUES ($1, $2, 'c')")
+    diesel::sql_query(
+        "INSERT INTO comments (commentable_type, commentable_id, author_id, body) \
+         VALUES ('Post', $1, $2, 'c')",
+    )
         .bind::<BigInt, _>(hot)
         .bind::<BigInt, _>(users[0])
         .execute(&mut conn)

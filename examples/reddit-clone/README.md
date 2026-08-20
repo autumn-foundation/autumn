@@ -170,9 +170,8 @@ src/
     mod.rs          # Module exports
     layout.rs       # Shared layout, vote controls, CSRF injection, time formatting
     auth.rs         # Register, login, logout, user profiles
-    subreddits.rs   # Community listing, creation (#[secured]), detail view
-    posts.rs        # Front page, submit, view, edit, delete
-    comments.rs     # Comment creation and lazy loading
+    subreddits.rs   # Community listing, creation (#[secured]), detail view + community discussion
+    posts.rs        # Front page, submit, view, edit, delete + the post's comment thread
     votes.rs        # htmx-powered upvote/downvote with toggle + ON CONFLICT
     live.rs         # #[ws] WebSocket feeds consuming process-local Channels
     about.rs        # #[static_get] pre-rendered about page

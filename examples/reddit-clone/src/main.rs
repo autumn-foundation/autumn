@@ -138,8 +138,6 @@ async fn main() {
             routes::posts::update,
             routes::posts::manage_tags,
             routes::posts::delete_post,
-            routes::comments::create,
-            routes::comments::list_comments,
             routes::votes::upvote,
             routes::votes::downvote,
             routes::live::live_feed_health,
@@ -161,6 +159,15 @@ async fn main() {
             routes::errors::trigger_panic,
             routes::errors::trigger_404,
         ])
+        // Threaded, polymorphic comments (#1367). This ONE mount serves every
+        // `#[commentable]` model in the binary -- `Post` and `Subreddit` here --
+        // because the framework router dispatches on the `{commentable_type}`
+        // path segment through the registry the attribute writes into. Adding a
+        // third commentable model needs no change here.
+        .nest(
+            "/comments",
+            autumn_web::commentable::router(autumn_web::commentable::CommentsConfig::default()),
+        )
         .mail_previews(routes::auth::mail_previews())
         .policy::<Post, _>(PostPolicy)
         .static_routes(static_routes![routes::about::about])

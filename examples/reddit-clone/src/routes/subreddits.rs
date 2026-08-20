@@ -8,10 +8,11 @@ use autumn_web::prelude::*;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use crate::models::NewSubreddit;
+use crate::models::{NewSubreddit, Subreddit, SubredditComments as _};
 use crate::repositories::{PgSubredditRepository, SubredditRepository};
 use crate::schema::users;
 use autumn_web::slugify;
+use autumn_web::widgets::{CommentThread, CommentView, comment_thread};
 
 use super::layout::{layout, time_ago};
 
@@ -213,6 +214,27 @@ pub async fn show(
             .load(&mut *db)
             .await?;
 
+    // AC5 of #1367, in full: `Subreddit` is the SECOND commentable model, and
+    // this is *all* it took -- the `#[commentable]` attribute on the model, its
+    // `comment_count` column, and these few lines of rendering. No comments
+    // table of its own, no route, no threading query: the framework router
+    // `main.rs` already mounts for `Post` serves this too, keyed on
+    // `Subreddit::COMMENTABLE_TYPE`.
+    let thread = repo.comment_thread(sub.id).await?;
+    let mut comment_config = CommentThread::new(
+        format!("comments-subreddit-{}", sub.id),
+        format!("/comments/{}/{}", Subreddit::COMMENTABLE_TYPE, sub.id),
+    )
+    .label("Community discussion")
+    .empty_text("No community discussion yet.")
+    .return_to(&__autumn_path_show(&sub.slug))
+    .max_depth(usize::try_from(Subreddit::commentable_spec().max_depth).unwrap_or(5));
+    if current_user.is_some() {
+        comment_config = comment_config.csrf_token(csrf.token());
+    } else {
+        comment_config = comment_config.read_only(Some("Log in to join the discussion.".to_owned()));
+    }
+
     // Consume the flash only after all fallible work above.
     let flash_html = flash.render().await;
     Ok(layout(
@@ -284,6 +306,14 @@ pub async fn show(
                         "No posts yet. Be the first!"
                     }
                 }
+            }
+
+            // Community discussion -- the second `#[commentable]` model (#1367).
+            div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mt-6" {
+                h2 class="font-semibold text-gray-700 mb-2" {
+                    (sub.comment_count) " community comments"
+                }
+                (comment_thread(&comment_config, &CommentView::from_thread(&thread)))
             }
         },
     ))

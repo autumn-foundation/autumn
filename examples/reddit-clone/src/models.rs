@@ -1,6 +1,6 @@
 use autumn_web::storage::Blob;
 
-use crate::schema::{comments, posts, subreddits, tags, users, votes};
+use crate::schema::{posts, subreddits, tags, users, votes};
 
 // Manual model -- password_hash should never be auto-exposed via API.
 
@@ -22,7 +22,7 @@ pub struct User {
 }
 
 // `User` is a hand-written model (so `password_hash` is never auto-exposed),
-// but it is the target of `#[belongs_to(User, ...)]` on `Post`/`Comment`/
+// but it is the target of `#[belongs_to(User, ...)]` on `Post`/
 // `Subreddit`. Make it a leaf preload target so `post.author()` works.
 autumn_web::impl_preloadable_leaf!(User);
 
@@ -33,9 +33,14 @@ pub struct NewUser {
     pub password_hash: String,
 }
 
+// Polymorphic comments (#1367), the SECOND commentable model. Everything that
+// makes a subreddit's about page discussable is on these two lines: the
+// attribute, and the `comment_count` column the migration added. No comments
+// table of its own, no routes, no threading query -- it shares `Post`'s.
 #[autumn_web::model]
 #[belongs_to(User, fk = creator_id)]
 #[has_many(Post)]
+#[commentable(by = User, author_name = username)]
 pub struct Subreddit {
     #[id]
     pub id: i64,
@@ -49,6 +54,8 @@ pub struct Subreddit {
     #[default]
     pub subscriber_count: i64,
     #[default]
+    pub comment_count: i64,
+    #[default]
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -60,12 +67,19 @@ pub struct Subreddit {
 // `ON CONFLICT` arbiter -- so there are no overrides and **no migration**.
 // It emits a `PostReactions` trait (`react` / `reaction_of`) that
 // `PgPostRepository` picks up; see `crate::routes::votes`.
+//
+// Polymorphic comments (#1367): `#[commentable]` replaces what used to be a
+// `#[has_many(Comment)]` leg plus a 188-line hand-rolled `routes/comments.rs`.
+// It emits a `PostComments` trait (`add_comment` / `comment_thread` /
+// `delete_comment`) on `PgPostRepository`, registers `Post` with the
+// framework's generic comment router, and keeps `posts.comment_count` current
+// inside each comment's own transaction.
 #[autumn_web::model]
 #[belongs_to(User, fk = author_id)]
 #[belongs_to(Subreddit)]
-#[has_many(Comment)]
 #[has_many(Tag, through = post_tags)]
 #[votable(by = User, aggregate = sum)]
+#[commentable(by = User, author_name = username)]
 pub struct Post {
     #[id]
     pub id: i64,
@@ -107,31 +121,12 @@ pub struct Tag {
     pub slug: String,
 }
 
-// Counter cache (#1325): `counter_cache` on the `Post` leg is the whole
-// `posts.comment_count` feature. The column already existed (this example has
-// shipped it since its first migration, and the default column convention is
-// `{snake(child)}_count` -> `comment_count`), so adding the option required
-// **no migration**. It retires the hand-written
-// `posts::comment_count.eq(posts::comment_count + 1)` that used to live in
-// `crate::routes::comments` -- along with the decrement nobody had written yet.
-#[autumn_web::model]
-#[belongs_to(User, fk = author_id)]
-#[belongs_to(Post, counter_cache)]
-pub struct Comment {
-    #[id]
-    pub id: i64,
-    #[validate(length(min = 1))]
-    pub body: String,
-    #[indexed]
-    pub author_id: i64,
-    #[indexed]
-    pub post_id: i64,
-    pub parent_id: Option<i64>,
-    #[default]
-    pub score: i64,
-    #[default]
-    pub created_at: chrono::NaiveDateTime,
-}
+// The `Comment` model that used to live here is gone (#1367). Comments are now
+// a framework association: one polymorphic `comments` table keyed on
+// `(commentable_type, commentable_id)`, read back through
+// `autumn_web::commentable::Comment` and the repository helpers `#[commentable]`
+// emits. `crate::schema::comments` is kept because the table is still this
+// app's -- `votes.comment_id` references it -- but no `#[model]` maps it.
 
 // `Vote` is an `#[autumn_web::model]` so `VoteRepository` (see
 // `crate::repositories`) can expose the typed grouped-aggregate roll-up

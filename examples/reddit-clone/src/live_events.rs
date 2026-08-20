@@ -905,26 +905,11 @@ pub fn post_created_event(
     })
 }
 
-#[must_use]
-pub fn comment_created_event(
-    comment_id: i64,
-    post_id: i64,
-    post_slug: &str,
-    subreddit_slug: &str,
-    author_username: &str,
-    body: &str,
-) -> Value {
-    json!({
-        "type": "comment_created",
-        "comment_id": comment_id,
-        "post_id": post_id,
-        "post_slug": post_slug,
-        "subreddit_slug": subreddit_slug,
-        "author_username": author_username,
-        "body_preview": comment_body_preview(body),
-        "path": format!("{}#comment-{comment_id}", crate::routes::posts::__autumn_path_show(subreddit_slug, post_slug)),
-    })
-}
+// `comment_created_event` used to live here, alongside `post_created_event`.
+// It went away with `routes/comments.rs` in #1367: comments are now served by
+// the framework's generic comment router, which deliberately owns no
+// app-specific side effects. Live cross-client comment updates compose with
+// model-change broadcast (#1336) rather than with a hand-rolled route.
 
 type AutumnResult<T> = Result<T, AutumnError>;
 
@@ -1105,31 +1090,6 @@ fn rebroadcast_row(state: &AppState, row: &LiveFeedEventRow) {
         .ok();
 }
 
-/// ⚡ Bolt Optimization:
-/// Avoids an intermediate `Vec<&str>` heap allocation and `join` overhead
-/// by manually building the collapsed string into a pre-allocated buffer.
-fn comment_body_preview(body: &str) -> String {
-    const MAX_PREVIEW_LEN: usize = 120;
-
-    let mut collapsed = String::with_capacity(body.len());
-    for word in body.split_whitespace() {
-        if !collapsed.is_empty() {
-            collapsed.push(' ');
-        }
-        collapsed.push_str(word);
-    }
-
-    if collapsed.len() <= MAX_PREVIEW_LEN {
-        return collapsed;
-    }
-
-    let mut preview = collapsed
-        .chars()
-        .take(MAX_PREVIEW_LEN.saturating_sub(3))
-        .collect::<String>();
-    preview.push_str("...");
-    preview
-}
 
 #[cfg(test)]
 mod tests {
@@ -1407,28 +1367,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn comment_event_payload_includes_preview_and_path() {
-        let event = comment_created_event(
-            7,
-            42,
-            "ferris-ships",
-            "rust",
-            "ferris",
-            "Borrow checker approved this message.",
-        );
-
-        assert_eq!(event["type"], "comment_created");
-        assert_eq!(event["comment_id"], 7);
-        assert_eq!(event["post_id"], 42);
-        assert_eq!(event["subreddit_slug"], "rust");
-        assert_eq!(event["author_username"], "ferris");
-        assert_eq!(event["path"], json!("/r/rust/posts/ferris-ships#comment-7"));
-        assert_eq!(
-            event["body_preview"],
-            json!("Borrow checker approved this message.")
-        );
-    }
 
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
