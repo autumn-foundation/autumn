@@ -818,4 +818,38 @@ fn deploy_help_lists_subcommands() {
         combined.contains("rollback"),
         "help should list rollback\n{combined}"
     );
+    // #1621 (T2.4): the group doc comment IS the help text (verbatim_doc_comment),
+    // so the fleet flags must be documented there or `autumn deploy --help` starts
+    // lying about what the command can do.
+    assert!(
+        combined.contains("--only"),
+        "help should document the fleet `--only` flag\n{combined}"
+    );
+    assert!(
+        combined.contains("--no-rollback"),
+        "help should document the fleet `--no-rollback` flag\n{combined}"
+    );
+}
+
+#[test]
+fn deploy_up_rejects_an_only_host_that_is_not_in_the_fleet() {
+    // #1621 (§3.2): `--only` is checked against `[deploy] hosts` before anything
+    // else happens — no preflight, no SSH, no build. A typo names itself and the
+    // configured hosts are listed, because the alternative (guessing, or silently
+    // deploying nothing) can put the wrong machine into production.
+    let dir = project("hosts = [\"web-1.example.com\", \"web-2.example.com\"]\n");
+    let (stdout, stderr) = run_autumn_fail(
+        dir.path(),
+        &["deploy", "up", "--only", "web-9.example.com"],
+        &[],
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("web-9.example.com"),
+        "the error must quote the unmatched host\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("web-1.example.com") && combined.contains("web-2.example.com"),
+        "the error must list the configured hosts\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 }

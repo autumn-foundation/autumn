@@ -841,19 +841,30 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Release(ReleaseCommands),
 
-    /// Push-button, zero-downtime deploys to a VPS (issue #1607).
+    /// Push-button, zero-downtime deploys to a VPS or a fleet (issues #1607, #1621).
     ///
-    /// Run from the project root. `check` runs a local preflight, `plan` and
-    /// `rollback` print dry-run plans, and `up` performs a real first deploy over
-    /// SSH (cutover/rollback land in follow-ups). Configure the target under
-    /// `[deploy]` in autumn.toml.
+    /// Run from the project root. `check` runs a preflight against every configured
+    /// host, `plan` prints the dry-run plan, `up` performs a real rolling deploy over
+    /// SSH, and `rollback` returns the fleet to its previous release. Configure the
+    /// target under `[deploy] host` (one server) or `[deploy] hosts` (a fleet, in
+    /// rollout order) in autumn.toml.
+    ///
+    /// Fleet flags:
+    ///   --only <HOST>   repeatable; restrict `up`/`rollback` to these hosts. A
+    ///                   REPAIR LEVER: it leaves the skipped hosts on their current
+    ///                   release, so the fleet may end up mixed.
+    ///   --no-rollback   on `up`, halt and FREEZE a failed rollout for inspection
+    ///                   instead of automatically rolling the cut-over hosts back.
     ///
     /// # Examples
     ///
     ///   autumn deploy check
     ///   autumn deploy plan
     ///   autumn deploy rollback
+    ///   autumn deploy rollback --only web-2.example.com
     ///   autumn deploy up
+    ///   autumn deploy up --only web-2.example.com
+    ///   autumn deploy up --no-rollback
     #[command(subcommand, verbatim_doc_comment)]
     Deploy(DeployCommands),
 
@@ -2197,7 +2208,18 @@ enum DeployCommands {
     /// Resolves the previous release on the target, brings its slot back up,
     /// flips the proxy back to it, repoints `current`, and re-probes `/ready`.
     /// Fails loudly (non-zero) when there is no previous release to roll back to.
-    Rollback,
+    ///
+    /// With `[deploy] hosts` this rolls back EVERY host, newest first, continuing
+    /// past a host that fails (each is reported) and exiting non-zero if any host
+    /// did not come back.
+    Rollback {
+        /// Roll back only this host; repeat the flag for several (issue #1621).
+        ///
+        /// Each value must appear in `[deploy] hosts`. The hosts left out keep
+        /// running whatever they are running now, so the fleet may end up mixed.
+        #[arg(long, value_name = "HOST")]
+        only: Vec<String>,
+    },
 
     /// Run the preflight, then perform a REAL deploy over SSH.
     ///
@@ -2207,7 +2229,28 @@ enum DeployCommands {
     /// installs the proxy and stands the release up behind it; a redeploy runs a
     /// zero-downtime cutover and auto-rolls-back the candidate on a pre-cutover
     /// failure.
-    Up,
+    ///
+    /// With `[deploy] hosts` the hosts are replaced ONE AT A TIME in declaration
+    /// order, migrations run exactly once, and a mid-rollout failure halts the
+    /// rollout and rolls the hosts that already cut over back.
+    Up {
+        /// Deploy only this host; repeat the flag for several (issue #1621).
+        ///
+        /// Each value must appear in `[deploy] hosts`. A REPAIR LEVER, not a faster
+        /// deploy: the skipped hosts keep their current release, so finish with a
+        /// full `autumn deploy up` to converge the fleet.
+        #[arg(long, value_name = "HOST")]
+        only: Vec<String>,
+
+        /// Halt and FREEZE a failed rollout instead of rolling the cut-over hosts
+        /// back (issue #1621).
+        ///
+        /// Every host is left exactly as it is — including the ones already on the
+        /// new release — and named in the final state table, so the failure can be
+        /// inspected before anything else moves.
+        #[arg(long)]
+        no_rollback: bool,
+    },
 }
 
 /// Subcommands for `autumn generate`.
@@ -4065,14 +4108,35 @@ fn run_release_command(cmd: ReleaseCommands) {
     }
 }
 
+/// Map a `deploy` subcommand onto the (action, options) pair `deploy::run` takes.
+///
+/// [`deploy::DeployAction`] stays a fieldless `Copy` enum and the flags travel
+/// beside it in [`deploy::DeployOptions`] (issue #1621, §3.1), so adding a flag
+/// never ripples through the action enum or its call sites. Every construction here
+/// spreads `..Default::default()` for the same reason.
 fn run_deploy_command(cmd: &DeployCommands) {
-    let action = match cmd {
-        DeployCommands::Check => deploy::DeployAction::Check,
-        DeployCommands::Plan => deploy::DeployAction::Plan,
-        DeployCommands::Rollback => deploy::DeployAction::Rollback,
-        DeployCommands::Up => deploy::DeployAction::Up,
+    let (action, options) = match cmd {
+        DeployCommands::Check => (
+            deploy::DeployAction::Check,
+            deploy::DeployOptions::default(),
+        ),
+        DeployCommands::Plan => (deploy::DeployAction::Plan, deploy::DeployOptions::default()),
+        DeployCommands::Rollback { only } => (
+            deploy::DeployAction::Rollback,
+            deploy::DeployOptions {
+                only: only.clone(),
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Up { only, no_rollback } => (
+            deploy::DeployAction::Up,
+            deploy::DeployOptions {
+                only: only.clone(),
+                no_rollback: *no_rollback,
+            },
+        ),
     };
-    if let Err(e) = deploy::run(action) {
+    if let Err(e) = deploy::run(action, &options) {
         eprintln!("autumn deploy: {e}");
         std::process::exit(1);
     }

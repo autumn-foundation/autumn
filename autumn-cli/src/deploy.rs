@@ -91,6 +91,30 @@ pub enum DeployError {
     /// rarest path is the right trade.
     #[error("{0}")]
     FleetHalted(Box<FleetHalt>),
+
+    /// A fleet-wide `deploy rollback` did not restore every host (issue #1621).
+    ///
+    /// Unlike [`Self::FleetHalted`] this is not a partial-state report: a fleet
+    /// rollback is **best-effort-continue**, so every host was attempted and the
+    /// per-host table printed above it is the detail. Two counts are all this
+    /// carries — never a host-specific string built from a driver error.
+    ///
+    /// Returned when ANY host was left un-rolled-back — its rollback failed, or it
+    /// had no previous release to return to. Partial success is failure here: the
+    /// contract is that the FLEET returns to its previous release, and a fleet where
+    /// one host could not follow the others is mixed.
+    #[error(
+        "fleet rollback incomplete: {not_rolled_back} of {total} host(s) were not rolled back \
+         — see the per-host table above. A host with no previous release recorded cannot be \
+         rolled back; deploy the intended release to it explicitly, or retry one host with \
+         `autumn deploy rollback --only <host>`"
+    )]
+    FleetRollbackFailed {
+        /// Hosts left un-rolled-back (failed, or nothing to roll back to).
+        not_rolled_back: usize,
+        /// Hosts attempted.
+        total: usize,
+    },
 }
 
 /// The partial-fleet state a halted rollout leaves behind (issue #1621, AC-3).
@@ -139,6 +163,31 @@ pub enum DeployAction {
     Rollback,
     /// Run the preflight, then perform a REAL first deploy over SSH.
     Up,
+}
+
+/// Flags that modify a [`DeployAction`] (issue #1621, plan §3.1).
+///
+/// Carried **beside** the action rather than inside it: [`DeployAction`] is a
+/// fieldless `Copy` enum matched 1:1 by `run_deploy_command`, and giving its
+/// variants payloads would ripple into every call site and test for no gain. This
+/// struct is also the natural home for the later fleet flags (`--json`,
+/// `--strict`, the maintenance verb) and, in Phase 2, `--role` — so it derives
+/// [`Default`] and every construction site outside the CLI uses
+/// `..DeployOptions::default()`, making each addition a non-event.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeployOptions {
+    /// Restrict the command to these hosts, a subset of `[deploy] hosts` (the
+    /// repeatable `--only`). Empty means the whole configured fleet.
+    ///
+    /// A **repair lever, not a convenience**: narrowing a rollout is how an
+    /// operator ends up with a mixed fleet on purpose, so the CLI says so out
+    /// loud whenever this excludes a configured host.
+    pub only: Vec<String>,
+    /// Halt and FREEZE a failed rollout instead of compensating it (`--no-rollback`).
+    ///
+    /// The hosts that already cut over are left exactly as they are for
+    /// inspection, and named in the state table. See [`FleetUpInput::auto_rollback`].
+    pub no_rollback: bool,
 }
 
 /// A `[deploy]` section with all defaults resolved to concrete values.
@@ -392,6 +441,56 @@ fn deploy_host_list(cfg: &DeployConfig) -> Result<Vec<String>, String> {
     }
 
     Ok(hosts)
+}
+
+/// Narrow the configured host list to the `--only` selection (issue #1621, §3.2)
+/// — **pure**, so the refusal lands before any config is even resolved.
+///
+/// Rules:
+///
+/// - An empty selection is the whole fleet (the default, and the only shape a
+///   single-host config ever sees).
+/// - The result keeps **declaration order**, not the order the flags were typed:
+///   `[deploy] hosts` order IS the rollout order, and letting `--only c --only a`
+///   reverse it would silently invert a rolling deploy.
+/// - An unknown name is a hard error that quotes the name and lists the configured
+///   hosts. Guessing (prefix match, DNS resolution) would let a typo deploy the
+///   wrong machine, and silently deploying nothing would be worse still.
+/// - A repeated name selects that host once.
+///
+/// # Errors
+///
+/// Returns a message naming the unmatched entry and listing the configured hosts.
+fn select_hosts(configured: &[String], only: &[String]) -> Result<Vec<String>, String> {
+    if only.is_empty() {
+        return Ok(configured.to_vec());
+    }
+
+    for wanted in only {
+        let wanted = wanted.trim();
+        if !configured.iter().any(|host| host == wanted) {
+            let known = if configured.is_empty() {
+                "none — set `[deploy] hosts` in autumn.toml first".to_owned()
+            } else {
+                configured.join(", ")
+            };
+            return Err(format!(
+                "`--only {wanted}` names a host that is not in this project's deploy \
+                 configuration. Configured hosts: {known}. `--only` selects from that list \
+                 verbatim — it never resolves or guesses a name, so a typo can't deploy the \
+                 wrong machine (#1621)"
+            ));
+        }
+    }
+
+    // Filter the CONFIGURED list rather than mapping over `only`: `[deploy] hosts`
+    // order is the rollout order, so `--only c --only a` must not reverse it. This
+    // also de-duplicates a repeated flag for free.
+    Ok(configured
+        .iter()
+        .filter(|host| only.iter().any(|wanted| wanted.trim() == host.as_str()))
+        .cloned()
+        .collect())
 }
 
 /// An ordered fleet of deploy targets, each a fully-resolved
@@ -1073,7 +1172,7 @@ pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
 ///
 /// Returns [`DeployError::Config`] when the project config cannot be loaded and
 /// [`DeployError::PreflightFailed`] when `check` finds a failing grader.
-pub fn run(action: DeployAction) -> Result<(), DeployError> {
+pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployError> {
     // Ambient load (the operator's shell profile, `dev` by default): used ONLY to
     // read `[deploy]` and compute `resolved` — in particular `resolved.profile`,
     // the profile the deployed service will actually boot under (default `prod`).
@@ -1094,6 +1193,15 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
     // `ResolvedFleet` lands in a later slice, so the single-host paths below are
     // deliberately untouched.
     let host_list = deploy_host_list(&deploy_cfg).map_err(DeployError::Config)?;
+    // #1621: `--only` narrows the rollout to a subset of that list, in DECLARATION
+    // order. Resolved here — before the config is even resolved and long before any
+    // preflight probe — so a typo'd host name costs nothing and names itself.
+    let targets = select_hosts(&host_list, &options.only).map_err(DeployError::Config)?;
+    // A narrowed rollout is a deliberate repair lever that leaves the fleet on two
+    // versions, so it is never silent.
+    for line in fleet::only_selection_warning_lines(&host_list, &targets) {
+        eprintln!("{line}");
+    }
     let resolved = ResolvedDeployConfig::resolve(&deploy_cfg, &resolve_project_name())
         .map_err(DeployError::Config)?;
 
@@ -1117,15 +1225,19 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
         // deploy profile — not the operator's ambient/dev config. Reload here.
         // `check`/`rollback` deliberately do NOT load the media config.
         DeployAction::Check => run_check(&load_runtime_config(&resolved)?, &resolved),
-        DeployAction::Rollback => run_rollback(&load_runtime_config(&resolved)?, &resolved),
+        DeployAction::Rollback => {
+            run_rollback(&load_runtime_config(&resolved)?, &resolved, &targets)
+        }
         DeployAction::Up => {
             let (media_cfg, ffmpeg_bin) = load_media_host_config(&resolved)?;
             run_up(
                 &load_runtime_config(&resolved)?,
                 &resolved,
-                &host_list,
+                &targets,
+                host_list.len(),
                 &media_cfg,
                 &ffmpeg_bin,
+                options,
             )
         }
     }
@@ -2094,6 +2206,130 @@ fn refuse_unprovable_proxy_options(marker: &exec::ProxyOptionsMarker) -> Result<
     }
 }
 
+// ── Fleet-wide fail-closed refusals (issue #1621, §4.8) ──────────────────────
+//
+// All three are **pure predicates over the CONFIGURED host count**, evaluated in
+// the rollout prologue before a single remote command runs, and all three are
+// gated on `configured > 1` rather than on the number of hosts this run happens to
+// touch: `--only` narrows a rollout, it does not change the topology that makes
+// these unsafe. Each names the config key and the tracking issue, matching the
+// house style of `reject_sqlite_sharding_topology` (`migrate.rs`).
+
+/// Refuse a multi-host deploy backed by `SQLite` (issue #1621, §4.8).
+///
+/// `build_env_file` ships a byte-identical `AUTUMN_DATABASE__URL` to every host, so
+/// a `sqlite://` URL means N independent database FILES — one per machine. There is
+/// no advisory lock across them, "migrate exactly once" degenerates to "migrated on
+/// exactly one host's database", and every host serves a different dataset behind
+/// the same load balancer. That is data-destroying by construction, not a
+/// performance footgun, so it fails closed.
+fn refuse_sqlite_fleet(configured_hosts: usize, writable_db_sqlite: bool) -> Result<(), String> {
+    if configured_hosts > 1 && writable_db_sqlite {
+        return Err(
+            "\u{2717} A multi-host deploy cannot run on SQLite. `[deploy] hosts` lists more \
+             than one server and the configured `[database]` URL is a sqlite:// target, but \
+             every host receives the SAME database URL — which means N independent database \
+             FILES, one per machine: no shared schema, no advisory lock to serialize \
+             migrations, and each host serving a different dataset behind your load \
+             balancer. Point `[database] url` at a Postgres server every host can reach, or \
+             deploy a single host with `[deploy] host`. Tracking: #1621."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a multi-host deploy with `[media.mediamtx] enabled` (issue #1621, §4.8).
+///
+/// `provision_media_host` runs after the cutover and has **no** teardown or
+/// rollback path by design. Fanning it out would give N `MediaMTX` daemons on
+/// identical ports with divergent recording sets, and nothing to undo them with
+/// when the app rollout is compensated.
+fn refuse_media_fleet(configured_hosts: usize, media_enabled: bool) -> Result<(), String> {
+    if configured_hosts > 1 && media_enabled {
+        return Err(
+            "\u{2717} A multi-host deploy cannot provision MediaMTX. `[deploy] hosts` lists \
+             more than one server and `[media.mediamtx] enabled = true`, but host media \
+             provisioning has no teardown or rollback path: fanning it out would leave one \
+             MediaMTX daemon per host on identical ports, with divergent recording sets and \
+             nothing to undo them with when the app rollout is rolled back. Deploy media on \
+             a single host with `[deploy] host`, or set `[media.mediamtx] enabled = false` \
+             and provision the media host separately. Tracking: #1621."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a multi-host deploy with `[deploy.tls] enabled` (issue #1621, §4.8).
+///
+/// kamal-proxy is PER HOST — it binds that host's public port; it is not a fleet
+/// load balancer. N hosts would each attempt ACME for the same `[deploy.tls] host`
+/// from behind the operator's load balancer, only one can answer a given challenge,
+/// and the rest burn Let's Encrypt failed-validation and duplicate-certificate rate
+/// limits. Behind a load balancer, TLS terminates at the load balancer.
+fn refuse_tls_fleet(configured_hosts: usize, tls_enabled: bool) -> Result<(), String> {
+    if configured_hosts > 1 && tls_enabled {
+        return Err(
+            "\u{2717} A multi-host deploy cannot terminate TLS per host. `[deploy] hosts` \
+             lists more than one server and `[deploy.tls] enabled = true`, but the \
+             deploy-managed proxy runs on EVERY host: each one would request a certificate \
+             for the same `[deploy.tls] host` from behind your load balancer, only one can \
+             answer a given ACME challenge, and the rest burn Let's Encrypt \
+             failed-validation and duplicate-certificate rate limits. Terminate TLS at the \
+             load balancer that fronts the fleet and set `[deploy.tls] enabled = false`. \
+             Tracking: #1621."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// The loud line printed when a fleet deploys an app that auto-applies migrations
+/// at boot (issue #1621, §4.8).
+///
+/// A **warning, not a refusal**: it is a real hazard but not a certainty, and
+/// making it a refusal (or a preflight grader) would break existing single-host
+/// users' scale-up and force a doctor-parity change for a rule the rollout itself
+/// does not depend on.
+const FLEET_AUTO_MIGRATE_WARNING: &str = "`[database] auto_migrate` is on and this deploy targets more than one host: every \
+     host applies migrations at boot, so the hosts RACE each other during the rollout \
+     and a checksum mismatch exits the process under `Restart=on-failure` — a crash \
+     loop mid-rollout. Turn it off for fleets and let the rollout's single `migrate` \
+     step own the schema (#1621).";
+
+/// Whether the fleet must be warned about boot-time auto-migration (issue #1621,
+/// §4.8) — pure.
+///
+/// `auto_migrate` supersedes the `auto_migrate_in_production` back-compat alias
+/// (`auto_migrate` wins when set), mirroring the runtime's own resolution. The
+/// alias is honoured without checking the profile: a deploy defaults to `prod`, and
+/// under-warning about a crash loop is worse than over-warning.
+fn fleet_auto_migrate_warning(
+    configured_hosts: usize,
+    auto_migrate: Option<bool>,
+    auto_migrate_in_production: bool,
+) -> Option<&'static str> {
+    let enabled = auto_migrate.unwrap_or(auto_migrate_in_production);
+    (configured_hosts > 1 && enabled).then_some(FLEET_AUTO_MIGRATE_WARNING)
+}
+
+/// Whether the resolved writable database URL names a `SQLite` backend (issue
+/// #1621, §4.8).
+///
+/// Resolves the same URL the deploy would SHIP to every host
+/// ([`resolve_writable_db_url`]) and reduces it to one bool **here**, so the URL —
+/// which carries credentials — never enters the rollout driver's inputs, its
+/// errors, or its output.
+fn writable_db_is_sqlite(db: &autumn_web::config::DatabaseConfig) -> bool {
+    resolve_writable_db_url(db).is_some_and(|url| {
+        matches!(
+            autumn_web::config::DatabaseBackend::detect(url),
+            Some(autumn_web::config::DatabaseBackend::Sqlite)
+        )
+    })
+}
+
 /// Perform a real deploy of the whole configured fleet (issue #1607, Slices 1–3;
 /// issue #1621).
 ///
@@ -2112,8 +2348,10 @@ fn run_up(
     config: &AutumnConfig,
     resolved: &ResolvedDeployConfig,
     hosts: &[String],
+    configured_host_count: usize,
     media_cfg: &media::MediaMtxHostConfig,
     ffmpeg_bin: &str,
+    options: &DeployOptions,
 ) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy up\n");
 
@@ -2167,10 +2405,19 @@ fn run_up(
             public_port,
             media_cfg,
             ffmpeg_bin,
-            writable_db_configured: resolve_writable_db_url(&config.database).is_some(),
+            configured_host_count,
+            // Every fact is reduced to a bool HERE so the database URL (credentials
+            // and all) never reaches the driver, its errors, or its output.
+            db: FleetDatabaseFacts {
+                writable_configured: resolve_writable_db_url(&config.database).is_some(),
+                sqlite: writable_db_is_sqlite(&config.database),
+                auto_migrate: config.database.auto_migrate,
+                auto_migrate_in_production: config.database.auto_migrate_in_production,
+            },
             // AC-3's default: a halted rollout compensates the hosts that already
-            // cut over rather than leaving the fleet on two versions.
-            auto_rollback: true,
+            // cut over rather than leaving the fleet on two versions. `--no-rollback`
+            // is halt-and-freeze: stop, report, change nothing else.
+            auto_rollback: !options.no_rollback,
         },
         // Host presence is guaranteed by the passing ssh_reachability grader above,
         // so this `None` arm is unreachable in practice; it keeps the pre-#1621
@@ -2181,6 +2428,28 @@ fn run_up(
                 .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
         },
     )
+}
+
+/// What this project's `[database]` config means for a fleet rollout (issue #1621,
+/// §4.8).
+///
+/// Grouped rather than passed as loose flags because they answer ONE question
+/// together — "what happens to the schema during this rollout?" — and because of
+/// what is deliberately absent: the database URL itself. It carries credentials, so
+/// every fact here is reduced to a bool at the point the URL is resolved, and the
+/// rollout driver, its errors and its output can never quote it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FleetDatabaseFacts {
+    /// Whether a writable database URL is configured at all — the fleet warns
+    /// loudly when it is and the rollout schedules no migration.
+    writable_configured: bool,
+    /// Whether that URL names a `SQLite` backend (the §4.8 refusal).
+    sqlite: bool,
+    /// `[database] auto_migrate`, verbatim (the §4.8 warning).
+    auto_migrate: Option<bool>,
+    /// `[database] auto_migrate_in_production` — the back-compat alias
+    /// `auto_migrate` supersedes.
+    auto_migrate_in_production: bool,
 }
 
 /// Everything the fleet rollout loop needs, already resolved by [`run_up`].
@@ -2213,9 +2482,23 @@ struct FleetUpInput<'a, P: ProxyController> {
     media_cfg: &'a media::MediaMtxHostConfig,
     /// Resolved `FFmpeg` binary path for the media preflight.
     ffmpeg_bin: &'a str,
-    /// Whether a writable database URL is configured — the fleet warns loudly when
-    /// it is and the rollout schedules no migration at all.
-    writable_db_configured: bool,
+    /// How many hosts the CONFIG declares, before `--only` narrowed `fleet`
+    /// (issue #1621, §3.2/§4.8).
+    ///
+    /// Two things turn on this rather than on `fleet.hosts.len()`:
+    ///
+    /// - The §4.8 refusals describe a TOPOLOGY (one `SQLite` file per machine, N
+    ///   `MediaMTX` daemons, N ACME clients racing for one certificate). Deploying
+    ///   a subset of that topology does not make it safe, so `--only` must not be a
+    ///   way to sneak past them.
+    /// - The byte-identical single-host path (AC-1) is for a config that declares
+    ///   ONE host — not for a three-host fleet narrowed to one. A narrowed rollout
+    ///   keeps the fleet framing, the state table and the compensation semantics,
+    ///   because the other two hosts still exist and are still on another release.
+    configured_host_count: usize,
+    /// What this project's `[database]` config means for the rollout — resolved
+    /// once in the prologue, never re-read here.
+    db: FleetDatabaseFacts,
     /// Whether a halted rollout automatically compensates the hosts that already
     /// cut over (issue #1621, §4.7). `true` in production; `false` is halt-and-freeze
     /// — the rollout stops and reports, leaving every host exactly as it is for
@@ -2436,8 +2719,32 @@ where
     F: Fn(&ResolvedDeployConfig) -> Result<E, DeployError>,
 {
     let fleet = input.fleet;
-    let single = fleet.is_single();
+    // The pre-#1621 path is for a config that declares ONE host — see
+    // [`FleetUpInput::configured_host_count`] for why a `--only`-narrowed fleet is
+    // deliberately NOT single.
+    let single = fleet.is_single() && input.configured_host_count <= 1;
     let total = fleet.hosts.len();
+
+    // ── FLEET-WIDE FAIL-CLOSED REFUSALS (§4.8) ───────────────────────────────
+    // First thing in the driver, before an executor is even built: these describe
+    // topologies that cannot be deployed safely at all, so the honest answer is to
+    // refuse with zero remote commands rather than discover it after a cutover.
+    refuse_sqlite_fleet(input.configured_host_count, input.db.sqlite)
+        .map_err(DeployError::Config)?;
+    refuse_media_fleet(input.configured_host_count, input.media_cfg.enabled)
+        .map_err(DeployError::Config)?;
+    refuse_tls_fleet(input.configured_host_count, fleet.hosts[0].tls_enabled)
+        .map_err(DeployError::Config)?;
+    // A warning, not a refusal: hosts racing to auto-migrate at boot is a real
+    // hazard but not a certainty, and refusing would break an existing single-host
+    // user's scale-up.
+    if let Some(warning) = fleet_auto_migrate_warning(
+        input.configured_host_count,
+        input.db.auto_migrate,
+        input.db.auto_migrate_in_production,
+    ) {
+        eprintln!("\u{26A0}\u{FE0F}  {warning}\n");
+    }
 
     // ONE executor per host, built up front and reused for that host's read-only
     // probe AND its execution.
@@ -2453,17 +2760,12 @@ where
     // until after the app cutover succeeds (below) so a rolled-back app deploy
     // never touches the host MediaMTX unit. No-op unless enabled (see fn).
     //
-    // Single-host only for now: `provision_media_host` has no teardown/rollback
-    // path, so fanning it out would leave N media daemons on identical ports with
-    // divergent recording sets and nothing to undo them with. Until the fleet-wide
-    // refusal lands a fleet therefore provisions NO media and prints nothing new.
-    //
-    // slice 5: refusal — a media-enabled fleet (`[media.mediamtx] enabled` with
-    // more than one host) must be REFUSED in the prologue, alongside the sqlite and
-    // TLS fleet refusals, rather than silently skipped here.
-    if single {
-        check_media_host_preflight(input.media_cfg, input.ffmpeg_bin, &executors[0])?;
-    }
+    // Single-host by construction, not by branch: `provision_media_host` has no
+    // teardown/rollback path, so a media-enabled FLEET is refused outright above
+    // (§4.8). Reaching here with media enabled therefore proves the config declares
+    // exactly one host, and `executors[0]` is it. With media disabled both this and
+    // the provisioning call below are no-ops, so no host-count branch is needed.
+    check_media_host_preflight(input.media_cfg, input.ffmpeg_bin, &executors[0])?;
 
     // ── ALL-HOSTS PROBE (read-only, serial, rollout order) ───────────────────
     // Nothing anywhere in the fleet is mutated by this phase.
@@ -2479,7 +2781,7 @@ where
 
     if !single {
         for line in
-            fleet::fleet_rollout_lines(&plan, input.release_id, input.writable_db_configured)
+            fleet::fleet_rollout_lines(&plan, input.release_id, input.db.writable_configured)
         {
             eprintln!("{line}");
         }
@@ -2647,8 +2949,10 @@ where
     // is no longer a rollback path. Only NOW provision the host MediaMTX unit
     // (write config/unit + restart) — deferring the mutation past this point means
     // a failed/rolled-back app deploy above never wrote or restarted MediaMTX
-    // (#1974 Slice 7). No-op unless enabled (see fn).
-    if single {
+    // (#1974 Slice 7). No-op unless enabled (see fn), and a media-enabled fleet is
+    // refused in the prologue (§4.8), so `executors[0]` is the only host whenever
+    // this does anything at all.
+    {
         let executor = &executors[0];
         provision_media_host(input.media_cfg, executor)?;
     }
@@ -2950,50 +3254,235 @@ fn fleet_halted(
 /// there is nothing to roll back to — and drives [`exec::rollback_ops`]: bring the
 /// previous slot's unit back up, flip the proxy back to it, repoint `current`, and
 /// re-probe `/ready`.
-fn run_rollback(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
+/// `hosts` is the ordered target list, already narrowed by `--only` (issue #1621).
+/// With more than one entry this becomes a FLEET rollback: every host, in strict
+/// REVERSE declaration order, best-effort-continue. With one entry (or none — a
+/// config with no target still flows into the preflight report) it is the
+/// pre-#1621 single-host path verbatim.
+fn run_rollback(
+    config: &AutumnConfig,
+    resolved: &ResolvedDeployConfig,
+    hosts: &[String],
+) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy rollback\n");
 
-    // Fail fast: same preflight/gate as `up`, before any remote call.
-    let checks = collect_preflight(config, resolved);
+    // The rollback targets, in declaration order. A single-host config (either
+    // spelling) resolves to a one-host fleet whose only element IS today's
+    // `resolved`, so the branch below is the pre-#1621 sequence at N = 1.
+    let fleet = ResolvedFleet::from_targets(resolved, hosts);
+
+    // Fail fast: same preflight/gate as `up`, before any remote call. Every host is
+    // graded, so an unreachable host in position 3 is reported before host 3 — or
+    // any other host — is touched.
+    let checks = collect_fleet_preflight(config, &fleet);
     let failed = report_preflight(&checks);
     if failed > 0 {
         return Err(DeployError::PreflightFailed(failed));
     }
 
     // Show what a rollback will do before it runs (descriptive, not a dry-run gate).
+    // These are the steps EACH host runs; the fleet ordering is printed below them.
     eprintln!("Rollback steps:");
     for (i, step) in build_rollback_plan(resolved).iter().enumerate() {
         eprintln!("  {}. [{}] {}", i + 1, step.label, step.description);
     }
     eprintln!();
 
-    let target = exec::SshTarget::from_resolved(resolved)
-        .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
     let public_port = config.server.port;
     let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs)
         .with_tls_host(resolved.tls_host.clone());
+
+    if !fleet.is_single() {
+        return run_fleet_rollback_with(&checks, &fleet, &proxy, public_port, |cfg| {
+            exec::SshTarget::from_resolved(cfg)
+                .map(exec::SshExecutor::new)
+                .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
+        });
+    }
+
+    let single = &fleet.hosts[0];
+    let target = exec::SshTarget::from_resolved(single)
+        .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
     let executor = exec::SshExecutor::new(target);
 
     // Resolve the previous release to roll back to (non-zero error if none).
-    let rollback_target = exec::resolve_rollback_target(resolved, public_port, &executor)
+    let rollback_target = exec::resolve_rollback_target(single, public_port, &executor)
         .map_err(|e| DeployError::Exec(e.to_string()))?;
     eprintln!(
         "Rolling back {} to {} ({})\u{2026}\n",
-        resolved.host.as_deref().unwrap_or_default(),
+        single.host.as_deref().unwrap_or_default(),
         rollback_target.release_dir,
         rollback_target.slot,
     );
 
-    let ops = exec::rollback_ops(resolved, &proxy, &rollback_target);
+    let ops = exec::rollback_ops(single, &proxy, &rollback_target);
     // If the rollback fails at or before the health-gated flip, disable the slot it
     // restarted so the original release is left cleanly serving (the flip never
     // moved traffic, and no marker is written until after the flip).
-    let teardown = exec::rollback_teardown_ops(resolved, &rollback_target);
+    let teardown = exec::rollback_teardown_ops(single, &rollback_target);
     exec::execute_rollback(&checks, &ops, &teardown, &executor)
         .map_err(|e| DeployError::Exec(e.to_string()))?;
 
     eprintln!("\n\u{2705} Rollback complete.");
     Ok(())
+}
+
+/// Roll EVERY host in `fleet` back to its previous release, newest first (issue
+/// #1621, §3.2).
+///
+/// The executor factory is injected (generic, never `dyn`, no `Send`/`Sync` bound)
+/// so the whole loop is unit-testable against one scripted fake per host.
+///
+/// Three deliberate differences from the rollout driver, all following from the
+/// fact that a rollback is a RECOVERY action rather than a change:
+///
+/// 1. **Reverse declaration order.** The rollout replaces hosts front to back, so
+///    the hosts at the back have been on the new release for the shortest time;
+///    undoing them first shrinks the mixed window from the newest end and mirrors
+///    the compensation order exactly.
+/// 2. **Best-effort continue, never halt.** A host that fails does not stop the
+///    others: stopping would leave MORE hosts on the release the operator is trying
+///    to leave. Every failure is recorded and reported — never swallowed.
+/// 3. **No previous release is not fatal — to the OTHER hosts.** A host that has
+///    never been redeployed (or was just added to the fleet) has no marker to roll
+///    back to. It is reported as a SKIP rather than as a failed rollback, and it
+///    never stops the rest of the fleet.
+///
+/// **Exit semantics (deliberate):** the command succeeds only when EVERY host
+/// rolled back. A host that failed and a host that had nothing to roll back to are
+/// distinguished in the table and in the operator's remedy, but both exit non-zero,
+/// because the contract of a fleet rollback is that the FLEET returns to its
+/// previous release — and a fleet where one host could not follow the others is
+/// mixed. Reporting that as success is how a mixed fleet survives an incident
+/// unnoticed.
+fn run_fleet_rollback_with<E, P, F>(
+    checks: &[PreflightCheck],
+    fleet: &ResolvedFleet,
+    proxy: &P,
+    public_port: u16,
+    make_executor: F,
+) -> Result<(), DeployError>
+where
+    E: exec::DeployExecutor,
+    P: ProxyController,
+    F: Fn(&ResolvedDeployConfig) -> Result<E, DeployError>,
+{
+    let total = fleet.hosts.len();
+    // ONE executor per host, built up front: a host with no SSH target is a config
+    // error, and finding it here means nothing has been flipped yet.
+    let executors = fleet
+        .hosts
+        .iter()
+        .map(&make_executor)
+        .collect::<Result<Vec<E>, DeployError>>()?;
+
+    let names: Vec<String> = fleet
+        .hosts
+        .iter()
+        .map(|cfg| cfg.host.clone().unwrap_or_default())
+        .collect();
+    eprintln!(
+        "Rolling {total} hosts back to their previous release, ONE AT A TIME, NEWEST FIRST \
+         (the reverse of `[deploy] hosts` order):\n"
+    );
+
+    // Every slot is overwritten below — the loop is exhaustive and, unlike the
+    // rollout driver, never breaks early — so the seed value is unobservable. It is
+    // the conservative one regardless: "nothing was rolled back here".
+    let mut outcomes = vec![fleet::RollbackOutcome::NoPreviousRelease; total];
+    for index in (0..total).rev() {
+        let cfg = &fleet.hosts[index];
+        let host = names[index].as_str();
+        eprintln!("[{}/{total} {host}] rolling back\u{2026}", index + 1);
+        outcomes[index] =
+            rollback_one_host(checks, cfg, proxy, public_port, host, &executors[index]);
+        eprintln!();
+    }
+
+    for line in fleet::fleet_rollback_summary_lines(&names, &outcomes) {
+        eprintln!("{line}");
+    }
+
+    let rolled_back = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, fleet::RollbackOutcome::RolledBack))
+        .count();
+    // Non-zero unless EVERY host came back: a fleet that half-rolled-back is mixed,
+    // and reporting that as success is how a mixed fleet survives an incident
+    // unnoticed. The table above distinguishes "failed" from "nothing to roll back
+    // to", which is what the operator's next move turns on.
+    if rolled_back < total {
+        return Err(DeployError::FleetRollbackFailed {
+            not_rolled_back: total - rolled_back,
+            total,
+        });
+    }
+    eprintln!("\n\u{2705} Fleet rollback complete \u{2014} all {total} hosts restored.");
+    Ok(())
+}
+
+/// Roll ONE host back to its previous release for a fleet-wide rollback.
+///
+/// Uses the UNCHANGED on-demand primitives ([`exec::resolve_rollback_target`] →
+/// [`exec::rollback_ops`] → [`exec::execute_rollback`], with the same
+/// [`exec::rollback_teardown_ops`]), so a fleet rollback is literally N single-host
+/// rollbacks and can never drift from the one the operator runs by hand.
+///
+/// Returns an outcome instead of an error because the caller continues past a
+/// failure: the report is the aggregate, and nothing here is swallowed. Only the
+/// `&'static str` step LABEL is printed — never the driver's message, which can
+/// carry remote output.
+fn rollback_one_host<E, P>(
+    checks: &[PreflightCheck],
+    cfg: &ResolvedDeployConfig,
+    proxy: &P,
+    public_port: u16,
+    host: &str,
+    executor: &E,
+) -> fleet::RollbackOutcome
+where
+    E: exec::DeployExecutor,
+    P: ProxyController,
+{
+    let target = match exec::resolve_rollback_target(cfg, public_port, executor) {
+        Ok(target) => target,
+        Err(exec::DeployExecError::NoPreviousRelease) => {
+            eprintln!(
+                "\u{26A0}\u{FE0F}  [{host}] no previous release recorded \u{2014} nothing to \
+                 roll back to on this host; it keeps serving what it is serving now."
+            );
+            return fleet::RollbackOutcome::NoPreviousRelease;
+        }
+        Err(err) => {
+            let failed_step = fleet::failed_step_label(&err);
+            eprintln!(
+                "\u{274C} [{host}] could not resolve the previous release (`{failed_step}`) \
+                 \u{2014} this host was NOT rolled back. The remaining hosts still are."
+            );
+            return fleet::RollbackOutcome::Failed { failed_step };
+        }
+    };
+    eprintln!(
+        "  \u{2192} {host} returns to {} ({})",
+        target.release_dir, target.slot,
+    );
+
+    let ops = exec::rollback_ops(cfg, proxy, &target);
+    // Same teardown as the on-demand rollback: a failure at or before the
+    // health-gated flip disables the slot it just restarted, so this host is left
+    // serving exactly what it served before the attempt.
+    let teardown = exec::rollback_teardown_ops(cfg, &target);
+    match exec::execute_rollback(checks, &ops, &teardown, executor) {
+        Ok(()) => fleet::RollbackOutcome::RolledBack,
+        Err(err) => {
+            let failed_step = fleet::failed_step_label(&err);
+            eprintln!(
+                "\u{274C} [{host}] the rollback FAILED at `{failed_step}` \u{2014} this host \
+                 was not restored. The remaining hosts still are."
+            );
+            fleet::RollbackOutcome::Failed { failed_step }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5061,6 +5550,21 @@ mod tests {
         "prune",
     ];
 
+    /// The exact ordered `Run` labels ONE host records in a fleet-wide rollback:
+    /// the read-only previous-release probe, then the UNCHANGED on-demand
+    /// `rollback_ops` sequence (`write-target-unit` is an upload, so it is not a
+    /// `Run`). Restated here rather than imported so a fleet rollback can never
+    /// quietly grow a step the single-host rollback does not have.
+    const FLEET_ROLLBACK_RUN_LABELS: [&str; 7] = [
+        "resolve-previous",
+        "daemon-reload",
+        "restart-previous",
+        "proxy-flip",
+        "commit-markers",
+        "readiness-gate",
+        "drain-rolled-back-slot",
+    ];
+
     const FLEET_RELEASE_ID: &str = "20260714T120000Z";
     const FLEET_PUBLIC_PORT: u16 = 3000;
 
@@ -5238,7 +5742,12 @@ mod tests {
                 public_port: FLEET_PUBLIC_PORT,
                 media_cfg: &self.media_cfg,
                 ffmpeg_bin: "ffmpeg",
-                writable_db_configured: true,
+                // No `--only`: the rollout covers everything the config declares.
+                configured_host_count: fleet.hosts.len(),
+                db: FleetDatabaseFacts {
+                    writable_configured: true,
+                    ..FleetDatabaseFacts::default()
+                },
                 auto_rollback: true,
             }
         }
@@ -6140,6 +6649,605 @@ mod tests {
                 .collect::<Vec<_>>(),
             "the one host runs today's exact sequence and nothing more — no \
              compensation, no extra probe"
+        );
+    }
+
+    // ── Fleet-wide fail-closed refusals (issue #1621, slice 5, §4.8) ─────────
+
+    /// A resolved fleet with `[deploy.tls]` enabled for a public hostname — the
+    /// shape §4.8 refuses for more than one host.
+    fn tls_fleet_of(hosts: &[&str]) -> ResolvedFleet {
+        ResolvedFleet::resolve(
+            &DeployConfig {
+                hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
+                tls: autumn_web::config::DeployTlsConfig {
+                    enabled: true,
+                    host: Some("shop.example.com".to_owned()),
+                },
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("a well-formed TLS fleet resolves")
+    }
+
+    #[test]
+    fn the_fleet_refusals_name_their_config_key_and_spare_a_single_host() {
+        // #1621 (§4.8, T1.22). Three topologies that cannot be deployed safely to
+        // more than one host at all. Each refusal is a PURE predicate over the
+        // CONFIGURED host count, so it is decided before any executor exists — and
+        // each names the config key the operator must change plus the tracking
+        // issue, matching `reject_sqlite_sharding_topology`'s house style.
+        let sqlite = refuse_sqlite_fleet(3, true).expect_err("a sqlite fleet must be refused");
+        assert!(
+            sqlite.contains("sqlite") && sqlite.contains("#1621"),
+            "the sqlite refusal must name the backend and the issue: {sqlite}"
+        );
+        assert!(
+            sqlite.contains("[database]"),
+            "the sqlite refusal must name the config section to change: {sqlite}"
+        );
+
+        let media = refuse_media_fleet(3, true).expect_err("a media fleet must be refused");
+        assert!(
+            media.contains("[media.mediamtx]") && media.contains("#1621"),
+            "the media refusal must name the config key and the issue: {media}"
+        );
+
+        let tls = refuse_tls_fleet(3, true).expect_err("a TLS fleet must be refused");
+        assert!(
+            tls.contains("[deploy.tls]") && tls.contains("#1621"),
+            "the TLS refusal must name the config key and the issue: {tls}"
+        );
+        assert!(
+            tls.contains("load balancer"),
+            "the TLS refusal must point at LB-terminated TLS: {tls}"
+        );
+
+        // None of the three constrains a single-host deploy — that is exactly
+        // today's supported topology (AC-1).
+        assert!(refuse_sqlite_fleet(1, true).is_ok());
+        assert!(refuse_media_fleet(1, true).is_ok());
+        assert!(refuse_tls_fleet(1, true).is_ok());
+        // Nor a fleet that does not have the offending feature turned on.
+        assert!(refuse_sqlite_fleet(3, false).is_ok());
+        assert!(refuse_media_fleet(3, false).is_ok());
+        assert!(refuse_tls_fleet(3, false).is_ok());
+    }
+
+    #[test]
+    fn writable_db_is_sqlite_reads_the_url_the_deploy_would_ship() {
+        // The refusal grades the SAME url `build_env_file` writes to every host, so
+        // it must follow the primary/compat/shard resolution rather than peeking at
+        // one field. Reduced to a bool here so the URL never reaches the driver.
+        use autumn_web::config::DatabaseConfig;
+        let sqlite = DatabaseConfig {
+            url: Some("sqlite://app.db".to_owned()),
+            ..DatabaseConfig::default()
+        };
+        assert!(writable_db_is_sqlite(&sqlite));
+
+        let postgres = DatabaseConfig {
+            url: Some("postgres://user:pw@db.internal/app".to_owned()),
+            ..DatabaseConfig::default()
+        };
+        assert!(!writable_db_is_sqlite(&postgres));
+        assert!(!writable_db_is_sqlite(&DatabaseConfig::default()));
+    }
+
+    #[test]
+    fn a_sqlite_fleet_is_refused_before_any_remote_command() {
+        // #1621 (T1.22). `build_env_file` ships a byte-identical database URL to
+        // every host, so a `sqlite://` fleet is N independent database FILES — no
+        // shared schema, no advisory lock, and every host serving a different
+        // dataset behind one load balancer. Refused with ZERO remote commands: not
+        // even the read-only probes run.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let recorder = fleet::test_support::FleetRecorder::new();
+        let fixture = FleetFixture::new();
+        let input = FleetUpInput {
+            db: FleetDatabaseFacts {
+                sqlite: true,
+                ..FleetDatabaseFacts::default()
+            },
+            ..fixture.input(&fleet)
+        };
+
+        let err = run_up_with(&input, |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a sqlite fleet must be refused");
+
+        match &err {
+            DeployError::Config(message) => assert!(
+                message.contains("sqlite") && message.contains("#1621"),
+                "the refusal must name the backend and the issue: {message}"
+            ),
+            other => panic!("expected a config refusal, got: {other:?}"),
+        }
+        assert!(
+            recorder.mutating(&[]).is_empty(),
+            "a refused fleet must run NO remote command at all, probes included: {:?}",
+            recorder.mutating(&[])
+        );
+    }
+
+    #[test]
+    fn a_media_fleet_is_refused_before_any_remote_command() {
+        // #1621 (T1.22). `provision_media_host` has no teardown or rollback path by
+        // design, so fanning it out gives N MediaMTX daemons on identical ports with
+        // divergent recording sets and nothing to undo them with when the app
+        // rollout is compensated. Refused in the prologue — which is also what makes
+        // the driver's single unguarded `executors[0]` media call correct.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let recorder = fleet::test_support::FleetRecorder::new();
+        let mut fixture = FleetFixture::new();
+        fixture.media_cfg.enabled = true;
+        let input = fixture.input(&fleet);
+
+        let err = run_up_with(&input, |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a media-enabled fleet must be refused");
+
+        match &err {
+            DeployError::Config(message) => assert!(
+                message.contains("[media.mediamtx]") && message.contains("#1621"),
+                "the refusal must name the config key and the issue: {message}"
+            ),
+            other => panic!("expected a config refusal, got: {other:?}"),
+        }
+        assert!(
+            recorder.mutating(&[]).is_empty(),
+            "a refused fleet must run NO remote command at all, probes included: {:?}",
+            recorder.mutating(&[])
+        );
+    }
+
+    #[test]
+    fn a_tls_fleet_is_refused_before_any_remote_command() {
+        // #1621 (T1.22). kamal-proxy is PER HOST, so N hosts would each attempt ACME
+        // for the same `[deploy.tls] host` from behind the operator's load balancer:
+        // only one can answer a challenge and the rest burn Let's Encrypt rate
+        // limits. Behind a load balancer, TLS terminates at the load balancer.
+        let fleet = tls_fleet_of(&["web-a", "web-b"]);
+        let recorder = fleet::test_support::FleetRecorder::new();
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a TLS-enabled fleet must be refused");
+
+        match &err {
+            DeployError::Config(message) => assert!(
+                message.contains("[deploy.tls]") && message.contains("load balancer"),
+                "the refusal must name the config key and point at LB-terminated TLS: \
+                 {message}"
+            ),
+            other => panic!("expected a config refusal, got: {other:?}"),
+        }
+        assert!(
+            recorder.mutating(&[]).is_empty(),
+            "a refused fleet must run NO remote command at all, probes included: {:?}",
+            recorder.mutating(&[])
+        );
+    }
+
+    #[test]
+    fn the_refusals_grade_the_configured_topology_not_the_narrowed_rollout() {
+        // #1621 (§4.8). `--only` narrows which hosts a run TOUCHES; it does not
+        // change the topology. A three-host sqlite fleet is just as broken when one
+        // host is deployed, so the refusal is keyed on the CONFIGURED count and
+        // `--only` can never be used to sneak past it.
+        let fleet = fleet_of(&["web-b"]);
+        let recorder = fleet::test_support::FleetRecorder::new();
+        let fixture = FleetFixture::new();
+        let input = FleetUpInput {
+            configured_host_count: 3,
+            db: FleetDatabaseFacts {
+                sqlite: true,
+                ..FleetDatabaseFacts::default()
+            },
+            ..fixture.input(&fleet)
+        };
+
+        let err = run_up_with(&input, |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("`--only` must not defeat a topology refusal");
+        assert!(
+            matches!(&err, DeployError::Config(m) if m.contains("sqlite")),
+            "expected the sqlite refusal, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn auto_migrate_warns_for_a_fleet_and_stays_silent_for_one_host() {
+        // #1621 (§4.8, last paragraph). A WARNING, not a refusal: with
+        // `auto_migrate` on, every host applies migrations at BOOT, so the hosts
+        // race each other mid-rollout and a checksum mismatch exits the process
+        // under `Restart=on-failure` — a crash loop. Real hazard, not a certainty,
+        // so it is said loudly and the deploy proceeds.
+        let warning = fleet_auto_migrate_warning(3, Some(true), false)
+            .expect("a fleet with auto_migrate on must be warned");
+        assert!(
+            warning.contains("auto_migrate") && warning.contains("#1621"),
+            "the warning must name the key and the issue: {warning}"
+        );
+        assert!(
+            warning.contains("boot") && warning.contains("crash loop"),
+            "the warning must name the mechanism (boot races) and the symptom: {warning}"
+        );
+
+        // The back-compat alias is honoured, and `auto_migrate` supersedes it — the
+        // runtime's own resolution rule.
+        assert!(fleet_auto_migrate_warning(3, None, true).is_some());
+        assert!(
+            fleet_auto_migrate_warning(3, Some(false), true).is_none(),
+            "an explicit `auto_migrate = false` wins over the alias"
+        );
+
+        // Silent for a single host (that is today's supported shape) and silent when
+        // the app does not auto-migrate at all.
+        assert!(fleet_auto_migrate_warning(1, Some(true), true).is_none());
+        assert!(fleet_auto_migrate_warning(3, None, false).is_none());
+    }
+
+    // ── `--only` (issue #1621, slice 5, §3.2) ────────────────────────────────
+
+    #[test]
+    fn only_selects_in_declaration_order_and_rejects_an_unknown_host() {
+        // #1621 (§3.2). `[deploy] hosts` order IS the rollout order, so the
+        // selection is filtered from the CONFIGURED list rather than built from the
+        // flag order: `--only web-c --only web-a` must not silently reverse a
+        // rolling deploy. An unknown name is a hard error naming itself — guessing
+        // (prefix, DNS) could deploy the wrong machine, and deploying nothing
+        // silently would be worse.
+        let configured: Vec<String> = ["web-a", "web-b", "web-c"]
+            .iter()
+            .map(|h| (*h).to_owned())
+            .collect();
+
+        assert_eq!(
+            select_hosts(&configured, &[]).expect("an empty selection is the whole fleet"),
+            configured,
+            "no `--only` must select the whole fleet, in order"
+        );
+        assert_eq!(
+            select_hosts(&configured, &["web-c".to_owned(), "web-a".to_owned()])
+                .expect("a valid selection resolves"),
+            vec!["web-a".to_owned(), "web-c".to_owned()],
+            "the selection must keep DECLARATION order, not flag order"
+        );
+        assert_eq!(
+            select_hosts(&configured, &["web-b".to_owned(), "web-b".to_owned()])
+                .expect("a repeated name is not an error"),
+            vec!["web-b".to_owned()],
+            "a repeated `--only` selects that host once"
+        );
+
+        let err = select_hosts(&configured, &["web-9".to_owned()])
+            .expect_err("an unknown host must be refused");
+        assert!(
+            err.contains("web-9") && err.contains("--only"),
+            "the error must quote the unmatched value and the flag: {err}"
+        );
+        for host in &configured {
+            assert!(
+                err.contains(host.as_str()),
+                "the error must list the configured hosts so the operator can fix the \
+                 typo: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_restricts_the_rollout_and_moves_the_migration_with_it() {
+        // #1621 (§3.2). `--only web-b` on a three-host fleet touches web-b and
+        // nothing else — not even the read-only probes run against the hosts it
+        // skips, which is deliberate: an excluded host's drifted marker must not
+        // refuse the repair deploy aimed at a different host.
+        //
+        // Migrate placement is computed over the SELECTED hosts: web-b is the first
+        // redeploy in this rollout, so web-b migrates. (Over the full fleet web-a
+        // would have.) That is the honest reading of "exactly once" for a narrowed
+        // rollout — the schema is fleet-wide, and the hosts left out are not being
+        // deployed at all.
+        let selected = select_hosts(
+            &["web-a", "web-b", "web-c"]
+                .iter()
+                .map(|h| (*h).to_owned())
+                .collect::<Vec<_>>(),
+            &["web-b".to_owned()],
+        )
+        .expect("web-b is in the configured fleet");
+        let fleet = ResolvedFleet::from_targets(&resolved_defaults(), &selected);
+        let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "web-b");
+        let fixture = FleetFixture::new();
+        let input = FleetUpInput {
+            configured_host_count: 3,
+            ..fixture.input(&fleet)
+        };
+
+        run_up_with(&input, |cfg| Ok(recorder.executor(cfg)))
+            .expect("a narrowed rollout deploys the selected host");
+
+        assert_eq!(
+            recorder.run_labels_for("web-b"),
+            READ_ONLY_PROBES
+                .iter()
+                .copied()
+                .chain(REDEPLOY_RUN_LABELS)
+                .collect::<Vec<_>>(),
+            "the selected host runs the full redeploy, migration included"
+        );
+        for skipped in ["web-a", "web-c"] {
+            assert!(
+                recorder.calls_for(skipped).is_empty(),
+                "`--only` must not touch {skipped} at all — not even a read-only probe"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrowed_rollout_keeps_fleet_semantics_rather_than_the_single_host_path() {
+        // #1621 (AC-1 boundary). The byte-identical pre-#1621 path is for a config
+        // that declares ONE host. A three-host fleet narrowed to one is NOT that: the
+        // other two hosts exist and are on another release, so the run keeps the
+        // fleet vocabulary, the state table and the compensation semantics. Proven
+        // by the error TYPE: the single-host path returns the raw executor error,
+        // the fleet path a `FleetHalted` report.
+        let fleet = fleet_of(&["web-b"]);
+        let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "web-b")
+            .fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+        let input = FleetUpInput {
+            configured_host_count: 3,
+            ..fixture.input(&fleet)
+        };
+
+        let err = run_up_with(&input, |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("the selected host's failure must fail the deploy");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_host, "web-b");
+        assert_eq!(halt.failed_step, "readiness-gate");
+    }
+
+    #[test]
+    fn no_rollback_freezes_the_fleet_instead_of_compensating() {
+        // #1621 (§4.7). `--no-rollback` is halt-and-FREEZE: the rollout stops and
+        // reports, and every host is left exactly as it is for inspection. web-b
+        // fails post-boundary (a dropped transport at `drain-old`, which carries no
+        // op label and so classifies as FUNCTIONAL), so both web-a and web-b are on
+        // the new release — and, unlike the default path, they STAY there.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder = recorder.transport_fail("web-b", "drain-old");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input_frozen(&fleet), |cfg| {
+            Ok(recorder.executor(cfg))
+        })
+        .expect_err("a post-boundary failure must fail the deploy");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(
+            halt.still_on_new,
+            vec!["web-a".to_owned(), "web-b".to_owned()],
+            "a frozen fleet reports every host left on the new release"
+        );
+        assert!(
+            halt.rolled_back.is_empty() && halt.torn_down.is_empty(),
+            "freezing compensates NOTHING: {:?} / {:?}",
+            halt.rolled_back,
+            halt.torn_down
+        );
+        // The observable proof: web-a flipped exactly once (its cutover). A
+        // compensating rollback would flip it a second time.
+        assert_eq!(
+            recorder
+                .positions_of("proxy-flip")
+                .iter()
+                .filter(|_| true)
+                .count(),
+            2,
+            "exactly two flips happened (web-a's and web-b's cutovers) — no host was \
+             flipped back"
+        );
+        assert!(
+            !recorder
+                .run_labels_for("web-a")
+                .contains(&"restart-previous"),
+            "a frozen rollout must not roll web-a back"
+        );
+
+        // And the flag is actually wired to the seam this test drives.
+        assert!(
+            include_str!("deploy.rs").contains("auto_rollback: !options.no_rollback"),
+            "`--no-rollback` must map to the `auto_rollback` driver seam"
+        );
+    }
+
+    // ── Fleet-wide `deploy rollback` (issue #1621, slice 5, §3.2) ────────────
+
+    /// Script one host's previous-release marker for a fleet-wide rollback.
+    fn script_previous_release(
+        recorder: fleet::test_support::FleetRecorder,
+        host: &str,
+    ) -> fleet::test_support::FleetRecorder {
+        recorder.script(
+            host,
+            "resolve-previous",
+            format!("prev:{PREVIOUS_RELEASE_DIR}\tblue\t3001"),
+        )
+    }
+
+    /// Drive a fleet-wide rollback against a scripted recorder.
+    fn drive_fleet_rollback(
+        fleet: &ResolvedFleet,
+        recorder: &fleet::test_support::FleetRecorder,
+    ) -> Result<(), DeployError> {
+        let proxy = proxy::KamalProxyController::new(60);
+        run_fleet_rollback_with(&[], fleet, &proxy, FLEET_PUBLIC_PORT, |cfg| {
+            Ok(recorder.executor(cfg))
+        })
+    }
+
+    #[test]
+    fn fleet_rollback_rolls_back_every_host_newest_first() {
+        // #1621 (§3.2). `deploy rollback` on a `[deploy] hosts` config rolls back the
+        // WHOLE fleet, in strict REVERSE declaration order: the hosts that cut over
+        // last have been on the new release for the shortest time, so undoing them
+        // first shrinks the mixed window from the newest end — the same order fleet
+        // compensation uses.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_previous_release(recorder, host);
+        }
+
+        drive_fleet_rollback(&fleet, &recorder).expect("every host rolls back cleanly");
+
+        for host in hosts {
+            assert_eq!(
+                recorder.run_labels_for(host),
+                FLEET_ROLLBACK_RUN_LABELS.to_vec(),
+                "{host} must run the UNCHANGED on-demand rollback sequence"
+            );
+        }
+        let flips: Vec<usize> = hosts
+            .iter()
+            .map(|host| {
+                recorder
+                    .index_of(host, "proxy-flip")
+                    .unwrap_or_else(|| panic!("{host} must flip back"))
+            })
+            .collect();
+        assert!(
+            flips[2] < flips[1] && flips[1] < flips[0],
+            "hosts must roll back newest-first (web-c, web-b, web-a), got positions {flips:?}"
+        );
+    }
+
+    #[test]
+    fn fleet_rollback_skips_a_host_with_no_previous_release_and_rolls_the_rest_back() {
+        // #1621 (§3.2). A host that has never been redeployed — a first deploy
+        // clears the marker, and a host just added to the fleet never had one — has
+        // nothing to roll back TO. That is a reported SKIP rather than a failed
+        // rollback, and it must NOT stop the other hosts: halting there would leave
+        // them on the release the operator is trying to leave.
+        //
+        // It does still make the COMMAND exit non-zero. The contract of a fleet
+        // rollback is that the FLEET returns to its previous release, and a fleet
+        // where one host cannot follow the others is mixed — reporting that as
+        // success is how a mixed fleet survives an incident unnoticed.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in ["web-a", "web-c"] {
+            recorder = script_previous_release(recorder, host);
+        }
+        // web-b's marker is absent: the probe answers `none`.
+        recorder = recorder.script("web-b", "resolve-previous", "none");
+
+        let err = drive_fleet_rollback(&fleet, &recorder)
+            .expect_err("a fleet that did not fully converge must exit non-zero");
+        assert!(
+            matches!(
+                &err,
+                DeployError::FleetRollbackFailed {
+                    not_rolled_back: 1,
+                    total: 3
+                }
+            ),
+            "exactly one host must be reported as un-rolled-back, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("no previous release"),
+            "the error must explain the skipped case, not just count it: {err}"
+        );
+
+        assert_eq!(
+            recorder.run_labels_for("web-b"),
+            vec!["resolve-previous"],
+            "a host with no previous release must be probed and then left ALONE"
+        );
+        for host in ["web-a", "web-c"] {
+            assert_eq!(
+                recorder.run_labels_for(host),
+                FLEET_ROLLBACK_RUN_LABELS.to_vec(),
+                "{host} must still roll back — a skip is not a halt"
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_rollback_continues_past_a_failed_host_and_exits_non_zero() {
+        // #1621 (§3.2). Best-effort continue, never swallowed: web-c's rollback
+        // fails at its readiness gate, and web-b and web-a are still rolled back —
+        // stopping would leave MORE hosts on the release being abandoned. The
+        // command still exits non-zero, with counts only (never a driver message).
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_previous_release(recorder, host);
+        }
+        recorder = recorder.fail("web-c", "readiness-gate");
+
+        let err = drive_fleet_rollback(&fleet, &recorder)
+            .expect_err("a failed host must fail the fleet rollback");
+
+        match &err {
+            DeployError::FleetRollbackFailed {
+                not_rolled_back,
+                total,
+            } => {
+                assert_eq!((*not_rolled_back, *total), (1, 3));
+            }
+            other => panic!("expected a fleet-rollback failure, got: {other:?}"),
+        }
+        for host in ["web-a", "web-b"] {
+            assert!(
+                recorder.run_labels_for(host).contains(&"proxy-flip"),
+                "{host} must still be rolled back after web-c failed"
+            );
+        }
+        let rendered = format!("{err}\n{err:?}");
+        for secret in [
+            "postgres://",
+            "topsecret",
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "the fleet-rollback error must never carry `{secret}`: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fleet_rollback_that_rolled_nothing_back_is_an_error() {
+        // #1621 (§3.2). Every host reports no previous release, so nothing happened
+        // at all. Exiting zero would tell the operator their fleet was rolled back
+        // when it was not — the one outcome worse than failing.
+        let hosts = ["web-a", "web-b"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = recorder.script(host, "resolve-previous", "none");
+        }
+
+        let err = drive_fleet_rollback(&fleet, &recorder)
+            .expect_err("a rollback that rolled nothing back must not report success");
+        assert!(
+            matches!(
+                &err,
+                DeployError::FleetRollbackFailed {
+                    not_rolled_back: 2,
+                    total: 2
+                }
+            ),
+            "expected all-hosts-unrolled, got: {err:?}"
         );
     }
 }

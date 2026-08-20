@@ -144,7 +144,9 @@ impl FleetPlan {
 /// Planning is pure and **total**: it returns a typed refusal rather than
 /// panicking, because a panic here would abort a CLI process that may already
 /// have cut hosts over. The operator-facing fleet-wide refusals (`SQLite` fleet,
-/// media fleet, TLS fleet) are prologue concerns and land with the driver.
+/// media fleet, TLS fleet) are prologue concerns and live with the driver
+/// (`refuse_sqlite_fleet` and friends in `deploy.rs`), not here: they grade the
+/// project's CONFIG, while this grades the plan's internal consistency.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum FleetPlanError {
     /// The probe-mode list did not line up with the resolved host list — a caller
@@ -616,6 +618,15 @@ pub(crate) const FLEET_NO_MIGRATION_NOTE: &str = "no host in this fleet is on a 
 pub(crate) const FLEET_SCHEMA_MOVED_NOTE: &str = "the schema has moved; from here an automatic rollback restores BINARIES only — \
      it never rolls a migration back";
 
+/// The recovery lever named for every host the summary reports as still on the new
+/// release (issue #1621, §8.2).
+///
+/// Both halves matter: `--only <host>` is how a single stranded host is reversed
+/// without disturbing the ones that are fine, and the bare command is how a fleet
+/// that halted mid-rollout converges back onto one release.
+pub(crate) const FLEET_RECOVERY_HINT: &str = "Roll ONE back with `autumn deploy rollback --only <host>`, or the whole fleet with \
+     `autumn deploy rollback`.";
+
 /// The line the summary prints once a fleet rollout has actually COMPENSATED hosts
 /// after a migration ran (issue #1621, §4.7, T1.12).
 ///
@@ -650,10 +661,12 @@ pub(crate) fn schema_moved(plan: &FleetPlan, outcomes: &[HostOutcome]) -> bool {
 /// Printed for every [`RollbackAction::Manual`], because "we did not touch it" is
 /// only useful next to "here is what to look at". The command is read-only and
 /// carries nothing secret: an SSH user, a host, and the two marker paths the deploy
-/// already prints on every run. It does NOT tell the operator to run
-/// `autumn deploy rollback`: with a `[deploy] hosts` fleet that command has no
-/// single target today (per-host targeting lands with the fleet CLI surface), and
-/// printing a command that cannot work is worse than printing none.
+/// already prints on every run. It deliberately does NOT tell the operator to run
+/// `autumn deploy rollback --only <host>`, even though that command exists: every
+/// `MANUAL_*` reason is a case where the ROLLBACK TARGET ITSELF is in doubt (markers
+/// mid-transaction, target dir missing, target unprovable, no previous release), so
+/// pointing at the command that trusts that target is precisely the wrong advice.
+/// The markers come first; the command comes after a human has read them.
 pub(crate) fn manual_recovery_lines(cfg: &ResolvedDeployConfig, reason: &str) -> Vec<String> {
     let host = cfg.host.as_deref().unwrap_or_default();
     let shared = cfg.shared_dir();
@@ -817,8 +830,8 @@ pub(crate) fn fleet_summary_lines(
         .collect();
     if !on_new.is_empty() {
         lines.push(format!(
-            "  On {release_id}: {}. Roll a host back with `autumn deploy rollback`.",
-            on_new.join(", "),
+            "  On {release_id}: {}. {FLEET_RECOVERY_HINT}",
+            on_new.join(", ")
         ));
         lines.push(format!("  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_MOVED_NOTE}"));
     }
@@ -838,6 +851,133 @@ pub(crate) fn fleet_summary_lines(
             "  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE}"
         ));
     }
+    lines
+}
+
+// ── `--only`: the repair lever (issue #1621, §3.2) ───────────────────────────
+
+/// The loud warning printed whenever `--only` excludes a configured host.
+///
+/// `--only` is the lever an operator reaches for when one host is broken, and its
+/// whole purpose is to touch a SUBSET — which is, definitionally, the mixed-version
+/// fleet the rollout driver otherwise works so hard to prevent. Making that trade
+/// silently would train operators to leave fleets half-deployed; saying it out loud
+/// every single time is the point.
+pub(crate) const FLEET_ONLY_MIXED_WARNING: &str = "`--only` narrows this command to part of the fleet, so the hosts it skips keep \
+     running whatever they are running now — THE FLEET MAY END UP MIXED. This is a \
+     repair lever, not a faster deploy: finish with a full `autumn deploy up` (no \
+     `--only`) so every host converges on one release (#1621).";
+
+/// The warning block for a `--only` selection — empty when nothing was excluded.
+///
+/// Pure and total: an empty or full selection prints nothing, so an ordinary deploy
+/// (and every single-host deploy, which can never exclude anything) is byte-identical
+/// to pre-#1621.
+pub(crate) fn only_selection_warning_lines(
+    configured: &[String],
+    selected: &[String],
+) -> Vec<String> {
+    let skipped: Vec<&str> = configured
+        .iter()
+        .filter(|host| !selected.iter().any(|picked| picked == *host))
+        .map(String::as_str)
+        .collect();
+    if skipped.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        format!("\u{26A0}\u{FE0F}  {FLEET_ONLY_MIXED_WARNING}"),
+        format!(
+            "   this run touches: {}",
+            selected
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        format!("   left as they are: {}", skipped.join(", ")),
+        String::new(),
+    ]
+}
+
+// ── Fleet-wide `deploy rollback` (issue #1621, §3.2) ─────────────────────────
+
+/// What a fleet-wide rollback did to ONE host.
+///
+/// Only three states, because a fleet rollback is best-effort-continue: every host
+/// is attempted, and the interesting question afterwards is simply whether it came
+/// back, had nothing to come back to, or failed trying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RollbackOutcome {
+    /// The host is serving its previous release again.
+    RolledBack,
+    /// The host records no previous release, so there is nothing to roll back to —
+    /// a first deploy clears the marker, and a host just added to the fleet never
+    /// had one. Reported and SKIPPED: it is not a failure of this host's rollback,
+    /// and it must not stop the other hosts.
+    NoPreviousRelease,
+    /// The rollback was attempted on this host and failed at this step. Never
+    /// swallowed, and never a shell line — the label only.
+    Failed {
+        /// Label of the step that failed.
+        failed_step: &'static str,
+    },
+}
+
+/// The per-host table printed at the end of a fleet-wide rollback.
+///
+/// Printed on **every** exit path: after a partial rollback the operator's fleet is
+/// deliberately mixed, and this table is the only record of which half is which.
+pub(crate) fn fleet_rollback_summary_lines(
+    hosts: &[String],
+    outcomes: &[RollbackOutcome],
+) -> Vec<String> {
+    let mut lines = vec!["Fleet rollback state:".to_owned()];
+    let width = hosts.iter().map(|h| h.chars().count()).max().unwrap_or(0);
+    for (host, outcome) in hosts.iter().zip(outcomes) {
+        let (marker, state) = match outcome {
+            RollbackOutcome::RolledBack => {
+                ("\u{21A9}\u{FE0F} ", "previous release restored".to_owned())
+            }
+            RollbackOutcome::NoPreviousRelease => (
+                "\u{26A0}\u{FE0F} ",
+                "SKIPPED \u{2014} no previous release recorded on this host, so there is \
+                 nothing to roll back to; it still serves what it served before"
+                    .to_owned(),
+            ),
+            RollbackOutcome::Failed { failed_step } => (
+                "\u{274C}",
+                format!(
+                    "NOT rolled back \u{2014} failed at `{failed_step}`; this host still \
+                     serves what it served before"
+                ),
+            ),
+        };
+        lines.push(format!("  {marker} {host:<width$}  {state}"));
+    }
+    let stalled: Vec<&str> = hosts
+        .iter()
+        .zip(outcomes)
+        .filter(|(_, outcome)| !matches!(outcome, RollbackOutcome::RolledBack))
+        .map(|(host, _)| host.as_str())
+        .collect();
+    if !stalled.is_empty() {
+        // A partly-rolled-back fleet is mixed on purpose-by-accident: say which half
+        // is which, and name the single-host lever for finishing the job.
+        lines.push(format!(
+            "  \u{26A0}\u{FE0F}  The fleet is now MIXED: {} did not roll back. Retry one host \
+             with `autumn deploy rollback --only <host>`, or deploy the intended release to \
+             it explicitly.",
+            stalled.join(", "),
+        ));
+    }
+    // The mirror of the rollout's promise, and just as important here: a rollback
+    // moves binaries, never schema.
+    lines.push(
+        "  \u{26A0}\u{FE0F}  This restored BINARIES only \u{2014} no migration was rolled \
+         back; confirm the schema still fits the release now serving."
+            .to_owned(),
+    );
     lines
 }
 
@@ -1900,5 +2040,92 @@ mod tests {
             1,
             "the migrate placement is a single fleet-wide note, not a per-host line:\n{rendered}"
         );
+    }
+    #[test]
+    fn only_warns_loudly_whenever_it_excludes_a_configured_host() {
+        // #1621 (§3.2). `--only` is a repair lever: it deliberately leaves the
+        // hosts it skips on their old release, which IS the mixed fleet the rollout
+        // driver otherwise refuses to create. That trade is never made silently —
+        // the warning names every skipped host and the command that converges the
+        // fleet again.
+        let configured = ["web-a".to_owned(), "web-b".to_owned(), "web-c".to_owned()];
+        let rendered = only_selection_warning_lines(&configured, &["web-b".to_owned()]).join("\n");
+
+        assert!(
+            rendered.contains(FLEET_ONLY_MIXED_WARNING),
+            "a narrowing selection must print the mixed-fleet warning:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("web-a") && rendered.contains("web-c"),
+            "the warning must name the hosts left behind:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("web-b"),
+            "the warning must name the hosts it WILL touch:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("autumn deploy up"),
+            "the warning must name the command that converges the fleet again:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_selection_that_excludes_nothing_prints_nothing() {
+        // AC-1: an ordinary deploy — and every single-host deploy, which can never
+        // exclude anything — must be byte-identical to pre-#1621, so the warning
+        // block is empty unless a host was actually skipped.
+        let configured = ["web-a".to_owned(), "web-b".to_owned()];
+        assert!(
+            only_selection_warning_lines(&configured, &configured).is_empty(),
+            "selecting the whole fleet excludes nothing and must print nothing"
+        );
+        assert!(
+            only_selection_warning_lines(&["web-a".to_owned()], &["web-a".to_owned()]).is_empty(),
+            "a single-host deploy must print nothing new"
+        );
+    }
+
+    #[test]
+    fn the_fleet_rollback_table_names_every_host_and_its_state() {
+        // #1621 (§3.2): after a partial rollback the fleet is deliberately mixed,
+        // and this table is the operator's only record of which half is which — so
+        // every host appears, including the ones nothing happened to.
+        let hosts = ["web-a".to_owned(), "web-b".to_owned(), "web-c".to_owned()];
+        let rendered = fleet_rollback_summary_lines(
+            &hosts,
+            &[
+                RollbackOutcome::RolledBack,
+                RollbackOutcome::NoPreviousRelease,
+                RollbackOutcome::Failed {
+                    failed_step: "readiness-gate",
+                },
+            ],
+        )
+        .join("\n");
+
+        for host in &hosts {
+            assert!(
+                rendered.contains(host.as_str()),
+                "every attempted host must appear in the table:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("readiness-gate"),
+            "a failed host must name the step it failed at:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("no previous release"),
+            "a skipped host must say WHY nothing happened to it:\n{rendered}"
+        );
+        for secret in [
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+            "postgres://",
+            "topsecret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "the rollback table must never carry `{secret}`:\n{rendered}"
+            );
+        }
     }
 }

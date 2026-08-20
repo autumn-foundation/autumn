@@ -417,11 +417,35 @@ impl SshTarget {
 /// prevents any password prompt from hanging a deploy, and
 /// `StrictHostKeyChecking=accept-new` pins a first-seen host key without
 /// blocking on an interactive yes/no.
-const SSH_BATCH_OPTS: [&str; 4] = [
+///
+/// **The three liveness options are load-bearing for fleets (issue #1621, R2).**
+/// [`SshExecutor::run`] shells out with `Command::output()`, which has no timeout,
+/// and the deploy preflight is a bare TCP connect — it proves a host accepts a
+/// connection, not that its SSH daemon will ever answer. A host that accepts TCP
+/// and then hangs (a wedged sshd, a black-holing firewall, a box mid-freeze) would
+/// therefore block the deploy **forever**. For one server that is a stuck deploy
+/// someone Ctrl-Cs. For a fleet it is a rollout frozen mid-flight with *k* hosts
+/// already on the new release and the rest on the old one — the mixed fleet the
+/// whole rollout design exists to prevent, entered by way of a hang rather than a
+/// failure, and with no error for the driver to compensate. `ConnectTimeout` bounds
+/// the handshake; `ServerAliveInterval`/`ServerAliveCountMax` bound a session that
+/// goes silent AFTER connecting (60s of silence ends it), which is the shape a long
+/// `migrate` or binary upload actually fails in. Turning an infinite hang into a
+/// finite error is what lets the fleet driver halt and compensate.
+///
+/// `scp` forwards `-o` to its own ssh transport, so uploads — the longest single
+/// operation in a deploy — get the same bounds.
+const SSH_BATCH_OPTS: [&str; 10] = [
     "-o",
     "BatchMode=yes",
     "-o",
     "StrictHostKeyChecking=accept-new",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
 ];
 
 /// Build the argv passed to the system `ssh` binary to run `remote_shell` on the
@@ -5358,6 +5382,14 @@ mod tests {
 
     #[test]
     fn ssh_and_scp_argv_are_built_correctly() {
+        // #1621 (R2, T1.23) DELIBERATELY updated this vector: the three liveness
+        // options below are new, and they apply to single-host and fleet deploys
+        // alike. `SshExecutor::run` uses `Command::output()` with no timeout and the
+        // preflight is a bare TCP connect, so before this a host that accepted TCP
+        // and then hung the SSH handshake blocked the deploy FOREVER — which at
+        // fleet scale means a permanently half-flipped fleet with no timeout to
+        // recover from. Assert the exact argv (never `contains`), so any future
+        // change to the option set is a conscious one.
         let target = SshTarget {
             host: "203.0.113.10".to_owned(),
             user: "deploy".to_owned(),
@@ -5374,6 +5406,12 @@ mod tests {
                 "BatchMode=yes".to_owned(),
                 "-o".to_owned(),
                 "StrictHostKeyChecking=accept-new".to_owned(),
+                "-o".to_owned(),
+                "ConnectTimeout=10".to_owned(),
+                "-o".to_owned(),
+                "ServerAliveInterval=15".to_owned(),
+                "-o".to_owned(),
+                "ServerAliveCountMax=4".to_owned(),
                 "deploy@203.0.113.10".to_owned(),
                 "systemctl daemon-reload".to_owned(),
             ]
@@ -5394,6 +5432,14 @@ mod tests {
                 "BatchMode=yes".to_owned(),
                 "-o".to_owned(),
                 "StrictHostKeyChecking=accept-new".to_owned(),
+                // scp forwards -o to its ssh transport, so an upload — the longest
+                // single operation in a deploy — gets the same liveness guarantees.
+                "-o".to_owned(),
+                "ConnectTimeout=10".to_owned(),
+                "-o".to_owned(),
+                "ServerAliveInterval=15".to_owned(),
+                "-o".to_owned(),
+                "ServerAliveCountMax=4".to_owned(),
                 "/local/target/release/myapp".to_owned(),
                 "deploy@203.0.113.10:/srv/autumn/myapp/releases/r1/myapp".to_owned(),
             ]
