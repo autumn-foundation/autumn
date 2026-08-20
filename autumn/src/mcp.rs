@@ -2054,10 +2054,22 @@ const MAX_QUERY_PAIRS: usize = 1024;
 const MAX_QUERY_BYTES: usize = 8 * 1024;
 
 /// Accumulator for the `key=value` pairs a tool call's `query` object expands
+/// Ceiling on **nodes visited** while flattening, whether or not a node emits a
+/// pair.
+///
+/// [`MAX_QUERY_PAIRS`] / [`MAX_QUERY_BYTES`] bound only what reaches the wire,
+/// so a container of hundreds of thousands of `null` fields paid nothing: each
+/// one still cost a formatted child key (copying the parent), and the all-null
+/// check that rejects it runs only *after* the whole subtree is walked. Charging
+/// every visit stops that traversal at a fixed bound instead, so a body inside
+/// the documented limit cannot amplify into unbounded key-copying work.
+const MAX_QUERY_NODES: usize = 4 * MAX_QUERY_PAIRS;
+
 /// into, enforcing [`MAX_QUERY_PAIRS`] / [`MAX_QUERY_BYTES`].
 struct QueryPairs {
     pairs: Vec<(String, String)>,
     bytes: usize,
+    nodes: usize,
 }
 
 impl QueryPairs {
@@ -2065,7 +2077,24 @@ impl QueryPairs {
         Self {
             pairs: Vec::new(),
             bytes: 0,
+            nodes: 0,
         }
+    }
+
+    /// Charge one visited node against [`MAX_QUERY_NODES`].
+    ///
+    /// Called for every node the encoder descends into — including the ones
+    /// that emit nothing (`null`, and containers before their leaves are
+    /// known) — so traversal cost is bounded independently of output size.
+    fn visit(&mut self) -> Result<(), String> {
+        self.nodes += 1;
+        if self.nodes > MAX_QUERY_NODES {
+            return Err(format!(
+                "query arguments traverse more than {MAX_QUERY_NODES} values; \
+                 move the field to a JSON body"
+            ));
+        }
+        Ok(())
     }
 
     fn push(&mut self, key: &str, value: String) -> Result<(), String> {
@@ -2155,6 +2184,10 @@ fn encode_query_arg(
             "query argument key exceeds {MAX_QUERY_BYTES} bytes"
         ));
     }
+    // Before descending, and so before any child key is formatted: a `null`
+    // leaf emits no pair, so without this it would pay nothing for the parent
+    // key its sibling count forces the encoder to copy.
+    out.visit()?;
     let is_container = matches!(value, Value::Array(_) | Value::Object(_));
     let before = out.pairs.len();
     match value {
@@ -2189,6 +2222,26 @@ fn encode_query_arg(
             return Err(format!(
                 "query argument `{key}` is an empty object; a query string cannot express an \
                  empty object — omit the argument, or move the field to a JSON body"
+            ));
+        }
+        // Every key digit-only means every segment decodes as a *position*
+        // (`query_string::classify_segment`), so the tree comes back a sequence
+        // and an untyped target (`serde_json::Value`, which takes whatever
+        // `deserialize_any` yields) receives an array where the caller sent an
+        // object — with the tell that adding one named key silently flips it
+        // back. A typed map target is unaffected, but the encoder cannot see
+        // the target, so it refuses the shape rather than dispatch a value the
+        // caller did not ask for. Mixed keys are fine: the named one forces the
+        // decoder to promote the whole node to a map.
+        Value::Object(fields)
+            if fields
+                .keys()
+                .all(|field| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            return Err(format!(
+                "query argument `{key}` is an object whose field names are all numeric; a \
+                 query string cannot tell that from a sequence — rename a field, or move the \
+                 field to a JSON body"
             ));
         }
         Value::Object(fields) => {
@@ -2782,6 +2835,62 @@ mod tests {
         let mut pairs = QueryPairs::new();
         let huge = "k".repeat(MAX_QUERY_BYTES + 1);
         assert!(encode_query_arg(&huge, &json!({ "a": 1 }), 1, &mut pairs).is_err());
+    }
+
+    #[test]
+    fn encode_query_arg_charges_null_leaves_for_the_traversal_they_cost() {
+        // Codex P2: `null` emits no pair, so a container of them paid nothing
+        // against the pair/byte limits while still forcing one formatted child
+        // key per field — the all-null check only fires after the full walk.
+        // The traversal budget now stops it early.
+        let nulls: serde_json::Map<String, Value> = (0..(MAX_QUERY_NODES * 2))
+            .map(|i| (format!("f{i}"), Value::Null))
+            .collect();
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("root", &Value::Object(nulls), 1, &mut pairs)
+            .expect_err("a traversal this wide must be refused");
+        assert!(err.contains("traverse"), "{err}");
+        assert!(
+            pairs.nodes <= MAX_QUERY_NODES + 1,
+            "traversal must stop at the bound, visited {}",
+            pairs.nodes
+        );
+
+        // The budget is generous enough that ordinary nesting is unaffected.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg(
+            "filter",
+            &json!({ "status": "open", "tag": null }),
+            1,
+            &mut pairs,
+        )
+        .expect("a small object still encodes");
+    }
+
+    #[test]
+    fn encode_query_arg_refuses_an_all_numeric_keyed_object() {
+        // Codex P2: every key digit-only decodes as a sequence, so an untyped
+        // target would receive an array where the caller sent an object.
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("counts", &json!({ "0": 5, "1": 6 }), 1, &mut pairs)
+            .expect_err("an all-numeric-keyed object is ambiguous on the wire");
+        assert!(err.contains("all numeric"), "{err}");
+
+        // One named key is enough to force map promotion on the way back in,
+        // so the mixed shape stays expressible.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("counts", &json!({ "0": 5, "total": 6 }), 1, &mut pairs)
+            .expect("a mixed-key object round-trips as a map");
+
+        // The check is per-object, so it also catches a nested one.
+        let mut pairs = QueryPairs::new();
+        assert!(encode_query_arg("filter", &json!({ "by": { "7": "x" } }), 1, &mut pairs).is_err());
+
+        // An empty field name still gets its own, more specific error.
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("counts", &json!({ "": 1 }), 1, &mut pairs)
+            .expect_err("an empty field name is inexpressible");
+        assert!(err.contains("may not be empty"), "{err}");
     }
 
     #[test]
