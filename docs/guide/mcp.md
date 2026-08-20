@@ -125,33 +125,42 @@ The per-tool `inputSchema` is generated from the request types via the `OpenApiS
 ### Structured query arguments round-trip
 
 A `Query<T>` field does **not** have to be a scalar. `Query<T>` decodes a
-superset of the flat `key=value` form — the same bracketed dialect
-`NestedChangesetForm` uses for `has_many` rows — and `tools/call` dispatch
-renders the tool's `query` object into exactly that wire format:
+superset of the flat `key=value` form — a bracketed dialect whose
+`items[0][sku]` shape matches the rows `NestedChangesetForm` renders,
+generalized to arbitrary objects, sequences and depths — and `tools/call`
+dispatch renders the tool's `query` object into exactly that format:
 
-| Tool argument | Dispatched query string | Handler field |
+| Tool argument | Decoded query keys | Handler field |
 | --- | --- | --- |
 | `{"page": 2}` | `page=2` | `u32` |
 | `{"tags": ["a","b"]}` | `tags=a&tags=b` | `Vec<String>` |
 | `{"filter": {"status":"open"}}` | `filter[status]=open` | a nested struct |
 | `{"items": [{"sku":"A"}]}` | `items[0][sku]=A` | `Vec<Item>` |
 
+(The keys are percent-encoded on the wire — `filter%5Bstatus%5D=open` — and
+decoded before the brackets are parsed, so the two forms are equivalent.)
+
 So an agent can pass structured arguments directly, instead of the
 comma-separated strings and JSON-in-a-string fields the flat form used to
-force. Three details are worth knowing:
+force. What the encoding cannot carry, dispatch **refuses** rather than quietly
+altering:
 
-- A JSON `null` renders **no** query parameter at all — a query string has no
-  null, so an explicitly-null optional argument arrives as absent (`None`)
-  rather than as the literal text `null`.
-- An **empty** array or object likewise renders no parameter, so a field that
-  must distinguish "empty" from "absent" belongs in a JSON body.
-- Nesting is capped at 16 levels on both the encode and decode side.
+- A `null` **field** renders no query parameter — a query string has no null, so
+  an explicitly-null optional argument arrives as absent (`None`) rather than as
+  the literal text `null`. That is the one silent conversion, and it matches
+  what the caller meant.
+- An **empty** array or object, a `null` **array element**, and an object field
+  name that is empty or contains `[` / `]` are all invalid-params errors: each
+  would otherwise vanish a field, shorten a sequence, or invent a nesting level.
+  A field that must distinguish "empty" from "absent" belongs in a JSON body.
+- Nesting is depth-capped (`autumn_web::query_string::MAX_DEPTH`) and one call's
+  query expansion is bounded, on both the encode and decode side.
 
 For genuinely large or deeply structured input, a JSON body (`Json<T>`) is
 still the better contract: it round-trips losslessly through the tool's `body`
 property and carries real JSON types rather than coerced text.
 
-### Build-time warnings
+### Build-time warning
 
 When assembling `/mcp`, Autumn emits a build-time `tracing::warn` for a tool
 whose `query` or `body` resolves to a bare `{"type":"object"}` placeholder —
@@ -159,7 +168,7 @@ the arg type has no `OpenApiSchema`, so its fields aren't advertised. Fix it by
 deriving (`#[derive(OpenApiSchema)]`) or implementing `OpenApiSchema` on the
 arg type.
 
-These are warnings, not errors: the app still builds and the tool is still
+It is a warning, not an error: the app still builds and the tool is still
 exposed.
 
 ### Safety annotations

@@ -134,9 +134,15 @@ will not accept. None of them fails the build:
 > (`?filter[status]=open`, `?items[0][sku]=A-1`) that
 > [`query_string`](https://docs.rs/autumn-web/latest/autumn_web/query_string/)
 > defines and MCP `tools/call` dispatch emits — but OpenAPI's `form`/`explode`
-> style leaves nested values undefined, so the generated document does not spell
-> that encoding out for a third-party client. Document the bracketed form for
-> external consumers, or take deeply structured input as a JSON body.
+> style leaves composite values undefined, so the generated document does not
+> spell that encoding out for a third-party client. OAS 3.x's `deepObject` style
+> expresses one object level (`filter[status]=open`) but not an array of
+> objects, and it re-introduces the parameter name that `form`/`explode`
+> correctly drops for an exploded query struct — so Autumn emits `form`
+> unconditionally rather than a style that is right for some fields and wrong
+> for others. Document the bracketed form for external consumers, or take
+> deeply structured input as a JSON body. MCP `tools/call` dispatch is not
+> affected: it renders the bracketed form directly.
 
 > **The query parameter is always `required: false`.** That flag is emitted
 > unconditionally, whatever `T` looks like. If `T` has a non-`Option` field, a

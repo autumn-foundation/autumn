@@ -69,7 +69,7 @@ async fn absent_optionals_are_none() {
     assert!(out["filter"].is_null());
 }
 
-/// Repeated keys collect into a sequence — the OpenAPI `form`/`explode` shape
+/// Repeated keys collect into a sequence — the `OpenAPI` `form`/`explode` shape
 /// MCP dispatch already emitted but the handler could not previously decode.
 #[tokio::test]
 async fn repeated_keys_decode_into_a_sequence() {
@@ -189,9 +189,51 @@ async fn conflicting_shapes_for_one_key_are_rejected() {
 /// recursion during tree construction.
 #[tokio::test]
 async fn excessive_nesting_depth_is_rejected() {
-    let deep = "a".to_owned() + &"[x]".repeat(64);
+    let deep = "filter".to_owned() + &"[x]".repeat(64);
     let resp = client().get(&format!("/search?q=x&{deep}=1")).send().await;
     resp.assert_status(400);
+}
+
+/// A key the grammar cannot resolve poisons only that key. Junk parameters a
+/// handler never reads (ad tracking, crawler noise) stay ignorable, exactly as
+/// they were when the bracketed form was merely an unrecognised key name.
+#[tokio::test]
+async fn unresolvable_keys_the_handler_ignores_do_not_fail_the_request() {
+    let resp = client()
+        .get("/search?q=x&utm=1&utm[source]=news&junk[a][b][c][d][e][f][g][h][i][j][k][l][m][n][o][p][q]=1")
+        .send()
+        .await;
+    resp.assert_ok();
+    let out: serde_json::Value = resp.json();
+    assert_eq!(out["q"], "x");
+}
+
+/// A key submitted twice for a single-valued field fails closed rather than
+/// quietly resolving to one of the two values — the parameter-pollution
+/// hardening `serde_urlencoded` + serde's derive provided before.
+#[tokio::test]
+async fn a_duplicated_scalar_parameter_is_rejected() {
+    let resp = client().get("/search?q=first&q=second").send().await;
+    resp.assert_status(400);
+}
+
+/// A coercion failure must not echo the submitted text: the message lands in
+/// the 400 body and in every error reporter, and a query parameter can hold a
+/// secret.
+#[tokio::test]
+async fn a_failed_coercion_does_not_echo_the_value() {
+    let resp = client().get("/search?q=x&page=SUPERSECRET").send().await;
+    resp.assert_status(400);
+    let body: serde_json::Value = resp.json();
+    let rendered = body.to_string();
+    assert!(
+        !rendered.contains("SUPERSECRET"),
+        "value must not be reflected: {rendered}"
+    );
+    assert!(
+        rendered.contains("page"),
+        "the field path is still named: {rendered}"
+    );
 }
 
 /// A very large explicit index is accepted as a sparse position rather than

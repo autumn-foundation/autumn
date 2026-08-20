@@ -17,9 +17,13 @@
 //! # Wire format
 //!
 //! The decoder is a **superset** of the flat form: a query string with unique
-//! scalar keys decodes exactly as it did before. On top of that it accepts the
-//! bracketed dialect the framework already speaks in
-//! [`nested_form`](crate::nested_form):
+//! scalar keys decodes exactly as it did before. On top of that it accepts a
+//! bracketed dialect whose `items[0][sku]` shape matches the repeated-row
+//! encoding [`nested_form`](crate::nested_form) renders — generalized here to
+//! arbitrary objects, sequences and depths. Note this applies to the **query
+//! string only**: [`Form<T>`](crate::form) and
+//! [`NestedChangesetForm`](crate::nested_form::NestedChangesetForm) still decode
+//! request *bodies* through `serde_urlencoded` and its own nested-row parser.
 //!
 //! ```text
 //! q=foo                       // scalar
@@ -42,17 +46,31 @@
 //!   `u32` and `flag=true` fills a `bool`. An `Option<T>` field that is
 //!   *present but empty* (`?page=`) still visits `Some`, exactly as
 //!   `serde_urlencoded` does — only an **absent** key is `None`.
-//! * **First occurrence wins for scalars.** `?q=a&q=b` fills a `String` field
-//!   with `"a"`. Deserializing the same key into a sequence field yields both.
-//! * **Shape conflicts are errors.** `?filter=flat&filter[status]=open` uses
-//!   one key as both a scalar and a container; that is rejected rather than
-//!   resolved by last-write-wins.
+//! * **A duplicated key is an error in a single-valued position.** `?q=a&q=b`
+//!   against a `String` field is rejected — `serde_urlencoded` + serde's derive
+//!   rejected it too (`duplicate field`), and quietly picking one of two values
+//!   is how parameter-pollution bugs are built. A **sequence** field takes every
+//!   occurrence; that is the whole point of the repeated-key form.
+//! * **Errors never echo a value.** A decode failure names the field path and
+//!   the expected type, never the submitted text — the message is returned in
+//!   the 400 body and recorded by error reporters, and a query parameter can
+//!   hold a secret.
+//! * **Shape conflicts poison one key, not the request.**
+//!   `?filter=flat&filter[status]=open` uses one name as both a scalar and a
+//!   container. That key is rejected *if the target claims it*; a target that
+//!   ignores it (ad-tracking junk, a crawler's garbage parameter) still decodes,
+//!   exactly as it did when the key was merely unrecognised.
 //! * **Malformed brackets stay literal.** A key the bracket grammar cannot
 //!   parse (`weird[unclosed`) is used verbatim as a flat key, so a stray
 //!   bracket never turns into a parse failure.
 //! * **Nesting is depth-capped** at [`MAX_DEPTH`] and indices key an ordered
 //!   map rather than a `Vec`, so neither deep nesting nor a huge index
 //!   (`tags[4000000000]=x`) lets a request drive unbounded allocation.
+//!
+//! * **Map iteration is key-ordered.** The tree keys each level with a
+//!   `BTreeMap`, so a `Query<Vec<(String, String)>>` target sees pairs sorted
+//!   by key rather than in submission order (occurrences of one key keep their
+//!   order). Deterministic either way, but not the wire order.
 //!
 //! # Compatibility note
 //!
@@ -144,6 +162,27 @@ impl de::Error for QueryError {
     }
 }
 
+/// Bound and clean attacker-supplied key text before it reaches an error
+/// message.
+///
+/// A decode failure is returned in the 400 Problem Details body and recorded by
+/// every registered error reporter, so raw request text must never flow into it
+/// unbounded: a long key would bloat the response and an embedded control
+/// character could forge a log line. Values are never included at all — a
+/// mistyped secret (`?token=…` against a typed field) must not be echoed back.
+fn sanitize_key(raw: &str) -> String {
+    const MAX: usize = 48;
+    let mut out: String = raw
+        .chars()
+        .take(MAX)
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect();
+    if raw.chars().nth(MAX).is_some() {
+        out.push('…');
+    }
+    out
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Key parsing
 // ──────────────────────────────────────────────────────────────────
@@ -216,6 +255,15 @@ enum Node {
     Seq(BTreeMap<usize, Self>),
     /// Named children (`k[name]`).
     Map(BTreeMap<String, Self>),
+    /// A key the grammar could not resolve — one name used as two shapes
+    /// (`?filter=flat&filter[status]=open`), or nesting past [`MAX_DEPTH`].
+    ///
+    /// Poisoning the node instead of failing the whole parse keeps decoding a
+    /// **superset** of the old flat form: a target that never asks for this key
+    /// (ad-tracking junk, a crawler's garbage parameter) still decodes, exactly
+    /// as it did when the key was simply unrecognised. Only a target that
+    /// actually claims the key sees the error.
+    Conflict(String),
 }
 
 impl Node {
@@ -225,6 +273,7 @@ impl Node {
             Self::Scalar(_) => "a value",
             Self::Seq(_) => "a sequence",
             Self::Map(_) => "an object",
+            Self::Conflict(_) => "an unresolvable key",
         }
     }
 }
@@ -254,20 +303,26 @@ fn key_path(base: &str, segments: &[Segment<'_>], upto: usize) -> String {
 }
 
 /// Insert one decoded `key=value` pair into the tree rooted at `root`.
-fn insert(
-    root: &mut BTreeMap<String, Node>,
-    base: &str,
-    segments: &[Segment<'_>],
-    value: String,
-) -> Result<(), QueryError> {
+///
+/// Infallible by design: a key the grammar cannot resolve poisons **that key's
+/// node** ([`Node::Conflict`]) rather than failing the request, so an
+/// unrecognised parameter stays ignorable and only a claimed one errors.
+fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>], value: String) {
     // `segments.len()` counts the bracketed steps; the base key is the first
     // level, so the total depth is `len + 1` — expressed as `>=` to stay clear
     // of the request-path gate's arithmetic ban.
     if segments.len() >= MAX_DEPTH {
-        return Err(QueryError::msg(format!(
-            "query key nesting exceeds the maximum depth of {MAX_DEPTH}"
-        ))
-        .with_segment(base));
+        let node = root
+            .entry(base.to_owned())
+            .or_insert_with(|| Node::Scalar(Vec::new()));
+        poison(
+            node,
+            format!(
+                "query key `{}` nests deeper than the maximum of {MAX_DEPTH}",
+                sanitize_key(base)
+            ),
+        );
+        return;
     }
 
     // Descend to the node this key addresses, creating containers on the way.
@@ -282,7 +337,7 @@ fn insert(
         match segment {
             Segment::Key(name) => {
                 let Node::Map(entries) = node else {
-                    return Err(conflict(base, segments, position, node, "an object"));
+                    return poison(node, conflict(base, segments, position, "an object"));
                 };
                 node = entries
                     .entry((*name).to_owned())
@@ -290,13 +345,13 @@ fn insert(
             }
             Segment::Index(index) => {
                 let Node::Seq(entries) = node else {
-                    return Err(conflict(base, segments, position, node, "a sequence"));
+                    return poison(node, conflict(base, segments, position, "a sequence"));
                 };
                 node = entries.entry(*index).or_insert_with(|| empty_for(next));
             }
             Segment::Append => {
                 let Node::Seq(entries) = node else {
-                    return Err(conflict(base, segments, position, node, "a sequence"));
+                    return poison(node, conflict(base, segments, position, "a sequence"));
                 };
                 // `k[]` appends after the highest position seen so far, so
                 // repeated appends stay in submission order even when mixed
@@ -311,11 +366,16 @@ fn insert(
     }
 
     match node {
-        Node::Scalar(values) => {
-            values.push(value);
-            Ok(())
-        }
-        other => Err(conflict(base, segments, segments.len(), other, "a value")),
+        Node::Scalar(values) => values.push(value),
+        _ => poison(node, conflict(base, segments, segments.len(), "a value")),
+    }
+}
+
+/// Mark a node unresolvable, keeping the FIRST diagnosis when a key collides
+/// more than once.
+fn poison(node: &mut Node, message: String) {
+    if !matches!(node, Node::Conflict(_)) {
+        *node = Node::Conflict(message);
     }
 }
 
@@ -328,33 +388,26 @@ const fn empty_for(next: Option<&Segment<'_>>) -> Node {
     }
 }
 
-fn conflict(
-    base: &str,
-    segments: &[Segment<'_>],
-    upto: usize,
-    found: &Node,
-    wanted: &str,
-) -> QueryError {
-    QueryError::msg(format!(
-        "query key `{}` is used as both {} and {wanted}",
-        key_path(base, segments, upto),
-        found.kind()
-    ))
+fn conflict(base: &str, segments: &[Segment<'_>], upto: usize, wanted: &str) -> String {
+    format!(
+        "query key `{}` is used as both a container and {wanted}",
+        sanitize_key(&key_path(base, segments, upto))
+    )
 }
 
 /// Build the query tree from an already-percent-decoded pair sequence.
 fn build_tree<'a>(
     pairs: impl Iterator<Item = (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)>,
-) -> Result<BTreeMap<String, Node>, QueryError> {
+) -> BTreeMap<String, Node> {
     let mut root = BTreeMap::new();
     for (key, value) in pairs {
         match parse_key(&key) {
-            Some((base, segments)) => insert(&mut root, base, &segments, value.into_owned())?,
+            Some((base, segments)) => insert(&mut root, base, &segments, value.into_owned()),
             // Not a well-formed bracket key: treat it as a flat literal name.
-            None => insert(&mut root, &key, &[], value.into_owned())?,
+            None => insert(&mut root, &key, &[], value.into_owned()),
         }
     }
-    Ok(root)
+    root
 }
 
 /// Decode a raw (still percent-encoded) query string into `T`.
@@ -369,7 +422,7 @@ fn build_tree<'a>(
 /// both a scalar and a container), when nesting exceeds [`MAX_DEPTH`], or when
 /// a value cannot be coerced into the target field's type.
 pub fn from_query_str<T: DeserializeOwned>(query: &str) -> Result<T, QueryError> {
-    let root = build_tree(url::form_urlencoded::parse(query.as_bytes()))?;
+    let root = build_tree(url::form_urlencoded::parse(query.as_bytes()));
     T::deserialize(NodeDeserializer {
         node: &Node::Map(root),
     })
@@ -389,12 +442,12 @@ macro_rules! parse_scalar {
     ($($method:ident => $visit:ident : $ty:ty),* $(,)?) => {
         $(
             fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, QueryError> {
+                // The offending text is deliberately NOT echoed: the error
+                // reaches the 400 body and every error reporter, and a query
+                // parameter can hold a secret. The field path already names
+                // which parameter failed.
                 let parsed: $ty = self.value.parse().map_err(|_| {
-                    QueryError::msg(format!(
-                        "invalid value `{}` for {}",
-                        self.value,
-                        stringify!($ty)
-                    ))
+                    QueryError::msg(concat!("invalid ", stringify!($ty), " value"))
                 })?;
                 visitor.$visit(parsed)
             }
@@ -469,10 +522,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_> {
     }
 
     fn deserialize_seq<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, QueryError> {
-        Err(QueryError::msg(format!(
-            "expected a sequence, found the value `{}`",
-            self.value
-        )))
+        Err(QueryError::msg("expected a sequence, found a single value"))
     }
 
     fn deserialize_tuple<V: Visitor<'de>>(
@@ -493,10 +543,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_> {
     }
 
     fn deserialize_map<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, QueryError> {
-        Err(QueryError::msg(format!(
-            "expected an object, found the value `{}`",
-            self.value
-        )))
+        Err(QueryError::msg("expected an object, found a single value"))
     }
 
     fn deserialize_struct<V: Visitor<'de>>(
@@ -588,10 +635,32 @@ struct NodeDeserializer<'a> {
 }
 
 impl<'a> NodeDeserializer<'a> {
-    /// The leaf view of a scalar node: its first submitted value (first
-    /// occurrence wins), or an error naming the container shape found instead.
-    fn as_value(&self, wanted: &str) -> Result<ValueDeserializer<'a>, QueryError> {
+    /// Refuse a node whose key the grammar could not resolve.
+    ///
+    /// Checked by every entry point EXCEPT `deserialize_ignored_any`, so a
+    /// conflicting key a target never claims stays ignorable.
+    fn check(&self) -> Result<(), QueryError> {
         match self.node {
+            Node::Conflict(message) => Err(QueryError::msg(message.clone())),
+            _ => Ok(()),
+        }
+    }
+
+    /// The leaf view of a scalar node.
+    ///
+    /// A key submitted more than once is an **error** in a single-valued
+    /// position, not a silent first- or last-wins pick: `serde_urlencoded` +
+    /// serde's derive rejected `?sig=a&sig=b` with `duplicate field`, and
+    /// resolving it quietly here would hand a security-relevant handler one of
+    /// two values while a proxy or log pipeline recorded the other. Sequence
+    /// fields still take every occurrence — that is [`Self::deserialize_seq`].
+    fn as_value(&self, wanted: &str) -> Result<ValueDeserializer<'a>, QueryError> {
+        self.check()?;
+        match self.node {
+            Node::Scalar(values) if values.len() > 1 => Err(QueryError::msg(
+                "duplicate query parameter: more than one value was submitted for a \
+                 single-valued field",
+            )),
             Node::Scalar(values) => Ok(ValueDeserializer {
                 // A scalar node is only ever created by pushing a value, so it
                 // is never empty; the fallback keeps this total regardless.
@@ -629,12 +698,13 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_> {
     /// `serde_json::Value`: a multi-valued key becomes a sequence, a single
     /// value stays a string.
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, QueryError> {
+        self.check()?;
         match self.node {
             Node::Scalar(values) if values.len() == 1 => {
                 visitor.visit_str(values.first().map_or("", String::as_str))
             }
             Node::Scalar(_) | Node::Seq(_) => self.deserialize_seq(visitor),
-            Node::Map(_) => self.deserialize_map(visitor),
+            Node::Map(_) | Node::Conflict(_) => self.deserialize_map(visitor),
         }
     }
 
@@ -673,6 +743,7 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_> {
     }
 
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, QueryError> {
+        self.check()?;
         match self.node {
             // Repeated keys: every submitted value is one element.
             Node::Scalar(values) => visitor.visit_seq(ValueSeq {
@@ -687,6 +758,8 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_> {
             Node::Map(entries) => visitor.visit_seq(PairSeq {
                 pairs: flatten_pairs(entries).into_iter(),
             }),
+            // Rejected by `check` above.
+            Node::Conflict(message) => Err(QueryError::msg(message.clone())),
         }
     }
 
@@ -708,8 +781,19 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_> {
     }
 
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, QueryError> {
+        self.check()?;
         match self.node {
             Node::Map(entries) => visitor.visit_map(NodeMap {
+                entries: entries.iter(),
+                value: None,
+                key: String::new(),
+            }),
+            // An all-digit key (`counts[2024]=5`) parses as a position, because
+            // the tree is built before the target type is known. Serving a
+            // positional node as a map — index rendered as its decimal key —
+            // lets such a field still land in a `HashMap`/struct target instead
+            // of failing on a shape the caller never chose.
+            Node::Seq(entries) => visitor.visit_map(IndexMap {
                 entries: entries.iter(),
                 value: None,
                 key: String::new(),
@@ -738,6 +822,7 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_> {
         variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, QueryError> {
+        self.check()?;
         match self.node {
             Node::Scalar(_) => self
                 .as_value("a value")?
@@ -769,7 +854,7 @@ enum PairValue<'a> {
 
 /// Flatten a map into `(key, value)` pairs, expanding a repeated key into one
 /// pair per submitted value so the pair view matches the wire.
-fn flatten_pairs<'a>(entries: &'a BTreeMap<String, Node>) -> Vec<(&'a str, PairValue<'a>)> {
+fn flatten_pairs(entries: &BTreeMap<String, Node>) -> Vec<(&str, PairValue<'_>)> {
     let mut out = Vec::new();
     for (key, node) in entries {
         match node {
@@ -931,7 +1016,47 @@ impl<'de> MapAccess<'de> for NodeMap<'_> {
         // Tag the failure with the field it came from, so a caller sees
         // `filter.limit: invalid value …` rather than a bare parse error.
         seed.deserialize(NodeDeserializer { node })
-            .map_err(|err| err.with_segment(self.key.clone()))
+            .map_err(|err| err.with_segment(sanitize_key(&self.key)))
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.entries.len())
+    }
+}
+
+/// `MapAccess` over a positional node, rendering each index as its decimal key.
+struct IndexMap<'a> {
+    entries: std::collections::btree_map::Iter<'a, usize, Node>,
+    value: Option<&'a Node>,
+    key: String,
+}
+
+impl<'de> MapAccess<'de> for IndexMap<'_> {
+    type Error = QueryError;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, QueryError> {
+        let Some((index, node)) = self.entries.next() else {
+            return Ok(None);
+        };
+        self.value = Some(node);
+        self.key = index.to_string();
+        seed.deserialize(ValueDeserializer { value: &self.key })
+            .map(Some)
+    }
+
+    fn next_value_seed<V: DeserializeSeed<'de>>(
+        &mut self,
+        seed: V,
+    ) -> Result<V::Value, QueryError> {
+        let node = self.value.take().ok_or_else(|| {
+            QueryError::msg("internal error: query map value requested before its key")
+        })?;
+        let key = self.key.clone();
+        seed.deserialize(NodeDeserializer { node })
+            .map_err(|err| err.with_segment(key))
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -1055,12 +1180,76 @@ mod tests {
     }
 
     #[test]
-    fn repeated_keys_fill_a_sequence_and_first_wins_for_a_scalar() {
+    fn repeated_keys_fill_a_sequence_but_a_duplicated_scalar_is_rejected() {
         assert_eq!(
             args("tags=a&tags=b").tags.unwrap(),
             vec!["a".to_owned(), "b".to_owned()]
         );
-        assert_eq!(args("q=first&q=second").q.as_deref(), Some("first"));
+        // Fail closed: picking one of two values for a single-valued field is
+        // how parameter-pollution bugs are built, and `serde_urlencoded` +
+        // serde's derive rejected it too.
+        let err = from_query_str::<Args>("q=first&q=second").expect_err("duplicate scalar");
+        assert!(
+            err.to_string().contains("duplicate query parameter"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn index_aliasing_is_rejected_rather_than_silently_dropping_a_value() {
+        // `tags[0]` and `tags[00]` address one position, as do two indices that
+        // both saturate. Both land two values in one slot — an error, not a
+        // silent loss of the second.
+        assert!(from_query_str::<Args>("tags[0]=a&tags[00]=b").is_err());
+        assert!(
+            from_query_str::<Args>("tags[99999999999999999999]=a&tags[99999999999999999999]=b")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn errors_never_echo_the_submitted_value() {
+        // The message reaches the 400 body and every error reporter, so a
+        // mistyped secret must not come back out.
+        let err = from_query_str::<Args>("page=SUPERSECRET").expect_err("coercion failure");
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("SUPERSECRET"),
+            "value leaked: {rendered}"
+        );
+        assert!(rendered.contains("page"), "field path kept: {rendered}");
+    }
+
+    #[test]
+    fn error_text_bounds_and_cleans_attacker_supplied_key_text() {
+        let long = "k".repeat(500);
+        let rendered = sanitize_key(&long);
+        assert!(
+            rendered.chars().count() <= 49,
+            "bounded: {}",
+            rendered.len()
+        );
+        assert_eq!(sanitize_key("a\nb"), "a.b");
+    }
+
+    #[test]
+    fn a_conflicting_key_the_target_ignores_is_still_ignored() {
+        // Pre-existing behaviour for an unrecognised parameter: it does not
+        // fail the request. Junk like `?utm=1&utm[src]=x` must stay ignorable.
+        let out = args("q=ok&utm=1&utm[src]=x");
+        assert_eq!(out.q.as_deref(), Some("ok"));
+        // Same for a key that nests past the cap but is never claimed.
+        let deep = format!("q=ok&junk{}=1", "[x]".repeat(MAX_DEPTH));
+        assert_eq!(args(&deep).q.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn an_all_digit_object_key_still_lands_in_a_map_target() {
+        // `counts[2024]=5` parses as a position (the tree is built before the
+        // target type is known), so a positional node must still serve a map.
+        let out: std::collections::HashMap<String, std::collections::HashMap<String, u32>> =
+            from_query_str("counts[2024]=5").expect("decodes");
+        assert_eq!(out["counts"]["2024"], 5);
     }
 
     #[test]
@@ -1173,12 +1362,13 @@ mod tests {
     }
 
     #[test]
-    fn nesting_deeper_than_the_cap_is_rejected() {
-        let deep = format!("a{}=1", "[x]".repeat(MAX_DEPTH));
+    fn nesting_deeper_than_the_cap_is_rejected_for_a_claimed_key() {
+        let deep = format!("filter{}=1", "[x]".repeat(MAX_DEPTH));
         let err = from_query_str::<Args>(&deep).expect_err("depth-capped");
-        assert!(err.to_string().contains("depth"), "{err}");
-        // One level under the cap is still accepted.
-        let ok = format!("a{}=1", "[x]".repeat(MAX_DEPTH - 2));
+        assert!(err.to_string().contains("deeper"), "{err}");
+        // One level under the cap parses; `filter` then fails on its own shape,
+        // not on the depth guard.
+        let ok = format!("q=x&junk{}=1", "[x]".repeat(MAX_DEPTH - 2));
         assert!(from_query_str::<Args>(&ok).is_ok());
     }
 
@@ -1187,6 +1377,13 @@ mod tests {
         let err = from_query_str::<Args>("filter[status]=open&filter[limit]=nope")
             .expect_err("coercion failure");
         assert!(err.to_string().starts_with("filter.limit:"), "{err}");
+    }
+
+    #[test]
+    fn shape_conflicts_surface_only_when_the_target_claims_the_key() {
+        let err = from_query_str::<Args>("filter=flat&filter[status]=open")
+            .expect_err("claimed conflicting key");
+        assert!(err.to_string().contains("used as both"), "{err}");
     }
 
     #[test]

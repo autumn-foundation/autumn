@@ -1961,12 +1961,12 @@ fn build_request(
         let Value::Object(map) = query else {
             return Err("`query` must be a JSON object".to_owned());
         };
-        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut pairs = QueryPairs::new();
         for (key, value) in map {
             encode_query_arg(key, value, 1, &mut pairs)?;
         }
-        if !pairs.is_empty() {
-            let qs = serde_urlencoded::to_string(&pairs)
+        if !pairs.pairs.is_empty() {
+            let qs = serde_urlencoded::to_string(&pairs.pairs)
                 .map_err(|e| format!("invalid query arguments: {e}"))?;
             path = format!("{path}?{qs}");
         }
@@ -2034,6 +2034,49 @@ fn query_scalar(value: &Value) -> String {
     }
 }
 
+/// Upper bound on the pairs one tool call may expand its `query` object into.
+///
+/// `tools/call` arguments are client-supplied and only bounded by the request
+/// body limit (32 MiB by default), while building a bracketed key copies its
+/// whole prefix per child — quadratic in the argument size. Both this and
+/// [`MAX_QUERY_BYTES`] bail out long before that matters, and well inside the
+/// 64 KiB `http::Uri` limit the assembled request would hit anyway.
+const MAX_QUERY_PAIRS: usize = 1024;
+
+/// Upper bound on the total key+value bytes one tool call may expand into.
+const MAX_QUERY_BYTES: usize = 8 * 1024;
+
+/// Accumulator for the `key=value` pairs a tool call's `query` object expands
+/// into, enforcing [`MAX_QUERY_PAIRS`] / [`MAX_QUERY_BYTES`].
+struct QueryPairs {
+    pairs: Vec<(String, String)>,
+    bytes: usize,
+}
+
+impl QueryPairs {
+    const fn new() -> Self {
+        Self {
+            pairs: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    fn push(&mut self, key: &str, value: String) -> Result<(), String> {
+        self.bytes = self
+            .bytes
+            .saturating_add(key.len())
+            .saturating_add(value.len());
+        if self.pairs.len() >= MAX_QUERY_PAIRS || self.bytes > MAX_QUERY_BYTES {
+            return Err(format!(
+                "query arguments expand past the dispatch limit of {MAX_QUERY_PAIRS} \
+                 parameters / {MAX_QUERY_BYTES} bytes"
+            ));
+        }
+        self.pairs.push((key.to_owned(), value));
+        Ok(())
+    }
+}
+
 /// Flatten one `query` argument into the `key=value` pairs the
 /// [`Query<T>`](crate::extract::Query) extractor decodes (issue #1972).
 ///
@@ -2043,26 +2086,35 @@ fn query_scalar(value: &Value) -> String {
 ///
 /// * scalars render flat (`page=2`);
 /// * an array of scalars expands to repeated keys (`tags=a&tags=b`) — the
-///   OpenAPI `form`/`explode` shape;
+///   `OpenAPI` `form`/`explode` shape;
 /// * an array containing any container uses explicit positions
 ///   (`items[0][sku]=A-1`), so element order survives;
 /// * an object nests by key (`filter[status]=open`).
 ///
-/// A JSON `null` renders **no pair at all**: a query string has no null, and
+/// A `null` **field** renders no pair at all: a query string has no null, and
 /// emitting the literal text `null` would fail the handler's coercion instead
 /// of decoding as the absent/`None` the caller meant.
 ///
 /// # Errors
 ///
-/// Returns an error when nesting exceeds
-/// [`query_string::MAX_DEPTH`](crate::query_string::MAX_DEPTH) — the depth the
-/// decoder on the other side accepts — rather than emitting keys that would
-/// then be rejected downstream.
+/// Refuses, rather than silently dispatching something the caller did not ask
+/// for, when the argument cannot be expressed in a query string:
+///
+/// * an **empty** array or object — dropping it would turn a present-but-empty
+///   value into an absent one (and 400 a required field downstream);
+/// * a `null` **array element** — dropping it would shorten the sequence and
+///   shift every later element;
+/// * an object field name that is empty or contains `[` / `]` — those are
+///   structure in the bracketed dialect, so interpolating one would invent or
+///   lose a nesting level;
+/// * nesting past
+///   [`query_string::MAX_DEPTH`](crate::query_string::MAX_DEPTH), or an
+///   expansion past [`MAX_QUERY_PAIRS`] / [`MAX_QUERY_BYTES`].
 fn encode_query_arg(
     key: &str,
     value: &Value,
     depth: usize,
-    out: &mut Vec<(String, String)>,
+    out: &mut QueryPairs,
 ) -> Result<(), String> {
     if depth > crate::query_string::MAX_DEPTH {
         return Err(format!(
@@ -2070,36 +2122,58 @@ fn encode_query_arg(
             crate::query_string::MAX_DEPTH
         ));
     }
+    // Bail before formatting any child key: a single absurd key would otherwise
+    // be copied once per descendant.
+    if key.len() > MAX_QUERY_BYTES {
+        return Err(format!(
+            "query argument key exceeds {MAX_QUERY_BYTES} bytes"
+        ));
+    }
     match value {
         Value::Null => Ok(()),
+        Value::Array(items) if items.is_empty() => Err(format!(
+            "query argument `{key}` is an empty array; a query string cannot express an \
+             empty sequence — omit the argument, or move the field to a JSON body"
+        )),
         Value::Array(items) => {
+            if let Some(position) = items.iter().position(Value::is_null) {
+                return Err(format!(
+                    "query argument `{key}[{position}]` is null; a query string cannot \
+                     express a null element — omit it, or move the field to a JSON body"
+                ));
+            }
             let all_scalar = items
                 .iter()
                 .all(|item| !matches!(item, Value::Array(_) | Value::Object(_)));
             if all_scalar {
                 for item in items {
-                    if !item.is_null() {
-                        out.push((key.to_owned(), query_scalar(item)));
-                    }
+                    out.push(key, query_scalar(item))?;
                 }
-                Ok(())
             } else {
                 for (index, item) in items.iter().enumerate() {
                     encode_query_arg(&format!("{key}[{index}]"), item, depth + 1, out)?;
                 }
-                Ok(())
             }
+            Ok(())
         }
+        Value::Object(fields) if fields.is_empty() => Err(format!(
+            "query argument `{key}` is an empty object; a query string cannot express an \
+             empty object — omit the argument, or move the field to a JSON body"
+        )),
         Value::Object(fields) => {
             for (field, nested) in fields {
+                if field.is_empty() || field.contains('[') || field.contains(']') {
+                    return Err(format!(
+                        "query argument `{key}` has a field name that a query string \
+                         cannot carry: a name may not be empty or contain `[` or `]`, \
+                         which are structure in the query encoding"
+                    ));
+                }
                 encode_query_arg(&format!("{key}[{field}]"), nested, depth + 1, out)?;
             }
             Ok(())
         }
-        scalar => {
-            out.push((key.to_owned(), query_scalar(scalar)));
-            Ok(())
-        }
+        scalar => out.push(key, query_scalar(scalar)),
     }
 }
 
@@ -2544,13 +2618,13 @@ mod tests {
 
     #[test]
     fn encode_query_arg_renders_the_extractor_dialect() {
-        let mut pairs = Vec::new();
+        let mut pairs = QueryPairs::new();
         encode_query_arg("page", &json!(2), 1, &mut pairs).expect("scalar");
         encode_query_arg("tags", &json!(["a", "b"]), 1, &mut pairs).expect("scalar array");
         encode_query_arg("filter", &json!({ "status": "open" }), 1, &mut pairs).expect("object");
         encode_query_arg("items", &json!([{ "sku": "A" }]), 1, &mut pairs).expect("object array");
         assert_eq!(
-            pairs,
+            pairs.pairs,
             vec![
                 ("page".to_owned(), "2".to_owned()),
                 ("tags".to_owned(), "a".to_owned()),
@@ -2562,11 +2636,60 @@ mod tests {
     }
 
     #[test]
-    fn encode_query_arg_omits_nulls_rather_than_stringifying_them() {
-        let mut pairs = Vec::new();
+    fn encode_query_arg_omits_null_fields_rather_than_stringifying_them() {
+        let mut pairs = QueryPairs::new();
         encode_query_arg("page", &json!(null), 1, &mut pairs).expect("null");
         encode_query_arg("filter", &json!({ "status": null }), 1, &mut pairs).expect("null field");
-        assert!(pairs.is_empty(), "a JSON null renders no pair: {pairs:?}");
+        assert!(
+            pairs.pairs.is_empty(),
+            "a null field renders no pair: {:?}",
+            pairs.pairs
+        );
+    }
+
+    #[test]
+    fn encode_query_arg_refuses_values_a_query_string_cannot_carry() {
+        // Each of these would otherwise dispatch something the caller did not
+        // ask for: a vanished field, a shortened sequence, or an invented
+        // nesting level (issue #1972 review follow-ups).
+        for (label, value) in [
+            ("empty array", json!({ "tags": [] })),
+            ("empty object", json!({ "filter": {} })),
+            ("empty nested array", json!({ "matrix": [[1], []] })),
+            ("null array element", json!({ "tags": ["a", null] })),
+            (
+                "null object-array element",
+                json!({ "items": [null, { "sku": "A" }] }),
+            ),
+            ("bracket in field name", json!({ "filter": { "a[b]": 1 } })),
+            ("empty field name", json!({ "filter": { "": 1 } })),
+        ] {
+            let mut pairs = QueryPairs::new();
+            let Value::Object(fields) = &value else {
+                unreachable!()
+            };
+            let result = fields
+                .iter()
+                .try_for_each(|(key, v)| encode_query_arg(key, v, 1, &mut pairs));
+            assert!(
+                result.is_err(),
+                "{label} must be refused, not silently dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_query_arg_bounds_its_expansion() {
+        // A wide array cannot be turned into an unbounded pair list: expansion
+        // stops at the dispatch limit instead of building a giant URI.
+        let wide: Vec<Value> = (0..(MAX_QUERY_PAIRS * 2)).map(|i| json!(i)).collect();
+        let mut pairs = QueryPairs::new();
+        assert!(encode_query_arg("tags", &Value::Array(wide), 1, &mut pairs).is_err());
+
+        // A single absurd key is refused before any child key is formatted.
+        let mut pairs = QueryPairs::new();
+        let huge = "k".repeat(MAX_QUERY_BYTES + 1);
+        assert!(encode_query_arg(&huge, &json!({ "a": 1 }), 1, &mut pairs).is_err());
     }
 
     #[test]
@@ -2577,7 +2700,7 @@ mod tests {
         for _ in 0..crate::query_string::MAX_DEPTH {
             value = json!({ "deeper": value });
         }
-        let mut pairs = Vec::new();
+        let mut pairs = QueryPairs::new();
         assert!(encode_query_arg("root", &value, 1, &mut pairs).is_err());
     }
 

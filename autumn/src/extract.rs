@@ -1,7 +1,10 @@
-//! Re-exports of Axum extractors for use in Autumn handlers.
+//! Autumn's request extractors.
 //!
-//! These are provided so users don't need `axum` as a direct dependency
-//! for the most common extractor types.
+//! Most are thin wrappers over the Axum extractor of the same name, provided so
+//! users don't need `axum` as a direct dependency and so parse failures use
+//! Autumn's Problem Details error contract. [`Query`] is the exception: it
+//! decodes through [`crate::query_string`], which accepts sequences and nested
+//! structures the flat `serde_urlencoded` form cannot express.
 //!
 //! | Extractor | Purpose |
 //! |-----------|---------|
@@ -160,10 +163,13 @@ where
 /// items[0][sku]=A-1           // array of objects
 /// ```
 ///
-/// are all accepted — the same bracketed dialect
-/// [`nested_form`](crate::nested_form) already uses for `has_many` form rows.
-/// See [`query_string`](crate::query_string) for the exact semantics (scalar
-/// coercion, first-occurrence-wins, shape conflicts, the depth cap).
+/// are all accepted — a bracketed dialect whose `items[0][sku]` shape matches
+/// the repeated-row encoding [`nested_form`](crate::nested_form) renders,
+/// generalized to arbitrary objects, sequences and depths. It applies to the
+/// query string only: [`Form<T>`] still decodes request bodies through
+/// `serde_urlencoded`. See [`query_string`](crate::query_string) for the exact
+/// semantics — scalar coercion, duplicate-key rejection, shape conflicts, the
+/// depth cap, and what changed for `HashMap`-typed targets.
 ///
 /// This also shapes MCP tool exposure (issue #1972): a `Query<T>` becomes the
 /// tool's `query` object property, and `tools/call` dispatch renders that

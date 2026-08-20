@@ -136,6 +136,40 @@ async fn scalar_query_arguments_still_round_trip() {
     assert_eq!(echoed["page"], 3);
 }
 
+/// Values a query string cannot carry are refused up front rather than
+/// dispatched as something the caller did not ask for: an empty array would
+/// vanish (400-ing a required field), and a null element would shorten the
+/// sequence and shift every later element.
+#[tokio::test]
+async fn inexpressible_query_arguments_are_refused_not_silently_altered() {
+    for (label, query) in [
+        ("empty array", serde_json::json!({ "q": "x", "tags": [] })),
+        (
+            "empty object",
+            serde_json::json!({ "q": "x", "filter": {} }),
+        ),
+        (
+            "null array element",
+            serde_json::json!({ "q": "x", "tags": ["a", null] }),
+        ),
+    ] {
+        let out = rpc(
+            &client(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "structured_search", "arguments": { "query": query } }
+            }),
+        )
+        .await;
+        assert!(
+            out["error"].is_object() || out["result"]["isError"] == serde_json::Value::Bool(true),
+            "{label} must be refused, not silently altered: {out}"
+        );
+    }
+}
+
 /// The advertised `inputSchema` exposes the nested field structure — the tool
 /// contract the dispatch path now actually honours.
 #[tokio::test]
