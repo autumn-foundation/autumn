@@ -30,14 +30,21 @@
 //! [`EdgeKv`]: autumn_edge::EdgeKv
 
 // This module runs on the request path: `EdgeKv::get` is called by the
-// `EdgeCache` extractor while a request is in flight. Production code here must
-// therefore be panic-free. It is deliberately not listed in
-// `scripts/check-panic-gate.sh`'s manifest: that check refuses a manifest entry
-// whose feature no enforcing CI clippy lane compiles, and no lane enables
-// `edge` yet (see check 8 / FEATURE_LINT_EXEMPT in that script). The deny block
-// below is real and is enforced by any `cargo clippy -p autumn-web --features
-// edge` run; add the manifest entry in the same change that adds `edge` to a
-// linted CI lane.
+// `EdgeCache` extractor while a request is in flight, so production code here
+// must be panic-free. The deny block below IS compiled — and therefore enforced
+// — by the `lint` job's `cargo clippy --workspace --all-targets -- -D warnings`:
+// `examples/edge-greeting` is a workspace member whose native build enables
+// `autumn-web/edge`, and cargo unifies features across the graph.
+//
+// It nevertheless carries no `autumn-panic-gate:` marker and no
+// `scripts/check-panic-gate.sh` manifest entry, on purpose. That script counts a
+// non-default feature as linted only when an enforcing
+// `cargo clippy -p autumn-web --features "…" -- -D warnings` lane names it, and
+// none does (nor should one — the workspace lane already covers this module).
+// So: the marker alone fails its reverse-manifest check, a manifest entry fails
+// its feature-reachability check, and a `:default` suffix would be exactly the
+// mislabelling that check exists to catch. Revisit only if `edge` ever gains a
+// dedicated `-p autumn-web --features` clippy lane.
 #![cfg_attr(
     not(test),
     deny(
