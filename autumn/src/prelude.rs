@@ -212,15 +212,16 @@ pub use crate::widgets::localized_path;
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
     ActiveSearchConfig, AlertConfig, AlertVariant, AutocompleteConfig, AvatarConfig, AvatarSize,
-    BadgeConfig, BadgeVariant, CardConfig, Column, ConfirmActionConfig, Crumb, Cta, CtaStyle,
-    DEFAULT_TOAST_REGION_ID, DataTableConfig, FeedConfig, FeedMode, HeadingLevel, HeroConfig,
-    ModalConfig, NavBarConfig, NavBarLayout, NavItem, NavLinkMatch, NavMenu, ReactionControls,
-    SearchMethod, active_search, active_search_empty_state, active_search_input,
-    active_search_results, alert, alert_with, autocomplete_empty_state, autocomplete_input,
-    autocomplete_option, avatar, badge, badge_with, breadcrumb, card, confirm_action, data_table,
-    error_summary, feed_page, hero, infinite_feed, locale_switcher, modal, modal_close_button,
-    modal_trigger, nav_bar, nav_link, nav_link_matched, property_list, reaction_controls,
-    stat_card, status_tag, tabs, toast, toast_in, toast_region,
+    BadgeConfig, BadgeVariant, CardConfig, Column, CommentThread, CommentView, ConfirmActionConfig,
+    Crumb, Cta, CtaStyle, DEFAULT_TOAST_REGION_ID, DataTableConfig, FeedConfig, FeedMode,
+    HeadingLevel, HeroConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem, NavLinkMatch,
+    NavMenu, ReactionControls, SearchMethod, active_search, active_search_empty_state,
+    active_search_input, active_search_results, alert, alert_with, autocomplete_empty_state,
+    autocomplete_input, autocomplete_option, avatar, badge, badge_with, breadcrumb, card,
+    comment_thread, confirm_action, data_table, error_summary, feed_page, hero, infinite_feed,
+    locale_switcher, modal, modal_close_button, modal_trigger, nav_bar, nav_link,
+    nav_link_matched, property_list, reaction_controls, stat_card, status_tag, tabs, toast,
+    toast_in, toast_region,
 };
 
 // ── Widget stories ───────────────────────────────────────────────

@@ -826,18 +826,24 @@ fn plan_scaffold_with_options_impl(
                     table = super::commentable::COMMENTS_TABLE,
                 ));
             }
-            plan.warn(match super::commentable::detect_author_model(project_root) {
-                Some(author) => format!(
-                    "`#[commentable(by = {author}, ...)]` on the generated model names this \
-                     app's author model. Add `author_name = <column>` to render display \
-                     names instead of `user #id`."
+            plan.warn(
+                super::commentable::detect_author_model(project_root).map_or_else(
+                    || {
+                        "This project has no `User` model, so the generated \
+                         `#[commentable]` names no author model. Add `by = <AuthorModel>` \
+                         (and `author_name = <column>`) once you have one — until then \
+                         threads render authors as `user #id`."
+                            .to_owned()
+                    },
+                    |author| {
+                        format!(
+                            "`#[commentable(by = {author}, ...)]` on the generated model \
+                             names this app's author model. Add `author_name = <column>` \
+                             to render display names instead of `user #id`."
+                        )
+                    },
                 ),
-                None => "This project has no `User` model, so the generated \
-                     `#[commentable]` names no author model. Add `by = <AuthorModel>` \
-                     (and `author_name = <column>`) once you have one — until then \
-                     threads render authors as `user #id`."
-                    .to_owned(),
-            });
+            );
         }
     }
 

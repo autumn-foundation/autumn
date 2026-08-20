@@ -1090,7 +1090,6 @@ fn rebroadcast_row(state: &AppState, row: &LiveFeedEventRow) {
         .ok();
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -1366,7 +1365,6 @@ mod tests {
             "prune should use the database clock so the just-inside-retention row survives",
         );
     }
-
 
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]

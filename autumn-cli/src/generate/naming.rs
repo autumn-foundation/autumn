@@ -253,8 +253,21 @@ mod tests {
     #[test]
     fn singularize_round_trips_pluralize() {
         for word in [
-            "comment", "note", "category", "box", "class", "match", "dish", "person", "child",
-            "man", "woman", "mouse", "goose", "blog_post", "quiz",
+            "comment",
+            "note",
+            "category",
+            "box",
+            "class",
+            "match",
+            "dish",
+            "person",
+            "child",
+            "man",
+            "woman",
+            "mouse",
+            "goose",
+            "blog_post",
+            "quiz",
         ] {
             let plural = pluralize(word);
             assert_eq!(
@@ -287,5 +300,4 @@ mod tests {
     fn singularize_of_empty_is_empty() {
         assert_eq!(singularize(""), "");
     }
-
 }

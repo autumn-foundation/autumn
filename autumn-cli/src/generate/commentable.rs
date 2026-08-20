@@ -163,9 +163,7 @@ pub fn detect_author_model(project_root: &Path) -> Option<&'static str> {
         return Some("User");
     }
     let single_file = std::fs::read_to_string(src.join("models.rs")).ok()?;
-    single_file
-        .contains("pub struct User ")
-        .then_some("User")
+    single_file.contains("pub struct User ").then_some("User")
 }
 
 #[cfg(test)]

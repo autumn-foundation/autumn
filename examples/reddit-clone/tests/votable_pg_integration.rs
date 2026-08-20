@@ -411,11 +411,11 @@ async fn leaderboard_grouped_aggregate_still_works_after_react() {
         "INSERT INTO comments (commentable_type, commentable_id, author_id, body) \
          VALUES ('Post', $1, $2, 'c')",
     )
-        .bind::<BigInt, _>(hot)
-        .bind::<BigInt, _>(users[0])
-        .execute(&mut conn)
-        .await
-        .expect("seed comment");
+    .bind::<BigInt, _>(hot)
+    .bind::<BigInt, _>(users[0])
+    .execute(&mut conn)
+    .await
+    .expect("seed comment");
     diesel::sql_query(
         "INSERT INTO votes (user_id, comment_id, value) \
          VALUES ($1, (SELECT id FROM comments LIMIT 1), 1)",

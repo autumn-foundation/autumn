@@ -235,10 +235,12 @@ async fn preload_missing_parent() {
     // `subreddits.creator_id` is `NOT NULL REFERENCES users(id)`, so an orphan
     // row can't exist under the strict FK. Drop just that constraint for this
     // case to exercise the "preloaded but parent missing" → `Ok(None)` path.
-    diesel::sql_query("ALTER TABLE subreddits DROP CONSTRAINT IF EXISTS subreddits_creator_id_fkey")
-        .execute(&mut *conn)
-        .await
-        .expect("drop subreddits.creator_id fk");
+    diesel::sql_query(
+        "ALTER TABLE subreddits DROP CONSTRAINT IF EXISTS subreddits_creator_id_fkey",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("drop subreddits.creator_id fk");
     // A subreddit whose creator_id points at a user that does not exist.
     diesel::sql_query(
         "INSERT INTO subreddits (name, slug, description, creator_id) VALUES \

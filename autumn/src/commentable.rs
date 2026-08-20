@@ -278,7 +278,7 @@ pub struct CommentNode {
     /// Nesting depth, `0` for a top-level comment.
     pub depth: usize,
     /// Replies to this comment, in the same stable `(created_at, id)` order.
-    pub replies: Vec<CommentNode>,
+    pub replies: Vec<Self>,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -415,9 +415,16 @@ pub async fn add_comment(
                 }
             }
 
-            let inserted =
-                insert_comment(conn, &spec, &parent_type, parent_id, author_id, &body, reply_to)
-                    .await?;
+            let inserted = insert_comment(
+                conn,
+                &spec,
+                &parent_type,
+                parent_id,
+                author_id,
+                &body,
+                reply_to,
+            )
+            .await?;
 
             if let Some(counter_column) = spec.counter_column {
                 counter_cache_apply_delta(
@@ -670,8 +677,8 @@ async fn probe_parent(
     };
     let lock_clause = if lock { FOR_NO_KEY_UPDATE } else { "" };
 
-    let found: Option<ParentRow> = match (spec.parent_tenant_column, tenant) {
-        (Some(column), tenant) => {
+    let found: Option<ParentRow> = if let Some(column) = spec.parent_tenant_column {
+        {
             let sql = format!(
                 "SELECT {parent_pk} AS id FROM {parent_table} \
                  WHERE {parent_table}.{parent_pk} = {} \
@@ -687,7 +694,8 @@ async fn probe_parent(
                 .await
                 .optional_row()?
         }
-        (None, _) => {
+    } else {
+        {
             let sql = format!(
                 "SELECT {parent_pk} AS id FROM {parent_table} \
                  WHERE {parent_table}.{parent_pk} = {}{live}{lock_clause}",
@@ -787,17 +795,21 @@ async fn insert_comment(
     // Resolved in the `RETURNING` list so the caller can render the new comment
     // without a second round trip; `NULL` when the model declared no
     // `author_name` column.
-    // Reuses the author bind (`ph(4)`) rather than claiming a placeholder of
-    // its own: a `RETURNING` expression is evaluated per inserted row, and
-    // naming `author_id` unqualified there would be ambiguous against the
-    // author table's own columns.
+    // The author id is bound a SECOND time here rather than reusing `$4`.
+    // Postgres would happily take the repeat, but `SQLite` numbers its
+    // placeholders by *position of occurrence*, so a reused `$4` would render
+    // as a sixth bare `?` with only five values pushed. Binding it twice is the
+    // one spelling that is correct on both backends. (Naming `author_id`
+    // unqualified inside `RETURNING` is not an option either: it would be
+    // ambiguous against the author table's own columns.)
+    let resolves_author_name = spec.author_table.is_some() && spec.author_name_column.is_some();
     let author_name = match (spec.author_table, spec.author_name_column) {
         (Some(table), Some(column)) => format!(
             "(SELECT {} FROM {} WHERE {} = {})",
             quote_ident(column),
             quote_ident(table),
             quote_ident(spec.author_pk),
-            ph(4),
+            ph(6),
         ),
         _ => "CAST(NULL AS TEXT)".to_owned(),
     };
@@ -815,15 +827,29 @@ async fn insert_comment(
         ph(4),
         ph(5),
     );
-    diesel::sql_query(sql)
+    // Bind order mirrors placeholder ORDER OF OCCURRENCE in the statement
+    // text, which is what `SQLite`'s bare `?` counts: the five `VALUES` binds,
+    // then the author id again for the `RETURNING` sub-select. When there is no
+    // `author_name` to resolve the sub-select is absent, so the sixth bind
+    // would have no placeholder — hence the fork.
+    let query = diesel::sql_query(sql)
         .bind::<Text, _>(parent_type)
         .bind::<BigInt, _>(parent_id)
         .bind::<Nullable<BigInt>, _>(reply_to)
         .bind::<BigInt, _>(author_id)
-        .bind::<Text, _>(body)
-        .get_result::<Comment>(conn)
-        .await
-        .map_err(AutumnError::from)
+        .bind::<Text, _>(body);
+    if resolves_author_name {
+        query
+            .bind::<BigInt, _>(author_id)
+            .get_result::<Comment>(conn)
+            .await
+            .map_err(AutumnError::from)
+    } else {
+        query
+            .get_result::<Comment>(conn)
+            .await
+            .map_err(AutumnError::from)
+    }
 }
 
 /// Remove `comment_id` and its whole descendant subtree, returning how many
@@ -908,14 +934,15 @@ mod tests {
         }
     }
 
+    fn walk(nodes: &[CommentNode], out: &mut Vec<(usize, String)>) {
+        for node in nodes {
+            out.push((node.depth, node.comment.body.clone()));
+            walk(&node.replies, out);
+        }
+    }
+
     fn flatten(nodes: &[CommentNode]) -> Vec<(usize, String)> {
         let mut out = Vec::new();
-        fn walk(nodes: &[CommentNode], out: &mut Vec<(usize, String)>) {
-            for node in nodes {
-                out.push((node.depth, node.comment.body.clone()));
-                walk(&node.replies, out);
-            }
-        }
         walk(nodes, &mut out);
         out
     }
@@ -1034,7 +1061,6 @@ impl Default for CommentsConfig {
 /// not itself authenticate, and it does not itself verify a CSRF token (autumn's
 /// CSRF layer does, and the widget renders the hidden field for it).
 #[cfg(all(feature = "db", feature = "maud"))]
-#[must_use]
 pub fn router<S>(config: CommentsConfig) -> axum::Router<S>
 where
     S: crate::db::DbState + Clone + Send + Sync + 'static,
@@ -1067,9 +1093,9 @@ struct CommentSubmission {
 /// column and the tenancy middleware established one.
 #[cfg(all(feature = "db", feature = "maud"))]
 fn request_tenant(spec: &CommentableSpec) -> Option<String> {
-    if spec.parent_tenant_column.is_none() {
-        return None;
-    }
+    // A model with no tenant column emits no tenant predicate at all, so
+    // reading the task-local would only ever produce a value nothing uses.
+    spec.parent_tenant_column?;
     crate::tenancy::CURRENT_TENANT
         .try_with(Clone::clone)
         .ok()
@@ -1087,8 +1113,14 @@ async fn show_thread(
 ) -> AutumnResult<maud::Markup> {
     let spec = resolve_spec(&commentable_type)?;
     let tenant = request_tenant(spec);
-    let thread =
-        comment_thread(&mut db, spec, &commentable_type, parent_id, tenant.as_deref()).await?;
+    let thread = comment_thread(
+        &mut db,
+        spec,
+        &commentable_type,
+        parent_id,
+        tenant.as_deref(),
+    )
+    .await?;
     let author_id = session_author(&session, &config).await;
     Ok(render(
         &config,
@@ -1153,8 +1185,14 @@ async fn post_comment(
         return Ok(crate::Redirect::to(return_to).into_response());
     }
 
-    let thread =
-        comment_thread(&mut db, spec, &commentable_type, parent_id, tenant.as_deref()).await?;
+    let thread = comment_thread(
+        &mut db,
+        spec,
+        &commentable_type,
+        parent_id,
+        tenant.as_deref(),
+    )
+    .await?;
     Ok(render(
         &config,
         spec,
@@ -1190,10 +1228,7 @@ fn resolve_spec(commentable_type: &str) -> AutumnResult<&'static CommentableSpec
 
 /// The signed-in author's id, when the session carries one.
 #[cfg(all(feature = "db", feature = "maud"))]
-async fn session_author(
-    session: &crate::session::Session,
-    config: &CommentsConfig,
-) -> Option<i64> {
+async fn session_author(session: &crate::session::Session, config: &CommentsConfig) -> Option<i64> {
     session
         .get(&config.session_author_key)
         .await

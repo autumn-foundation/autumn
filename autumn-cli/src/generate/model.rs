@@ -2640,11 +2640,7 @@ fn render_model_file(
             .commentable_author
             .as_deref()
             .map_or_else(String::new, |author| format!("by = {author}, "));
-        let _ = writeln!(
-            out,
-            "#[commentable({by}counter_cache = {})]",
-            counter.name
-        );
+        let _ = writeln!(out, "#[commentable({by}counter_cache = {})]", counter.name);
     }
     // Struct-level `#[searchable(language = "…")]` (issue #1319) opts the model
     // into full-text search; the per-field `#[searchable(weight = "…")]` below

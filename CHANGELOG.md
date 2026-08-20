@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Threaded, polymorphic comments — `#[commentable]` (#1367):** Autumn's fifth
+  association kind. `belongs_to`/`has_many`/`has_one`/`through` all pin the
+  child to exactly one parent table, which is why every app that wants comments
+  on a *second* model duplicates the table, the routes, the threading query and
+  the count maintenance. `#[commentable(by = User)]` on a `#[model]` replaces
+  all of it: one `comments` table keyed on `(commentable_type,
+  commentable_id)`, with a `parent_id` self-reference for threading, attaches to
+  any number of models at once. The attribute emits `Model::COMMENTABLE_TYPE`,
+  `Model::commentable_spec()`, a `{Model}Comments` trait
+  (`add_comment(parent_id, author_id, body, reply_to)` /
+  `comment_thread(parent_id)` / `delete_comment(comment_id)`) blanket-implemented
+  over the generated repository, and an `inventory` registration — so
+  `AppBuilder::nest("/comments", autumn_web::commentable::router(…))` serves
+  **every** commentable model in the binary from one pair of routes, and adding
+  a third model needs no route, no query and no migration. `comment_thread` is
+  one query whatever the nesting depth (the tree is assembled in Rust, never an
+  N+1 walk) in stable `(created_at, id)` order; `delete_comment` cascades to the
+  whole descendant subtree and is idempotent. `parent.comment_count` is
+  maintained by the #1325 counter-cache primitive — a single atomic `SET c = c +
+  $1` **inside the comment's own transaction** — and the thread read is
+  soft-delete aware. Because a single column cannot reference two tables, the
+  write path *is* the referential check: `add_comment` probes and row-locks the
+  parent before inserting, so an unknown, soft-deleted or foreign-tenant parent
+  is a `404` before anything is written, and a `reply_to` naming a comment on a
+  different record (or one deeper than `max_depth`, default 5) is a `422`. The
+  view half is `widgets::comment_thread`, a no-JavaScript nested `<ol>` with an
+  inline `<details>` reply form on every node; with htmx present each form
+  additionally swaps the thread region in place. `autumn generate scaffold post
+  title:string comments:commentable` emits the shared table (once per project),
+  the `comment_count` column, and the attribute. See
+  `docs/guide/commentable.md`.
+
 - **`autumn generate webhook` for signed, replay-safe provider intake
   (#1366):** the `SignedWebhook` substrate has shipped since 0.4.0, but every
   Stripe/GitHub/Slack integration still hand-rolled the route, the endpoint

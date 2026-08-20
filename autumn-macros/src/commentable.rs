@@ -31,6 +31,7 @@ use crate::model::{infer_table_name, pascal_to_snake};
 /// is the one-liner `#[commentable(by = User)]` → a shared
 /// `comments(commentable_type, commentable_id, parent_id, author_id, body)`
 /// table maintaining `posts.comment_count`.
+#[derive(Debug)]
 pub struct CommentableSpec {
     /// The author model named by `by = <Model>` (e.g. `User`), when the
     /// declaration names one. `None` is fine — the comments table stores a
@@ -107,6 +108,27 @@ fn check_ident_value(key: &syn::Ident, value: &str, span: proc_macro2::Span) -> 
         ),
     ))
 }
+
+/// Every key `#[commentable(...)]` accepts, for the unknown-key diagnostic.
+const KNOWN_KEYS: &[&str] = &[
+    "by",
+    "type_name",
+    "table",
+    "comment_pk",
+    "type_column",
+    "id_column",
+    "parent_column",
+    "author_column",
+    "body_column",
+    "created_at_column",
+    "soft_delete",
+    "counter_cache",
+    "author_table",
+    "author_pk",
+    "author_name",
+    "max_depth",
+    "max_body",
+];
 
 /// One parsed `key = value` pair: the raw text plus where it came from.
 struct KeyValue {
@@ -210,32 +232,13 @@ pub fn parse_commentable_attr(
         })?;
     }
 
-    const KNOWN: &[&str] = &[
-        "by",
-        "type_name",
-        "table",
-        "comment_pk",
-        "type_column",
-        "id_column",
-        "parent_column",
-        "author_column",
-        "body_column",
-        "created_at_column",
-        "soft_delete",
-        "counter_cache",
-        "author_table",
-        "author_pk",
-        "author_name",
-        "max_depth",
-        "max_body",
-    ];
     for (key, parsed) in &pairs {
-        if !KNOWN.contains(&key.as_str()) {
+        if !KNOWN_KEYS.contains(&key.as_str()) {
             return Err(syn::Error::new(
                 parsed.span,
                 format!(
                     "unknown key `{key}` in `#[commentable]`; expected one of: {}",
-                    KNOWN.join(", ")
+                    KNOWN_KEYS.join(", ")
                 ),
             ));
         }
@@ -258,7 +261,9 @@ pub fn parse_commentable_attr(
     // against. Without it (and without an explicit `author_table`) there is
     // nothing to join, so `author_name` has no meaning — say so rather than
     // silently rendering `user #id` forever.
-    let author_table_default = author_model.as_ref().map_or_else(String::new, infer_table_name);
+    let author_table_default = author_model
+        .as_ref()
+        .map_or_else(String::new, infer_table_name);
     if let Some(parsed) = pairs.get("author_name")
         && author_table_default.is_empty()
         && !pairs.contains_key("author_table")
@@ -414,6 +419,10 @@ pub fn resolve_commentable(
 /// soft-delete and tenant columns are *projected into the spec* rather than
 /// assumed, so a model without them emits SQL byte-for-byte identical to what
 /// it would emit if the features did not exist.
+// One straight-line assembly of the generated items and their rendered docs,
+// mirroring `model::emit_votable_items`. Splitting it would mean threading a
+// dozen `TokenStream` fragments through helper signatures for no gain.
+#[allow(clippy::too_many_lines)]
 pub fn emit_commentable_items(
     model_ident: &syn::Ident,
     vis: &syn::Visibility,
@@ -441,10 +450,10 @@ pub fn emit_commentable_items(
     let max_depth = spec.max_depth;
     let max_body_bytes = spec.max_body_bytes;
 
-    let counter_column = match &spec.counter_column {
-        Some(column) => quote! { ::core::option::Option::Some(#column) },
-        None => quote! { ::core::option::Option::None },
-    };
+    let counter_column = spec.counter_column.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |column| quote! { ::core::option::Option::Some(#column) },
+    );
     let parent_tenant_column = if has_tenant_id {
         quote! { ::core::option::Option::Some("tenant_id") }
     } else {
@@ -453,19 +462,21 @@ pub fn emit_commentable_items(
     // The author table is only ever consulted to resolve a display name, so it
     // is projected together with the column: naming a table but no column would
     // emit a join whose selected expression is `NULL`.
-    let (author_table, author_name_column) = match &spec.author_name_column {
-        Some(column) => {
+    let (author_table, author_name_column) = spec.author_name_column.as_ref().map_or_else(
+        || {
+            (
+                quote! { ::core::option::Option::None },
+                quote! { ::core::option::Option::None },
+            )
+        },
+        |column| {
             let table = &spec.author_table;
             (
                 quote! { ::core::option::Option::Some(#table) },
                 quote! { ::core::option::Option::Some(#column) },
             )
-        }
-        None => (
-            quote! { ::core::option::Option::None },
-            quote! { ::core::option::Option::None },
-        ),
-    };
+        },
+    );
     let author_pk = &spec.author_pk;
 
     // ── Compile-time guards ──────────────────────────────────────────────
@@ -771,5 +782,270 @@ impl SpanOfAttr for syn::Path {
     fn span_of_attr(&self) -> proc_macro2::Span {
         use syn::spanned::Spanned as _;
         self.span()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::ToTokens as _;
+
+    /// Parse one `#[commentable(...)]` attribute written on `Post`.
+    fn parse(attr: &proc_macro2::TokenStream) -> syn::Result<CommentableSpec> {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attr: syn::Attribute = syn::parse_quote!(#[commentable #attr]);
+        parse_commentable_attr(&attr, &model)
+    }
+
+    fn error(attr: &proc_macro2::TokenStream) -> String {
+        parse(attr).expect_err("expected a rejection").to_string()
+    }
+
+    #[test]
+    fn a_bare_attribute_takes_every_convention() {
+        let spec = parse(&quote! {}).expect("`#[commentable]` alone is valid");
+        assert!(spec.author_model.is_none());
+        assert_eq!(spec.type_name, "Post");
+        assert_eq!(spec.table, "comments");
+        assert_eq!(spec.type_column, "commentable_type");
+        assert_eq!(spec.id_column, "commentable_id");
+        assert_eq!(spec.parent_column, "parent_id");
+        assert_eq!(spec.author_column, "author_id");
+        assert_eq!(spec.body_column, "body");
+        assert_eq!(spec.created_at_column, "created_at");
+        assert_eq!(spec.comment_pk, "id");
+        assert_eq!(spec.author_pk, "id");
+        assert!(spec.soft_delete);
+        assert_eq!(spec.counter_column.as_deref(), Some("comment_count"));
+        assert_eq!(spec.author_name_column, None);
+        assert_eq!(spec.max_depth, 5);
+        assert_eq!(spec.max_body_bytes, 10_000);
+    }
+
+    /// `by` supplies the author table by the same pluralize-the-snake-case
+    /// convention every other association uses.
+    #[test]
+    fn by_derives_the_author_table() {
+        let spec = parse(&quote! { (by = AppUser, author_name = username) }).expect("valid");
+        assert_eq!(
+            spec.author_model
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("AppUser")
+        );
+        assert_eq!(spec.author_table, "app_users");
+        assert_eq!(spec.author_name_column.as_deref(), Some("username"));
+    }
+
+    #[test]
+    fn every_key_can_be_overridden() {
+        let spec = parse(&quote! {(
+            by = User,
+            type_name = "LegacyPost",
+            table = discussion,
+            comment_pk = pk,
+            type_column = kind,
+            id_column = target_id,
+            parent_column = reply_to,
+            author_column = writer_id,
+            body_column = text,
+            created_at_column = posted_at,
+            soft_delete = false,
+            counter_cache = discussion_count,
+            author_table = accounts,
+            author_pk = account_id,
+            author_name = handle,
+            max_depth = 2,
+            max_body = 500,
+        )})
+        .expect("valid");
+        assert_eq!(spec.type_name, "LegacyPost");
+        assert_eq!(spec.table, "discussion");
+        assert_eq!(spec.comment_pk, "pk");
+        assert_eq!(spec.type_column, "kind");
+        assert_eq!(spec.id_column, "target_id");
+        assert_eq!(spec.parent_column, "reply_to");
+        assert_eq!(spec.author_column, "writer_id");
+        assert_eq!(spec.body_column, "text");
+        assert_eq!(spec.created_at_column, "posted_at");
+        assert!(!spec.soft_delete);
+        assert_eq!(spec.counter_column.as_deref(), Some("discussion_count"));
+        assert_eq!(spec.author_table, "accounts");
+        assert_eq!(spec.author_pk, "account_id");
+        assert_eq!(spec.author_name_column.as_deref(), Some("handle"));
+        assert_eq!(spec.max_depth, 2);
+        assert_eq!(spec.max_body_bytes, 500);
+    }
+
+    #[test]
+    fn counter_cache_false_opts_out_of_the_counter() {
+        assert_eq!(
+            parse(&quote! { (counter_cache = false) })
+                .expect("valid")
+                .counter_column,
+            None
+        );
+        // `true` is the same as omitting it, rather than a parse error — the
+        // spelling reads naturally next to `counter_cache = false`.
+        assert_eq!(
+            parse(&quote! { (counter_cache = true) })
+                .expect("valid")
+                .counter_column
+                .as_deref(),
+            Some("comment_count")
+        );
+    }
+
+    /// A repeated key would silently win last-write, so a typo'd
+    /// `table = a, table = b` would build SQL against the wrong one.
+    #[test]
+    fn a_repeated_key_is_rejected() {
+        let message = error(&quote! { (table = a, table = b) });
+        assert!(message.contains("duplicate `table = ...`"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_key_lists_the_ones_that_exist() {
+        let message = error(&quote! { (autor_name = username) });
+        assert!(message.contains("unknown key `autor_name`"), "{message}");
+        assert!(message.contains("author_name"), "{message}");
+    }
+
+    /// Every name-shaped value is spliced verbatim into generated SQL, so a
+    /// non-identifier must never get that far.
+    #[test]
+    fn a_non_identifier_value_is_rejected_before_it_reaches_sql() {
+        for attr in [
+            quote! { (table = "comments\"; DROP TABLE posts --") },
+            quote! { (counter_cache = "1bad") },
+            quote! { (by = User, author_name = "") },
+            quote! { (body_column = "has space") },
+        ] {
+            let message = error(&attr);
+            assert!(
+                message.contains("is not a valid identifier"),
+                "expected an identifier rejection, got: {message}"
+            );
+        }
+    }
+
+    /// An empty discriminator cannot tell two models' comments apart.
+    #[test]
+    fn an_empty_type_name_is_rejected() {
+        let message = error(&quote! { (type_name = "  ") });
+        assert!(message.contains("must not be empty"), "{message}");
+    }
+
+    /// Nothing joins to a display name without a table to read it from.
+    #[test]
+    fn author_name_without_a_table_is_rejected() {
+        let message = error(&quote! { (author_name = username) });
+        assert!(message.contains("needs a table"), "{message}");
+        // …and either way of supplying one is accepted.
+        assert!(parse(&quote! { (by = User, author_name = username) }).is_ok());
+        assert!(parse(&quote! { (author_table = users, author_name = username) }).is_ok());
+    }
+
+    #[test]
+    fn typed_keys_reject_the_wrong_literal_kind() {
+        assert!(
+            error(&quote! { (soft_delete = yes) }).contains("takes `true` or `false`"),
+            "soft_delete must be a bool"
+        );
+        assert!(
+            error(&quote! { (max_depth = deep) }).contains("takes an integer"),
+            "max_depth must be an integer"
+        );
+        assert!(
+            error(&quote! { (max_body = big) }).contains("takes an integer"),
+            "max_body must be an integer"
+        );
+    }
+
+    /// A cap of zero rejects every comment, which is never what anyone means.
+    #[test]
+    fn a_zero_max_body_is_rejected() {
+        let message = error(&quote! { (max_body = 0) });
+        assert!(message.contains("must be at least 1"), "{message}");
+    }
+
+    /// A second declaration would generate the same `{Model}Comments` trait.
+    #[test]
+    fn at_most_one_commentable_per_model() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[commentable(by = User)]),
+            syn::parse_quote!(#[commentable(by = User, table = other)]),
+        ];
+        let message = resolve_commentable(&model, &attrs)
+            .expect_err("a second declaration must be rejected")
+            .to_string();
+        assert!(
+            message.contains("at most one `#[commentable]`"),
+            "{message}"
+        );
+
+        // One is fine; none resolves to `None` and emits nothing at all.
+        assert!(
+            resolve_commentable(&model, &attrs[..1])
+                .expect("one is fine")
+                .is_some()
+        );
+        assert!(
+            resolve_commentable(&model, &[])
+                .expect("none is fine")
+                .is_none()
+        );
+    }
+
+    /// The emitted surface is what the runtime and the router bind to, so the
+    /// names are contract rather than cosmetics.
+    #[test]
+    fn the_emitted_items_carry_the_documented_names() {
+        let spec = parse(&quote! { (by = User, author_name = username) }).expect("valid");
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let vis: syn::Visibility = syn::parse_quote!(pub);
+        let pk: syn::Ident = syn::parse_quote!(id);
+        let emitted = emit_commentable_items(&model, &vis, &spec, "posts", false, false, Some(&pk))
+            .to_token_stream()
+            .to_string();
+
+        assert!(emitted.contains("PostComments"), "the trait name");
+        assert!(emitted.contains("COMMENTABLE_TYPE"));
+        assert!(emitted.contains("commentable_spec"));
+        assert!(emitted.contains("CommentableDescriptor"), "registry entry");
+        assert!(emitted.contains("add_comment"));
+        assert!(emitted.contains("comment_thread"));
+        assert!(emitted.contains("delete_comment"));
+        // The author guard is what turns a typo'd `by` into a name-resolution
+        // error rather than silence.
+        assert!(emitted.contains("PhantomData"));
+    }
+
+    /// A model with neither a tenant nor a soft-delete column must emit no
+    /// trace of either — that zero-cost path is the whole reason the spec
+    /// projects them rather than assuming them.
+    #[test]
+    fn a_plain_model_emits_no_tenant_or_soft_delete_machinery() {
+        let spec = parse(&quote! { (by = User) }).expect("valid");
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let vis: syn::Visibility = syn::parse_quote!(pub);
+        let pk: syn::Ident = syn::parse_quote!(id);
+
+        let plain = emit_commentable_items(&model, &vis, &spec, "posts", false, false, Some(&pk))
+            .to_token_stream()
+            .to_string();
+        assert!(plain.contains("parent_soft_delete : false"), "{plain}");
+        assert!(
+            plain.contains("parent_tenant_column : :: core :: option :: Option :: None"),
+            "{plain}"
+        );
+
+        let tenanted = emit_commentable_items(&model, &vis, &spec, "posts", true, true, Some(&pk))
+            .to_token_stream()
+            .to_string();
+        assert!(tenanted.contains("parent_soft_delete : true"), "{tenanted}");
+        assert!(tenanted.contains("\"tenant_id\""), "{tenanted}");
     }
 }

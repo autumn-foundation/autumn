@@ -13,9 +13,9 @@
 pub mod admin;
 pub mod auth;
 pub mod channel;
+pub mod commentable;
 pub mod config;
 pub mod controller;
-pub mod commentable;
 pub mod counter_cache;
 pub mod dsl;
 pub mod emit;

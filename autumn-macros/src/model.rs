@@ -17,9 +17,7 @@ use quote::{ToTokens as _, format_ident, quote};
 use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
 
-use crate::commentable::{
-    emit_commentable_items, is_commentable_attr, resolve_commentable,
-};
+use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
 
 /// Parsed `#[model(...)]` attribute arguments.
 ///

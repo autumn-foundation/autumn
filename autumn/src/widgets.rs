@@ -1249,7 +1249,7 @@ pub struct CommentView {
     /// `datetime` is `None`.
     pub timestamp: String,
     /// Replies to this comment, in the order they should render.
-    pub replies: Vec<CommentView>,
+    pub replies: Vec<Self>,
 }
 
 #[cfg(all(feature = "maud", feature = "db"))]
@@ -1269,9 +1269,11 @@ impl CommentView {
             .iter()
             .map(|node| Self {
                 id: node.comment.id,
-                author: node.comment.author_name.clone().unwrap_or_else(|| {
-                    format!("user #{}", node.comment.author_id)
-                }),
+                author: node
+                    .comment
+                    .author_name
+                    .clone()
+                    .unwrap_or_else(|| format!("user #{}", node.comment.author_id)),
                 body: node.comment.body.clone(),
                 datetime: Some(
                     node.comment
@@ -1605,10 +1607,10 @@ fn comment_node(cfg: &CommentThread, comment: &CommentView, depth: usize) -> mau
 /// The shared comment/reply form. `reply_to` distinguishes the two.
 #[cfg(feature = "maud")]
 fn comment_form(cfg: &CommentThread, reply_to: Option<i64>) -> maud::Markup {
-    let textarea_id = match reply_to {
-        Some(id) => format!("{}-c{id}-body", cfg.dom_id),
-        None => format!("{}-body", cfg.dom_id),
-    };
+    let textarea_id = reply_to.map_or_else(
+        || format!("{}-body", cfg.dom_id),
+        |id| format!("{}-c{id}-body", cfg.dom_id),
+    );
     let submit_label = if reply_to.is_some() {
         &cfg.reply_label
     } else {
@@ -5794,7 +5796,6 @@ pub fn line_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud
 mod tests {
     use super::*;
 
-
     // ── comment_thread (#1367) ─────────────────────────────────────────
 
     /// A two-level fixture: one root with one reply.
@@ -5871,7 +5872,10 @@ mod tests {
         let cfg = CommentThread::new("c", "/comments/Post/1");
         let html = comment_thread(&cfg, &comment_fixture()).into_string();
         assert_eq!(html.matches(r#"class="autumn-comment-list""#).count(), 2);
-        assert!(html.contains(r#"id="c-c2""#), "the reply gets its own node id");
+        assert!(
+            html.contains(r#"id="c-c2""#),
+            "the reply gets its own node id"
+        );
     }
 
     /// Blank-line-separated paragraphs render as separate `<p>`s, and the body
@@ -5931,7 +5935,10 @@ mod tests {
         let html = comment_thread(&cfg, &comment_fixture()).into_string();
         assert!(!html.contains("<form"));
         assert!(html.contains("Sign in to comment."));
-        assert!(html.contains("unrelated"), "the thread itself still renders");
+        assert!(
+            html.contains("unrelated"),
+            "the thread itself still renders"
+        );
     }
 
     #[test]
@@ -5940,7 +5947,10 @@ mod tests {
         let html = comment_thread(&cfg, &[]).into_string();
         assert!(html.contains("Nothing here."));
         assert!(html.contains(r#"class="autumn-comments-empty""#));
-        assert!(html.contains("<form"), "an empty thread still invites a first comment");
+        assert!(
+            html.contains("<form"),
+            "an empty thread still invites a first comment"
+        );
     }
 
     /// `return_to` is the no-JS round trip: the host page names where to come
@@ -5950,7 +5960,8 @@ mod tests {
         let cfg = CommentThread::new("c", "/comments/Post/1").return_to("/r/rust/posts/hello");
         let html = comment_thread(&cfg, &comment_fixture()).into_string();
         assert_eq!(
-            html.matches(r#"name="return_to" value="/r/rust/posts/hello""#).count(),
+            html.matches(r#"name="return_to" value="/r/rust/posts/hello""#)
+                .count(),
             4
         );
     }

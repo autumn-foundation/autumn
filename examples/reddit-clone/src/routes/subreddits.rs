@@ -227,12 +227,13 @@ pub async fn show(
     )
     .label("Community discussion")
     .empty_text("No community discussion yet.")
-    .return_to(&__autumn_path_show(&sub.slug))
+    .return_to(__autumn_path_show(&sub.slug))
     .max_depth(usize::try_from(Subreddit::commentable_spec().max_depth).unwrap_or(5));
     if current_user.is_some() {
         comment_config = comment_config.csrf_token(csrf.token());
     } else {
-        comment_config = comment_config.read_only(Some("Log in to join the discussion.".to_owned()));
+        comment_config =
+            comment_config.read_only(Some("Log in to join the discussion.".to_owned()));
     }
 
     // Consume the flash only after all fallible work above.
