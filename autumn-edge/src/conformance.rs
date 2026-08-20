@@ -30,11 +30,11 @@ use crate::wire::{
 /// this list weakens the guarantee, so it is one constant rather than a
 /// per-test allowance.
 pub const VOLATILE_HEADERS: &[&str] = &[
-    "date",
-    "x-request-id",
-    "server-timing",
     "content-security-policy",
+    "date",
+    "server-timing",
     "set-cookie",
+    "x-request-id",
 ];
 
 /// What a conformance case expects.
@@ -313,6 +313,9 @@ mod tests {
         );
         assert!(VOLATILE_HEADERS.contains(&"date"));
         assert!(VOLATILE_HEADERS.contains(&"set-cookie"));
-        let _ = sorted;
+        assert_eq!(
+            VOLATILE_HEADERS, sorted,
+            "keep VOLATILE_HEADERS sorted so the docs and the guide stay diffable"
+        );
     }
 }

@@ -34,7 +34,12 @@
 //! | --- | --- |
 //! | `Path`, `Query`, `HeaderMap` | sessions, auth, CSRF, flash |
 //! | [`EdgeCache`] (a mediated, non-authoritative KV read) | a database, writes of any kind |
-//! | any pure rendering | clocks, entropy, outbound HTTP |
+//! | any pure rendering | the `Clock`/`Rng` extractors, outbound HTTP |
+//!
+//! Ambient time and randomness (`SystemTime::now()`, `getrandom`) *compile* at
+//! the edge but return whatever the host decides — the reference host pins
+//! them for determinism, a real edge host will not — so keep them out of
+//! handlers (see `docs/guide/edge.md`).
 //!
 //! The restriction is enforced by the type system: an edge handler must be an
 //! `axum` handler over the unit [`EdgeState`], so a native-only extractor

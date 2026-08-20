@@ -39,7 +39,8 @@
 //!
 //! # The sentinel
 //!
-//! A response carrying the [`FALLTHROUGH_SENTINEL`] header is a decline, not
+//! A response carrying the [`FALLTHROUGH_SENTINEL`](crate::wire::FALLTHROUGH_SENTINEL)
+//! header is a decline, not
 //! an answer: the runtime converts it to a fallthrough and neither the header
 //! nor the response body ever reaches the wire. That is how the 404 fallback,
 //! the [`EdgeCache`] rejection, and a handler's own explicit opt-out all reach
@@ -293,16 +294,24 @@ where
         let Ok(response) = router.oneshot(http_request).await;
 
         let status = response.status().as_u16();
-        let mut headers: Vec<(String, String)> = response
-            .headers()
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_owned(),
-                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                )
-            })
-            .collect();
+        // Header values cross the wire as JSON strings, so they must be valid
+        // UTF-8. A lossy conversion here would silently serve *different
+        // bytes* than the origin (which sends header values verbatim), so a
+        // non-UTF-8 value is a deterministic decline instead: the origin
+        // serves the request with the value intact.
+        let mut headers = Vec::with_capacity(response.headers().len());
+        for (name, value) in response.headers() {
+            let Ok(text) = std::str::from_utf8(value.as_bytes()) else {
+                return EdgeOutcome::fallthrough(
+                    FallthroughReason::CapsuleError,
+                    format!(
+                        "the handler for {uri} set a non-UTF-8 value on the `{name}` response \
+                         header, which cannot cross the edge wire byte-faithfully"
+                    ),
+                );
+            };
+            headers.push((name.as_str().to_owned(), text.to_owned()));
+        }
         let sentinel = strip_sentinel(&mut headers);
 
         if let Some(raw) = sentinel {

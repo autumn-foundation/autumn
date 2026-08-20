@@ -34,6 +34,7 @@ fn compile_fail_tests() {
     // pre-rendered CDN-side.
     t.compile_fail("tests/compile-fail/edge_on_post.rs");
     t.compile_fail("tests/compile-fail/edge_with_secured.rs");
+    t.compile_fail("tests/compile-fail/edge_with_intercept.rs");
     t.compile_fail("tests/compile-fail/edge_on_static_get.rs");
 
     // Lifecycle macro failures (always available — the `lifecycle` macro is not

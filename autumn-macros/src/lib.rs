@@ -964,13 +964,13 @@ pub fn public(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// #[get("/greet/{name}")]
 /// #[edge]
-/// async fn greet(name: Path<String>) -> String {
+/// async fn greet(Path(name): Path<String>) -> String {
 ///     format!("Hello, {name}!")
 /// }
 ///
 /// #[get("/note/{id}")]
 /// #[edge(needs(kv))]
-/// async fn note(id: Path<String>, cache: EdgeCache) -> String {
+/// async fn note(Path(id): Path<String>, cache: EdgeCache) -> String {
 ///     cache.get_string(&id).unwrap_or_else(|| "not cached".to_owned())
 /// }
 /// ```

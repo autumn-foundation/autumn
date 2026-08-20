@@ -59,7 +59,12 @@ pub fn route_macro(
     // errors from the emitted edge companion.
     let edge = crate::edge::detect(&input_fn);
     if let Some(marking) = edge
-        && let Some(err) = reject_ineligible_edge_route(http_method, &input_fn, marking.span)
+        && let Some(err) = reject_ineligible_edge_route(
+            http_method,
+            &input_fn,
+            !interceptors.is_empty(),
+            marking.span,
+        )
     {
         return err;
     }
@@ -290,6 +295,12 @@ const EDGE_GUARD_ERROR: &str = "`#[edge]` cannot be combined with \
                                 capsule has no session or auth state; serve this route from the \
                                 origin";
 
+/// Compile error for `#[edge]` stacked with `#[intercept(...)]`.
+const EDGE_INTERCEPT_ERROR: &str = "`#[edge]` cannot be combined with `#[intercept(...)]` — \
+                                    interceptor layers are origin-only tower middleware and are \
+                                    not carried into the edge capsule, so the two lanes would \
+                                    serve different bytes; serve this route from the origin";
+
 /// Marker consts the auth/rate guards inject into a handler body. A guard that
 /// expanded *before* this route macro left one of these behind instead of an
 /// attribute, and missing it would ship a guarded route to the unauthenticated
@@ -307,6 +318,7 @@ const GUARD_MARKERS: &[&str] = &[
 fn reject_ineligible_edge_route(
     http_method: &str,
     input_fn: &syn::ItemFn,
+    has_interceptors: bool,
     span: Span,
 ) -> Option<TokenStream> {
     if http_method != "GET" {
@@ -314,6 +326,12 @@ fn reject_ineligible_edge_route(
     }
     if has_auth_or_rate_guard(input_fn) {
         return Some(syn::Error::new(span, EDGE_GUARD_ERROR).to_compile_error());
+    }
+    // `#[intercept(...)]` attrs were already stripped off `input_fn` by
+    // `parse::extract_interceptors`, so the caller passes the extracted list's
+    // emptiness instead of this fn re-scanning attributes.
+    if has_interceptors {
+        return Some(syn::Error::new(span, EDGE_INTERCEPT_ERROR).to_compile_error());
     }
     None
 }
@@ -363,7 +381,10 @@ fn emit_edge_items(
                     method: ::autumn_edge::reexports::http::Method::GET,
                     path: #path,
                     // The same handler axum mounts natively — including the
-                    // primitive-output wrapper when there is one — so the two
+                    // primitive-output wrapper when there is one. Everything
+                    // else the native mount can wrap around a handler
+                    // (`#[intercept]` layers, auth guards) is refused for edge
+                    // routes by `reject_ineligible_edge_route`, so the two
                     // lanes cannot diverge on how a response is produced.
                     handler: ::autumn_edge::edge_get(#handler_name),
                     name: ::core::stringify!(#fn_name),
@@ -1720,6 +1741,77 @@ mod tests {
         assert!(
             generated.contains("compile_error"),
             "a buried #[edge] marker must still be detected next to #[secured]: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_with_intercept_is_a_compile_error() {
+        // `#[intercept]` layers wrap only the native mount; the edge companion
+        // mounts the bare handler, so allowing the pair would let the two
+        // lanes serve different bytes. Refused whichever side of `#[get]` the
+        // interceptor sits on.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/stamped" },
+            quote! {
+                #[edge]
+                #[intercept(StampLayer)]
+                async fn stamped() -> &'static str { "stamped" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "#[edge] + #[intercept] must be rejected: {generated}"
+        );
+        assert!(
+            generated.contains("origin-only tower middleware"),
+            "the error must explain that interceptors do not cross into the capsule: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_marker_with_intercept_is_a_compile_error() {
+        // Ordering B: `#[edge]` above `#[get]` (already expanded into its
+        // marker const), `#[intercept]` still a live attribute.
+        let edged = crate::edge::edge_macro(
+            quote! {},
+            quote! {
+                #[intercept(StampLayer)]
+                async fn stamped() -> &'static str { "stamped" }
+            },
+        );
+        let generated = route_macro("GET", "get", quote! { "/stamped" }, edged).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "an expanded #[edge] marker + live #[intercept] must be rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_intercept_without_edge_is_unaffected() {
+        // The refusal must not leak into the ordinary interceptor path.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/stamped" },
+            quote! {
+                #[intercept(StampLayer)]
+                async fn stamped() -> &'static str { "stamped" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("compile_error"),
+            "#[intercept] without #[edge] must keep compiling: {generated}"
+        );
+        assert!(
+            generated.contains("StampLayer"),
+            "the interceptor layer must still wrap the native mount: {generated}"
         );
     }
 

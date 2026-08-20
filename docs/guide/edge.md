@@ -146,6 +146,7 @@ lane could not honour:
 | --- | --- |
 | `#[post]` / `#[put]` / `#[delete]` + `#[edge]` | the edge lane is read-path only; the origin is the authority for every write |
 | `#[secured]` / `#[authorize]` / `#[step_up]` / `#[throttle]` + `#[edge]` | the capsule has no session, no auth state, and no shared rate counter |
+| `#[intercept(...)]` + `#[edge]` | interceptor layers are origin-only tower middleware; the capsule mounts the bare handler, so the two lanes would serve different bytes |
 | `#[static_get]` + `#[edge]` | the route is already pre-rendered and served CDN-side; a capsule adds nothing |
 | `#[ws]` / `#[oauth2_callback]` + `#[edge]` | neither is a read-path GET |
 | `#[edge(needs(db))]` | `kv` is the only capability the host mediates today |
@@ -243,7 +244,7 @@ stated precisely, in one constant both the tests and this page read from —
 `autumn_edge::conformance::VOLATILE_HEADERS`:
 
 ```text
-date · x-request-id · server-timing · content-security-policy · set-cookie
+content-security-policy · date · server-timing · set-cookie · x-request-id
 ```
 
 Those are dropped from both sides before comparison, names are lowercased and
@@ -259,8 +260,10 @@ origin and *your* capsule, built together, agree.
 ### Determinism is your half of the contract
 
 Byte-identity only holds if the handler is a function of its request. The
-framework removes the usual sources of drift — there is no clock, no entropy and
-no ambient state at the edge — but a handler can still be non-deterministic:
+framework removes the usual sources of drift — the `Clock` and `Rng` extractors
+do not exist at the edge, and the *reference host* pins the WASI clock to zero
+and seeds `random_get` deterministically — but a real edge host makes no such
+promise, and a handler can still be non-deterministic:
 
 - **`HashMap` / `HashSet` iteration order.** Rendering a map's entries in
   iteration order produces different bytes on different runs *and* different
@@ -273,6 +276,11 @@ no ambient state at the edge — but a handler can still be non-deterministic:
   `usize::MAX`, on a hash of a pointer, or on `size_of::<usize>()` is not.
 - **Anything address-derived.** Pointer values, `{:p}`, and default `Hash`
   seeds differ per process.
+- **Ambient time and randomness.** `SystemTime::now()`, `getrandom`, and
+  anything built on them (`Utc::now()`, `Uuid::new_v4()`) compile at the edge —
+  WASI provides both syscalls — and return whatever the host decides. The
+  reference host pins them; a CDN host will not. Keep them out of `#[edge]`
+  handlers.
 
 The conformance suite runs each side twice and compares it with itself before
 comparing lanes, so a handler that manages to be non-deterministic is reported
@@ -374,10 +382,11 @@ error rather than a silently skipped step.
 | Check | Result | When |
 | --- | --- | --- |
 | `edge_target` | **Fail** | the project has `#[edge]` routes and `wasm32-wasip1` is not installed — hinting ``Run `rustup target add wasm32-wasip1` `` |
-| `edge_routes` | **Fail** | an `#[edge]` handler also carries an auth or rate guard (the build would fail too; doctor catches it first) |
+| `edge_routes` | **Fail** | an `#[edge]` handler also carries an auth/rate guard or `#[intercept]` (the build would fail too; doctor catches it first) |
 | `edge_routes` | **Warn** | a handler is marked but never registered with `edge_routes![]`, or `src/bin/edge-capsule.rs` is missing |
 
-Both report `file:line` for the handler at fault, and both pass with "no
+`edge_routes` reports `handler @ file:line` for the handler at fault;
+`edge_target` names the files that carry edge routes. Both pass with "no
 `#[edge]` routes" on a project that has none.
 
 ### Deploying

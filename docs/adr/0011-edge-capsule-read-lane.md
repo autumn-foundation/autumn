@@ -177,8 +177,13 @@ unfiltered CI job.
 - **`autumn-macros` emits `::autumn_edge::…` paths** for edge routes, so an app
   that marks a route must depend on `autumn-edge`. The macro crate itself does
   not.
-- **The `edge` feature is not yet linted by any CI clippy lane**, so
-  `edge_support.rs` carries its panic-gate deny block without a manifest entry.
+- **The `edge` feature is linted through workspace feature unification**, not a
+  dedicated `-p autumn-web --features` lane: `examples/edge-greeting` (a
+  workspace member) enables it, so the lint job's `cargo clippy --workspace`
+  compiles `edge_support.rs`'s panic-gate deny block. The module carries the
+  deny block without a `check-panic-gate.sh` manifest entry because that
+  script's feature-reachability check cannot see unification (details in the
+  module's header comment).
 
 ### Risks
 

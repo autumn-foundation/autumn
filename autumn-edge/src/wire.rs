@@ -62,8 +62,15 @@ pub const FALLTHROUGH_SENTINEL: &str = "x-autumn-edge-fallthrough";
 ///
 /// Stripped by the host before the request frame is sent and again by the
 /// guest on receipt — a defensive double-strip, because the guest cannot audit
-/// the host it is running under.
-pub const SENSITIVE_HEADERS: &[&str] = &["cookie", "authorization", "proxy-authorization"];
+/// the host it is running under. The [`FALLTHROUGH_SENTINEL`] is in the list
+/// because it is an internal control channel: an inbound request must not be
+/// able to pre-set it and confuse a handler that echoes request headers.
+pub const SENSITIVE_HEADERS: &[&str] = &[
+    "cookie",
+    "authorization",
+    "proxy-authorization",
+    FALLTHROUGH_SENTINEL,
+];
 
 // ── Errors ───────────────────────────────────────────────────────────
 
@@ -528,6 +535,22 @@ mod tests {
         assert_eq!(
             strip_sensitive_headers(&input),
             owned(&[("accept", "text/html"), ("x-keep", "yes")])
+        );
+    }
+
+    #[test]
+    fn strip_sensitive_removes_an_inbound_fallthrough_sentinel() {
+        // The sentinel is an internal control channel: an inbound request must
+        // not be able to pre-set it and confuse a handler that echoes request
+        // headers (or a host that scans them).
+        let input = owned(&[
+            ("X-Autumn-Edge-Fallthrough", "unknown_route"),
+            ("accept", "text/html"),
+        ]);
+
+        assert_eq!(
+            strip_sensitive_headers(&input),
+            owned(&[("accept", "text/html")])
         );
     }
 

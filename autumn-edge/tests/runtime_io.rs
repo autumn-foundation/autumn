@@ -61,6 +61,18 @@ async fn garbled_optout() -> (
     )
 }
 
+/// A handler whose response header value is valid HTTP but not valid UTF-8 —
+/// it cannot cross the JSON wire byte-faithfully, so the runtime must decline
+/// rather than serve a lossily rewritten value the origin would never send.
+async fn latin1_header() -> (http::HeaderMap, &'static str) {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "x-latin1",
+        http::HeaderValue::from_bytes(&[0xE9, 0xE8]).expect("opaque bytes are a valid value"),
+    );
+    (headers, "body")
+}
+
 fn routes() -> Vec<EdgeRoute> {
     vec![
         EdgeRoute {
@@ -68,6 +80,13 @@ fn routes() -> Vec<EdgeRoute> {
             path: "/greet/{name}",
             handler: edge_get(greet),
             name: "greet",
+            needs: &[],
+        },
+        EdgeRoute {
+            method: http::Method::GET,
+            path: "/latin1",
+            handler: edge_get(latin1_header),
+            name: "latin1_header",
             needs: &[],
         },
         EdgeRoute {
@@ -189,6 +208,43 @@ fn a_matched_get_is_served() {
     assert_eq!(response.status, 200);
     assert_eq!(response.body, b"hello ada");
     assert_eq!(header(response, "x-edge-lane"), Some("edge"));
+}
+
+#[test]
+fn head_is_served_by_the_get_router_with_an_empty_body_and_gets_content_length() {
+    let get_frames = drive(&[request_line(EdgeRequest::get("/greet/ada"), &[])]);
+    let mut head_request = EdgeRequest::get("/greet/ada");
+    head_request.method = "HEAD".to_owned();
+    let head_frames = drive(&[request_line(head_request, &[])]);
+
+    let get_response = expect_response(&get_frames[0]);
+    let head_response = expect_response(&head_frames[0]);
+    assert_eq!(head_response.status, 200);
+    assert!(
+        head_response.body.is_empty(),
+        "HEAD must carry no body: {head_response:?}"
+    );
+    // axum answers HEAD from the GET handler, advertising the GET body's
+    // length — the same on every target, since it is the same axum.
+    assert_eq!(
+        header(head_response, "content-length"),
+        header(get_response, "content-length"),
+        "HEAD must advertise the GET body's content-length"
+    );
+    assert_eq!(header(head_response, "x-edge-lane"), Some("edge"));
+}
+
+#[test]
+fn a_non_utf8_response_header_value_is_a_fallthrough_not_a_lossy_rewrite() {
+    let frames = drive(&[request_line(EdgeRequest::get("/latin1"), &[])]);
+
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    let (reason, detail) = expect_fallthrough(&frames[0]);
+    assert_eq!(reason, FallthroughReason::CapsuleError);
+    assert!(
+        detail.contains("x-latin1") && detail.contains("non-UTF-8"),
+        "the decline must name the offending header: {detail}"
+    );
 }
 
 #[test]

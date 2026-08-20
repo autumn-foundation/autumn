@@ -55,9 +55,10 @@ use std::str::FromStr as _;
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 
 /// Attribute names that cannot coexist with `#[edge]`: the edge capsule has no
-/// session, no auth state, and no rate-limit store, so the `#[edge]` macro
-/// rejects each of these on the same handler.
-pub const EDGE_GUARD_ATTRS: &[&str] = &["secured", "authorize", "step_up", "throttle"];
+/// session, no auth state, and no rate-limit store, and `#[intercept]` layers
+/// are origin-only tower middleware that never run in the capsule, so the
+/// `#[edge]` macro rejects each of these on the same handler.
+pub const EDGE_GUARD_ATTRS: &[&str] = &["secured", "authorize", "step_up", "throttle", "intercept"];
 
 /// One `#[edge]`-marked handler function found in the project's sources.
 #[derive(Debug, Clone, PartialEq, Eq)]

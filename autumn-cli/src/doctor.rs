@@ -8178,8 +8178,9 @@ pub fn check_edge_routes_impl(
             status: CheckStatus::Fail,
             detail: Some(lines.join("\n")),
             hint: Some(
-                "Remove #[edge] or the auth guard: edge routes are unauthenticated read-path \
-                 routes; the capsule has no session, auth, or rate-limit state.",
+                "Remove #[edge] or the conflicting attribute: edge routes are unauthenticated \
+                 read-path routes served without origin middleware — the capsule has no session, \
+                 auth, or rate-limit state, and #[intercept] layers do not run there.",
             ),
         };
     }
