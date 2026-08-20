@@ -46,6 +46,23 @@ async fn note(Path(key): Path<String>, cache: EdgeCache) -> String {
         .unwrap_or_else(|| "not cached here".to_owned())
 }
 
+/// A handler that would betray a lane divergence if credentials were visible:
+/// the wire strips them before the capsule, and the macro's native mount must
+/// strip the same set.
+#[get("/edge/credential-blind")]
+#[edge]
+async fn credential_blind(headers: axum::http::HeaderMap) -> String {
+    let saw: Vec<&str> = ["cookie", "authorization", "proxy-authorization"]
+        .into_iter()
+        .filter(|name| headers.contains_key(*name))
+        .collect();
+    if saw.is_empty() {
+        "no credentials visible".to_owned()
+    } else {
+        format!("SAW: {}", saw.join(","))
+    }
+}
+
 /// A cache pre-filled the way an origin app fills it: through the normal
 /// serde-aware `insert_cached` path, with no knowledge of the edge lane.
 fn seeded_cache() -> Arc<dyn Cache> {
@@ -108,6 +125,23 @@ async fn an_edge_route_serves_natively_through_the_origin_router() {
         .await
         .assert_ok()
         .assert_body_eq("Hello, ada!");
+}
+
+#[tokio::test]
+async fn the_origin_mount_strips_credentials_exactly_like_the_wire_does() {
+    let client = TestApp::new()
+        .routes(routes![greet, note, credential_blind])
+        .build();
+
+    client
+        .get("/edge/credential-blind")
+        .header("cookie", "session=secret")
+        .header("authorization", "Bearer secret")
+        .header("proxy-authorization", "Basic secret")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_eq("no credentials visible");
 }
 
 #[tokio::test]

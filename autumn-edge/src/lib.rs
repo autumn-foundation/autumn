@@ -115,7 +115,7 @@ pub use handler::{EdgeHandler, edge_get};
 pub use kv::{EdgeKv, EmptyEdgeKv, InMemoryEdgeKv};
 pub use route::{EdgeCapability, EdgeRoute, EdgeState};
 pub use router::{CapabilityProbe, build_edge_router};
-pub use runtime::{serve, serve_io};
+pub use runtime::{serve, serve_io, strip_request_credentials};
 pub use wire::{
     EdgeOutcome, EdgeRequest, EdgeResponse, FALLTHROUGH_SENTINEL, FallthroughReason,
     SENSITIVE_HEADERS, WIRE_VERSION, WireError,

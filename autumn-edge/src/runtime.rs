@@ -248,6 +248,25 @@ fn render_capabilities(capabilities: &[EdgeCapability]) -> String {
 
 // ── dispatch ─────────────────────────────────────────────────────────
 
+/// Strip the request headers a capsule never sees — for the *origin* mount.
+///
+/// The `#[edge]` macro wraps every native mount of an edge route in
+/// `map_request(strip_request_credentials)`, so a handler observes the same
+/// header set on both substrates. Without this, a handler that branches on
+/// `cookie`/`authorization` would serve different bytes at the origin than at
+/// the edge — the guest-side strip alone equalizes what the *capsule* sees,
+/// not what the handler sees natively. Route-local by construction: the app's
+/// own middleware (sessions, guards on other routes) wraps the router above
+/// this layer and still sees the original request.
+pub async fn strip_request_credentials(
+    mut request: axum::extract::Request,
+) -> axum::extract::Request {
+    for name in crate::wire::SENSITIVE_HEADERS {
+        request.headers_mut().remove(*name);
+    }
+    request
+}
+
 fn dispatch<R, W>(
     router: &Router<()>,
     transport: &Arc<Mutex<Transport<R, W>>>,

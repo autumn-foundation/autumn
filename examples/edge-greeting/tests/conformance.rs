@@ -87,6 +87,18 @@ const CORPUS: &[ConformanceCase] = &[
         expect: Expectation::Served,
     },
     ConformanceCase {
+        name: "credentials are invisible to a header-reading handler in both lanes",
+        method: "GET",
+        uri: "/whoami",
+        headers: &[
+            ("cookie", "session=super-secret"),
+            ("authorization", "Bearer super-secret"),
+            ("proxy-authorization", "Basic super-secret"),
+        ],
+        provided_capabilities: &[],
+        expect: Expectation::Served,
+    },
+    ConformanceCase {
         name: "kv hit",
         method: "GET",
         uri: "/note/greeting",
@@ -590,6 +602,7 @@ fn origin() -> autumn_web::test::TestClient {
             edge_greeting::handlers::note,
             edge_greeting::handlers::stats,
             edge_greeting::handlers::count,
+            edge_greeting::handlers::whoami,
             edge_greeting::handlers::boom,
             edge_greeting::origin::feedback,
         ])

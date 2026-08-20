@@ -180,12 +180,25 @@ pub fn route_macro(
         || has_step_up_guard(&input_fn)
         || has_throttle_guard(&input_fn);
     let intercepted_route = !interceptors.is_empty();
-    let handler_expr = build_handler_expr(
+    let mut handler_expr = build_handler_expr(
         &routing_fn,
         &handler_name,
         &interceptors,
         !body_guarded_replay && !intercepted_route,
     );
+    if edge.is_some() {
+        // The wire runtime strips SENSITIVE_HEADERS before the capsule
+        // dispatches, so the native mount must strip the same set before the
+        // handler: otherwise a handler that reads `cookie`/`authorization`
+        // through `HeaderMap` would serve different bytes at the origin than
+        // at the edge. Route-local — middleware above the router still sees
+        // the original request.
+        handler_expr = quote! {
+            #handler_expr.layer(::autumn_edge::reexports::axum::middleware::map_request(
+                ::autumn_edge::strip_request_credentials,
+            ))
+        };
+    }
     let route_idempotency = if intercepted_route {
         quote! { ::autumn_web::RouteIdempotency::Direct }
     } else {
@@ -1824,6 +1837,42 @@ mod tests {
         assert!(
             generated.contains("compile_error"),
             "an expanded #[edge] marker + live #[intercept] must be rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_native_mount_strips_request_credentials() {
+        // The wire runtime strips SENSITIVE_HEADERS before capsule dispatch;
+        // the native mount must strip the same set so a HeaderMap-reading
+        // handler observes identical headers on both substrates.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/greet/{name}" },
+            quote! {
+                #[edge]
+                async fn greet(Path(name): Path<String>) -> String { name }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("strip_request_credentials"),
+            "the edge route's native mount must carry the credential strip: {generated}"
+        );
+
+        let plain = route_macro(
+            "GET",
+            "get",
+            quote! { "/greet/{name}" },
+            quote! {
+                async fn greet(Path(name): Path<String>) -> String { name }
+            },
+        )
+        .to_string();
+        assert!(
+            !plain.contains("strip_request_credentials"),
+            "a non-edge route must not be rewritten: {plain}"
         );
     }
 

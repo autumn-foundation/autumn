@@ -15,7 +15,7 @@
 //!    extractor that is not there (`Db`, `Session`, `Clock`, `Rng`) does not
 //!    satisfy the `EdgeHandler` bound, and the diagnostic says so.
 //!
-//! # Why these five routes
+//! # Why these six routes
 //!
 //! Each one is a class of thing that could plausibly differ between two
 //! compilations of "the same" code, which is what
@@ -27,13 +27,14 @@
 //! | `/note/{key}` | the mediated KV seam — hit and miss, `#[edge(needs(kv))]` |
 //! | `/stats` | repeated query keys and float formatting |
 //! | `/stats/count` | a primitive (`usize`) return value |
+//! | `/whoami` | credential invisibility: both lanes strip the same headers |
 //! | `/boom` | a panic: a trap at the edge, a 500 at the origin |
 
 use autumn_edge::prelude::*;
 
 /// How many routes the edge lane carries. Rendered by `/stats` and
 /// `/stats/count` so both lanes have a number to disagree about.
-pub const EDGE_ROUTE_COUNT: usize = 5;
+pub const EDGE_ROUTE_COUNT: usize = 6;
 
 /// `GET /greet/{name}` — the shape of an edge route in one screen.
 ///
@@ -105,6 +106,27 @@ pub async fn count() -> usize {
     EDGE_ROUTE_COUNT
 }
 
+/// `GET /whoami` — proof that neither lane lets a handler see credentials.
+///
+/// The wire strips `cookie`/`authorization`/`proxy-authorization` before the
+/// capsule dispatches, and the `#[edge]` macro gives the *origin* mount the
+/// same strip — so this handler renders the same answer on both substrates
+/// even when the client sent credentials. Without that mirror, a handler
+/// branching on these headers would be a silent lane divergence.
+#[get("/whoami")]
+#[edge]
+pub async fn whoami(headers: HeaderMap) -> String {
+    let visible: Vec<&str> = ["cookie", "authorization", "proxy-authorization"]
+        .into_iter()
+        .filter(|name| headers.contains_key(*name))
+        .collect();
+    if visible.is_empty() {
+        "anonymous at this lane (credentials are origin-middleware business)\n".to_owned()
+    } else {
+        format!("credentials visible: {}\n", visible.join(","))
+    }
+}
+
 /// `GET /boom` — a handler that panics, on purpose.
 ///
 /// At the edge a panic aborts, which traps the module; the host reports
@@ -125,5 +147,5 @@ pub async fn boom() -> String {
 /// hands the result to `autumn_edge::serve`.
 #[must_use]
 pub fn edge_routes() -> Vec<EdgeRoute> {
-    edge_routes![greet, note, stats, count, boom]
+    edge_routes![greet, note, stats, count, whoami, boom]
 }

@@ -364,17 +364,24 @@ fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>, features: Opti
 
 /// Scan the project's sources for `#[edge]` routes.
 ///
-/// Always scans the manifest directory of the package [`find_binary`] resolves
-/// — the same package every later step (fingerprinting, the static renderer,
-/// the capsule build) operates on. Scanning the bare CWD instead would silently
-/// miss a member's edge routes when `autumn build` runs from a virtual
-/// workspace root, where `find_binary` picks a member but `<root>/src` does not
-/// exist. Costs one `cargo metadata --no-deps` read; resolution failures
-/// (e.g. a library-only project) surface here, before the native compile,
-/// instead of after it.
+/// A selector-free invocation whose CWD has a `src/` scans it directly — the
+/// pure source-reading path the preflight guarantee depends on: flag/scan
+/// conflicts (`--edge` with no routes, `--embed` with routes) must be
+/// reportable without spawning cargo at all, and the CLI integration tests
+/// pin that by running with an empty `PATH`. Every other shape resolves the
+/// scanned directory through [`find_binary`] — `-p`/`--bin` select a member
+/// whose sources live elsewhere, and a selector-free CWD *without* `src/` is
+/// a virtual workspace root, where only `find_binary`'s resolution matches
+/// the package every later build step operates on.
 fn resolve_project_edge_scan(debug: bool, package: Option<&str>, bin: Option<&str>) -> EdgeScan {
     let cwd = std::env::current_dir().expect("current dir");
-    let root = find_binary(debug, package, bin).1.unwrap_or(cwd);
+    let root = if package.is_none() && bin.is_none() && cwd.join("src").is_dir() {
+        cwd
+    } else {
+        find_binary(debug, package, bin)
+            .1
+            .unwrap_or_else(|| cwd.clone())
+    };
     crate::edge_scan::resolve_edge_scan(&root)
 }
 

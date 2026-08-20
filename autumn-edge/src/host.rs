@@ -58,6 +58,8 @@ mod errno {
     pub(super) const SUCCESS: i32 = 0;
     pub(super) const BADF: i32 = 8;
     pub(super) const INVAL: i32 = 28;
+    /// Out of space: a stdout line outgrew [`super::STDOUT_LINE_BUDGET_BYTES`].
+    pub(super) const NOSPC: i32 = 51;
     /// Seek on a pipe.
     pub(super) const SPIPE: i32 = 70;
 }
@@ -112,6 +114,26 @@ pub const FUEL_BUDGET: u64 = 1_000_000_000;
 /// instantiation is refused — both surface as a
 /// [`FallthroughReason::CapsuleError`], never as a dead host.
 pub const MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Cap on the guest's buffered (newline-less) stdout, in bytes (64 MiB).
+///
+/// Stdout is the wire: complete NDJSON lines are consumed and cleared as they
+/// arrive, so this bounds only a line that never ends — a guest streaming
+/// bytes without `\n` would otherwise grow a host-owned buffer without limit,
+/// unmetered by fuel (host-side copies burn no guest fuel) or the linear-memory
+/// ceiling (which bounds each chunk, not their sum). Sized above any honest
+/// frame: a response with a 16 MiB body is ~22 MiB base64'd. Exceeding it
+/// fails the guest's `fd_write` with `ENOSPC`, which ends as a
+/// [`FallthroughReason::CapsuleError`].
+pub const STDOUT_LINE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Cap on accumulated guest stderr, in bytes (1 MiB).
+///
+/// Stderr is diagnostics: only [`STDERR_EXCERPT`] characters ever reach a
+/// fallthrough detail, so bytes past this cap are silently dropped rather
+/// than failing the write — a panicking guest should never be punished for
+/// being chatty while it dies.
+pub const STDERR_BUDGET_BYTES: usize = 1024 * 1024;
 
 /// A compiled edge capsule, ready to serve requests.
 ///
@@ -345,15 +367,34 @@ impl<'kv> HostState<'kv> {
         }
     }
 
-    fn write_stdout(&mut self, bytes: &[u8]) {
+    /// Buffer stdout bytes, consuming each completed NDJSON line.
+    ///
+    /// Returns `false` — the guest's write must fail — once a single line
+    /// exceeds [`STDOUT_LINE_BUDGET_BYTES`].
+    #[must_use]
+    fn write_stdout(&mut self, bytes: &[u8]) -> bool {
         for byte in bytes {
             if *byte == b'\n' {
                 let line = std::mem::take(&mut self.stdout_line);
                 let line = String::from_utf8_lossy(&line).into_owned();
                 self.on_guest_line(&line);
             } else {
+                if self.stdout_line.len() >= STDOUT_LINE_BUDGET_BYTES {
+                    return false;
+                }
                 self.stdout_line.push(*byte);
             }
+        }
+        true
+    }
+
+    /// Buffer stderr bytes, silently dropping everything past
+    /// [`STDERR_BUDGET_BYTES`] — the excerpt that reaches a fallthrough detail
+    /// is far shorter anyway.
+    fn write_stderr(&mut self, bytes: &[u8]) {
+        let room = STDERR_BUDGET_BYTES.saturating_sub(self.stderr.len());
+        if let Some(kept) = bytes.get(..bytes.len().min(room)) {
+            self.stderr.extend_from_slice(kept);
         }
     }
 
@@ -547,9 +588,12 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
 
                     let state = caller.data_mut();
                     if fd == 2 {
-                        state.stderr.extend_from_slice(&chunk);
-                    } else {
-                        state.write_stdout(&chunk);
+                        state.write_stderr(&chunk);
+                    } else if !state.write_stdout(&chunk) {
+                        // A single stdout line has outgrown any honest frame:
+                        // fail the write so the guest aborts and the request
+                        // falls through, instead of growing host memory.
+                        return errno::NOSPC;
                     }
                 }
 
@@ -810,6 +854,29 @@ mod tests {
     }
 
     #[test]
+    fn stdout_line_budget_fails_the_write_and_stderr_budget_drops_the_excess() {
+        let kv = InMemoryEdgeKv::new();
+        let mut state = HostState::new(&kv, false);
+
+        // Newline-less stdout accumulates only up to the budget.
+        assert!(state.write_stdout(b"honest partial line"));
+        state.stdout_line = vec![b'x'; STDOUT_LINE_BUDGET_BYTES];
+        assert!(
+            !state.write_stdout(b"one byte too many"),
+            "a line past the budget must fail the guest's write"
+        );
+        // A newline still drains the buffered line even at the cap.
+        assert!(state.write_stdout(b"\n"));
+        assert!(state.stdout_line.is_empty());
+
+        // Stderr past its budget is dropped, never an error.
+        state.stderr = vec![b'e'; STDERR_BUDGET_BYTES - 2];
+        state.write_stderr(b"abcdef");
+        assert_eq!(state.stderr.len(), STDERR_BUDGET_BYTES);
+        assert!(state.stderr.ends_with(b"ab"), "kept only what fit");
+    }
+
+    #[test]
     fn a_memory_hungry_module_is_refused_instead_of_killing_the_host() {
         // A hand-assembled module declaring a 4097-page (256 MiB + 64 KiB)
         // linear memory — one page over MEMORY_BUDGET_BYTES — with an empty
@@ -849,7 +916,7 @@ mod tests {
         };
         let line = to_line(&GuestFrame::Response(response.clone())).expect("line");
 
-        state.write_stdout(line.as_bytes());
+        assert!(state.write_stdout(line.as_bytes()));
 
         assert_eq!(state.terminal, Some(EdgeOutcome::Served(response)));
     }
@@ -859,7 +926,7 @@ mod tests {
         let kv = InMemoryEdgeKv::new().with("greeting", "hello");
         let mut state = state_with(&kv, true);
 
-        state.write_stdout(b"{\"op\":\"kv_get\",\"key\":\"greeting\"}\n");
+        assert!(state.write_stdout(b"{\"op\":\"kv_get\",\"key\":\"greeting\"}\n"));
 
         let answer: String = state.stdin.iter().map(|byte| char::from(*byte)).collect();
         assert_eq!(
@@ -874,7 +941,7 @@ mod tests {
         let kv = InMemoryEdgeKv::new().with("greeting", "hello");
         let mut state = state_with(&kv, false);
 
-        state.write_stdout(b"{\"op\":\"kv_get\",\"key\":\"greeting\"}\n");
+        assert!(state.write_stdout(b"{\"op\":\"kv_get\",\"key\":\"greeting\"}\n"));
 
         let answer: String = state.stdin.iter().map(|byte| char::from(*byte)).collect();
         assert_eq!(answer.trim_end(), r#"{"op":"kv_value","value_b64":null}"#);
@@ -885,7 +952,7 @@ mod tests {
         let kv = InMemoryEdgeKv::new();
         let mut state = state_with(&kv, false);
 
-        state.write_stdout(b"{ not json at all\n");
+        assert!(state.write_stdout(b"{ not json at all\n"));
 
         let Some(EdgeOutcome::Fallthrough { reason, .. }) = state.terminal else {
             panic!("expected a capsule error, got {:?}", state.terminal);
@@ -898,12 +965,12 @@ mod tests {
         let kv = InMemoryEdgeKv::new();
         let mut state = state_with(&kv, false);
 
-        state.write_stdout(
+        assert!(state.write_stdout(
             b"{\"op\":\"fallthrough\",\"reason\":\"unknown_route\",\"detail\":\"a\"}\n",
-        );
-        state.write_stdout(
+        ));
+        assert!(state.write_stdout(
             b"{\"op\":\"fallthrough\",\"reason\":\"capsule_error\",\"detail\":\"b\"}\n",
-        );
+        ));
 
         assert_eq!(
             state
@@ -918,9 +985,9 @@ mod tests {
         let kv = InMemoryEdgeKv::new();
         let mut state = state_with(&kv, false);
 
-        state.write_stdout(b"{\"op\":\"fallthrough\",\"reason\":");
+        assert!(state.write_stdout(b"{\"op\":\"fallthrough\",\"reason\":"));
         assert_eq!(state.terminal, None);
-        state.write_stdout(b"\"unknown_route\",\"detail\":\"\"}\n");
+        assert!(state.write_stdout(b"\"unknown_route\",\"detail\":\"\"}\n"));
 
         assert_eq!(
             state

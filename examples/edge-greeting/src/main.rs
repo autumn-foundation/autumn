@@ -22,6 +22,7 @@ async fn main() {
             edge_greeting::handlers::note,
             edge_greeting::handlers::stats,
             edge_greeting::handlers::count,
+            edge_greeting::handlers::whoami,
             edge_greeting::handlers::boom,
             edge_greeting::origin::feedback,
         ])
