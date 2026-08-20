@@ -126,18 +126,17 @@ contributes an operation with no response body schema.
 Several places where the generated document can describe a request the handler
 will not accept. None of them fails the build:
 
-> **`Query<T>` must be flat — scalars only.** The `style: form, explode: true`
-> mapping is accurate only while every field of `T` is a scalar. `Query<T>`
-> decodes with `serde_urlencoded`, which handles neither nested objects nor
-> **sequences**: a `Vec<String>` field advertised as an array is sent by a
-> conforming client as `?tags=a&tags=b` and fails to deserialize with
-> `invalid type: string "a", expected a sequence`. Take anything but scalars as
-> a JSON body.
->
-> The MCP projection notices the nested-object case and logs a build-time
-> `tracing::warn`, but it still publishes the tool — so it appears in
-> `tools/list` and fails when an agent calls it. Neither output refuses to
-> generate; both only warn at best.
+> **`style: form, explode: true` cannot describe a nested `Query<T>` field.**
+> The mapping is exact for scalar and scalar-sequence fields: a `Vec<String>`
+> field advertised as an array is sent by a conforming client as
+> `?tags=a&tags=b`, and `Query<T>` decodes that. A **nested** field (an object,
+> or an array of objects) is decoded from the bracketed form
+> (`?filter[status]=open`, `?items[0][sku]=A-1`) that
+> [`query_string`](https://docs.rs/autumn-web/latest/autumn_web/query_string/)
+> defines and MCP `tools/call` dispatch emits — but OpenAPI's `form`/`explode`
+> style leaves nested values undefined, so the generated document does not spell
+> that encoding out for a third-party client. Document the bracketed form for
+> external consumers, or take deeply structured input as a JSON body.
 
 > **The query parameter is always `required: false`.** That flag is emitted
 > unconditionally, whatever `T` looks like. If `T` has a non-`Option` field, a

@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Query<T>` decodes sequences and nested structures (#1972):** the extractor
+  no longer delegates to `serde_urlencoded`, whose strict flatness meant a
+  `Vec<String>` field fed the conforming `?tags=a&tags=b` form failed with
+  `invalid type: string "a", expected a sequence`, and a nested struct field was
+  unrepresentable by any encoding — so builders fell back to comma-separated
+  strings and JSON-in-a-string. It now decodes a **superset** of the flat form
+  (a query string of unique scalar keys behaves exactly as before) that also
+  accepts repeated keys (`tags=a&tags=b`), the append and indexed sequence forms
+  (`tags[]=a`, `tags[0]=a`), nested objects (`filter[status]=open`), and arrays
+  of objects (`items[0][sku]=A-1`) — the same bracketed dialect
+  `NestedChangesetForm` already uses for `has_many` rows. Scalar coercion,
+  present-but-empty `Option` handling, and unknown-key tolerance keep
+  `serde_urlencoded` parity; decode errors now name the failing field path
+  (`filter.limit: invalid value …`). Nesting is depth-capped and indices key an
+  ordered map rather than a `Vec`, so neither deep nesting nor `tags[4000000000]`
+  can drive unbounded allocation.
+- **MCP `tools/call` dispatch honors structured query arguments (#1972):** the
+  dispatcher already expanded an array query argument to repeated keys, which
+  the handler then rejected — a tool whose derived `inputSchema` advertised
+  `tags: array` dispatched a request its own handler answered with 400. Query
+  arguments are now rendered into the extractor's own wire format (scalars flat,
+  scalar arrays as repeated keys, containers bracketed), so the advertised
+  contract and the dispatch actually agree. A JSON `null` renders no parameter
+  at all instead of the literal text `null`, and nesting past the decoder's cap
+  is refused up front. The build-time "nested query field" warning is gone —
+  nested query fields are now honored rather than steered away — while the
+  opaque-`{"type":"object"}`-placeholder warnings remain.
+
 - **`autumn generate webhook` for signed, replay-safe provider intake
   (#1366):** the `SignedWebhook` substrate has shipped since 0.4.0, but every
   Stripe/GitHub/Slack integration still hand-rolled the route, the endpoint

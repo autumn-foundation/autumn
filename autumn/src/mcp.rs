@@ -543,10 +543,6 @@ enum SchemaDegradation {
     /// The `body` property resolved to a bare `{"type":"object"}` placeholder,
     /// so the tool advertises no body fields.
     OpaqueBody,
-    /// A `query` field is itself a nested object (or an array of objects) — a
-    /// shape `serde_urlencoded` (which `Query<T>` delegates to) cannot parse,
-    /// so dispatch of such an argument could never round-trip to the handler.
-    NestedQuery,
 }
 
 /// Resolve a schema node through a single `#/$defs/X` indirection (the form
@@ -574,46 +570,6 @@ fn is_opaque_object(schema: &Value) -> bool {
             .is_none_or(|map| !map.contains_key("properties"))
 }
 
-/// True when a `oneOf`/`anyOf` branch is the `{"type":"null"}` arm the
-/// `OpenApiSchema` derive emits for the `None` case of an `Option<T>` field.
-fn is_null_branch(branch: &Value) -> bool {
-    branch.get("type").and_then(Value::as_str) == Some("null")
-}
-
-/// True when `schema` (already ref-resolved) is a nested object or an array of
-/// objects — the shapes flat `serde_urlencoded` query decoding cannot handle.
-///
-/// A nullable query field (`Option<Struct>`, `Option<Vec<Struct>>`) derives to a
-/// `oneOf`/`anyOf` with the nested-shape branch plus a `{"type":"null"}` branch
-/// and therefore carries no top-level `type`; unwrap those wrappers and treat the
-/// field as nested when ANY non-null branch is itself nested, so a nullable
-/// structured query field warns exactly like its non-nullable form (issue #1972).
-fn is_nested_query_shape(root: &Value, schema: &Value) -> bool {
-    if let Some(branches) = schema
-        .get("oneOf")
-        .or_else(|| schema.get("anyOf"))
-        .and_then(Value::as_array)
-    {
-        return branches
-            .iter()
-            .filter(|branch| !is_null_branch(branch))
-            .map(|branch| resolve_local_ref(root, branch))
-            .any(|branch| is_nested_query_shape(root, branch));
-    }
-
-    match schema.get("type").and_then(Value::as_str) {
-        // A non-placeholder object nested under a query field.
-        Some("object") => schema
-            .as_object()
-            .is_some_and(|map| map.contains_key("properties")),
-        Some("array") => schema
-            .get("items")
-            .map(|items| resolve_local_ref(root, items))
-            .is_some_and(|items| is_nested_query_shape(root, items)),
-        _ => false,
-    }
-}
-
 /// Inspect a built `inputSchema` for the degradations in [`SchemaDegradation`].
 ///
 /// Pure and self-contained (no logging) so it is unit-testable; [`derive_tools`]
@@ -633,21 +589,14 @@ fn detect_schema_degradations(
         out.push(SchemaDegradation::OpaqueBody);
     }
 
-    if has_query && let Some(query) = props.and_then(|p| p.get("query")) {
-        let resolved = resolve_local_ref(input_schema, query);
-        if is_opaque_object(resolved) {
-            out.push(SchemaDegradation::OpaqueQuery);
-        } else if let Some(fields) = resolved.get("properties").and_then(Value::as_object) {
-            // A `Query<T>` whose schema is real but has a nested/object-of-array
-            // field can't round-trip through `serde_urlencoded`.
-            let nested = fields
-                .values()
-                .map(|field| resolve_local_ref(input_schema, field))
-                .any(|field| is_nested_query_shape(input_schema, field));
-            if nested {
-                out.push(SchemaDegradation::NestedQuery);
-            }
-        }
+    // A nested/array query field is NOT a degradation: `Query<T>` decodes the
+    // bracketed dialect `build_request` renders it into (issue #1972), so the
+    // advertised structure round-trips. Only a missing field-level schema is.
+    if has_query
+        && let Some(query) = props.and_then(|p| p.get("query"))
+        && is_opaque_object(resolve_local_ref(input_schema, query))
+    {
+        out.push(SchemaDegradation::OpaqueQuery);
     }
 
     out
@@ -677,15 +626,6 @@ fn warn_on_degraded_input_schema(doc: &ApiDoc, input_schema: &Value) {
                 "MCP tool query has no field-level schema (opaque object); derive or \
                  impl `OpenApiSchema` on the `Query<T>` type so the tool advertises \
                  its real query parameters instead of a bare `{{\"type\":\"object\"}}` placeholder"
-            ),
-            SchemaDegradation::NestedQuery => tracing::warn!(
-                operation_id = doc.operation_id,
-                method = doc.method,
-                path = doc.path,
-                "MCP tool query advertises a nested object/array-of-object field; \
-                 `Query<T>` decodes with `serde_urlencoded`, which is strictly flat and \
-                 cannot parse nested query parameters — move the structured input to a \
-                 JSON request body (`Json<T>`) so it round-trips losslessly"
             ),
         }
     }
@@ -2023,17 +1963,7 @@ fn build_request(
         };
         let mut pairs: Vec<(String, String)> = Vec::new();
         for (key, value) in map {
-            match value {
-                // Form/explode semantics: an array field expands to repeated
-                // keys (`tags=a&tags=b`), matching the OpenAPI query model the
-                // tool schema advertises — not a single `tags=["a","b"]`.
-                Value::Array(items) => {
-                    for item in items {
-                        pairs.push((key.clone(), query_scalar(item)));
-                    }
-                }
-                other => pairs.push((key.clone(), query_scalar(other))),
-            }
+            encode_query_arg(key, value, 1, &mut pairs)?;
         }
         if !pairs.is_empty() {
             let qs = serde_urlencoded::to_string(&pairs)
@@ -2101,6 +2031,75 @@ fn query_scalar(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+/// Flatten one `query` argument into the `key=value` pairs the
+/// [`Query<T>`](crate::extract::Query) extractor decodes (issue #1972).
+///
+/// The wire format is the extractor's own dialect
+/// ([`query_string`](crate::query_string)), so a tool's advertised
+/// `inputSchema` and the request dispatch actually agree:
+///
+/// * scalars render flat (`page=2`);
+/// * an array of scalars expands to repeated keys (`tags=a&tags=b`) — the
+///   OpenAPI `form`/`explode` shape;
+/// * an array containing any container uses explicit positions
+///   (`items[0][sku]=A-1`), so element order survives;
+/// * an object nests by key (`filter[status]=open`).
+///
+/// A JSON `null` renders **no pair at all**: a query string has no null, and
+/// emitting the literal text `null` would fail the handler's coercion instead
+/// of decoding as the absent/`None` the caller meant.
+///
+/// # Errors
+///
+/// Returns an error when nesting exceeds
+/// [`query_string::MAX_DEPTH`](crate::query_string::MAX_DEPTH) — the depth the
+/// decoder on the other side accepts — rather than emitting keys that would
+/// then be rejected downstream.
+fn encode_query_arg(
+    key: &str,
+    value: &Value,
+    depth: usize,
+    out: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    if depth > crate::query_string::MAX_DEPTH {
+        return Err(format!(
+            "query argument `{key}` nests deeper than the maximum of {}",
+            crate::query_string::MAX_DEPTH
+        ));
+    }
+    match value {
+        Value::Null => Ok(()),
+        Value::Array(items) => {
+            let all_scalar = items
+                .iter()
+                .all(|item| !matches!(item, Value::Array(_) | Value::Object(_)));
+            if all_scalar {
+                for item in items {
+                    if !item.is_null() {
+                        out.push((key.to_owned(), query_scalar(item)));
+                    }
+                }
+                Ok(())
+            } else {
+                for (index, item) in items.iter().enumerate() {
+                    encode_query_arg(&format!("{key}[{index}]"), item, depth + 1, out)?;
+                }
+                Ok(())
+            }
+        }
+        Value::Object(fields) => {
+            for (field, nested) in fields {
+                encode_query_arg(&format!("{key}[{field}]"), nested, depth + 1, out)?;
+            }
+            Ok(())
+        }
+        scalar => {
+            out.push((key.to_owned(), query_scalar(scalar)));
+            Ok(())
+        }
     }
 }
 
@@ -2493,7 +2492,6 @@ mod tests {
         let degradations = detect_schema_degradations(&schema, true, true);
         assert!(degradations.contains(&SchemaDegradation::OpaqueQuery));
         assert!(degradations.contains(&SchemaDegradation::OpaqueBody));
-        assert!(!degradations.contains(&SchemaDegradation::NestedQuery));
     }
 
     #[test]
@@ -2514,9 +2512,11 @@ mod tests {
     }
 
     #[test]
-    fn detect_degradation_flags_nested_query_object_and_array() {
-        // A query field that is itself an object → nested (flat-encoding cannot
-        // round-trip). Also cover an array-of-objects field.
+    fn detect_degradation_accepts_structured_query_fields() {
+        // Nested objects, arrays of objects, `$ref`s and their nullable
+        // (`oneOf [.., {"type":"null"}]`) forms are all round-trippable now that
+        // `Query<T>` decodes the bracketed dialect `build_request` emits
+        // (issue #1972), so none of them may be reported as a degradation.
         let schema = json!({
             "type": "object",
             "properties": {
@@ -2525,69 +2525,9 @@ mod tests {
                     "properties": {
                         "filter": { "type": "object", "properties": { "min": { "type": "integer" } } },
                         "rows": { "type": "array", "items": { "type": "object", "properties": { "k": { "type": "string" } } } },
-                    },
-                },
-            },
-        });
-        let degradations = detect_schema_degradations(&schema, true, false);
-        assert!(degradations.contains(&SchemaDegradation::NestedQuery));
-        assert!(!degradations.contains(&SchemaDegradation::OpaqueQuery));
-    }
-
-    #[test]
-    fn detect_degradation_flags_nested_query_via_ref() {
-        // A query field that is a `$ref` to an object def is still nested.
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "object",
-                    "properties": { "filter": { "$ref": "#/$defs/Filter" } },
-                },
-            },
-            "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
-        });
-        assert!(
-            detect_schema_degradations(&schema, true, false)
-                .contains(&SchemaDegradation::NestedQuery)
-        );
-    }
-
-    #[test]
-    fn detect_degradation_flags_nullable_nested_query_field() {
-        // `filter: Option<Filter>` derives to a nullable `oneOf` (the nested
-        // object branch + a `{"type":"null"}` branch) with no top-level `type`.
-        // The detector must still flag it — `serde_urlencoded` cannot decode the
-        // structured value whether or not the field is optional (issue #1972).
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "object",
-                    "properties": {
-                        "filter": { "oneOf": [ { "$ref": "#/$defs/Filter" }, { "type": "null" } ] },
-                    },
-                },
-            },
-            "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
-        });
-        let degradations = detect_schema_degradations(&schema, true, false);
-        assert!(
-            degradations.contains(&SchemaDegradation::NestedQuery),
-            "nullable nested query field must warn: {degradations:?}"
-        );
-    }
-
-    #[test]
-    fn detect_degradation_flags_nullable_array_of_objects_query_field() {
-        // `filter: Option<Vec<Filter>>` → `oneOf[{array of $ref}, {null}]`.
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "object",
-                    "properties": {
-                        "filters": { "oneOf": [
+                        "ref_filter": { "$ref": "#/$defs/Filter" },
+                        "maybe_filter": { "oneOf": [ { "$ref": "#/$defs/Filter" }, { "type": "null" } ] },
+                        "maybe_rows": { "oneOf": [
                             { "type": "array", "items": { "$ref": "#/$defs/Filter" } },
                             { "type": "null" },
                         ] },
@@ -2597,37 +2537,48 @@ mod tests {
             "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
         });
         assert!(
-            detect_schema_degradations(&schema, true, false)
-                .contains(&SchemaDegradation::NestedQuery),
-            "nullable array-of-objects query field must warn"
+            detect_schema_degradations(&schema, true, false).is_empty(),
+            "structured query fields are honored, not degraded"
         );
     }
 
     #[test]
-    fn detect_degradation_ignores_nullable_scalar_query_field() {
-        // `q: Option<String>` → `oneOf[{type:string}, {type:null}]` and
-        // `tags: Option<Vec<String>>` → `oneOf[{array of scalar}, {null}]`: both
-        // are flat-encodable, so neither may produce a false positive.
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "object",
-                    "properties": {
-                        "q": { "oneOf": [ { "type": "string" }, { "type": "null" } ] },
-                        "tags": { "oneOf": [
-                            { "type": "array", "items": { "type": "string" } },
-                            { "type": "null" },
-                        ] },
-                    },
-                },
-            },
-        });
-        assert!(
-            !detect_schema_degradations(&schema, true, false)
-                .contains(&SchemaDegradation::NestedQuery),
-            "nullable scalar / scalar-array query fields must NOT warn"
+    fn encode_query_arg_renders_the_extractor_dialect() {
+        let mut pairs = Vec::new();
+        encode_query_arg("page", &json!(2), 1, &mut pairs).expect("scalar");
+        encode_query_arg("tags", &json!(["a", "b"]), 1, &mut pairs).expect("scalar array");
+        encode_query_arg("filter", &json!({ "status": "open" }), 1, &mut pairs).expect("object");
+        encode_query_arg("items", &json!([{ "sku": "A" }]), 1, &mut pairs).expect("object array");
+        assert_eq!(
+            pairs,
+            vec![
+                ("page".to_owned(), "2".to_owned()),
+                ("tags".to_owned(), "a".to_owned()),
+                ("tags".to_owned(), "b".to_owned()),
+                ("filter[status]".to_owned(), "open".to_owned()),
+                ("items[0][sku]".to_owned(), "A".to_owned()),
+            ]
         );
+    }
+
+    #[test]
+    fn encode_query_arg_omits_nulls_rather_than_stringifying_them() {
+        let mut pairs = Vec::new();
+        encode_query_arg("page", &json!(null), 1, &mut pairs).expect("null");
+        encode_query_arg("filter", &json!({ "status": null }), 1, &mut pairs).expect("null field");
+        assert!(pairs.is_empty(), "a JSON null renders no pair: {pairs:?}");
+    }
+
+    #[test]
+    fn encode_query_arg_rejects_nesting_past_the_decoder_cap() {
+        // Build an object nested one level deeper than the decoder accepts, so
+        // the encoder refuses instead of emitting keys the extractor rejects.
+        let mut value = json!("leaf");
+        for _ in 0..crate::query_string::MAX_DEPTH {
+            value = json!({ "deeper": value });
+        }
+        let mut pairs = Vec::new();
+        assert!(encode_query_arg("root", &value, 1, &mut pairs).is_err());
     }
 
     #[test]

@@ -194,6 +194,7 @@ pub(crate) mod pg_conn_str;
 pub mod plugin;
 pub mod plugin_conformance;
 pub mod probe;
+pub mod query_string;
 
 /// Re-export of the [`include_dir`](https://docs.rs/include_dir) crate.
 ///
