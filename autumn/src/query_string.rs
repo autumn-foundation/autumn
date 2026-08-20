@@ -174,7 +174,7 @@ impl de::Error for QueryError {
         ))
     }
 
-    /// Same reasoning as [`Self::invalid_type`]: the value is the secret-bearing
+    /// Same reasoning as `invalid_type` above: the value is the secret-bearing
     /// half of the message.
     fn invalid_value(unexp: de::Unexpected<'_>, exp: &dyn de::Expected) -> Self {
         Self::msg(format!(
@@ -861,7 +861,12 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_> {
         visitor.visit_some(self)
     }
 
+    /// A `()`/unit-struct field still has to be a *claimable scalar*: routing
+    /// through `as_value` applies both the poisoned-key check and the shape
+    /// requirement, so `?flag=x&flag[y]=z` cannot decode successfully just
+    /// because the target happens to discard the value.
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, QueryError> {
+        self.as_value("a value")?;
         visitor.visit_unit()
     }
 
@@ -870,6 +875,7 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_> {
         _name: &'static str,
         visitor: V,
     ) -> Result<V::Value, QueryError> {
+        self.as_value("a value")?;
         visitor.visit_unit()
     }
 
@@ -1068,7 +1074,9 @@ impl<'de> SeqAccess<'de> for PairSeq<'_> {
         };
         seed.deserialize(PairDeserializer { key, value })
             .map(Some)
-            .map_err(|err| err.with_segment(key))
+            // Same bounding/stripping `NodeMap` applies: this key is raw,
+            // percent-decoded request text.
+            .map_err(|err| err.with_segment(sanitize_key(key)))
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -1380,6 +1388,49 @@ mod tests {
         let err =
             from_query_str::<Nested>("filter[a]=x&filter=SUPERSECRET").expect_err("shape conflict");
         assert!(!err.to_string().contains("SUPERSECRET"), "{err}");
+    }
+
+    #[test]
+    fn a_unit_field_still_validates_the_node_it_claims() {
+        // Codex P2: `()` discards its value, but the key is still *claimed* —
+        // a poisoned shape conflict or a bracketed container under it must not
+        // decode successfully just because the target throws the value away.
+        #[derive(Debug, Deserialize)]
+        struct WithUnit {
+            #[allow(dead_code)]
+            flag: (),
+        }
+        assert!(
+            from_query_str::<WithUnit>("flag=x&flag[y]=z").is_err(),
+            "a claimed conflicting key must fail even for a unit field"
+        );
+        assert!(
+            from_query_str::<WithUnit>("flag[y]=z").is_err(),
+            "a bracketed container is not a value"
+        );
+        assert!(from_query_str::<WithUnit>("flag=x").is_ok());
+    }
+
+    #[test]
+    fn pair_sequence_errors_sanitize_their_key() {
+        // Codex P2: this path annotated errors with the raw, percent-decoded
+        // key while `NodeMap` sanitized — the same control characters and
+        // unbounded length would have reached the 400 body.
+        let err = from_query_str::<Vec<(String, u32)>>("\nATTACKER=not-a-number")
+            .expect_err("coercion failure");
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains('\n'),
+            "control chars stripped: {rendered:?}"
+        );
+
+        let long = format!("{}=not-a-number", "k".repeat(500));
+        let err = from_query_str::<Vec<(String, u32)>>(&long).expect_err("coercion failure");
+        assert!(
+            err.to_string().chars().count() < 200,
+            "key bounded: {}",
+            err.to_string().len()
+        );
     }
 
     #[test]

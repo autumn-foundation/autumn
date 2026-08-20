@@ -1963,6 +1963,13 @@ fn build_request(
         };
         let mut pairs = QueryPairs::new();
         for (key, value) in map {
+            // The tool's own `query` property names get the same rule its
+            // nested object fields do — a dynamic query object can carry an
+            // arbitrary key here, and `filter[x]` would otherwise reach the
+            // decoder as structure rather than as the name the caller sent.
+            if !is_expressible_field_name(key) {
+                return Err(inexpressible_field_name("query"));
+            }
             encode_query_arg(key, value, 1, &mut pairs)?;
         }
         if !pairs.pairs.is_empty() {
@@ -2077,6 +2084,25 @@ impl QueryPairs {
     }
 }
 
+/// True when a JSON field name survives the bracketed query encoding.
+///
+/// `[` and `]` are structure in that encoding and an empty name addresses the
+/// append position, so a field called any of those cannot be carried: emitting
+/// it verbatim would invent, move, or lose a nesting level on the way back in.
+/// Applied to every name the encoder introduces — the tool's top-level `query`
+/// properties as well as nested object fields.
+fn is_expressible_field_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('[') && !name.contains(']')
+}
+
+/// The error for a field name [`is_expressible_field_name`] rejects.
+fn inexpressible_field_name(owner: &str) -> String {
+    format!(
+        "query argument `{owner}` has a field name that a query string cannot carry: a name \
+         may not be empty or contain `[` or `]`, which are structure in the query encoding"
+    )
+}
+
 /// Flatten one `query` argument into the `key=value` pairs the
 /// [`Query<T>`](crate::extract::Query) extractor decodes (issue #1972).
 ///
@@ -2167,12 +2193,8 @@ fn encode_query_arg(
         }
         Value::Object(fields) => {
             for (field, nested) in fields {
-                if field.is_empty() || field.contains('[') || field.contains(']') {
-                    return Err(format!(
-                        "query argument `{key}` has a field name that a query string \
-                         cannot carry: a name may not be empty or contain `[` or `]`, \
-                         which are structure in the query encoding"
-                    ));
+                if !is_expressible_field_name(field) {
+                    return Err(inexpressible_field_name(key));
                 }
                 encode_query_arg(&format!("{key}[{field}]"), nested, depth + 1, out)?;
             }
@@ -2735,6 +2757,17 @@ mod tests {
         let mut pairs = QueryPairs::new();
         encode_query_arg("filter", &json!({ "a": 1, "b": null }), 1, &mut pairs).expect("partial");
         assert_eq!(pairs.pairs, vec![("filter[a]".to_owned(), "1".to_owned())]);
+    }
+
+    #[test]
+    fn top_level_query_keys_are_validated_like_nested_field_names() {
+        // Codex P2: a dynamic query object can carry an arbitrary top-level
+        // key, and `filter[x]` would otherwise reach the decoder as structure.
+        assert!(!is_expressible_field_name("filter[x]"));
+        assert!(!is_expressible_field_name(""));
+        assert!(!is_expressible_field_name("a]b"));
+        assert!(is_expressible_field_name("filter"));
+        assert!(is_expressible_field_name("sort_by"));
     }
 
     #[test]
