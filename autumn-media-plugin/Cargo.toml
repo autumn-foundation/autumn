@@ -94,6 +94,7 @@ aws-sdk-s3 = { version = ">=1.122, <1.123", default-features = false, features =
 tempfile = "3"
 # Job-arg / artifact (de)serialization round-trip tests.
 serde_json = { workspace = true }
+tower = { workspace = true }
 
 [lints]
 workspace = true
