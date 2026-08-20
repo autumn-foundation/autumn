@@ -293,7 +293,12 @@ enum Segment<'a> {
     /// `k[]` — append at the next free position.
     Append,
     /// `k[3]` — an explicit position.
-    Index(usize),
+    ///
+    /// Carries both the parsed ordering value and the **raw** spelling: a map
+    /// target must receive the key the caller actually sent (`00` stays `00`,
+    /// and an index past `usize::MAX` is not rewritten to the saturated one),
+    /// while a sequence target still orders by `position`.
+    Index { position: usize, raw: &'a str },
     /// `k[name]` — a named entry.
     Key(&'a str),
 }
@@ -331,7 +336,12 @@ fn classify_segment(inner: &str) -> Segment<'_> {
         return Segment::Append;
     }
     if inner.bytes().all(|b| b.is_ascii_digit()) {
-        return Segment::Index(inner.parse().unwrap_or(usize::MAX));
+        return Segment::Index {
+            // Saturation only affects ORDERING; `raw` keeps the submitted text,
+            // so nothing about the key itself is platform-dependent.
+            position: inner.parse().unwrap_or(usize::MAX),
+            raw: inner,
+        };
     }
     Segment::Key(inner)
 }
@@ -349,10 +359,10 @@ enum Node {
     /// same node serve a scalar field (first wins) and a sequence field (all
     /// values) without the parser needing to know the target type.
     Scalar(Vec<String>),
-    /// Positional children (`k[]`, `k[3]`), ordered by index. A `BTreeMap`
+    /// Positional children (`k[]`, `k[3]`), ordered by [`SeqKey`]. A `BTreeMap`
     /// keeps sparse and out-of-order indices cheap: `tags[4000000000]` costs
     /// one entry, not four billion.
-    Seq(BTreeMap<usize, Self>),
+    Seq(BTreeMap<SeqKey, Self>),
     /// Named children (`k[name]`).
     Map(BTreeMap<String, Self>),
     /// A key the grammar could not resolve — one name used as two shapes
@@ -378,6 +388,30 @@ impl Node {
     }
 }
 
+/// A positional child's key: its ordering value plus the spelling that produced
+/// it.
+///
+/// Ordering is by `position` first, so a sequence target sees ascending indices
+/// regardless of how they were written. `raw` breaks ties and is what a **map**
+/// target receives, so `counts[0]` and `counts[00]` stay two distinct keys
+/// rather than colliding on one — and neither is rewritten on the way through.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SeqKey {
+    position: usize,
+    raw: String,
+}
+
+impl SeqKey {
+    /// A key for a position the caller did not spell out (the `k[]` append
+    /// form), rendered canonically.
+    fn synthesized(position: usize) -> Self {
+        Self {
+            position,
+            raw: position.to_string(),
+        }
+    }
+}
+
 /// Render the key path up to (and including) `upto` segments, for error text.
 ///
 /// Built only when a conflict is being reported — the success path never
@@ -391,9 +425,9 @@ fn key_path(base: &str, segments: &[Segment<'_>], upto: usize) -> String {
                 out.push_str(name);
                 out.push(']');
             }
-            Segment::Index(index) => {
+            Segment::Index { raw, .. } => {
                 out.push('[');
-                out.push_str(&index.to_string());
+                out.push_str(raw);
                 out.push(']');
             }
             Segment::Append => out.push_str("[]"),
@@ -451,13 +485,21 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
             }
             // A position addressed on an already-promoted map keeps its decimal
             // key, so the two orderings of the same query agree.
-            Segment::Index(index) => match node {
+            Segment::Index {
+                position: index,
+                raw,
+            } => match node {
                 Node::Seq(entries) => {
-                    node = entries.entry(*index).or_insert_with(|| empty_for(next));
+                    node = entries
+                        .entry(SeqKey {
+                            position: *index,
+                            raw: (*raw).to_owned(),
+                        })
+                        .or_insert_with(|| empty_for(next));
                 }
                 Node::Map(entries) => {
                     node = entries
-                        .entry(index.to_string())
+                        .entry((*raw).to_owned())
                         .or_insert_with(|| empty_for(next));
                 }
                 other => {
@@ -472,8 +514,10 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
                     let index = entries
                         .keys()
                         .next_back()
-                        .map_or(0, |last| last.saturating_add(1));
-                    node = entries.entry(index).or_insert_with(|| empty_for(next));
+                        .map_or(0, |last| last.position.saturating_add(1));
+                    node = entries
+                        .entry(SeqKey::synthesized(index))
+                        .or_insert_with(|| empty_for(next));
                 }
                 Node::Map(entries) => {
                     let index = entries
@@ -504,7 +548,7 @@ fn promote_to_map(node: &mut Node) {
     if let Node::Seq(entries) = node {
         let promoted = std::mem::take(entries)
             .into_iter()
-            .map(|(index, child)| (index.to_string(), child))
+            .map(|(key, child)| (key.raw, child))
             .collect();
         *node = Node::Map(promoted);
     }
@@ -523,7 +567,7 @@ const fn empty_for(next: Option<&Segment<'_>>) -> Node {
     match next {
         None => Node::Scalar(Vec::new()),
         Some(Segment::Key(_)) => Node::Map(BTreeMap::new()),
-        Some(Segment::Append | Segment::Index(_)) => Node::Seq(BTreeMap::new()),
+        Some(Segment::Append | Segment::Index { .. }) => Node::Seq(BTreeMap::new()),
     }
 }
 
@@ -1035,7 +1079,7 @@ impl<'de> SeqAccess<'de> for ValueSeq<'_> {
 }
 
 struct NodeSeq<'a> {
-    entries: std::collections::btree_map::Iter<'a, usize, Node>,
+    entries: std::collections::btree_map::Iter<'a, SeqKey, Node>,
 }
 
 impl<'de> SeqAccess<'de> for NodeSeq<'_> {
@@ -1045,12 +1089,14 @@ impl<'de> SeqAccess<'de> for NodeSeq<'_> {
         &mut self,
         seed: T,
     ) -> Result<Option<T::Value>, QueryError> {
-        let Some((index, node)) = self.entries.next() else {
+        let Some((key, node)) = self.entries.next() else {
             return Ok(None);
         };
         seed.deserialize(NodeDeserializer { node })
             .map(Some)
-            .map_err(|err| err.with_segment(index.to_string()))
+            // `raw` is the submitted spelling, so it gets the same bounding and
+            // control-character stripping every other request-derived segment does.
+            .map_err(|err| err.with_segment(sanitize_key(&key.raw)))
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -1173,7 +1219,7 @@ impl<'de> MapAccess<'de> for NodeMap<'_> {
 
 /// `MapAccess` over a positional node, rendering each index as its decimal key.
 struct IndexMap<'a> {
-    entries: std::collections::btree_map::Iter<'a, usize, Node>,
+    entries: std::collections::btree_map::Iter<'a, SeqKey, Node>,
     value: Option<&'a Node>,
     key: String,
 }
@@ -1185,11 +1231,13 @@ impl<'de> MapAccess<'de> for IndexMap<'_> {
         &mut self,
         seed: K,
     ) -> Result<Option<K::Value>, QueryError> {
-        let Some((index, node)) = self.entries.next() else {
+        let Some((key, node)) = self.entries.next() else {
             return Ok(None);
         };
         self.value = Some(node);
-        self.key = index.to_string();
+        // The submitted spelling, so `counts[00]` reaches a map target as
+        // `"00"` rather than as a re-rendered `"0"`.
+        self.key = key.raw.clone();
         seed.deserialize(ValueDeserializer { value: &self.key })
             .map(Some)
     }
@@ -1201,7 +1249,7 @@ impl<'de> MapAccess<'de> for IndexMap<'_> {
         let node = self.value.take().ok_or_else(|| {
             QueryError::msg("internal error: query map value requested before its key")
         })?;
-        let key = self.key.clone();
+        let key = sanitize_key(&self.key);
         seed.deserialize(NodeDeserializer { node })
             .map_err(|err| err.with_segment(key))
     }
@@ -1244,7 +1292,12 @@ struct NodeContent<'a> {
 impl<'de> VariantAccess<'de> for NodeContent<'_> {
     type Error = QueryError;
 
+    /// A unit variant carries no data, but the node selecting it is still
+    /// *claimed*: `?mode[asc][unexpected]=v` must not quietly select `Asc` and
+    /// discard the attached object, and a shape-conflicted node must not pass.
+    /// Same principle as the unit-field path — validate, then discard.
     fn unit_variant(self) -> Result<(), QueryError> {
+        NodeDeserializer { node: self.content }.as_value("a value")?;
         Ok(())
     }
 
@@ -1343,15 +1396,60 @@ mod tests {
     }
 
     #[test]
-    fn index_aliasing_is_rejected_rather_than_silently_dropping_a_value() {
-        // `tags[0]` and `tags[00]` address one position, as do two indices that
-        // both saturate. Both land two values in one slot — an error, not a
-        // silent loss of the second.
-        assert!(from_query_str::<Args>("tags[0]=a&tags[00]=b").is_err());
-        assert!(
-            from_query_str::<Args>("tags[99999999999999999999]=a&tags[99999999999999999999]=b")
-                .is_err()
+    fn distinct_index_spellings_stay_distinct() {
+        // Codex P2: `0` and `00` are different keys, so neither may overwrite
+        // the other. A sequence target orders them by position and keeps both;
+        // a map target receives each spelling unchanged.
+        #[derive(Debug, Deserialize)]
+        struct Counts {
+            counts: std::collections::HashMap<String, u32>,
+        }
+
+        assert_eq!(
+            args("tags[0]=a&tags[00]=b").tags.unwrap(),
+            vec!["a".to_owned(), "b".to_owned()]
         );
+
+        let out: Counts = from_query_str("counts[00]=5&counts[0]=6").expect("decodes");
+        assert_eq!(
+            out.counts.get("00"),
+            Some(&5),
+            "spelling preserved: {out:?}"
+        );
+        assert_eq!(out.counts.get("0"), Some(&6));
+
+        // An index past `usize::MAX` is not rewritten to the saturated value.
+        let out: Counts = from_query_str("counts[99999999999999999999]=7").expect("decodes");
+        assert_eq!(out.counts.get("99999999999999999999"), Some(&7));
+
+        // The SAME spelling twice is still a genuine duplicate.
+        assert!(from_query_str::<Args>("tags[0]=a&tags[0]=b").is_err());
+    }
+
+    #[test]
+    fn a_unit_variant_still_validates_the_node_it_claims() {
+        // Codex P2: selecting a unit variant must not silently discard an
+        // attached payload or accept a poisoned node.
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(rename_all = "lowercase")]
+        enum Mode {
+            Asc,
+        }
+        #[derive(Debug, Deserialize)]
+        struct Sorted {
+            mode: Mode,
+        }
+        assert_eq!(
+            from_query_str::<Sorted>("mode[asc]=1")
+                .expect("decodes")
+                .mode,
+            Mode::Asc
+        );
+        assert!(
+            from_query_str::<Sorted>("mode[asc][unexpected]=value").is_err(),
+            "an attached payload must not be silently discarded"
+        );
+        assert!(from_query_str::<Sorted>("mode=asc").is_ok());
     }
 
     #[test]
@@ -1596,7 +1694,16 @@ mod tests {
     fn bracket_keys_parse_into_segments() {
         assert_eq!(
             parse_key("items[0][sku]"),
-            Some(("items", vec![Segment::Index(0), Segment::Key("sku")]))
+            Some((
+                "items",
+                vec![
+                    Segment::Index {
+                        position: 0,
+                        raw: "0"
+                    },
+                    Segment::Key("sku")
+                ]
+            ))
         );
         assert_eq!(parse_key("tags[]"), Some(("tags", vec![Segment::Append])));
     }
