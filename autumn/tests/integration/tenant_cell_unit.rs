@@ -147,44 +147,46 @@ fn eviction_reclaims_to_zero() {
     );
 }
 
-/// Density smoke test: 1000 concurrent cells each holding a small buffer track
-/// exactly, and evicting all of them reclaims everything.
+/// Density smoke test: empty resident cells keep API-accounted payload separate
+/// from their process-resident structural cost, meet the configured target,
+/// and can all be torn down.
 #[test]
 fn density_smoke_thousand_cells() {
     const CELLS: usize = 1000;
-    const BUF: usize = 16;
 
-    // Each cell is charged its value buffer plus the "buf" key's capacity and a
-    // fixed per-entry overhead for the one scratch entry it stores.
-    let kc = String::from("buf").capacity();
-    let overhead = TenantCell::scratch_entry_overhead();
-
-    let registry = TenantCellRegistry::new();
+    let registry = TenantCellRegistry::with_limits(CELLS, None);
     for i in 0..CELLS {
-        let cell = registry.get_or_create(&format!("tenant-{i}"), 0);
-        cell.scratch_insert("buf", vec![0u8; BUF])
-            .expect("insert under unlimited quota");
+        drop(registry.get_or_create(&format!("tenant-{i:04}"), 0));
     }
 
+    assert_eq!(registry.max_cells(), CELLS);
     assert_eq!(registry.len(), CELLS);
     assert_eq!(
         registry.total_tracked_bytes(),
-        CELLS * (BUF + kc + overhead)
+        0,
+        "empty cells have no API-accounted tenant payload"
     );
+    let structural = registry.structural_overhead();
+    assert_eq!(structural.resident_cells, CELLS);
+    assert!(structural.total_bytes > structural.registry_fixed_bytes);
     println!(
-        "size_of::<TenantCell>() = {} bytes (fixed per-cell handle overhead)",
-        std::mem::size_of::<autumn_web::tenant_cell::TenantCell>()
+        "tenant-cell density: api_accounted_payload={} structural_total={} structural_per_cell={} registry_fixed={} (allocator metadata/rounding/fragmentation excluded)",
+        registry.total_tracked_bytes(),
+        structural.total_bytes,
+        structural.per_cell_bytes(),
+        structural.registry_fixed_bytes,
     );
 
     for i in 0..CELLS {
         let evicted = registry
-            .evict(&format!("tenant-{i}"))
+            .evict(&format!("tenant-{i:04}"))
             .expect("each cell was resident");
         drop(evicted);
     }
 
     assert_eq!(registry.len(), 0);
     assert_eq!(registry.total_tracked_bytes(), 0);
+    assert_eq!(registry.structural_overhead().resident_cells, 0);
 }
 
 /// Replacing an existing scratch key must account only for the net byte delta,

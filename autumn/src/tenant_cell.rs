@@ -44,6 +44,52 @@ use std::time::{Duration, Instant};
 /// cannot amplify its footprint past the configured cap via map growth.
 const SCRATCH_ENTRY_OVERHEAD: usize = std::mem::size_of::<(String, Vec<u8>)>() + 16;
 
+/// Deterministic model of the process-resident structure used by a registry.
+///
+/// This is deliberately separate from [`TenantCell::tracked_bytes`]: quota
+/// accounting describes tenant payload, while this report describes the fixed
+/// machinery required to keep otherwise-empty cells resident. The model uses
+/// Rust layout sizes, observed `String` capacities, and the registry map's
+/// current capacity. It does **not** attempt to count allocator headers,
+/// size-class rounding, or fragmentation, none of which has a stable portable
+/// representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TenantCellStructuralOverhead {
+    /// Number of cells represented by this report.
+    pub resident_cells: usize,
+    /// Registry state shared by every cell, including its synchronization
+    /// fields and the two registry-owned `Arc` allocation headers.
+    pub registry_fixed_bytes: usize,
+    /// Payloads of the `Arc<TenantCell>` allocations.
+    pub tenant_cell_bytes: usize,
+    /// Payloads of the `Arc<TenantCellInner>` allocations. This includes the
+    /// atomics, scratch-map header, mutex, and global-gauge `Arc` pointer.
+    pub tenant_cell_inner_bytes: usize,
+    /// Inline `String` and `Arc<TenantCell>` values in occupied map buckets.
+    pub registry_entry_bytes: usize,
+    /// Heap capacity of both copies of every tenant id (registry key and cell).
+    pub tenant_id_capacity_bytes: usize,
+    /// Two strong/weak counter pairs: one for each per-cell `Arc` allocation.
+    pub arc_header_bytes: usize,
+    /// Estimated unoccupied bucket slots plus one control byte per map bucket.
+    /// The map capacity is observed, but the control-byte model is an explicit
+    /// std `HashMap` implementation estimate rather than a Rust API guarantee.
+    pub registry_bucket_bytes: usize,
+    /// Sum of all deterministic structural components in this report.
+    pub total_bytes: usize,
+}
+
+impl TenantCellStructuralOverhead {
+    /// Structural bytes per resident cell, excluding the one-off registry.
+    #[must_use]
+    pub fn per_cell_bytes(self) -> usize {
+        if self.resident_cells == 0 {
+            return 0;
+        }
+        (self.total_bytes - self.registry_fixed_bytes) / self.resident_cells
+    }
+}
+
 /// Error returned when a charge would exceed a tenant's soft memory quota.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaExceeded {
@@ -768,6 +814,65 @@ impl TenantCellRegistry {
     #[must_use]
     pub fn total_tracked_bytes(&self) -> usize {
         self.inner.global_tracked.load(Ordering::Relaxed)
+    }
+
+    /// Estimate the fixed structural footprint of the resident registry.
+    ///
+    /// Unlike [`Self::total_tracked_bytes`], this excludes API-accounted tenant
+    /// payload. The returned values are deterministic for the current Rust
+    /// layouts, tenant-id capacities, and map capacity. Allocator metadata,
+    /// size-class rounding, and fragmentation are intentionally excluded.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry lock is poisoned.
+    #[must_use]
+    pub fn structural_overhead(&self) -> TenantCellStructuralOverhead {
+        // `ArcInner` contains one strong and one weak reference counter before
+        // its payload. Rust does not expose its private layout; two `usize`s is
+        // the stable structural model used here, not an allocator measurement.
+        const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
+        type RegistryEntry = (String, Arc<TenantCell>);
+
+        let cells = self
+            .inner
+            .cells
+            .read()
+            .expect("tenant cell registry lock poisoned");
+        let resident_cells = cells.len();
+        let registry_fixed_bytes = std::mem::size_of::<RegistryInner>()
+            + std::mem::size_of::<AtomicUsize>()
+            + 2 * ARC_HEADER;
+        let tenant_cell_bytes = resident_cells * std::mem::size_of::<TenantCell>();
+        let tenant_cell_inner_bytes = resident_cells * std::mem::size_of::<TenantCellInner>();
+        let registry_entry_bytes = resident_cells * std::mem::size_of::<RegistryEntry>();
+        let tenant_id_capacity_bytes = cells
+            .iter()
+            .map(|(key, cell)| key.capacity() + cell.inner.tenant_id.capacity())
+            .sum();
+        let arc_header_bytes = resident_cells * 2 * ARC_HEADER;
+        let registry_bucket_bytes = (cells.capacity() - resident_cells)
+            * std::mem::size_of::<RegistryEntry>()
+            + cells.capacity();
+        let total_bytes = registry_fixed_bytes
+            + tenant_cell_bytes
+            + tenant_cell_inner_bytes
+            + registry_entry_bytes
+            + tenant_id_capacity_bytes
+            + arc_header_bytes
+            + registry_bucket_bytes;
+
+        TenantCellStructuralOverhead {
+            resident_cells,
+            registry_fixed_bytes,
+            tenant_cell_bytes,
+            tenant_cell_inner_bytes,
+            registry_entry_bytes,
+            tenant_id_capacity_bytes,
+            arc_header_bytes,
+            registry_bucket_bytes,
+            total_bytes,
+        }
     }
 }
 
