@@ -1628,19 +1628,42 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
 /// is REPORTED, never compensated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MaintenanceOutcome {
-    /// Both flag paths written/removed (amendment A2: the shared authoritative
-    /// path AND the release-local legacy path for units deployed before #1621).
+    /// The file the host's RUNNING slot unit polls was written/removed — either it
+    /// IS the shared authoritative path (a #1621 unit), or its own path was written
+    /// alongside the shared one (amendment A2, for a unit deployed before #1621).
     Applied,
-    /// Only the shared path was written/removed: the host's `current` symlink did
-    /// not resolve, so there is no release dir to carry the legacy flag. Fine for
-    /// a host already redeployed with #1621 units; noted so the operator knows.
+    /// Only the shared path was written/removed, and that is the whole job: no
+    /// release is promoted on this host, so no running unit polls anything else.
     AppliedSharedOnly,
-    /// The change failed on this host at this step. Never swallowed, and never a
-    /// shell line — the label only.
+    /// The shared (authoritative) flag WAS written/removed, but the file the host's
+    /// RUNNING unit polls was NOT: its unit could not be read, or the write to that
+    /// path failed (issue #1621, review round 3).
+    ///
+    /// **Counts as a failure** even though the host did change. A pre-#1621 unit
+    /// ignores the shared flag entirely, so `on` here may leave the application
+    /// serving traffic and `off` may leave it maintained — reporting either as
+    /// success is the lie this variant exists to prevent.
+    LiveUnitUnchanged {
+        /// Label of the step that could not be proved or failed.
+        failed_step: &'static str,
+    },
+    /// The change failed on this host at this step, before anything was written.
+    /// Never swallowed, and never a shell line — the label only.
     Failed {
         /// Label of the op that failed.
         failed_step: &'static str,
     },
+}
+
+impl MaintenanceOutcome {
+    /// Whether this host counts as a failure for the exit code.
+    ///
+    /// Fails CLOSED: a host whose running unit's flag could not be proved counts as
+    /// failed even though its shared flag changed, because the application may not
+    /// have observed the change at all.
+    pub(crate) const fn failed(self) -> bool {
+        matches!(self, Self::Failed { .. } | Self::LiveUnitUnchanged { .. })
+    }
 }
 
 /// The per-host table printed at the end of a `deploy maintenance on|off` fan-out.
@@ -1662,9 +1685,22 @@ pub(crate) fn fleet_maintenance_summary_lines(
             MaintenanceOutcome::AppliedSharedOnly => (
                 "\u{26A0}\u{FE0F} ",
                 format!(
-                    "maintenance {verb} (shared flag only \u{2014} no `current` release \
-                     resolved on this host, so the release-local flag for pre-#1621 units \
-                     was skipped)"
+                    "maintenance {verb} (shared flag only \u{2014} no release is promoted on \
+                     this host, so no running unit polls a release-local flag)"
+                ),
+            ),
+            MaintenanceOutcome::LiveUnitUnchanged { failed_step } => (
+                "\u{274C}",
+                format!(
+                    "PARTIAL \u{2014} shared flag {written}, but the file this host's RUNNING \
+                     unit polls was NOT (failed at `{failed_step}`), so this host may still \
+                     be {state}",
+                    written = if on { "written" } else { "removed" },
+                    state = if on {
+                        "serving traffic"
+                    } else {
+                        "in maintenance"
+                    },
                 ),
             ),
             MaintenanceOutcome::Failed { failed_step } => (
@@ -1679,13 +1715,17 @@ pub(crate) fn fleet_maintenance_summary_lines(
     let changed: Vec<&str> = hosts
         .iter()
         .zip(outcomes)
-        .filter(|(_, outcome)| !matches!(outcome, MaintenanceOutcome::Failed { .. }))
+        // Only the hosts that are DONE. A partially-changed host is named on the
+        // failed side instead, and its own row spells out that its shared flag did
+        // change — listing it as simply "changed" would read as "this host is
+        // maintained", which is the one thing it is not known to be.
+        .filter(|(_, outcome)| !outcome.failed())
         .map(|(host, _)| host.as_str())
         .collect();
     let failed: Vec<&str> = hosts
         .iter()
         .zip(outcomes)
-        .filter(|(_, outcome)| matches!(outcome, MaintenanceOutcome::Failed { .. }))
+        .filter(|(_, outcome)| outcome.failed())
         .map(|(host, _)| host.as_str())
         .collect();
     if !failed.is_empty() && !changed.is_empty() {

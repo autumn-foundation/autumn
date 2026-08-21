@@ -1879,6 +1879,31 @@ pub struct DeployProbe {
     pub current_release_dir: Option<String>,
 }
 
+impl DeployProbe {
+    /// The live-slot decision for this host, reconciled against the running proxy —
+    /// pure, and `None` for a host with no promoted release at all.
+    ///
+    /// The ONE seam every fleet surface decides "which slot, and therefore which
+    /// unit, is live" through: `deploy status` READS the maintenance flag off it and
+    /// the `deploy maintenance` fan-out WRITES to it (review round 3). Sharing it is
+    /// what stops the read path and the write path from disagreeing about which file
+    /// matters — a `current` symlink can name a different release than the unit the
+    /// proxy is actually serving (a flip that landed with a `commit-markers` that
+    /// did not), and only the unit's own view is true for the running app.
+    #[must_use]
+    pub fn reconcile(&self, cfg: &ResolvedDeployConfig, public_port: u16) -> Option<SlotReconcile> {
+        match &self.mode {
+            DeployMode::First => None,
+            DeployMode::Redeploy { live_slot } => Some(reconcile_live_slot(
+                live_slot,
+                &self.proxy_list,
+                &cfg.service_name,
+                public_port,
+            )),
+        }
+    }
+}
+
 /// Parse the probe's unit section into an [`InstalledProxyPort`] (#2073).
 ///
 /// The section is the stdout the probe shell prints between [`PROXY_UNIT_DELIM`]
@@ -2080,6 +2105,90 @@ pub enum MaintenanceFlagSource {
     Unknown,
 }
 
+/// The maintenance flag file the app on one slot ACTUALLY polls, resolved on the
+/// host from that slot's unit (issue #1621, review round 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveMaintenanceFlag {
+    /// The path the unit makes the runtime poll: its `AUTUMN_MAINTENANCE_FLAG_FILE`
+    /// when non-blank, else its `WorkingDirectory` joined with the cwd-relative
+    /// legacy path — the same rule
+    /// [`autumn_web::maintenance::flag_file_path_from`] applies at runtime.
+    pub path: String,
+    /// Whether that file existed at probe time.
+    pub present: bool,
+}
+
+/// Shell that resolves, ON THE HOST, the maintenance flag file `live_slot`'s unit
+/// makes the app poll — and whether it exists (issue #1621, review round 3).
+///
+/// The single copy of that rule. `deploy status` embeds it in its batched status
+/// round-trip to REPORT the flag, and the `deploy maintenance` fan-out runs it via
+/// [`probe_live_maintenance_flag`] to decide where to WRITE; a second copy is
+/// exactly how the two would drift back apart into reporting one file and writing
+/// another.
+///
+/// Prints nothing at all when the unit cannot be read — the caller's fail-closed
+/// signal, never a fallback to a path the running app may not poll.
+fn live_maintenance_flag_shell(cfg: &ResolvedDeployConfig, live_slot: &str) -> String {
+    format!(
+        "if [ -f {unit} ]; then \
+         autumn_mf=$(sed -n 's|^Environment={flag_env}=||p' {unit} 2>/dev/null | tail -n 1); \
+         autumn_wd=$(sed -n 's|^WorkingDirectory=||p' {unit} 2>/dev/null | tail -n 1); \
+         if [ -z \"$autumn_mf\" ] && [ -n \"$autumn_wd\" ]; then \
+         autumn_mf=\"$autumn_wd/{legacy_rel}\"; fi; \
+         if [ -n \"$autumn_mf\" ]; then printf '%s\\n' \"$autumn_mf\"; \
+         if [ -f \"$autumn_mf\" ]; then printf '%s' '{on}'; fi; fi; fi",
+        unit = shell_quote(&format!(
+            "/etc/systemd/system/{}.service",
+            slot_unit_name(&cfg.service_name, live_slot)
+        )),
+        flag_env = autumn_web::maintenance::MAINTENANCE_FLAG_FILE_ENV,
+        legacy_rel = autumn_web::maintenance::MAINTENANCE_FLAG_FILE,
+        on = MAINTENANCE_ON_SENTINEL,
+    )
+}
+
+/// Parse what [`live_maintenance_flag_shell`] printed: `{path}\n[{sentinel}]`.
+///
+/// `None` — a blank or absent path — means the unit could not be read. It is
+/// deliberately NOT degraded to the shared path: the whole point is that a
+/// pre-#1621 unit polls somewhere else entirely.
+fn parse_live_maintenance_flag(section: &str) -> Option<LiveMaintenanceFlag> {
+    let mut lines = section.trim_start_matches('\n').lines();
+    let path = lines.next().unwrap_or_default().trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(LiveMaintenanceFlag {
+        path: path.to_owned(),
+        present: lines
+            .next()
+            .is_some_and(|line| line.trim() == MAINTENANCE_ON_SENTINEL),
+    })
+}
+
+/// Resolve the maintenance flag file the host's live slot unit polls, in ONE
+/// read-only round-trip (issue #1621, review round 3).
+///
+/// `Ok(None)` is the fail-closed answer — the unit is absent or unreadable, so
+/// nothing about the running app's flag path is proved and the caller must not act
+/// as though it were.
+///
+/// # Errors
+///
+/// Returns the executor's error only when the probe command cannot run at all.
+pub fn probe_live_maintenance_flag(
+    cfg: &ResolvedDeployConfig,
+    live_slot: &str,
+    exec: &impl DeployExecutor,
+) -> Result<Option<LiveMaintenanceFlag>, DeployExecError> {
+    let out = exec.run(&RemoteCommand::new(
+        "detect-maintenance-flag",
+        live_maintenance_flag_shell(cfg, live_slot),
+    ))?;
+    Ok(parse_live_maintenance_flag(&out.stdout))
+}
+
 /// Everything `autumn deploy status` reads from ONE host (issue #1621, AC-6).
 ///
 /// Deliberately a superset of [`DeployProbe`] rather than an extension of it:
@@ -2122,20 +2231,14 @@ impl HostStatusProbe {
     /// The live-slot decision for this host, reconciled against the running proxy —
     /// pure, and `None` for a host with no promoted release at all.
     ///
-    /// Shared with the rollout path's slot selection ([`reconcile_live_slot`]), so
-    /// `status` reports the same slot a deploy would plan from, including the same
-    /// proxy-over-marker precedence on a disagreement.
+    /// Shared with the rollout path's slot selection ([`reconcile_live_slot`]) and
+    /// with the `deploy maintenance` fan-out through [`DeployProbe::reconcile`], so
+    /// `status` reports the same slot a deploy would plan from — and the same one
+    /// maintenance writes to — including the same proxy-over-marker precedence on a
+    /// disagreement.
     #[must_use]
     pub fn reconcile(&self, cfg: &ResolvedDeployConfig, public_port: u16) -> Option<SlotReconcile> {
-        match &self.deploy.mode {
-            DeployMode::First => None,
-            DeployMode::Redeploy { live_slot } => Some(reconcile_live_slot(
-                live_slot,
-                &self.deploy.proxy_list,
-                &cfg.service_name,
-                public_port,
-            )),
-        }
+        self.deploy.reconcile(cfg, public_port)
     }
 }
 
@@ -2167,18 +2270,9 @@ pub fn probe_host_status(
     // Poll whichever slot the proxy is actually serving; on a host with nothing
     // promoted yet, blue is the slot a first deploy takes, and the probe simply
     // reports that nothing answered.
-    let live_slot = match &deploy.mode {
-        DeployMode::First => SLOT_BLUE,
-        DeployMode::Redeploy { live_slot } => {
-            reconcile_live_slot(
-                live_slot,
-                &deploy.proxy_list,
-                &cfg.service_name,
-                public_port,
-            )
-            .live_slot
-        }
-    };
+    let live_slot = deploy
+        .reconcile(cfg, public_port)
+        .map_or(SLOT_BLUE, |reconcile| reconcile.live_slot);
     let shared_flag = cfg.maintenance_flag_file();
     let shell = format!(
         "curl -o /dev/null -s -m 5 -w '%{{http_code}}' http://127.0.0.1:{port}/ready 2>/dev/null \
@@ -2188,13 +2282,7 @@ pub fn probe_host_status(
          printf '\\n{delim}\\n'; \
          cat {last_deploy} 2>/dev/null || true; \
          printf '\\n{delim}\\n'; \
-         if [ -f {unit} ]; then \
-         autumn_mf=$(sed -n 's|^Environment={flag_env}=||p' {unit} 2>/dev/null | tail -n 1); \
-         autumn_wd=$(sed -n 's|^WorkingDirectory=||p' {unit} 2>/dev/null | tail -n 1); \
-         if [ -z \"$autumn_mf\" ] && [ -n \"$autumn_wd\" ]; then \
-         autumn_mf=\"$autumn_wd/{legacy_rel}\"; fi; \
-         if [ -n \"$autumn_mf\" ]; then printf '%s\\n' \"$autumn_mf\"; \
-         if [ -f \"$autumn_mf\" ]; then printf '%s' '{on}'; fi; fi; fi",
+         {unit_flag}",
         port = slot_app_port(public_port, live_slot),
         delim = HOST_STATUS_DELIM,
         flag = shell_quote(&shared_flag),
@@ -2205,19 +2293,13 @@ pub fn probe_host_status(
         // paid N times.
         last_deploy = shell_quote(&last_deploy_marker(cfg)),
         // Review round 1: resolve, ON THE HOST, the flag file the LIVE SLOT UNIT
-        // actually makes the app poll — the same rule
-        // `maintenance::flag_file_path_from` applies at runtime (the override when
-        // non-blank, else the cwd-relative legacy path, and `WorkingDirectory` IS
-        // the app's cwd). Doing it in-shell keeps `deploy status` at the same two
-        // round-trips per host; doing it from the unit rather than from `current`
-        // is what makes the answer true for a unit rendered before #1621, which
-        // carries no override line at all.
-        unit = shell_quote(&format!(
-            "/etc/systemd/system/{}.service",
-            slot_unit_name(&cfg.service_name, live_slot)
-        )),
-        flag_env = autumn_web::maintenance::MAINTENANCE_FLAG_FILE_ENV,
-        legacy_rel = autumn_web::maintenance::MAINTENANCE_FLAG_FILE,
+        // actually makes the app poll — doing it from the unit rather than from
+        // `current` is what makes the answer true for a unit rendered before #1621,
+        // which carries no override line at all. Folded into this round-trip (round
+        // 3 moved the fragment itself into `live_maintenance_flag_shell`, shared
+        // with the `deploy maintenance` WRITE path) so `deploy status` stays at the
+        // same two round-trips per host.
+        unit_flag = live_maintenance_flag_shell(cfg, live_slot),
     );
     let out = exec.run(&RemoteCommand::new("probe-host-status", shell))?;
     // Section-count tolerant: a host still running a pre-#1621 probe shape (or a
@@ -2231,27 +2313,22 @@ pub fn probe_host_status(
     // The unit section is `{resolved path}\n[{sentinel}]`. A blank/absent path is
     // "the unit could not be read" — fail closed rather than fall back to the
     // shared path, whose state the running unit may well not observe.
-    let mut unit_lines = unit_flag_section.trim_start_matches('\n').lines();
-    let resolved_flag_path = unit_lines.next().unwrap_or_default().trim();
-    let (maintenance, maintenance_flag_source) = if resolved_flag_path.is_empty() {
-        (MaintenanceStatus::Unknown, MaintenanceFlagSource::Unknown)
-    } else {
-        let present = unit_lines
-            .next()
-            .is_some_and(|line| line.trim() == MAINTENANCE_ON_SENTINEL);
-        (
-            if present {
-                MaintenanceStatus::On
-            } else {
-                MaintenanceStatus::Off
-            },
-            if resolved_flag_path == shared_flag {
-                MaintenanceFlagSource::Shared
-            } else {
-                MaintenanceFlagSource::Unshared
-            },
-        )
-    };
+    let (maintenance, maintenance_flag_source) =
+        match parse_live_maintenance_flag(unit_flag_section) {
+            None => (MaintenanceStatus::Unknown, MaintenanceFlagSource::Unknown),
+            Some(flag) => (
+                if flag.present {
+                    MaintenanceStatus::On
+                } else {
+                    MaintenanceStatus::Off
+                },
+                if flag.path == shared_flag {
+                    MaintenanceFlagSource::Shared
+                } else {
+                    MaintenanceFlagSource::Unshared
+                },
+            ),
+        };
     Ok(HostStatusProbe {
         deploy,
         // `curl` writes `000` when it never got a response; that is "nothing
@@ -3001,13 +3078,17 @@ pub(crate) mod test_support {
     /// [`super::DeployMode::First`] / `Absent`. A fleet test that forgets to script
     /// host N's probe would therefore exercise the first-deploy branch and still
     /// pass. [`RecordingExecutor::strict`] turns that into a loud panic.
-    pub(crate) const PROBE_LABELS: [&str; 6] = [
+    pub(crate) const PROBE_LABELS: [&str; 7] = [
         "proxy-compat-probe",
         "detect-current",
         "probe-release-dir",
         "probe-rollback-target",
         "resolve-previous",
         "probe-host-status",
+        // Round 3: the maintenance WRITE path parses this one to decide which file
+        // the running unit polls. Unscripted, it reads as "the unit could not be
+        // read" and the fan-out would fail closed for the wrong reason.
+        "detect-maintenance-flag",
     ];
 
     /// One recorded executor call. Uploads carry no local path: op building is
@@ -5836,6 +5917,59 @@ mod tests {
             exec.run_labels(),
             vec!["detect-current", "probe-host-status"],
             "`deploy status` must never mutate a host"
+        );
+    }
+
+    #[test]
+    fn the_status_read_and_the_maintenance_write_resolve_the_flag_with_one_shell() {
+        // #1621 review round 3. `deploy status` REPORTS the flag file the live slot
+        // unit polls; the `deploy maintenance` fan-out WRITES it. While the write
+        // path derived its path from the `current` symlink instead, the two
+        // disagreed exactly when it matters — a proxy flip that landed with a
+        // `commit-markers` that did not leaves `current` naming another release than
+        // the unit that is running — so `maintenance on` could report success while
+        // the application carried on serving traffic. One shell fragment, used by
+        // both, is what makes that class of drift unrepresentable.
+        let cfg = resolved();
+        let exec = RecordingExecutor::new()
+            .with_stdout("detect-current", status_probe_stdout(RELEASE_ID, 3001))
+            .with_stdout("probe-host-status", "200\n---autumn-host-status---\n")
+            .with_stdout(
+                "detect-maintenance-flag",
+                "/srv/autumn/myapp/releases/r9/tmp/autumn-maintenance.json\n",
+            );
+        probe_host_status(&cfg, 3000, &exec).expect("status probe runs");
+        let status_shell = exec
+            .shell_for("probe-host-status")
+            .expect("status probe ran");
+        let resolution = live_maintenance_flag_shell(&cfg, SLOT_BLUE);
+        assert!(
+            status_shell.contains(&resolution),
+            "`deploy status` must resolve the flag through the shared fragment: \
+             {status_shell}"
+        );
+
+        let flag = probe_live_maintenance_flag(&cfg, SLOT_BLUE, &exec)
+            .expect("the flag probe runs")
+            .expect("the unit resolved a path");
+        assert_eq!(
+            exec.shell_for("detect-maintenance-flag"),
+            Some(resolution),
+            "the write path must run the SAME resolution, not a second copy of it"
+        );
+        assert_eq!(
+            flag.path, "/srv/autumn/myapp/releases/r9/tmp/autumn-maintenance.json",
+            "the resolved path is the unit's, whatever `current` happens to say"
+        );
+        assert!(!flag.present, "no sentinel line means the file is absent");
+
+        // Fails closed: an unreadable unit prints nothing, and that is never
+        // degraded into "the shared path".
+        let blank = RecordingExecutor::new().with_stdout("detect-maintenance-flag", "");
+        assert_eq!(
+            probe_live_maintenance_flag(&cfg, SLOT_BLUE, &blank).expect("the probe runs"),
+            None,
+            "an unreadable unit proves nothing about which file the app polls"
         );
     }
 

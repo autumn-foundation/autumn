@@ -1557,11 +1557,24 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
         DeployAction::MaintenanceOn | DeployAction::MaintenanceOff => {
             let fleet = ResolvedFleet::resolve(&deploy_cfg, &resolve_project_name())
                 .map_err(DeployError::Config)?;
-            run_fleet_maintenance_with(&fleet, action, options.maintenance.as_ref(), |cfg| {
-                exec::SshTarget::from_resolved(cfg)
-                    .map(exec::SshExecutor::new)
-                    .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
-            })
+            // Review round 3: the fan-out writes the flag file each host's LIVE slot
+            // unit actually polls, and deciding WHICH slot that is maps the proxy's
+            // routed target port through the public port. Resolved exactly as
+            // `status` resolves it — same degraded fallback — because maintenance is
+            // switched mid-incident too.
+            let port = status_public_port(&resolved)?;
+            run_fleet_maintenance_with(
+                &fleet,
+                &port,
+                &resolved.profile,
+                action,
+                options.maintenance.as_ref(),
+                |cfg| {
+                    exec::SshTarget::from_resolved(cfg)
+                        .map(exec::SshExecutor::new)
+                        .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
+                },
+            )
         }
         DeployAction::Up => {
             let (media_cfg, ffmpeg_bin) = load_media_host_config(&resolved)?;
@@ -4205,9 +4218,10 @@ where
 ///   slot unit observes it, or `null` when the CLI could not prove which flag file
 ///   that unit polls — see `fleet::DRIFT_MAINTENANCE_UNPROVEN`), `proxy_port`
 ///   (number or null),
-///   `last_deploy` (AC-6's third fact: `{result, at}` — `result` is `"deployed"`
-///   or `"rolled back"`, `at` the host's UTC timestamp or null — and the whole
-///   object is null when the host has never completed a cutover or the marker
+///   `last_deploy` (AC-6's third fact: `{result, at}` — `result` is `"deployed"`,
+///   `"rolled back"` or `"torn down"` (a first deploy the driver compensated away,
+///   so the host serves nothing), `at` the host's UTC timestamp or null — and the
+///   whole object is null when the host has never completed a cutover or the marker
 ///   could not be read), and `drift` (array of reason strings, empty when none).
 ///   `last_deploy` is the host's own last COMPLETED action, not a verdict on the
 ///   last rollout: a deploy that failed before cutover never rewrites it (see
@@ -4288,6 +4302,25 @@ fn fleet_status_json(
 /// `autumn deploy status`: probe every host read-only and render the shared
 /// per-host table (or `--json`), exiting non-zero on drift only under `--strict`
 /// (issue #1621, AC-6).
+/// Say out loud that the public port was resolved WITHOUT validating the app
+/// config, and what this command does about it (issue #1621, review round 1).
+///
+/// Never silent, and never on stdout: a `--json` consumer keeps the documented
+/// shape while a human still sees WHY the port was resolved the hard way and WHICH
+/// port the command is working against. `continues` is the caller's own second
+/// line, because `status` (read-only) and `maintenance` (which uses the port only
+/// to identify the live slot unit) owe the operator different sentences.
+fn warn_degraded_port(port: &StatusPort, profile: &str, continues: &str) {
+    let Some(reason) = &port.degraded else {
+        return;
+    };
+    eprintln!(
+        "\u{26A0}\u{FE0F}  this project's configuration does not validate under the \
+         `{profile}` deploy profile: {reason}"
+    );
+    eprintln!("{continues}\n");
+}
+
 fn run_status(
     port: &StatusPort,
     profile: &str,
@@ -4297,21 +4330,16 @@ fn run_status(
     if !options.json {
         eprintln!("\u{1F342} autumn deploy status\n");
     }
-    // Never silent, and never on stdout: a `--json` consumer keeps the documented
-    // shape while a human still sees WHY the port was resolved the hard way and
-    // WHICH port the report is graded against.
-    if let Some(reason) = &port.degraded {
-        eprintln!(
-            "\u{26A0}\u{FE0F}  this project's configuration does not validate under the \
-             `{profile}` deploy profile: {reason}"
-        );
-        eprintln!(
+    warn_degraded_port(
+        port,
+        profile,
+        &format!(
             "   `deploy status` is read-only, so it continues against the DECLARED \
              `[server] port = {}` for that profile (read without validation). \
-             `autumn deploy check`/`up` still refuse to run until the config is fixed.\n",
+             `autumn deploy check`/`up` still refuse to run until the config is fixed.",
             port.port
-        );
-    }
+        ),
+    );
     let statuses = collect_fleet_status(fleet, port.port, |cfg| {
         exec::SshTarget::from_resolved(cfg)
             .map(exec::SshExecutor::new)
@@ -4364,22 +4392,32 @@ fn maintenance_flag_body(args: &MaintenanceOnArgs) -> String {
 /// serving). Every host is attempted, every outcome is named in the table, and the
 /// command exits non-zero when ANY host failed.
 ///
-/// Per amendment A2 each `on` writes BOTH flag paths:
+/// Per amendment A2 each `on` writes up to two flag paths, shared one FIRST:
 ///
 /// - `{app_dir}/shared/autumn-maintenance.json` — the authoritative path the
 ///   #1621 slot units point `AUTUMN_MAINTENANCE_FLAG_FILE` at; survives cutovers.
-/// - `{current_release_dir}/tmp/autumn-maintenance.json` — the legacy cwd-relative
-///   path units deployed BEFORE #1621 still poll. Written only when the host's
-///   `current` symlink resolves (read from the same read-only probe round-trip);
-///   a host with no resolvable release gets the shared flag only and its row says
-///   so.
+///   Always written first, so a #1621 unit reacts within its 500 ms poll even if
+///   the second write fails.
+/// - the file the host's **live slot unit** actually makes the app poll, when that
+///   is a DIFFERENT file — a unit deployed before #1621 carries no override and
+///   polls its own `WorkingDirectory`-relative `tmp/autumn-maintenance.json`.
+///   Resolved from the proxy-selected live slot's unit, exactly as `deploy status`
+///   resolves the flag it REPORTS (review round 3); never from the `current`
+///   symlink, which can name a different release than the unit that is running.
 ///
-/// `off` removes both (`rm -f`, absent files are not an error).
+/// `off` removes the same set (`rm -f`, absent files are not an error).
+///
+/// `public_port` is what maps the proxy's routed target back to a slot, so it is
+/// resolved exactly as `deploy status` resolves it — degraded fallback included,
+/// because a maintenance window gets closed mid-incident and an unrelated invalid
+/// setting must not stand in the way.
 ///
 /// The executor factory is injected (generic, never `dyn`, no `Send`/`Sync`
 /// bound) so the whole loop is unit-testable against one scripted fake per host.
 fn run_fleet_maintenance_with<E, F>(
     fleet: &ResolvedFleet,
+    port: &StatusPort,
+    profile: &str,
     action: DeployAction,
     args: Option<&MaintenanceOnArgs>,
     make_executor: F,
@@ -4391,6 +4429,17 @@ where
     let on = matches!(action, DeployAction::MaintenanceOn);
     let verb = if on { "on" } else { "off" };
     eprintln!("\u{1F342} autumn deploy maintenance {verb}\n");
+    warn_degraded_port(
+        port,
+        profile,
+        &format!(
+            "   `deploy maintenance` continues against the DECLARED `[server] port = {}` \
+             for that profile (read without validation); it uses that port only to identify \
+             which slot unit each host is running. `autumn deploy check`/`up` still refuse \
+             to run until the config is fixed.",
+            port.port
+        ),
+    );
 
     let total = fleet.hosts.len();
     // ONE executor per host, built up front: a host with no SSH target is a config
@@ -4416,7 +4465,13 @@ where
             index + 1,
             names[index],
         );
-        outcomes.push(maintenance_one_host(cfg, on, &body, &executors[index]));
+        outcomes.push(maintenance_one_host(
+            cfg,
+            port.port,
+            on,
+            &body,
+            &executors[index],
+        ));
         eprintln!();
     }
 
@@ -4424,10 +4479,7 @@ where
         eprintln!("{line}");
     }
 
-    let failed = outcomes
-        .iter()
-        .filter(|outcome| matches!(outcome, fleet::MaintenanceOutcome::Failed { .. }))
-        .count();
+    let failed = outcomes.iter().filter(|outcome| outcome.failed()).count();
     if failed > 0 {
         return Err(DeployError::FleetMaintenanceFailed {
             verb: if on { "on" } else { "off" },
@@ -4438,34 +4490,75 @@ where
     Ok(())
 }
 
+/// What the write path could prove about the file this host's RUNNING unit polls
+/// (issue #1621, review round 3).
+enum LiveFlagTarget {
+    /// Nothing is promoted on this host, so no unit is serving and the shared write
+    /// is the whole job.
+    NoRelease,
+    /// The live slot's unit resolves to exactly this file.
+    Path(String),
+    /// A release IS live, but its unit could not be read — so which file the
+    /// application polls is NOT proved. Fail closed: never guessed from `current`.
+    Unproved,
+}
+
 /// Apply `maintenance on|off` to ONE host, returning what happened — never an
 /// error, because the caller continues past a failure (issue #1621, §6.2).
 ///
-/// One read-only probe first (`detect-current`, the same shared probe `up` runs)
-/// to resolve the `current` release dir the legacy flag lives under; then the
-/// writes/removals per amendment A2. Only op LABELS ever leave this function —
-/// the raw error can carry remote stderr, and the aggregate report must not.
+/// Two read-only probes first: `detect-current` (the same shared probe `up` runs)
+/// for the live-slot decision, then `detect-maintenance-flag` — the SAME on-host
+/// resolution `deploy status` reads the maintenance verdict with
+/// ([`exec::probe_live_maintenance_flag`]) — for the file that slot's unit actually
+/// makes the app poll. Resolving the write target the way the read path resolves
+/// its answer is the point: the `current` symlink and the running unit disagree
+/// whenever a proxy flip landed and `commit-markers` did not, and a flag written
+/// under `current` is then a file nothing polls (review round 3).
+///
+/// Then the writes/removals per amendment A2, shared path FIRST.
+///
+/// Only op LABELS ever leave this function — the raw error can carry remote
+/// stderr, and the aggregate report must not.
 fn maintenance_one_host<E: exec::DeployExecutor>(
     cfg: &ResolvedDeployConfig,
+    public_port: u16,
     on: bool,
     body: &str,
     executor: &E,
 ) -> fleet::MaintenanceOutcome {
-    let current = match exec::probe_deploy_state(cfg, executor) {
-        Ok(probe) => probe.current_release_dir,
-        Err(_) => {
-            return fleet::MaintenanceOutcome::Failed {
-                failed_step: "detect-current",
-            };
+    let Ok(probe) = exec::probe_deploy_state(cfg, executor) else {
+        return fleet::MaintenanceOutcome::Failed {
+            failed_step: "detect-current",
+        };
+    };
+    let target = match probe.reconcile(cfg, public_port) {
+        None => LiveFlagTarget::NoRelease,
+        // An unreadable unit AND an unrunnable probe both mean the same thing here:
+        // nothing is proved. The shared write still goes ahead below — it is the
+        // authoritative path and costs nothing to be right about — but the host is
+        // reported as only partially changed.
+        Some(reconcile) => {
+            match exec::probe_live_maintenance_flag(cfg, reconcile.live_slot, executor) {
+                Ok(Some(flag)) => LiveFlagTarget::Path(flag.path),
+                Ok(None) | Err(_) => LiveFlagTarget::Unproved,
+            }
         }
     };
 
     let shared = cfg.maintenance_flag_file();
+    // The file the live unit polls, ONLY when it is not the shared one already
+    // being written: a #1621 unit points at the shared path, and writing a second
+    // copy nothing reads would just leave litter for the next operator to wonder at.
+    let live_path = match &target {
+        LiveFlagTarget::Path(path) if *path != shared => Some(path.clone()),
+        _ => None,
+    };
+
     let mut ops: Vec<exec::DeployOp> = Vec::new();
     if on {
         // Shared (authoritative) flag first: a #1621 unit reacts within 500 ms of
-        // this single write, so the window starts closing even if the legacy write
-        // below fails.
+        // this single write, so the window starts closing even if the write below
+        // fails (amendment A2).
         ops.push(exec::DeployOp::WriteFile {
             label: "maintenance-write-shared",
             contents: exec::FileContents::Plain(body.to_owned()),
@@ -4477,18 +4570,20 @@ fn maintenance_one_host<E: exec::DeployExecutor>(
             // 0600 is sufficient — same rule as the 0600 env file (AC-5).
             mode: Some(0o600),
         });
-        if let Some(dir) = &current {
-            // Legacy path for units deployed before #1621 (amendment A2). The
-            // release-scoped tmp/ dir may not exist yet — the runtime only creates
-            // it when IT writes a flag — so mkdir -p first.
-            ops.push(exec::DeployOp::Run(exec::RemoteCommand::new(
-                "maintenance-prepare-release-tmp",
-                format!("mkdir -p {}", exec::shell_quote(&format!("{dir}/tmp"))),
-            )));
+        if let Some(path) = &live_path {
+            // The dir holding a pre-#1621 unit's flag (its `WorkingDirectory`'s
+            // `tmp/`) may not exist yet — the runtime only creates it when IT
+            // writes a flag — so mkdir -p first.
+            if let Some(parent) = remote_parent_dir(path) {
+                ops.push(exec::DeployOp::Run(exec::RemoteCommand::new(
+                    "maintenance-prepare-live-flag-dir",
+                    format!("mkdir -p {}", exec::shell_quote(parent)),
+                )));
+            }
             ops.push(exec::DeployOp::WriteFile {
-                label: "maintenance-write-release",
+                label: "maintenance-write-live-flag",
                 contents: exec::FileContents::Plain(body.to_owned()),
-                remote_path: format!("{dir}/{}", autumn_web::maintenance::MAINTENANCE_FLAG_FILE),
+                remote_path: path.clone(),
                 // 0600 for the same reason as the shared write above.
                 mode: Some(0o600),
             });
@@ -4498,12 +4593,9 @@ fn maintenance_one_host<E: exec::DeployExecutor>(
         // least one of them (a host has either the new unit or the old), so a
         // missing file must never fail the `off`.
         let mut paths = exec::shell_quote(&shared);
-        if let Some(dir) = &current {
+        if let Some(path) = &live_path {
             paths.push(' ');
-            paths.push_str(&exec::shell_quote(&format!(
-                "{dir}/{}",
-                autumn_web::maintenance::MAINTENANCE_FLAG_FILE
-            )));
+            paths.push_str(&exec::shell_quote(path));
         }
         ops.push(exec::DeployOp::Run(exec::RemoteCommand::new(
             "maintenance-clear",
@@ -4511,21 +4603,38 @@ fn maintenance_one_host<E: exec::DeployExecutor>(
         )));
     }
 
-    for op in &ops {
+    for (index, op) in ops.iter().enumerate() {
         if exec::run_ops(std::slice::from_ref(op), executor).is_err() {
             // The op label is known HERE regardless of the error's shape (an
             // upload failure carries no label), so the report can always name the
             // step without quoting the error.
-            return fleet::MaintenanceOutcome::Failed {
-                failed_step: op.label(),
+            let failed_step = op.label();
+            // Op 0 is the shared path in both directions, so failing it leaves the
+            // host genuinely UNCHANGED; failing anything after it means the shared
+            // flag landed but the running unit's own file did not.
+            return if index == 0 {
+                fleet::MaintenanceOutcome::Failed { failed_step }
+            } else {
+                fleet::MaintenanceOutcome::LiveUnitUnchanged { failed_step }
             };
         }
     }
-    if current.is_none() {
-        fleet::MaintenanceOutcome::AppliedSharedOnly
-    } else {
-        fleet::MaintenanceOutcome::Applied
+    match target {
+        LiveFlagTarget::NoRelease => fleet::MaintenanceOutcome::AppliedSharedOnly,
+        LiveFlagTarget::Path(_) => fleet::MaintenanceOutcome::Applied,
+        // Fail closed. The shared flag changed, but a pre-#1621 unit would ignore
+        // it, so this host must NOT be reported as maintained (or as released from
+        // maintenance) when nothing proved which file it reads.
+        LiveFlagTarget::Unproved => fleet::MaintenanceOutcome::LiveUnitUnchanged {
+            failed_step: "detect-maintenance-flag",
+        },
     }
+}
+
+/// The parent directory of a remote absolute path, or `None` when it has none.
+fn remote_parent_dir(path: &str) -> Option<&str> {
+    let (parent, _) = path.rsplit_once('/')?;
+    (!parent.is_empty()).then_some(parent)
 }
 
 #[cfg(test)]
@@ -9003,6 +9112,10 @@ mod tests {
     const MAINTENANCE_SHARED_PATH: &str = "/srv/autumn/myapp/shared/autumn-maintenance.json";
     const MAINTENANCE_LEGACY_PATH: &str =
         "/srv/autumn/myapp/releases/r1/tmp/autumn-maintenance.json";
+    /// The flag path a pre-#1621 unit resolves to when it is running a DIFFERENT
+    /// release than the one `current` names — the round-3 disagreement.
+    const MAINTENANCE_LIVE_UNIT_PATH: &str =
+        "/srv/autumn/myapp/releases/r2/tmp/autumn-maintenance.json";
 
     fn drive_maintenance(
         fleet: &ResolvedFleet,
@@ -9010,7 +9123,35 @@ mod tests {
         verb: DeployAction,
         args: Option<&MaintenanceOnArgs>,
     ) -> Result<(), DeployError> {
-        run_fleet_maintenance_with(fleet, verb, args, |cfg| Ok(recorder.executor(cfg)))
+        let port = StatusPort {
+            port: FLEET_PUBLIC_PORT,
+            degraded: None,
+        };
+        run_fleet_maintenance_with(fleet, &port, "prod", verb, args, |cfg| {
+            Ok(recorder.executor(cfg))
+        })
+    }
+
+    /// Script one host for the maintenance fan-out: the shared deploy probe, plus
+    /// the flag path that host's LIVE slot unit resolves to (`""` scripts a unit
+    /// that could not be read).
+    fn script_maintenance(
+        recorder: fleet::test_support::FleetRecorder,
+        host: &str,
+        release: &str,
+        unit_flag: &str,
+    ) -> fleet::test_support::FleetRecorder {
+        recorder
+            .script(host, "detect-current", status_probe(release))
+            .script(
+                host,
+                "detect-maintenance-flag",
+                if unit_flag.is_empty() {
+                    String::new()
+                } else {
+                    format!("{unit_flag}\n")
+                },
+            )
     }
 
     /// The remote paths `host` was asked to upload to, in order.
@@ -9040,7 +9181,7 @@ mod tests {
         let fleet = fleet_of(&hosts);
         let mut recorder = fleet::test_support::FleetRecorder::new();
         for host in hosts {
-            recorder = script_status(recorder, host, "r1", "200", false);
+            recorder = script_maintenance(recorder, host, "r1", MAINTENANCE_LEGACY_PATH);
         }
 
         let args = MaintenanceOnArgs {
@@ -9065,8 +9206,9 @@ mod tests {
             assert!(
                 recorder
                     .run_labels_for(host)
-                    .contains(&"maintenance-prepare-release-tmp"),
-                "{host} must create the release tmp dir before writing into it"
+                    .contains(&"maintenance-prepare-live-flag-dir"),
+                "{host} must create the dir holding the running unit's flag before \
+                 writing into it"
             );
         }
     }
@@ -9085,7 +9227,7 @@ mod tests {
         let fleet = fleet_of(&hosts);
         let mut recorder = fleet::test_support::FleetRecorder::new();
         for host in hosts {
-            recorder = script_status(recorder, host, "r1", "200", false);
+            recorder = script_maintenance(recorder, host, "r1", MAINTENANCE_LEGACY_PATH);
         }
 
         let args = MaintenanceOnArgs {
@@ -9131,13 +9273,14 @@ mod tests {
     }
 
     #[test]
-    fn fleet_maintenance_on_writes_shared_only_when_current_is_unresolvable() {
-        // A host with no promoted release (its first deploy has not happened yet, or
-        // `current` dangles) has no release dir to carry the legacy flag. The shared
-        // write still happens — a #1621 unit will honour it — and the outcome says
-        // shared-only rather than pretending both landed. Also proves the fan-out
-        // works for an N==1 "fleet" (the deploy-config'd remote host, as distinct
-        // from the LOCAL `autumn maintenance`).
+    fn fleet_maintenance_on_writes_shared_only_when_no_release_is_promoted() {
+        // A host whose first deploy has not happened yet runs no slot unit at all, so
+        // no application polls a release-local flag and the shared write IS the whole
+        // job — the next deploy installs a #1621 unit that honours it. The outcome says
+        // shared-only rather than pretending two files landed, and unlike the unproved
+        // case (where a unit IS serving) this is a success, not a failure. Also proves
+        // the fan-out works for an N==1 "fleet" (the deploy-config'd remote host, as
+        // distinct from the LOCAL `autumn maintenance`).
         let fleet = fleet_of(&["web-a"]);
         let recorder = fleet::test_support::FleetRecorder::new().script(
             "web-a",
@@ -9162,8 +9305,131 @@ mod tests {
         assert!(
             !recorder
                 .run_labels_for("web-a")
-                .contains(&"maintenance-prepare-release-tmp"),
-            "no release dir means no release-tmp preparation"
+                .contains(&"maintenance-prepare-live-flag-dir"),
+            "no running unit means no second flag dir to prepare"
+        );
+    }
+
+    #[test]
+    fn fleet_maintenance_writes_the_flag_the_running_unit_polls_not_the_symlink_target() {
+        // #1621 review round 3. `current` and the RUNNING unit can disagree: the proxy
+        // flip landed and `commit-markers` did not, so the symlink still names the OLD
+        // release while the live slot unit keeps serving from another one. Deriving the
+        // legacy flag path from `current` then writes a file NOTHING polls — `on`
+        // reports success while the application carries on serving traffic. The write
+        // path must resolve the file from the proxy-selected live slot's unit, exactly
+        // as the status probe reads it, so read and write agree by construction.
+        let fleet = fleet_of(&["web-a"]);
+        let recorder = script_maintenance(
+            fleet::test_support::FleetRecorder::new(),
+            "web-a",
+            "r1",
+            MAINTENANCE_LIVE_UNIT_PATH,
+        );
+
+        drive_maintenance(
+            &fleet,
+            &recorder,
+            DeployAction::MaintenanceOn,
+            Some(&MaintenanceOnArgs::default()),
+        )
+        .expect("both writes land");
+
+        assert_eq!(
+            upload_paths(&recorder, "web-a"),
+            vec![
+                MAINTENANCE_SHARED_PATH.to_owned(),
+                MAINTENANCE_LIVE_UNIT_PATH.to_owned(),
+            ],
+            "the shared flag first (A2), then the file the RUNNING unit polls — and \
+             never the stale `current` target"
+        );
+    }
+
+    #[test]
+    fn fleet_maintenance_on_fails_closed_when_the_running_units_flag_is_unproved() {
+        // The live slot's unit could not be read, so which file the application polls
+        // is NOT proved. The shared (authoritative) write still happens — a #1621 unit
+        // reacts to it within 500 ms — but the host must not be reported as maintained:
+        // a pre-#1621 unit ignores the shared flag entirely, so claiming success here
+        // is exactly the lie the round-3 finding is about.
+        let fleet = fleet_of(&["web-a"]);
+        let recorder =
+            script_maintenance(fleet::test_support::FleetRecorder::new(), "web-a", "r1", "");
+
+        let err = drive_maintenance(
+            &fleet,
+            &recorder,
+            DeployAction::MaintenanceOn,
+            Some(&MaintenanceOnArgs::default()),
+        )
+        .expect_err("an unproved live-unit flag must not exit 0");
+        assert!(
+            err.to_string().contains("1 of 1"),
+            "the host counts as failed in the aggregate: {err}"
+        );
+        assert_eq!(
+            upload_paths(&recorder, "web-a"),
+            vec![MAINTENANCE_SHARED_PATH.to_owned()],
+            "the shared flag is still written first; nothing is GUESSED for the rest"
+        );
+    }
+
+    #[test]
+    fn fleet_maintenance_off_never_claims_to_clear_a_flag_it_cannot_locate() {
+        // The mirror of the `on` case: `off` that cannot prove which file the running
+        // unit polls must not report the host as un-maintained, and must not pretend to
+        // have removed a release-local flag whose path it only guessed from `current`.
+        let fleet = fleet_of(&["web-a"]);
+        let recorder =
+            script_maintenance(fleet::test_support::FleetRecorder::new(), "web-a", "r1", "");
+
+        drive_maintenance(&fleet, &recorder, DeployAction::MaintenanceOff, None)
+            .expect_err("an unproved live-unit flag must not exit 0");
+
+        let shell = recorder
+            .calls_for("web-a")
+            .iter()
+            .find_map(|call| match call {
+                exec::test_support::RecordedCall::Run { label, shell }
+                    if *label == "maintenance-clear" =>
+                {
+                    Some(shell.clone())
+                }
+                _ => None,
+            })
+            .expect("the shared flag is still cleared");
+        assert!(
+            shell.contains(MAINTENANCE_SHARED_PATH),
+            "the shared flag is still removed: {shell}"
+        );
+        assert!(
+            !shell.contains(MAINTENANCE_LEGACY_PATH),
+            "a path derived from `current` must not be removed on a hunch: {shell}"
+        );
+    }
+
+    #[test]
+    fn fleet_maintenance_row_says_the_running_units_flag_was_not_changed() {
+        // The row for a partially-changed host must say BOTH true things: the shared
+        // flag did change (so an operator reversing by hand knows), and the file the
+        // running unit polls did NOT (so nobody reads the row as "this host is
+        // maintained").
+        let rendered = fleet::fleet_maintenance_summary_lines(
+            &["web-a".to_owned()],
+            &[fleet::MaintenanceOutcome::LiveUnitUnchanged {
+                failed_step: "detect-maintenance-flag",
+            }],
+            true,
+        )
+        .join("\n");
+        assert!(
+            rendered.contains("detect-maintenance-flag"),
+            "the row names the step that could not be proved:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("shared flag") && rendered.contains("RUNNING"),
+            "the row must distinguish the shared flag from the running unit's:\n{rendered}"
         );
     }
 
@@ -9199,7 +9465,7 @@ mod tests {
         let fleet = fleet_of(&hosts);
         let mut recorder = fleet::test_support::FleetRecorder::new();
         for host in hosts {
-            recorder = script_status(recorder, host, "r1", "200", true);
+            recorder = script_maintenance(recorder, host, "r1", MAINTENANCE_LEGACY_PATH);
         }
 
         drive_maintenance(&fleet, &recorder, DeployAction::MaintenanceOff, None)
@@ -9245,7 +9511,7 @@ mod tests {
         let fleet = fleet_of(&hosts);
         let mut recorder = fleet::test_support::FleetRecorder::new();
         for host in hosts {
-            recorder = script_status(recorder, host, "r1", "200", false);
+            recorder = script_maintenance(recorder, host, "r1", MAINTENANCE_LEGACY_PATH);
         }
         recorder = recorder.fail_upload("web-b", MAINTENANCE_SHARED_PATH);
 
