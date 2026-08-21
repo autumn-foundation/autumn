@@ -538,11 +538,37 @@ to. Restore it by hand, then deploy the fleet again.
 
 ### After any halted rollout: check the schema
 
-An automatic compensation restores **binaries only**. If the rollout got far
-enough to migrate, the schema is still forward while the binaries are back. That
-is safe *if* your migrations are expand/contract (below) and alarming if they are
-not — so confirm it explicitly rather than assuming the rollback undid
-everything.
+**The trigger is the migration, not the compensation.** If the rollout got far
+enough to reach the host carrying the migration, the schema is forward — whether
+or not the fleet ever compensated anything. That is safe *if* your migrations are
+expand/contract (below) and alarming if they are not, so confirm it explicitly
+rather than assuming the halt undid everything.
+
+The `Fleet state:` summary states which of three things is true, and it is worth
+reading the exact sentence rather than skimming for the ⚠️:
+
+- **Some host is still on the new release** → `the schema has moved; from here an
+  automatic rollback restores BINARIES only — it never rolls a migration back`.
+  Forward-looking: it describes what a rollback *you* run next will not undo.
+- **The fleet actually put a host back** — restored it to its previous release,
+  or removed its just-completed first deploy → `the compensating rollback
+  restored BINARIES only — the migration that already ran was NOT rolled back;
+  confirm the schema still fits the release now serving`. A compensation that
+  only **failed** does not produce this line: that host is still serving the new
+  release, so it gets the forward-looking note above instead. Both lines appear
+  together when a halt compensated some hosts and left others forward.
+- **Nothing is forward and nothing was compensated** — the migrating host failed
+  after `migrate` but before its own cutover (a `readiness-gate` timeout is the
+  usual shape) and tore its candidate down, so every later host was never touched
+  → `no host is serving the new release, but the migration that already ran was
+  NOT rolled back — the binaries went back and the schema did not; confirm the
+  release now serving still fits the migrated schema`. This is the one that reads
+  like a clean no-op and is not: the table is all "previous release still
+  serving" rows, and the database has already moved on.
+
+A fleet where *every* host is a first deploy schedules no migration at all, so it
+prints none of these — the prologue already told you to run `autumn migrate`
+yourself.
 
 ---
 

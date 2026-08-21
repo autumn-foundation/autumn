@@ -42,7 +42,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release) is reported with the exact by-hand recovery command instead of being
   guessed at. Compensation and `autumn deploy rollback` restore **binaries only**
   — a migration that already ran is never rolled back, which is stated on every
-  surface that can reach that state. `--only <HOST>` (repeatable) narrows `up` or
+  surface that can reach that state. The closing `Fleet state:` summary states it
+  in whichever of three tenses is TRUE, gated on the **migration** having been
+  reached rather than on whether the fleet compensated: a host still on the new
+  release gets the forward-looking `the schema has moved …` note; a fleet that
+  actually *restored* a host or *removed* a just-completed first deploy gets `the
+  compensating rollback restored BINARIES only …` (a compensation that merely
+  **failed** no longer claims this — that host is still serving the new release,
+  so it takes the forward-looking note instead, and both notes appear together
+  when a halt compensated some hosts and left others forward); and the case that
+  previously printed **nothing at all** — no host forward and nothing to
+  compensate, because the migrating host itself failed after `migrate` but before
+  its cutover and tore its own candidate down — now gets its own `no host is
+  serving the new release, but the migration that already ran was NOT rolled back
+  …` note. An all-first-deploy fleet schedules no migration and stays silent, so
+  the summary never contradicts the prologue's "run `autumn migrate` yourself".
+  (A failed *single-host* deploy still renders no summary and so still says
+  nothing about a migration that already ran — tracked as #2276.)
+  `--only <HOST>` (repeatable) narrows `up` or
   `rollback` to a subset as a repair lever, warning loudly every time that the
   fleet may end up mixed; `--no-rollback` halts and freezes for inspection
   instead. `autumn deploy rollback` rolls the whole fleet back newest-first and
@@ -54,7 +71,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`[jobs] backend = "local"`, `[scheduler] backend = "in_process"`), which are
   correct on one host and become N independent queues and N cron timers on a
   fleet. The preflight grades **every** targeted host before any host is touched,
-  and `autumn doctor` grades the same list. Note that no host is ever *drained*
+  and `autumn doctor` grades the same list; it is also the fail-fast boundary that
+  `up`, `check` and `rollback` all abort on, so it now **fails closed on a fleet
+  with no entries at all** (#2274) — returning the same `no target host
+  configured` `ssh_reachability` failure the single-host path uses, rather than
+  zero checks, which would read as "0 failed" and walk the run past the gate into
+  a panic downstream. Note that no host is ever *drained*
   for the rollout's sake — a host's `/ready` never goes `503` and it is never
   removed from your load balancer's pool; each host is replaced in place by its
   own kamal-proxy flipping loopback slots. See `docs/guide/fleet-deploys.md`.

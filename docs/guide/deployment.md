@@ -436,6 +436,71 @@ safe. `autumn migrate check` (already part of the preflight) classifies your
 local `migrations/` by rolling-deploy risk; the
 [fleet deploys guide](fleet-deploys.md) covers the pattern in full.
 
+##### The three schema notes on the `Fleet state:` summary
+
+The same binaries-versus-schema truth is repeated once at the end of the run, on
+the `Fleet state:` table described [below](#a-failure-halts-the-rollout-and-rolls-the-fleet-back).
+The question being answered is never "did the fleet compensate" — it is **the
+schema is at the new release; where are the binaries?** So the gate is the
+migration: the summary says nothing at all unless this run actually scheduled a
+migration *and* reached the host carrying it. (A fleet where every host is a
+first deploy schedules no migration and stays silent — the prologue already told
+you to run `autumn migrate` yourself.) Beyond that gate the fleet's shape only
+picks which sentence is true:
+
+- **Some host is still forward.** At least one host is on the new release —
+  deployed, degraded, left alone because its rollback target was in doubt, or one
+  whose compensating rollback *failed*. You get:
+
+  ```
+  ⚠️  the schema has moved; from here an automatic rollback restores BINARIES
+  only — it never rolls a migration back
+  ```
+
+  Forward-looking: it describes what a rollback you run *from here* will and will
+  not undo. It is the same sentence the rollout printed mid-run, repeated because
+  the run is ending with hosts still on the new release.
+
+- **The fleet actually put hosts back.** Compensation *restored* a host to its
+  previous release or *removed* a just-completed first deploy. You get:
+
+  ```
+  ⚠️  the compensating rollback restored BINARIES only — the migration that
+  already ran was NOT rolled back; confirm the schema still fits the release now
+  serving
+  ```
+
+  Past-tense: something already moved back underneath you. A compensation that
+  only **failed** does not count here — that host is still serving the new
+  release, so it lands in the first case instead, and claiming a rollback
+  "restored binaries" would be false.
+
+  These two are independent. A halt that compensated some hosts and left others
+  forward (a `NOT rolled back automatically` row, or a compensation that failed)
+  prints **both**.
+
+- **Nothing forward, and nothing compensated.** No host is on the new release and
+  the fleet never had anything to undo — because the migrating host itself failed
+  at a step *after* `migrate` but *before* its cutover (a `readiness-gate`
+  timeout is the ordinary shape) and tore its own candidate down, leaving every
+  later host untouched. The table is then all "previous release still serving"
+  rows with the database already moved on underneath them, so the summary says so
+  explicitly:
+
+  ```
+  ⚠️  no host is serving the new release, but the migration that already ran was
+  NOT rolled back — the binaries went back and the schema did not; confirm the
+  release now serving still fits the migrated schema
+  ```
+
+  This is the case that is easiest to misread as a clean no-op. It is not one:
+  the rollout aborted, but the migration stands.
+
+The gate is deliberately conservative. The rollout cannot prove from a failing
+step label whether the one-shot `migrate` itself succeeded, so it errs toward
+"the schema moved" — one extra line of output is cheaper than an operator rolling
+binaries back believing the schema came with them.
+
 #### A failure halts the rollout and rolls the fleet back
 
 A host that fails **stops the rollout**: the hosts behind it are never touched.
@@ -467,8 +532,13 @@ host never stops the next, and every result is named.
 Two things compensation deliberately does **not** do:
 
 - **It restores binaries, never schema.** A migration that already ran stays
-  applied. The summary says so out loud; confirm the schema still fits the
-  release now serving.
+  applied. The summary says so out loud — but only when compensation actually
+  *restored* a host to its previous release or *removed* a just-completed first
+  deploy. A compensation that merely **failed** leaves that host serving the new
+  release, so the summary prints the forward-looking `the schema has moved …`
+  note for it instead. Either way, confirm the schema still fits the release now
+  serving; the three notes and when each appears are spelled out under
+  [The three schema notes on the `Fleet state:` summary](#the-three-schema-notes-on-the-fleet-state-summary).
 - **It does not touch a host whose rollback target is in doubt.** Markers left
   mid-transaction, a missing or unverifiable target release dir, or no recorded
   previous release each produce a `NOT rolled back automatically` row plus the
@@ -622,6 +692,22 @@ single-host path prints byte-for-byte what it printed before.
 
 `autumn deploy --help` was also rewritten, and `up`/`rollback` gained `--only`
 and `--no-rollback`; no existing flag changed meaning.
+
+> **Known limitation — a single-host deploy that fails after its migration ran
+> says nothing about the schema (#2276).** On one host, a failure at any point is
+> reported as the plain per-host error and the command returns right there: the
+> single-host path deliberately keeps its pre-fleet output byte-for-byte, so it
+> renders no `Fleet state:` summary and therefore none of
+> [the three schema notes](#the-three-schema-notes-on-the-fleet-state-summary).
+> If the failure landed *after* `migrate` but before the cutover — a
+> `readiness-gate` timeout is the ordinary shape — the candidate is torn down and
+> your previous release keeps serving, **against the already-migrated schema**,
+> with nothing on screen saying so. The fleet path does warn in exactly this
+> situation; the single-host path does not yet. This is tracked as
+> [#2276](https://github.com/autumn-foundation/autumn/issues/2276) and is not fixed. Until
+> it is: after any failed single-host `deploy up`, check `autumn migrate status`
+> before assuming the failure left nothing behind — and write expand/contract
+> migrations so the still-serving release fits the migrated schema either way.
 
 ### Rollback
 
@@ -1032,6 +1118,13 @@ or error messages.
   down-migration mid-flip would run exactly the SQL nothing reviews. Use
   expand/contract migrations so a rolled-back binary still fits the migrated
   schema.
+- **A failed *single-host* deploy never warns that the schema moved** (#2276).
+  A fleet ends every run with a `Fleet state:` summary that names the
+  binaries-versus-schema state; the single-host path returns the per-host error
+  directly and renders no summary, so a failure after `migrate` but before the
+  cutover leaves the previous release serving against the migrated schema with
+  nothing saying so. See
+  [What fleet support changed for an existing single-host deploy](#what-fleet-support-changed-for-an-existing-single-host-deploy).
 - **A compensated first deploy leaves its proxy route behind.** When the fleet
   removes a host's just-completed *first* deploy, that host's kamal-proxy still
   holds a route pointing at the (now stopped) slot, so its public port answers

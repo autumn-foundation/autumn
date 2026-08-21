@@ -2119,7 +2119,20 @@ order — except post-cutover housekeeping failures (`record-proxy-options`,
 and continues, and hosts whose rollback target is unprovable, which are reported
 for manual recovery rather than guessed at. **Rollback restores binaries only —
 no migration is ever rolled back**, so tell users to write expand/contract
-migrations. `--only <HOST>` (repeatable, `up` and `rollback`) is a repair lever
+migrations. The closing `Fleet state:` summary says which of THREE things is
+true, gated on the migration having been reached (never on whether the fleet
+compensated): a host still on the new release → `the schema has moved …`; the
+fleet actually restored a host or removed its just-completed first deploy → `the
+compensating rollback restored BINARIES only …` (a compensation that only FAILED
+leaves that host forward, so it takes the first note, and both can print
+together); nothing forward and nothing compensated, because the migrating host
+failed after `migrate` but before its cutover and tore its own candidate down →
+`no host is serving the new release, but the migration that already ran was NOT
+rolled back …`. An all-first-deploy fleet migrates nowhere and prints none of
+them. **A failed SINGLE-host deploy prints no summary and so warns about none of
+this** (known gap, #2276) — if a user's one-host `deploy up` failed, tell them to
+check `autumn migrate status` before assuming nothing was applied.
+`--only <HOST>` (repeatable, `up` and `rollback`) is a repair lever
 that warns about a mixed fleet; `--no-rollback` halts and freezes instead.
 `--only` narrowed to ONE host takes the single-host path: `deploy rollback --only
 <host>` prints no fleet state table and keeps the HARD preflight gate (a
