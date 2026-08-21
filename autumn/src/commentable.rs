@@ -1625,20 +1625,77 @@ async fn authorize(
     }
 }
 
+/// The authorization decision for one comment request, resolved as an
+/// **extractor** rather than in the handler body.
+///
+/// This is load-bearing for pool safety, not a style choice. `Db` is an
+/// eager extractor: by the time a handler body runs, its connection is already
+/// checked out. `CommentsConfig::authorize` is documented as the place to run a
+/// record-level policy check, and a policy check reads the database — so an
+/// `authorize` call from the body would run while this request already holds a
+/// connection, and at concurrency equal to the pool size every request could
+/// pin one while waiting for a second that can never be issued.
+///
+/// axum runs extractors in argument order, so declaring this one **before**
+/// `Db` makes "authorize, then check out" a property of the signature rather
+/// than of a comment somebody could later reorder.
+#[cfg(all(feature = "db", feature = "maud"))]
+struct AuthorizedComment {
+    /// The signed-in author, if any. `None` is allowed for a read and refused
+    /// for a write.
+    author_id: Option<i64>,
+}
+
+#[cfg(all(feature = "db", feature = "maud"))]
+impl<S> axum::extract::FromRequestParts<S> for AuthorizedComment
+where
+    S: Send + Sync,
+{
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let axum::Extension(config) =
+            axum::Extension::<std::sync::Arc<CommentsConfig>>::from_request_parts(parts, state)
+                .await
+                .map_err(|_| {
+                    AutumnError::internal_server_error_msg(
+                        "comment router is not mounted with its CommentsConfig",
+                    )
+                })?;
+        let axum::extract::Path((commentable_type, parent_id)) =
+            axum::extract::Path::<(String, i64)>::from_request_parts(parts, state).await?;
+        let session = crate::session::Session::from_request_parts(parts, state).await?;
+
+        // A write is the method that creates a comment; everything else reads.
+        let write = parts.method == axum::http::Method::POST;
+        let author_id = session_author(&session, &config).await;
+        if write && author_id.is_none() {
+            return Err(AutumnError::unauthorized_msg("Sign in to comment"));
+        }
+
+        authorize(&config, &commentable_type, parent_id, author_id, write).await?;
+        Ok(Self { author_id })
+    }
+}
+
 /// Render the thread for one record.
 #[cfg(all(feature = "db", feature = "maud"))]
 async fn show_thread(
     axum::Extension(config): axum::Extension<std::sync::Arc<CommentsConfig>>,
     axum::extract::Path((commentable_type, parent_id)): axum::extract::Path<(String, i64)>,
     axum::extract::Query(query): axum::extract::Query<ThreadQuery>,
-    session: crate::session::Session,
     csrf: Option<crate::security::csrf::CsrfToken>,
     csrf_field: Option<crate::security::csrf::CsrfFormField>,
+    // Declared before `Db` on purpose: authorization runs (and may read the
+    // database) before this request holds a pooled connection. See
+    // `AuthorizedComment`.
+    AuthorizedComment { author_id }: AuthorizedComment,
     mut db: crate::db::Db,
 ) -> AutumnResult<maud::Markup> {
     let spec = resolve_spec(&commentable_type)?;
-    let author_id = session_author(&session, &config).await;
-    authorize(&config, &commentable_type, parent_id, author_id, false).await?;
     let tenant = request_tenant(spec)?;
     let thread = comment_thread(
         &mut db,
@@ -1684,20 +1741,20 @@ struct ThreadQuery {
 async fn post_comment(
     axum::Extension(config): axum::Extension<std::sync::Arc<CommentsConfig>>,
     axum::extract::Path((commentable_type, parent_id)): axum::extract::Path<(String, i64)>,
-    session: crate::session::Session,
     csrf: Option<crate::security::csrf::CsrfToken>,
     csrf_field: Option<crate::security::csrf::CsrfFormField>,
     htmx: crate::htmx::HxRequest,
+    // Before `Db`, as in `show_thread`: a policy check that reads the database
+    // must not run while this request is already holding a connection.
+    AuthorizedComment { author_id }: AuthorizedComment,
     mut db: crate::db::Db,
     axum::extract::Form(submission): axum::extract::Form<CommentSubmission>,
 ) -> AutumnResult<axum::response::Response> {
     use axum::response::IntoResponse as _;
 
     let spec = resolve_spec(&commentable_type)?;
-    let author_id = session_author(&session, &config)
-        .await
-        .ok_or_else(|| AutumnError::unauthorized_msg("Sign in to comment"))?;
-    authorize(&config, &commentable_type, parent_id, Some(author_id), true).await?;
+    // The extractor refuses an unauthenticated write, so this is always `Some`.
+    let author_id = author_id.ok_or_else(|| AutumnError::unauthorized_msg("Sign in to comment"))?;
     // An empty hidden input means "top-level", not "malformed": the widget
     // renders `reply_to` only on the per-node forms.
     let reply_to = match submission.reply_to.as_deref().map(str::trim) {

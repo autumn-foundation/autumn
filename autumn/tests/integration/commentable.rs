@@ -319,6 +319,19 @@ async fn setup_pool() -> (
     Pool<AsyncPgConnection>,
     testcontainers::ContainerAsync<Postgres>,
 ) {
+    // Comfortably exceeds the concurrent callers in the race test plus the
+    // observer connection, so no caller ever queues on pool acquisition.
+    setup_pool_with_size(40).await
+}
+
+/// The same fixture with an explicit pool size, for the tests that care how
+/// many connections a single request holds at once.
+async fn setup_pool_with_size(
+    max_size: usize,
+) -> (
+    Pool<AsyncPgConnection>,
+    testcontainers::ContainerAsync<Postgres>,
+) {
     let container = Postgres::default()
         .start()
         .await
@@ -329,9 +342,10 @@ async fn setup_pool() -> (
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
-    // Comfortably exceeds the concurrent callers in the race test plus the
-    // observer connection, so no caller ever queues on pool acquisition.
-    let pool = Pool::builder(manager).max_size(40).build().expect("pool");
+    let pool = Pool::builder(manager)
+        .max_size(max_size)
+        .build()
+        .expect("pool");
 
     let mut conn = pool.get().await.expect("conn");
     for stmt in DDL {
@@ -1329,6 +1343,64 @@ async fn router_honours_the_record_level_authorization_hook() {
         "a refusal is 404, never 403 — no existence oracle"
     );
     assert!(!body.contains("secret"), "{body}");
+}
+
+/// The authorization hook is documented as the place to run a record-level
+/// policy check, and a policy check reads the database. If it ran while the
+/// request already held its `Db` checkout, an app on a small pool would
+/// deadlock under concurrency rather than answer.
+///
+/// This drives the hook through a pool with exactly ONE connection, and has the
+/// hook itself take a connection from that pool — the shape a real policy check
+/// has. It can only pass if authorization completes before the handler's own
+/// checkout, which is what declaring the extractor ahead of `Db` buys.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_authorizes_before_it_checks_out_a_connection() {
+    let (pool, _container) = setup_pool_with_size(1).await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    // Release the fixture's connection before the repository takes its own:
+    // this pool holds exactly one, so seeding and commenting cannot overlap.
+    drop(conn);
+    PgCmtPostRepository::with_pool_untracked(pool.clone())
+        .add_comment(post, author, "visible", None)
+        .await
+        .expect("comment");
+
+    // A hook that reads the database, exactly as a `Policy::can_show` would.
+    let probe_pool = pool.clone();
+    let config = autumn_web::commentable::CommentsConfig::default().authorize(move |_access| {
+        let pool = probe_pool.clone();
+        Box::pin(async move {
+            // Taking a connection here IS the assertion: on a pool of one, this
+            // can only succeed if the handler has not checked one out yet. A
+            // regression that authorizes from the handler body deadlocks
+            // instead of returning, which the timeout below reports.
+            let mut conn = pool
+                .get()
+                .await
+                .expect("authorize ran while the request already held the only connection");
+            diesel::sql_query("SELECT 1")
+                .execute(&mut conn)
+                .await
+                .expect("the connection handed to authorize must be usable");
+            true
+        })
+    });
+
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        call(
+            comment_app(pool.clone(), config),
+            get(&format!("/comments/CmtPost/{post}")),
+        ),
+    )
+    .await
+    .expect("a DB-backed authorize hook must not deadlock the pool");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("visible"), "{body}");
 }
 
 /// A browser submits an *empty* hidden input as `reply_to=`. Reading that as
