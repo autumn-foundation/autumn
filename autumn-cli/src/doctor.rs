@@ -6683,27 +6683,59 @@ pub fn run(opts: DoctorOptions) {
         // --strict` must fail on it too rather than green-lighting a config the
         // deploy path rejects. Only the actual TCP connect probe is gated behind
         // `--online`.
-        let host = deploy_cfg.host.clone();
+        //
+        // #1621: the target is a LIST — `[deploy] host` (one) or `[deploy] hosts`
+        // (a fleet, in rollout order) — and doctor enumerates it exactly as
+        // `deploy check` does, through the same shared validator, so a fleet config
+        // is graded rather than reported as "no target host configured". A malformed
+        // spelling (both keys set, a blank entry, a duplicate) is the same hard
+        // refusal `deploy check` makes, surfaced here as a failing `deploy_host`.
+        //
+        // Doctor keeps ONE check per grader name even for a fleet: `CheckResult.name`
+        // is `&'static str` and an operator-visible `--json` key, so the per-host
+        // detail rides in the DETAIL text instead of multiplying names. See
+        // `crate::deploy::DOCTOR_PREFLIGHT_GRADERS`.
+        let deploy_hosts = crate::deploy::deploy_host_list(&deploy_cfg);
         tasks.push(Box::new({
-            let host = host.clone();
-            move || {
-                deploy_preflight_result(
+            let deploy_hosts = deploy_hosts.clone();
+            move || match &deploy_hosts {
+                Ok(hosts) => deploy_preflight_result(
                     "deploy_host",
-                    crate::deploy::grade_deploy_host_present(host.as_deref()),
-                )
+                    crate::deploy::grade_deploy_hosts_present(hosts),
+                ),
+                Err(message) => CheckResult {
+                    name: "deploy_host",
+                    status: CheckStatus::Fail,
+                    detail: Some(message.clone()),
+                    hint: Some(
+                        "Fix the [deploy] host spelling in autumn.toml — set either `host`                          (one server) or `hosts` (a fleet), never both (see `autumn deploy                          check`)",
+                    ),
+                },
             }
         }));
         if opts.online {
             let ssh_port = deploy_cfg.ssh_port;
-            tasks.push(Box::new(move || {
-                deploy_preflight_result(
-                    "deploy_ssh_reachability",
-                    crate::deploy::grade_ssh_reachability(
-                        host.as_deref(),
+            tasks.push(Box::new(move || match &deploy_hosts {
+                Ok(hosts) => deploy_preflight_result(
+                    crate::deploy::DOCTOR_PREFLIGHT_GRADERS[0],
+                    crate::deploy::grade_fleet_ssh_reachability(
+                        hosts,
                         ssh_port,
                         std::time::Duration::from_secs(5),
                     ),
-                )
+                ),
+                // The spelling itself is broken, so there is no list to probe; the
+                // `deploy_host` check above already names the problem. Report the
+                // reachability check as failing rather than silently omitting it —
+                // omission would change the `--json` key set.
+                Err(message) => CheckResult {
+                    name: crate::deploy::DOCTOR_PREFLIGHT_GRADERS[0],
+                    status: CheckStatus::Fail,
+                    detail: Some(message.clone()),
+                    hint: Some(
+                        "Fix the [deploy] host spelling in autumn.toml before probing                          reachability (see `autumn deploy check`)",
+                    ),
+                },
             }));
         }
 
@@ -6711,7 +6743,7 @@ pub fn run(opts: DoctorOptions) {
             Ok(deploy_previous_signing) => {
                 tasks.push(Box::new(move || {
                     deploy_preflight_result(
-                        "deploy_signing_secret",
+                        crate::deploy::DOCTOR_PREFLIGHT_GRADERS[1],
                         crate::deploy::grade_signing_secret(
                             deploy_signing.as_deref(),
                             &deploy_previous_signing,
@@ -6729,7 +6761,7 @@ pub fn run(opts: DoctorOptions) {
                 // strong current secret green-light a config the deploy path
                 // rejects.
                 tasks.push(Box::new(move || CheckResult {
-                    name: "deploy_signing_secret",
+                    name: crate::deploy::DOCTOR_PREFLIGHT_GRADERS[1],
                     status: CheckStatus::Fail,
                     detail: Some(format!(
                         "security.signing_secret.previous_secrets is present but invalid: {msg}"
@@ -6745,7 +6777,7 @@ pub fn run(opts: DoctorOptions) {
             Ok(deploy_db_url) => {
                 tasks.push(Box::new(move || {
                     deploy_preflight_result(
-                        "deploy_database_url",
+                        crate::deploy::DOCTOR_PREFLIGHT_GRADERS[2],
                         crate::deploy::grade_database_url(
                             deploy_db_url.as_deref(),
                             std::path::Path::new("migrations"),
@@ -6760,7 +6792,7 @@ pub fn run(opts: DoctorOptions) {
                 // check instead of exiting the process, so `autumn doctor --json`
                 // still emits valid JSON with a clear, actionable failure.
                 tasks.push(Box::new(move || CheckResult {
-                    name: "deploy_database_url",
+                    name: crate::deploy::DOCTOR_PREFLIGHT_GRADERS[2],
                     status: CheckStatus::Fail,
                     detail: Some(format!("[[database.shards]] is present but invalid: {msg}")),
                     hint: Some(
@@ -6772,7 +6804,7 @@ pub fn run(opts: DoctorOptions) {
         }
         tasks.push(Box::new(|| {
             deploy_preflight_result(
-                "deploy_migrate_check",
+                crate::deploy::DOCTOR_PREFLIGHT_GRADERS[3],
                 crate::deploy::grade_migrate_check(std::path::Path::new("migrations")),
             )
         }));

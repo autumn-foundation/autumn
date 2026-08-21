@@ -733,6 +733,29 @@ pub(crate) fn fleet_rollout_lines(
     lines
 }
 
+/// The ONE per-host table renderer every fleet view goes through (issue #1621,
+/// §7.3): the end-of-rollout summary, the fleet rollback summary, the maintenance
+/// fan-out summary, and `deploy status`.
+///
+/// Sharing the primitive is the point. Several surfaces describing the same fleet
+/// in slightly different layouts is how an operator ends up comparing tables that
+/// disagree at 3 am; here they cannot, because the host column width, the marker
+/// slot and the row shape are computed in exactly one place. Each caller supplies
+/// its own marker and its own already-composed state text.
+fn state_table_lines(title: &str, rows: &[(&'static str, &str, String)]) -> Vec<String> {
+    let width = rows
+        .iter()
+        .map(|(_, host, _)| host.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    lines.push(title.to_owned());
+    for (marker, host, state) in rows {
+        lines.push(format!("  {marker} {host:<width$}  {state}"));
+    }
+    lines
+}
+
 /// The per-host state table printed at the END of every fleet rollout — success or
 /// halt (issue #1621, §8.2).
 ///
@@ -744,13 +767,7 @@ pub(crate) fn fleet_summary_lines(
     outcomes: &[HostOutcome],
     release_id: &str,
 ) -> Vec<String> {
-    let mut lines = vec!["Fleet state:".to_owned()];
-    let width = plan
-        .hosts
-        .iter()
-        .map(|h| h.host.chars().count())
-        .max()
-        .unwrap_or(0);
+    let mut rows: Vec<(&'static str, &str, String)> = Vec::with_capacity(plan.hosts.len());
     for (host, outcome) in plan.hosts.iter().zip(outcomes) {
         let state = match outcome {
             HostOutcome::Untouched => "untouched (not reached)".to_owned(),
@@ -806,11 +823,9 @@ pub(crate) fn fleet_summary_lines(
             }
             _ => "\u{274C}",
         };
-        lines.push(format!(
-            "  {marker} {host:<width$}  {state}",
-            host = host.host,
-        ));
+        rows.push((marker, host.host.as_str(), state));
     }
+    let mut lines = state_table_lines("Fleet state:", &rows);
     let on_new: Vec<&str> = plan
         .hosts
         .iter()
@@ -849,6 +864,478 @@ pub(crate) fn fleet_summary_lines(
     if compensated && schema_moved(plan, outcomes) {
         lines.push(format!(
             "  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE}"
+        ));
+    }
+    lines
+}
+
+// ── `deploy status`: per-host state and drift (issue #1621, AC-6) ────────────
+
+/// The deployed release a host reports, or the honest absence of one.
+///
+/// `Unknown` is a first-class, DISTINCT state — never folded into drift. The only
+/// release identity a host can be asked for is its `current` symlink's basename
+/// (no runtime endpoint reports one: the probe body's `version` is the framework
+/// crate version, identical on every host forever), and that symlink can be
+/// missing on a host that has never been deployed, dangling mid-incident, or
+/// unreadable because the SSH round-trip degraded. Calling any of those "a
+/// different version" would report a mixed fleet that does not exist, and a false
+/// alarm at 3 am is worse than no alarm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReleaseId {
+    /// The release id read from the host's `current` symlink.
+    Known(String),
+    /// The host did not report a release (never deployed, symlink unreadable, or
+    /// the host was unreachable). Reported, never counted as drift.
+    Unknown,
+}
+
+/// State drift: the live-slot marker names a different slot than the proxy is
+/// actually serving.
+///
+/// Not cosmetic — the next redeploy picks the candidate slot from this marker, so
+/// a drifted marker makes it restart the slot that is CURRENTLY SERVING, taking
+/// the host down mid-deploy. (`deploy up` repairs it automatically; `status`
+/// surfaces it before then.)
+pub(crate) const DRIFT_LIVE_SLOT_MARKER: &str =
+    "live-slot marker disagrees with the slot kamal-proxy is serving";
+
+/// State drift: the `shared/proxy-options` marker exists but cannot be parsed.
+///
+/// The refuse-unprovable-proxy-options guard fails CLOSED on this, so the next
+/// deploy of this host is already broken — it just has not been attempted yet.
+/// That is exactly the kind of debris a status command exists to surface.
+pub(crate) const DRIFT_PROXY_OPTIONS_UNREADABLE: &str =
+    "shared/proxy-options marker is unreadable — the NEXT deploy of this host will refuse";
+
+/// State drift: the installed kamal-proxy unit binds a different public port than
+/// this project configures.
+///
+/// The redeploy path refuses a concurrent public-port change (it would strand the
+/// old port mid-cutover), so this host cannot be redeployed until the two agree.
+pub(crate) const DRIFT_PROXY_PORT_MISMATCH: &str =
+    "the installed proxy unit binds a different public port than `[server] port` configures";
+
+/// The sentence every maintenance-related surface prints, because the mechanism is
+/// counter-intuitive and getting it wrong causes an outage (plan §6.4).
+///
+/// `build_maintenance_layer` puts `/ready` on the probe-bypass list, so a host in
+/// maintenance mode keeps answering its load balancer's health check with 200 and
+/// stays in rotation, serving 503s with `Retry-After` to real users. That is
+/// DELIBERATE — gating `/ready` would eject every host from the pool the moment
+/// maintenance was enabled — but it means maintenance mode is not a drain, and
+/// `deploy status` therefore reports readiness and maintenance in SEPARATE columns.
+pub(crate) const MAINTENANCE_DOES_NOT_DRAIN_NOTE: &str = "maintenance mode does NOT drain a host from your load balancer: `/ready` stays 200 by \
+     design, so a maintained host keeps taking traffic and answers it with 503. Drain at the \
+     load balancer if you need the host out of rotation.";
+
+/// One host's observed state, as `deploy status` reports it (issue #1621, AC-6).
+///
+/// Pure data assembled from a read-only probe. It carries the FACTS, never a
+/// verdict: [`fleet_drift`] is the (pure) function that turns a fleet of these into
+/// a report, so the drift rules are unit-testable against synthetic hosts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostStatus {
+    /// The SSH-reachable address (never an op label — rule 2).
+    pub(crate) host: String,
+    /// Whether the read-only probe completed at all. Everything below is
+    /// unknown/false for an unreachable host, and [`fleet_drift`] never derives
+    /// drift from it — a network outage is not a deploy defect.
+    pub(crate) reachable: bool,
+    /// First-deploy vs redeploy, as probed.
+    pub(crate) mode: Option<HostMode>,
+    /// The release the host's `current` symlink names.
+    pub(crate) release: ReleaseId,
+    /// The slot serving now, reconciled against the live proxy.
+    pub(crate) live_slot: Option<&'static str>,
+    /// HTTP status the live slot's loopback `/ready` returned, `None` when nothing
+    /// answered.
+    pub(crate) ready_code: Option<u16>,
+    /// Whether the shared maintenance flag file is present. ORTHOGONAL to
+    /// `ready_code` — see [`MAINTENANCE_DOES_NOT_DRAIN_NOTE`].
+    pub(crate) maintenance_on: bool,
+    /// The `--http-port` the installed proxy unit binds.
+    pub(crate) installed_proxy_port: exec::InstalledProxyPort,
+    /// The TLS/host options the last forward deploy recorded.
+    pub(crate) proxy_options: exec::ProxyOptionsMarker,
+    /// The public port THIS project configures, for the mismatch comparison.
+    pub(crate) public_port: u16,
+    /// Whether the live-slot marker disagrees with the running proxy.
+    pub(crate) live_slot_marker_drift: bool,
+}
+
+impl HostStatus {
+    /// The status of a host whose read-only probe could not be completed.
+    ///
+    /// Deliberately not an error: `deploy status` reports the whole fleet or it is
+    /// useless during the incident it exists for, so one unreachable host is a row,
+    /// not an abort.
+    pub(crate) fn unreachable(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            reachable: false,
+            mode: None,
+            release: ReleaseId::Unknown,
+            live_slot: None,
+            ready_code: None,
+            maintenance_on: false,
+            installed_proxy_port: exec::InstalledProxyPort::Absent,
+            proxy_options: exec::ProxyOptionsMarker::Absent,
+            public_port: 0,
+            live_slot_marker_drift: false,
+        }
+    }
+
+    /// Assemble a status row from one host's read-only probe — PURE, so every
+    /// mapping rule is testable from synthetic probe values.
+    pub(crate) fn from_probe(
+        cfg: &ResolvedDeployConfig,
+        public_port: u16,
+        probe: &exec::HostStatusProbe,
+    ) -> Self {
+        let reconcile = probe.reconcile(cfg, public_port);
+        Self {
+            host: cfg.host.clone().unwrap_or_default(),
+            reachable: true,
+            mode: Some(HostMode::from_deploy_mode(&probe.deploy.mode)),
+            release: probe
+                .deploy
+                .current_release_dir
+                .as_deref()
+                .and_then(exec::release_id_from_dir)
+                .map_or(ReleaseId::Unknown, |id| ReleaseId::Known(id.to_owned())),
+            live_slot: reconcile.as_ref().map(|r| r.live_slot),
+            ready_code: probe.ready_code,
+            maintenance_on: probe.maintenance_on,
+            installed_proxy_port: probe.deploy.installed_proxy_port.clone(),
+            proxy_options: probe.deploy.last_proxy_options.clone(),
+            public_port,
+            live_slot_marker_drift: reconcile.is_some_and(|r| r.repair),
+        }
+    }
+}
+
+/// What `deploy status` concluded about the fleet (issue #1621, §7.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DriftReport {
+    /// Each host's reported release, in declaration order — the EVIDENCE, printed
+    /// alongside the verdict so an operator can check it.
+    pub(crate) releases: Vec<(String, ReleaseId)>,
+    /// More than one DISTINCT KNOWN release across the fleet.
+    pub(crate) version_drift: bool,
+    /// Per-host state disagreements, each with its reason. Kept separate from
+    /// `version_drift` because these are the failures that will make a FUTURE
+    /// deploy fail closed — folding them into "version drift" would hide them
+    /// behind a perfectly converged fleet.
+    pub(crate) state_drift: Vec<(String, &'static str)>,
+}
+
+impl DriftReport {
+    /// Whether ANY drift was found — the `--strict` exit condition.
+    pub(crate) const fn drifted(&self) -> bool {
+        self.version_drift || !self.state_drift.is_empty()
+    }
+
+    /// Hosts that reported no release, named so "unknown" is visible rather than
+    /// inferred from a blank column.
+    pub(crate) fn unknown_releases(&self) -> Vec<&str> {
+        self.releases
+            .iter()
+            .filter(|(_, release)| matches!(release, ReleaseId::Unknown))
+            .map(|(host, _)| host.as_str())
+            .collect()
+    }
+
+    /// The distinct KNOWN releases across the fleet, in first-seen order — what
+    /// version drift is actually about.
+    pub(crate) fn known_releases(&self) -> Vec<&str> {
+        let mut seen: Vec<&str> = Vec::new();
+        for (_, release) in &self.releases {
+            if let ReleaseId::Known(id) = release
+                && !seen.contains(&id.as_str())
+            {
+                seen.push(id.as_str());
+            }
+        }
+        seen
+    }
+}
+
+/// Reduce a fleet's observed status to a drift report — PURE (issue #1621, §7.2).
+///
+/// Two rules carry all the weight:
+///
+/// 1. **Version drift is more than one DISTINCT KNOWN release.** `Unknown` never
+///    contributes (see [`ReleaseId`]). A partially-compensated fleet legitimately
+///    holds up to three distinct ids, and the report says so — that is information,
+///    not corruption.
+/// 2. **State drift is per host and separate.** Each reason is a `&'static str`
+///    (never a shell line or a driver error), and each names a condition that will
+///    make a FUTURE deploy of that host fail closed or take the wrong slot.
+///
+/// An UNREACHABLE host contributes an `Unknown` release and no state drift at all:
+/// its markers were never read, so deriving drift from their absence would report
+/// a network outage as a deploy defect.
+pub(crate) fn fleet_drift(hosts: &[HostStatus]) -> DriftReport {
+    let releases: Vec<(String, ReleaseId)> = hosts
+        .iter()
+        .map(|status| (status.host.clone(), status.release.clone()))
+        .collect();
+
+    let mut known: Vec<&str> = Vec::new();
+    for status in hosts {
+        if let ReleaseId::Known(id) = &status.release
+            && !known.contains(&id.as_str())
+        {
+            known.push(id.as_str());
+        }
+    }
+
+    let mut state_drift: Vec<(String, &'static str)> = Vec::new();
+    for status in hosts.iter().filter(|status| status.reachable) {
+        if status.live_slot_marker_drift {
+            state_drift.push((status.host.clone(), DRIFT_LIVE_SLOT_MARKER));
+        }
+        if matches!(status.proxy_options, exec::ProxyOptionsMarker::Unreadable) {
+            state_drift.push((status.host.clone(), DRIFT_PROXY_OPTIONS_UNREADABLE));
+        }
+        // Only a PROVEN different port is drift: `Absent` (no unit yet) and
+        // `Unreadable` are handled by the deploy path's own fail-closed guard, and
+        // reporting them here would flag every never-deployed host.
+        if matches!(status.installed_proxy_port, exec::InstalledProxyPort::Port(port) if port != status.public_port)
+        {
+            state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_MISMATCH));
+        }
+    }
+
+    DriftReport {
+        version_drift: known.len() > 1,
+        releases,
+        state_drift,
+    }
+}
+
+/// One status row's seven display cells, in column order: mode, release, slot,
+/// readiness, maintenance, proxy port, drift reasons. Extracted from
+/// [`fleet_status_lines`] so the renderer stays within the line budget and the
+/// cell wording has one home.
+fn status_row_cells(status: &HostStatus, report: &DriftReport) -> [String; 7] {
+    [
+        match status.mode {
+            _ if !status.reachable => "unreachable".to_owned(),
+            Some(HostMode::First) => "not deployed".to_owned(),
+            Some(HostMode::Redeploy) => "deployed".to_owned(),
+            None => "unknown".to_owned(),
+        },
+        match &status.release {
+            ReleaseId::Known(id) => id.clone(),
+            ReleaseId::Unknown => "release unknown".to_owned(),
+        },
+        status.live_slot.unwrap_or("slot ?").to_owned(),
+        status
+            .ready_code
+            .map_or_else(|| "ready ?".to_owned(), |code| format!("ready {code}")),
+        if status.maintenance_on {
+            "maintenance ON".to_owned()
+        } else {
+            "maintenance off".to_owned()
+        },
+        match &status.installed_proxy_port {
+            exec::InstalledProxyPort::Port(port) => format!("proxy {port}"),
+            exec::InstalledProxyPort::Absent => "proxy absent".to_owned(),
+            exec::InstalledProxyPort::Unreadable => "proxy ?".to_owned(),
+        },
+        {
+            let reasons: Vec<&str> = report
+                .state_drift
+                .iter()
+                .filter(|(host, _)| *host == status.host)
+                .map(|(_, reason)| *reason)
+                .collect();
+            if reasons.is_empty() {
+                String::new()
+            } else {
+                format!("\u{26A0}\u{FE0F}  {}", reasons.join("; "))
+            }
+        },
+    ]
+}
+
+/// The `deploy status` table: one aligned row per host, then the verdict.
+///
+/// Rendered through [`state_table_lines`] — the SAME primitive the rollout summary
+/// and the fleet rollback summary use — so the fleet views can never disagree
+/// about how a host row looks (plan §7.3).
+///
+/// Readiness and maintenance are deliberately SEPARATE columns; see
+/// [`MAINTENANCE_DOES_NOT_DRAIN_NOTE`].
+pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> Vec<String> {
+    let cells: Vec<[String; 7]> = hosts
+        .iter()
+        .map(|status| status_row_cells(status, report))
+        .collect();
+
+    // Column widths, so the composite "state" the shared row renderer prints is
+    // itself aligned. The last column is ragged by design (it is prose).
+    let mut widths = [0_usize; 7];
+    for row in &cells {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+
+    let rows: Vec<(&'static str, &str, String)> = hosts
+        .iter()
+        .zip(&cells)
+        .map(|(status, cells)| {
+            let marker = if !status.reachable {
+                "\u{274C}"
+            } else if report
+                .state_drift
+                .iter()
+                .any(|(host, _)| *host == status.host)
+                || status.maintenance_on
+            {
+                "\u{26A0}\u{FE0F} "
+            } else {
+                "\u{2705}"
+            };
+            let mut state = String::new();
+            for (index, cell) in cells.iter().enumerate() {
+                if index > 0 {
+                    state.push_str("  ");
+                }
+                state.push_str(cell);
+                // Pad every column but the last (the ragged prose column) by hand
+                // — no `format!` allocation per cell.
+                if index + 1 < cells.len() {
+                    for _ in cell.chars().count()..widths[index] {
+                        state.push(' ');
+                    }
+                }
+            }
+            (marker, status.host.as_str(), state.trim_end().to_owned())
+        })
+        .collect();
+
+    let mut lines = state_table_lines("Fleet status:", &rows);
+
+    if report.version_drift {
+        lines.push(format!(
+            "  \u{26A0}\u{FE0F}  VERSION DRIFT: {} distinct releases across this fleet ({}). \
+             Converge with `autumn deploy up`, or roll the fleet back with \
+             `autumn deploy rollback`.",
+            report.known_releases().len(),
+            report.known_releases().join(", "),
+        ));
+    }
+    let unknown = report.unknown_releases();
+    if !unknown.is_empty() {
+        // Named, and explicitly NOT called drift — the evidence matters more than
+        // the verdict here.
+        lines.push(format!(
+            "  \u{2139}\u{FE0F}  release unknown on {} (the `current` symlink was unreadable) \
+             \u{2014} reported, not counted as drift.",
+            unknown.join(", "),
+        ));
+    }
+    for (host, reason) in &report.state_drift {
+        lines.push(format!("  \u{26A0}\u{FE0F}  {host}: {reason}"));
+    }
+    if hosts.iter().any(|status| status.maintenance_on) {
+        lines.push(format!(
+            "  \u{2139}\u{FE0F}  {MAINTENANCE_DOES_NOT_DRAIN_NOTE}"
+        ));
+    }
+    lines
+}
+
+// ── Fleet-wide `deploy maintenance` (issue #1621, AC-5) ──────────────────────
+
+/// What the maintenance fan-out did to ONE host (issue #1621, §6.2).
+///
+/// Best-effort-and-aggregate — the OPPOSITE of the rollout driver. Turning
+/// maintenance on for 2 of 3 hosts and then "rolling back" the 2 would push users
+/// back into the very window the operator is trying to close, so a partial result
+/// is REPORTED, never compensated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaintenanceOutcome {
+    /// Both flag paths written/removed (amendment A2: the shared authoritative
+    /// path AND the release-local legacy path for units deployed before #1621).
+    Applied,
+    /// Only the shared path was written/removed: the host's `current` symlink did
+    /// not resolve, so there is no release dir to carry the legacy flag. Fine for
+    /// a host already redeployed with #1621 units; noted so the operator knows.
+    AppliedSharedOnly,
+    /// The change failed on this host at this step. Never swallowed, and never a
+    /// shell line — the label only.
+    Failed {
+        /// Label of the op that failed.
+        failed_step: &'static str,
+    },
+}
+
+/// The per-host table printed at the end of a `deploy maintenance on|off` fan-out.
+///
+/// Printed on EVERY exit path: after a partial change the operator must know which
+/// hosts DID change (they may need reversing by hand), and the orthogonality note
+/// is repeated because assuming maintenance drains a host from the LB causes an
+/// outage (plan §6.4).
+pub(crate) fn fleet_maintenance_summary_lines(
+    hosts: &[String],
+    outcomes: &[MaintenanceOutcome],
+    on: bool,
+) -> Vec<String> {
+    let verb = if on { "enabled" } else { "disabled" };
+    let mut rows: Vec<(&'static str, &str, String)> = Vec::with_capacity(hosts.len());
+    for (host, outcome) in hosts.iter().zip(outcomes) {
+        let (marker, state) = match outcome {
+            MaintenanceOutcome::Applied => ("\u{2705}", format!("maintenance {verb}")),
+            MaintenanceOutcome::AppliedSharedOnly => (
+                "\u{26A0}\u{FE0F} ",
+                format!(
+                    "maintenance {verb} (shared flag only \u{2014} no `current` release \
+                     resolved on this host, so the release-local flag for pre-#1621 units \
+                     was skipped)"
+                ),
+            ),
+            MaintenanceOutcome::Failed { failed_step } => (
+                "\u{274C}",
+                format!("UNCHANGED \u{2014} failed at `{failed_step}`"),
+            ),
+        };
+        rows.push((marker, host.as_str(), state));
+    }
+    let mut lines = state_table_lines("Fleet maintenance state:", &rows);
+
+    let changed: Vec<&str> = hosts
+        .iter()
+        .zip(outcomes)
+        .filter(|(_, outcome)| !matches!(outcome, MaintenanceOutcome::Failed { .. }))
+        .map(|(host, _)| host.as_str())
+        .collect();
+    let failed: Vec<&str> = hosts
+        .iter()
+        .zip(outcomes)
+        .filter(|(_, outcome)| matches!(outcome, MaintenanceOutcome::Failed { .. }))
+        .map(|(host, _)| host.as_str())
+        .collect();
+    if !failed.is_empty() && !changed.is_empty() {
+        // Naming the hosts that DID change is the point: a partial change is never
+        // rolled back automatically (that would reopen the window being closed), so
+        // the operator needs the exact list to reverse by hand if that is the call.
+        lines.push(format!(
+            "  \u{26A0}\u{FE0F}  Changed anyway: {changed}. NOT reversed automatically \u{2014} \
+             reverse them with `autumn deploy maintenance {reverse}` if the fleet must stay \
+             consistent while {failed} is repaired.",
+            changed = changed.join(", "),
+            reverse = if on { "off" } else { "on" },
+            failed = failed.join(", "),
+        ));
+    }
+    if on {
+        lines.push(format!(
+            "  \u{2139}\u{FE0F}  {MAINTENANCE_DOES_NOT_DRAIN_NOTE}"
         ));
     }
     lines
@@ -932,8 +1419,7 @@ pub(crate) fn fleet_rollback_summary_lines(
     hosts: &[String],
     outcomes: &[RollbackOutcome],
 ) -> Vec<String> {
-    let mut lines = vec!["Fleet rollback state:".to_owned()];
-    let width = hosts.iter().map(|h| h.chars().count()).max().unwrap_or(0);
+    let mut rows: Vec<(&'static str, &str, String)> = Vec::with_capacity(hosts.len());
     for (host, outcome) in hosts.iter().zip(outcomes) {
         let (marker, state) = match outcome {
             RollbackOutcome::RolledBack => {
@@ -953,8 +1439,9 @@ pub(crate) fn fleet_rollback_summary_lines(
                 ),
             ),
         };
-        lines.push(format!("  {marker} {host:<width$}  {state}"));
+        rows.push((marker, host.as_str(), state));
     }
+    let mut lines = state_table_lines("Fleet rollback state:", &rows);
     let stalled: Vec<&str> = hosts
         .iter()
         .zip(outcomes)
@@ -1003,6 +1490,7 @@ pub(crate) mod test_support {
         stdout: Vec<(&'static str, String)>,
         fail: Vec<&'static str>,
         transport_fail: Vec<&'static str>,
+        upload_fail: Vec<String>,
     }
 
     /// A fleet-shaped recording fake: ONE
@@ -1072,6 +1560,15 @@ pub(crate) mod test_support {
             self
         }
 
+        /// Make one host's UPLOAD fail for any remote path containing `fragment`
+        /// (#1621). Uploads carry no label, so this is keyed on the destination —
+        /// how a test fails a `WriteFile` op (e.g. the maintenance flag write) the
+        /// way a dying scp would.
+        pub(crate) fn fail_upload(mut self, host: &str, fragment: impl Into<String>) -> Self {
+            self.entry(host).upload_fail.push(fragment.into());
+            self
+        }
+
         /// The executor factory the fleet driver is injected with: one strict,
         /// tape-sharing fake per host.
         pub(crate) fn executor(&self, cfg: &ResolvedDeployConfig) -> RecordingExecutor {
@@ -1088,6 +1585,9 @@ pub(crate) mod test_support {
                 }
                 for label in &script.transport_fail {
                     exec = exec.transport_failing(label);
+                }
+                for fragment in &script.upload_fail {
+                    exec = exec.failing_upload(fragment.clone());
                 }
             }
             exec
@@ -2127,5 +2627,193 @@ mod tests {
                 "the rollback table must never carry `{secret}`:\n{rendered}"
             );
         }
+    }
+    // ── `deploy status`: per-host state and drift (issue #1621, AC-6) ─────────
+
+    /// A synthetic status row, with every "everything is fine" default in place so
+    /// each test varies exactly the one fact it is about.
+    fn status(host: &str, release: Option<&str>) -> HostStatus {
+        HostStatus {
+            host: host.to_owned(),
+            reachable: true,
+            mode: Some(HostMode::Redeploy),
+            release: release.map_or(ReleaseId::Unknown, |id| ReleaseId::Known(id.to_owned())),
+            live_slot: Some(exec::SLOT_BLUE),
+            ready_code: Some(200),
+            maintenance_on: false,
+            installed_proxy_port: exec::InstalledProxyPort::Port(3000),
+            proxy_options: exec::ProxyOptionsMarker::Options(exec::ProxyServiceOptions {
+                tls: false,
+                host: None,
+            }),
+            public_port: 3000,
+            live_slot_marker_drift: false,
+        }
+    }
+
+    #[test]
+    fn fleet_drift_reports_two_different_releases_as_version_drift() {
+        // #1621 (T1.20, AC-6): the whole point of `deploy status`. Two hosts on
+        // different KNOWN releases is a mixed fleet — the state a rolling deploy
+        // exists to avoid — so it must be reported as drift, with the evidence.
+        let report = fleet_drift(&[
+            status("web-a", Some("20260714T120000Z")),
+            status("web-b", Some("20260714T130000Z")),
+        ]);
+        assert!(report.version_drift, "differing releases are version drift");
+        assert_eq!(
+            report.releases,
+            vec![
+                (
+                    "web-a".to_owned(),
+                    ReleaseId::Known("20260714T120000Z".to_owned())
+                ),
+                (
+                    "web-b".to_owned(),
+                    ReleaseId::Known("20260714T130000Z".to_owned())
+                ),
+            ],
+            "the report names each host's release as its evidence"
+        );
+        assert!(
+            report.state_drift.is_empty(),
+            "version drift is not state drift: {:?}",
+            report.state_drift
+        );
+
+        // The converging case: one release everywhere is NOT drift.
+        let converged = fleet_drift(&[
+            status("web-a", Some("20260714T120000Z")),
+            status("web-b", Some("20260714T120000Z")),
+            status("web-c", Some("20260714T120000Z")),
+        ]);
+        assert!(!converged.version_drift);
+    }
+
+    #[test]
+    fn fleet_drift_never_treats_an_unknown_release_as_drift() {
+        // #1621 (T1.20): an unreadable `current` symlink means "we do not know",
+        // not "this host differs". A false "your fleet is mixed" at 3 am trains
+        // operators to ignore the warning, which is worse than no warning — so
+        // Unknown is a DISTINCT reported state that never contributes to drift.
+        let all_unknown = fleet_drift(&[status("web-a", None), status("web-b", None)]);
+        assert!(
+            !all_unknown.version_drift,
+            "an all-unknown fleet is not drifted, it is unreported"
+        );
+        assert_eq!(
+            all_unknown.releases,
+            vec![
+                ("web-a".to_owned(), ReleaseId::Unknown),
+                ("web-b".to_owned(), ReleaseId::Unknown),
+            ],
+            "…and the unknowns are still named"
+        );
+        assert!(all_unknown.unknown_releases().contains(&"web-a"));
+
+        // One known + one unknown is likewise not drift: there is exactly one known
+        // release, and the unknown is reported separately.
+        let mixed = fleet_drift(&[
+            status("web-a", Some("20260714T120000Z")),
+            status("web-b", None),
+        ]);
+        assert!(!mixed.version_drift, "one known release is not drift");
+        assert_eq!(mixed.unknown_releases(), vec!["web-b"]);
+    }
+
+    #[test]
+    fn fleet_drift_reports_state_drift_separately_from_version_drift() {
+        // #1621 (T1.20, plan §7.2): these are two different things and collapsing
+        // them hides the dangerous one. Every state-drift reason below makes a
+        // FUTURE deploy of that host fail closed or take the wrong slot, on a fleet
+        // that is perfectly converged version-wise.
+        let mut marker_drift = status("web-a", Some("r1"));
+        marker_drift.live_slot_marker_drift = true;
+        let mut unreadable_options = status("web-b", Some("r1"));
+        unreadable_options.proxy_options = exec::ProxyOptionsMarker::Unreadable;
+        let mut wrong_port = status("web-c", Some("r1"));
+        wrong_port.installed_proxy_port = exec::InstalledProxyPort::Port(8080);
+
+        let report = fleet_drift(&[marker_drift, unreadable_options, wrong_port]);
+        assert!(
+            !report.version_drift,
+            "every host is on r1 — this is state drift, not version drift"
+        );
+        assert_eq!(
+            report.state_drift,
+            vec![
+                ("web-a".to_owned(), DRIFT_LIVE_SLOT_MARKER),
+                ("web-b".to_owned(), DRIFT_PROXY_OPTIONS_UNREADABLE),
+                ("web-c".to_owned(), DRIFT_PROXY_PORT_MISMATCH),
+            ],
+            "each host is named with its own reason"
+        );
+        assert!(
+            report.drifted(),
+            "state drift alone must make --strict fail"
+        );
+
+        // A clean fleet reports nothing at all.
+        let clean = fleet_drift(&[status("web-a", Some("r1")), status("web-b", Some("r1"))]);
+        assert!(!clean.drifted() && clean.state_drift.is_empty());
+    }
+
+    #[test]
+    fn fleet_drift_never_flags_a_host_it_could_not_reach() {
+        // An unreachable host has no facts, so inventing drift from its absent
+        // markers would report the network outage as a deploy defect. It is listed
+        // with an unknown release and nothing else.
+        let report = fleet_drift(&[
+            status("web-a", Some("r1")),
+            HostStatus::unreachable("web-b"),
+        ]);
+        assert!(!report.version_drift);
+        assert!(
+            report.state_drift.is_empty(),
+            "an unreachable host contributes no state drift: {:?}",
+            report.state_drift
+        );
+        assert_eq!(report.unknown_releases(), vec!["web-b"]);
+    }
+
+    #[test]
+    fn fleet_status_table_shows_readiness_and_maintenance_as_separate_columns() {
+        // #1621 (plan §6.4/§7.3): maintenance mode does NOT drain a host from a load
+        // balancer — `/ready` is on the probe-bypass list, so a maintained host stays
+        // in rotation serving 503s to real users. Reporting them in one column would
+        // teach exactly the wrong mental model, so they are separate and the table
+        // says so.
+        let mut maintained = status("web-b", Some("r1"));
+        maintained.maintenance_on = true;
+        let rows = [status("web-a", Some("r1")), maintained];
+        let report = fleet_drift(&rows);
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
+
+        for host in ["web-a", "web-b"] {
+            assert!(rendered.contains(host), "every host is a row:\n{rendered}");
+        }
+        assert!(rendered.contains("r1"), "the release column:\n{rendered}");
+        assert!(rendered.contains("200"), "the ready column:\n{rendered}");
+        assert!(
+            rendered.contains(MAINTENANCE_DOES_NOT_DRAIN_NOTE),
+            "the table must state the orthogonality out loud:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn fleet_status_table_names_every_drift_reason() {
+        let mut drifted = status("web-b", Some("r2"));
+        drifted.proxy_options = exec::ProxyOptionsMarker::Unreadable;
+        let rows = [status("web-a", Some("r1")), drifted];
+        let report = fleet_drift(&rows);
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
+        assert!(
+            rendered.contains(DRIFT_PROXY_OPTIONS_UNREADABLE),
+            "a state-drift reason must be spelled out, not abbreviated:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("r1") && rendered.contains("r2"),
+            "version drift must show WHICH releases:\n{rendered}"
+        );
     }
 }

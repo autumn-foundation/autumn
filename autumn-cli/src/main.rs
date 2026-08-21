@@ -856,6 +856,15 @@ enum Commands {
     ///   --no-rollback   on `up`, halt and FREEZE a failed rollout for inspection
     ///                   instead of automatically rolling the cut-over hosts back.
     ///
+    /// Fleet visibility and control (issue #1621):
+    ///   status          read-only per-host state (release, readiness, maintenance,
+    ///                   proxy) plus version/state drift; `--json` for machines,
+    ///                   `--strict` exits non-zero on drift (cron-alertable).
+    ///   maintenance     turn maintenance mode on|off on EVERY configured host over
+    ///                   SSH (the local `autumn maintenance` only writes this
+    ///                   machine's working directory). NOTE: maintenance does not
+    ///                   drain a host from your load balancer — /ready stays 200.
+    ///
     /// # Examples
     ///
     ///   autumn deploy check
@@ -865,6 +874,9 @@ enum Commands {
     ///   autumn deploy up
     ///   autumn deploy up --only web-2.example.com
     ///   autumn deploy up --no-rollback
+    ///   autumn deploy status --json --strict
+    ///   autumn deploy maintenance on --message "Upgrading database schema"
+    ///   autumn deploy maintenance off
     #[command(subcommand, verbatim_doc_comment)]
     Deploy(DeployCommands),
 
@@ -1117,6 +1129,11 @@ enum Commands {
     /// Writes (or removes) a JSON flag file that the running app polls every
     /// 500 ms. Within one second every replica responds 503 to non-bypassed
     /// HTTP traffic while health-check routes stay green.
+    ///
+    /// LOCAL only: the flag lands in THIS working directory. For servers
+    /// managed by `autumn deploy` (`[deploy] host`/`hosts`), use
+    /// `autumn deploy maintenance on|off`, which fans the same flag out to
+    /// every host over SSH (issue #1621).
     ///
     /// # Examples
     ///
@@ -2251,6 +2268,78 @@ enum DeployCommands {
         #[arg(long)]
         no_rollback: bool,
     },
+
+    /// Report every configured host's deploy state, read-only (issue #1621).
+    ///
+    /// One row per `[deploy] hosts` entry: mode, deployed release (from the
+    /// `current` symlink), live slot, /ready status, maintenance flag, and proxy
+    /// port — plus version drift (hosts on different releases) and state drift
+    /// (per-host marker damage that will fail the NEXT deploy closed). Touches
+    /// nothing; safe mid-incident.
+    Status {
+        /// Emit the stable JSON report on stdout instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero when ANY drift is detected, so drift is alertable from
+        /// cron. The default exits 0 — status is a report, not a judgement.
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Fleet-wide maintenance mode over SSH (issue #1621).
+    ///
+    /// Applies to the DEPLOY-CONFIGURED host(s) — `[deploy] host` or `[deploy]
+    /// hosts` — unlike the top-level `autumn maintenance`, which only writes this
+    /// machine's own working directory. Best-effort: every host is attempted, the
+    /// per-host table names what changed, and the command exits non-zero if any
+    /// host failed (the changed hosts are NOT reversed).
+    ///
+    /// Maintenance mode does NOT drain a host from your load balancer: /ready
+    /// stays 200 by design, so a maintained host keeps taking traffic and answers
+    /// it with 503. Drain at the load balancer if you need a host out of rotation.
+    #[command(subcommand)]
+    Maintenance(DeployMaintenanceCommands),
+}
+
+/// Subcommands for `autumn deploy maintenance` (issue #1621).
+#[derive(Subcommand)]
+enum DeployMaintenanceCommands {
+    /// Enable maintenance mode on every configured deploy host.
+    ///
+    /// Writes the same flag file the local `autumn maintenance on` writes, to the
+    /// per-app shared dir on each host (and, for hosts still running pre-#1621
+    /// units, to the current release's tmp/ dir), so running apps react within
+    /// 500 ms without a restart.
+    ///
+    /// # Examples
+    ///
+    ///   autumn deploy maintenance on
+    ///   autumn deploy maintenance on --message "Upgrading database schema"
+    ///   autumn deploy maintenance on --readonly
+    ///   autumn deploy maintenance on --allow-ips 10.0.0.0/8 --bypass-header X-Dev-Bypass:mytoken
+    #[command(verbatim_doc_comment)]
+    On {
+        /// Human-readable message shown to users in the 503 response body.
+        #[arg(long, value_name = "MSG")]
+        message: Option<String>,
+        /// CIDR block or IP address whose requests bypass maintenance.
+        /// Repeatable: `--allow-ips 10.0.0.0/8 --allow-ips 172.16.0.1`
+        #[arg(long, value_name = "CIDR")]
+        allow_ips: Vec<String>,
+        /// Allow GET, HEAD, OPTIONS through while blocking writes.
+        #[arg(long)]
+        readonly: bool,
+        /// Bypass header in NAME:VALUE format.
+        /// Requests carrying this header+value bypass the 503.
+        /// Example: `--bypass-header X-Autumn-Maintenance-Bypass:mytoken`
+        #[arg(long, value_name = "NAME:VALUE")]
+        bypass_header: Option<String>,
+    },
+    /// Disable maintenance mode on every configured deploy host.
+    ///
+    /// Removes the flag file(s); a host where maintenance was already off is a
+    /// success, not an error.
+    Off,
 }
 
 /// Subcommands for `autumn generate`.
@@ -4133,8 +4222,54 @@ fn run_deploy_command(cmd: &DeployCommands) {
             deploy::DeployOptions {
                 only: only.clone(),
                 no_rollback: *no_rollback,
+                ..deploy::DeployOptions::default()
             },
         ),
+        DeployCommands::Status { json, strict } => (
+            deploy::DeployAction::Status,
+            deploy::DeployOptions {
+                json: *json,
+                strict: *strict,
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Maintenance(cmd) => match cmd {
+            DeployMaintenanceCommands::On {
+                message,
+                allow_ips,
+                readonly,
+                bypass_header,
+            } => {
+                // Same parse (and same failure behavior) as the local
+                // `autumn maintenance on`, so the two surfaces reject a malformed
+                // NAME:VALUE identically.
+                let parsed_bypass = bypass_header.as_deref().map(|s| {
+                    maintenance::parse_bypass_header(s).map_or_else(
+                        |e| {
+                            eprintln!("autumn deploy maintenance on: {e}");
+                            std::process::exit(1);
+                        },
+                        |(name, value)| (name.to_owned(), value.to_owned()),
+                    )
+                });
+                (
+                    deploy::DeployAction::MaintenanceOn,
+                    deploy::DeployOptions {
+                        maintenance: Some(deploy::MaintenanceOnArgs {
+                            message: message.clone(),
+                            allow_ips: allow_ips.clone(),
+                            readonly: *readonly,
+                            bypass_header: parsed_bypass,
+                        }),
+                        ..deploy::DeployOptions::default()
+                    },
+                )
+            }
+            DeployMaintenanceCommands::Off => (
+                deploy::DeployAction::MaintenanceOff,
+                deploy::DeployOptions::default(),
+            ),
+        },
     };
     if let Err(e) = deploy::run(action, &options) {
         eprintln!("autumn deploy: {e}");

@@ -3292,20 +3292,31 @@ impl AppBuilder {
         }
 
         // Instantiate MaintenanceState, load flag synchronously at startup, insert as extension, and start background poller task
+        //
+        // #1621: the flag path comes from `maintenance::resolve_flag_file_path()`,
+        // NOT the bare cwd-relative const. A deploy-managed slot unit runs with
+        // `WorkingDirectory={release_dir}` — a fresh dir every release — so the
+        // legacy path made a cutover ORPHAN the flag and silently un-maintain the
+        // host. The resolver honours `AUTUMN_MAINTENANCE_FLAG_FILE` (stamped by
+        // `autumn deploy` at the per-app `shared/` dir, which survives cutovers) and
+        // falls back to the legacy path when unset, so a non-deploy-managed app is
+        // unaffected. Both read sites — this boot load and the 500 ms poller below —
+        // go through the SAME resolver so they can never disagree.
         let maintenance_state = crate::maintenance::MaintenanceState::new();
-        let flag_path = std::path::Path::new(crate::maintenance::MAINTENANCE_FLAG_FILE);
-        if let Ok(Some(cfg)) = crate::maintenance::MaintenanceState::load_from_file(flag_path) {
+        let flag_path = crate::maintenance::resolve_flag_file_path();
+        if let Ok(Some(cfg)) = crate::maintenance::MaintenanceState::load_from_file(&flag_path) {
             maintenance_state.enable(cfg);
         }
         state.insert_extension(maintenance_state.clone());
 
         let poller_state = maintenance_state.clone();
         tokio::spawn(async move {
-            let path = std::path::Path::new(crate::maintenance::MAINTENANCE_FLAG_FILE);
+            let path = crate::maintenance::resolve_flag_file_path();
             let interval = std::time::Duration::from_millis(500);
             loop {
+                let poll_path = path.clone();
                 let load_res = tokio::task::spawn_blocking(move || {
-                    crate::maintenance::MaintenanceState::load_from_file(path)
+                    crate::maintenance::MaintenanceState::load_from_file(&poll_path)
                 })
                 .await;
 

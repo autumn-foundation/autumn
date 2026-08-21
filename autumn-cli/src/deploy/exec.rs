@@ -1659,6 +1659,27 @@ const NO_PROXY_UNIT_SENTINEL: &str = "---autumn-no-proxy-unit---";
 /// refuse guard never fires on synthetic input).
 const PROXY_OPTIONS_DELIM: &str = "---autumn-kamal-proxy-options---";
 
+/// Delimiter appended after the `shared/proxy-options` marker, before
+/// `readlink -f {app_dir}/current` (issue #1621, AC-6), so all five sections ride
+/// in ONE round-trip. Its ABSENCE (a host deployed before this feature, older
+/// recorded output, or a scripted test) leaves an empty section →
+/// [`DeployProbe::current_release_dir`] `None` — "unknown", never a guessed id.
+const CURRENT_RELEASE_DELIM: &str = "---autumn-current-release---";
+
+/// The release id encoded in a resolved `current` release dir: its basename
+/// (issue #1621, AC-6).
+///
+/// `None` for an empty or root-only path, so an unreadable symlink can never be
+/// mistaken for a release named `""` — the drift report treats an unknown release
+/// as a DISTINCT reported state and never as drift, and that distinction depends on
+/// this returning `None` rather than something empty-but-`Some`.
+#[must_use]
+pub fn release_id_from_dir(dir: &str) -> Option<&str> {
+    let trimmed = dir.trim().trim_end_matches('/');
+    let id = trimmed.rsplit('/').next().unwrap_or_default();
+    (!id.is_empty()).then_some(id)
+}
+
 /// The outcome of the deploy-start probe: the first-vs-redeploy [`DeployMode`],
 /// the raw `kamal-proxy list` output, AND the installed proxy unit's `--http-port`
 /// state — all captured in the SAME remote round-trip, so a drifted live-slot
@@ -1678,6 +1699,13 @@ pub struct DeployProbe {
     /// the redeploy path to PRESERVE the old release's options on the durability
     /// re-register — or FAIL CLOSED when the marker is present but unreadable.
     pub last_proxy_options: ProxyOptionsMarker,
+    /// The release dir the host's `current` symlink resolves to (#1621, AC-6); its
+    /// basename is the deployed release id ([`release_id_from_dir`]).
+    ///
+    /// `None` when the symlink is absent, dangling, or the probe output predates
+    /// this section — reported as "unknown", never guessed. `deploy status` and the
+    /// fleet `maintenance` fan-out read it; the rollout path ignores it.
+    pub current_release_dir: Option<String>,
 }
 
 /// Parse the probe's unit section into an [`InstalledProxyPort`] (#2073).
@@ -1747,7 +1775,9 @@ pub fn probe_deploy_state(
          if [ -f {unit} ]; then grep -hoE -e '--http-port[[:space:]]+[0-9]+' {unit} 2>/dev/null || true; \
          else printf '%s' '{no_unit}'; fi; \
          printf '\\n{opts_delim}\\n'; \
-         cat {opts_marker} 2>/dev/null || true",
+         cat {opts_marker} 2>/dev/null || true; \
+         printf '\\n{current_delim}\\n'; \
+         readlink -f {current} 2>/dev/null || true",
         current = shell_quote(&cfg.current_symlink()),
         marker = shell_quote(&live_slot_marker(cfg)),
         blue = SLOT_BLUE,
@@ -1757,6 +1787,7 @@ pub fn probe_deploy_state(
         no_unit = NO_PROXY_UNIT_SENTINEL,
         opts_delim = PROXY_OPTIONS_DELIM,
         opts_marker = shell_quote(&proxy_options_marker(cfg)),
+        current_delim = CURRENT_RELEASE_DELIM,
     );
     let out = exec.run(&RemoteCommand::new("detect-current", shell))?;
     let (mode_part, rest) = out
@@ -1766,21 +1797,34 @@ pub fn probe_deploy_state(
     // Split the proxy list from the installed-unit section. A missing unit delimiter
     // (older/scripted output) → empty unit + options sections → `Absent`/`Absent`
     // (never a spurious refuse, always proceed-as-legacy).
-    let (proxy_list, installed_proxy_port, last_proxy_options) =
+    let (proxy_list, installed_proxy_port, last_proxy_options, current_release_dir) =
         match rest.split_once(PROXY_UNIT_DELIM) {
             Some((list, after_unit)) => {
                 // The installed-unit section further splits into the `--http-port` grep and
                 // the proxy-options marker; a missing options delimiter → empty → `Absent`.
-                let (unit_section, opts_section) = after_unit
+                let (unit_section, after_opts) = after_unit
                     .split_once(PROXY_OPTIONS_DELIM)
                     .unwrap_or((after_unit, ""));
+                // …and the options section further splits into the marker `cat` and the
+                // `readlink -f current` result (#1621). A missing delimiter (a host
+                // deployed before this feature, or a scripted test) leaves an empty
+                // current section → `None` = "release unknown", never a guessed id.
+                let (opts_section, current_section) = after_opts
+                    .split_once(CURRENT_RELEASE_DELIM)
+                    .unwrap_or((after_opts, ""));
                 (
                     list,
                     parse_installed_proxy_port(unit_section),
                     parse_proxy_options(opts_section),
+                    parse_current_release(current_section),
                 )
             }
-            None => (rest, InstalledProxyPort::Absent, ProxyOptionsMarker::Absent),
+            None => (
+                rest,
+                InstalledProxyPort::Absent,
+                ProxyOptionsMarker::Absent,
+                None,
+            ),
         };
     let mode = mode_part
         .trim()
@@ -1800,6 +1844,140 @@ pub fn probe_deploy_state(
         proxy_list: proxy_list.to_owned(),
         installed_proxy_port,
         last_proxy_options,
+        current_release_dir,
+    })
+}
+
+/// Parse the probe's `readlink -f {app_dir}/current` section (#1621, AC-6).
+///
+/// Empty (absent/dangling symlink, or a probe capture predating this section) →
+/// `None`. Anything else is the resolved release DIR, trimmed of surrounding
+/// whitespace/newlines. Deliberately NOT fail-closed: this section is read-only
+/// reporting, and refusing to report a status because a symlink is unreadable would
+/// make `deploy status` useless on exactly the drifted host it exists to surface.
+fn parse_current_release(section: &str) -> Option<String> {
+    let trimmed = section.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Delimiter separating the two facts only `deploy status` needs — the live slot's
+/// `/ready` HTTP code and the maintenance-flag presence — in one round-trip
+/// (issue #1621, AC-6).
+const HOST_STATUS_DELIM: &str = "---autumn-host-status---";
+
+/// Sentinel the status probe prints when the shared maintenance flag file exists.
+const MAINTENANCE_ON_SENTINEL: &str = "maintenance-on";
+
+/// Everything `autumn deploy status` reads from ONE host (issue #1621, AC-6).
+///
+/// Deliberately a superset of [`DeployProbe`] rather than an extension of it:
+/// `deploy up` must NOT pay for a `curl` and a flag-file `test` on every host, and
+/// the fields below are meaningless to a rollout. Keeping them here is what lets
+/// [`probe_deploy_state`] stay exactly as costly as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostStatusProbe {
+    /// The shared deploy-state probe: mode + live-slot marker, `kamal-proxy list`,
+    /// the installed proxy port, the proxy-options marker and the `current` release.
+    pub deploy: DeployProbe,
+    /// HTTP status the live slot's loopback `/ready` answered with, or `None` when
+    /// nothing answered (connection refused, no `curl`, a timeout, an
+    /// unparseable code). `None` is "we could not tell", never "unhealthy".
+    pub ready_code: Option<u16>,
+    /// Whether the SHARED maintenance flag file exists on this host.
+    ///
+    /// Read from `{app_dir}/shared/…` — the release-independent path the slot units
+    /// point `AUTUMN_MAINTENANCE_FLAG_FILE` at — so the answer survives a cutover,
+    /// which is the whole reason that override exists.
+    pub maintenance_on: bool,
+}
+
+impl HostStatusProbe {
+    /// The live-slot decision for this host, reconciled against the running proxy —
+    /// pure, and `None` for a host with no promoted release at all.
+    ///
+    /// Shared with the rollout path's slot selection ([`reconcile_live_slot`]), so
+    /// `status` reports the same slot a deploy would plan from, including the same
+    /// proxy-over-marker precedence on a disagreement.
+    #[must_use]
+    pub fn reconcile(&self, cfg: &ResolvedDeployConfig, public_port: u16) -> Option<SlotReconcile> {
+        match &self.deploy.mode {
+            DeployMode::First => None,
+            DeployMode::Redeploy { live_slot } => Some(reconcile_live_slot(
+                live_slot,
+                &self.deploy.proxy_list,
+                &cfg.service_name,
+                public_port,
+            )),
+        }
+    }
+}
+
+/// The read-only status probe: the shared deploy-state round-trip PLUS the live
+/// slot's `/ready` code and the maintenance-flag presence (issue #1621, AC-6).
+///
+/// Used ONLY by `deploy status`, never by `up` — see [`HostStatusProbe`]. Both
+/// commands it runs are read-only (`readlink`/`cat`/`grep`, then `curl` and
+/// `[ -f ]`), so this can be pointed at a production fleet mid-incident.
+///
+/// The readiness probe hits the LIVE slot's loopback port (the same
+/// `http://127.0.0.1:{slot_port}/ready` the deploy's readiness gate polls), not the
+/// public port: the public port is kamal-proxy's, and asking the proxy would report
+/// the proxy's health rather than the release's. It is bounded by `--max-time` so a
+/// hung app cannot stall a fleet-wide status, and its failure is never fatal —
+/// `deploy status` must report the whole fleet or it is useless during the incident
+/// it exists for.
+///
+/// # Errors
+///
+/// Returns the executor's error only when a probe command cannot run at all — the
+/// caller renders that host as unreachable rather than aborting the fleet report.
+pub fn probe_host_status(
+    cfg: &ResolvedDeployConfig,
+    public_port: u16,
+    exec: &impl DeployExecutor,
+) -> Result<HostStatusProbe, DeployExecError> {
+    let deploy = probe_deploy_state(cfg, exec)?;
+    // Poll whichever slot the proxy is actually serving; on a host with nothing
+    // promoted yet, blue is the slot a first deploy takes, and the probe simply
+    // reports that nothing answered.
+    let live_slot = match &deploy.mode {
+        DeployMode::First => SLOT_BLUE,
+        DeployMode::Redeploy { live_slot } => {
+            reconcile_live_slot(
+                live_slot,
+                &deploy.proxy_list,
+                &cfg.service_name,
+                public_port,
+            )
+            .live_slot
+        }
+    };
+    let shell = format!(
+        "curl -o /dev/null -s -m 5 -w '%{{http_code}}' http://127.0.0.1:{port}/ready 2>/dev/null \
+         || true; \
+         printf '\\n{delim}\\n'; \
+         if [ -f {flag} ]; then printf '%s' '{on}'; fi",
+        port = slot_app_port(public_port, live_slot),
+        delim = HOST_STATUS_DELIM,
+        flag = shell_quote(&cfg.maintenance_flag_file()),
+        on = MAINTENANCE_ON_SENTINEL,
+    );
+    let out = exec.run(&RemoteCommand::new("probe-host-status", shell))?;
+    let (ready_section, maintenance_section) = out
+        .stdout
+        .split_once(HOST_STATUS_DELIM)
+        .unwrap_or((out.stdout.as_str(), ""));
+    Ok(HostStatusProbe {
+        deploy,
+        // `curl` writes `000` when it never got a response; that is "nothing
+        // answered", not an HTTP status, so it degrades to `None` like every other
+        // unreadable capture.
+        ready_code: ready_section
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|code| *code > 0),
+        maintenance_on: maintenance_section.trim() == MAINTENANCE_ON_SENTINEL,
     })
 }
 
@@ -2523,12 +2701,13 @@ pub(crate) mod test_support {
     /// [`super::DeployMode::First`] / `Absent`. A fleet test that forgets to script
     /// host N's probe would therefore exercise the first-deploy branch and still
     /// pass. [`RecordingExecutor::strict`] turns that into a loud panic.
-    pub(crate) const PROBE_LABELS: [&str; 5] = [
+    pub(crate) const PROBE_LABELS: [&str; 6] = [
         "proxy-compat-probe",
         "detect-current",
         "probe-release-dir",
         "probe-rollback-target",
         "resolve-previous",
+        "probe-host-status",
     ];
 
     /// One recorded executor call. Uploads carry no local path: op building is
@@ -2579,6 +2758,11 @@ pub(crate) mod test_support {
         transport_fail_labels: Vec<&'static str>,
         /// Scripted stdout returned for a given command label.
         stdout_by_label: Vec<(&'static str, String)>,
+        /// #1621: remote-path fragments whose `upload` should fail. Uploads carry
+        /// no label, so failure is keyed on the destination path — the only
+        /// identity an upload has. This is what lets a test fail a `WriteFile` op
+        /// (the maintenance fan-out's flag write) the way a dying scp would.
+        upload_fail_paths: Vec<String>,
         /// #1621: the host this executor targets, recorded onto the shared fleet
         /// tape. Empty for the single-host fakes, which never set a tape.
         host: String,
@@ -2634,6 +2818,15 @@ pub(crate) mod test_support {
             stdout: impl Into<String>,
         ) -> Self {
             self.stdout_by_label.push((label, stdout.into()));
+            self
+        }
+
+        /// Make `upload` fail for any remote path containing `fragment` (#1621).
+        ///
+        /// The upload is still RECORDED first, mirroring `run`'s scripted
+        /// failures, so a test can assert the attempt happened.
+        pub(crate) fn failing_upload(mut self, fragment: impl Into<String>) -> Self {
+            self.upload_fail_paths.push(fragment.into());
             self
         }
 
@@ -2736,6 +2929,16 @@ pub(crate) mod test_support {
                 remote_path: remote_path.to_owned(),
                 mode,
             });
+            if self
+                .upload_fail_paths
+                .iter()
+                .any(|fragment| remote_path.contains(fragment.as_str()))
+            {
+                return Err(DeployExecError::CommandFailed {
+                    label: "upload",
+                    message: "scripted upload failure".to_owned(),
+                });
+            }
             Ok(())
         }
     }
@@ -4983,6 +5186,238 @@ mod tests {
             ProxyOptionsMarker::Unreadable,
             "an unparseable proxy-options marker fails closed as Unreadable",
         );
+    }
+
+    #[test]
+    fn probe_deploy_state_captures_the_current_release_dir() {
+        // #1621 (AC-6, plan §7.1): `autumn deploy status` needs each host's DEPLOYED
+        // RELEASE, and the only honest source is the `current` symlink's target — no
+        // runtime endpoint reports a release id (the probe body's `version` is the
+        // FRAMEWORK crate version, identical on every host forever). It rides as a
+        // FIFTH delimited section on the existing probe, so `status` costs the same
+        // one ssh round-trip `up` already pays and it works retroactively on hosts
+        // deployed before this feature.
+        let cfg = resolved();
+        let stdout = format!(
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n{}\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n\
+             ---autumn-kamal-proxy-options---\n0\t\n\
+             ---autumn-current-release---\n/srv/autumn/myapp/releases/20260714T120000Z",
+            proxy_list_serving("myapp", 3001)
+        );
+        let exec = RecordingExecutor::new().with_stdout("detect-current", stdout);
+        let probe = probe_deploy_state(&cfg, &exec).unwrap();
+        assert_eq!(
+            probe.current_release_dir.as_deref(),
+            Some("/srv/autumn/myapp/releases/20260714T120000Z"),
+        );
+        assert_eq!(
+            release_id_from_dir(probe.current_release_dir.as_deref().unwrap()),
+            Some("20260714T120000Z"),
+            "the release id is the release dir's basename"
+        );
+        // The earlier sections are still cleanly split off — the new delimiter must
+        // not leak into the proxy-options marker.
+        assert_eq!(
+            probe.last_proxy_options,
+            ProxyOptionsMarker::Options(ProxyServiceOptions {
+                tls: false,
+                host: None,
+            })
+        );
+        assert_eq!(probe.installed_proxy_port, InstalledProxyPort::Port(80));
+
+        // The probe shell resolves the symlink behind its own delimiter, best-effort.
+        let shell = exec.shell_for("detect-current").expect("probe ran");
+        assert!(
+            shell.contains("---autumn-current-release---")
+                && shell.contains("readlink -f '/srv/autumn/myapp/current'"),
+            "probe resolves the current symlink behind its delimiter: {shell}"
+        );
+        // The LABEL is unchanged: it is load-bearing for every exact-vector test and
+        // for the strict test fake's probe allow-list.
+        assert_eq!(
+            exec.run_labels(),
+            vec!["detect-current"],
+            "the probe's op label must not change when a section is added"
+        );
+    }
+
+    #[test]
+    fn probe_deploy_state_degrades_when_the_current_release_section_is_missing() {
+        // #1621: a host deployed before this feature (or a scripted test that stubs
+        // only the earlier sections) has no fifth delimiter. That degrades to
+        // "unknown", exactly like every other section — never to a guessed release id,
+        // because drift reporting treats Unknown as a DISTINCT state and never as
+        // drift. A false "these hosts differ" at 3 am is worse than no warning.
+        let cfg = resolved();
+        let legacy = RecordingExecutor::new().with_stdout(
+            "detect-current",
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80",
+        );
+        assert!(
+            probe_deploy_state(&cfg, &legacy)
+                .unwrap()
+                .current_release_dir
+                .is_none(),
+            "a missing fifth delimiter degrades to unknown"
+        );
+
+        // Present but empty (`readlink` on a dangling/absent symlink prints nothing).
+        let empty = RecordingExecutor::new().with_stdout(
+            "detect-current",
+            "first\n---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n---autumn-no-proxy-unit---\n\
+             ---autumn-kamal-proxy-options---\n\n---autumn-current-release---\n",
+        );
+        let probe = probe_deploy_state(&cfg, &empty).unwrap();
+        assert_eq!(probe.mode, DeployMode::First);
+        assert!(
+            probe.current_release_dir.is_none(),
+            "an empty current section is unknown, not an empty release id"
+        );
+    }
+
+    /// Full five-section `detect-current` stdout for a redeploy host on `release`.
+    fn status_probe_stdout(release: &str, live_port: u16) -> String {
+        format!(
+            "redeploy:blue\t{live_port}\n---autumn-kamal-proxy-list---\n{}\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 3000\n\
+             ---autumn-kamal-proxy-options---\n0\t\n\
+             ---autumn-current-release---\n/srv/autumn/myapp/releases/{release}",
+            proxy_list_serving("myapp", live_port)
+        )
+    }
+
+    #[test]
+    fn probe_host_status_reads_readiness_and_maintenance_off_the_live_slot() {
+        // #1621 (AC-6, plan §7.1): `deploy status` needs two facts `up` must never
+        // pay for — the live slot's `/ready` code and whether the SHARED maintenance
+        // flag exists. They ride on their own labelled round-trip so
+        // `probe_deploy_state` (and therefore every `deploy up`) is unchanged.
+        let cfg = resolved();
+        let exec = RecordingExecutor::new()
+            .with_stdout(
+                "detect-current",
+                status_probe_stdout("20260714T120000Z", 3001),
+            )
+            .with_stdout(
+                "probe-host-status",
+                "200\n---autumn-host-status---\nmaintenance-on",
+            );
+        let probe = probe_host_status(&cfg, 3000, &exec).unwrap();
+        assert_eq!(probe.ready_code, Some(200));
+        assert!(probe.maintenance_on);
+        assert_eq!(
+            probe.deploy.current_release_dir.as_deref(),
+            Some("/srv/autumn/myapp/releases/20260714T120000Z")
+        );
+
+        // It polls the LIVE slot's loopback port (blue = public + 1), not the public
+        // port — the public port is kamal-proxy's, and asking it would report the
+        // proxy's health rather than the release's.
+        let shell = exec
+            .shell_for("probe-host-status")
+            .expect("status probe ran");
+        assert!(
+            shell.contains("http://127.0.0.1:3001/ready"),
+            "readiness is polled on the live slot's loopback port: {shell}"
+        );
+        // Bounded, so one hung app cannot stall a fleet-wide status.
+        assert!(shell.contains("-m 5"), "the curl must be bounded: {shell}");
+        // The maintenance flag is read from the RELEASE-INDEPENDENT shared path —
+        // reading a release dir would report "off" for every host after a cutover,
+        // which is the very defect the shared path exists to fix.
+        assert!(
+            shell.contains("'/srv/autumn/myapp/shared/autumn-maintenance.json'"),
+            "the maintenance flag is read from the shared dir: {shell}"
+        );
+        assert!(
+            !shell.contains("/releases/"),
+            "the status probe must not look for a release-scoped flag: {shell}"
+        );
+        // Read-only: exactly the two probe labels, nothing mutating.
+        assert_eq!(
+            exec.run_labels(),
+            vec!["detect-current", "probe-host-status"],
+            "`deploy status` must never mutate a host"
+        );
+    }
+
+    #[test]
+    fn probe_host_status_degrades_to_unknown_readiness_rather_than_failing() {
+        // A host with no `curl`, a refused connection, or a timeout writes `000`
+        // (or nothing). That is "we could not tell" — reporting it as an HTTP status
+        // would be a lie, and failing the probe would make `deploy status` useless on
+        // exactly the broken host it exists to surface.
+        let cfg = resolved();
+        for capture in [
+            "000\n---autumn-host-status---\n",
+            "---autumn-host-status---\n",
+            "",
+        ] {
+            let exec = RecordingExecutor::new()
+                .with_stdout("detect-current", status_probe_stdout("r1", 3001))
+                .with_stdout("probe-host-status", capture);
+            let probe = probe_host_status(&cfg, 3000, &exec).unwrap();
+            assert_eq!(
+                probe.ready_code, None,
+                "capture {capture:?} must degrade to unknown readiness"
+            );
+            assert!(
+                !probe.maintenance_on,
+                "no sentinel means maintenance is off, never unknown-as-on"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_host_status_polls_the_slot_the_proxy_is_actually_serving() {
+        // The live-slot marker can drift from what kamal-proxy serves (an interrupted
+        // post-flip marker write). `status` reconciles exactly like the rollout path
+        // does, so it reports the slot a deploy would plan from — polling the marker's
+        // slot instead would report the IDLE release's readiness.
+        let cfg = resolved();
+        let drifted = format!(
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n{}\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 3000\n\
+             ---autumn-kamal-proxy-options---\n0\t\n\
+             ---autumn-current-release---\n/srv/autumn/myapp/releases/r1",
+            // the proxy is serving GREEN (public + 2) while the marker says blue
+            proxy_list_serving("myapp", 3002)
+        );
+        let exec = RecordingExecutor::new()
+            .with_stdout("detect-current", drifted)
+            .with_stdout("probe-host-status", "200\n---autumn-host-status---\n");
+        let probe = probe_host_status(&cfg, 3000, &exec).unwrap();
+        let reconcile = probe
+            .reconcile(&cfg, 3000)
+            .expect("a redeploy host reconciles");
+        assert_eq!(reconcile.live_slot, SLOT_GREEN);
+        assert!(reconcile.repair, "the disagreement is reported as drift");
+        let shell = exec
+            .shell_for("probe-host-status")
+            .expect("status probe ran");
+        assert!(
+            shell.contains("http://127.0.0.1:3002/ready"),
+            "readiness must follow the PROXY's slot, not the marker's: {shell}"
+        );
+    }
+
+    #[test]
+    fn release_id_from_dir_takes_the_basename_and_rejects_junk() {
+        assert_eq!(
+            release_id_from_dir("/srv/autumn/myapp/releases/20260714T120000Z"),
+            Some("20260714T120000Z")
+        );
+        // Trailing slash (some readlink/shell shapes) still yields the id.
+        assert_eq!(
+            release_id_from_dir("/srv/autumn/myapp/releases/20260714T120000Z/"),
+            Some("20260714T120000Z")
+        );
+        assert_eq!(release_id_from_dir(""), None);
+        assert_eq!(release_id_from_dir("/"), None);
     }
 
     /// A compatible `kamal-proxy deploy --help` capture for the compat probe tests.

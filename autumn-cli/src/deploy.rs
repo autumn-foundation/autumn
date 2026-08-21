@@ -115,6 +115,35 @@ pub enum DeployError {
         /// Hosts attempted.
         total: usize,
     },
+
+    /// `deploy status --strict` found drift (issue #1621, AC-6).
+    ///
+    /// Carries no payload: the status table printed above IS the report, and this
+    /// error exists so drift is alertable from cron — the default (non-`--strict`)
+    /// status never fails on drift.
+    #[error(
+        "fleet drift detected — the status table above names each host and reason          (`--strict` exits non-zero on drift so it can be alerted on)"
+    )]
+    DriftDetected,
+
+    /// A fleet `deploy maintenance on|off` did not reach every host (issue #1621,
+    /// AC-5).
+    ///
+    /// Best-effort-and-aggregate: every host was attempted, the per-host table
+    /// above names the ones that DID change (they are deliberately NOT reversed —
+    /// that would reopen the window the operator is closing), and this carries
+    /// only counts — never a host-derived string.
+    #[error(
+        "fleet maintenance {verb} incomplete: {failed} of {total} host(s) failed — the          table above names the hosts that DID change, so they can be reversed by hand          if the fleet must stay consistent"
+    )]
+    FleetMaintenanceFailed {
+        /// Which verb was fanned out (`"on"` / `"off"`).
+        verb: &'static str,
+        /// Hosts whose change failed.
+        failed: usize,
+        /// Hosts attempted.
+        total: usize,
+    },
 }
 
 /// The partial-fleet state a halted rollout leaves behind (issue #1621, AC-3).
@@ -163,6 +192,37 @@ pub enum DeployAction {
     Rollback,
     /// Run the preflight, then perform a REAL first deploy over SSH.
     Up,
+    /// Report every configured host's state, read-only (issue #1621, AC-6).
+    Status,
+    /// Turn maintenance mode ON across every configured host (issue #1621, AC-5).
+    ///
+    /// The flags travel in [`DeployOptions::maintenance`] so this enum stays
+    /// fieldless and `Copy`.
+    MaintenanceOn,
+    /// Turn maintenance mode OFF across every configured host (issue #1621, AC-5).
+    MaintenanceOff,
+}
+
+/// The `autumn deploy maintenance on` flags (issue #1621, AC-5).
+///
+/// Exactly the flag set of the existing local `autumn maintenance on`, because the
+/// two write the SAME wire format — `autumn_web::maintenance::MaintenanceConfig` —
+/// and an operator who knows one must not have to learn the other. This is a plain
+/// owned mirror of `MaintenanceOnOptions` (which borrows, and carries a test-only
+/// path override that has no meaning for a remote host).
+///
+/// Carried in [`DeployOptions`] rather than as a [`DeployAction`] payload so the
+/// action enum stays fieldless and `Copy`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaintenanceOnArgs {
+    /// Human-readable message shown in the 503 body.
+    pub message: Option<String>,
+    /// CIDR blocks / IPs whose requests bypass the gate.
+    pub allow_ips: Vec<String>,
+    /// Let GET/HEAD/OPTIONS through while blocking writes.
+    pub readonly: bool,
+    /// `(header name, expected value)` that bypasses the gate.
+    pub bypass_header: Option<(String, String)>,
 }
 
 /// Flags that modify a [`DeployAction`] (issue #1621, plan §3.1).
@@ -188,6 +248,17 @@ pub struct DeployOptions {
     /// The hosts that already cut over are left exactly as they are for
     /// inspection, and named in the state table. See [`FleetUpInput::auto_rollback`].
     pub no_rollback: bool,
+    /// `deploy status --json`: emit the stable machine-readable report (the repo's
+    /// skills are a first-class consumer) instead of the table.
+    pub json: bool,
+    /// `deploy status --strict`: exit non-zero when ANY drift is detected, so
+    /// drift is alertable from cron. The default status always exits 0 (it is a
+    /// report, not a judgement).
+    pub strict: bool,
+    /// The `deploy maintenance on` flags. `Some` only for
+    /// [`DeployAction::MaintenanceOn`]; `None` everywhere else (including
+    /// `MaintenanceOff`, which takes no flags).
+    pub maintenance: Option<MaintenanceOnArgs>,
 }
 
 /// A `[deploy]` section with all defaults resolved to concrete values.
@@ -371,6 +442,28 @@ impl ResolvedDeployConfig {
     pub fn current_symlink(&self) -> String {
         format!("{}/current", self.app_dir)
     }
+
+    /// The maintenance flag file this host's slot units read (issue #1621, R1).
+    ///
+    /// It lives in the SHARED dir, not a release dir: the runtime's default flag
+    /// path is cwd-relative and a slot unit's `WorkingDirectory` is the release dir,
+    /// so a cutover would orphan the flag and silently un-maintain the host.
+    /// `shared/` is created by `prepare-dirs`, survives cutovers, rollbacks and
+    /// pruning, and is seen by BOTH slots — so a flag written here means the same
+    /// thing before and after a deploy. [`render_app_unit`] stamps this path into
+    /// every slot unit via `AUTUMN_MAINTENANCE_FLAG_FILE`, and the fleet
+    /// `deploy maintenance` fan-out writes exactly here.
+    ///
+    /// The file NAME comes from `autumn_web` — the CLI never re-declares a wire
+    /// path the framework owns.
+    #[must_use]
+    pub fn maintenance_flag_file(&self) -> String {
+        format!(
+            "{}/{}",
+            self.shared_dir(),
+            autumn_web::maintenance::MAINTENANCE_FLAG_BASENAME
+        )
+    }
 }
 
 /// Validate the `[deploy]` host spelling(s) and return the ordered target list
@@ -390,7 +483,13 @@ impl ResolvedDeployConfig {
 ///
 /// Returns a message when `host` and `hosts` are both configured, when a `hosts`
 /// entry is blank, or when a `hosts` entry repeats (compared after trimming).
-fn deploy_host_list(cfg: &DeployConfig) -> Result<Vec<String>, String> {
+// `pub(crate)` (not private): `doctor` enumerates the deploy target list through
+// THIS function so its deploy branch grades the same fleet `deploy check` does —
+// re-deriving the rules there is exactly the drift the parity invariant forbids.
+// In this bin-only crate `deploy` is a private module, so clippy flags the
+// `pub(crate)` as redundant; it is kept to document the intended visibility.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn deploy_host_list(cfg: &DeployConfig) -> Result<Vec<String>, String> {
     let host = cfg
         .host
         .as_deref()
@@ -529,7 +628,6 @@ impl ResolvedFleet {
     // (`ssh_reachability`), byte-identically to pre-#1621, instead of being
     // rejected earlier here with a different message and no report. This is the
     // seam the read-only fleet surfaces (`status`, `maintenance`) use.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn resolve(cfg: &DeployConfig, project_name: &str) -> Result<Self, String> {
         let addresses = deploy_host_list(cfg)?;
         if addresses.is_empty() {
@@ -607,7 +705,21 @@ impl DeployStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreflightCheck {
     /// Short stable identifier for the check.
+    ///
+    /// **Deliberately still `&'static str`.** It is the operator-visible key in
+    /// `autumn doctor --json`, so it must not become host-specific; a fleet names
+    /// the host in [`Self::scope`] instead. (Making it dynamic would need a
+    /// `Cow`/`Box::leak` — an unbounded per-host-per-run leak clippy will not flag
+    /// — and would change a published contract for no gain.)
     pub name: &'static str,
+    /// Which fleet host this grader graded, when that is a meaningful question
+    /// (issue #1621, plan §5.2).
+    ///
+    /// `Some(host)` only for a per-host grader in a fleet of MORE THAN ONE host;
+    /// `None` for every project-wide grader and for every check in a single-host
+    /// deploy — which is what keeps single-host output byte-identical to pre-#1621
+    /// (AC-1). [`preflight_label`] is the single place it is rendered.
+    pub scope: Option<String>,
     /// Whether the check passed.
     pub passed: bool,
     /// Whether the check could not be verified here and is deliberately
@@ -627,6 +739,7 @@ impl PreflightCheck {
     fn pass(name: &'static str, detail: impl Into<String>) -> Self {
         Self {
             name,
+            scope: None,
             passed: true,
             deferred: false,
             detail: detail.into(),
@@ -637,11 +750,22 @@ impl PreflightCheck {
     fn fail(name: &'static str, detail: impl Into<String>, hint: &'static str) -> Self {
         Self {
             name,
+            scope: None,
             passed: false,
             deferred: false,
             detail: detail.into(),
             hint: Some(hint),
         }
+    }
+
+    /// Attach the fleet host this check graded (issue #1621).
+    ///
+    /// Always called with `None` for a single-host fleet, so the rendered line is
+    /// byte-identical to pre-#1621.
+    #[must_use]
+    fn scoped(mut self, scope: Option<String>) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// Whether this check must abort the deploy. A check blocks only when it
@@ -656,6 +780,52 @@ impl PreflightCheck {
 }
 
 // ── Preflight graders (AC-6) ─────────────────────────────────────────────────
+
+/// The preflight graders BOTH `autumn deploy check` and `autumn doctor` run, in
+/// the order `deploy check` reports them (issue #1621, plan §5.5).
+///
+/// This is the **single shared source** for the parity invariant that the two
+/// surfaces grade the same things. Doctor's own operator-visible check names are
+/// mechanically this list with a `deploy_` prefix — see
+/// [`DOCTOR_PREFLIGHT_GRADERS`] and the test that pins the derivation.
+///
+/// `ssh_reachability` is the only PER-HOST grader: a fleet emits one row per host
+/// (distinguished by [`PreflightCheck::scope`]) and the other three once, because
+/// they grade the project, not the target.
+#[allow(clippy::redundant_pub_crate)]
+// Consumed by the parity tests (deploy-side and doctor-side). Kept in production
+// code rather than `#[cfg(test)]` because it IS the documented shared source the
+// two surfaces derive from — hiding it in a test module would invite a third,
+// unchecked hand-written list.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const PREFLIGHT_GRADERS: [&str; 4] = [
+    "ssh_reachability",
+    "signing_secret",
+    "database_url",
+    "migrate_check",
+];
+
+/// `autumn doctor`'s names for [`PREFLIGHT_GRADERS`], in the same order.
+///
+/// These strings are an operator-visible `doctor --json` contract, so they are
+/// spelled out literally (a `const fn` concat is not available for `&'static str`)
+/// and pinned against [`PREFLIGHT_GRADERS`] by
+/// `doctor_deploy_check_names_are_the_shared_grader_names_prefixed`. The doctor
+/// branch indexes THIS array rather than repeating the literals, so a rename can
+/// only happen in one place.
+///
+/// Two doctor deploy checks are deliberately NOT here: `deploy_config` (a
+/// doctor-only config-load guard) and `deploy_host` (the OFFLINE host-presence
+/// grader, which exists because doctor grades a deploy target without `--online`;
+/// `deploy check` subsumes it into `ssh_reachability`, which reports the identical
+/// missing-host detail and hint).
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) const DOCTOR_PREFLIGHT_GRADERS: [&str; 4] = [
+    "deploy_ssh_reachability",
+    "deploy_signing_secret",
+    "deploy_database_url",
+    "deploy_migrate_check",
+];
 
 /// Grade that a deploy target host is configured — a pure, OFFLINE check with no
 /// network I/O. This is deliberately split out from [`grade_ssh_reachability`]
@@ -673,6 +843,99 @@ pub fn grade_deploy_host_present(host: Option<&str>) -> PreflightCheck {
             DEPLOY_HOST_MISSING_DETAIL,
             DEPLOY_HOST_MISSING_HINT,
         ),
+    }
+}
+
+/// Grade that at least one deploy target is configured, across BOTH host
+/// spellings (issue #1621) — the fleet sibling of [`grade_deploy_host_present`].
+///
+/// `hosts` is the validated, ordered list from [`deploy_host_list`]. Used by
+/// `autumn doctor`, whose `deploy_host` check must grade a `[deploy] hosts` fleet
+/// rather than reporting "no target host configured" because the scalar `host` is
+/// unset.
+///
+/// The empty and single-host cases produce **byte-identical** detail/hint to
+/// [`grade_deploy_host_present`], so single-server doctor output is unchanged; only
+/// a real fleet gets the extra host enumeration. That enumeration lives in the
+/// DETAIL text rather than in per-host check names because `CheckResult.name` is an
+/// operator-visible `doctor --json` key (plan §5.2).
+#[must_use]
+pub fn grade_deploy_hosts_present(hosts: &[String]) -> PreflightCheck {
+    match hosts {
+        // Delegate the historical shapes to the historical grader, so their
+        // detail/hint are identical BY CONSTRUCTION rather than by copy.
+        [] => grade_deploy_host_present(None),
+        [only] => grade_deploy_host_present(Some(only)),
+        many => PreflightCheck::pass(
+            "deploy_host",
+            format!(
+                "{} deploy target hosts configured, in rollout order: {}",
+                many.len(),
+                many.join(", ")
+            ),
+        ),
+    }
+}
+
+/// Probe SSH reachability for EVERY configured host and aggregate the result into
+/// ONE check (issue #1621) — the shape `autumn doctor` needs.
+///
+/// `deploy check` reports one `ssh_reachability` row per host (distinguished by
+/// [`PreflightCheck::scope`]); doctor cannot, because its `CheckResult.name` is a
+/// `&'static str` `--json` key that must stay stable and unique. So doctor grades
+/// the same hosts with the same grader and folds the per-host outcomes into the
+/// detail text: the NAME set stays identical between the two surfaces (the parity
+/// invariant, plan §5.5) while the fleet detail is not lost.
+///
+/// A single-host list delegates straight through, so its detail/hint are
+/// byte-identical to pre-#1621. The check fails when ANY host is unreachable — a
+/// rollout touches all of them.
+#[must_use]
+pub fn grade_fleet_ssh_reachability(
+    hosts: &[String],
+    ssh_port: u16,
+    timeout: Duration,
+) -> PreflightCheck {
+    match hosts {
+        [] => grade_ssh_reachability(None, ssh_port, timeout),
+        [only] => grade_ssh_reachability(Some(only.as_str()), ssh_port, timeout),
+        many => {
+            let graded: Vec<(&str, PreflightCheck)> = many
+                .iter()
+                .map(|host| {
+                    (
+                        host.as_str(),
+                        grade_ssh_reachability(Some(host.as_str()), ssh_port, timeout),
+                    )
+                })
+                .collect();
+            let unreachable: Vec<&str> = graded
+                .iter()
+                .filter(|(_, check)| !check.passed)
+                .map(|(host, _)| *host)
+                .collect();
+            if unreachable.is_empty() {
+                PreflightCheck::pass(
+                    "ssh_reachability",
+                    format!(
+                        "SSH port reachable on all {} fleet hosts: {}",
+                        many.len(),
+                        many.join(", ")
+                    ),
+                )
+            } else {
+                PreflightCheck::fail(
+                    "ssh_reachability",
+                    format!(
+                        "cannot reach {} of {} fleet hosts on port {ssh_port}: {}",
+                        unreachable.len(),
+                        many.len(),
+                        unreachable.join(", ")
+                    ),
+                    "Confirm the server is up, the SSH port is open, and any firewall allows your IP",
+                )
+            }
+        }
     }
 }
 
@@ -989,6 +1252,7 @@ pub fn render_app_unit(
          WorkingDirectory={release_dir}\n\
          EnvironmentFile={env_file}\n\
          Environment=AUTUMN_MANIFEST_DIR={manifest_dir}\n\
+         Environment={maintenance_env}={maintenance_flag}\n\
          Environment=AUTUMN_SERVER__HOST=127.0.0.1\n\
          Environment=AUTUMN_SERVER__PORT={app_port}\n\
          ExecStart={release_dir}/{app}\n\
@@ -1008,6 +1272,15 @@ pub fn render_app_unit(
         // release's OWN manifest. Non-secret → unit Environment=, not the 0600 env
         // file.
         manifest_dir = release_dir,
+        // #1621 R1: point the runtime's maintenance flag at the per-app SHARED dir
+        // instead of leaving it cwd-relative (i.e. release-relative, because
+        // `WorkingDirectory` above is the release dir). Without this a cutover
+        // orphans an active maintenance flag and silently un-maintains the host —
+        // and the blue and green slots cannot see each other's flag at all. The
+        // variable name and file name are the framework's, imported (never
+        // re-declared here). Non-secret → unit `Environment=`.
+        maintenance_env = autumn_web::maintenance::MAINTENANCE_FLAG_FILE_ENV,
+        maintenance_flag = cfg.maintenance_flag_file(),
     )
 }
 
@@ -1224,9 +1497,27 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
         // and DB URL, so they must see those VALUES resolved under the TARGET
         // deploy profile — not the operator's ambient/dev config. Reload here.
         // `check`/`rollback` deliberately do NOT load the media config.
-        DeployAction::Check => run_check(&load_runtime_config(&resolved)?, &resolved),
+        DeployAction::Check => run_check(&load_runtime_config(&resolved)?, &resolved, &targets),
         DeployAction::Rollback => {
             run_rollback(&load_runtime_config(&resolved)?, &resolved, &targets)
+        }
+        // The read-only fleet surfaces (#1621). Both resolve through
+        // `ResolvedFleet::resolve` — the seam that rejects a malformed/absent target
+        // with one actionable message — and neither loads the media config (they
+        // provision nothing).
+        DeployAction::Status => {
+            let fleet = ResolvedFleet::resolve(&deploy_cfg, &resolve_project_name())
+                .map_err(DeployError::Config)?;
+            run_status(&load_runtime_config(&resolved)?, &fleet, options)
+        }
+        DeployAction::MaintenanceOn | DeployAction::MaintenanceOff => {
+            let fleet = ResolvedFleet::resolve(&deploy_cfg, &resolve_project_name())
+                .map_err(DeployError::Config)?;
+            run_fleet_maintenance_with(&fleet, action, options.maintenance.as_ref(), |cfg| {
+                exec::SshTarget::from_resolved(cfg)
+                    .map(exec::SshExecutor::new)
+                    .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
+            })
         }
         DeployAction::Up => {
             let (media_cfg, ffmpeg_bin) = load_media_host_config(&resolved)?;
@@ -1657,10 +1948,16 @@ fn collect_project_preflight(
 /// project-wide graders **once** (issue #1621, AC-7).
 ///
 /// A single-host fleet returns exactly [`collect_preflight`]'s vector, so its
-/// report is byte-identical to pre-#1621 (AC-1). For a real fleet the per-host
-/// rows are distinguished by the grader's own detail text, which already names the
-/// host (`SSH port reachable at web-2:22`) — the structured `scope` field that
-/// `doctor --json` will also carry lands with the CLI-surface slice.
+/// report is byte-identical to pre-#1621 (AC-1). For a real fleet each per-host row
+/// additionally carries [`PreflightCheck::scope`], so `report_preflight` can render
+/// `✅ ssh_reachability (web-2): …` without the grader NAME — a `doctor --json`
+/// contract — ever becoming host-specific.
+///
+/// **No fleet grader ever returns `deferred`** (plan §5.3, pinned by
+/// `no_fleet_preflight_grader_returns_deferred`): `report_preflight` treats deferred
+/// as a non-blocking warning while doctor maps it to a hard `Fail`, so a deferring
+/// fleet grader would make `doctor --strict` reject a config `deploy check` accepts.
+/// These graders pass or they fail.
 ///
 /// The probes run SERIALLY here: they are a bounded TCP connect each, the report
 /// must come out in declaration order, and threading them would put a `Sync` bound
@@ -1676,7 +1973,12 @@ fn collect_fleet_preflight(config: &AutumnConfig, fleet: &ResolvedFleet) -> Vec<
     let mut checks: Vec<PreflightCheck> = fleet
         .hosts
         .iter()
-        .map(|cfg| grade_ssh_reachability(cfg.host.as_deref(), cfg.ssh_port, SSH_PROBE_TIMEOUT))
+        .map(|cfg| {
+            grade_ssh_reachability(cfg.host.as_deref(), cfg.ssh_port, SSH_PROBE_TIMEOUT)
+                // Scope only ever names a host in a REAL fleet — the single-host
+                // branch above returns before this point.
+                .scoped(cfg.host.clone())
+        })
         .collect();
     checks.extend(collect_project_preflight(config, shared));
     checks
@@ -1710,23 +2012,37 @@ fn requires_database_pool(config: &AutumnConfig) -> bool {
         || config.scheduler.backend == autumn_web::config::SchedulerBackend::Postgres
 }
 
+/// The label a preflight line leads with: the stable grader name, plus the fleet
+/// host in parentheses when the check is scoped (issue #1621, plan §5.2).
+///
+/// Pure so the fleet rendering rule is testable without capturing stderr. An
+/// unscoped check (every check in a single-host deploy, and every project-wide
+/// grader in a fleet) renders as the bare name — byte-identical to pre-#1621.
+fn preflight_label(check: &PreflightCheck) -> String {
+    check.scope.as_ref().map_or_else(
+        || check.name.to_owned(),
+        |scope| format!("{} ({scope})", check.name),
+    )
+}
+
 /// Print each preflight check as a pass/fail line and return the failure count.
 /// Shared by `check` and `up` so both surfaces report graders identically.
 fn report_preflight(checks: &[PreflightCheck]) -> usize {
     let mut failed = 0_usize;
     for check in checks {
+        let label = preflight_label(check);
         if check.passed {
-            eprintln!("\u{2705} {}: {}", check.name, check.detail);
+            eprintln!("\u{2705} {label}: {}", check.detail);
         } else if check.deferred {
             // Non-blocking: verified in the service's own runtime, not here.
             // Surfaced as a warning so it is visible but never aborts the deploy.
-            eprintln!("\u{26A0}\u{FE0F}  {}: {}", check.name, check.detail);
+            eprintln!("\u{26A0}\u{FE0F}  {label}: {}", check.detail);
             if let Some(hint) = check.hint {
                 eprintln!("   \u{2192} {hint}");
             }
         } else {
             failed += 1;
-            eprintln!("\u{274C} {}: {}", check.name, check.detail);
+            eprintln!("\u{274C} {label}: {}", check.detail);
             if let Some(hint) = check.hint {
                 eprintln!("   \u{2192} {hint}");
             }
@@ -1736,10 +2052,23 @@ fn report_preflight(checks: &[PreflightCheck]) -> usize {
     failed
 }
 
-fn run_check(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
+/// Run the preflight over EVERY configured host and report it (issue #1621, AC-7).
+///
+/// `hosts` is the ordered target list from [`deploy_host_list`]. With more than one
+/// entry the per-host `ssh_reachability` grader runs once per host — so an
+/// unreachable host in position 3 is named before any host is touched — and the
+/// three project-wide graders run once. With at most one entry this is the
+/// pre-#1621 single-host report verbatim, down to the absent `scope` suffix (AC-1;
+/// proved by `deploy_check_output_is_identical_for_host_and_a_single_entry_hosts_list`).
+fn run_check(
+    config: &AutumnConfig,
+    resolved: &ResolvedDeployConfig,
+    hosts: &[String],
+) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy check\n");
 
-    let checks = collect_preflight(config, resolved);
+    let fleet = ResolvedFleet::from_targets(resolved, hosts);
+    let checks = collect_fleet_preflight(config, &fleet);
     let failed = report_preflight(&checks);
 
     if failed == 0 {
@@ -3485,6 +3814,334 @@ where
     }
 }
 
+// ── `deploy status` (issue #1621, AC-6) ──────────────────────────────────────
+
+/// Probe every fleet host read-only and collect its status row (issue #1621).
+///
+/// Serial and deterministic (declaration order), like every other fleet loop here:
+/// threading the probes would put a `Sync` bound on `DeployExecutor` that the
+/// `RefCell`-based test fake cannot satisfy, and status output must come out in
+/// rollout order anyway. Parallelism is a later, isolated optimisation.
+///
+/// A host whose probe fails becomes an `unreachable` ROW, never an abort:
+/// `deploy status` exists for incidents, and an incident is exactly when a host
+/// may not answer. Only an executor-construction failure (a config with no SSH
+/// target at all) aborts, because then NO host could be probed.
+fn collect_fleet_status<E, F>(
+    fleet: &ResolvedFleet,
+    public_port: u16,
+    make_executor: F,
+) -> Result<Vec<fleet::HostStatus>, DeployError>
+where
+    E: exec::DeployExecutor,
+    F: Fn(&ResolvedDeployConfig) -> Result<E, DeployError>,
+{
+    let mut statuses = Vec::with_capacity(fleet.hosts.len());
+    for cfg in &fleet.hosts {
+        let executor = make_executor(cfg)?;
+        // The probe error is deliberately not printed: it can carry remote stderr,
+        // and "unreachable" in the table is the operator-facing fact.
+        let status = exec::probe_host_status(cfg, public_port, &executor).map_or_else(
+            |_| fleet::HostStatus::unreachable(cfg.host.clone().unwrap_or_default()),
+            |probe| fleet::HostStatus::from_probe(cfg, public_port, &probe),
+        );
+        statuses.push(status);
+    }
+    Ok(statuses)
+}
+
+/// The stable `deploy status --json` shape (issue #1621, AC-6).
+///
+/// The repo's skills are a first-class consumer, so the field set is a documented
+/// contract:
+///
+/// - `hosts`: one object per host, in `[deploy] hosts` (rollout) order, with
+///   `host` (string), `reachable` (bool), `mode`
+///   (`"deployed"`/`"not deployed"`/`"unknown"`/`"unreachable"`), `release`
+///   (string or null when unknown), `live_slot` (string or null), `ready` (HTTP
+///   status number or null), `maintenance` (bool), `proxy_port` (number or null),
+///   and `drift` (array of reason strings, empty when none).
+/// - `version_drift` (bool), `state_drift` (array of `{host, reason}`), and
+///   `drifted` (bool — the `--strict` condition).
+///
+/// Everything here is a host name, an enum word, a number, or a `&'static str`
+/// reason — never a shell line, a remote capture, or a driver error, so no secret
+/// can reach it.
+fn fleet_status_json(
+    statuses: &[fleet::HostStatus],
+    report: &fleet::DriftReport,
+) -> serde_json::Value {
+    let hosts: Vec<serde_json::Value> = statuses
+        .iter()
+        .map(|status| {
+            let mode = if status.reachable {
+                match status.mode {
+                    Some(fleet::HostMode::First) => "not deployed",
+                    Some(fleet::HostMode::Redeploy) => "deployed",
+                    None => "unknown",
+                }
+            } else {
+                "unreachable"
+            };
+            serde_json::json!({
+                "host": status.host,
+                "reachable": status.reachable,
+                "mode": mode,
+                "release": match &status.release {
+                    fleet::ReleaseId::Known(id) => serde_json::Value::String(id.clone()),
+                    fleet::ReleaseId::Unknown => serde_json::Value::Null,
+                },
+                "live_slot": status.live_slot,
+                "ready": status.ready_code,
+                "maintenance": status.maintenance_on,
+                "proxy_port": match status.installed_proxy_port {
+                    exec::InstalledProxyPort::Port(port) => {
+                        serde_json::Value::Number(port.into())
+                    }
+                    _ => serde_json::Value::Null,
+                },
+                "drift": report
+                    .state_drift
+                    .iter()
+                    .filter(|(host, _)| *host == status.host)
+                    .map(|(_, reason)| *reason)
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "hosts": hosts,
+        "version_drift": report.version_drift,
+        "state_drift": report
+            .state_drift
+            .iter()
+            .map(|(host, reason)| serde_json::json!({ "host": host, "reason": reason }))
+            .collect::<Vec<_>>(),
+        "drifted": report.drifted(),
+    })
+}
+
+/// `autumn deploy status`: probe every host read-only and render the shared
+/// per-host table (or `--json`), exiting non-zero on drift only under `--strict`
+/// (issue #1621, AC-6).
+fn run_status(
+    config: &AutumnConfig,
+    fleet: &ResolvedFleet,
+    options: &DeployOptions,
+) -> Result<(), DeployError> {
+    if !options.json {
+        eprintln!("\u{1F342} autumn deploy status\n");
+    }
+    let statuses = collect_fleet_status(fleet, config.server.port, |cfg| {
+        exec::SshTarget::from_resolved(cfg)
+            .map(exec::SshExecutor::new)
+            .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
+    })?;
+    let report = fleet::fleet_drift(&statuses);
+    if options.json {
+        // Reports (like `plan`) go to stdout; a `Value` cannot fail to serialise.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&fleet_status_json(&statuses, &report))
+                .expect("a serde_json::Value always serializes")
+        );
+    } else {
+        for line in fleet::fleet_status_lines(&statuses, &report) {
+            println!("{line}");
+        }
+    }
+    if options.strict && report.drifted() {
+        return Err(DeployError::DriftDetected);
+    }
+    Ok(())
+}
+
+// ── `deploy maintenance on|off` fan-out (issue #1621, AC-5) ──────────────────
+
+/// Serialize the maintenance flag body from the CLI flags (issue #1621).
+///
+/// Goes through `autumn_web::maintenance::MaintenanceConfig` — the exact struct
+/// the RUNTIME deserializes — and the same pretty-printed JSON
+/// `MaintenanceState::save_to_file` writes locally, so the fleet fan-out and the
+/// local `autumn maintenance on` can never disagree about the wire format.
+fn maintenance_flag_body(args: &MaintenanceOnArgs) -> String {
+    let config = autumn_web::maintenance::MaintenanceConfig {
+        message: args.message.clone(),
+        allow_ips: args.allow_ips.clone(),
+        readonly: args.readonly,
+        bypass_header: args.bypass_header.clone(),
+    };
+    serde_json::to_string_pretty(&config).expect("MaintenanceConfig always serializes")
+}
+
+/// Fan `maintenance on|off` out over every fleet host (issue #1621, AC-5).
+///
+/// **Best-effort-and-aggregate — deliberately the OPPOSITE of the rollout
+/// driver** (plan §6.2). Rollout halts and compensates because a mixed-version
+/// fleet is the harm; a control-plane switch that succeeded on 2 of 3 hosts must
+/// NOT be rolled back (that pushes users back into the live window the operator is
+/// closing) and must NOT stop at the failure (the remaining hosts are still
+/// serving). Every host is attempted, every outcome is named in the table, and the
+/// command exits non-zero when ANY host failed.
+///
+/// Per amendment A2 each `on` writes BOTH flag paths:
+///
+/// - `{app_dir}/shared/autumn-maintenance.json` — the authoritative path the
+///   #1621 slot units point `AUTUMN_MAINTENANCE_FLAG_FILE` at; survives cutovers.
+/// - `{current_release_dir}/tmp/autumn-maintenance.json` — the legacy cwd-relative
+///   path units deployed BEFORE #1621 still poll. Written only when the host's
+///   `current` symlink resolves (read from the same read-only probe round-trip);
+///   a host with no resolvable release gets the shared flag only and its row says
+///   so.
+///
+/// `off` removes both (`rm -f`, absent files are not an error).
+///
+/// The executor factory is injected (generic, never `dyn`, no `Send`/`Sync`
+/// bound) so the whole loop is unit-testable against one scripted fake per host.
+fn run_fleet_maintenance_with<E, F>(
+    fleet: &ResolvedFleet,
+    action: DeployAction,
+    args: Option<&MaintenanceOnArgs>,
+    make_executor: F,
+) -> Result<(), DeployError>
+where
+    E: exec::DeployExecutor,
+    F: Fn(&ResolvedDeployConfig) -> Result<E, DeployError>,
+{
+    let on = matches!(action, DeployAction::MaintenanceOn);
+    let verb = if on { "on" } else { "off" };
+    eprintln!("\u{1F342} autumn deploy maintenance {verb}\n");
+
+    let total = fleet.hosts.len();
+    // ONE executor per host, built up front: a host with no SSH target is a config
+    // error, and finding it here means no host has been half-changed yet.
+    let executors = fleet
+        .hosts
+        .iter()
+        .map(&make_executor)
+        .collect::<Result<Vec<E>, DeployError>>()?;
+    let names: Vec<String> = fleet
+        .hosts
+        .iter()
+        .map(|cfg| cfg.host.clone().unwrap_or_default())
+        .collect();
+
+    let default_args = MaintenanceOnArgs::default();
+    let body = maintenance_flag_body(args.unwrap_or(&default_args));
+
+    let mut outcomes = Vec::with_capacity(total);
+    for (index, cfg) in fleet.hosts.iter().enumerate() {
+        eprintln!(
+            "[{}/{total} {}] maintenance {verb}\u{2026}",
+            index + 1,
+            names[index],
+        );
+        outcomes.push(maintenance_one_host(cfg, on, &body, &executors[index]));
+        eprintln!();
+    }
+
+    for line in fleet::fleet_maintenance_summary_lines(&names, &outcomes, on) {
+        eprintln!("{line}");
+    }
+
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, fleet::MaintenanceOutcome::Failed { .. }))
+        .count();
+    if failed > 0 {
+        return Err(DeployError::FleetMaintenanceFailed {
+            verb: if on { "on" } else { "off" },
+            failed,
+            total,
+        });
+    }
+    Ok(())
+}
+
+/// Apply `maintenance on|off` to ONE host, returning what happened — never an
+/// error, because the caller continues past a failure (issue #1621, §6.2).
+///
+/// One read-only probe first (`detect-current`, the same shared probe `up` runs)
+/// to resolve the `current` release dir the legacy flag lives under; then the
+/// writes/removals per amendment A2. Only op LABELS ever leave this function —
+/// the raw error can carry remote stderr, and the aggregate report must not.
+fn maintenance_one_host<E: exec::DeployExecutor>(
+    cfg: &ResolvedDeployConfig,
+    on: bool,
+    body: &str,
+    executor: &E,
+) -> fleet::MaintenanceOutcome {
+    let current = match exec::probe_deploy_state(cfg, executor) {
+        Ok(probe) => probe.current_release_dir,
+        Err(_) => {
+            return fleet::MaintenanceOutcome::Failed {
+                failed_step: "detect-current",
+            };
+        }
+    };
+
+    let shared = cfg.maintenance_flag_file();
+    let mut ops: Vec<exec::DeployOp> = Vec::new();
+    if on {
+        // Shared (authoritative) flag first: a #1621 unit reacts within 500 ms of
+        // this single write, so the window starts closing even if the legacy write
+        // below fails.
+        ops.push(exec::DeployOp::WriteFile {
+            label: "maintenance-write-shared",
+            contents: exec::FileContents::Plain(body.to_owned()),
+            remote_path: shared,
+            mode: Some(0o644),
+        });
+        if let Some(dir) = &current {
+            // Legacy path for units deployed before #1621 (amendment A2). The
+            // release-scoped tmp/ dir may not exist yet — the runtime only creates
+            // it when IT writes a flag — so mkdir -p first.
+            ops.push(exec::DeployOp::Run(exec::RemoteCommand::new(
+                "maintenance-prepare-release-tmp",
+                format!("mkdir -p {}", exec::shell_quote(&format!("{dir}/tmp"))),
+            )));
+            ops.push(exec::DeployOp::WriteFile {
+                label: "maintenance-write-release",
+                contents: exec::FileContents::Plain(body.to_owned()),
+                remote_path: format!("{dir}/{}", autumn_web::maintenance::MAINTENANCE_FLAG_FILE),
+                mode: Some(0o644),
+            });
+        }
+    } else {
+        // `rm -f` both paths in one op: absent files are the NORMAL case for at
+        // least one of them (a host has either the new unit or the old), so a
+        // missing file must never fail the `off`.
+        let mut paths = exec::shell_quote(&shared);
+        if let Some(dir) = &current {
+            paths.push(' ');
+            paths.push_str(&exec::shell_quote(&format!(
+                "{dir}/{}",
+                autumn_web::maintenance::MAINTENANCE_FLAG_FILE
+            )));
+        }
+        ops.push(exec::DeployOp::Run(exec::RemoteCommand::new(
+            "maintenance-clear",
+            format!("rm -f {paths}"),
+        )));
+    }
+
+    for op in &ops {
+        if exec::run_ops(std::slice::from_ref(op), executor).is_err() {
+            // The op label is known HERE regardless of the error's shape (an
+            // upload failure carries no label), so the report can always name the
+            // step without quoting the error.
+            return fleet::MaintenanceOutcome::Failed {
+                failed_step: op.label(),
+            };
+        }
+    }
+    if current.is_none() {
+        fleet::MaintenanceOutcome::AppliedSharedOnly
+    } else {
+        fleet::MaintenanceOutcome::Applied
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3894,6 +4551,166 @@ mod tests {
              fleet: {:?}, single: {expected:?}",
             fleet.hosts[0]
         );
+    }
+
+    /// A minimal loaded config for the preflight graders — no DB, no migrations,
+    /// no secret — so the three project graders return stable, host-independent
+    /// results and the assertions below are about SCOPE, not grading.
+    fn preflight_config() -> AutumnConfig {
+        AutumnConfig::default()
+    }
+
+    #[test]
+    fn preflight_scope_is_none_for_one_host_and_the_host_for_a_fleet() {
+        // #1621 (T1.24, plan §5.2): `scope` is the additive field that lets a fleet
+        // name WHICH host a per-host grader graded, without touching
+        // `PreflightCheck::name` — an operator-visible `doctor --json` contract.
+        //
+        // It is `None` for a single-host fleet, which is what keeps `deploy check`
+        // output byte-identical to pre-#1621 (AC-1, artifact 4). Do not "simplify"
+        // this to always-Some.
+        let config = preflight_config();
+
+        let one = ResolvedFleet::resolve(&fleet_cfg(&["web-1.example.test"]), "myapp")
+            .expect("one-host fleet resolves");
+        let checks = collect_fleet_preflight(&config, &one);
+        assert!(
+            checks.iter().all(|check| check.scope.is_none()),
+            "a single-host fleet must carry no scope (AC-1): {:?}",
+            checks
+                .iter()
+                .map(|c| (c.name, &c.scope))
+                .collect::<Vec<_>>()
+        );
+
+        let many = ResolvedFleet::resolve(
+            &fleet_cfg(&["web-1.example.test", "web-2.example.test"]),
+            "myapp",
+        )
+        .expect("two-host fleet resolves");
+        let checks = collect_fleet_preflight(&config, &many);
+        let scoped: Vec<(&str, Option<&str>)> = checks
+            .iter()
+            .map(|check| (check.name, check.scope.as_deref()))
+            .collect();
+        assert_eq!(
+            scoped
+                .iter()
+                .filter(|(name, _)| *name == "ssh_reachability")
+                .map(|(_, scope)| *scope)
+                .collect::<Vec<_>>(),
+            vec![Some("web-1.example.test"), Some("web-2.example.test")],
+            "each per-host grader must name its host, in rollout order: {scoped:?}"
+        );
+        // The project-wide graders grade the PROJECT, not a host, so they stay
+        // unscoped even in a fleet — scoping them would imply they were run N times.
+        assert!(
+            scoped
+                .iter()
+                .filter(|(name, _)| *name != "ssh_reachability")
+                .all(|(_, scope)| scope.is_none()),
+            "project-wide graders must stay unscoped: {scoped:?}"
+        );
+    }
+
+    #[test]
+    fn no_fleet_preflight_grader_returns_deferred() {
+        // #1621 (T1.16, plan §5.3): `deploy_preflight_result` maps `deferred` →
+        // `CheckStatus::Fail` while `report_preflight` treats it as a NON-blocking
+        // warning, so a deferred fleet grader would mean `doctor --strict` fails a
+        // config `deploy check` passes. The resolution is a rule, not a
+        // reconciliation: FLEET graders pass or they fail — they never defer.
+        // (`deferred` remains in use for the media graders, which are single-host by
+        // construction; see the `[media]` fleet refusal.)
+        let config = preflight_config();
+        for hosts in [
+            vec!["web-1.example.test"],
+            vec!["web-1.example.test", "web-2.example.test"],
+            vec![
+                "web-1.example.test",
+                "web-2.example.test",
+                "web-3.example.test",
+            ],
+        ] {
+            let fleet =
+                ResolvedFleet::resolve(&fleet_cfg(&hosts), "myapp").expect("fleet resolves");
+            for check in collect_fleet_preflight(&config, &fleet) {
+                assert!(
+                    !check.deferred,
+                    "fleet grader `{}` must never defer (scope {:?}): {}",
+                    check.name, check.scope, check.detail
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preflight_report_label_appends_the_scope_only_when_present() {
+        // #1621 (plan §5.2): `✅ ssh_reachability (web-2): …`. The NAME is unchanged
+        // and stays the stable identifier; the host rides in parentheses after it,
+        // so a single-host run (scope `None`) prints the pre-#1621 label verbatim.
+        let plain = PreflightCheck::pass("ssh_reachability", "reachable");
+        assert_eq!(preflight_label(&plain), "ssh_reachability");
+        let scoped = plain.scoped(Some("web-2.example.test".to_owned()));
+        assert_eq!(
+            preflight_label(&scoped),
+            "ssh_reachability (web-2.example.test)"
+        );
+        assert_eq!(
+            scoped.name, "ssh_reachability",
+            "the stable identifier must not absorb the host"
+        );
+    }
+
+    #[test]
+    fn doctor_deploy_check_names_are_the_shared_grader_names_prefixed() {
+        // #1621 (T2.5, plan §5.5): doctor's deploy checks and `deploy check`'s
+        // graders are enumerated from ONE ordered list, and doctor's operator-visible
+        // `--json` names are exactly that list with a `deploy_` prefix. Deriving the
+        // mapping mechanically (rather than trusting two hand-maintained literal
+        // lists to stay in step) is what turns the comment-enforced parity invariant
+        // into a machine-enforced one.
+        assert_eq!(
+            PREFLIGHT_GRADERS.len(),
+            DOCTOR_PREFLIGHT_GRADERS.len(),
+            "the two lists must stay the same length"
+        );
+        for (grader, doctor_name) in PREFLIGHT_GRADERS.iter().zip(DOCTOR_PREFLIGHT_GRADERS) {
+            assert_eq!(
+                doctor_name,
+                format!("deploy_{grader}"),
+                "doctor's name for `{grader}` must be the prefixed grader name"
+            );
+        }
+        // …and the list is exactly what a fleet preflight emits (the per-host grader
+        // once per host, then the project graders once).
+        let fleet = ResolvedFleet::resolve(
+            &fleet_cfg(&["web-1.example.test", "web-2.example.test"]),
+            "myapp",
+        )
+        .expect("fleet resolves");
+        let emitted: Vec<&str> = collect_fleet_preflight(&preflight_config(), &fleet)
+            .iter()
+            .map(|check| check.name)
+            .collect();
+        assert_eq!(
+            emitted,
+            vec![
+                "ssh_reachability",
+                "ssh_reachability",
+                "signing_secret",
+                "database_url",
+                "migrate_check"
+            ],
+            "the fleet preflight emits the per-host grader once per host, then the \
+             project graders once"
+        );
+        let mut distinct = emitted.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let mut expected = PREFLIGHT_GRADERS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(distinct, expected);
     }
 
     #[test]
@@ -4385,6 +5202,53 @@ mod tests {
         // config loading at `current` (matching its WorkingDirectory), where the
         // active release's uploaded autumn.toml is reachable.
         assert!(unit.contains("Environment=AUTUMN_MANIFEST_DIR=/srv/autumn/shop/current"));
+    }
+
+    #[test]
+    fn app_unit_points_the_maintenance_flag_at_the_shared_dir() {
+        // #1621 R1 (the deliberate cross-cutting register entry): the runtime's
+        // maintenance flag path is cwd-relative and the slot unit's WorkingDirectory
+        // is the RELEASE dir, so before this line a cutover ORPHANED the flag and
+        // silently un-maintained the host. Pointing the override at the per-app
+        // `shared/` dir — which `prepare-dirs` already creates, which survives
+        // cutovers/rollbacks/pruning, and which BOTH slots see — is what makes
+        // `autumn deploy maintenance on` mean anything.
+        //
+        // This line is added to BOTH host spellings equally (it comes from
+        // `render_app_unit`, which the fleet driver and the single-host path share),
+        // so the AC-1 differential invariant is untouched.
+        let cfg = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                app_name: Some("shop".to_owned()),
+                ..DeployConfig::default()
+            },
+            "shop",
+        )
+        .expect("deploy config resolves");
+        let unit = render_app_unit(&cfg, "/srv/autumn/shop/releases/r1", 3001, "blue");
+        assert!(
+            unit.contains(
+                "Environment=AUTUMN_MAINTENANCE_FLAG_FILE=/srv/autumn/shop/shared/autumn-maintenance.json"
+            ),
+            "slot unit must point the maintenance flag at the shared dir: {unit}"
+        );
+        // It must NOT land under the release dir — that is the defect being fixed.
+        assert!(
+            !unit.contains("AUTUMN_MAINTENANCE_FLAG_FILE=/srv/autumn/shop/releases"),
+            "the maintenance flag must not be release-scoped: {unit}"
+        );
+        // The path the unit stamps IS the one the fan-out writes to.
+        assert!(unit.contains(&format!(
+            "Environment=AUTUMN_MAINTENANCE_FLAG_FILE={}",
+            cfg.maintenance_flag_file()
+        )));
+        // …and it uses the framework's own env-var name and file name, never a
+        // CLI-local re-declaration.
+        assert!(unit.contains(autumn_web::maintenance::MAINTENANCE_FLAG_FILE_ENV));
+        assert!(
+            cfg.maintenance_flag_file()
+                .ends_with(autumn_web::maintenance::MAINTENANCE_FLAG_BASENAME)
+        );
     }
 
     #[test]
@@ -7089,6 +7953,455 @@ mod tests {
         run_fleet_rollback_with(&[], fleet, &proxy, FLEET_PUBLIC_PORT, |cfg| {
             Ok(recorder.executor(cfg))
         })
+    }
+
+    // ── `deploy status` (issue #1621, AC-6) ──────────────────────────────────
+
+    /// Full five-section probe stdout: redeploy on blue, proxy serving blue,
+    /// public port 3000, TLS off, on `release`.
+    fn status_probe(release: &str) -> String {
+        format!(
+            "redeploy:blue\t3001\n\
+             ---autumn-kamal-proxy-list---\n\
+             Service   Host          Target            State    TLS\n\
+             myapp     example.com   127.0.0.1:3001    running  no\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 3000\n\
+             ---autumn-kamal-proxy-options---\n0\t\n\
+             ---autumn-current-release---\n/srv/autumn/myapp/releases/{release}"
+        )
+    }
+
+    /// Script a host's two read-only status probes.
+    fn script_status(
+        recorder: fleet::test_support::FleetRecorder,
+        host: &str,
+        release: &str,
+        ready: &str,
+        maintenance: bool,
+    ) -> fleet::test_support::FleetRecorder {
+        recorder
+            .script(host, "detect-current", status_probe(release))
+            .script(
+                host,
+                "probe-host-status",
+                format!(
+                    "{ready}\n---autumn-host-status---\n{}",
+                    if maintenance { "maintenance-on" } else { "" }
+                ),
+            )
+    }
+
+    fn drive_status(
+        fleet: &ResolvedFleet,
+        recorder: &fleet::test_support::FleetRecorder,
+    ) -> Result<Vec<fleet::HostStatus>, DeployError> {
+        collect_fleet_status(fleet, FLEET_PUBLIC_PORT, |cfg| Ok(recorder.executor(cfg)))
+    }
+
+    #[test]
+    fn fleet_status_reports_every_host_read_only_and_in_declaration_order() {
+        // #1621 (AC-6): `deploy status` is the surface an operator reaches for
+        // mid-incident, so it (a) touches nothing, (b) reports EVERY host, and (c)
+        // keeps declaration order — the same order a rollout would replace them in.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_status(recorder, host, "20260714T120000Z", "200", false);
+        }
+
+        let statuses =
+            drive_status(&fleet, &recorder).expect("a read-only status never fails the command");
+
+        assert_eq!(
+            statuses.iter().map(|s| s.host.as_str()).collect::<Vec<_>>(),
+            hosts.to_vec(),
+            "status must keep `[deploy] hosts` order"
+        );
+        for host in hosts {
+            assert_eq!(
+                recorder.run_labels_for(host),
+                vec!["detect-current", "probe-host-status"],
+                "{host}: status must run ONLY the two read-only probes"
+            );
+        }
+        assert!(
+            recorder
+                .mutating(&["detect-current", "probe-host-status"])
+                .is_empty(),
+            "`deploy status` must never mutate a host"
+        );
+        let report = fleet::fleet_drift(&statuses);
+        assert!(!report.drifted(), "a converged fleet reports no drift");
+    }
+
+    #[test]
+    fn fleet_status_reports_an_unreachable_host_as_a_row_not_an_abort() {
+        // A dropped SSH transport on host 2 must NOT abort the report: the fleet's
+        // state is exactly what the operator is trying to learn, and hosts 1 and 3
+        // still have answers. The unreachable host is a row with an unknown release,
+        // and contributes NO drift (a network outage is not a deploy defect).
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_status(recorder, "web-a", "r1", "200", false);
+        recorder = script_status(recorder, "web-b", "r1", "200", false)
+            .transport_fail("web-b", "detect-current");
+        recorder = script_status(recorder, "web-c", "r1", "200", false);
+
+        let statuses = drive_status(&fleet, &recorder).expect("status reports");
+        assert_eq!(statuses.len(), 3, "every host gets a row");
+        assert!(!statuses[1].reachable, "host 2 is reported unreachable");
+        assert!(statuses[0].reachable && statuses[2].reachable);
+        let report = fleet::fleet_drift(&statuses);
+        assert!(
+            !report.version_drift && report.state_drift.is_empty(),
+            "an unreachable host must not manufacture drift: {report:?}"
+        );
+        assert_eq!(report.unknown_releases(), vec!["web-b"]);
+    }
+
+    #[test]
+    fn fleet_status_surfaces_version_drift_across_mixed_releases() {
+        // #1621 (T1.20 at the driver level): two hosts on different releases is the
+        // mixed fleet a rolling deploy exists to avoid, and `--strict` is what makes
+        // it alertable from cron.
+        let hosts = ["web-a", "web-b"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_status(recorder, "web-a", "20260714T120000Z", "200", false);
+        recorder = script_status(recorder, "web-b", "20260714T130000Z", "200", true);
+
+        let statuses = drive_status(&fleet, &recorder).expect("status reports");
+        let report = fleet::fleet_drift(&statuses);
+        assert!(report.version_drift, "different releases are drift");
+        assert!(statuses[1].maintenance_on, "the flag file is read per host");
+        assert!(
+            statuses[1].ready_code == Some(200),
+            "maintenance does NOT change readiness — the two are orthogonal"
+        );
+
+        let json = fleet_status_json(&statuses, &report);
+        assert_eq!(json["version_drift"], serde_json::json!(true));
+        assert_eq!(
+            json["hosts"][0]["release"],
+            serde_json::json!("20260714T120000Z")
+        );
+        assert_eq!(json["hosts"][1]["maintenance"], serde_json::json!(true));
+        assert_eq!(json["hosts"][1]["ready"], serde_json::json!(200));
+    }
+
+    #[test]
+    fn fleet_status_json_shape_is_stable_and_carries_no_secret() {
+        // The repo's own skills are a first-class consumer of `--json`, so the field
+        // names are a contract. Nothing here is derived from a shell line or a driver
+        // error, so no secret can reach it.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_status(recorder, "web-a", "r1", "200", false);
+        recorder = script_status(recorder, "web-b", "r1", "503", false);
+        let statuses = drive_status(&fleet, &recorder).expect("status reports");
+        let json = fleet_status_json(&statuses, &fleet::fleet_drift(&statuses));
+
+        let host = &json["hosts"][0];
+        for field in [
+            "host",
+            "reachable",
+            "mode",
+            "release",
+            "live_slot",
+            "ready",
+            "maintenance",
+            "proxy_port",
+            "drift",
+        ] {
+            assert!(
+                host.get(field).is_some(),
+                "the documented per-host field `{field}` must be present: {json}"
+            );
+        }
+        for field in ["hosts", "version_drift", "state_drift", "drifted"] {
+            assert!(
+                json.get(field).is_some(),
+                "the documented top-level field `{field}` must be present: {json}"
+            );
+        }
+        assert_eq!(host["host"], serde_json::json!("web-a"));
+        assert_eq!(host["mode"], serde_json::json!("deployed"));
+        assert_eq!(json["hosts"][1]["ready"], serde_json::json!(503));
+        let rendered = json.to_string();
+        for secret in ["AUTUMN_SECURITY__SIGNING_SECRET", "postgres://", "curl"] {
+            assert!(
+                !rendered.contains(secret),
+                "the status JSON must never carry `{secret}`: {rendered}"
+            );
+        }
+    }
+
+    // ── `deploy maintenance on|off` fan-out (issue #1621, AC-5) ──────────────
+
+    /// The remote paths a maintenance `on` writes on one host, per amendment A2.
+    const MAINTENANCE_SHARED_PATH: &str = "/srv/autumn/myapp/shared/autumn-maintenance.json";
+    const MAINTENANCE_LEGACY_PATH: &str =
+        "/srv/autumn/myapp/releases/r1/tmp/autumn-maintenance.json";
+
+    fn drive_maintenance(
+        fleet: &ResolvedFleet,
+        recorder: &fleet::test_support::FleetRecorder,
+        verb: DeployAction,
+        args: Option<&MaintenanceOnArgs>,
+    ) -> Result<(), DeployError> {
+        run_fleet_maintenance_with(fleet, verb, args, |cfg| Ok(recorder.executor(cfg)))
+    }
+
+    /// The remote paths `host` was asked to upload to, in order.
+    fn upload_paths(recorder: &fleet::test_support::FleetRecorder, host: &str) -> Vec<String> {
+        recorder
+            .calls_for(host)
+            .iter()
+            .filter_map(|call| match call {
+                exec::test_support::RecordedCall::Upload { remote_path, .. } => {
+                    Some(remote_path.clone())
+                }
+                exec::test_support::RecordedCall::Run { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fleet_maintenance_on_writes_both_flag_paths_on_every_host() {
+        // #1621 (AC-5, amendment A2): a host deployed BEFORE this release runs a slot
+        // unit with no `AUTUMN_MAINTENANCE_FLAG_FILE`, so its runtime still polls the
+        // cwd-relative `{release_dir}/tmp/…`. Writing only the shared path would make
+        // `deploy maintenance on` silently do nothing on exactly the hosts an operator
+        // is most likely to be maintaining. So both paths are written: the shared one
+        // is authoritative for redeployed hosts, the release-scoped one keeps the
+        // not-yet-redeployed ones working.
+        let hosts = ["web-a", "web-b"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_status(recorder, host, "r1", "200", false);
+        }
+
+        let args = MaintenanceOnArgs {
+            message: Some("Upgrading the database".to_owned()),
+            readonly: true,
+            ..MaintenanceOnArgs::default()
+        };
+        drive_maintenance(&fleet, &recorder, DeployAction::MaintenanceOn, Some(&args))
+            .expect("every host accepts the write");
+
+        for host in hosts {
+            let paths = upload_paths(&recorder, host);
+            assert!(
+                paths.iter().any(|p| p == MAINTENANCE_SHARED_PATH),
+                "{host} must get the shared (authoritative) flag: {paths:?}"
+            );
+            assert!(
+                paths.iter().any(|p| p == MAINTENANCE_LEGACY_PATH),
+                "{host} must also get the release-scoped flag for pre-#1621 units: {paths:?}"
+            );
+            // The release-scoped `tmp/` dir may not exist yet.
+            assert!(
+                recorder
+                    .run_labels_for(host)
+                    .contains(&"maintenance-prepare-release-tmp"),
+                "{host} must create the release tmp dir before writing into it"
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_maintenance_on_writes_shared_only_when_current_is_unresolvable() {
+        // A host with no promoted release (its first deploy has not happened yet, or
+        // `current` dangles) has no release dir to carry the legacy flag. The shared
+        // write still happens — a #1621 unit will honour it — and the outcome says
+        // shared-only rather than pretending both landed. Also proves the fan-out
+        // works for an N==1 "fleet" (the deploy-config'd remote host, as distinct
+        // from the LOCAL `autumn maintenance`).
+        let fleet = fleet_of(&["web-a"]);
+        let recorder = fleet::test_support::FleetRecorder::new().script(
+            "web-a",
+            "detect-current",
+            "first\n---autumn-kamal-proxy-list---\n",
+        );
+
+        drive_maintenance(
+            &fleet,
+            &recorder,
+            DeployAction::MaintenanceOn,
+            Some(&MaintenanceOnArgs::default()),
+        )
+        .expect("a shared-only write is a success, not a failure");
+
+        let paths = upload_paths(&recorder, "web-a");
+        assert_eq!(
+            paths,
+            vec![MAINTENANCE_SHARED_PATH.to_owned()],
+            "only the shared flag can be written without a resolvable release"
+        );
+        assert!(
+            !recorder
+                .run_labels_for("web-a")
+                .contains(&"maintenance-prepare-release-tmp"),
+            "no release dir means no release-tmp preparation"
+        );
+    }
+
+    #[test]
+    fn fleet_maintenance_serializes_the_framework_wire_format() {
+        // The flag file's shape is `autumn_web::maintenance::MaintenanceConfig` — the
+        // struct the RUNTIME deserializes. The CLI serialises that type rather than
+        // hand-rolling JSON, so the two can never drift.
+        let args = MaintenanceOnArgs {
+            message: Some("Upgrading".to_owned()),
+            allow_ips: vec!["10.0.0.0/8".to_owned()],
+            readonly: true,
+            bypass_header: Some(("X-Bypass".to_owned(), "tok".to_owned())),
+        };
+        let body = maintenance_flag_body(&args);
+        let parsed: autumn_web::maintenance::MaintenanceConfig =
+            serde_json::from_str(&body).expect("the body must be a MaintenanceConfig");
+        assert_eq!(parsed.message.as_deref(), Some("Upgrading"));
+        assert!(parsed.readonly);
+        assert_eq!(parsed.allow_ips, vec!["10.0.0.0/8"]);
+        assert_eq!(
+            parsed
+                .bypass_header
+                .as_ref()
+                .map(|(n, v)| (n.as_str(), v.as_str())),
+            Some(("X-Bypass", "tok"))
+        );
+    }
+
+    #[test]
+    fn fleet_maintenance_off_removes_both_flag_paths() {
+        let hosts = ["web-a", "web-b"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_status(recorder, host, "r1", "200", true);
+        }
+
+        drive_maintenance(&fleet, &recorder, DeployAction::MaintenanceOff, None)
+            .expect("every host clears cleanly");
+
+        for host in hosts {
+            let shell = recorder
+                .calls_for(host)
+                .iter()
+                .find_map(|call| match call {
+                    exec::test_support::RecordedCall::Run { label, shell }
+                        if *label == "maintenance-clear" =>
+                    {
+                        Some(shell.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{host} must run the clear op"));
+            assert!(
+                shell.contains(MAINTENANCE_SHARED_PATH) && shell.contains(MAINTENANCE_LEGACY_PATH),
+                "{host} must clear BOTH paths: {shell}"
+            );
+            assert!(
+                shell.contains("rm -f"),
+                "clearing an absent flag must not be an error: {shell}"
+            );
+            assert!(
+                upload_paths(&recorder, host).is_empty(),
+                "`off` writes nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_maintenance_attempts_every_host_and_reports_the_ones_that_failed() {
+        // #1621 (T1.21, plan §6.2): control-plane fan-out is best-effort-and-aggregate,
+        // the OPPOSITE of the rollout driver. `maintenance on` that succeeded on 2 of 3
+        // hosts must NOT be rolled back — that would push users back into the very live
+        // window the operator is trying to close — and it must NOT stop at host 2,
+        // because host 3 is still serving. Every host is attempted, all three are named
+        // with their state, and the command exits non-zero.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_status(recorder, host, "r1", "200", false);
+        }
+        recorder = recorder.fail_upload("web-b", MAINTENANCE_SHARED_PATH);
+
+        let err = drive_maintenance(
+            &fleet,
+            &recorder,
+            DeployAction::MaintenanceOn,
+            Some(&MaintenanceOnArgs::default()),
+        )
+        .expect_err("a failed host must exit non-zero");
+        let message = err.to_string();
+        assert!(
+            message.contains("1 of 3"),
+            "the error must count the failures against the fleet: {message}"
+        );
+
+        // Hosts 1 and 3 were still attempted AND still wrote — the point of
+        // best-effort-and-aggregate.
+        for host in ["web-a", "web-c"] {
+            assert!(
+                upload_paths(&recorder, host)
+                    .iter()
+                    .any(|p| p == MAINTENANCE_SHARED_PATH),
+                "{host} must still be attempted (and changed) after web-b failed"
+            );
+        }
+        assert!(
+            upload_paths(&recorder, "web-b")
+                .iter()
+                .any(|p| p == MAINTENANCE_SHARED_PATH),
+            "the failing host is attempted too, not skipped"
+        );
+        // Nothing about the failure leaks a shell line or a remote message.
+        for noise in ["scripted upload failure", "rm -f", "printf"] {
+            assert!(
+                !message.contains(noise),
+                "the aggregate error must carry no remote detail: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_maintenance_rows_name_every_host_and_the_orthogonality_note() {
+        // Every host is named with what happened to it, so an operator who has to
+        // reverse a partial change knows which hosts changed. And the output states —
+        // every time — that maintenance mode does not drain a host from the LB, because
+        // the opposite assumption causes an outage.
+        let rendered = fleet::fleet_maintenance_summary_lines(
+            &["web-a".to_owned(), "web-b".to_owned(), "web-c".to_owned()],
+            &[
+                fleet::MaintenanceOutcome::Applied,
+                fleet::MaintenanceOutcome::Failed {
+                    failed_step: "maintenance-write-shared",
+                },
+                fleet::MaintenanceOutcome::AppliedSharedOnly,
+            ],
+            true,
+        )
+        .join("\n");
+        for host in ["web-a", "web-b", "web-c"] {
+            assert!(rendered.contains(host), "every host is named:\n{rendered}");
+        }
+        assert!(
+            rendered.contains(fleet::MAINTENANCE_DOES_NOT_DRAIN_NOTE),
+            "the orthogonality note must be printed:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("maintenance-write-shared"),
+            "a failure names its step label:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Changed anyway: web-a, web-c"),
+            "the hosts that DID change must be named so they can be reversed:\n{rendered}"
+        );
     }
 
     #[test]

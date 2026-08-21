@@ -768,6 +768,198 @@ fn deploy_plan_renders_the_fleet_rollout_order_and_one_migrate_note() {
     );
 }
 
+/// The grader names `deploy check` printed, in order, read off its report lines
+/// (`✅ name: detail`, `❌ name (host): detail`, `⚠️  name: detail`).
+///
+/// Scope suffixes are stripped, so this returns the STABLE identifiers — which is
+/// exactly the set `autumn doctor` must mirror (issue #1621, plan §5.5).
+fn preflight_grader_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let rest = line
+                .strip_prefix("\u{2705} ")
+                .or_else(|| line.strip_prefix("\u{274C} "))
+                .or_else(|| line.strip_prefix("\u{26A0}\u{FE0F}  "))?;
+            let name = rest.split(':').next()?.trim();
+            // Drop the ` (host)` scope suffix a fleet row carries.
+            let name = name.split(" (").next()?.trim();
+            (!name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+                .then(|| name.to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn deploy_check_reports_ssh_reachability_per_fleet_host() {
+    // #1621 (T2.3, AC-7): every host is graded BEFORE anything is touched, and each
+    // per-host row names its host — otherwise "cannot reach the server" in a
+    // three-host fleet does not say which server. The three project-wide graders
+    // (signing secret, database URL, migrate check) grade the PROJECT, so they run
+    // once and stay unscoped.
+    //
+    // `.test` addresses never resolve (RFC 2606), so the ssh grader fails fast per
+    // host with no network dependence.
+    let dir = project(
+        "hosts = [\"web-1.example.test\", \"web-2.example.test\", \"web-3.example.test\"]\n",
+    );
+    let (stdout, stderr) = run_autumn_fail(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+
+    for host in [
+        "web-1.example.test",
+        "web-2.example.test",
+        "web-3.example.test",
+    ] {
+        assert!(
+            combined.contains(&format!("ssh_reachability ({host})")),
+            "every fleet host needs its own scoped ssh_reachability row; missing \
+             {host}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    let names = preflight_grader_names(&combined);
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| *name == "ssh_reachability")
+            .count(),
+        3,
+        "one ssh_reachability row per host\nnames: {names:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    for project_grader in ["signing_secret", "database_url", "migrate_check"] {
+        assert_eq!(
+            names.iter().filter(|name| *name == project_grader).count(),
+            1,
+            "the project-wide grader `{project_grader}` runs ONCE for the whole \
+             fleet\nnames: {names:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !combined.contains(&format!("{project_grader} (")),
+            "`{project_grader}` grades the project, not a host, so it must not be \
+             scoped\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    // Six checks in total (three hosts + three project graders) and the count
+    // includes every failing host, so the operator learns about host 3 before host 1
+    // is touched.
+    assert!(
+        combined.contains("of 6 preflight check(s) failed"),
+        "the report must count every host's grader\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        combined.matches("could not resolve web-").count(),
+        3,
+        "every host must be probed, not just the first\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_and_doctor_grade_the_same_fleet_graders() {
+    // #1621 (T2.5, plan §5.5): `autumn doctor` mirroring the deploy preflight is a
+    // hard invariant that has, until now, been enforced only by comments. Both
+    // surfaces build their names from ONE ordered list
+    // (`deploy::PREFLIGHT_GRADERS` / `deploy::DOCTOR_PREFLIGHT_GRADERS`, whose
+    // `deploy_`-prefix derivation is pinned by a unit test); this asserts the two
+    // really do emit the same grader set for the SAME fleet config.
+    //
+    // Doctor emits one `deploy_ssh_reachability` for the whole fleet (its check
+    // names are `&'static str` `--json` keys and must stay unique) while
+    // `deploy check` emits one row per host — so the comparison is over the SET of
+    // stable identifiers, not the row count.
+    let dir = project("hosts = [\"web-1.example.test\", \"web-2.example.test\"]\n");
+
+    let (check_out, check_err, _) = run_autumn(dir.path(), &["deploy", "check"], &[]);
+    let mut from_check: Vec<String> = preflight_grader_names(&format!("{check_out}{check_err}"))
+        .into_iter()
+        .map(|name| format!("deploy_{name}"))
+        .collect();
+    from_check.sort_unstable();
+    from_check.dedup();
+
+    // `--online` is what enables doctor's TCP reachability probe; without it the
+    // deploy branch deliberately runs only the offline graders.
+    let (doctor_out, doctor_err, _) =
+        run_autumn(dir.path(), &["doctor", "--json", "--online"], &[]);
+    let report: serde_json::Value = serde_json::from_str(&doctor_out).unwrap_or_else(|e| {
+        panic!(
+            "doctor --json must emit valid JSON: {e}\nstdout:\n{doctor_out}\nstderr:\n{doctor_err}"
+        )
+    });
+    let mut from_doctor: Vec<String> = report["checks"]
+        .as_array()
+        .expect("doctor --json carries a checks array")
+        .iter()
+        .filter_map(|check| check["name"].as_str())
+        .filter(|name| name.starts_with("deploy_"))
+        // `deploy_host` (offline host presence) and `deploy_config` (a config-load
+        // guard) are doctor-only by design — `deploy check` folds host presence into
+        // `ssh_reachability`, which reports the identical missing-host detail.
+        .filter(|name| *name != "deploy_host" && *name != "deploy_config")
+        .map(str::to_owned)
+        .collect();
+    from_doctor.sort_unstable();
+    from_doctor.dedup();
+
+    assert_eq!(
+        from_check, from_doctor,
+        "`deploy check` and `doctor` must grade the SAME deploy graders for the same \
+         fleet config\ncheck stdout:\n{check_out}\ncheck stderr:\n{check_err}\ndoctor \
+         stdout:\n{doctor_out}"
+    );
+    assert!(
+        !from_check.is_empty(),
+        "the parity assertion must not pass vacuously\ncheck stderr:\n{check_err}"
+    );
+
+    // …and doctor really did enumerate the fleet rather than reporting "no target
+    // host configured" because the scalar `[deploy] host` is unset.
+    assert!(
+        doctor_out.contains("web-1.example.test") && doctor_out.contains("web-2.example.test"),
+        "doctor must enumerate the configured fleet hosts\nstdout:\n{doctor_out}"
+    );
+}
+
+#[test]
+fn deploy_check_output_is_identical_for_host_and_a_single_entry_hosts_list() {
+    // #1621 (AC-1, the `check` half of T2.1): the same differential proof the `plan`
+    // half makes, over the surface that grades. `deploy check` now runs the FLEET
+    // preflight, so this is what pins "a one-entry `hosts` list is byte-for-byte
+    // today's single-server deploy" against the scope field, the per-host rows and
+    // the failure counting all at once.
+    let scalar = project("host = \"deploy.example.test\"\n");
+    let list = project("hosts = [\"deploy.example.test\"]\n");
+
+    let (scalar_out, scalar_err, scalar_code) =
+        run_autumn(scalar.path(), &["deploy", "check"], &[]);
+    let (list_out, list_err, list_code) = run_autumn(list.path(), &["deploy", "check"], &[]);
+
+    assert_eq!(
+        scalar_code, list_code,
+        "exit codes must match\n`host` stderr:\n{scalar_err}\n`hosts` stderr:\n{list_err}"
+    );
+    assert_eq!(
+        scalar_out, list_out,
+        "`deploy check` stdout must be byte-identical under both spellings"
+    );
+    assert_eq!(
+        scalar_err, list_err,
+        "`deploy check` stderr must be byte-identical under both spellings"
+    );
+    // Non-vacuous: the report really was produced (not two empty strings from an
+    // early config refusal).
+    assert!(
+        scalar_err.contains("ssh_reachability"),
+        "the differential must compare a real preflight report\nstderr:\n{scalar_err}"
+    );
+    // A single-host report carries NO scope suffix — that is what "identical" means
+    // here (AC-1 artifact 4).
+    assert!(
+        !scalar_err.contains("ssh_reachability ("),
+        "a single-host preflight must not print a scope suffix\nstderr:\n{scalar_err}"
+    );
+}
+
 #[test]
 fn deploy_plan_output_is_identical_for_host_and_a_single_entry_hosts_list() {
     // #1621 (AC-1, differential half of T2.1): a one-entry `hosts` list IS today's
@@ -828,6 +1020,45 @@ fn deploy_help_lists_subcommands() {
     assert!(
         combined.contains("--no-rollback"),
         "help should document the fleet `--no-rollback` flag\n{combined}"
+    );
+    // #1621 (T2.4): the fleet status + maintenance surfaces must be discoverable
+    // from the group help, flags included.
+    assert!(
+        combined.contains("status"),
+        "help should list the status subcommand\n{combined}"
+    );
+    assert!(
+        combined.contains("maintenance"),
+        "help should list the maintenance subcommand\n{combined}"
+    );
+    assert!(
+        combined.contains("--json"),
+        "help should document status --json\n{combined}"
+    );
+    assert!(
+        combined.contains("--strict"),
+        "help should document status --strict\n{combined}"
+    );
+}
+
+#[test]
+fn maintenance_help_cross_references_the_deploy_fan_out() {
+    // #1621 (plan §3.3): the top-level `autumn maintenance` is LOCAL-only (it
+    // writes the flag in the CLI's own working directory), and the fleet fan-out
+    // lives under `autumn deploy maintenance`. The local command's help must point
+    // at the deploy one, or operators of deploy-managed hosts will run the local
+    // command and wonder why nothing happened.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (stdout, stderr, code) = run_autumn(dir.path(), &["maintenance", "--help"], &[]);
+    assert_eq!(
+        code,
+        Some(0),
+        "maintenance --help should succeed\nstderr:\n{stderr}"
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("deploy maintenance"),
+        "the local maintenance help must cross-reference `autumn deploy maintenance`          for deploy-managed hosts\n{combined}"
     );
 }
 
