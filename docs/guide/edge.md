@@ -469,3 +469,14 @@ a middleware, a macro or a dependency is exactly what could break it.
   category-2 framing `EdgeKv` inherits
 - [Conditional GET](conditional-get.md) — and `#[static_get]`, for pages that
   can be pre-rendered outright, which is cheaper than any capsule
+
+## Authenticated edge routes
+
+Identity is resolved on the host before capsule execution. Install a custom
+`EdgeIdentityProvider` with `AppBuilder::with_edge_identity_provider`; return
+`Ok(Some(EdgeIdentity))` only after authoritative verification, `Ok(None)` for
+missing/invalid authentication, and a typed error for store or network failure.
+Only normalized user and role claims cross the wire. Cookies, session ids and
+maps, signing secrets, and backend credentials remain host-only. Identity misses
+and infrastructure errors fall through to origin without running the capsule.
+See [ADR-0005](../adr/0005-edge-session-identity.md).

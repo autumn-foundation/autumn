@@ -1997,6 +1997,19 @@ impl AppBuilder {
         self.layer(autumn_edge::EdgeCache::layer(kv))
     }
 
+    /// Install an arbitrary host-side edge identity source.
+    ///
+    /// The provider remains in the native application graph; capsules receive
+    /// only the resulting [`EdgeIdentity`](crate::edge_support::EdgeIdentity).
+    #[cfg(feature = "edge")]
+    #[must_use]
+    pub fn with_edge_identity_provider<P>(self, provider: P) -> Self
+    where
+        P: crate::edge_support::EdgeIdentityProvider,
+    {
+        self.layer(axum::Extension(Arc::new(provider)))
+    }
+
     /// Register an [`ErrorReporter`](crate::reporting::ErrorReporter) for
     /// unhandled panics and 5xx responses.
     ///
