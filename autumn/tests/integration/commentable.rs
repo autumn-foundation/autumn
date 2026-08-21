@@ -1581,6 +1581,58 @@ async fn the_helpers_run_the_discriminator_check_without_a_router() {
     assert_eq!(repo.comment_thread(post).await.expect("thread").len(), 1);
 }
 
+/// A `parent_id` cycle has no terminating edge, so the delete walk's
+/// `UNION ALL` re-emits the same ids at every depth until the recursion guard —
+/// roughly a thousand rows for a two-comment cycle. The `UPDATE` touches each
+/// physical row once, but the returned count is the counter delta, so an
+/// inflated one drives `comment_count` sharply negative and, counters being
+/// unclamped, leaves it there.
+///
+/// The framework's own write path cannot build a cycle (`add_comment` refuses a
+/// `reply_to` outside the record, and a reply always points at an existing
+/// row), so this seeds one by hand — which is exactly how it reaches production.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_cyclic_thread_does_not_inflate_the_counter_decrement() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+
+    let a = repo.add_comment(post, author, "a", None).await.expect("a");
+    let b = repo
+        .add_comment(post, author, "b", Some(a.id))
+        .await
+        .expect("b");
+
+    // Close the loop: a becomes b's child while b is already a's child.
+    diesel::sql_query("UPDATE cmt_comments SET parent_id = $1 WHERE id = $2")
+        .bind::<diesel::sql_types::BigInt, _>(b.id)
+        .bind::<diesel::sql_types::BigInt, _>(a.id)
+        .execute(&mut conn)
+        .await
+        .expect("introduce cycle");
+
+    assert_eq!(
+        counter(&mut conn, "cmt_posts", post).await,
+        2,
+        "two comments were posted"
+    );
+
+    let removed = repo.delete_comment(post, a.id).await.expect("delete");
+    assert_eq!(
+        removed, 2,
+        "a two-comment cycle is two rows, however many times the walk revisits them"
+    );
+
+    assert_eq!(
+        counter(&mut conn, "cmt_posts", post).await,
+        0,
+        "the counter must land on zero, not a thousand below it"
+    );
+}
+
 /// A sharded repository routes every query through the tenant's shard, and it
 /// does NOT require a `#[shard_key]` on the model — `sharding_across_tenants.rs`
 /// has exactly that shape. Inferring shardedness from the model alone therefore

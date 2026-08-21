@@ -1313,6 +1313,22 @@ async fn delete_subtree(
     .await
     .map_err(AutumnError::from)?;
 
+    // Deduplicate before ANY of it is used as a count. `UNION ALL` does not
+    // deduplicate, and a `parent_id` cycle among imported or hand-edited rows
+    // has no terminating edge, so the walk re-emits the same handful of ids at
+    // every depth until the guard stops it — roughly a thousand rows for a
+    // two-comment cycle. The `UPDATE`/`DELETE` is keyed on `id IN (…)` and so
+    // touches each physical row once, but `ids.len()` is the counter delta, and
+    // an inflated one drives `comment_count` sharply negative with no error
+    // anywhere. Counters are deliberately unclamped, so it stays wrong until
+    // someone runs `recompute_comment_count`.
+    //
+    // Sorted by depth first so the retained copy of each id is its shallowest,
+    // keeping the truncation check below meaningful.
+    let mut ids = ids;
+    ids.sort_by_key(|row| (row.id, row.depth));
+    ids.dedup_by_key(|row| row.id);
+
     // The walk stops at `RECURSION_GUARD`. On the SOFT-delete path that is
     // survivable: the rows past it stay live, stay counted, and surface as
     // promoted roots. On the HARD-delete path it is not — the `parent_id`

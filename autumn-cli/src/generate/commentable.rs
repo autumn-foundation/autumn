@@ -297,8 +297,12 @@ fn alter_removes_column(statement: &str, column: &str) -> bool {
 fn comments_table_events(sql: &str) -> Vec<CommentsEvent> {
     let mut events: Vec<(usize, CommentsEvent)> = Vec::new();
 
-    if let Some(start) = comments_table_statement_start(sql) {
-        let body = comments_table_body(sql).unwrap_or("");
+    // EVERY create, not just the first. One `up.sql` may legitimately recreate
+    // the table (`CREATE …; DROP …; CREATE …;`), and since the drop scanner
+    // already reports every drop, recording only the first create left the
+    // replay ending on the drop — reporting no table, and emitting a duplicate
+    // `CREATE TABLE comments` that fails when applied.
+    for (start, body) in comments_creations(sql) {
         events.push((
             start,
             CommentsEvent::Create {
@@ -378,6 +382,26 @@ fn comments_table_events(sql: &str) -> Vec<CommentsEvent> {
 
     events.sort_by_key(|(at, _)| *at);
     events.into_iter().map(|(_, event)| event).collect()
+}
+
+/// Every `CREATE TABLE comments (…)` in `sql`, as (offset, column list).
+fn comments_creations(sql: &str) -> Vec<(usize, &str)> {
+    let mut found = Vec::new();
+    let mut base = 0usize;
+    while let Some(start) = comments_table_statement_start(&sql[base..]) {
+        let absolute = base + start;
+        let Some(body) = comments_table_body(&sql[absolute..]) else {
+            break;
+        };
+        found.push((absolute, body));
+        // Continue past this statement's opening paren so the next search
+        // cannot rediscover the same one.
+        match sql[absolute..].find('(') {
+            Some(open) => base = absolute + open + 1,
+            None => break,
+        }
+    }
+    found
 }
 
 /// Whether `name` is one of the accepted spellings of the shared comments
@@ -1519,6 +1543,39 @@ mod tests {
         )
         .expect("write");
         assert!(already_migrated(tmp.path()));
+    }
+
+    /// One file may legitimately recreate the table. Recording only the first
+    /// CREATE, while every DROP is recorded, ended the replay on the drop.
+    #[test]
+    fn every_create_in_a_file_is_replayed_not_just_the_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_recreate");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);\n\
+             DROP TABLE comments;\n\
+             CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n",
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "the LAST create is the one that stands"
+        );
+
+        // …and the reverse order still ends with no table.
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n\
+             DROP TABLE comments;\n\
+             CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the last create declares no discriminator columns"
+        );
     }
 
     /// The shared migration must survive `destroy scaffold` while any other
