@@ -72,9 +72,12 @@ pub struct TenantCellStructuralOverhead {
     pub tenant_id_capacity_bytes: usize,
     /// Two strong/weak counter pairs: one for each per-cell `Arc` allocation.
     pub arc_header_bytes: usize,
+    /// Current element capacity reported by [`HashMap::capacity`]. This can
+    /// decrease as tombstones accumulate even though the allocation is retained.
+    pub registry_element_capacity: usize,
     /// Estimated backing bucket count. `HashMap::capacity()` is an element
-    /// capacity, not a bucket count; the current `SwissTable` implementation uses
-    /// the next power of two backing buckets.
+    /// capacity, not a bucket count; this is the high-water mark of the current
+    /// `SwissTable` implementation's power-of-two backing bucket estimate.
     pub registry_bucket_count: usize,
     /// Lower bound for unoccupied backing slots plus one control byte per
     /// bucket. This excludes the implementation's trailing control group and
@@ -532,6 +535,10 @@ pub struct TenantCellRegistry {
 
 struct RegistryInner {
     cells: RwLock<HashMap<String, Arc<TenantCell>>>,
+    /// High-water backing-bucket estimate. Removing entries can consume
+    /// tombstones and lower `HashMap::capacity()` without shrinking its backing
+    /// allocation, so the current capacity alone is insufficient.
+    registry_bucket_high_water: AtomicUsize,
     global_tracked: Arc<AtomicUsize>,
     /// Maximum number of resident cells; least-recently-used cells are evicted
     /// once the count exceeds this. `0` disables the bound (unlimited).
@@ -581,6 +588,7 @@ impl TenantCellRegistry {
         Self {
             inner: Arc::new(RegistryInner {
                 cells: RwLock::new(HashMap::new()),
+                registry_bucket_high_water: AtomicUsize::new(0),
                 global_tracked: Arc::new(AtomicUsize::new(0)),
                 max_cells,
                 idle_ttl,
@@ -699,6 +707,10 @@ impl TenantCellRegistry {
         // holds the greatest sequence and is never chosen as the LRU victim.
         cell.touch(now, self.next_seq());
         cells.insert(tenant_id.to_string(), Arc::clone(&cell));
+        self.inner.registry_bucket_high_water.fetch_max(
+            Self::estimated_bucket_count(cells.capacity()),
+            Ordering::Relaxed,
+        );
         // Enforce eviction limits while we already hold the write lock. The
         // just-touched new cell has the newest access time and the greatest
         // access sequence, so it is never the idle or LRU victim.
@@ -861,21 +873,15 @@ impl TenantCellRegistry {
             .map(|(key, cell)| key.capacity() + cell.inner.tenant_id.capacity())
             .sum();
         let arc_header_bytes = resident_cells * 2 * ARC_HEADER;
-        // `capacity()` reports how many *elements* fit without reallocating. It
-        // is not the backing bucket count: SwissTable reserves 1/8 of its
-        // power-of-two buckets to keep probes short (e.g. capacity 1,792 uses
-        // 2,048 buckets). Recover that implementation-specific bucket count so
-        // load-factor-reserved slots are not silently omitted. `0` has no
-        // allocation; the overflow fallback is only defensive for hypothetical
-        // capacities that cannot arise from a real allocation.
-        let registry_bucket_count = if cells.capacity() == 0 {
-            0
-        } else {
-            cells
-                .capacity()
-                .checked_next_power_of_two()
-                .map_or_else(|| cells.capacity(), |bucket_count| bucket_count)
-        };
+        let registry_element_capacity = cells.capacity();
+        drop(cells);
+        // Use allocation history rather than only current capacity. Removals
+        // create tombstones that can reduce effective element capacity while
+        // `HashMap` retains the original backing allocation.
+        let registry_bucket_count = self
+            .inner
+            .registry_bucket_high_water
+            .load(Ordering::Relaxed);
         let registry_bucket_bytes = (registry_bucket_count - resident_cells)
             * std::mem::size_of::<RegistryEntry>()
             + registry_bucket_count;
@@ -895,10 +901,22 @@ impl TenantCellRegistry {
             registry_entry_bytes,
             tenant_id_capacity_bytes,
             arc_header_bytes,
+            registry_element_capacity,
             registry_bucket_count,
             registry_bucket_bytes,
             total_bytes,
         }
+    }
+
+    /// Convert std's effective element capacity into the current `SwissTable`
+    /// backing-bucket estimate. `0` means no allocation.
+    fn estimated_bucket_count(element_capacity: usize) -> usize {
+        if element_capacity == 0 {
+            return 0;
+        }
+        element_capacity
+            .checked_next_power_of_two()
+            .map_or(element_capacity, |bucket_count| bucket_count)
     }
 }
 

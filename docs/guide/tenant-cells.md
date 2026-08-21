@@ -202,10 +202,14 @@ allocation capacities, and amortized spare registry buckets plus control bytes.
 Because `HashMap::capacity()` is an **element capacity**, not a bucket count,
 the model rounds it up to the current SwissTable implementation's power-of-two
 backing bucket count. For this workload that means 1,792 elements map to 2,048
-buckets, including the load-factor-reserved slots.
+buckets, including the load-factor-reserved slots. The registry retains that
+bucket estimate as a high-water mark: removals can consume tombstones and lower
+the map's reported element capacity without shrinking its backing allocation,
+so recomputing solely from the current capacity would undercount churned
+registries.
 It also reports the one-off registry allocation separately. On 64-bit Linux,
 the 1,000-cell smoke test currently measures **257 lower-bound structural bytes
-per cell** plus a **160-byte one-off registry structure** (257,744 bytes total);
+per cell** plus a **168-byte one-off registry structure** (257,752 bytes total);
 run the
 following command to reproduce the exact number for a toolchain/platform:
 

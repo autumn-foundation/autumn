@@ -196,6 +196,44 @@ fn density_smoke_thousand_cells() {
     assert_eq!(registry.structural_overhead().resident_cells, 0);
 }
 
+/// Registry removals may lower `HashMap`'s effective element capacity by
+/// consuming tombstones without releasing its backing allocation. Structural
+/// accounting must therefore preserve the bucket high-water mark.
+#[test]
+fn structural_overhead_preserves_bucket_high_water_after_eviction() {
+    const INITIAL_CELLS: usize = 1792;
+    const EVICTIONS: usize = 1100;
+
+    let registry = TenantCellRegistry::new();
+    for i in 0..INITIAL_CELLS {
+        drop(registry.get_or_create(&format!("churn-{i:04}"), 0));
+    }
+    let before = registry.structural_overhead();
+    assert_eq!(before.registry_bucket_count, 2048);
+
+    for i in 0..EVICTIONS {
+        drop(
+            registry
+                .evict(&format!("churn-{i:04}"))
+                .expect("resident churn cell must be evicted"),
+        );
+    }
+
+    let after = registry.structural_overhead();
+    assert_eq!(after.resident_cells, INITIAL_CELLS - EVICTIONS);
+    assert!(after.registry_element_capacity < before.registry_element_capacity);
+    assert_eq!(after.registry_bucket_count, before.registry_bucket_count);
+
+    for i in EVICTIONS..INITIAL_CELLS {
+        drop(
+            registry
+                .evict(&format!("churn-{i:04}"))
+                .expect("remaining churn cell must be evicted"),
+        );
+    }
+    assert!(registry.is_empty());
+}
+
 /// Replacing an existing scratch key must account only for the net byte delta,
 /// not the full new size, so a same-size or shrinking replace can never
 /// transiently overshoot the quota and spuriously return `QuotaExceeded`.
