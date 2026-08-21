@@ -36,7 +36,10 @@ Docker-compose mount, a Fly.io shared volume) reacts in lock-step.
 > machine it runs on. For hosts managed by `autumn deploy` (`[deploy] host` or
 > `[deploy] hosts`), use
 > [`autumn deploy maintenance on|off`](#fleet-wide-maintenance-autumn-deploy-maintenance),
-> which writes the same flag file to every configured host over SSH.
+> which writes the same flag file to every configured host over SSH. Running the
+> local command *on* a deploy-managed host does not help either — it writes a
+> path the app no longer reads, silently and with exit `0`. See
+> [Where the flag file lives](#where-the-flag-file-lives).
 
 ### Where the flag file lives
 
@@ -59,6 +62,26 @@ the default cwd-relative path a cutover would orphan an active maintenance flag
 and silently un-maintain the host, and the blue and green slots could not see
 each other's flag at all. The `shared/` directory survives cutovers, rollbacks
 and pruning, and both slots read it.
+
+> **On a deploy-managed host, the local `autumn maintenance` command no longer
+> does anything.** `autumn maintenance on|off` always writes and removes
+> `tmp/autumn-maintenance.json` relative to its own working directory — it is a
+> separate process from the app, it does not read the unit's `Environment=`, and
+> it has no flag to point it elsewhere. On a host deployed by `autumn deploy`,
+> the app reads `{app_dir}/shared/autumn-maintenance.json`, so SSH-ing in and
+> running `autumn maintenance on` writes a file nothing reads: the command exits
+> `0`, and the host keeps serving traffic normally. There is no error to warn
+> you.
+>
+> **On deploy-managed hosts, use
+> [`autumn deploy maintenance on|off`](#fleet-wide-maintenance-autumn-deploy-maintenance)**
+> — from your workstation or CI, not from the host. It writes the path the slot
+> units actually point at (and, for a host still running a unit deployed before
+> this existed, the old release-relative path as well), on every configured host,
+> and reports per host what it changed. The local command remains the right tool
+> for local development and for replicas that share a working directory
+> (docker-compose, a Fly.io volume) — anywhere the app and the CLI see the same
+> directory and no unit is overriding the path.
 
 When maintenance is active, all gated requests receive **503 Service Unavailable**
 with `Retry-After: 120`. The app never returns 200 for application routes while

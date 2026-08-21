@@ -2101,7 +2101,13 @@ order — each host runs the unchanged per-host blue/green cutover against its o
 kamal-proxy and must finish before the next starts, so the rest of the fleet
 keeps serving. One release id per run. **Migrations run exactly once**, on the
 first host still on a previous release, before its cutover; an all-first-deploy
-fleet migrates nowhere and warns, naming `autumn migrate`. A failure **halts**
+fleet migrates nowhere and warns, naming `autumn migrate`. **When a user adds
+hosts to an existing fleet, tell them to list the already-deployed host(s)
+first**: a first-deploy host ahead of the migrating host cuts over with no
+migrate step, so it serves the new release against the OLD schema until the
+rollout reaches the migrating host. The rollout warns by name (it never reorders
+the list — declaration order is the contract), and the warning is gated on a
+writable DB URL being resolvable locally. A failure **halts**
 the rollout and (by default) rolls the already-cut-over hosts back in reverse
 order — except post-cutover housekeeping failures (`record-proxy-options`,
 `drain-old`, `prune`), which leave the host live and healthy so the rollout warns
@@ -2110,6 +2116,26 @@ for manual recovery rather than guessed at. **Rollback restores binaries only �
 no migration is ever rolled back**, so tell users to write expand/contract
 migrations. `--only <HOST>` (repeatable, `up` and `rollback`) is a repair lever
 that warns about a mixed fleet; `--no-rollback` halts and freezes instead.
+`--only` narrowed to ONE host takes the single-host path: `deploy rollback --only
+<host>` prints no fleet state table and keeps the HARD preflight gate (a
+multi-host rollback downgrades a per-host `ssh_reachability` failure to a
+reported row and continues; a one-target run does not). Only the selected hosts
+are reachability-graded, but the topology refusals below key on the *configured*
+host count, so `--only` never unlocks them.
+
+No host is ever **drained** by a rollout: `/ready` never goes 503 for the
+rollout's sake and no host leaves the LB pool — each host is replaced in place
+(candidate on the idle loopback slot, `/ready`-gated there, atomic kamal-proxy
+flip, old slot drained after). Never describe a fleet rollout as draining hosts.
+
+`[jobs] backend = "local"` and `[scheduler] backend = "in_process"` are the
+per-process defaults; on a fleet each host runs its own copy (work never
+balances, queued work dies with the old slot, `unique`/`concurrency` stop being
+fleet-wide, scheduled tasks fire once PER HOST). `deploy up` prints a loud ⚠️
+naming the key(s) in effect whenever more than one host is configured — a
+warning, never a refusal, and nothing else says it (`deploy check`, `deploy plan`,
+`deploy status` and `autumn doctor` are all silent). Tell users to move to
+`postgres`/`redis` before relying on background work across a fleet.
 
 Fleet-unsafe topologies fail closed in the prologue, before any remote command:
 `sqlite://` databases (every host gets the same URL → N independent files),
@@ -2140,7 +2166,11 @@ every host attempted, non-zero if any failed, changed hosts NOT reversed.
 **Maintenance does not drain a host from a load balancer** — `/ready` stays 200
 by design — so never tell a user maintenance mode removes a host from rotation.
 Deploy-managed hosts read `{app_dir}/shared/autumn-maintenance.json` because the
-slot units carry `AUTUMN_MAINTENANCE_FLAG_FILE`.
+slot units carry `AUTUMN_MAINTENANCE_FLAG_FILE`. The local `autumn maintenance`
+has no override for that path — it always writes cwd-relative
+`tmp/autumn-maintenance.json` — so running it ON a deploy-managed host writes a
+file the app never reads and exits 0 with no warning. Always route users to
+`autumn deploy maintenance` for deploy-managed hosts.
 
 See `docs/guide/fleet-deploys.md`, `docs/guide/deployment.md`, and
 `docs/guide/maintenance-mode.md`.

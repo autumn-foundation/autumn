@@ -200,10 +200,33 @@ to create it: a host's candidate process starts before that host's `migrate` ste
 runs. `redis` reuses the Redis you already stood up for sessions and rate
 limiting; `[jobs.redis] key_prefix` keeps its keys separate.
 
-**Nothing refuses `local` on a fleet.** The doctor check that fails a `local`
-jobs backend (`process_role_backend`) only fires for a split `web`/`worker` role,
-and fleet hosts are all combined-role — so `deploy check`, the rollout preflight
-and `deploy status` are all silent about this. It is on you.
+**Nothing refuses `local` on a fleet — but `deploy up` does warn.** The
+in-process defaults are correct on one host and are what every un-configured app
+runs, so refusing them would break the scale-up this guide exists to make easy.
+Instead, whenever more than one host is configured, the rollout prologue prints:
+
+```
+⚠️  `[jobs] backend = "local"` (an in-process queue) and `[scheduler] backend =
+"in_process"` (a per-process timer) are in effect and this deploy targets more
+than one host — they are PER HOST: each host then runs its OWN copy, so work
+enqueued on one host is only ever run by that host, whatever is still queued dies
+when the next rollout drains that host's old slot, `unique`/`concurrency` limits
+stop being enforced fleet-wide, and every scheduled task fires once PER HOST.
+Move them to a shared backend (`postgres` or `redis`) before you rely on
+background work across the fleet — see docs/guide/fleet-deploys.md (#1621).
+```
+
+It names only the key(s) actually in effect, so a fleet on a shared queue with an
+in-process scheduler is warned about the scheduler alone. It is keyed on the
+number of *configured* hosts, so `--only` does not silence it, and it is silent
+for a single-host config, where the defaults are right.
+
+That warning is the **only** place this surfaces. It comes from the rollout
+driver, after the preflight report — so `deploy check`, `deploy plan` and
+`deploy status` say nothing about it, and neither does `autumn doctor` (its
+`process_role_backend` check only fires for a split `web`/`worker` role, and
+fleet hosts are all combined-role). Sessions and rate limiting get no warning at
+all. Work the table above yourself rather than waiting to be told.
 
 Full backend comparison, delivery semantics and the migration note are in the
 [jobs guide](jobs.md#backend-selection-autumntoml); don't duplicate them, read
@@ -230,8 +253,12 @@ above; a fleet on a `sqlite://` database is refused outright.
 
 This is also where you switch the backends that silently defaulted to per-host
 on a single server: sessions, rate limiting, `[jobs] backend` and
-`[scheduler] backend`. Nothing in the rollout refuses a per-host default — it
-just quietly becomes three of everything.
+`[scheduler] backend`. Nothing in the rollout *refuses* a per-host default — it
+becomes three of everything. It does not become three of everything quietly,
+though: `autumn deploy up` prints a loud ⚠️ naming `[jobs] backend = "local"`
+and/or `[scheduler] backend = "in_process"` whenever the deploy targets more than
+one host ([above](#background-jobs-the-default-queue-is-per-host)). Sessions and
+rate limiting get no such warning — those two are on you.
 
 ### 3. Swap `host` for `hosts`
 
@@ -287,6 +314,41 @@ Rolling release 20260821T101500Z across 3 hosts, ONE AT A TIME, in `[deploy] hos
 > so a brand-new fleet with no host on a previous release runs no migration at
 > all — and says so loudly, telling you to run `autumn migrate` yourself before
 > serving traffic. That warning is your cue, not a bug.
+
+#### List the already-deployed hosts first
+
+The example above works because `10.0.0.1` — the host that is already serving —
+is **first** in the list. That ordering is load-bearing, and nothing enforces it.
+
+The migration is placed on the first host in rollout order that is still on a
+previous release. A new host listed *ahead* of that one takes the first-deploy
+path, which carries no migrate step, so it **goes live on the new release before
+the schema moves**. With `hosts = ["10.0.0.2", "10.0.0.3", "10.0.0.1"]` — the two
+new hosts first — `10.0.0.2` and `10.0.0.3` serve the new release against the old
+schema until the rollout reaches `10.0.0.1`. If the release needs the new schema,
+that window is an outage on those hosts.
+
+So when you add hosts to an existing fleet: **put the already-deployed host (or
+hosts) at the front of `hosts` and append the new ones**. The list is never
+reordered for you — declaration order is the rollout contract, and silently
+resequencing it would be worse than the hazard.
+
+The rollout names the hazard when you hit it, in the header, before anything is
+touched:
+
+```
+⚠️  10.0.0.2, 10.0.0.3 go live on the new release BEFORE the migration runs
+(a first deploy never migrates) — if this release needs the new schema they will
+serve against the old one until the migrating host is reached; list an
+already-deployed host first to avoid it
+```
+
+Seeing that means exactly one thing: reorder `hosts` so an already-deployed host
+comes first and re-run, or accept the window knowingly because this release does
+not depend on the new schema. Like the other migration warnings it is only
+printed when the CLI can resolve a writable database URL from your config — an
+app whose database URL exists only in the host's environment gets no warning, so
+order the list correctly regardless.
 
 ### 6. Add the new hosts to the load balancer
 
@@ -372,6 +434,28 @@ because narrowing a rollout is precisely how a fleet ends up mixed on purpose.
 **Finish with a full `autumn deploy up`** and confirm with `deploy status
 --strict`.
 
+> **`--only` down to one host is a single-host run, and it behaves like one.**
+> This is worth knowing *before* an incident, because the fleet summary's
+> recovery line points you at exactly this command. Narrowing to a single target
+> takes the pre-fleet code path, so `autumn deploy rollback --only 10.0.0.2`:
+>
+> - prints **no `Fleet state:` table** and no per-host outcome rows — you get
+>   `Rolling back 10.0.0.2 to <release>…` and a single `✅ Rollback complete.`, or
+>   a plain error. Run `autumn deploy status` afterwards for the fleet-wide
+>   picture.
+> - gets **no benefit from the fleet rollback's reachability softening.** A
+>   multi-host rollback deliberately continues past a host that does not answer
+>   SSH, because stopping would strand the *other* hosts on the release you are
+>   abandoning. With one target there are no other hosts: an unreachable host
+>   stops the command non-zero having changed nothing.
+> - still needs the project's local inputs (signing secret, database URL,
+>   `migrations/`) wherever you invoke it — the preflight runs first either way.
+>
+> The same narrowing applies to `--only` on `deploy up`: only the selected hosts
+> are reachability-graded. The fleet-wide topology refusals (`sqlite://`,
+> `[media.mediamtx]`, `[deploy.tls]`) are keyed on the *configured* host count, so
+> `--only` never unlocks those.
+
 ### When the fleet says "NOT rolled back automatically"
 
 Four situations make a host's rollback *target* untrustworthy, and the fleet
@@ -441,8 +525,12 @@ Four things to know before you run it:
   cutover, a rollback and a prune all leave it in place, and both blue and green
   see the same flag. (See [maintenance-mode.md](maintenance-mode.md).)
 - **The local `autumn maintenance` is a different command.** It writes *this*
-  machine's working directory, which is not the host you deploy to. Use
-  `autumn deploy maintenance` for deploy-managed hosts.
+  machine's working directory, which is not the host you deploy to — and SSH-ing
+  into a host to run it there does not work either, because it writes the
+  cwd-relative `tmp/autumn-maintenance.json` while a deploy-managed app reads
+  `{app_dir}/shared/autumn-maintenance.json`. It exits `0` and changes nothing.
+  Use `autumn deploy maintenance` for deploy-managed hosts; see
+  [maintenance-mode.md](maintenance-mode.md#where-the-flag-file-lives).
 
 ---
 
@@ -489,6 +577,26 @@ Stated plainly so you can plan around it:
 - **No load-balancer management.** No provisioning, no health-check
   configuration, no adding or removing backends during a rollout. Your LB, your
   automation.
+- **No draining of a host, ever.** A rolling deploy does not take a host out of
+  rotation and does not push its `/ready` to `503` — not before the cutover, not
+  during it. Each host is replaced *in place*: the candidate starts on that
+  host's idle loopback slot, is `/ready`-gated on that loopback port, and the
+  host's own kamal-proxy flips upstreams atomically; the old slot is drained and
+  stopped only **after** the flip. From your load balancer's point of view the
+  host answers `200` on `/ready` the whole way through. If you need a host
+  genuinely out of the pool — a reboot, a scale-down, a host-level repair — you
+  drain it at the load balancer yourself, budgeting per
+  [rule 2](#2-budget-35-seconds-for-a-host-to-leave-rotation). Maintenance mode
+  is not that lever either ([rule 3](#3-maintenance-mode-does-not-drain-a-host)).
+- **No proof about *your* load balancer.** Autumn's end-to-end deploy test rolls
+  a real two-host fleet in CI and asserts that neither host returned a single
+  failed response during the rollout. Read it for what it is: the checker is a
+  **liveness prober** — one thread per host, one request at a time, roughly ten
+  requests a second — pointed at each host's *public port directly*, with no load
+  balancer in the harness at all. It is good evidence that a host being replaced
+  keeps answering. It is not a load test, it says nothing about behaviour under
+  concurrency, and it exercises none of your LB's health-check interval,
+  unhealthy threshold or deregistration delay. Those you validate yourself.
 - **No parallel rollout.** Hosts are replaced strictly one at a time. A batch or
   percentage rollout is not configurable.
 - **No canary weighting.** Autumn's canary primitives (version-labelled metrics,

@@ -19,7 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serving throughout. One release id per run, and **migrations run exactly
   once** — on the first host still on a previous release, before its cutover;
   every other host skips them, and an all-first-deploy fleet migrates nowhere and
-  says so, naming `autumn migrate`. A failure **halts** the rollout (the
+  says so, naming `autumn migrate`. **List already-deployed hosts first when you
+  scale up**: the migration lands on the first host still on a previous release,
+  so a *new* host listed ahead of it cuts over with no migrate step and serves the
+  new release against the old schema until the rollout reaches the migrating host
+  — the rollout names that hazard and the hosts it affects up front rather than
+  silently resequencing a list whose order is the documented contract. A failure
+  **halts** the rollout (the
   remaining hosts are never touched) and, by default, compensates the hosts that
   already cut over in reverse rollout order — rolling each back to its previous
   release, or removing a just-completed first deploy — best-effort-continue and
@@ -38,9 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before any remote command runs — a `sqlite://` database (N independent files),
   `[media.mediamtx]` (no teardown path), and `[deploy.tls]` (terminate TLS at the
   load balancer that fronts the fleet) — and `[database] auto_migrate` on a fleet
-  is a loud warning. The preflight grades **every** targeted host before any host
-  is touched, and `autumn doctor` grades the same list. See
-  `docs/guide/fleet-deploys.md`.
+  is a loud warning, as are the per-process background-work defaults
+  (`[jobs] backend = "local"`, `[scheduler] backend = "in_process"`), which are
+  correct on one host and become N independent queues and N cron timers on a
+  fleet. The preflight grades **every** targeted host before any host is touched,
+  and `autumn doctor` grades the same list. Note that no host is ever *drained*
+  for the rollout's sake — a host's `/ready` never goes `503` and it is never
+  removed from your load balancer's pool; each host is replaced in place by its
+  own kamal-proxy flipping loopback slots. See `docs/guide/fleet-deploys.md`.
 
 - **`autumn deploy status` — read-only fleet state and drift (#1621):** one row
   per configured host in rollout order — mode, deployed release (from the
@@ -69,15 +80,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/ready` stays `200` by design, so a maintained host keeps taking traffic and
   answers it with `503`. See `docs/guide/maintenance-mode.md`.
 
-- **`autumn deploy` hardening that also applies to a single host (#1621):** the
-  deploy now refuses a **release-directory collision** — the release id has
-  one-second granularity, so a fast re-run could re-upload into the directory
-  `shared/previous-release` still points at and make a later rollback roll
-  *forward* — and refuses equally when the probe cannot prove the directory is
-  absent. Every `ssh`/`scp` invocation also carries `ConnectTimeout=10`,
+- **`autumn deploy` hardening that also applies to a single host (#1621):** a
+  one-entry `hosts` list behaves exactly like `host`, but a single-host deploy is
+  *not* unchanged from the previous release — these apply to every deploy,
+  whatever the host count. The deploy now refuses a **release-directory
+  collision** — the release id has one-second granularity, so a fast re-run could
+  re-upload into the directory `shared/previous-release` still points at and make
+  a later rollback roll *forward* — and refuses equally when the probe cannot
+  prove the directory is absent; concretely, a re-run of `autumn deploy up`
+  inside the same second now exits non-zero where it previously proceeded, at the
+  cost of one extra read-only round-trip before anything is mutated. Every
+  `ssh`/`scp` invocation also carries `ConnectTimeout=10`,
   `ServerAliveInterval=15` and `ServerAliveCountMax=4`, so a host that accepts
   TCP and then wedges produces a finite error instead of hanging the deploy
-  forever. See `docs/guide/deployment.md`.
+  forever. Slot units now carry
+  `Environment=AUTUMN_MAINTENANCE_FLAG_FILE={app_dir}/shared/autumn-maintenance.json`,
+  so an active maintenance flag survives a cutover instead of being orphaned by
+  it — which also means the **local** `autumn maintenance on`, run on a
+  deploy-managed host, writes a path the app no longer reads: use
+  `autumn deploy maintenance` there. Three smaller changes complete the list: the
+  ops that complete a cutover append an advisory fragment recording a
+  `shared/last-deploy` marker naming the action that completed (what
+  `deploy status` reads, and it can never fail the op it rides on); the existing
+  `detect-current` probe resolves the `current`
+  symlink in the same round-trip via one extra delimited section; and the "no
+  target host configured" hint now names `[deploy] hosts` alongside
+  `[deploy] host`. See `docs/guide/deployment.md`.
 
 - **`autumn generate webhook` for signed, replay-safe provider intake
   (#1366):** the `SignedWebhook` substrate has shipped since 0.4.0, but every
