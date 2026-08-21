@@ -547,18 +547,85 @@ pub(crate) fn fleet_rollback_set(
 /// Secrets discipline is load-bearing here: `DeployExecError`'s own `Display` is
 /// already redacted, but the fleet error/summary types quote only labels and host
 /// names, never a formatted source error.
-pub(crate) const fn failed_step_label(err: &exec::DeployExecError) -> &'static str {
+pub(crate) fn failed_step_label(err: &exec::DeployExecError) -> &'static str {
     match err {
         exec::DeployExecError::CommandFailed { label, .. } => label,
         exec::DeployExecError::CandidateRolledBack { failed_step, .. }
         | exec::DeployExecError::FirstDeployTornDown { failed_step, .. }
         | exec::DeployExecError::RollbackFailed { failed_step, .. } => failed_step,
+        // The post-cutover wrapper is a CLASSIFIER input, not a reporting one: it
+        // adds the op that was running, while the operator-facing step label stays
+        // exactly what the underlying failure would have reported on its own. A
+        // dropped transport is still attributed to the transport, never to a
+        // fabricated step (see `attributed_step_label` for the other question).
+        exec::DeployExecError::PostCutover { source, .. } => failed_step_label(source),
         exec::DeployExecError::UploadFailed { .. } => "upload",
         exec::DeployExecError::Stage { .. } => "stage-local-file",
         exec::DeployExecError::Spawn { .. } => "ssh-transport",
         exec::DeployExecError::PreflightAborted { .. } => "preflight",
         exec::DeployExecError::ProxyIncompatible { .. } => "proxy-compat-probe",
         exec::DeployExecError::NoPreviousRelease => "resolve-previous",
+    }
+}
+
+/// The label of the op that was actually RUNNING when this failure landed, when
+/// the error proves one — `None` when nothing does (issue #1621, §4.6).
+///
+/// Deliberately not the same question as [`failed_step_label`], which always
+/// answers something so it can be printed. Several executor errors name no op at
+/// all ([`exec::DeployExecError::Spawn`] and friends are raised by the local
+/// transport, not by a step), and post-boundary that distinction decides whether a
+/// host may be touched — so it is asked explicitly rather than inferred from a
+/// synthesized label string.
+///
+/// [`exec::execute_with_teardown`] attaches the op label to every failure past a
+/// known go-live boundary, which is what makes this answerable for the error shapes
+/// that carry none of their own.
+const fn attributed_step_label(err: &exec::DeployExecError) -> Option<&'static str> {
+    match err {
+        exec::DeployExecError::CommandFailed { label, .. } => Some(label),
+        exec::DeployExecError::PostCutover { failed_step, .. }
+        | exec::DeployExecError::CandidateRolledBack { failed_step, .. }
+        | exec::DeployExecError::FirstDeployTornDown { failed_step, .. }
+        | exec::DeployExecError::RollbackFailed { failed_step, .. } => Some(failed_step),
+        exec::DeployExecError::Spawn { .. }
+        | exec::DeployExecError::UploadFailed { .. }
+        | exec::DeployExecError::Stage { .. }
+        | exec::DeployExecError::PreflightAborted { .. }
+        | exec::DeployExecError::ProxyIncompatible { .. }
+        | exec::DeployExecError::NoPreviousRelease => None,
+    }
+}
+
+/// The post-boundary class for one executor ERROR, rather than for a bare label
+/// (issue #1621, §4.6).
+///
+/// [`classify_post_boundary`] answers "how bad is a failure of THIS op", which is
+/// the right question only when the op is known. Attribution is then used in
+/// exactly one direction — it can make the verdict more conservative, never less:
+///
+/// * **`commit-markers` always wins.** The marker triple is written as one remote
+///   transaction, so any failure inside it leaves the rollback target unprovable —
+///   whether it arrived as a non-zero remote exit or as a dropped transport that
+///   never launched the command. Keying that guard on the error shape is how a host
+///   gets auto-rolled-back onto a stale `shared/previous-release` target.
+/// * **A label-less failure never DOWNGRADES to housekeeping.** A transport that
+///   dropped during `drain-old` is not proof that only bookkeeping broke: the deploy
+///   host can no longer talk to this host at all, so nothing about it is provable
+///   and it stays [`PostBoundaryClass::Functional`] — halt and compensate — exactly
+///   as it does today.
+/// * **An unattributable failure fails CLOSED.** If nothing names the op, we cannot
+///   say which post-cutover step broke, which is precisely when the rollback target
+///   is least provable — so decline to touch the host
+///   ([`PostBoundaryClass::Ambiguous`]) rather than compensate it blind.
+fn post_boundary_class(err: &exec::DeployExecError, reported_label: &str) -> PostBoundaryClass {
+    match attributed_step_label(err) {
+        // The marker transaction (whatever error shape carried the failure), or a
+        // failure that names no op at all: both leave the rollback target unprovable.
+        Some(AMBIGUOUS_MARKERS_LABEL) | None => PostBoundaryClass::Ambiguous,
+        // Otherwise today's policy, keyed on the label the failure REPORTS — so a
+        // label-less transport error is never waved through as housekeeping.
+        Some(_) => classify_post_boundary(reported_label),
     }
 }
 
@@ -570,7 +637,7 @@ pub(crate) const fn failed_step_label(err: &exec::DeployExecError) -> &'static s
 /// `execute_with_teardown` returns the raw error precisely when the failure landed
 /// *after* the go-live boundary (or when the boundary could not be located, in
 /// which case it deliberately refuses to guess).
-pub(crate) const fn classify_failure(err: &exec::DeployExecError) -> HostOutcome {
+pub(crate) fn classify_failure(err: &exec::DeployExecError) -> HostOutcome {
     match err {
         exec::DeployExecError::CandidateRolledBack { failed_step, .. } => {
             HostOutcome::RolledBack { failed_step }
@@ -590,12 +657,13 @@ pub(crate) const fn classify_failure(err: &exec::DeployExecError) -> HostOutcome
 /// Kept as its own function — rather than folded into [`classify_failure`] —
 /// because the two questions have different inputs and different failure modes.
 /// `classify_failure` reads the executor's TYPED error and is the discriminator
-/// AC-3 turns on; this one reads a LABEL and encodes a policy about which
-/// post-cutover steps matter. A pre-boundary outcome passes through untouched: the
-/// executor already tore that candidate down, so there is nothing left to classify.
+/// AC-3 turns on; this one encodes a policy about which post-cutover steps matter
+/// (see [`post_boundary_class`] for how the failing op is attributed). A
+/// pre-boundary outcome passes through untouched: the executor already tore that
+/// candidate down, so there is nothing left to classify.
 pub(crate) fn classify_host_outcome(err: &exec::DeployExecError) -> HostOutcome {
     match classify_failure(err) {
-        HostOutcome::LiveOnNew { failed_step } => match classify_post_boundary(failed_step) {
+        HostOutcome::LiveOnNew { failed_step } => match post_boundary_class(err, failed_step) {
             PostBoundaryClass::Housekeeping => HostOutcome::Degraded { label: failed_step },
             PostBoundaryClass::Ambiguous => HostOutcome::AmbiguousMarkers,
             PostBoundaryClass::Functional => HostOutcome::LiveOnNew { failed_step },
@@ -613,6 +681,22 @@ pub(crate) fn classify_host_outcome(err: &exec::DeployExecError) -> HostOutcome 
 /// absence of a `migrate` line.
 pub(crate) const FLEET_NO_MIGRATION_NOTE: &str = "no host in this fleet is on a previous release, so this rollout runs NO migrations \
      (a first deploy never does) — run `autumn migrate` yourself before serving traffic";
+
+/// The loud line printed when first-deploy hosts sit AHEAD of the fleet's single
+/// migration in rollout order (issue #1621, AC-4).
+///
+/// [`migrate_placement`] puts the migration on the first host whose probed mode is
+/// `Redeploy` — a first-deploy host has no live release to keep serving if the
+/// migration fails, so it is the wrong place for it. The consequence is that any
+/// first deploy listed BEFORE that host runs [`exec::first_deploy_ops`] (which
+/// carries no migrate op) and goes live on the new release while the schema is
+/// still the old one. Declaration order is a documented contract — the guide tells
+/// operators to order the list themselves — so the rollout is not silently
+/// reordered; the hazard is named, with the hosts it applies to and the one-line
+/// remedy.
+pub(crate) const FLEET_FIRST_BEFORE_MIGRATE_NOTE: &str = "go live on the new release BEFORE the migration runs (a first deploy never migrates) \
+     — if this release needs the new schema they will serve against the old one until \
+     the migrating host is reached; list an already-deployed host first to avoid it";
 
 /// The one-line reminder printed once, after the fleet's single migration lands.
 pub(crate) const FLEET_SCHEMA_MOVED_NOTE: &str = "the schema has moved; from here an automatic rollback restores BINARIES only — \
@@ -724,6 +808,22 @@ pub(crate) fn fleet_rollout_lines(
                 migrating.host,
                 skipped.join(", "),
             ));
+            // Hosts listed AHEAD of the migrating one that are first deploys cut over
+            // before the schema moves (AC-4). Named rather than reordered — see
+            // `FLEET_FIRST_BEFORE_MIGRATE_NOTE`.
+            let before_migration: Vec<&str> = plan
+                .hosts
+                .iter()
+                .take_while(|h| h.host != migrating.host)
+                .filter(|h| h.mode == HostMode::First)
+                .map(|h| h.host.as_str())
+                .collect();
+            if writable_db_configured && !before_migration.is_empty() {
+                lines.push(format!(
+                    "  \u{26A0}\u{FE0F}  {} {FLEET_FIRST_BEFORE_MIGRATE_NOTE}",
+                    before_migration.join(", "),
+                ));
+            }
         }
         None if writable_db_configured => {
             lines.push(format!("  \u{26A0}\u{FE0F}  {FLEET_NO_MIGRATION_NOTE}"));
@@ -848,7 +948,15 @@ pub(crate) fn fleet_summary_lines(
             "  On {release_id}: {}. {FLEET_RECOVERY_HINT}",
             on_new.join(", ")
         ));
-        lines.push(format!("  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_MOVED_NOTE}"));
+        // Gated on the MIGRATION, not on liveness: `on_new` says hosts are serving
+        // the new release, which is a different question. An all-first-deploy fleet
+        // schedules no migration at all, and the same run's header says so out loud
+        // ("run `autumn migrate` yourself before serving traffic") — asserting the
+        // schema moved here would negate that instruction on the last line before
+        // the green one.
+        if schema_moved(plan, outcomes) {
+            lines.push(format!("  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_MOVED_NOTE}"));
+        }
     }
     // Say the binaries-only truth once the fleet has ACTUALLY undone hosts: at that
     // point the operator is looking at a fleet back on the old release with a schema
@@ -899,6 +1007,20 @@ pub(crate) enum ReleaseId {
 /// surfaces it before then.)
 pub(crate) const DRIFT_LIVE_SLOT_MARKER: &str =
     "live-slot marker disagrees with the slot kamal-proxy is serving";
+
+/// State drift: this host has no release deployed at all, while the rest of the
+/// fleet is serving one (issue #1621, AC-6).
+///
+/// Deliberately NOT version drift — [`ReleaseId::Unknown`] never contributes to
+/// that, and it must not start to. This is a different question: `HostMode::First`
+/// is a PROVEN absence (the probe shell tests `[ -L current ]`, so even a dangling
+/// symlink reports `Redeploy`), so a fleet whose peers are serving a release has a
+/// host that is carrying none of the traffic the operator provisioned it for. That
+/// is exactly the state the standing `deploy status --strict` alert exists to catch
+/// — a compensated first deploy, or a host added to `[deploy] hosts` and never
+/// deployed.
+pub(crate) const DRIFT_HOST_NOT_DEPLOYED: &str = "no release is deployed on this host while the rest of the fleet is serving one — it is \
+     carrying no traffic (deploy it with `autumn deploy up`)";
 
 /// State drift: the `shared/proxy-options` marker exists but cannot be parsed.
 ///
@@ -1091,8 +1213,20 @@ pub(crate) fn fleet_drift(hosts: &[HostStatus]) -> DriftReport {
         }
     }
 
+    // Whether ANY reachable host proved it is serving a release — the peer a
+    // not-deployed host is judged against.
+    let any_release_deployed = hosts
+        .iter()
+        .any(|status| status.reachable && matches!(status.release, ReleaseId::Known(_)));
+
     let mut state_drift: Vec<(String, &'static str)> = Vec::new();
     for status in hosts.iter().filter(|status| status.reachable) {
+        // A PROVEN absence, judged against the fleet: nothing is deployed here while
+        // a peer is serving a release. A fleet that has never been deployed at all
+        // has no peer to be out of step with, so it stays silent.
+        if status.mode == Some(HostMode::First) && any_release_deployed {
+            state_drift.push((status.host.clone(), DRIFT_HOST_NOT_DEPLOYED));
+        }
         if status.live_slot_marker_drift {
             state_drift.push((status.host.clone(), DRIFT_LIVE_SLOT_MARKER));
         }
@@ -1231,13 +1365,32 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
     }
     let unknown = report.unknown_releases();
     if !unknown.is_empty() {
-        // Named, and explicitly NOT called drift — the evidence matters more than
-        // the verdict here.
-        lines.push(format!(
-            "  \u{2139}\u{FE0F}  release unknown on {} (the `current` symlink was unreadable) \
-             \u{2014} reported, not counted as drift.",
-            unknown.join(", "),
-        ));
+        // Two different facts, deliberately split: a host that reported
+        // `HostMode::First` PROVED it has no `current` symlink, while every other
+        // unknown really is "we could not read it". Describing the first as an
+        // unreadable symlink sends the operator to inspect something that was never
+        // there.
+        let (not_deployed, unreadable): (Vec<&str>, Vec<&str>) = unknown.iter().partition(|host| {
+            hosts.iter().any(|status| {
+                status.host == **host && status.reachable && status.mode == Some(HostMode::First)
+            })
+        });
+        if !not_deployed.is_empty() {
+            lines.push(format!(
+                "  \u{2139}\u{FE0F}  no release deployed on {} \u{2014} nothing is installed \
+                 there yet.",
+                not_deployed.join(", "),
+            ));
+        }
+        if !unreadable.is_empty() {
+            // Named, and explicitly NOT called drift — the evidence matters more than
+            // the verdict here.
+            lines.push(format!(
+                "  \u{2139}\u{FE0F}  release unknown on {} (the `current` symlink was unreadable) \
+                 \u{2014} reported, not counted as drift.",
+                unreadable.join(", "),
+            ));
+        }
     }
     for (host, reason) in &report.state_drift {
         lines.push(format!("  \u{26A0}\u{FE0F}  {host}: {reason}"));
@@ -2113,6 +2266,63 @@ mod tests {
     }
 
     #[test]
+    fn the_rollout_header_warns_when_first_deploys_cut_over_before_the_migration() {
+        // #1621 (AC-4): the migration lands on the first REDEPLOY host in rollout
+        // order, so every first-deploy host listed ahead of it goes live on the new
+        // release before the schema moves — `first_deploy_ops` carries no migrate op.
+        // Declaration order is a documented contract and reordering it silently would
+        // be worse, so the hazard is said out loud, naming the hosts it applies to.
+        let fleet = fleet_of(&["10.0.0.2", "10.0.0.3", "10.0.0.1"]);
+        let plan = plan_fleet(
+            &fleet,
+            &[HostMode::First, HostMode::First, HostMode::Redeploy],
+        )
+        .expect("a well-formed fleet plans");
+
+        let warned = fleet_rollout_lines(&plan, "20260714T120000Z", true).join("\n");
+        assert!(
+            warned.contains(FLEET_FIRST_BEFORE_MIGRATE_NOTE),
+            "hosts that cut over before the fleet's only migration must be warned \
+             about:\n{warned}"
+        );
+        assert!(
+            warned.contains("10.0.0.2, 10.0.0.3") && !warned.contains("10.0.0.1 go live"),
+            "the warning must name exactly the hosts ahead of the migrating one:\n{warned}"
+        );
+        let quiet = fleet_rollout_lines(&plan, "20260714T120000Z", false).join("\n");
+        assert!(
+            !quiet.contains(FLEET_FIRST_BEFORE_MIGRATE_NOTE),
+            "an app with no writable database has no schema to be behind:\n{quiet}"
+        );
+
+        // The mixed fleet whose migrating host runs FIRST is silent: nothing goes
+        // live before the schema moves, which is what AC-4 asks for.
+        let ordered = plan_fleet(
+            &fleet,
+            &[HostMode::Redeploy, HostMode::First, HostMode::First],
+        )
+        .expect("a well-formed fleet plans");
+        let silent = fleet_rollout_lines(&ordered, "20260714T120000Z", true).join("\n");
+        assert!(
+            !silent.contains(FLEET_FIRST_BEFORE_MIGRATE_NOTE),
+            "the migration runs before any cutover here — there is nothing to \
+             warn about:\n{silent}"
+        );
+        // …and so is an all-redeploy fleet, whose every host waits for the migration.
+        let all_redeploy = plan_fleet(
+            &fleet,
+            &[HostMode::Redeploy, HostMode::Redeploy, HostMode::Redeploy],
+        )
+        .expect("a well-formed fleet plans");
+        assert!(
+            !fleet_rollout_lines(&all_redeploy, "20260714T120000Z", true)
+                .join("\n")
+                .contains(FLEET_FIRST_BEFORE_MIGRATE_NOTE),
+            "no first deploy, no pre-migration cutover"
+        );
+    }
+
+    #[test]
     fn an_all_first_deploy_fleet_warns_only_when_a_database_is_configured() {
         // #1621 (AC-4): `first_deploy_ops` carries no migrate op, so an
         // all-first-deploy fleet migrates NOWHERE — today's documented single-host
@@ -2286,6 +2496,67 @@ mod tests {
                 failed_step: "readiness-gate"
             },
             "a pre-boundary outcome is already clean and must pass through unrefined"
+        );
+    }
+
+    #[test]
+    fn a_post_boundary_failure_is_classified_by_the_op_that_was_running() {
+        // #1621 (§4.6). The never-auto-roll-back guard is about an OP, not about an
+        // error shape. `DeployExecError::Spawn` carries no label of its own, so
+        // before `execute_with_teardown` attached one a dropped transport during
+        // `commit-markers` classified as Functional and the host was auto-rolled-back
+        // onto whatever `shared/previous-release` still named — a marker the failed
+        // command never rewrote.
+        let transport = || {
+            Box::new(exec::DeployExecError::Spawn {
+                program: "ssh".to_owned(),
+                source: std::io::Error::other("scripted"),
+            })
+        };
+        assert_eq!(
+            classify_host_outcome(&exec::DeployExecError::PostCutover {
+                failed_step: "commit-markers",
+                source: transport(),
+            }),
+            HostOutcome::AmbiguousMarkers,
+            "a transport that dropped during `commit-markers` leaves the marker triple \
+             exactly as unprovable as a non-zero exit does — it must fail closed too"
+        );
+        // Attribution only ever makes the verdict MORE conservative. A transport that
+        // dropped during housekeeping is not proof that only bookkeeping broke: the
+        // deploy host can no longer talk to this host at all, so it stays Functional.
+        assert_eq!(
+            classify_host_outcome(&exec::DeployExecError::PostCutover {
+                failed_step: "drain-old",
+                source: transport(),
+            }),
+            HostOutcome::LiveOnNew {
+                failed_step: "ssh-transport"
+            },
+            "a dropped transport must never be waved through as harmless housekeeping"
+        );
+        // …and a housekeeping op that really did report its own failure still degrades.
+        assert_eq!(
+            classify_host_outcome(&exec::DeployExecError::PostCutover {
+                failed_step: "prune",
+                source: Box::new(exec::DeployExecError::CommandFailed {
+                    label: "prune",
+                    message: "scripted".to_owned(),
+                }),
+            }),
+            HostOutcome::Degraded { label: "prune" },
+            "a remote `prune` failure is still bookkeeping — the rollout continues"
+        );
+        // Nothing names the failing op: we cannot say WHICH post-cutover step broke,
+        // which is exactly when the rollback target is least provable. Fail closed to
+        // "do not touch this host" rather than compensating it blind.
+        assert_eq!(
+            classify_host_outcome(&exec::DeployExecError::Spawn {
+                program: "ssh".to_owned(),
+                source: std::io::Error::other("scripted"),
+            }),
+            HostOutcome::AmbiguousMarkers,
+            "an unattributable post-boundary failure must decline the automatic rollback"
         );
     }
 
@@ -2476,6 +2747,35 @@ mod tests {
         assert!(
             !rendered.contains(FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE),
             "no migration ran, so there is no schema statement to make:\n{rendered}"
+        );
+        // …and neither must the SUCCESS path. An all-first-deploy fleet is the shape
+        // the header warns runs NO migrations ("run `autumn migrate` yourself before
+        // serving traffic"); ending the same run with "the schema has moved" negates
+        // that instruction on the last line the operator reads before the green one.
+        let served = fleet_summary_lines(
+            &first_only,
+            &[HostOutcome::Serving, HostOutcome::Serving],
+            "20260714T120000Z",
+        )
+        .join("\n");
+        assert!(
+            !served.contains(FLEET_SCHEMA_MOVED_NOTE),
+            "a rollout that scheduled no migration must never claim the schema moved:\n{served}"
+        );
+        assert!(
+            served.contains(FLEET_RECOVERY_HINT),
+            "the recovery lever is still named — hosts ARE on the new release:\n{served}"
+        );
+        // The note is still printed where it is true: a fleet that did migrate.
+        let migrated = fleet_summary_lines(
+            &migrating,
+            &[HostOutcome::Serving, HostOutcome::Serving],
+            "20260714T120000Z",
+        )
+        .join("\n");
+        assert!(
+            migrated.contains(FLEET_SCHEMA_MOVED_NOTE),
+            "the migrating fleet DID move the schema and must say so:\n{migrated}"
         );
     }
 
@@ -2756,6 +3056,60 @@ mod tests {
         // A clean fleet reports nothing at all.
         let clean = fleet_drift(&[status("web-a", Some("r1")), status("web-b", Some("r1"))]);
         assert!(!clean.drifted() && clean.state_drift.is_empty());
+    }
+
+    #[test]
+    fn fleet_drift_flags_a_host_that_is_not_deployed_at_all() {
+        // #1621 (AC-6). A host the probe proved has NO `current` symlink is not
+        // "unknown", it is empty: `HostMode::First` is a positive fact (the probe
+        // shell tests `[ -L current ]`, and even a dangling symlink takes the
+        // redeploy branch). Folding it into `ReleaseId::Unknown` made `--strict`
+        // exit 0 on a fleet running a fraction of its capacity — the documented cron
+        // alert never fired — and blamed an "unreadable symlink" that was never there.
+        let mut not_deployed = status("web-b", None);
+        not_deployed.mode = Some(HostMode::First);
+        let report = fleet_drift(&[status("web-a", Some("r1")), not_deployed.clone()]);
+        assert!(
+            !report.version_drift,
+            "one known release is still not VERSION drift — this is a separate signal"
+        );
+        assert_eq!(
+            report.state_drift,
+            vec![("web-b".to_owned(), DRIFT_HOST_NOT_DEPLOYED)],
+            "a host carrying no release while its peers serve one is drift"
+        );
+        assert!(
+            report.drifted(),
+            "`deploy status --strict` must exit non-zero on it"
+        );
+
+        // A fleet where NOTHING is deployed yet is not drifted: there is no peer
+        // serving a release for it to be out of step with (the first `deploy up` of a
+        // brand-new fleet must not page anyone).
+        let mut second = status("web-a", None);
+        second.mode = Some(HostMode::First);
+        let fresh = fleet_drift(&[second, not_deployed.clone()]);
+        assert!(
+            !fresh.drifted() && fresh.state_drift.is_empty(),
+            "a fleet that has never been deployed is not drifted: {:?}",
+            fresh.state_drift
+        );
+
+        // The row and the footer must say what is actually true.
+        let rows = [status("web-a", Some("r1")), not_deployed];
+        let rendered = fleet_status_lines(&rows, &fleet_drift(&rows)).join("\n");
+        assert!(
+            rendered.contains(DRIFT_HOST_NOT_DEPLOYED),
+            "the drift reason must be named on the row:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("web-b, ") && rendered.contains("no release deployed on web-b"),
+            "a host that is not deployed must be described as such:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("`current` symlink was unreadable"),
+            "…and never blamed on a symlink that was never there:\n{rendered}"
+        );
     }
 
     #[test]

@@ -3600,13 +3600,22 @@ fn run_rollback(
     // `resolved`, so the branch below is the pre-#1621 sequence at N = 1.
     let fleet = ResolvedFleet::from_targets(resolved, hosts);
 
-    // Fail fast: same preflight/gate as `up`, before any remote call. Every host is
+    // Fail fast: the same preflight as `up`, before any remote call. Every host is
     // graded, so an unreachable host in position 3 is reported before host 3 — or
-    // any other host — is touched.
+    // any other host — is touched. The GATE is narrower than `up`'s, though: see
+    // [`blocking_rollback_failures`].
     let checks = collect_fleet_preflight(config, &fleet);
     let failed = report_preflight(&checks);
-    if failed > 0 {
+    if blocking_rollback_failures(&checks) > 0 {
         return Err(DeployError::PreflightFailed(failed));
+    }
+    if failed > 0 {
+        eprintln!(
+            "\u{26A0}\u{FE0F}  {failed} host(s) above did not answer the reachability probe. A \
+             ROLLBACK continues without them \u{2014} stopping would leave the hosts that ARE \
+             reachable on the release you are leaving \u{2014} but each is reported as NOT \
+             rolled back and this command still exits non-zero.\n"
+        );
     }
 
     // Show what a rollback will do before it runs (descriptive, not a dry-run gate).
@@ -3654,6 +3663,46 @@ fn run_rollback(
 
     eprintln!("\n\u{2705} Rollback complete.");
     Ok(())
+}
+
+/// The grader name a per-host reachability row carries. Kept as one constant so
+/// the rollback gate below and the skip it implies can never key on different
+/// spellings than [`grade_ssh_reachability`] emits.
+const SSH_REACHABILITY_CHECK: &str = "ssh_reachability";
+
+/// Whether a preflight check is a PER-HOST reachability row of a real fleet
+/// (issue #1621): the grader name plus a scope, which
+/// [`collect_fleet_preflight`] attaches only for a fleet of more than one host.
+fn is_per_host_reachability(check: &PreflightCheck) -> bool {
+    check.name == SSH_REACHABILITY_CHECK && check.scope.is_some()
+}
+
+/// How many preflight failures must ABORT a fleet rollback before it touches
+/// anything (issue #1621, §3.2).
+///
+/// `deploy up` refuses the whole rollout if any host fails — AC-7 — because a
+/// rollout is a CHANGE, and starting one against a fleet it cannot finish is how a
+/// fleet ends up mixed. A rollback is the opposite kind of command: it is recovery,
+/// its documented contract is best-effort-continue
+/// ([`run_fleet_rollback_with`]), and the host that stopped answering SSH is very
+/// often the reason the operator is rolling back at all. Refusing to move the
+/// healthy majority off a bad release because one host is dead leaves MORE hosts on
+/// the release being abandoned — the exact outcome that contract exists to prevent.
+///
+/// So exactly one class is downgraded to a reported, non-blocking row: a per-host
+/// `ssh_reachability` failure in a real fleet. It is still printed by
+/// [`report_preflight`], that host is still skipped and reported as NOT rolled back,
+/// and the command still exits non-zero via [`DeployError::FleetRollbackFailed`].
+///
+/// Everything else keeps the hard gate. A project-wide grader describes the release
+/// being rolled back TO rather than one host's reachability, and a SINGLE-host
+/// rollback keeps the pre-#1621 gate verbatim — its checks are unscoped, so none of
+/// them qualify (AC-1).
+fn blocking_rollback_failures(checks: &[PreflightCheck]) -> usize {
+    checks
+        .iter()
+        .filter(|check| check.blocking() && !is_per_host_reachability(check))
+        .count()
 }
 
 /// Roll EVERY host in `fleet` back to its previous release, newest first (issue
@@ -3723,8 +3772,38 @@ where
         let cfg = &fleet.hosts[index];
         let host = names[index].as_str();
         eprintln!("[{}/{total} {host}] rolling back\u{2026}", index + 1);
-        outcomes[index] =
-            rollback_one_host(checks, cfg, proxy, public_port, host, &executors[index]);
+        // Preflight is fleet-wide, but a per-host reachability row belongs to ONE
+        // host: forwarding another host's failed row would abort this host's
+        // `execute_rollback` for a fault that is not its own
+        // (see `blocking_rollback_failures`).
+        let host_checks: Vec<PreflightCheck> = checks
+            .iter()
+            .filter(|check| {
+                !is_per_host_reachability(check) || check.scope.as_deref() == Some(host)
+            })
+            .cloned()
+            .collect();
+        outcomes[index] = if host_checks.iter().any(PreflightCheck::blocking) {
+            // Reported, never touched: its preflight row is already on screen, and
+            // probing a host that did not answer a TCP connect would only stall the
+            // hosts queued behind it.
+            eprintln!(
+                "\u{274C} [{host}] did not answer the preflight reachability probe \u{2014} \
+                 this host was NOT rolled back. The remaining hosts still are."
+            );
+            fleet::RollbackOutcome::Failed {
+                failed_step: SSH_REACHABILITY_CHECK,
+            }
+        } else {
+            rollback_one_host(
+                &host_checks,
+                cfg,
+                proxy,
+                public_port,
+                host,
+                &executors[index],
+            )
+        };
         eprintln!();
     }
 
@@ -7383,6 +7462,61 @@ mod tests {
     }
 
     #[test]
+    fn a_transport_failure_at_commit_markers_is_never_auto_rolled_back() {
+        // #1621 (§4.6, T1.15). The guard above must key on the OP that was running,
+        // not on the error shape that carried the failure. `DeployExecError::Spawn`
+        // carries no label of its own (`failed_step_label` synthesizes
+        // "ssh-transport"), so a dropped transport during `commit-markers` used to
+        // classify as Functional and auto-roll-back a host whose marker triple was
+        // never written — landing it on whatever `shared/previous-release` still
+        // named, which can be a release older than the one every other compensated
+        // host returns to, and reporting it as "previous release restored".
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in ["web-a", "web-b"] {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder = script_compensation(recorder, "web-a", "present")
+            .transport_fail("web-b", "commit-markers");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("an ambiguous-marker failure must halt the rollout");
+
+        let web_b = recorder.run_labels_for("web-b");
+        for rollback_op in [
+            "resolve-previous",
+            "probe-rollback-target",
+            "restart-previous",
+            "drain-rolled-back-slot",
+        ] {
+            assert!(
+                !web_b.contains(&rollback_op),
+                "a host whose `commit-markers` failed must see ZERO rollback-flavoured \
+                 ops whatever the error shape, got `{rollback_op}`: {web_b:?}"
+            );
+        }
+        assert_eq!(
+            recorder.run_labels_for("web-a"),
+            redeploy_then_compensated(true),
+            "the earlier host is still compensated"
+        );
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(
+            halt.manual,
+            vec![("web-b".to_owned(), fleet::MANUAL_AMBIGUOUS_MARKERS)],
+            "the host with an unprovable marker triple must be reported as needing a human"
+        );
+        assert_eq!(
+            halt.still_on_new,
+            vec!["web-b".to_owned()],
+            "it was not rolled back, so it is still on the new release"
+        );
+        assert_eq!(halt.rolled_back, vec!["web-a".to_owned()]);
+    }
+
+    #[test]
     fn a_housekeeping_failure_degrades_the_host_and_continues_the_rollout() {
         // #1621 (§4.6, T1.15). `prune` runs AFTER the flip: the proxy is already
         // serving the new release, so a failed `rm -rf` of old release dirs affects
@@ -8438,6 +8572,110 @@ mod tests {
         assert!(
             flips[2] < flips[1] && flips[1] < flips[0],
             "hosts must roll back newest-first (web-c, web-b, web-a), got positions {flips:?}"
+        );
+    }
+
+    #[test]
+    fn fleet_rollback_rolls_the_reachable_hosts_back_past_a_dead_peer() {
+        // #1621 (§3.2 vs AC-7). `deploy up` refuses the whole rollout when any host
+        // fails preflight — a rollout is a change, and starting one it cannot finish
+        // is how a fleet ends up mixed. A ROLLBACK is the opposite: it is recovery,
+        // and the host that stopped answering SSH is very often the reason the
+        // operator is rolling back. Hard-gating there leaves the healthy majority on
+        // the bad release — MORE hosts on the release being abandoned, which is the
+        // outcome the best-effort-continue contract exists to prevent.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in ["web-a", "web-c"] {
+            recorder = script_previous_release(recorder, host);
+        }
+        // web-b never answered the preflight TCP probe. It is NOT scripted at all, so
+        // the strict recorder panics if the rollback so much as probes it.
+        let checks = vec![
+            PreflightCheck::fail(
+                "ssh_reachability",
+                "cannot reach web-b:22",
+                "check the host",
+            )
+            .scoped(Some("web-b".to_owned())),
+            PreflightCheck::pass("migrate_check", "ok"),
+        ];
+        let proxy = proxy::KamalProxyController::new(60);
+
+        let err = run_fleet_rollback_with(&checks, &fleet, &proxy, FLEET_PUBLIC_PORT, |cfg| {
+            Ok(recorder.executor(cfg))
+        })
+        .expect_err("a fleet that did not fully converge must exit non-zero");
+
+        assert!(
+            matches!(
+                &err,
+                DeployError::FleetRollbackFailed {
+                    not_rolled_back: 1,
+                    total: 3
+                }
+            ),
+            "the unreachable host is reported as NOT rolled back, got: {err:?}"
+        );
+        for host in ["web-a", "web-c"] {
+            assert_eq!(
+                recorder.run_labels_for(host),
+                FLEET_ROLLBACK_RUN_LABELS.to_vec(),
+                "{host} is reachable and must be rolled back despite web-b being dead"
+            );
+        }
+        assert!(
+            recorder.run_labels_for("web-b").is_empty(),
+            "an unreachable host must not be touched at all: {:?}",
+            recorder.run_labels_for("web-b")
+        );
+    }
+
+    #[test]
+    fn a_rollback_still_hard_gates_on_a_project_wide_preflight_failure() {
+        // …and the downgrade above is narrow by construction: only a PER-HOST
+        // reachability row is survivable. A project-wide grader describes the release
+        // being rolled back TO, not one host's reachability, so it keeps the
+        // pre-#1621 hard gate — as does every check of a single-host rollback, whose
+        // rows are unscoped.
+        let reachable_fleet = vec![
+            PreflightCheck::fail(
+                "ssh_reachability",
+                "cannot reach web-b:22",
+                "check the host",
+            )
+            .scoped(Some("web-b".to_owned())),
+        ];
+        assert_eq!(
+            blocking_rollback_failures(&reachable_fleet),
+            0,
+            "a per-host reachability failure must not block the reachable hosts"
+        );
+
+        let mut project_wide = reachable_fleet;
+        project_wide.push(PreflightCheck::fail(
+            "migrate_check",
+            "migrations do not compile",
+            "fix them",
+        ));
+        assert_eq!(
+            blocking_rollback_failures(&project_wide),
+            1,
+            "a project-wide grader still aborts the whole command"
+        );
+
+        // The single-host path is untouched: its rows carry no scope, so its
+        // reachability failure is still blocking (pre-#1621 behavior verbatim).
+        let single = vec![PreflightCheck::fail(
+            "ssh_reachability",
+            "cannot reach web-a:22",
+            "check the host",
+        )];
+        assert_eq!(
+            blocking_rollback_failures(&single),
+            1,
+            "a single-host rollback must keep aborting before touching the server"
         );
     }
 

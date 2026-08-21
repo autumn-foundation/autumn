@@ -358,6 +358,29 @@ pub enum DeployExecError {
         #[source]
         source: Box<Self>,
     },
+    /// A step failed strictly AFTER the go-live boundary: traffic had already
+    /// moved, so nothing was torn down and the candidate is live. The wrapper
+    /// exists for ONE reason — to name the op that was actually running (issue
+    /// #1621, §4.6).
+    ///
+    /// Several executor errors carry no label of their own ([`Self::Spawn`],
+    /// [`Self::UploadFailed`], [`Self::Stage`]), and post-boundary the fleet's
+    /// never-auto-roll-back guard is keyed on the op label: a dropped transport
+    /// during `commit-markers` must fail closed exactly like a non-zero exit from
+    /// it, because either way the marker triple may be mid-transaction and the
+    /// rollback target unprovable.
+    ///
+    /// `Display` delegates to the wrapped error verbatim, so every operator-facing
+    /// message — the single-host path's included — is byte-for-byte what it was
+    /// before this wrapper existed. Only the fleet classifier looks inside.
+    #[error("{source}")]
+    PostCutover {
+        /// Label of the op that was running when the failure landed.
+        failed_step: &'static str,
+        /// The underlying failure (its `Display` is already redacted).
+        #[source]
+        source: Box<Self>,
+    },
 }
 
 /// Executes remote operations for a deploy. Injectable so tests can substitute a
@@ -2467,14 +2490,26 @@ fn execute_with_teardown(
     let boundary = ops.iter().position(|op| op.label() == boundary_label);
     for (index, op) in ops.iter().enumerate() {
         if let Err(source) = run_one(op, exec) {
-            // Fail safe: if the boundary op was never found (`None`), we do NOT
-            // know whether the candidate is already live, so we must never tear
-            // it down — a missing/mislabeled boundary surfaces the raw error
-            // instead of risking teardown of a possibly-live app. Only a known
-            // boundary index at or after the failing step permits teardown.
-            let at_or_before_boundary = boundary.is_some_and(|b| index <= b);
-            if !at_or_before_boundary {
-                return Err(source);
+            match boundary {
+                // Past a KNOWN boundary: traffic already moved, so the candidate is
+                // live and nothing may be torn down. The error is attributed to the
+                // op that was running — several executor errors carry no label of
+                // their own, and post-boundary policy is decided by op
+                // (`DeployExecError::PostCutover`, issue #1621 §4.6).
+                Some(b) if index > b => {
+                    return Err(DeployExecError::PostCutover {
+                        failed_step: op.label(),
+                        source: Box::new(source),
+                    });
+                }
+                // Fail safe: if the boundary op was never found (`None`), we do NOT
+                // know whether the candidate is already live, so we must never tear
+                // it down — a missing/mislabeled boundary surfaces the raw error
+                // instead of risking teardown of a possibly-live app, and does not
+                // claim to know which side of the cutover the failure landed on.
+                None => return Err(source),
+                // At or before a known boundary: teardown is safe.
+                Some(_) => {}
             }
             eprintln!(
                 "  \u{2717} {} failed — {}\u{2026}",
