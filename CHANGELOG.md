@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `#[commentable]`'s generic router gained `CommentsConfig::on_comment`, an
+  after-commit hook carrying the created comment (ids, author, body) so an app
+  adopting the router keeps its own side effects — notifications, live-feed
+  broadcasts, search indexing. `examples/reddit-clone` uses it to keep
+  announcing new comments on `/ws/feed`.
 - **Threaded, polymorphic comments — `#[commentable]` (#1367):** Autumn's fifth
   association kind. `belongs_to`/`has_many`/`has_one`/`through` all pin the
   child to exactly one parent table, which is why every app that wants comments

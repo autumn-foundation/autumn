@@ -1417,6 +1417,20 @@ pub struct CommentsConfig {
     /// draft, or role-gated records must set this** — see
     /// [`CommentsConfig::authorize`].
     pub authorize: Option<CommentAuthorizer>,
+    /// Called after a comment is successfully created through the router.
+    ///
+    /// The router deliberately owns no app-specific side effects, but a real
+    /// app has them: a notification, a live-feed broadcast, a moderation
+    /// queue, a search index. Without a hook here, adopting the generic router
+    /// means *losing* whatever a hand-rolled route used to do on create, which
+    /// is a reason not to adopt it.
+    ///
+    /// Runs **after** the comment's transaction has committed, so the row is
+    /// already durable and visible to other connections. Its result is not
+    /// awaited for correctness: a failing callback is logged and the request
+    /// still succeeds, because a broken notifier must not un-post a comment
+    /// the user already sees.
+    pub on_comment: Option<CommentCreatedHook>,
 }
 
 /// The record-level authorization callback for [`CommentsConfig::authorize`].
@@ -1428,6 +1442,34 @@ pub struct CommentsConfig {
 pub type CommentAuthorizer = std::sync::Arc<
     dyn Fn(CommentAccess) -> futures::future::BoxFuture<'static, bool> + Send + Sync,
 >;
+
+/// The post-create callback for [`CommentsConfig::on_comment`].
+#[cfg(all(feature = "db", feature = "maud"))]
+pub type CommentCreatedHook =
+    std::sync::Arc<dyn Fn(CommentCreated) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// The comment [`CommentsConfig::on_comment`] is told about.
+#[cfg(all(feature = "db", feature = "maud"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CommentCreated {
+    /// The model the comment was filed against, as stored in the
+    /// discriminator column.
+    pub commentable_type: String,
+    /// The record it was filed against.
+    pub parent_id: i64,
+    /// The new comment's own id.
+    pub comment_id: i64,
+    /// The comment being replied to, if this is a reply.
+    pub reply_to: Option<i64>,
+    /// Who wrote it.
+    pub author_id: i64,
+    /// The body as accepted — already validated against the model's
+    /// `max_body_bytes` and blank-body rules. Carried here so a notifier or a
+    /// search indexer does not have to read back the row it was just told
+    /// about.
+    pub body: String,
+}
 
 /// What [`CommentsConfig::authorize`] is asked about.
 #[cfg(all(feature = "db", feature = "maud"))]
@@ -1455,6 +1497,7 @@ impl std::fmt::Debug for CommentsConfig {
             .field("sign_in_prompt", &self.sign_in_prompt)
             .field("label", &self.label)
             .field("authorize", &self.authorize.as_ref().map(|_| "<fn>"))
+            .field("on_comment", &self.on_comment.as_ref().map(|_| "<fn>"))
             .finish()
     }
 }
@@ -1481,6 +1524,16 @@ impl CommentsConfig {
         self.authorize = Some(std::sync::Arc::new(authorize));
         self
     }
+
+    /// Set the post-create callback. See [`on_comment`](Self::on_comment).
+    #[must_use]
+    pub fn on_comment<F>(mut self, on_comment: F) -> Self
+    where
+        F: Fn(CommentCreated) -> futures::future::BoxFuture<'static, ()> + Send + Sync + 'static,
+    {
+        self.on_comment = Some(std::sync::Arc::new(on_comment));
+        self
+    }
 }
 
 #[cfg(all(feature = "db", feature = "maud"))]
@@ -1492,6 +1545,7 @@ impl Default for CommentsConfig {
             sign_in_prompt: "Sign in to join the discussion.".to_owned(),
             label: "Comments".to_owned(),
             authorize: None,
+            on_comment: None,
         }
     }
 }
@@ -1791,7 +1845,22 @@ async fn post_comment(
     // broken; re-rendering the thread with the message above the form is the
     // only feedback a no-JS visitor gets either.
     let error = match outcome {
-        Ok(_) => None,
+        Ok(created) => {
+            // After the commit, so the row a notifier goes looking for is
+            // already durable and visible on another connection.
+            if let Some(hook) = config.on_comment.as_ref() {
+                hook(CommentCreated {
+                    commentable_type: commentable_type.clone(),
+                    parent_id,
+                    comment_id: created.id,
+                    reply_to,
+                    author_id,
+                    body: submission.body.clone(),
+                })
+                .await;
+            }
+            None
+        }
         Err(err) if err.status() == http::StatusCode::UNPROCESSABLE_ENTITY => Some(err.to_string()),
         Err(err) => return Err(err),
     };

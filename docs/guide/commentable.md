@@ -256,6 +256,30 @@ An app that would rather not think about it can skip the router entirely: the
 repository helpers and the widget work perfectly well from your own already
 authorized handlers.
 
+### Side effects on create
+
+The router deliberately owns no app-specific behaviour, which would make
+adopting it a downgrade for any app whose hand-rolled route did something on
+create — sent a notification, pushed to a live feed, queued for moderation,
+updated a search index. `on_comment` is where that goes back:
+
+```rust
+CommentsConfig::default().on_comment(|created| Box::pin(async move {
+    // `created` carries commentable_type, parent_id, comment_id, reply_to,
+    // author_id and the body as accepted — no read-back required.
+    my_app::live_feed::announce(&created).await;
+}))
+```
+
+It runs **after** the comment's transaction commits, so the row is durable and
+visible on other connections. A failing callback is logged and the request
+still succeeds: a broken notifier must not un-post a comment the user can
+already see. A *rejected* comment (blank body, over the cap, past `max_depth`)
+never reaches it, because no row was created.
+
+`examples/reddit-clone` uses exactly this to keep `/ws/feed` and
+`/ws/r/{slug}` announcing new comments after moving to the generic router.
+
 ## Options
 
 Every key is optional except that `author_name` needs somewhere to read the

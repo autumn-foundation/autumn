@@ -1403,6 +1403,62 @@ async fn router_authorizes_before_it_checks_out_a_connection() {
     assert!(body.contains("visible"), "{body}");
 }
 
+/// The router owns no app-specific side effects, so an app adopting it must be
+/// able to put its own back — a notification, a live-feed broadcast, a search
+/// index. Without this hook, replacing a hand-rolled comment route with the
+/// generic one silently *loses* whatever that route did on create.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_reports_each_created_comment_to_the_app() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    drop(conn);
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = std::sync::Arc::clone(&seen);
+    let config = autumn_web::commentable::CommentsConfig::default().on_comment(move |created| {
+        let recorder = std::sync::Arc::clone(&recorder);
+        Box::pin(async move {
+            recorder.lock().expect("not poisoned").push(created);
+        })
+    });
+
+    let (status, _) = call_with_author(
+        comment_app(pool.clone(), config.clone()),
+        form_post(&format!("/comments/CmtPost/{post}"), "body=first"),
+        author,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let reports = seen.lock().expect("not poisoned").clone();
+    assert_eq!(reports.len(), 1, "one create, one report");
+    assert_eq!(reports[0].commentable_type, "CmtPost");
+    assert_eq!(reports[0].parent_id, post);
+    assert_eq!(reports[0].author_id, author);
+    assert_eq!(reports[0].reply_to, None);
+    // The body rides along, so a notifier need not read back the row it was
+    // just told about.
+    assert_eq!(reports[0].body, "first");
+    assert!(reports[0].comment_id > 0);
+
+    // A REJECTED comment must not be reported: the row does not exist.
+    let (status, _) = call_with_author(
+        comment_app(pool.clone(), config),
+        form_post(&format!("/comments/CmtPost/{post}"), "body=+++"),
+        author,
+    )
+    .await;
+    assert_eq!(status, 200, "a blank body re-renders with an inline error");
+    assert_eq!(
+        seen.lock().expect("not poisoned").len(),
+        1,
+        "a rejected comment is not a created comment"
+    );
+}
+
 /// A browser submits an *empty* hidden input as `reply_to=`. Reading that as
 /// malformed would 422 every top-level comment posted from the widget.
 #[tokio::test]

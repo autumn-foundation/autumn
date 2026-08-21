@@ -166,7 +166,18 @@ async fn main() {
         // third commentable model needs no change here.
         .nest(
             "/comments",
-            autumn_web::commentable::router(autumn_web::commentable::CommentsConfig::default()),
+            autumn_web::commentable::router(
+                autumn_web::commentable::CommentsConfig::default()
+                    // The router owns no app-specific side effects, so this is
+                    // where the app puts its own back: `/ws/feed` and
+                    // `/ws/r/{slug}` keep announcing new comments exactly as
+                    // they did when a hand-rolled route published the event.
+                    .on_comment(|created| {
+                        Box::pin(async move {
+                            live_events::publish_comment_created(&created).await;
+                        })
+                    }),
+            ),
         )
         .mail_previews(routes::auth::mail_previews())
         .policy::<Post, _>(PostPolicy)

@@ -564,7 +564,19 @@ pub async fn publish_stored_live_event_best_effort(state: &AppState, event_id: i
     }
 }
 
+/// The running app's state, captured at startup for
+/// [`publish_comment_created`].
+///
+/// The framework's comment router is mounted before the app is built, so its
+/// `on_comment` callback is a plain closure with nothing to capture. The
+/// startup hook below is the first place `AppState` exists, so it is stashed
+/// here. Best-effort by construction: a callback that fires before startup
+/// completes (it cannot) or after a failed boot simply finds `None` and does
+/// nothing, which is the right answer for a live-feed notification.
+static LIVE_FEED_STATE: std::sync::OnceLock<AppState> = std::sync::OnceLock::new();
+
 pub async fn start_live_event_relay(state: AppState) -> AutumnResult<()> {
+    let _ = LIVE_FEED_STATE.set(state.clone());
     if state.pool().is_none() {
         return Err(AutumnError::service_unavailable_msg(
             "reddit-clone live feed relay requires database.url",
@@ -905,11 +917,131 @@ pub fn post_created_event(
     })
 }
 
-// `comment_created_event` used to live here, alongside `post_created_event`.
-// It went away with `routes/comments.rs` in #1367: comments are now served by
-// the framework's generic comment router, which deliberately owns no
-// app-specific side effects. Live cross-client comment updates compose with
-// model-change broadcast (#1336) rather than with a hand-rolled route.
+// `comment_created_event` survived the move to the framework's generic comment
+// router in #1367. The router owns no app-specific side effects of its own, but
+// it does offer `CommentsConfig::on_comment` for exactly this: `main.rs` hands
+// it a callback that lands here, so `/ws/feed` and `/ws/r/{slug}` keep
+// announcing new comments as they always did. (Model-change broadcast (#1336)
+// is NOT a substitute -- comment rows are written by the framework's own SQL
+// rather than through a `#[model]` repository, so no model-change event fires
+// for them.)
+#[must_use]
+pub fn comment_created_event(
+    comment_id: i64,
+    post_id: i64,
+    post_slug: &str,
+    subreddit_slug: &str,
+    author_username: &str,
+    body: &str,
+) -> Value {
+    json!({
+        "type": "comment_created",
+        "comment_id": comment_id,
+        "post_id": post_id,
+        "post_slug": post_slug,
+        "subreddit_slug": subreddit_slug,
+        "author_username": author_username,
+        "body_preview": comment_body_preview(body),
+        "path": format!(
+            "{}#comment-{comment_id}",
+            crate::routes::posts::__autumn_path_show(subreddit_slug, post_slug)
+        ),
+    })
+}
+
+/// Collapse a comment body to a short single-line preview for the live feed.
+fn comment_body_preview(body: &str) -> String {
+    const MAX_PREVIEW_LEN: usize = 120;
+
+    let mut collapsed = String::with_capacity(body.len());
+    for word in body.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+    }
+
+    if collapsed.len() <= MAX_PREVIEW_LEN {
+        return collapsed;
+    }
+
+    let mut preview = collapsed
+        .chars()
+        .take(MAX_PREVIEW_LEN.saturating_sub(3))
+        .collect::<String>();
+    preview.push_str("...");
+    preview
+}
+
+/// Announce a comment created through the framework's comment router.
+///
+/// Wired in `main.rs` via `CommentsConfig::on_comment`. Only `Post` comments
+/// reach the feed: a `Subreddit` comment has no post to link to, and the feed's
+/// existing `comment_created` shape is post-shaped. Best-effort throughout --
+/// a comment the user can already see must not be undone by a failing notifier,
+/// so every step logs and returns rather than propagating.
+pub async fn publish_comment_created(created: &autumn_web::commentable::CommentCreated) {
+    use crate::models::Post;
+    use crate::schema::{posts, subreddits, users};
+
+    if created.commentable_type != Post::COMMENTABLE_TYPE {
+        return;
+    }
+
+    let Some(state) = LIVE_FEED_STATE.get() else {
+        return;
+    };
+    let Some(pool) = state.pool() else {
+        return;
+    };
+    let Ok(mut conn) = pool.get().await else {
+        tracing::warn!("live feed: no connection for comment_created");
+        return;
+    };
+
+    // The feed entry needs the post's slug and subreddit (for the link) and the
+    // author's username (for the byline). Two small reads rather than a join:
+    // this is a best-effort notifier, and each step has its own "give up".
+    let post: Result<(String, i64), _> = posts::table
+        .filter(posts::id.eq(created.parent_id))
+        .select((posts::slug, posts::subreddit_id))
+        .first(&mut conn)
+        .await;
+    let Ok((post_slug, subreddit_id)) = post else {
+        tracing::warn!(post_id = created.parent_id, "live feed: post not found");
+        return;
+    };
+
+    let subreddit_slug: Result<String, _> = subreddits::table
+        .filter(subreddits::id.eq(subreddit_id))
+        .select(subreddits::slug)
+        .first(&mut conn)
+        .await;
+    let Ok(subreddit_slug) = subreddit_slug else {
+        tracing::warn!(subreddit_id, "live feed: subreddit not found");
+        return;
+    };
+
+    let username: String = users::table
+        .filter(users::id.eq(created.author_id))
+        .select(users::username)
+        .first(&mut conn)
+        .await
+        .unwrap_or_else(|_| format!("user #{}", created.author_id));
+
+    let event = comment_created_event(
+        created.comment_id,
+        created.parent_id,
+        &post_slug,
+        &subreddit_slug,
+        &username,
+        &created.body,
+    );
+    match store_activity_event_for_state(state, &mut conn, &subreddit_slug, &event).await {
+        Ok(event_id) => publish_stored_live_event_best_effort(state, event_id).await,
+        Err(error) => tracing::warn!(%error, "live feed: storing comment_created failed"),
+    }
+}
 
 type AutumnResult<T> = Result<T, AutumnError>;
 
