@@ -216,6 +216,43 @@ fn eviction_sweeps_expired_lifecycle_tombstones_under_churn() {
     assert_eq!(registry.accounting_domain_count(), 1);
 }
 
+/// Lifecycle cleanup is amortized: many simultaneously-live evicted domains
+/// are retained, then reclaimed in bounded batches after their owners drop.
+#[test]
+fn lifecycle_tombstones_are_swept_incrementally() {
+    let registry = TenantCellRegistry::with_limits(1, None);
+    let mut in_flight = Vec::new();
+    for i in 0..100 {
+        in_flight.push(registry.get_or_create(&format!("stream-{i}"), 1_000));
+    }
+    assert_eq!(registry.accounting_domain_count(), 100);
+
+    drop(in_flight);
+    // Each mutation examines a fixed-size batch. Seven batches are enough for
+    // the 99 non-resident candidates; the final resident domain remains.
+    for _ in 0..7 {
+        assert!(registry.evict("not-present").is_none());
+    }
+    assert_eq!(registry.accounting_domain_count(), 1);
+}
+
+/// A resurrected cell must use one timestamp for touching and TTL enforcement,
+/// otherwise a millisecond rollover can immediately evict it at a zero TTL.
+#[test]
+fn resurrection_with_zero_idle_ttl_remains_resident() {
+    let registry = TenantCellRegistry::with_limits(0, Some(Duration::ZERO));
+    let original = registry.get_or_create("t", 1_000);
+    let evicted = registry.evict("t").expect("tenant was resident");
+
+    let resurrected = registry.get_or_create("t", 1_000);
+    assert_eq!(registry.len(), 1);
+    assert!(registry.get("t").is_some());
+
+    drop(original);
+    drop(evicted);
+    drop(resurrected);
+}
+
 /// Density smoke test: 1000 concurrent cells each holding a small buffer track
 /// exactly, and evicting all of them reclaims everything.
 #[test]

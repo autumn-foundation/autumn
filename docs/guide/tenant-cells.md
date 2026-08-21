@@ -196,8 +196,9 @@ first materialized, so eviction does **not** reset that request's state. It also
 does not hand a subsequent request a fresh empty cell while the old domain is
 alive: both requests share its scratch state and aggregate quota. `len()` and
 `is_empty()` report resident-cache membership, `accounting_domain_count()` also
-includes evicted domains retained by in-flight work, and
-`total_tracked_bytes()` covers every live domain regardless of residency.
+includes evicted domains retained by in-flight work (plus dead tombstones
+awaiting bounded incremental cleanup), and `total_tracked_bytes()` covers every
+live domain regardless of residency.
 
 **Dynamic quota.** A cell's `quota_bytes` is stored atomically rather than
 frozen at creation. Every access refreshes a resident cell's quota from the
