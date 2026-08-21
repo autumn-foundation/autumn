@@ -1317,7 +1317,9 @@ fn fleet_rolling_deploy_lifecycle() {
         body_a.contains("e2eapp v2") && body_b.contains("e2eapp v2"),
         "both hosts must still serve v2 after the halted rollout, got {body_a:?} / {body_b:?}"
     );
-    eprintln!("[fleet] 3. halt-on-host-1 OK — exit non-zero, host 2 untouched, both still serve v2");
+    eprintln!(
+        "[fleet] 3. halt-on-host-1 OK — exit non-zero, host 2 untouched, both still serve v2"
+    );
 
     // ── 4. Failure on host 2 AFTER host 1 cut over: host 1 auto-rolled back ──
     thread::sleep(Duration::from_millis(1200));
@@ -1466,7 +1468,11 @@ fn fleet_rolling_deploy_lifecycle() {
         assert!(!host["live_slot"].is_null(), "{report}");
         assert_eq!(host["drift"], serde_json::json!([]), "{report}");
     }
-    assert_eq!(report["version_drift"], serde_json::json!(false), "{report}");
+    assert_eq!(
+        report["version_drift"],
+        serde_json::json!(false),
+        "{report}"
+    );
     assert_eq!(report["state_drift"], serde_json::json!([]), "{report}");
     assert_eq!(report["drifted"], serde_json::json!(false), "{report}");
 
