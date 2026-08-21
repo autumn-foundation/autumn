@@ -146,7 +146,11 @@ Every key also has an environment override (`AUTUMN_DEPLOY__HOST`,
 `AUTUMN_DEPLOY__HOSTS`, `AUTUMN_DEPLOY__USER`, `AUTUMN_DEPLOY__SSH_PORT`, …) if
 you prefer to keep the host out of the file. `AUTUMN_DEPLOY__HOSTS` takes a
 comma-separated list (`AUTUMN_DEPLOY__HOSTS=10.0.0.1,10.0.0.2`) and **replaces**
-the whole `hosts` list from the file rather than appending to it.
+the whole `hosts` list from the file rather than appending to it. Entries are
+trimmed and blank segments are dropped, so a trailing or doubled comma is
+tolerated, and `AUTUMN_DEPLOY__HOSTS=` (empty) means *unset* — the same as
+`AUTUMN_DEPLOY__HOST=` — rather than a blank fleet entry that would refuse every
+deploy subcommand.
 
 > **`host` and `hosts` are mutually exclusive.** Setting both is refused before
 > anything runs — with both set the rollout order would be ambiguous. A blank
@@ -579,7 +583,20 @@ an unreachable host becomes a row, never an abort. It works for a single
 Each row carries: mode (`deployed` / `not deployed` / `unreachable` /
 `unknown`), the deployed release (read from the host's `current` symlink), the
 live slot, the `/ready` status code, the maintenance flag, the proxy's bound
-port, and any per-host drift reasons.
+port, that host's last deploy result, and any per-host drift reasons.
+
+> **`last deploy` is the last action that host *completed*.** It reads
+> `last deploy: deployed <UTC time>` or `last deploy: rolled back <UTC time>` —
+> the host's own `date -u` clock, from a marker written by the ops that complete
+> a cutover. A deploy that failed *before* the cutover boundary never rewrites
+> it, so the host still shows its previous action: this is a per-host fact, not
+> a verdict on the last fleet rollout (the rollout itself exits non-zero and
+> prints its own per-host outcome table). A `rolled back` host was rolled back
+> by hand or compensated after a halted rollout. The cell reads
+> `last deploy: ?` when the marker is absent or unreadable — a host that has
+> never completed a cutover, or one last deployed by a CLI that predates the
+> marker — because "we could not tell" must never render as a result. It is
+> **reported, never counted as drift**.
 
 Two kinds of drift are reported, and they are deliberately separate:
 
@@ -603,8 +620,15 @@ Two kinds of drift are reported, and they are deliberately separate:
 `--strict` exits non-zero when **any** drift is found, so drift is alertable from
 cron. The default exits `0`: status is a report, not a judgement. `--json` emits
 a stable machine-readable report on stdout — `hosts[]` (with `host`, `reachable`,
-`mode`, `release`, `live_slot`, `ready`, `maintenance`, `proxy_port`, `drift[]`),
-plus `version_drift`, `state_drift[]`, and `drifted` (the `--strict` condition).
+`mode`, `release`, `live_slot`, `ready`, `maintenance`, `proxy_port`,
+`last_deploy`, `drift[]`), plus `version_drift`, `state_drift[]`, and `drifted`
+(the `--strict` condition).
+
+`last_deploy` is `{"result", "at"}`, or `null` when the host reports no readable
+marker. `result` is `"deployed"` or `"rolled back"`; `at` is the host's own UTC
+timestamp (`null` for a marker written before the timestamp field existed). It
+records the host's last **completed** action, so a deploy that failed before
+cutover never rewrites it, and it is reported rather than counted as drift.
 
 ### Fleet maintenance
 

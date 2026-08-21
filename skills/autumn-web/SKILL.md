@@ -2120,13 +2120,18 @@ warning, not a refusal.
 
 `autumn deploy status [--json] [--strict]` is read-only and safe mid-incident:
 one row per host (mode, release from the `current` symlink, live slot, `/ready`
-code, maintenance flag, proxy port, drift reasons) plus `version_drift` (hosts on
-different releases) and `state_drift` (per-host marker damage that fails the NEXT
-deploy closed). An unreachable host is a row, not an abort; an unreadable release
-is reported as unknown and is **not** drift. `--strict` exits non-zero on any
-drift (cron-alertable); `--json` is a stable contract: `hosts[]` with `host`,
-`reachable`, `mode`, `release`, `live_slot`, `ready`, `maintenance`,
-`proxy_port`, `drift[]`, plus `version_drift`, `state_drift[]`, `drifted`.
+code, maintenance flag, proxy port, last deploy result, drift reasons) plus
+`version_drift` (hosts on different releases) and `state_drift` (per-host marker
+damage that fails the NEXT deploy closed). An unreachable host is a row, not an
+abort; an unreadable release is reported as unknown and is **not** drift.
+`last deploy` is the last action that host COMPLETED (`deployed` / `rolled back`
++ the host's UTC time, `?` when unreadable) — a deploy that failed before cutover
+never rewrites it, so it is never a verdict on the last rollout, and it is
+reported, not drift. `--strict` exits non-zero on any drift (cron-alertable);
+`--json` is a stable contract: `hosts[]` with `host`, `reachable`, `mode`,
+`release`, `live_slot`, `ready`, `maintenance`, `proxy_port`, `last_deploy`
+(`{result, at}` or null), `drift[]`, plus `version_drift`, `state_drift[]`,
+`drifted`.
 
 `autumn deploy maintenance on|off` fans maintenance mode out to every configured
 host over SSH (same flags and wire format as the local `autumn maintenance on`,

@@ -332,6 +332,14 @@ cannot be read is reported as `release unknown` and explicitly **not** counted a
 version drift. A false "your fleet is mixed" alarm at 3 am is worse than no
 alarm.
 
+Each row also carries a `last deploy` cell — the last action that host
+*completed* (`deployed` or `rolled back`, with the host's UTC time; `?` when the
+marker is absent or unreadable). Mid-incident that is what tells a compensated
+host apart from one that simply deployed, since both read back healthy and on
+the same release. Mind its scope: a deploy that failed *before* cutover never
+rewrites it, so it is that host's own last completed action rather than a
+verdict on the last rollout, and it is reported, never counted as drift.
+
 ### Converging a mixed fleet
 
 The default answer to version drift is to roll forward:
