@@ -336,9 +336,89 @@ fn comments_table_events(sql: &str) -> Vec<CommentsEvent> {
     for (at, _) in comments_statements(sql, "drop table") {
         events.push((at, CommentsEvent::Drop));
     }
+    // `ALTER TABLE comments RENAME TO archived_comments` mentions no
+    // discriminator column, so the column loop above emits nothing for it — and
+    // the table is gone all the same. Without this the scan would report a
+    // `comments` table that no longer exists and skip generating one.
+    for (at, statement) in comments_statements(sql, "alter table") {
+        let Some(rest) = statement.split(" rename to ").nth(1) else {
+            continue;
+        };
+        // `RENAME COLUMN … TO …` is a column rename, handled above.
+        if statement.contains("rename column") {
+            continue;
+        }
+        let new_name = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';');
+        if !is_comments_table_name(new_name) {
+            events.push((at, CommentsEvent::Drop));
+        }
+    }
+    // …and the reverse: a table renamed INTO `comments` becomes the table. Its
+    // statement starts with the OLD name, so `comments_statements` cannot find
+    // it; the scan is by the destination instead.
+    for (at, new_name_at) in rename_targets(sql) {
+        if is_comments_table_name(new_name_at) {
+            // Columns unknown: the rename says nothing about what the table
+            // holds, so it is recorded as a create declaring neither. A later
+            // ALTER can still add them, and until one does the scan correctly
+            // reports the table as not yet polymorphic.
+            events.push((
+                at,
+                CommentsEvent::Create {
+                    has_type: false,
+                    has_id: false,
+                },
+            ));
+        }
+    }
 
     events.sort_by_key(|(at, _)| *at);
     events.into_iter().map(|(_, event)| event).collect()
+}
+
+/// Whether `name` is one of the accepted spellings of the shared comments
+/// table, quoted or `public.`-qualified.
+fn is_comments_table_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    [
+        COMMENTS_TABLE.to_owned(),
+        format!("\"{COMMENTS_TABLE}\""),
+        format!("public.{COMMENTS_TABLE}"),
+        format!("public.\"{COMMENTS_TABLE}\""),
+        format!("\"public\".{COMMENTS_TABLE}"),
+        format!("\"public\".\"{COMMENTS_TABLE}\""),
+    ]
+    .iter()
+    .any(|accepted| accepted == trimmed)
+}
+
+/// Every `ALTER TABLE … RENAME TO <name>` in `sql`, as (offset, new name).
+///
+/// Scanned by destination because a rename INTO `comments` begins with whatever
+/// the table used to be called, which this scan has no way to know.
+fn rename_targets(lowered: &str) -> Vec<(usize, &str)> {
+    let mut found = Vec::new();
+    let mut base = 0usize;
+    while let Some(at) = lowered[base..].find(" rename to ") {
+        let start = base + at;
+        let rest = &lowered[start + " rename to ".len()..];
+        // Column renames are a different statement shape.
+        let statement_start = lowered[..start].rfind(';').map_or(0, |semi| semi + 1);
+        if !lowered[statement_start..start].contains("rename column") {
+            let name = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(';');
+            found.push((start, name));
+        }
+        base = start + " rename to ".len();
+    }
+    found
 }
 
 /// Statements of the form `<verb> [if exists] comments …`, as (offset, body).
@@ -396,38 +476,77 @@ fn strip_sql_comments(sql: &str) -> String {
 
     while i < bytes.len() {
         match bytes[i] {
-            // A quoted literal or identifier is TEXT, not syntax: a `--` inside
-            // one (`note TEXT DEFAULT '--'`) is a string, and treating it as a
-            // comment truncated the rest of the statement — dropping the
-            // discriminator columns that came after it and making the generator
-            // emit a duplicate table.
-            quote @ (b'\'' | b'"') => {
-                out.push(quote as char);
+            // A single-quoted STRING LITERAL is data, never DDL. Its contents
+            // are blanked rather than copied, because every matcher downstream
+            // scans this text for keywords, table names, columns and
+            // parentheses — and a literal can contain all four. Without this,
+            // `VALUES ('DROP TABLE comments;')` reads as a drop, and
+            // `DEFAULT ')'` closes a column list early.
+            //
+            // Length is preserved (one space per byte) so byte offsets stay
+            // valid: `comments_table_events` sorts events by position, and the
+            // body slice is taken by index.
+            b'\'' => {
+                out.push('\'');
                 i += 1;
                 while i < bytes.len() {
-                    if bytes[i] == quote {
+                    if bytes[i] == b'\'' {
                         // A doubled quote is an escaped one, still inside.
-                        if bytes.get(i + 1) == Some(&quote) {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            out.push_str("  ");
+                            i += 2;
+                            continue;
+                        }
+                        out.push('\'');
+                        i += 1;
+                        break;
+                    }
+                    let ch = sql[i..].chars().next().unwrap_or(' ');
+                    // One space per BYTE, not per char, to hold the offset.
+                    for _ in 0..ch.len_utf8() {
+                        out.push(' ');
+                    }
+                    i += ch.len_utf8();
+                }
+            }
+            // A double-quoted IDENTIFIER is a name — exactly what the matchers
+            // are looking for — so it is copied through intact. `"comments"`
+            // and `"commentable_type"` have to stay findable.
+            b'"' => {
+                out.push('"');
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        if bytes.get(i + 1) == Some(&b'"') {
                             out.push_str(&sql[i..=i + 1]);
                             i += 2;
                             continue;
                         }
-                        out.push(quote as char);
+                        out.push('"');
                         i += 1;
                         break;
                     }
-                    let ch = sql[i..].chars().next().unwrap_or(quote as char);
+                    let ch = sql[i..].chars().next().unwrap_or('"');
                     out.push(ch);
                     i += ch.len_utf8();
                 }
             }
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                i = sql[i..].find('\n').map_or(bytes.len(), |nl| i + nl);
+                let end = sql[i..].find('\n').map_or(bytes.len(), |nl| i + nl);
+                // Blanked, not dropped, so offsets survive.
+                for _ in i..end {
+                    out.push(' ');
+                }
+                i = end;
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i = sql[i + 2..]
+                let end = sql[i + 2..]
                     .find("*/")
-                    .map_or(bytes.len(), |end| i + 2 + end + 2);
+                    .map_or(bytes.len(), |e| i + 2 + e + 2);
+                for _ in i..end {
+                    out.push(' ');
+                }
+                i = end;
             }
             _ => {
                 let ch = sql[i..].chars().next().unwrap_or(' ');
@@ -1293,6 +1412,113 @@ mod tests {
              a known limit of name-based matching, pinned so it is a decision and \
              not a surprise"
         );
+    }
+
+    /// A string literal is data, not DDL. Every matcher downstream scans this
+    /// text for keywords, names, columns and parentheses — and a literal can
+    /// contain all four.
+    #[test]
+    fn sql_string_literals_are_not_read_as_ddl() {
+        let real = "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n";
+
+        // A `)` inside a literal must not close the column list early.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_paren");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (note TEXT DEFAULT ')', \
+             commentable_type TEXT, commentable_id BIGINT);\n",
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "a quoted ')' must not end the column list"
+        );
+
+        // A DROP inside a literal must not read as a drop.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let migrations = tmp.path().join("migrations");
+        let created = migrations.join("0001_create");
+        std::fs::create_dir_all(&created).expect("mkdir");
+        std::fs::write(created.join("up.sql"), real).expect("write");
+        let logged = migrations.join("0002_log");
+        std::fs::create_dir_all(&logged).expect("mkdir");
+        std::fs::write(
+            logged.join("up.sql"),
+            "INSERT INTO audit_log(message) VALUES ('DROP TABLE comments;');\n",
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "a DROP quoted inside a value is not a DROP"
+        );
+
+        // …but a real DROP still is one.
+        std::fs::write(logged.join("up.sql"), "DROP TABLE comments;\n").expect("write");
+        assert!(!already_migrated(tmp.path()));
+
+        // A quoted IDENTIFIER is a name and must stay findable.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_quoted");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE \"comments\" (\"commentable_type\" TEXT, \"commentable_id\" BIGINT);\n",
+        )
+        .expect("write");
+        assert!(already_migrated(tmp.path()), "quoted identifiers are names");
+    }
+
+    /// Renaming the table away removes it just as surely as dropping it.
+    #[test]
+    fn renaming_the_comments_table_moves_the_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let migrations = tmp.path().join("migrations");
+        let created = migrations.join("0001_create");
+        std::fs::create_dir_all(&created).expect("mkdir");
+        std::fs::write(
+            created.join("up.sql"),
+            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n",
+        )
+        .expect("write");
+        assert!(already_migrated(tmp.path()));
+
+        let renamed = migrations.join("0002_rename");
+        std::fs::create_dir_all(&renamed).expect("mkdir");
+        std::fs::write(
+            renamed.join("up.sql"),
+            "ALTER TABLE comments RENAME TO archived_comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "only archived_comments remains; `comments` has to be created again"
+        );
+
+        // Renaming a table INTO `comments` brings one back — with no columns
+        // claimed, so it is not polymorphic until an ALTER adds them.
+        let back = migrations.join("0003_rename_back");
+        std::fs::create_dir_all(&back).expect("mkdir");
+        std::fs::write(
+            back.join("up.sql"),
+            "ALTER TABLE archived_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the table is back but the scan cannot know its columns"
+        );
+
+        let columns = migrations.join("0004_columns");
+        std::fs::create_dir_all(&columns).expect("mkdir");
+        std::fs::write(
+            columns.join("up.sql"),
+            "ALTER TABLE comments ADD COLUMN commentable_type TEXT;\n\
+             ALTER TABLE comments ADD COLUMN commentable_id BIGINT;\n",
+        )
+        .expect("write");
+        assert!(already_migrated(tmp.path()));
     }
 
     /// The shared migration must survive `destroy scaffold` while any other
