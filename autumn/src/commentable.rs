@@ -778,11 +778,18 @@ fn nest(rows: Vec<Comment>) -> Vec<CommentNode> {
     let mut roots: Vec<usize> = Vec::new();
     for (position, comment) in rows.iter().enumerate() {
         match comment.parent_id.and_then(|parent| index.get(&parent)) {
-            // `*parent < position` always holds for a well-formed thread (a
+            // `parent < position` always holds for a well-formed thread (a
             // parent is inserted before its reply, and the query is ordered by
             // creation), but a clock skew or a hand-edited row could invert it.
-            // Treating such a row as a root keeps the build acyclic.
-            Some(&parent) if parent != position => children[parent].push(position),
+            //
+            // Keeping only strictly-backward edges is what makes the build
+            // acyclic, and it has to be the real test: rejecting merely
+            // `parent != position` catches a self-parenting row but not a
+            // longer cycle, and a cyclic component has no root — every comment
+            // in it would vanish from the thread rather than show up
+            // misordered. Promoting the forward edge to a root keeps them
+            // visible, which is the whole point of this defensive pass.
+            Some(&parent) if parent < position => children[parent].push(position),
             _ => roots.push(position),
         }
     }
@@ -1257,6 +1264,38 @@ mod tests {
     fn nest_survives_a_self_referential_row() {
         let rows = vec![comment(1, Some(1), "self")];
         assert_eq!(flatten(&nest(rows)), vec![(0, "self".to_owned())]);
+    }
+
+    /// A cycle longer than one node has no root, so accepting its edges would
+    /// drop every comment in the component — the opposite of what this pass is
+    /// for. Only strictly-backward edges are kept, which promotes the forward
+    /// one to a root and leaves both rows visible.
+    #[test]
+    fn nest_keeps_both_rows_of_a_two_node_cycle() {
+        // 1 -> 2 and 2 -> 1: neither is a root by parent_id alone.
+        let rows = vec![comment(1, Some(2), "a"), comment(2, Some(1), "b")];
+        let flattened = flatten(&nest(rows));
+        assert_eq!(flattened.len(), 2, "no comment may vanish: {flattened:?}");
+        assert!(
+            flattened.iter().any(|(_, body)| body == "a"),
+            "{flattened:?}"
+        );
+        assert!(
+            flattened.iter().any(|(_, body)| body == "b"),
+            "{flattened:?}"
+        );
+    }
+
+    /// Same for a longer ring, which a hand-edited or imported thread could
+    /// produce just as easily.
+    #[test]
+    fn nest_keeps_every_row_of_a_longer_cycle() {
+        let rows = vec![
+            comment(1, Some(3), "a"),
+            comment(2, Some(1), "b"),
+            comment(3, Some(2), "c"),
+        ];
+        assert_eq!(flatten(&nest(rows)).len(), 3);
     }
 
     #[test]

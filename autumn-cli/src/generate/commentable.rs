@@ -197,11 +197,15 @@ fn is_polymorphic_up_sql(up_sql: &str) -> bool {
 /// has to end where the identifier ends -- at whitespace, an opening paren, or
 /// the closing quote of a quoted identifier.
 fn creates_comments_table(lowered: &str) -> bool {
+    // `create` is part of the match, not assumed: `DROP TABLE comments;`
+    // followed by an archive table carrying the discriminator columns would
+    // otherwise read as "the shared table is already here", and the generator
+    // would emit nothing while the table it reported is gone.
     for prefix in [
-        format!("table if not exists {COMMENTS_TABLE}"),
-        format!("table if not exists \"{COMMENTS_TABLE}\""),
-        format!("table {COMMENTS_TABLE}"),
-        format!("table \"{COMMENTS_TABLE}\""),
+        format!("create table if not exists {COMMENTS_TABLE}"),
+        format!("create table if not exists \"{COMMENTS_TABLE}\""),
+        format!("create table {COMMENTS_TABLE}"),
+        format!("create table \"{COMMENTS_TABLE}\""),
     ] {
         let mut rest = lowered;
         while let Some(at) = rest.find(&prefix) {
@@ -491,6 +495,25 @@ mod tests {
             std::fs::write(dir.join("up.sql"), sql).expect("write");
             assert!(already_migrated(tmp.path()), "{sql}");
         }
+    }
+
+    /// A migration that *drops* the comments table has not created it, however
+    /// many discriminator columns appear later in the file.
+    #[test]
+    fn dropping_the_comments_table_is_not_creating_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_retire");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "DROP TABLE comments;\nCREATE TABLE comments_archive (\n    \
+             commentable_type TEXT NOT NULL,\n    commentable_id BIGINT NOT NULL\n);\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "a dropped table is not a reusable one"
+        );
     }
 
     /// The shared migration must survive `destroy scaffold` while any other
