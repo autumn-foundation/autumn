@@ -183,10 +183,14 @@ pub fn polymorphic_comment_migrations(project_root: &Path) -> Vec<std::path::Pat
 /// table.
 fn is_polymorphic_up_sql(up_sql: &str) -> bool {
     let lowered = up_sql.to_ascii_lowercase();
-    lowered.contains(&format!("table if not exists {COMMENTS_TABLE}"))
-        || (lowered.contains(&format!("table {COMMENTS_TABLE}"))
-            && lowered.contains("commentable_type")
-            && lowered.contains("commentable_id"))
+    // The discriminator pair is required for BOTH spellings. Matching an
+    // `IF NOT EXISTS` variant on the table name alone would mistake somebody
+    // else's idempotent `comments` table for this one, skip the shared
+    // migration, and report it as reused -- the same false positive the
+    // name-only check had, just narrower.
+    let creates_comments = lowered.contains(&format!("table if not exists {COMMENTS_TABLE}"))
+        || lowered.contains(&format!("table {COMMENTS_TABLE}"));
+    creates_comments && lowered.contains("commentable_type") && lowered.contains("commentable_id")
 }
 
 /// Push the shared comments migration onto `plan`, unless the project already
@@ -408,6 +412,26 @@ mod tests {
         assert!(
             !already_migrated(tmp.path()),
             "a post_id-keyed comments table is not the polymorphic one"
+        );
+    }
+
+    /// An unrelated *idempotent* `comments` table is not this migration either.
+    /// The discriminator pair is what identifies it, whichever spelling of
+    /// `CREATE TABLE` the file uses.
+    #[test]
+    fn an_unrelated_idempotent_comments_table_is_not_the_shared_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_create_comments");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE IF NOT EXISTS comments (\n    id BIGSERIAL PRIMARY KEY,\n    \
+             body TEXT NOT NULL,\n    post_id BIGINT NOT NULL\n);\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "IF NOT EXISTS does not make an unrelated table polymorphic"
         );
     }
 

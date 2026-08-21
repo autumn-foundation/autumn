@@ -214,6 +214,15 @@ pub async fn show(
             .load(&mut *db)
             .await?;
 
+    // Release this request's pooled connection before the comment read. The
+    // repository helper takes its OWN connection from the pool -- it does not
+    // join an enclosing `Db` checkout -- so holding both across the await lets
+    // `pool_size` concurrent requests each pin one connection while waiting for
+    // a second that can never arrive. Every route that pairs a `Db` query with
+    // a repository helper has to drop first; the post-detail route does the
+    // same a few lines above its own `comment_thread` call.
+    drop(db);
+
     // AC5 of #1367, in full: `Subreddit` is the SECOND commentable model, and
     // this is *all* it took -- the `#[commentable]` attribute on the model, its
     // `comment_count` column, and these few lines of rendering. No comments

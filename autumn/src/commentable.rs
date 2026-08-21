@@ -1633,6 +1633,7 @@ async fn show_thread(
     axum::extract::Query(query): axum::extract::Query<ThreadQuery>,
     session: crate::session::Session,
     csrf: Option<crate::security::csrf::CsrfToken>,
+    csrf_field: Option<crate::security::csrf::CsrfFormField>,
     mut db: crate::db::Db,
 ) -> AutumnResult<maud::Markup> {
     let spec = resolve_spec(&commentable_type)?;
@@ -1654,6 +1655,7 @@ async fn show_thread(
         parent_id,
         &thread,
         csrf.as_ref(),
+        csrf_field.as_ref(),
         author_id.is_some(),
         query
             .return_to
@@ -1674,11 +1676,17 @@ struct ThreadQuery {
 
 /// Post a comment (or a reply) and re-render the thread.
 #[cfg(all(feature = "db", feature = "maud"))]
+#[allow(clippy::too_many_arguments)] // Every argument is a distinct axum
+// extractor -- config, path, session, CSRF token, CSRF field name, htmx
+// detection, the connection, and the form body. An axum handler's arguments
+// ARE its request-state declaration; bundling them into a struct would only
+// move the same list one level down.
 async fn post_comment(
     axum::Extension(config): axum::Extension<std::sync::Arc<CommentsConfig>>,
     axum::extract::Path((commentable_type, parent_id)): axum::extract::Path<(String, i64)>,
     session: crate::session::Session,
     csrf: Option<crate::security::csrf::CsrfToken>,
+    csrf_field: Option<crate::security::csrf::CsrfFormField>,
     htmx: crate::htmx::HxRequest,
     mut db: crate::db::Db,
     axum::extract::Form(submission): axum::extract::Form<CommentSubmission>,
@@ -1753,6 +1761,7 @@ async fn post_comment(
         parent_id,
         &thread,
         csrf.as_ref(),
+        csrf_field.as_ref(),
         true,
         return_to,
         error,
@@ -1807,6 +1816,7 @@ fn render(
     parent_id: i64,
     thread: &[CommentNode],
     csrf: Option<&crate::security::csrf::CsrfToken>,
+    csrf_field: Option<&crate::security::csrf::CsrfFormField>,
     can_comment: bool,
     return_to: Option<&str>,
     error: Option<String>,
@@ -1819,6 +1829,14 @@ fn render(
     .label(config.label.clone());
     if let Some(csrf) = csrf {
         widget = widget.csrf_token(csrf.token());
+    }
+    // `CsrfLayer` scans a URL-encoded body for the CONFIGURED field name only
+    // (unlike the query-string path, which also accepts `_csrf`), so an app
+    // that set `security.csrf.form_field` needs the widget's hidden input
+    // renamed to match. Without this the fragment renders perfectly and every
+    // no-JavaScript submit from it is a 403.
+    if let Some(field) = csrf_field {
+        widget = widget.csrf_field(field.0.clone());
     }
     if let Some(return_to) = return_to {
         widget = widget.return_to(return_to);

@@ -371,7 +371,35 @@ pub fn parse_commentable_attr(
                  cannot tell two models' comments apart",
             ));
         }
-        Some(parsed) => parsed.value.clone(),
+        Some(parsed) => {
+            // The discriminator does not only land in a database column: the
+            // generic router matches it as ONE path segment
+            // (`/comments/{commentable_type}/{parent_id}`) and the widget
+            // interpolates it into an `hx-target` id selector. A name carrying
+            // `/` could never match the route; one carrying a space, `:`, `.`
+            // or `#` produces a selector that means something else entirely, so
+            // the thread would render and then never swap. Restrict it here,
+            // where the message can name the offending character, rather than
+            // let it fail as a mysterious 404 or a dead reply button.
+            let bad = parsed
+                .value
+                .chars()
+                .find(|c| !c.is_ascii_alphanumeric() && !matches!(c, '_' | '-'));
+            if let Some(bad) = bad {
+                return Err(syn::Error::new(
+                    parsed.span,
+                    format!(
+                        "`type_name` in `#[commentable]` may only contain ASCII \
+                         letters, digits, `_` and `-`, but this one contains \
+                         {bad:?}: the value is matched as a single URL path \
+                         segment by the generic router and interpolated into an \
+                         htmx id selector by the widget, and {bad:?} is valid in \
+                         neither"
+                    ),
+                ));
+            }
+            parsed.value.clone()
+        }
     };
 
     Ok(CommentableSpec {
@@ -1022,6 +1050,23 @@ mod tests {
     fn an_empty_type_name_is_rejected() {
         let message = error(&quote! { (type_name = "  ") });
         assert!(message.contains("must not be empty"), "{message}");
+    }
+
+    /// The discriminator is matched as one URL path segment and interpolated
+    /// into an htmx id selector, so it has to be safe in both.
+    #[test]
+    fn a_route_or_selector_unsafe_type_name_is_rejected() {
+        for bad in ["blog/Post", "Blog Post", "blog:Post", "Post.v2", "Post#1"] {
+            let message = error(&quote! { (type_name = #bad) });
+            assert!(
+                message.contains("URL path segment") && message.contains("id selector"),
+                "{bad} should be rejected, got: {message}"
+            );
+        }
+        // The spellings a real override would use are still accepted.
+        assert!(parse(&quote! { (by = User, type_name = "BlogPost") }).is_ok());
+        assert!(parse(&quote! { (by = User, type_name = "blog_post") }).is_ok());
+        assert!(parse(&quote! { (by = User, type_name = "blog-post-v2") }).is_ok());
     }
 
     /// Nothing joins to a display name without a table to read it from.
