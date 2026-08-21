@@ -649,7 +649,11 @@ pub struct Parameter {
     /// The schema defining the type used for the parameter.
     pub schema: serde_json::Value,
     /// Serialization style. `"form"` with `explode: true` makes each object
-    /// property a separate query key — the correct mapping for `Query<T>`.
+    /// property a separate query key — the accurate mapping for a `Query<T>`
+    /// whose fields are scalars or scalar arrays. A **nested** field decodes
+    /// from the bracketed form (`?filter[status]=open`) that
+    /// [`crate::query_string`] defines, which `form`/`explode` leaves
+    /// undefined; see the "Known gaps" note in `docs/guide/openapi.md`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub style: Option<String>,
     /// When `true` with `style: "form"`, each schema property becomes an
@@ -1201,8 +1205,14 @@ fn operation_for(
 
     // Query parameters from `Query<T>` extractor.
     // Use `style: form, explode: true` so each field of the query struct
-    // is serialized as an independent query key (e.g. `?q=foo&page=2`),
-    // which matches what the server's `Query<T>` deserialization expects.
+    // is serialized as an independent query key (e.g. `?q=foo&page=2`).
+    // That is exact for scalar and scalar-array fields. A nested field
+    // (an object, or an array of objects) is decoded from the bracketed form
+    // `crate::query_string` defines — `?filter[status]=open` — which no OpenAPI
+    // style expresses in full (`deepObject` covers one object level but not an
+    // array of objects, and would also re-introduce the parameter name that
+    // `form`/`explode` correctly drops). Documented in docs/guide/openapi.md
+    // rather than misdescribed here (issue #1972).
     if let Some(query_entry) = &api_doc.query_schema {
         parameters.push(Parameter {
             name: query_entry.name.to_owned(),

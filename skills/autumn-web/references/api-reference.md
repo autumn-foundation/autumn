@@ -376,6 +376,44 @@ back to the model's default order, and an invalid `dir` falls back to `asc`
 so only real columns can reach SQL (unknown sort/filter columns are ignored, not
 injected).
 
+**(unreleased)** — `Query<T>` decodes sequences and nested structures (#1972):
+the extractor no longer delegates to `serde_urlencoded`, so a query field does
+**not** have to be a scalar. A query string of unique scalar keys behaves
+exactly as before; on top of that it accepts
+
+| Wire form | Decodes into |
+| --- | --- |
+| `?tags=a&tags=b` | `Vec<String>` (repeated key) |
+| `?tags[]=a&tags[]=b` | `Vec<String>` (append form) |
+| `?tags[0]=a&tags[2]=c` | `Vec<String>` (indexed; gaps compacted) |
+| `?filter[status]=open` | a nested struct / map field |
+| `?items[0][sku]=A-1` | `Vec<Item>` |
+
+So prefer a real nested type over the comma-separated-string and
+JSON-in-a-string workarounds. This is the same bracket syntax `ListQuery`'s
+`?filter[<col>]=<val>` already used, generalized to arbitrary objects,
+sequences and depths — and it applies to the **query string only**: `Form<T>`
+still decodes bodies through `serde_urlencoded`.
+
+Behaviour worth knowing when writing handlers:
+
+- A duplicated key in a **single-valued** position is a 400 (`?q=a&q=b` against
+  a `String`), matching what serde's derive did before. A sequence field takes
+  every occurrence.
+- `[` and `]` in a key are now **structure**, so a `Query<HashMap<String,
+  String>>` that used to receive `?filter[a]=1` as the literal key
+  `"filter[a]"` now sees a nested object — give such a field a nested type, or
+  accept it as `serde_json::Value`.
+- An unrecognised key that the target never reads stays ignorable even if its
+  bracket syntax is malformed or contradictory.
+- Decode errors name the failing field path (`filter.limit: invalid u32 value`)
+  and never echo the submitted value.
+
+MCP `tools/call` dispatch renders a tool's `query` object into this same wire
+format, so a tool advertising a sequence or nested object round-trips into the
+handler's typed struct. See `docs/guide/mcp.md` and the
+`autumn_web::query_string` module docs.
+
 ## Optimistic concurrency (`#[lock_version]`)
 
 Declare a non-nullable `i32`/`i64` field named `lock_version` on a `#[model]`

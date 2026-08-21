@@ -152,6 +152,8 @@ mod mcp_repository;
 mod mcp_schema_derive;
 #[cfg(feature = "mcp")]
 mod mcp_streaming;
+#[cfg(feature = "mcp")]
+mod mcp_structured_query;
 mod middleware_introspection;
 mod middleware_pipeline;
 mod middleware_stack_depth;
@@ -201,6 +203,7 @@ mod problem_details;
 #[cfg(feature = "redis")]
 mod process_role_worker_gating;
 mod query_count_asserts;
+mod query_structured;
 #[cfg(feature = "redis")]
 mod queue_dedicated_capacity;
 mod range;
