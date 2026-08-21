@@ -1085,3 +1085,24 @@ fn deploy_up_rejects_an_only_host_that_is_not_in_the_fleet() {
         "the error must list the configured hosts\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
+
+#[test]
+fn deploy_up_fails_fast_without_host() {
+    // #2274: forgetting `[deploy] host` is an ordinary first-run mistake, and `up`
+    // must report it the way `check` does — at the preflight boundary, before any
+    // local prerequisite work and long before anything indexes the fleet's first
+    // host. The tier-2 harness runs with an empty `PATH`, so this asserts the
+    // fail-fast boundary itself: the run must end in the missing-host preflight
+    // report, never a panic.
+    let dir = project("");
+    let (stdout, stderr) = run_autumn_fail(dir.path(), &["deploy", "up"], &[]);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !combined.contains("panicked"),
+        "a hostless `up` must fail cleanly, not panic\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("[deploy] host") && combined.contains("hosts"),
+        "the missing-host report must name both spellings\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}

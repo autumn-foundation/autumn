@@ -2150,7 +2150,17 @@ fn collect_fleet_preflight(
     configured_host_count: usize,
 ) -> Vec<PreflightCheck> {
     let Some(shared) = fleet.hosts.first() else {
-        return Vec::new();
+        // A fleet with no entries at all (issue #2274). `ResolvedFleet::from_targets`
+        // keeps a `None`-host entry rather than dropping it, so an unconfigured
+        // `[deploy]` reaches the arm below and reports `ssh_reachability` normally —
+        // this arm is unreachable today. It still must not return NO checks: this
+        // function IS the fail-fast boundary (`run_up`, `run_check` and
+        // `run_rollback` all abort on the count it produces), and zero checks reads
+        // as "0 failed", walks the run past that boundary, and leaves the
+        // `fleet.hosts[0]` sites downstream to panic on the empty vec. `hosts` is a
+        // `pub` field, so the non-empty promise in its doc comment is not a type —
+        // the gate fails CLOSED, in the same words the single-host path uses.
+        return vec![grade_ssh_reachability(None, 0, SSH_PROBE_TIMEOUT)];
     };
     if is_single_host_deploy(fleet, configured_host_count) {
         return collect_preflight(config, shared);
@@ -3318,7 +3328,15 @@ where
         .map_err(DeployError::Config)?;
     refuse_media_fleet(input.configured_host_count, input.media_cfg.enabled)
         .map_err(DeployError::Config)?;
-    refuse_tls_fleet(input.configured_host_count, fleet.hosts[0].tls_enabled)
+    // `first()` rather than `[0]`: the shared shape is identical across the fleet,
+    // and an empty `hosts` — which `collect_fleet_preflight` now refuses to let a
+    // run reach at all (#2274) — must still surface as the missing-host config
+    // error every other hostless path returns, never as an index panic.
+    let shared = fleet
+        .hosts
+        .first()
+        .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
+    refuse_tls_fleet(input.configured_host_count, shared.tls_enabled)
         .map_err(DeployError::Config)?;
     // A warning, not a refusal: hosts racing to auto-migrate at boot is a real
     // hazard but not a certainty, and refusing would break an existing single-host
@@ -3810,17 +3828,9 @@ fn fleet_halted(
                 fleet::HostOutcome::TornDown { .. } | fleet::HostOutcome::CompensatedTeardown
             )
         }),
-        still_on_new: named(|o| {
-            matches!(
-                o,
-                fleet::HostOutcome::Serving
-                    | fleet::HostOutcome::Degraded { .. }
-                    | fleet::HostOutcome::LiveOnNew { .. }
-                    | fleet::HostOutcome::AmbiguousMarkers
-                    | fleet::HostOutcome::Manual { .. }
-                    | fleet::HostOutcome::CompensationFailed { .. }
-            )
-        }),
+        // Shared with the summary table's own list, so the halt error and the state
+        // table can never disagree about which hosts are still forward.
+        still_on_new: named(fleet::HostOutcome::on_new_release),
         degraded: degraded.to_vec(),
         manual: plan
             .hosts
@@ -3908,7 +3918,12 @@ fn run_rollback(
         });
     }
 
-    let single = &fleet.hosts[0];
+    // Same rule as the `up` driver (#2274): a hostless fleet is a config error with
+    // a message, not an index panic.
+    let single = fleet
+        .hosts
+        .first()
+        .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
     let target = exec::SshTarget::from_resolved(single)
         .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
     let executor = exec::SshExecutor::new(target);
@@ -5105,6 +5120,33 @@ mod tests {
                 .filter(|(name, _)| *name != "ssh_reachability")
                 .all(|(_, scope)| scope.is_none()),
             "project-wide graders must stay unscoped: {scoped:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_fleet_still_fails_the_preflight_gate() {
+        // #2274: `collect_fleet_preflight` is the fail-fast boundary — `run_up`,
+        // `run_check` and `run_rollback` all abort on the count it produces. Handing
+        // back ZERO checks for a hostless fleet would report "0 failed", let the run
+        // walk past that boundary, and leave the three `fleet.hosts[0]` sites
+        // downstream to panic on the empty vec.
+        //
+        // `ResolvedFleet::from_targets` keeps a `None` host rather than dropping the
+        // entry, so today every real fleet has at least one element and this arm is
+        // unreachable — but `hosts` is a `pub` field on a `pub` struct, so the
+        // invariant is a promise, not a type. The gate fails CLOSED instead of
+        // trusting it.
+        let empty = ResolvedFleet { hosts: vec![] };
+        let checks = collect_fleet_preflight(&preflight_config(), &empty, 0);
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.blocking() && check.detail.contains(DEPLOY_HOST_MISSING_DETAIL)),
+            "a fleet with no target must fail the preflight gate, not return no checks: {:?}",
+            checks
+                .iter()
+                .map(|c| (c.name, c.passed, &c.detail))
+                .collect::<Vec<_>>()
         );
     }
 

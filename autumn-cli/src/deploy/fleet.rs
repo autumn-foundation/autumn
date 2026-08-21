@@ -387,6 +387,52 @@ pub(crate) enum HostOutcome {
     },
 }
 
+impl HostOutcome {
+    /// Whether this host is left RUNNING the new release, whatever route it took
+    /// there (issue #1621, §8.2).
+    ///
+    /// The question every recovery line turns on — which hosts still need undoing —
+    /// and it is deliberately answered in one place: the summary, the halt error's
+    /// `still_on_new` list and the schema notes must never disagree about it. A
+    /// `CompensationFailed` host belongs here precisely BECAUSE the compensation
+    /// failed: it is still forward.
+    pub(crate) const fn on_new_release(&self) -> bool {
+        matches!(
+            self,
+            Self::Serving
+                | Self::Degraded { .. }
+                | Self::LiveOnNew { .. }
+                | Self::AmbiguousMarkers
+                | Self::Manual { .. }
+                | Self::CompensationFailed { .. }
+        )
+    }
+
+    /// Whether this host was touched and ended up back OFF the new release — its
+    /// candidate torn down by its own pre-boundary teardown, or put back by fleet
+    /// compensation.
+    ///
+    /// With [`HostOutcome::on_new_release`] this exhaustively partitions every
+    /// variant except [`HostOutcome::Untouched`], which is the point: "the fleet is
+    /// not forward" is then provable rather than assumed, and a variant added later
+    /// cannot quietly fall into neither set — the `match` below has no wildcard.
+    pub(crate) const fn went_back(&self) -> bool {
+        match self {
+            Self::RolledBack { .. }
+            | Self::TornDown { .. }
+            | Self::CompensatedRollback
+            | Self::CompensatedTeardown => true,
+            Self::Untouched
+            | Self::Serving
+            | Self::Degraded { .. }
+            | Self::LiveOnNew { .. }
+            | Self::AmbiguousMarkers
+            | Self::Manual { .. }
+            | Self::CompensationFailed { .. } => false,
+        }
+    }
+}
+
 /// How bad a POST-boundary failure is (issue #1621, §4.6).
 ///
 /// "Post-boundary" means `exec::execute_with_teardown` returned the RAW executor
@@ -724,6 +770,22 @@ pub(crate) const FLEET_RECOVERY_HINT: &str = "Roll ONE back with `autumn deploy 
 pub(crate) const FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE: &str = "the compensating rollback restored BINARIES only — the migration that already ran was \
      NOT rolled back; confirm the schema still fits the release now serving";
 
+/// The same binaries-versus-schema truth for the rollout where NOTHING was
+/// compensated because nothing needed to be (issue #1621).
+///
+/// The fleet's one migration runs on the first redeploy host, and a PRE-boundary
+/// failure after it — a `readiness-gate` timeout is the ordinary shape — makes that
+/// host tear its own candidate down ([`HostOutcome::RolledBack`]) while every later
+/// host stays [`HostOutcome::Untouched`]. No host ever reached the new release, so
+/// the fleet driver has nothing to compensate and never says the word: the operator
+/// is left reading a table of "previous release still serving" rows with no hint
+/// that the database underneath them has already moved on. Same hazard as
+/// [`FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE`], different cause — so it gets its own
+/// sentence rather than borrowing one that claims a compensating rollback ran.
+pub(crate) const FLEET_SCHEMA_AHEAD_OF_BINARIES_NOTE: &str = "no host is serving the new release, but the migration that already ran was NOT rolled \
+     back — the binaries went back and the schema did not; confirm the release now serving \
+     still fits the migrated schema";
+
 /// Whether this rollout moved the schema, judged conservatively (issue #1621).
 ///
 /// True when the plan scheduled a migration AND the host carrying it was reached at
@@ -941,17 +1003,7 @@ pub(crate) fn fleet_summary_lines(
         .hosts
         .iter()
         .zip(outcomes)
-        .filter(|(_, outcome)| {
-            matches!(
-                outcome,
-                HostOutcome::Serving
-                    | HostOutcome::Degraded { .. }
-                    | HostOutcome::LiveOnNew { .. }
-                    | HostOutcome::AmbiguousMarkers
-                    | HostOutcome::Manual { .. }
-                    | HostOutcome::CompensationFailed { .. }
-            )
-        })
+        .filter(|(_, outcome)| outcome.on_new_release())
         .map(|(host, _)| host.host.as_str())
         .collect();
     if !on_new.is_empty() {
@@ -959,31 +1011,52 @@ pub(crate) fn fleet_summary_lines(
             "  On {release_id}: {}. {FLEET_RECOVERY_HINT}",
             on_new.join(", ")
         ));
-        // Gated on the MIGRATION, not on liveness: `on_new` says hosts are serving
-        // the new release, which is a different question. An all-first-deploy fleet
-        // schedules no migration at all, and the same run's header says so out loud
-        // ("run `autumn migrate` yourself before serving traffic") — asserting the
-        // schema moved here would negate that instruction on the last line before
-        // the green one.
-        if schema_moved(plan, outcomes) {
+    }
+    // The binaries-versus-schema truth, said once, in whichever tense is TRUE.
+    //
+    // The question the operator needs answered is never "did the fleet compensate"
+    // — it is "the schema is at the new release; where are the binaries?". So the
+    // migration is the gate, and the fleet's shape only picks the sentence:
+    //
+    // * some host is still forward — a rollback from here restores binaries only;
+    // * the fleet undid hosts itself — that rollback restored binaries only;
+    // * nothing is forward and nothing was compensated — the migrating host tore
+    //   its own candidate down (a pre-boundary failure AFTER `migrate`), so every
+    //   binary went back on its own and the schema stayed put. This last case used
+    //   to print NOTHING at all, which is the worst of the three to be silent about.
+    //
+    // Gating on the migration and not on liveness also keeps an all-first-deploy
+    // fleet silent: it schedules no migration, and the same run's header already
+    // told the operator to run `autumn migrate` themselves — asserting the schema
+    // moved here would negate that instruction on the last line before the green
+    // one.
+    if schema_moved(plan, outcomes) {
+        if !on_new.is_empty() {
             lines.push(format!("  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_MOVED_NOTE}"));
         }
-    }
-    // Say the binaries-only truth once the fleet has ACTUALLY undone hosts: at that
-    // point the operator is looking at a fleet back on the old release with a schema
-    // that is not.
-    let compensated = outcomes.iter().any(|outcome| {
-        matches!(
-            outcome,
-            HostOutcome::CompensatedRollback
-                | HostOutcome::CompensatedTeardown
-                | HostOutcome::CompensationFailed { .. }
-        )
-    });
-    if compensated && schema_moved(plan, outcomes) {
-        lines.push(format!(
-            "  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE}"
-        ));
+        // Only hosts the fleet actually PUT BACK count as compensated: a
+        // `CompensationFailed` host is still on the new release (it is in `on_new`
+        // above), so on its own it restored no binaries and the note would be false.
+        let compensated = outcomes.iter().any(|outcome| {
+            matches!(
+                outcome,
+                HostOutcome::CompensatedRollback | HostOutcome::CompensatedTeardown
+            )
+        });
+        if compensated {
+            lines.push(format!(
+                "  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE}"
+            ));
+        } else if on_new.is_empty() && outcomes.iter().any(HostOutcome::went_back) {
+            // `on_new_release()` and `went_back()` partition every touched host, and
+            // `schema_moved` proves at least one host was touched — so the second
+            // half of this condition is implied by the first; it is spelled out so
+            // the sentence below ("the binaries went back") is read off the outcomes
+            // rather than inferred from them.
+            lines.push(format!(
+                "  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_AHEAD_OF_BINARIES_NOTE}"
+            ));
+        }
     }
     lines
 }
@@ -3114,6 +3187,147 @@ mod tests {
             migrated.contains(FLEET_SCHEMA_MOVED_NOTE),
             "the migrating fleet DID move the schema and must say so:\n{migrated}"
         );
+    }
+
+    #[test]
+    fn the_summary_states_the_schema_truth_when_the_migrating_host_rolls_itself_back() {
+        // #1621: the fleet's single migration runs on the FIRST redeploy host, and a
+        // pre-boundary failure AFTER it (a `readiness-gate` timeout, say) tears that
+        // host's own candidate down — no fleet compensation is involved, and every
+        // later host stays untouched. That leaves the whole fleet on the PREVIOUS
+        // binaries against the NEW schema, which is exactly the state an operator
+        // must be told about; before this test the summary said nothing at all,
+        // because one note was gated on a host being on the new release and the
+        // other on fleet compensation having run.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let plan = plan_fleet(
+            &fleet,
+            &[HostMode::Redeploy, HostMode::Redeploy, HostMode::Redeploy],
+        )
+        .expect("a well-formed fleet plans");
+        assert_eq!(
+            plan.hosts[0].migrate,
+            MigrateStep::Run,
+            "the fleet migration lands on the first redeploy host"
+        );
+        let outcomes = [
+            HostOutcome::RolledBack {
+                failed_step: "readiness-gate",
+            },
+            HostOutcome::Untouched,
+            HostOutcome::Untouched,
+        ];
+        assert!(
+            schema_moved(&plan, &outcomes),
+            "the migrating host was reached, so the schema moved"
+        );
+        let rendered = fleet_summary_lines(&plan, &outcomes, "20260714T120000Z").join("\n");
+
+        assert!(
+            rendered.contains(FLEET_SCHEMA_AHEAD_OF_BINARIES_NOTE),
+            "the migration ran and every binary went back, so the summary must say the \
+             schema did NOT come back with them:\n{rendered}"
+        );
+        // …in the wording that is TRUE here: nothing was compensated (the host tore
+        // its own candidate down), and nothing is on the new release.
+        assert!(
+            !rendered.contains(FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE)
+                && !rendered.contains(FLEET_SCHEMA_MOVED_NOTE),
+            "no compensation ran and no host is forward, so neither of those notes is \
+             true here:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(FLEET_RECOVERY_HINT),
+            "no host is on the new release, so there is nothing to roll back:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn exactly_one_schema_note_speaks_for_every_outcome_mix() {
+        // #1621: the three schema notes describe the SAME fact in three different
+        // states of the fleet, so two rules hold across every mix: whenever the
+        // migration ran, at least one of them speaks (the hole this pins shut), and
+        // the "nothing is forward" note never appears next to either the recovery
+        // hint or the compensation note, whose sentences would contradict it.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let plan = plan_fleet(
+            &fleet,
+            &[HostMode::Redeploy, HostMode::Redeploy, HostMode::Redeploy],
+        )
+        .expect("a well-formed fleet plans");
+        let readiness = "readiness-gate";
+        let mixes: [[HostOutcome; 3]; 7] = [
+            // The migrating host tears its own candidate down.
+            [
+                HostOutcome::RolledBack {
+                    failed_step: readiness,
+                },
+                HostOutcome::Untouched,
+                HostOutcome::Untouched,
+            ],
+            // A later host fails and the fleet compensates the migrating one.
+            [
+                HostOutcome::CompensatedRollback,
+                HostOutcome::RolledBack {
+                    failed_step: readiness,
+                },
+                HostOutcome::Untouched,
+            ],
+            // Compensation itself failed: that host is STILL on the new release.
+            [
+                HostOutcome::CompensationFailed {
+                    failed_step: "proxy-flip-back",
+                },
+                HostOutcome::RolledBack {
+                    failed_step: readiness,
+                },
+                HostOutcome::Untouched,
+            ],
+            // Partly compensated, partly stranded.
+            [
+                HostOutcome::CompensatedRollback,
+                HostOutcome::AmbiguousMarkers,
+                HostOutcome::Untouched,
+            ],
+            // Halted with hosts left forward, no compensation attempted.
+            [
+                HostOutcome::Serving,
+                HostOutcome::RolledBack {
+                    failed_step: readiness,
+                },
+                HostOutcome::Untouched,
+            ],
+            // A degraded but complete rollout.
+            [
+                HostOutcome::Serving,
+                HostOutcome::Degraded { label: "prune" },
+                HostOutcome::Serving,
+            ],
+            // Nothing was reached at all: no migration, no schema claim.
+            [
+                HostOutcome::Untouched,
+                HostOutcome::Untouched,
+                HostOutcome::Untouched,
+            ],
+        ];
+
+        for mix in &mixes {
+            let rendered = fleet_summary_lines(&plan, mix, "20260714T120000Z").join("\n");
+            let moved = rendered.contains(FLEET_SCHEMA_MOVED_NOTE);
+            let not_rolled_back = rendered.contains(FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE);
+            let ahead = rendered.contains(FLEET_SCHEMA_AHEAD_OF_BINARIES_NOTE);
+            assert_eq!(
+                schema_moved(&plan, mix),
+                moved || not_rolled_back || ahead,
+                "the summary must state the schema truth exactly when the migration ran \
+                 ({mix:?}):\n{rendered}"
+            );
+            assert!(
+                !(ahead && (moved || not_rolled_back || rendered.contains(FLEET_RECOVERY_HINT))),
+                "\"nothing is forward\" cannot share a summary with a note that says \
+                 something is ({mix:?}):\n{rendered}"
+            );
+        }
     }
 
     #[test]
