@@ -34,11 +34,18 @@ internet connection.
 ## Push-button deploy to your own server (`autumn deploy`)
 
 `autumn deploy` takes a fresh project to a live, zero-downtime service on a
-single Linux VPS you control — no Dockerfile, no container registry, no PaaS
+Linux VPS you control — no Dockerfile, no container registry, no PaaS
 account. It uploads a single embedded binary, supervises it with systemd behind
 a reverse proxy, migrates before cutover, health-gates on `/ready`, and flips
 traffic atomically. Re-running it is a zero-downtime redeploy; one command rolls
 back.
+
+List several servers under `[deploy] hosts` instead of one under `[deploy] host`
+and the same command becomes a **rolling deploy across the fleet**: hosts are
+replaced one at a time in declaration order, migrations run exactly once, and a
+mid-rollout failure halts and rolls the hosts that already cut over back. See
+[Rolling deploy across a fleet](#rolling-deploy-across-a-fleet) and the
+[fleet deploys guide](fleet-deploys.md).
 
 This is the **primary** deployment path. A few alternatives remain documented
 below and are better fits in specific cases:
@@ -124,6 +131,10 @@ Point the deploy at your server by adding a `[deploy]` section to `autumn.toml`:
 ```toml
 [deploy]
 host = "203.0.113.10"     # SSH-reachable IP or hostname of your VPS (required)
+# hosts = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+#                         # a FLEET instead of one server (see "Rolling deploy
+#                         # across a fleet"). Mutually exclusive with `host`;
+#                         # the list order IS the rollout order.
 # user = "root"           # SSH user (default: root)
 # ssh_port = 22           # SSH port (default: 22)
 # app_dir = "/srv/autumn/myapp"   # remote install dir (default: /srv/autumn/<app_name>)
@@ -132,8 +143,16 @@ host = "203.0.113.10"     # SSH-reachable IP or hostname of your VPS (required)
 ```
 
 Every key also has an environment override (`AUTUMN_DEPLOY__HOST`,
-`AUTUMN_DEPLOY__USER`, `AUTUMN_DEPLOY__SSH_PORT`, …) if you prefer to keep the
-host out of the file.
+`AUTUMN_DEPLOY__HOSTS`, `AUTUMN_DEPLOY__USER`, `AUTUMN_DEPLOY__SSH_PORT`, …) if
+you prefer to keep the host out of the file. `AUTUMN_DEPLOY__HOSTS` takes a
+comma-separated list (`AUTUMN_DEPLOY__HOSTS=10.0.0.1,10.0.0.2`) and **replaces**
+the whole `hosts` list from the file rather than appending to it.
+
+> **`host` and `hosts` are mutually exclusive.** Setting both is refused before
+> anything runs — with both set the rollout order would be ambiguous. A blank
+> entry or a repeated entry in `hosts` is refused too (deploying the same server
+> twice would corrupt its previous-release chain). A one-entry `hosts` list is
+> byte-for-byte the historical single-server deploy.
 
 Put these two values in a project `.env` (git-ignored — never committed). The
 deploy reads them and writes **only** them to a `0600` env file
@@ -210,7 +229,15 @@ from pending migrations — an old destructive migration file left in the direct
 fails the check even after it has been applied. Keep `migrations/` rolling-safe
 (remove or adjust an already-applied destructive migration if it trips the scan).
 The preflight exits non-zero if anything fails, so nothing touches the server
-until it is green:
+until it is green.
+
+With a fleet (`[deploy] hosts`), **every host the run targets is graded before
+any host is touched**: SSH reachability is probed once per host and reported on
+its own line (`ssh_reachability (10.0.0.3)`), while the project-wide graders —
+signing secret, database URL, migrate-safety — run once. So an unreachable host
+in position 3 is named before host 1 is deployed, not after two hosts have
+already cut over. `autumn deploy up` and `autumn deploy rollback` re-run this
+same fleet-wide preflight and abort on any failure.
 
 ```bash
 autumn deploy check      # doctor --online runs the same graders (plain doctor skips network probes)
