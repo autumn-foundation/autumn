@@ -1037,7 +1037,17 @@ pub async fn publish_comment_created(created: &autumn_web::commentable::CommentC
         &username,
         &created.body,
     );
-    match store_activity_event_for_state(state, &mut conn, &subreddit_slug, &event).await {
+    let stored = store_activity_event_for_state(state, &mut conn, &subreddit_slug, &event).await;
+
+    // Release the database connection before publishing. With
+    // `distributed.live_feed_bus.kind = redis_pubsub` the publish opens a Redis
+    // connection and has no timeout of its own, so holding this checkout across
+    // it lets a slow or unreachable Redis pin database connections that the
+    // publish does not even use -- starving unrelated queries for as long as
+    // Redis takes to answer.
+    drop(conn);
+
+    match stored {
         Ok(event_id) => publish_stored_live_event_best_effort(state, event_id).await,
         Err(error) => tracing::warn!(%error, "live feed: storing comment_created failed"),
     }

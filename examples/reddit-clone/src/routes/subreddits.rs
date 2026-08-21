@@ -326,9 +326,11 @@ pub async fn show(
 
             // Community discussion -- the second `#[commentable]` model (#1367).
             div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mt-6" {
-                h2 class="font-semibold text-gray-700 mb-2" {
-                    (sub.comment_count) " community comments"
-                }
+                // No count, for the same reason as the post detail page: an
+                // htmx reply swaps only the widget's own region, so a number
+                // rendered outside it would go stale the moment someone
+                // replies.
+                h2 class="font-semibold text-gray-700 mb-2" { "Community discussion" }
                 (comment_thread(&comment_config, &CommentView::from_thread(&thread)))
             }
         },

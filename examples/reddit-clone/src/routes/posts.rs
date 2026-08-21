@@ -839,9 +839,13 @@ pub async fn show(
             // generic comment route -- with htmx it swaps the thread in place,
             // and without any JavaScript at all it is an ordinary form POST
             // that comes back here via `return_to`.
-            h2 class="font-semibold text-gray-700 mb-2" {
-                (post.comment_count) " Comments"
-            }
+            // Deliberately no count here. An htmx reply swaps ONLY the widget's
+            // own region (`hx-target` / `outerHTML`), so anything rendered
+            // outside it -- a heading like this one -- would still show the
+            // pre-reply number until a full page load. A stale count next to a
+            // freshly posted comment is worse than no count; the listings show
+            // `comment_count`, and those are always full loads.
+            h2 class="font-semibold text-gray-700 mb-2" { "Comments" }
             (comment_thread_widget(&comment_config, &CommentView::from_thread(&comment_thread)))
         },
     ))
