@@ -476,6 +476,15 @@ pub fn sharded_commentable_type() -> Option<&'static str> {
 /// `{Model}Comments` helpers) would otherwise never reach the check at all,
 /// which is exactly the app most likely to have models in separate modules.
 ///
+/// **Scoped to storage, not to the name.** A collision only misfiles rows when
+/// the two models share the same comments table *and* the same discriminator
+/// columns. `#[commentable(table = …)]` is a supported override, and two
+/// same-named models pointed at different tables are as isolated as two
+/// unrelated apps — panicking on those would make a legitimate configuration
+/// unusable. [`router`] applies the stricter name-only check on top, because a
+/// mounted router dispatches on the string alone and a duplicate is ambiguous
+/// there whatever the storage.
+///
 /// Checked once per process — the registry is built at load time and cannot
 /// change afterwards — so this costs one atomic load per call.
 #[cfg(feature = "db")]
@@ -483,13 +492,34 @@ fn assert_unique_discriminators() {
     static CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     CHECKED.get_or_init(|| {
         assert!(
-            duplicate_commentable_type().is_none(),
-            "two #[commentable] models share the commentable_type {:?}: the shared comments \
-             table cannot tell their rows apart, so each would read and delete the other's \
-             comments. Give one of them `#[commentable(type_name = \"…\")]`.",
-            duplicate_commentable_type().unwrap_or_default(),
+            duplicate_commentable_storage().is_none(),
+            "two #[commentable] models share the commentable_type {:?} **and** the same \
+             comments storage, so the table cannot tell their rows apart: each would read \
+             and delete the other's comments. Give one of them \
+             `#[commentable(type_name = \"…\")]`, or point it at its own \
+             `#[commentable(table = …)]`.",
+            duplicate_commentable_storage().unwrap_or_default(),
         );
     });
+}
+
+/// The `commentable_type` shared by two models that also share their comments
+/// storage — the combination that actually misfiles rows.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn duplicate_commentable_storage() -> Option<&'static str> {
+    let mut seen = std::collections::HashSet::new();
+    inventory::iter::<CommentableDescriptor>()
+        .find(|descriptor| {
+            let spec = descriptor.spec;
+            !seen.insert((
+                descriptor.type_name,
+                spec.comments_table,
+                spec.type_column,
+                spec.id_column,
+            ))
+        })
+        .map(|descriptor| descriptor.type_name)
 }
 
 // ── Write path ──────────────────────────────────────────────────────────────

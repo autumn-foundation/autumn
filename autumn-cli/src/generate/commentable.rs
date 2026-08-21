@@ -183,10 +183,14 @@ pub fn polymorphic_comment_migrations(project_root: &Path) -> Vec<std::path::Pat
 /// table.
 fn is_polymorphic_up_sql(up_sql: &str) -> bool {
     let lowered = strip_sql_comments(&up_sql.to_ascii_lowercase());
-    let lowered = lowered.as_str();
-    creates_comments_table(lowered)
-        && lowered.contains("commentable_type")
-        && lowered.contains("commentable_id")
+    // The discriminator columns have to belong to the `comments` statement
+    // itself. Searching the whole file would let an ordinary `comments` table
+    // sitting beside an unrelated table that happens to carry
+    // `commentable_type`/`commentable_id` pass as the shared migration -- the
+    // generator would then skip emitting it, and every helper would fail on the
+    // columns `comments` does not have.
+    comments_table_body(&lowered)
+        .is_some_and(|body| body.contains("commentable_type") && body.contains("commentable_id"))
 }
 
 /// `sql` with `--` line comments and `/* … */` blocks removed.
@@ -223,39 +227,73 @@ fn strip_sql_comments(sql: &str) -> String {
     }
 }
 
-/// Whether `lowered` contains a `CREATE TABLE` naming **exactly** the shared
-/// comments table.
+/// The column list of a `CREATE TABLE` naming **exactly** the shared comments
+/// table, or `None` when `lowered` creates no such table.
+///
+/// Returns the text between the statement's outer parentheses, so callers can
+/// ask what *this* table declares rather than what the file mentions anywhere.
+fn comments_table_body(lowered: &str) -> Option<&str> {
+    let start = comments_table_statement_start(lowered)?;
+    let open = lowered[start..].find('(')? + start;
+    // Balance parens: a column can carry its own, e.g. `NUMERIC(10, 2)`.
+    let mut depth = 0usize;
+    for (offset, ch) in lowered[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&lowered[open + 1..open + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Unbalanced SQL: treat the rest of the file as the body rather than
+    // silently reporting "no such table" for a migration that does create one.
+    Some(&lowered[open + 1..])
+}
+
+/// Where a `CREATE TABLE` naming exactly the shared comments table begins.
 ///
 /// A prefix match is not enough: `CREATE TABLE comments_archive (...)` carrying
 /// the discriminator columns would satisfy every other check, and the generator
 /// would then skip the real table while reporting that it was reused. The name
 /// has to end where the identifier ends -- at whitespace, an opening paren, or
 /// the closing quote of a quoted identifier.
-fn creates_comments_table(lowered: &str) -> bool {
+fn comments_table_statement_start(lowered: &str) -> Option<usize> {
     // `create` is part of the match, not assumed: `DROP TABLE comments;`
     // followed by an archive table carrying the discriminator columns would
     // otherwise read as "the shared table is already here", and the generator
     // would emit nothing while the table it reported is gone.
+    //
+    // The name must also end where the identifier ends -- at whitespace, an
+    // opening paren, or a closing quote -- so `comments_archive` is not
+    // mistaken for `comments`.
+    let mut best: Option<usize> = None;
     for prefix in [
         format!("create table if not exists {COMMENTS_TABLE}"),
         format!("create table if not exists \"{COMMENTS_TABLE}\""),
         format!("create table {COMMENTS_TABLE}"),
         format!("create table \"{COMMENTS_TABLE}\""),
     ] {
-        let mut rest = lowered;
-        while let Some(at) = rest.find(&prefix) {
-            let after = &rest[at + prefix.len()..];
-            // A quoted spelling already ended at its closing quote.
+        let mut base = 0usize;
+        while let Some(at) = lowered[base..].find(&prefix) {
+            let start = base + at;
+            let after = &lowered[start + prefix.len()..];
             if prefix.ends_with('"')
                 || after.is_empty()
                 || after.starts_with(|c: char| c.is_whitespace() || c == '(' || c == ';')
             {
-                return true;
+                // Earliest match wins, so the body belongs to the first such
+                // statement in the file.
+                best = Some(best.map_or(start, |b: usize| b.min(start)));
+                break;
             }
-            rest = &rest[at + prefix.len()..];
+            base = start + prefix.len();
         }
     }
-    false
+    best
 }
 
 /// Push the shared comments migration onto `plan`, unless the project already
@@ -577,6 +615,47 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(dir.join("up.sql"), up_sql(DatabaseBackend::Postgres)).expect("write");
         assert!(already_migrated(tmp.path()));
+    }
+
+    /// The discriminator columns have to belong to the `comments` statement
+    /// itself. A file that creates an ordinary `comments` table next to an
+    /// unrelated table carrying those columns is not the shared migration.
+    #[test]
+    fn discriminator_columns_on_another_table_do_not_count() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_mixed");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (\n    id BIGSERIAL PRIMARY KEY,\n    \
+             body TEXT NOT NULL,\n    post_id BIGINT NOT NULL\n);\n\
+             CREATE TABLE audit_log (\n    id BIGSERIAL PRIMARY KEY,\n    \
+             commentable_type TEXT NOT NULL,\n    commentable_id BIGINT NOT NULL\n);\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the discriminator columns belong to audit_log, not to comments"
+        );
+    }
+
+    /// …and a column list with its own parentheses still parses.
+    #[test]
+    fn a_nested_paren_in_the_column_list_does_not_truncate_the_body() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_nested");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (\n    id BIGSERIAL PRIMARY KEY,\n    \
+             score NUMERIC(10, 2) NOT NULL DEFAULT 0,\n    \
+             commentable_type TEXT NOT NULL,\n    commentable_id BIGINT NOT NULL\n);\n",
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "NUMERIC(10, 2) must not end the column list early"
+        );
     }
 
     /// The shared migration must survive `destroy scaffold` while any other
