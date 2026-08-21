@@ -2065,8 +2065,15 @@ async fn post_comment(
 
     // Read everything this response still needs from the database BEFORE the
     // hook runs, so the connection can be released first.
+    //
+    // The result is HELD rather than `?`-propagated: the comment is already
+    // committed by this point, and a transient failure re-reading the thread
+    // must not cost it its notification, live-feed entry or search-index write.
+    // Returning early here would leave a durable comment the rest of the system
+    // never hears about — a silent inconsistency worse than the refresh failure
+    // the caller is about to be told about anyway.
     let thread = if redirecting {
-        Vec::new()
+        Ok(Vec::new())
     } else {
         comment_thread(
             &mut db,
@@ -2075,7 +2082,7 @@ async fn post_comment(
             parent_id,
             tenant.as_deref(),
         )
-        .await?
+        .await
     };
 
     // Release the checkout before awaiting the hook. `on_comment` is documented
@@ -2104,6 +2111,10 @@ async fn post_comment(
         })
         .await;
     }
+
+    // Now that the hook has run for the committed comment, a failed refresh can
+    // surface.
+    let thread = thread?;
 
     if redirecting && let Some(return_to) = return_to {
         return Ok(crate::Redirect::to(return_to).into_response());

@@ -188,6 +188,30 @@ pub fn already_migrated(project_root: &Path) -> bool {
     creates && (created_with_discriminators || (altered_type && altered_id))
 }
 
+/// Whether `haystack` mentions `column` as a complete SQL identifier.
+///
+/// A bare `contains` would accept `legacy_commentable_type` as
+/// `commentable_type`, classify a table that lacks the real columns as
+/// polymorphic, and make the generator skip the shared migration while
+/// reporting that it reused the table — with every helper then failing at
+/// runtime on columns that are not there. The same identifier-boundary rule the
+/// table name gets; columns had been left as substrings.
+fn mentions_column(haystack: &str, column: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut base = 0usize;
+    while let Some(at) = haystack[base..].find(column) {
+        let start = base + at;
+        let end = start + column.len();
+        let before_ok = start == 0 || !haystack[..start].ends_with(is_ident);
+        let after_ok = !haystack[end..].starts_with(is_ident);
+        if before_ok && after_ok {
+            return true;
+        }
+        base = end;
+    }
+    false
+}
+
 /// What one statement does to the shared comments table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommentsEvent {
@@ -209,15 +233,15 @@ fn comments_table_events(sql: &str) -> Vec<CommentsEvent> {
 
     if let Some(start) = comments_table_statement_start(sql) {
         let discriminated = comments_table_body(sql).is_some_and(|body| {
-            body.contains("commentable_type") && body.contains("commentable_id")
+            mentions_column(body, "commentable_type") && mentions_column(body, "commentable_id")
         });
         events.push((start, CommentsEvent::Create { discriminated }));
     }
     for (at, statement) in comments_statements(sql, "alter table") {
-        if statement.contains("commentable_type") {
+        if mentions_column(statement, "commentable_type") {
             events.push((at, CommentsEvent::AddType));
         }
-        if statement.contains("commentable_id") {
+        if mentions_column(statement, "commentable_id") {
             events.push((at, CommentsEvent::AddId));
         }
     }
@@ -885,6 +909,44 @@ mod tests {
             dir.join("up.sql"),
             "DROP TABLE IF EXISTS comments;\n\
              CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n",
+        )
+        .expect("write");
+        assert!(already_migrated(tmp.path()));
+    }
+
+    /// Column names need the same identifier-boundary rule the table name
+    /// gets: `legacy_commentable_type` is not `commentable_type`.
+    #[test]
+    fn similarly_named_columns_do_not_look_like_the_discriminator() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_legacy");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (\n    id BIGSERIAL PRIMARY KEY,\n    \
+             legacy_commentable_type TEXT NOT NULL,\n    \
+             legacy_commentable_id BIGINT NOT NULL\n);\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "legacy_* columns are not the discriminator pair"
+        );
+
+        // A trailing suffix is no better than a leading one.
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (\n    commentable_type_old TEXT,\n    \
+             commentable_id_old BIGINT\n);\n",
+        )
+        .expect("write");
+        assert!(!already_migrated(tmp.path()));
+
+        // …and the real columns still register, quoted or not.
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (\n    \"commentable_type\" TEXT NOT NULL,\n    \
+             commentable_id BIGINT NOT NULL\n);\n",
         )
         .expect("write");
         assert!(already_migrated(tmp.path()));
