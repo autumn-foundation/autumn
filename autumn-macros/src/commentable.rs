@@ -767,7 +767,7 @@ pub fn emit_commentable_items(
                 type_name: #type_name,
                 // The model's own name, which `type_name` may have renamed.
                 // The sharded-repository registry is keyed on this.
-                model: ::core::stringify!(#model_ident),
+                model: || ::core::any::type_name::<#model_ident>(),
                 spec: &#spec_static,
             }
         }

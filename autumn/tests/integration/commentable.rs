@@ -1591,14 +1591,28 @@ async fn the_helpers_run_the_discriminator_check_without_a_router() {
 /// is the only place that knows it.
 #[test]
 fn a_sharded_repository_registers_its_model_even_without_a_shard_key() {
+    // Keyed on the fully-qualified type name, not the bare ident: two modules
+    // may each define a `Post`, and a sharded `admin::Post` must not make an
+    // unsharded `blog::Post` look sharded — that would refuse to mount the
+    // router for a model that is perfectly safe to serve.
+    let sharded =
+        std::any::type_name::<crate::integration::sharding_across_tenants::ShardedTenantPost>();
     assert!(
-        autumn_web::commentable::model_has_sharded_repository("ShardedTenantPost"),
-        "a #[repository(..., sharded)] model must be discoverable by name, so the \
+        autumn_web::commentable::model_has_sharded_repository(sharded),
+        "a #[repository(..., sharded)] model must be discoverable by type, so the \
          comment router's wiring-time guard can refuse to serve it"
     );
     assert!(
-        !autumn_web::commentable::model_has_sharded_repository("CmtPost"),
+        sharded.contains("::"),
+        "the identity must be module-qualified, or same-named models collide: {sharded}"
+    );
+    assert!(
+        !autumn_web::commentable::model_has_sharded_repository(std::any::type_name::<CmtPost>()),
         "an ordinary model must not be mistaken for a sharded one"
+    );
+    assert!(
+        !autumn_web::commentable::model_has_sharded_repository("ShardedTenantPost"),
+        "a BARE name must not match — that is the collision this keying avoids"
     );
 }
 

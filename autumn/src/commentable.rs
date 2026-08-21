@@ -359,10 +359,12 @@ struct TargetRow {
 pub struct CommentableDescriptor {
     /// The discriminator this model stores in `commentable_type`.
     pub type_name: &'static str,
-    /// The model type's name, as written. Distinct from `type_name`, which a
+    /// The model type's fully-qualified name, as [`core::any::type_name`]
+    /// reports it. Distinct from `type_name`, which a
     /// `#[commentable(type_name = "…")]` override can rename; this is what the
-    /// repository registry is keyed on.
-    pub model: &'static str,
+    /// sharded-repository registry is keyed on, and it has to be qualified so
+    /// two modules' same-named models stay distinguishable.
+    pub model: fn() -> &'static str,
     /// The model's binding.
     pub spec: &'static CommentableSpec,
 }
@@ -380,8 +382,17 @@ inventory::collect!(CommentableDescriptor);
 /// happily serve the model from the control pool.
 #[cfg(feature = "db")]
 pub struct ShardedRepositoryDescriptor {
-    /// The model type's name, as written (`stringify!` of the ident).
-    pub model: &'static str,
+    /// The model type's fully-qualified name.
+    ///
+    /// A function pointer to [`core::any::type_name`] rather than a
+    /// `stringify!`d ident: two modules may each define a `Post`, and keying on
+    /// the bare name would make a sharded `admin::Post` repository
+    /// indistinguishable from an unsharded `blog::Post` — refusing to mount the
+    /// router for a model that is perfectly safe to serve. `module_path!` is no
+    /// good either, because a `#[repository]` trait and its `#[model]` struct
+    /// routinely live in different modules; the *type* is the one identity both
+    /// macros agree on.
+    pub model: fn() -> &'static str,
 }
 
 #[cfg(feature = "db")]
@@ -391,7 +402,7 @@ inventory::collect!(ShardedRepositoryDescriptor);
 #[cfg(feature = "db")]
 #[must_use]
 pub fn model_has_sharded_repository(model: &str) -> bool {
-    inventory::iter::<ShardedRepositoryDescriptor>().any(|descriptor| descriptor.model == model)
+    inventory::iter::<ShardedRepositoryDescriptor>().any(|descriptor| (descriptor.model)() == model)
 }
 
 /// The spec registered for `type_name`, or `None` when no `#[commentable]`
@@ -445,7 +456,7 @@ pub fn sharded_commentable_type() -> Option<&'static str> {
             // through the tenant's shard even when the model carries no shard
             // key. Checking only the first leaves that shape served from the
             // control pool — silently the wrong database.
-            descriptor.spec.parent_sharded || model_has_sharded_repository(descriptor.model)
+            descriptor.spec.parent_sharded || model_has_sharded_repository((descriptor.model)())
         })
         .map(|descriptor| descriptor.type_name)
 }

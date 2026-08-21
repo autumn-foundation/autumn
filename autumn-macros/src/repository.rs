@@ -11769,7 +11769,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             ::autumn_web::reexports::inventory::submit! {
                 ::autumn_web::commentable::ShardedRepositoryDescriptor {
-                    model: ::core::stringify!(#sharded_model_name),
+                    model: || ::core::any::type_name::<#sharded_model_name>(),
                 }
             }
         }

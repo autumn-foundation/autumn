@@ -182,10 +182,45 @@ pub fn polymorphic_comment_migrations(project_root: &Path) -> Vec<std::path::Pat
 /// `author_id` foreign key the header suggests, say — and it is still the same
 /// table.
 fn is_polymorphic_up_sql(up_sql: &str) -> bool {
-    let lowered = up_sql.to_ascii_lowercase();
-    creates_comments_table(&lowered)
+    let lowered = strip_sql_comments(&up_sql.to_ascii_lowercase());
+    let lowered = lowered.as_str();
+    creates_comments_table(lowered)
         && lowered.contains("commentable_type")
         && lowered.contains("commentable_id")
+}
+
+/// `sql` with `--` line comments and `/* … */` blocks removed.
+///
+/// Matching runs over raw text, so a commented-out example — `-- CREATE TABLE
+/// comments (commentable_type …)` in a migration's header, which is exactly the
+/// kind of thing a header explaining the shared table would contain — would
+/// otherwise read as the real table and make the generator emit nothing.
+fn strip_sql_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    loop {
+        let line = rest.find("--");
+        let block = rest.find("/*");
+        match (line, block) {
+            (None, None) => {
+                out.push_str(rest);
+                return out;
+            }
+            // Whichever opens first wins; a `--` inside a block comment (and a
+            // `/*` inside a line comment) is just text.
+            (Some(l), b) if b.is_none_or(|b| l < b) => {
+                out.push_str(&rest[..l]);
+                rest = rest[l..].find('\n').map_or("", |nl| &rest[l + nl..]);
+            }
+            (_, Some(b)) => {
+                out.push_str(&rest[..b]);
+                rest = rest[b + 2..]
+                    .find("*/")
+                    .map_or("", |end| &rest[b + 2 + end + 2..]);
+            }
+            (Some(_), None) => unreachable!("the guard above covers a line comment first"),
+        }
+    }
 }
 
 /// Whether `lowered` contains a `CREATE TABLE` naming **exactly** the shared
@@ -514,6 +549,34 @@ mod tests {
             !already_migrated(tmp.path()),
             "a dropped table is not a reusable one"
         );
+    }
+
+    /// A commented-out example is not a table. A migration header explaining
+    /// the shared table is a realistic place to find exactly this.
+    #[test]
+    fn a_commented_out_create_table_is_not_the_shared_one() {
+        for sql in [
+            "-- CREATE TABLE comments (\n--   commentable_type TEXT NOT NULL,\n\
+             --   commentable_id BIGINT NOT NULL\n-- );\nCREATE TABLE notes (id BIGSERIAL);\n",
+            "/* CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT); */\n\
+             CREATE TABLE notes (id BIGSERIAL);\n",
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let dir = tmp.path().join("migrations").join("0001_notes");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("up.sql"), sql).expect("write");
+            assert!(
+                !already_migrated(tmp.path()),
+                "a commented-out CREATE is not the shared table:\n{sql}"
+            );
+        }
+
+        // The real migration still registers, comments in its header and all.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_real");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("up.sql"), up_sql(DatabaseBackend::Postgres)).expect("write");
+        assert!(already_migrated(tmp.path()));
     }
 
     /// The shared migration must survive `destroy scaffold` while any other
