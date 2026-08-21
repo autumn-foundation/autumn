@@ -7,9 +7,11 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use reddit_clone::repositories::{PgPostRepository, PostRepository};
+use std::sync::{Arc, OnceLock};
 use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const CREATE_SCHEMA: &str = include_str!("../migrations/20260419000000_create_reddit/up.sql");
 const ADD_AVATAR: &str = include_str!("../migrations/20260427000000_add_user_avatar/up.sql");
@@ -22,12 +24,24 @@ struct CountRow {
 
 enum PgHandle {
     Container(#[allow(dead_code)] Box<ContainerAsync<Postgres>>),
-    External,
+    // An external URL points every test at the same persistent database. Keep
+    // this process-wide guard for the entire test, not merely schema setup, so
+    // parallel tests cannot drop one another's tables midway through a query.
+    External(#[allow(dead_code)] OwnedMutexGuard<()>),
+}
+
+async fn external_database_guard() -> OwnedMutexGuard<()> {
+    static EXTERNAL_DATABASE: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+    EXTERNAL_DATABASE
+        .get_or_init(|| Arc::new(Mutex::new(())))
+        .clone()
+        .lock_owned()
+        .await
 }
 
 async fn setup() -> (PgHandle, Pool<AsyncPgConnection>) {
     let (handle, url) = if let Ok(url) = std::env::var("AUTUMN_TEST_PG_URL") {
-        (PgHandle::External, url)
+        (PgHandle::External(external_database_guard().await), url)
     } else {
         let container = Postgres::default().start().await.expect("start Postgres");
         let port = container
@@ -59,6 +73,25 @@ async fn setup() -> (PgHandle, Pool<AsyncPgConnection>) {
     conn.batch_execute(ADD_AVATAR).await.expect("add avatar");
     drop(conn);
     (handle, pool)
+}
+
+#[tokio::test]
+async fn external_database_guard_serializes_tests() {
+    let first = external_database_guard().await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            external_database_guard()
+        )
+        .await
+        .is_err(),
+        "a second external-database test must wait while the first is running"
+    );
+
+    drop(first);
+    tokio::time::timeout(std::time::Duration::from_secs(1), external_database_guard())
+        .await
+        .expect("the next test can acquire the released external-database guard");
 }
 
 async fn seed_graph(conn: &mut AsyncPgConnection) {
