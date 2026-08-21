@@ -26,7 +26,7 @@ pub struct ArenaState {
     pub reachable: nat,
 }
 
-pub open spec fn invariant(s: ArenaState) -> bool {
+pub open spec fn arena_invariant(s: ArenaState) -> bool {
     &&& (!s.finite || s.usage <= s.quota)
     &&& s.reachable <= s.usage
 }
@@ -35,38 +35,52 @@ pub open spec fn same_domain(pre: ArenaState, post: ArenaState) -> bool {
     pre.tenant == post.tenant && pre.domain == post.domain
 }
 
+/// The final-drop transition itself constructs the reclaimed state. Keeping
+/// this definition separate from the proof prevents callers from assuming the
+/// zeroed post-state that reclamation is meant to establish.
+pub open spec fn teardown_transition(pre: ArenaState) -> ArenaState {
+    ArenaState {
+        tenant: pre.tenant,
+        domain: pre.domain,
+        quota: pre.quota,
+        finite: pre.finite,
+        usage: 0,
+        reachable: 0,
+    }
+}
+
 pub proof fn successful_allocation(pre: ArenaState, bytes: nat, post: ArenaState)
     requires
-        invariant(pre),
+        arena_invariant(pre),
         !pre.finite || pre.usage + bytes <= pre.quota,
         same_domain(pre, post),
         post.finite == pre.finite,
         post.quota == pre.quota,
         post.usage == pre.usage + bytes,
         post.reachable == pre.reachable + bytes,
-    ensures invariant(post), same_domain(pre, post)
+    ensures arena_invariant(post), same_domain(pre, post)
 {}
 
 pub proof fn failed_reservation_does_not_mutate(pre: ArenaState, post: ArenaState)
     requires
-        invariant(pre),
+        arena_invariant(pre),
         post == pre,
     ensures
-        invariant(post),
+        arena_invariant(post),
         post.usage == pre.usage,
         post.reachable == pre.reachable,
         same_domain(pre, post),
 {}
 
-pub proof fn final_teardown(pre: ArenaState, post: ArenaState)
-    requires
-        invariant(pre),
-        same_domain(pre, post),
-        post.finite == pre.finite,
-        post.quota == pre.quota,
-        post.usage == 0,
-        post.reachable == 0,
-    ensures invariant(post), post.reachable == 0
+pub proof fn final_teardown_reclaims_all(pre: ArenaState)
+    requires arena_invariant(pre)
+    ensures
+        arena_invariant(teardown_transition(pre)),
+        same_domain(pre, teardown_transition(pre)),
+        teardown_transition(pre).usage == 0,
+        teardown_transition(pre).reachable == 0,
 {}
+
+fn main() {}
 
 } // verus!
