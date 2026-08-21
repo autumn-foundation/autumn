@@ -143,13 +143,71 @@ anything that must be shared has to live *outside* the hosts.
 | Sessions | Redis session backend. In-memory sessions are per host. | [Multi-replica setup](deployment.md#multi-replica-setup) |
 | Rate limiting | Redis rate-limit backend, or an N-host fleet permits N× your configured rate. | [rate-limiting.md](rate-limiting.md) |
 | Uploaded files | Object storage (`[storage] backend = "s3"`). Local disk is per host, and a release dir is wiped by pruning. | [storage.md](storage.md) |
-| Scheduled tasks | Advisory-lock coordination so a `#[scheduled]` task runs once per fleet, not once per host. | [scheduled-multi-replica.md](scheduled-multi-replica.md) |
+| Background jobs | A durable queue every host shares: `[jobs] backend = "postgres"` or `"redis"`. The default `local` backend is an in-process queue, so N hosts means N independent queues. | [below](#background-jobs-the-default-queue-is-per-host) |
+| Scheduled tasks | `[scheduler] backend = "postgres"` — advisory-lock coordination so a `#[scheduled]` task runs once per fleet, not once per host. The default is a per-process timer. | [scheduled-multi-replica.md](scheduled-multi-replica.md) |
 | Migrations at boot | `[database] auto_migrate` **off**. Every host would apply migrations at boot and race the others. | below |
 
 The [Multi-replica setup](deployment.md#multi-replica-setup) section of the
 deployment guide has the concrete config for the shared session/rate-limit
 backends — it is the same configuration whether your replicas are containers or
 `autumn deploy` hosts. Don't duplicate it; read it there.
+
+### Background jobs: the default queue is per host
+
+This is the row people miss, because on one host it is invisible.
+
+Every fleet host runs the **combined** process role — one env file and one unit
+go to every host, and nothing in `autumn deploy` sets a per-host role — so all
+three hosts serve HTTP *and* run job workers *and* run the cron scheduler. That
+is the right shape for a fleet, but only once the queue those workers drain is
+shared. `[jobs] backend` defaults to `local`, which is an in-process queue. Three
+hosts on the default are three independent queues:
+
+- **Work never balances.** A job enqueued while serving on `10.0.0.2` can only
+  ever be executed by `10.0.0.2`.
+- **A rollout drops pending work.** `local` holds queued and delayed jobs in
+  memory only; a rolling deploy stops each host's old slot in turn, so anything
+  not yet run is gone. The durable backends keep it (`run_at` column on Postgres,
+  a due-time ZSET on Redis).
+- **`unique` and `concurrency` caps are per host.** `#[job(unique)]` and
+  `concurrency = N` are distributed-safe only on the durable backends, so the
+  same "runs at most once" job can run once *per host*.
+- **Tracked-job polling breaks behind the load balancer.** The record store
+  behind `enqueue_tracked` follows the jobs backend; on `local` it is
+  process-local, so when the browser's next poll of `GET /_autumn/jobs/{token}`
+  lands on a different host, that host returns the same `404` it returns for an
+  unknown token.
+- **`/admin/jobs` shows one host.** The local runtime installs a process-local
+  dashboard backend, so the dashboard — and its retry/discard/cancel buttons —
+  act on whichever host the load balancer happened to pick. (`redis` installs a
+  cluster-wide dashboard backend automatically.) `/actuator/jobs` counters are
+  per host for the same reason.
+
+So pick a shared backend before the first fleet rollout:
+
+```toml
+[jobs]
+backend = "postgres"   # or "redis"
+```
+
+`postgres` is usually the cheaper choice for a fleet: a fleet already requires a
+shared Postgres (`sqlite://` is refused), the queue reuses the `[database]` pool,
+and no new service appears. It needs the framework's `autumn_jobs` table, which
+`autumn migrate` creates — so on a fleet that has already deployed against
+Postgres it is there, and on a brand-new fleet it arrives with the `autumn
+migrate` the guide already tells you to run. Do not count on the *same* rollout
+to create it: a host's candidate process starts before that host's `migrate` step
+runs. `redis` reuses the Redis you already stood up for sessions and rate
+limiting; `[jobs.redis] key_prefix` keeps its keys separate.
+
+**Nothing refuses `local` on a fleet.** The doctor check that fails a `local`
+jobs backend (`process_role_backend`) only fires for a split `web`/`worker` role,
+and fleet hosts are all combined-role — so `deploy check`, the rollout preflight
+and `deploy status` are all silent about this. It is on you.
+
+Full backend comparison, delivery semantics and the migration note are in the
+[jobs guide](jobs.md#backend-selection-autumntoml); don't duplicate them, read
+them there.
 
 ---
 
@@ -169,6 +227,11 @@ Nothing else — the release layout, units and directories are created for you.
 If your single host was running Postgres or Redis locally, move them now. Every
 host must reach the same database and the same Redis. Work through the table
 above; a fleet on a `sqlite://` database is refused outright.
+
+This is also where you switch the backends that silently defaulted to per-host
+on a single server: sessions, rate limiting, `[jobs] backend` and
+`[scheduler] backend`. Nothing in the rollout refuses a per-host default — it
+just quietly becomes three of everything.
 
 ### 3. Swap `host` for `hosts`
 
@@ -446,5 +509,9 @@ Stated plainly so you can plan around it:
   lifecycle, blue/green at the platform level, and canary primitives.
 - **[Multi-replica setup](deployment.md#multi-replica-setup)** — the shared
   session, rate-limit and secret configuration every fleet needs.
+- **[Background jobs](jobs.md#backend-selection-autumntoml)** and
+  **[Multi-replica scheduled tasks](scheduled-multi-replica.md)** — the durable
+  queue and the advisory-lock scheduler a fleet needs instead of the per-process
+  defaults.
 - **Alert on drift** — wire `autumn deploy status --strict` into cron so a fleet
   that quietly stopped converging pages someone.
