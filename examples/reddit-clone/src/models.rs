@@ -124,6 +124,10 @@ pub struct Tag {
 #[autumn_web::model]
 #[belongs_to(User, fk = author_id)]
 #[belongs_to(Post, counter_cache)]
+// Destroy replies before their parent so every nested comment traverses
+// `PgCommentRepository`; relying on the database's `ON DELETE CASCADE` would
+// bypass reply hooks and counter-cache maintenance.
+#[has_many(Comment, fk = "parent_id", name = replies, dependent = destroy)]
 pub struct Comment {
     #[id]
     pub id: i64,

@@ -61,8 +61,10 @@ async fn setup() -> (PgHandle, Pool<AsyncPgConnection>) {
     let mut conn = pool.get().await.expect("connection");
     if std::env::var("AUTUMN_TEST_PG_URL").is_ok() {
         conn.batch_execute(
-            "DROP TABLE IF EXISTS post_tags, tags, comments, votes, live_feed_events, \
-             posts, subreddits, users CASCADE;",
+             "DROP TABLE IF EXISTS post_tags, tags, comments, votes, live_feed_events, \
+             posts, subreddits, users CASCADE;
+             DROP FUNCTION IF EXISTS reject_comment_delete();
+             DROP FUNCTION IF EXISTS reject_parent_before_reply();",
         )
         .await
         .expect("reset schema");
@@ -101,14 +103,15 @@ async fn seed_graph(conn: &mut AsyncPgConnection) {
          INSERT INTO subreddits (id, name, slug, creator_id)
            VALUES (1, 'Rust', 'rust', 1);
          INSERT INTO posts (id, title, slug, author_id, subreddit_id, comment_count, score)
-           VALUES (10, 'target', 'target', 1, 1, 2, 2),
+           VALUES (10, 'target', 'target', 1, 1, 3, 2),
                   (11, 'control', 'control', 1, 1, 0, 1);
-         INSERT INTO comments (id, body, author_id, post_id)
-           VALUES (20, 'first', 1, 10), (21, 'second', 1, 10);
+         INSERT INTO comments (id, body, author_id, post_id, parent_id)
+           VALUES (20, 'first', 1, 10, NULL), (21, 'second', 1, 10, NULL),
+                  (22, 'nested reply', 1, 10, 20);
          INSERT INTO votes (id, user_id, post_id, comment_id, value) VALUES
            (30, 2, 10, NULL, 1), (31, 3, 10, NULL, 1),
            (32, 2, NULL, 20, 1), (33, 3, NULL, 21, -1),
-           (34, 2, 11, NULL, 1);",
+           (34, 2, 11, NULL, 1), (35, 2, NULL, 22, 1);",
     )
     .await
     .expect("seed post graph");
@@ -128,6 +131,24 @@ async fn repository_delete_removes_only_the_target_post_graph() {
     let (_handle, pool) = setup().await;
     let mut conn = pool.get().await.expect("connection");
     seed_graph(&mut conn).await;
+    // This trigger turns repository ordering into an observable invariant: a
+    // direct database cascade from comment 20 would encounter its live reply
+    // and fail, whereas `Comment.replies dependent = destroy` removes 22 via
+    // `PgCommentRepository` before deleting 20.
+    conn.batch_execute(
+        "CREATE OR REPLACE FUNCTION reject_parent_before_reply() RETURNS trigger
+           LANGUAGE plpgsql AS $$
+           BEGIN
+             IF EXISTS (SELECT 1 FROM comments WHERE parent_id = OLD.id) THEN
+               RAISE EXCEPTION 'reply lifecycle was bypassed';
+             END IF;
+             RETURN OLD;
+           END $$;
+         CREATE TRIGGER reject_parent_before_reply BEFORE DELETE ON comments
+           FOR EACH ROW EXECUTE FUNCTION reject_parent_before_reply();",
+    )
+    .await
+    .expect("install nested-comment ordering trigger");
     drop(conn);
 
     PgPostRepository::with_pool_untracked(pool.clone())
@@ -163,7 +184,7 @@ async fn repository_delete_removes_only_the_target_post_graph() {
     assert_eq!(
         count(
             &mut conn,
-            "SELECT COUNT(*) AS count FROM votes WHERE comment_id IN (20, 21)"
+            "SELECT COUNT(*) AS count FROM votes WHERE comment_id IN (20, 21, 22)"
         )
         .await,
         0
@@ -197,7 +218,7 @@ async fn dependent_failure_rolls_back_the_complete_post_graph() {
     let mut conn = pool.get().await.expect("connection");
     seed_graph(&mut conn).await;
     conn.batch_execute(
-        "CREATE FUNCTION reject_comment_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+        "CREATE OR REPLACE FUNCTION reject_comment_delete() RETURNS trigger LANGUAGE plpgsql AS $$
            BEGIN RAISE EXCEPTION 'forced dependent failure'; END $$;
          CREATE TRIGGER reject_comment_delete BEFORE DELETE ON comments
            FOR EACH ROW EXECUTE FUNCTION reject_comment_delete();",
@@ -229,7 +250,7 @@ async fn dependent_failure_rolls_back_the_complete_post_graph() {
             "SELECT comment_count AS count FROM posts WHERE id = 10"
         )
         .await,
-        2
+        3
     );
     assert_eq!(
         count(&mut conn, "SELECT score AS count FROM posts WHERE id = 10").await,
@@ -241,7 +262,7 @@ async fn dependent_failure_rolls_back_the_complete_post_graph() {
             "SELECT COUNT(*) AS count FROM comments WHERE post_id = 10"
         )
         .await,
-        2
+        3
     );
     assert_eq!(
         count(
@@ -254,9 +275,9 @@ async fn dependent_failure_rolls_back_the_complete_post_graph() {
     assert_eq!(
         count(
             &mut conn,
-            "SELECT COUNT(*) AS count FROM votes WHERE comment_id IN (20, 21)"
+            "SELECT COUNT(*) AS count FROM votes WHERE comment_id IN (20, 21, 22)"
         )
         .await,
-        2
+        3
     );
 }
