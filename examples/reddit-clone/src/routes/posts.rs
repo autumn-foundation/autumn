@@ -631,10 +631,20 @@ pub async fn show_by_id(Path(post_id): Path<i64>, mut db: Db) -> AutumnResult<Re
 
 #[allow(clippy::too_many_lines)] // Template-heavy function
 #[get("/r/{sub_slug}/posts/{post_slug}")]
+// Every argument is a distinct extractor -- path, session, CSRF token, CSRF
+// field name, connection, repository, flags, flash. An axum handler's arguments
+// ARE its request-state declaration; bundling them into a struct would only
+// move the same list one level down.
+#[allow(clippy::too_many_arguments)]
 pub async fn show(
     Path((sub_slug, post_slug)): Path<(String, String)>,
     session: Session,
     csrf: CsrfToken,
+    // The widget's hidden input has to carry the field name `CsrfLayer` will
+    // look for. It scans a URL-encoded body for the CONFIGURED name only, so an
+    // app that set `security.csrf.form_field` would otherwise render a thread
+    // whose very first submit is a 403.
+    csrf_field: CsrfFormField,
     mut db: Db,
     repo: PgPostRepository,
     flags: Flags,
@@ -702,7 +712,9 @@ pub async fn show(
     .empty_text("No comments yet. Start the conversation!")
     .return_to(&post_path);
     if current_user.is_some() {
-        comment_config = comment_config.csrf_token(csrf.token());
+        comment_config = comment_config
+            .csrf_token(csrf.token())
+            .csrf_field(csrf_field.0.clone());
     } else {
         comment_config = comment_config
             .read_only()

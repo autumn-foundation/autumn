@@ -184,6 +184,9 @@ pub async fn show(
     Path(slug): Path<String>,
     session: Session,
     csrf: CsrfToken,
+    // Same as the post detail page: the widget's hidden input must be named
+    // whatever `security.csrf.form_field` configured, or the first submit 403s.
+    csrf_field: CsrfFormField,
     repo: PgSubredditRepository,
     mut db: Db,
     flash: Flash,
@@ -244,7 +247,9 @@ pub async fn show(
     .empty_text("No community discussion yet.")
     .return_to(__autumn_path_show(&sub.slug));
     if current_user.is_some() {
-        comment_config = comment_config.csrf_token(csrf.token());
+        comment_config = comment_config
+            .csrf_token(csrf.token())
+            .csrf_field(csrf_field.0.clone());
     } else {
         comment_config = comment_config
             .read_only()
