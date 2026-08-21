@@ -15,6 +15,12 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const CREATE_SCHEMA: &str = include_str!("../migrations/20260419000000_create_reddit/up.sql");
 const ADD_AVATAR: &str = include_str!("../migrations/20260427000000_add_user_avatar/up.sql");
+// #1367 moved comments to the polymorphic table and installed the
+// `posts_delete_comments` trigger that replaces the old `post_id` cascade. This
+// suite builds its schema from the migrations directly, so it needs that one
+// too or it would be testing a table shape the app no longer has.
+const POLYMORPHIC_COMMENTS: &str =
+    include_str!("../migrations/20260820000000_polymorphic_comments/up.sql");
 
 #[derive(diesel::QueryableByName)]
 struct CountRow {
@@ -64,7 +70,8 @@ async fn setup() -> (PgHandle, Pool<AsyncPgConnection>) {
              "DROP TABLE IF EXISTS post_tags, tags, comments, votes, live_feed_events, \
              posts, subreddits, users CASCADE;
              DROP FUNCTION IF EXISTS reject_comment_delete();
-             DROP FUNCTION IF EXISTS reject_parent_before_reply();",
+             DROP FUNCTION IF EXISTS reject_parent_before_reply();
+             DROP FUNCTION IF EXISTS comments_delete_for_parent() CASCADE;",
         )
         .await
         .expect("reset schema");
@@ -73,6 +80,9 @@ async fn setup() -> (PgHandle, Pool<AsyncPgConnection>) {
         .await
         .expect("create schema");
     conn.batch_execute(ADD_AVATAR).await.expect("add avatar");
+    conn.batch_execute(POLYMORPHIC_COMMENTS)
+        .await
+        .expect("polymorphic comments");
     drop(conn);
     (handle, pool)
 }
@@ -104,10 +114,14 @@ async fn seed_graph(conn: &mut AsyncPgConnection) {
            VALUES (1, 'Rust', 'rust', 1);
          INSERT INTO posts (id, title, slug, author_id, subreddit_id, comment_count, score)
            VALUES (10, 'target', 'target', 1, 1, 3, 2),
-                  (11, 'control', 'control', 1, 1, 0, 1);
+                  (11, 'control', 'control', 1, 1, 1, 1);
          INSERT INTO comments (id, body, author_id, commentable_type, commentable_id, parent_id)
            VALUES (20, 'first', 1, 'Post', 10, NULL), (21, 'second', 1, 'Post', 10, NULL),
-                  (22, 'nested reply', 1, 'Post', 10, 20);
+                  (22, 'nested reply', 1, 'Post', 10, 20),
+                  -- The control post's own comment: the parent-delete trigger
+                  -- filters on `commentable_id`, and nothing proves that filter
+                  -- works unless some other parent's rows are sitting beside it.
+                  (23, 'untouched', 1, 'Post', 11, NULL);
          INSERT INTO votes (id, user_id, post_id, comment_id, value) VALUES
            (30, 2, 10, NULL, 1), (31, 3, 10, NULL, 1),
            (32, 2, NULL, 20, 1), (33, 3, NULL, 21, -1),
@@ -131,24 +145,23 @@ async fn repository_delete_removes_only_the_target_post_graph() {
     let (_handle, pool) = setup().await;
     let mut conn = pool.get().await.expect("connection");
     seed_graph(&mut conn).await;
-    // This trigger turns repository ordering into an observable invariant: a
-    // direct database cascade from comment 20 would encounter its live reply
-    // and fail, whereas `Comment.replies dependent = destroy` removes 22 via
-    // `PgCommentRepository` before deleting 20.
-    conn.batch_execute(
-        "CREATE OR REPLACE FUNCTION reject_parent_before_reply() RETURNS trigger
-           LANGUAGE plpgsql AS $$
-           BEGIN
-             IF EXISTS (SELECT 1 FROM comments WHERE parent_id = OLD.id) THEN
-               RAISE EXCEPTION 'reply lifecycle was bypassed';
-             END IF;
-             RETURN OLD;
-           END $$;
-         CREATE TRIGGER reject_parent_before_reply BEFORE DELETE ON comments
-           FOR EACH ROW EXECUTE FUNCTION reject_parent_before_reply();",
-    )
-    .await
-    .expect("install nested-comment ordering trigger");
+    // #2260 asserted reply-before-parent ORDERING here, via a trigger that
+    // raised if a comment was deleted while a reply still pointed at it. That
+    // pinned `Comment.replies dependent = destroy` removing 22 through
+    // `PgCommentRepository` before 20.
+    //
+    // #1367 removed the `Comment` model: comments are polymorphic rows, and the
+    // parent's `posts_delete_comments` trigger deletes the whole
+    // `(commentable_type, commentable_id)` set in one statement. Per-row trigger
+    // order within a single DELETE is unspecified, so the ordering assertion no
+    // longer describes the mechanism — and there is nothing left for it to
+    // protect: no `#[model]` means no per-comment lifecycle hooks, and the
+    // post's own `comment_count` dies with the post.
+    //
+    // What still has to hold is the OUTCOME, including the part the ordering was
+    // really guarding: a nested reply must not survive its parent, and comment
+    // votes must go with the comments (`votes.comment_id` cascades). Those are
+    // asserted below.
     drop(conn);
 
     PgPostRepository::with_pool_untracked(pool.clone())
@@ -196,7 +209,7 @@ async fn repository_delete_removes_only_the_target_post_graph() {
             "SELECT comment_count AS count FROM posts WHERE id = 11"
         )
         .await,
-        0
+        1
     );
     assert_eq!(
         count(&mut conn, "SELECT score AS count FROM posts WHERE id = 11").await,
@@ -209,6 +222,40 @@ async fn repository_delete_removes_only_the_target_post_graph() {
         )
         .await,
         1
+    );
+
+    // The nested reply (22) must not outlive its parent (20) — the outcome
+    // #2260's ordering trigger existed to protect.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS count FROM comments WHERE id IN (20, 21, 22)"
+        )
+        .await,
+        0,
+        "the whole thread, nested replies included, goes with the post"
+    );
+    // …and their votes go with them, through `votes.comment_id`'s cascade.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS count FROM votes WHERE comment_id IN (20, 21, 22)"
+        )
+        .await,
+        0,
+        "comment votes are reclaimed when their comment is deleted"
+    );
+    // The control post's comment survives: the trigger is scoped to the parent
+    // being deleted, not to the discriminator alone.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS count FROM comments \
+             WHERE commentable_type = 'Post' AND commentable_id = 11"
+        )
+        .await,
+        1,
+        "deleting post 10 must not touch post 11's thread"
     );
 }
 
