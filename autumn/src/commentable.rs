@@ -334,10 +334,16 @@ struct CountRow {
     count: i64,
 }
 
+/// A subtree row plus how deep the walk was when it was reached.
+///
+/// The depth is carried so [`delete_subtree`] can tell whether the recursive
+/// walk was CUT OFF by [`RECURSION_GUARD`] rather than finishing.
 #[derive(diesel::QueryableByName)]
-struct IdRow {
+struct SubtreeRow {
     #[diesel(sql_type = BigInt)]
     id: i64,
+    #[diesel(sql_type = BigInt)]
+    depth: i64,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -1240,7 +1246,7 @@ async fn delete_subtree(
     let anchor_live = spec.live_comments("c");
     let descendant_live = spec.live_comments("d");
 
-    let ids: Vec<IdRow> = diesel::sql_query(format!(
+    let ids: Vec<SubtreeRow> = diesel::sql_query(format!(
         "WITH RECURSIVE __autumn_cmt_sub(id, depth) AS (\
            SELECT c.{pk}, CAST(0 AS BIGINT) FROM {comments} AS c \
             WHERE c.{pk} = {} AND c.{type_column} = {} AND c.{id_column} = {}{anchor_live} \
@@ -1249,7 +1255,7 @@ async fn delete_subtree(
              FROM {comments} AS d JOIN __autumn_cmt_sub AS s ON d.{parent_column} = s.id \
             WHERE s.depth < {RECURSION_GUARD} \
               AND d.{type_column} = {} AND d.{id_column} = {}{descendant_live}\
-         ) SELECT id FROM __autumn_cmt_sub",
+         ) SELECT id, depth FROM __autumn_cmt_sub",
         ph(1),
         ph(2),
         ph(3),
@@ -1261,9 +1267,29 @@ async fn delete_subtree(
     .bind::<BigInt, _>(parent_id)
     .bind::<Text, _>(parent_type)
     .bind::<BigInt, _>(parent_id)
-    .load::<IdRow>(conn)
+    .load::<SubtreeRow>(conn)
     .await
     .map_err(AutumnError::from)?;
+
+    // The walk stops at `RECURSION_GUARD`. On the SOFT-delete path that is
+    // survivable: the rows past it stay live, stay counted, and surface as
+    // promoted roots. On the HARD-delete path it is not — the `parent_id`
+    // foreign key cascades, so the database removes every deeper descendant
+    // while `ids.len()` counts only what the walk reached, and the parent's
+    // counter is left permanently too high with no error anywhere.
+    //
+    // Refusing is the honest answer. A chain this deep cannot be produced by
+    // the framework's own write path (`max_depth` is capped below the guard),
+    // so reaching here means imported or hand-edited rows, and quietly
+    // corrupting a counter is a worse service than saying so.
+    if !spec.soft_delete && ids.iter().any(|row| row.depth >= RECURSION_GUARD) {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "comment {comment_id} has a reply chain deeper than {RECURSION_GUARD}, which this \
+             hard-delete path cannot remove without leaving the parent's comment counter wrong: \
+             the database would cascade past what the traversal can see. Shorten or repair the \
+             chain, or run the delete in batches from the leaves."
+        )));
+    }
 
     if ids.is_empty() {
         return Ok(0);

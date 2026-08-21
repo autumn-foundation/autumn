@@ -196,6 +196,37 @@ pub fn already_migrated(project_root: &Path) -> bool {
     creates && has_type && has_id
 }
 
+/// Every spelling of the shared comments table this scan accepts after `verb`.
+///
+/// Unqualified and `public.`-qualified, each half optionally quoted, with the
+/// optional `IF [NOT] EXISTS`. `CREATE TABLE public.comments (…)` is an
+/// ordinary spelling that targets the same relation as the unqualified one
+/// under the default search path, so failing to recognise it makes the
+/// generator emit a second `CREATE TABLE comments` and the next `migrate` fail
+/// on "already exists".
+///
+/// Only `public` is accepted. Another schema is a genuinely different table
+/// unless the app's `search_path` says otherwise, and guessing at that would
+/// trade this false negative for a false positive.
+fn comments_table_spellings(verb: &str) -> Vec<String> {
+    let names = [
+        COMMENTS_TABLE.to_owned(),
+        format!("\"{COMMENTS_TABLE}\""),
+        format!("public.{COMMENTS_TABLE}"),
+        format!("public.\"{COMMENTS_TABLE}\""),
+        format!("\"public\".{COMMENTS_TABLE}"),
+        format!("\"public\".\"{COMMENTS_TABLE}\""),
+    ];
+    let existence = ["", "if exists ", "if not exists "];
+    let mut spellings = Vec::with_capacity(names.len() * existence.len());
+    for exists in existence {
+        for name in &names {
+            spellings.push(format!("{verb} {exists}{name}"));
+        }
+    }
+    spellings
+}
+
 /// Whether `haystack` mentions `column` as a complete SQL identifier.
 ///
 /// A bare `contains` would accept `legacy_commentable_type` as
@@ -315,12 +346,7 @@ fn comments_table_events(sql: &str) -> Vec<CommentsEvent> {
 /// Identifier-exact, so `comments_archive` is never mistaken for `comments`.
 fn comments_statements<'a>(lowered: &'a str, verb: &str) -> Vec<(usize, &'a str)> {
     let mut found = Vec::new();
-    for prefix in [
-        format!("{verb} {COMMENTS_TABLE}"),
-        format!("{verb} \"{COMMENTS_TABLE}\""),
-        format!("{verb} if exists {COMMENTS_TABLE}"),
-        format!("{verb} if exists \"{COMMENTS_TABLE}\""),
-    ] {
+    for prefix in comments_table_spellings(verb) {
         let mut base = 0usize;
         while let Some(at) = lowered[base..].find(&prefix) {
             let start = base + at;
@@ -435,12 +461,7 @@ fn comments_table_statement_start(lowered: &str) -> Option<usize> {
     // opening paren, or a closing quote -- so `comments_archive` is not
     // mistaken for `comments`.
     let mut best: Option<usize> = None;
-    for prefix in [
-        format!("create table if not exists {COMMENTS_TABLE}"),
-        format!("create table if not exists \"{COMMENTS_TABLE}\""),
-        format!("create table {COMMENTS_TABLE}"),
-        format!("create table \"{COMMENTS_TABLE}\""),
-    ] {
+    for prefix in comments_table_spellings("create table") {
         let mut base = 0usize;
         while let Some(at) = lowered[base..].find(&prefix) {
             let start = base + at;
@@ -1086,6 +1107,61 @@ mod tests {
         assert!(
             already_migrated(tmp.path()),
             "a rename INTO the discriminator name adds it"
+        );
+    }
+
+    /// `public.comments` is the same relation as `comments` under the default
+    /// search path, so a migration spelling it that way already has the table.
+    #[test]
+    fn a_schema_qualified_comments_table_is_recognised() {
+        for create in [
+            "CREATE TABLE public.comments",
+            "CREATE TABLE \"public\".\"comments\"",
+            "CREATE TABLE public.\"comments\"",
+            "CREATE TABLE IF NOT EXISTS public.comments",
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let dir = tmp.path().join("migrations").join("0001_qualified");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(
+                dir.join("up.sql"),
+                format!(
+                    "{create} (\n    id BIGSERIAL PRIMARY KEY,\n    \
+                     commentable_type TEXT NOT NULL,\n    \
+                     commentable_id BIGINT NOT NULL\n);\n"
+                ),
+            )
+            .expect("write");
+            assert!(already_migrated(tmp.path()), "{create}");
+        }
+
+        // A qualified DROP still undoes a qualified CREATE.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let migrations = tmp.path().join("migrations");
+        let created = migrations.join("0001_create");
+        std::fs::create_dir_all(&created).expect("mkdir");
+        std::fs::write(
+            created.join("up.sql"),
+            "CREATE TABLE public.comments (commentable_type TEXT, commentable_id BIGINT);\n",
+        )
+        .expect("write");
+        let dropped = migrations.join("0002_drop");
+        std::fs::create_dir_all(&dropped).expect("mkdir");
+        std::fs::write(dropped.join("up.sql"), "DROP TABLE public.comments;\n").expect("write");
+        assert!(!already_migrated(tmp.path()));
+
+        // …but another schema is a different table.
+        let other = tempfile::tempdir().expect("tempdir");
+        let dir = other.path().join("migrations").join("0001_other");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE archive.comments (commentable_type TEXT, commentable_id BIGINT);\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(other.path()),
+            "archive.comments is not public.comments"
         );
     }
 
