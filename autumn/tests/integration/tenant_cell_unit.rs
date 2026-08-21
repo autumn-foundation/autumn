@@ -168,13 +168,20 @@ fn density_smoke_thousand_cells() {
     );
     let structural = registry.structural_overhead();
     assert_eq!(structural.resident_cells, CELLS);
+    // Regression: `HashMap::capacity()` is 1,792 for this workload on the
+    // current SwissTable implementation, but its backing allocation has 2,048
+    // buckets. The structural model must include the load-factor-reserved
+    // slots, not mistake element capacity for bucket count.
+    assert!(structural.registry_bucket_count >= CELLS);
+    assert!(structural.registry_bucket_count.is_power_of_two());
     assert!(structural.total_bytes > structural.registry_fixed_bytes);
     println!(
-        "tenant-cell density: api_accounted_payload={} structural_total={} structural_per_cell={} registry_fixed={} (allocator metadata/rounding/fragmentation excluded)",
+        "tenant-cell density lower bound: api_accounted_payload={} structural_total={} structural_per_cell={} registry_fixed={} registry_buckets={} (trailing control group, allocation padding, allocator metadata/rounding/fragmentation excluded)",
         registry.total_tracked_bytes(),
         structural.total_bytes,
         structural.per_cell_bytes(),
         structural.registry_fixed_bytes,
+        structural.registry_bucket_count,
     );
 
     for i in 0..CELLS {

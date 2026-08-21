@@ -44,7 +44,8 @@ use std::time::{Duration, Instant};
 /// cannot amplify its footprint past the configured cap via map growth.
 const SCRATCH_ENTRY_OVERHEAD: usize = std::mem::size_of::<(String, Vec<u8>)>() + 16;
 
-/// Deterministic model of the process-resident structure used by a registry.
+/// Deterministic lower-bound model of the process-resident structure used by a
+/// registry.
 ///
 /// This is deliberately separate from [`TenantCell::tracked_bytes`]: quota
 /// accounting describes tenant payload, while this report describes the fixed
@@ -71,18 +72,22 @@ pub struct TenantCellStructuralOverhead {
     pub tenant_id_capacity_bytes: usize,
     /// Two strong/weak counter pairs: one for each per-cell `Arc` allocation.
     pub arc_header_bytes: usize,
-    /// Estimated unoccupied bucket slots plus one control byte per map bucket.
-    /// The map capacity is observed, but the control-byte model is an explicit
-    /// std `HashMap` implementation estimate rather than a Rust API guarantee.
+    /// Estimated backing bucket count. `HashMap::capacity()` is an element
+    /// capacity, not a bucket count; the current `SwissTable` implementation uses
+    /// the next power of two backing buckets.
+    pub registry_bucket_count: usize,
+    /// Lower bound for unoccupied backing slots plus one control byte per
+    /// bucket. This excludes the implementation's trailing control group and
+    /// allocation padding.
     pub registry_bucket_bytes: usize,
-    /// Sum of all deterministic structural components in this report.
+    /// Sum of all deterministic lower-bound structural components.
     pub total_bytes: usize,
 }
 
 impl TenantCellStructuralOverhead {
     /// Structural bytes per resident cell, excluding the one-off registry.
     #[must_use]
-    pub fn per_cell_bytes(self) -> usize {
+    pub const fn per_cell_bytes(self) -> usize {
         if self.resident_cells == 0 {
             return 0;
         }
@@ -816,12 +821,17 @@ impl TenantCellRegistry {
         self.inner.global_tracked.load(Ordering::Relaxed)
     }
 
-    /// Estimate the fixed structural footprint of the resident registry.
+    /// Estimate a lower bound for the fixed structural footprint of the
+    /// resident registry.
     ///
     /// Unlike [`Self::total_tracked_bytes`], this excludes API-accounted tenant
     /// payload. The returned values are deterministic for the current Rust
-    /// layouts, tenant-id capacities, and map capacity. Allocator metadata,
-    /// size-class rounding, and fragmentation are intentionally excluded.
+    /// layouts, tenant-id capacities, and map capacity. The current std
+    /// `SwissTable` load-factor scheme is modeled by rounding its element
+    /// capacity up to the backing bucket count. Trailing control bytes,
+    /// allocator metadata, allocation padding, size-class rounding, and
+    /// fragmentation are intentionally excluded, so this remains a lower bound
+    /// rather than a claim about exact allocated bytes.
     ///
     /// # Panics
     ///
@@ -851,9 +861,24 @@ impl TenantCellRegistry {
             .map(|(key, cell)| key.capacity() + cell.inner.tenant_id.capacity())
             .sum();
         let arc_header_bytes = resident_cells * 2 * ARC_HEADER;
-        let registry_bucket_bytes = (cells.capacity() - resident_cells)
+        // `capacity()` reports how many *elements* fit without reallocating. It
+        // is not the backing bucket count: SwissTable reserves 1/8 of its
+        // power-of-two buckets to keep probes short (e.g. capacity 1,792 uses
+        // 2,048 buckets). Recover that implementation-specific bucket count so
+        // load-factor-reserved slots are not silently omitted. `0` has no
+        // allocation; the overflow fallback is only defensive for hypothetical
+        // capacities that cannot arise from a real allocation.
+        let registry_bucket_count = if cells.capacity() == 0 {
+            0
+        } else {
+            cells
+                .capacity()
+                .checked_next_power_of_two()
+                .map_or_else(|| cells.capacity(), |bucket_count| bucket_count)
+        };
+        let registry_bucket_bytes = (registry_bucket_count - resident_cells)
             * std::mem::size_of::<RegistryEntry>()
-            + cells.capacity();
+            + registry_bucket_count;
         let total_bytes = registry_fixed_bytes
             + tenant_cell_bytes
             + tenant_cell_inner_bytes
@@ -870,6 +895,7 @@ impl TenantCellRegistry {
             registry_entry_bytes,
             tenant_id_capacity_bytes,
             arc_header_bytes,
+            registry_bucket_count,
             registry_bucket_bytes,
             total_bytes,
         }
