@@ -165,6 +165,11 @@ pub fn already_migrated(project_root: &Path) -> bool {
     // `migrate` with "relation already exists".
     let mut creates = false;
     let mut discriminated = false;
+    // The two ALTERs accumulate across the WHOLE history too, not just within
+    // one file: nothing requires a conversion to add both columns in the same
+    // migration, and combining them per-file would reintroduce, for
+    // ALTER+ALTER, exactly the one-file assumption this scan exists to remove.
+    let (mut altered_type, mut altered_id) = (false, false);
     for sql in migration_up_sql(project_root) {
         if let Some(body) = comments_table_body(&sql) {
             creates = true;
@@ -172,12 +177,11 @@ pub fn already_migrated(project_root: &Path) -> bool {
                 discriminated = true;
             }
         }
-        let (altered_type, altered_id) = comments_altered_columns(&sql);
-        if altered_type && altered_id {
-            discriminated = true;
-        }
+        let (sql_type, sql_id) = comments_altered_columns(&sql);
+        altered_type |= sql_type;
+        altered_id |= sql_id;
     }
-    creates && discriminated
+    creates && (discriminated || (altered_type && altered_id))
 }
 
 /// Every migration's `up.sql`, lowercased with SQL comments stripped.
@@ -740,6 +744,44 @@ mod tests {
         assert!(
             !already_migrated(tmp.path()),
             "comments_archive is not comments"
+        );
+    }
+
+    /// Nothing requires a conversion to add both discriminator columns in the
+    /// same migration, so the two ALTERs have to accumulate across the history
+    /// as well.
+    #[test]
+    fn discriminator_columns_altered_in_separate_migrations_still_count() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let migrations = tmp.path().join("migrations");
+        for (dir, sql) in [
+            (
+                "0001_create",
+                "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL);\n",
+            ),
+            (
+                "0002_add_type",
+                "ALTER TABLE comments ADD COLUMN commentable_type TEXT;\n",
+            ),
+        ] {
+            let path = migrations.join(dir);
+            std::fs::create_dir_all(&path).expect("mkdir");
+            std::fs::write(path.join("up.sql"), sql).expect("write");
+        }
+
+        // Only one of the two columns so far.
+        assert!(!already_migrated(tmp.path()));
+
+        let path = migrations.join("0003_add_id");
+        std::fs::create_dir_all(&path).expect("mkdir");
+        std::fs::write(
+            path.join("up.sql"),
+            "ALTER TABLE comments ADD COLUMN commentable_id BIGINT;\n",
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "the columns may arrive in separate migrations"
         );
     }
 

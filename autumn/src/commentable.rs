@@ -481,9 +481,9 @@ pub fn sharded_commentable_type() -> Option<&'static str> {
 /// columns. `#[commentable(table = …)]` is a supported override, and two
 /// same-named models pointed at different tables are as isolated as two
 /// unrelated apps — panicking on those would make a legitimate configuration
-/// unusable. [`router`] applies the stricter name-only check on top, because a
-/// mounted router dispatches on the string alone and a duplicate is ambiguous
-/// there whatever the storage.
+/// unusable. [`router`] applies [`duplicate_commentable_type`] on top of this
+/// one, because a mounted router dispatches on the string alone and a duplicate
+/// is ambiguous there whatever the storage.
 ///
 /// Checked once per process — the registry is built at load time and cannot
 /// change afterwards — so this costs one atomic load per call.
@@ -1759,10 +1759,25 @@ where
     S: crate::db::DbState + Clone + Send + Sync + 'static,
 {
     // Two models claiming one discriminator would render each other's threads
-    // and probe each other's tables. Checked here so a mounted router fails at
-    // wiring time, where the fix is obvious — and checked again from every
-    // helper, for the app that never mounts one.
+    // and probe each other's tables. The helpers' storage-scoped check runs
+    // here too, for the shared-table case…
     assert_unique_discriminators();
+    // …and the router additionally needs the STRICTER name-only rule. It
+    // dispatches on `{commentable_type}` alone, so two models sharing a
+    // discriminator are ambiguous at the URL even when their comments live in
+    // different tables: `commentable_spec_for` returns whichever registered
+    // first, and the other model is unreachable — or worse, served against the
+    // wrong parent table. Storage isolation makes the helpers safe; it does
+    // nothing for a route.
+    assert!(
+        duplicate_commentable_type().is_none(),
+        "two #[commentable] models share the commentable_type {:?}, so the comment router \
+         cannot tell `/comments/{}/…` apart: one of them would be unreachable. Give one a \
+         `#[commentable(type_name = \"…\")]`, or serve them from your own routes instead of \
+         mounting the generic router.",
+        duplicate_commentable_type().unwrap_or_default(),
+        duplicate_commentable_type().unwrap_or_default(),
+    );
     // A sharded model routes every query through the shard its tenant selects;
     // this router checks out the control pool. There is no request-time answer
     // that is not silently wrong, so refuse at wiring time — the repository
