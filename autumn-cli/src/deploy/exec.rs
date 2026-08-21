@@ -2036,8 +2036,49 @@ fn parse_current_release(section: &str) -> Option<String> {
 /// (issue #1621, AC-6).
 const HOST_STATUS_DELIM: &str = "---autumn-host-status---";
 
-/// Sentinel the status probe prints when the shared maintenance flag file exists.
+/// Sentinel the status probe prints when a maintenance flag file exists.
 const MAINTENANCE_ON_SENTINEL: &str = "maintenance-on";
+
+/// Whether a host is in maintenance, **as the unit it is actually running sees
+/// it** (issue #1621, review round 1).
+///
+/// Deliberately three-valued rather than a `bool`. The flag file the runtime polls
+/// is chosen by `AUTUMN_MAINTENANCE_FLAG_FILE` (see
+/// [`autumn_web::maintenance::flag_file_path_from`]), which slot units only carry
+/// from #1621 onwards — so on a host whose unit predates this feature the app polls
+/// a release-local path the fleet switch does not own. Reading one fixed path and
+/// calling the answer `on`/`off` therefore lies in both directions: `off` for a
+/// host that is maintained, and `ON` for a host still taking traffic. When the CLI
+/// cannot prove WHICH file the running unit polls it says so instead of guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceStatus {
+    /// The file the running unit polls exists: the app is serving maintenance.
+    On,
+    /// The file the running unit polls does not exist: the app is serving traffic.
+    Off,
+    /// The live slot unit could not be read, so the file the app polls is unknown.
+    /// **Fails closed** — never rendered as a confident `ON`/`off`.
+    Unknown,
+}
+
+/// Which maintenance flag file the host's live slot unit resolves to (issue #1621,
+/// review round 1).
+///
+/// Reported alongside [`MaintenanceStatus`] because it is the actionable half: a
+/// host that does not poll the shared path will have its flag orphaned by the next
+/// cutover, and a fleet-wide `deploy maintenance on` cannot reach it reliably.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceFlagSource {
+    /// The unit declares `AUTUMN_MAINTENANCE_FLAG_FILE` and it is exactly the
+    /// per-app shared path this CLI manages — the #1621 shape.
+    Shared,
+    /// The unit resolves to some OTHER file: no override at all (a pre-#1621 unit,
+    /// polling `WorkingDirectory`-relative `tmp/autumn-maintenance.json`), or an
+    /// override pointing somewhere this CLI does not write.
+    Unshared,
+    /// The unit could not be read, so nothing about the flag path is proved.
+    Unknown,
+}
 
 /// Everything `autumn deploy status` reads from ONE host (issue #1621, AC-6).
 ///
@@ -2056,10 +2097,17 @@ pub struct HostStatusProbe {
     pub ready_code: Option<u16>,
     /// Whether the SHARED maintenance flag file exists on this host.
     ///
-    /// Read from `{app_dir}/shared/…` — the release-independent path the slot units
-    /// point `AUTUMN_MAINTENANCE_FLAG_FILE` at — so the answer survives a cutover,
-    /// which is the whole reason that override exists.
-    pub maintenance_on: bool,
+    /// Read from `{app_dir}/shared/…` — the release-independent path the #1621 slot
+    /// units point `AUTUMN_MAINTENANCE_FLAG_FILE` at — so the answer survives a
+    /// cutover, which is the whole reason that override exists. It is the state of
+    /// ONE file, not a verdict: see [`Self::maintenance`] for what the RUNNING unit
+    /// observes.
+    pub shared_maintenance_flag: bool,
+    /// Maintenance as the host's live slot unit actually observes it — the fact
+    /// `deploy status` reports (issue #1621, review round 1).
+    pub maintenance: MaintenanceStatus,
+    /// Which file that verdict came from.
+    pub maintenance_flag_source: MaintenanceFlagSource,
     /// The last state-changing deploy action this host COMPLETED, from the
     /// `shared/last-deploy` marker (AC-6), or `None` when the marker is absent or
     /// unreadable.
@@ -2131,30 +2179,79 @@ pub fn probe_host_status(
             .live_slot
         }
     };
+    let shared_flag = cfg.maintenance_flag_file();
     let shell = format!(
         "curl -o /dev/null -s -m 5 -w '%{{http_code}}' http://127.0.0.1:{port}/ready 2>/dev/null \
          || true; \
          printf '\\n{delim}\\n'; \
          if [ -f {flag} ]; then printf '%s' '{on}'; fi; \
          printf '\\n{delim}\\n'; \
-         cat {last_deploy} 2>/dev/null || true",
+         cat {last_deploy} 2>/dev/null || true; \
+         printf '\\n{delim}\\n'; \
+         if [ -f {unit} ]; then \
+         autumn_mf=$(sed -n 's|^Environment={flag_env}=||p' {unit} 2>/dev/null | tail -n 1); \
+         autumn_wd=$(sed -n 's|^WorkingDirectory=||p' {unit} 2>/dev/null | tail -n 1); \
+         if [ -z \"$autumn_mf\" ] && [ -n \"$autumn_wd\" ]; then \
+         autumn_mf=\"$autumn_wd/{legacy_rel}\"; fi; \
+         if [ -n \"$autumn_mf\" ]; then printf '%s\\n' \"$autumn_mf\"; \
+         if [ -f \"$autumn_mf\" ]; then printf '%s' '{on}'; fi; fi; fi",
         port = slot_app_port(public_port, live_slot),
         delim = HOST_STATUS_DELIM,
-        flag = shell_quote(&cfg.maintenance_flag_file()),
+        flag = shell_quote(&shared_flag),
         on = MAINTENANCE_ON_SENTINEL,
         // AC-6, third fact: the last COMPLETED deploy action. Folded into this
         // existing round-trip rather than a new per-host ssh — `deploy status` is
         // run mid-incident across the whole fleet, and every extra round-trip is
         // paid N times.
         last_deploy = shell_quote(&last_deploy_marker(cfg)),
+        // Review round 1: resolve, ON THE HOST, the flag file the LIVE SLOT UNIT
+        // actually makes the app poll — the same rule
+        // `maintenance::flag_file_path_from` applies at runtime (the override when
+        // non-blank, else the cwd-relative legacy path, and `WorkingDirectory` IS
+        // the app's cwd). Doing it in-shell keeps `deploy status` at the same two
+        // round-trips per host; doing it from the unit rather than from `current`
+        // is what makes the answer true for a unit rendered before #1621, which
+        // carries no override line at all.
+        unit = shell_quote(&format!(
+            "/etc/systemd/system/{}.service",
+            slot_unit_name(&cfg.service_name, live_slot)
+        )),
+        flag_env = autumn_web::maintenance::MAINTENANCE_FLAG_FILE_ENV,
+        legacy_rel = autumn_web::maintenance::MAINTENANCE_FLAG_FILE,
     );
     let out = exec.run(&RemoteCommand::new("probe-host-status", shell))?;
     // Section-count tolerant: a host still running a pre-#1621 probe shape (or a
-    // fixture written against it) simply reports no last-deploy section.
+    // fixture written against it) simply reports no last-deploy section, and a
+    // capture predating the unit section leaves the maintenance verdict `Unknown`.
     let mut sections = out.stdout.split(HOST_STATUS_DELIM);
     let ready_section = sections.next().unwrap_or_default();
-    let maintenance_section = sections.next().unwrap_or_default();
+    let shared_flag_section = sections.next().unwrap_or_default();
     let last_deploy_section = sections.next().unwrap_or_default();
+    let unit_flag_section = sections.next().unwrap_or_default();
+    // The unit section is `{resolved path}\n[{sentinel}]`. A blank/absent path is
+    // "the unit could not be read" — fail closed rather than fall back to the
+    // shared path, whose state the running unit may well not observe.
+    let mut unit_lines = unit_flag_section.trim_start_matches('\n').lines();
+    let resolved_flag_path = unit_lines.next().unwrap_or_default().trim();
+    let (maintenance, maintenance_flag_source) = if resolved_flag_path.is_empty() {
+        (MaintenanceStatus::Unknown, MaintenanceFlagSource::Unknown)
+    } else {
+        let present = unit_lines
+            .next()
+            .is_some_and(|line| line.trim() == MAINTENANCE_ON_SENTINEL);
+        (
+            if present {
+                MaintenanceStatus::On
+            } else {
+                MaintenanceStatus::Off
+            },
+            if resolved_flag_path == shared_flag {
+                MaintenanceFlagSource::Shared
+            } else {
+                MaintenanceFlagSource::Unshared
+            },
+        )
+    };
     Ok(HostStatusProbe {
         deploy,
         // `curl` writes `000` when it never got a response; that is "nothing
@@ -2165,7 +2262,9 @@ pub fn probe_host_status(
             .parse::<u16>()
             .ok()
             .filter(|code| *code > 0),
-        maintenance_on: maintenance_section.trim() == MAINTENANCE_ON_SENTINEL,
+        shared_maintenance_flag: shared_flag_section.trim() == MAINTENANCE_ON_SENTINEL,
+        maintenance,
+        maintenance_flag_source,
         last_deploy: parse_last_deploy(last_deploy_section),
     })
 }
@@ -5696,6 +5795,166 @@ mod tests {
     }
 
     #[test]
+    fn probe_host_status_consults_the_live_slot_unit_for_the_maintenance_flag_path() {
+        // #1621 review round 1 (Codex 2). The status probe used to read ONLY the
+        // shared flag path. A host still running a slot unit rendered BEFORE #1621
+        // has no `Environment=AUTUMN_MAINTENANCE_FLAG_FILE=` line, so the app it is
+        // running polls the cwd-relative (release-local) `tmp/autumn-maintenance
+        // .json` instead — and `deploy status` reported the SHARED path's state for
+        // it anyway. So it could print `maintenance off` for a host that is
+        // actually maintained, and `maintenance ON` for one whose legacy write
+        // failed and which is therefore still taking traffic.
+        //
+        // The probe must instead ask the LIVE SLOT UNIT which file the running app
+        // polls, resolving it exactly as `maintenance::flag_file_path_from` does
+        // (the override when set, else `WorkingDirectory` + the legacy relative
+        // path), and report THAT file's presence.
+        let cfg = resolved();
+        let exec = RecordingExecutor::new()
+            .with_stdout("detect-current", status_probe_stdout(RELEASE_ID, 3001))
+            .with_stdout("probe-host-status", "200\n---autumn-host-status---\n");
+        probe_host_status(&cfg, 3000, &exec).expect("status probe runs");
+        let shell = exec
+            .shell_for("probe-host-status")
+            .expect("status probe ran");
+        assert!(
+            shell.contains("'/etc/systemd/system/myapp-blue.service'"),
+            "the status probe must read the LIVE SLOT UNIT to learn which flag file \
+             the running app polls: {shell}"
+        );
+        assert!(
+            shell.contains(autumn_web::maintenance::MAINTENANCE_FLAG_FILE_ENV),
+            "the probe must resolve the unit's flag-file override: {shell}"
+        );
+        assert!(
+            shell.contains(autumn_web::maintenance::MAINTENANCE_FLAG_FILE),
+            "the probe must fall back to the legacy cwd-relative path for a unit \
+             that declares no override: {shell}"
+        );
+        // Still read-only: exactly the two probe labels, nothing mutating.
+        assert_eq!(
+            exec.run_labels(),
+            vec!["detect-current", "probe-host-status"],
+            "`deploy status` must never mutate a host"
+        );
+    }
+
+    /// Build a `probe-host-status` capture from its four sections: the `/ready`
+    /// code, the shared-flag sentinel, the last-deploy marker, and the resolved
+    /// unit flag path + its own presence sentinel.
+    fn host_status_capture(ready: &str, shared_on: bool, unit_section: &str) -> String {
+        format!(
+            "{ready}\n{HOST_STATUS_DELIM}\n{shared}\n{HOST_STATUS_DELIM}\n\n{unit_section}",
+            shared = if shared_on {
+                MAINTENANCE_ON_SENTINEL
+            } else {
+                ""
+            },
+        )
+    }
+
+    #[test]
+    fn probe_host_status_reports_the_flag_state_the_running_unit_observes() {
+        // #1621 review round 1 (Codex 2), the semantics. In every case the reported
+        // state is the one the RUNNING unit sees, not the one the shared path holds.
+        let cfg = resolved();
+        let legacy_flag = format!(
+            "{RELEASE_DIR}/{}",
+            autumn_web::maintenance::MAINTENANCE_FLAG_FILE
+        );
+        let probe_with_sections = |shared_on: bool, unit_section: String| {
+            let exec = RecordingExecutor::new()
+                .with_stdout("detect-current", status_probe_stdout(RELEASE_ID, 3001))
+                .with_stdout(
+                    "probe-host-status",
+                    host_status_capture("200", shared_on, &unit_section),
+                );
+            probe_host_status(&cfg, 3000, &exec).expect("status probe runs")
+        };
+
+        // 1. A pre-#1621 unit whose LEGACY flag is present while the shared flag is
+        //    absent: the app IS maintained. Reporting `off` here is the defect.
+        let maintained = probe_with_sections(
+            false,
+            format!("{HOST_STATUS_DELIM}\n{legacy_flag}\n{MAINTENANCE_ON_SENTINEL}"),
+        );
+        assert_eq!(maintained.maintenance, MaintenanceStatus::On);
+        assert_eq!(
+            maintained.maintenance_flag_source,
+            MaintenanceFlagSource::Unshared,
+            "a unit with no override polls a path the fleet switch does not own",
+        );
+
+        // 2. The same host after a `maintenance on` whose legacy write FAILED: the
+        //    shared flag exists but the running app never sees it, so the host is
+        //    still taking traffic. `off` is the truthful answer — a confident `ON`
+        //    would send the operator into a live window believing it closed.
+        let shared_only =
+            probe_with_sections(true, format!("{HOST_STATUS_DELIM}\n{legacy_flag}\n"));
+        assert_eq!(shared_only.maintenance, MaintenanceStatus::Off);
+        assert_eq!(
+            shared_only.maintenance_flag_source,
+            MaintenanceFlagSource::Unshared
+        );
+
+        // 3. A #1621 unit: the resolved path IS the shared one, and its state is
+        //    reported with confidence — the pre-existing behaviour, unchanged.
+        let shared_path = cfg.maintenance_flag_file();
+        let modern = probe_with_sections(
+            true,
+            format!("{HOST_STATUS_DELIM}\n{shared_path}\n{MAINTENANCE_ON_SENTINEL}"),
+        );
+        assert_eq!(modern.maintenance, MaintenanceStatus::On);
+        assert_eq!(
+            modern.maintenance_flag_source,
+            MaintenanceFlagSource::Shared
+        );
+        let cleared = probe_with_sections(false, format!("{HOST_STATUS_DELIM}\n{shared_path}\n"));
+        assert_eq!(cleared.maintenance, MaintenanceStatus::Off);
+        assert_eq!(
+            cleared.maintenance_flag_source,
+            MaintenanceFlagSource::Shared
+        );
+    }
+
+    #[test]
+    fn probe_host_status_fails_closed_when_the_flag_path_cannot_be_proved() {
+        // #1621 review round 1 (Codex 2), the fail-closed half. A host whose live
+        // slot unit could not be read at all (absent, unreadable, or a capture that
+        // predates this section) leaves the CLI unable to say WHICH file the running
+        // app polls. That is "we could not tell" — never a confident `ON`/`off`,
+        // even though the shared flag below is set.
+        let cfg = resolved();
+        for unit_section in [
+            // No unit section at all (a capture from a CLI predating this probe).
+            String::new(),
+            // Section present but empty: no unit file on the host.
+            format!("{HOST_STATUS_DELIM}\n"),
+            // Section present but the path line is blank: the unit declared neither
+            // an override nor a `WorkingDirectory`, so nothing was probed.
+            format!("{HOST_STATUS_DELIM}\n   \n"),
+        ] {
+            let exec = RecordingExecutor::new()
+                .with_stdout("detect-current", status_probe_stdout(RELEASE_ID, 3001))
+                .with_stdout(
+                    "probe-host-status",
+                    host_status_capture("200", true, &unit_section),
+                );
+            let probe = probe_host_status(&cfg, 3000, &exec).expect("status probe runs");
+            assert_eq!(
+                probe.maintenance,
+                MaintenanceStatus::Unknown,
+                "an unprovable flag path must not render as a confident on/off: \
+                 {unit_section:?}"
+            );
+            assert_eq!(
+                probe.maintenance_flag_source,
+                MaintenanceFlagSource::Unknown
+            );
+        }
+    }
+
+    #[test]
     fn probe_host_status_reads_readiness_and_maintenance_off_the_live_slot() {
         // #1621 (AC-6, plan §7.1): `deploy status` needs two facts `up` must never
         // pay for — the live slot's `/ready` code and whether the SHARED maintenance
@@ -5709,11 +5968,16 @@ mod tests {
             )
             .with_stdout(
                 "probe-host-status",
-                "200\n---autumn-host-status---\nmaintenance-on",
+                format!(
+                    "200\n---autumn-host-status---\nmaintenance-on\n---autumn-host-status---\n\n\
+                     ---autumn-host-status---\n{}\nmaintenance-on",
+                    resolved().maintenance_flag_file()
+                ),
             );
         let probe = probe_host_status(&cfg, 3000, &exec).unwrap();
         assert_eq!(probe.ready_code, Some(200));
-        assert!(probe.maintenance_on);
+        assert!(probe.shared_maintenance_flag);
+        assert_eq!(probe.maintenance, MaintenanceStatus::On);
         assert_eq!(
             probe.deploy.current_release_dir.as_deref(),
             Some("/srv/autumn/myapp/releases/20260714T120000Z")
@@ -5771,9 +6035,12 @@ mod tests {
                 "capture {capture:?} must degrade to unknown readiness"
             );
             assert!(
-                !probe.maintenance_on,
-                "no sentinel means maintenance is off, never unknown-as-on"
+                !probe.shared_maintenance_flag,
+                "no sentinel means the shared flag is absent, never unknown-as-on"
             );
+            // …and with no unit section at all the VERDICT is `Unknown`, not a
+            // confident `off` (review round 1, Codex 2).
+            assert_eq!(probe.maintenance, MaintenanceStatus::Unknown);
         }
     }
 

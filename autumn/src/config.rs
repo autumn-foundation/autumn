@@ -7614,6 +7614,28 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         return;
     }
     let deploy = deploy.get_or_insert_with(DeployConfig::default);
+    // #1621 review round 1: `host` and `hosts` are MUTUALLY EXCLUSIVE downstream,
+    // so applying one spelling from the environment on top of the OTHER spelling in
+    // TOML produced a config that refuses every `autumn deploy` subcommand — even
+    // though `AUTUMN_DEPLOY__*` is documented to WIN over TOML. Whether each
+    // spelling was set NON-EMPTY in the environment is therefore captured BEFORE
+    // either is applied, so a non-empty env value can clear the TOML alternate
+    // below.
+    //
+    // "Non-empty" is judged conservatively — a value that is blank AFTER TRIMMING
+    // never clears the other spelling — so the established empty-means-unset
+    // semantics survive: `AUTUMN_DEPLOY__HOST=` / ` ` and `AUTUMN_DEPLOY__HOSTS=` /
+    // `,` / ` , ` are the shape a CI or compose template emits for an unfilled
+    // slot. They say NOTHING about the other spelling. (`parse_env_option_string`
+    // below still applies its own, unchanged, `is_empty()` rule to `host` itself;
+    // trimming here only makes the CLEARING decision stricter, so a whitespace-only
+    // value can never silently drop a configured fleet list.)
+    let env_set_host = env
+        .var("AUTUMN_DEPLOY__HOST")
+        .is_ok_and(|value| !value.trim().is_empty());
+    let env_set_hosts = env
+        .var("AUTUMN_DEPLOY__HOSTS")
+        .is_ok_and(|value| value.split(',').any(|entry| !entry.trim().is_empty()));
     parse_env_option_string(env, "AUTUMN_DEPLOY__HOST", &mut deploy.host);
     // #1621: the fleet host list, as CSV. It REPLACES the whole TOML list (a
     // fleet-level retarget), matching every other `AUTUMN_DEPLOY__*` override.
@@ -7623,6 +7645,20 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     // CLI as a blank fleet entry that refuses every deploy subcommand. Duplicate
     // entries are still rejected downstream by the CLI's `ResolvedFleet::resolve`.
     parse_env_csv_non_empty(env, "AUTUMN_DEPLOY__HOSTS", &mut deploy.hosts);
+    // Env-over-TOML precedence, applied to the spelling the operator did NOT set:
+    // retargeting a `[deploy] host` project as a fleet (or a `[deploy] hosts`
+    // project at a single server) is a legitimate env override, not a conflict.
+    //
+    // It is deliberately NOT a tie-break: when BOTH env spellings are set
+    // non-empty the rollout order is genuinely ambiguous — an operator error, not a
+    // precedence question — so both survive and the existing mutual-exclusion
+    // refusal (`DeployConfig::validate` / the CLI's `deploy_host_list`) still fires
+    // naming both keys.
+    if env_set_hosts && !env_set_host {
+        deploy.host = None;
+    } else if env_set_host && !env_set_hosts {
+        deploy.hosts.clear();
+    }
     parse_env_string(env, "AUTUMN_DEPLOY__USER", &mut deploy.user);
     parse_env(env, "AUTUMN_DEPLOY__SSH_PORT", &mut deploy.ssh_port);
     parse_env_option_string(env, "AUTUMN_DEPLOY__APP_NAME", &mut deploy.app_name);
@@ -13125,6 +13161,157 @@ path = "/healthz"
                 deploy.validate()
             );
         }
+    }
+
+    #[test]
+    fn a_non_empty_deploy_host_env_override_clears_the_toml_alternate_spelling() {
+        // #1621 review round 1 (Codex 1). `host` and `hosts` are MUTUALLY
+        // EXCLUSIVE downstream, so an env override that sets one spelling while the
+        // TOML still holds the other produced a config that refuses every `autumn
+        // deploy` subcommand — even though `AUTUMN_DEPLOY__*` is documented to WIN
+        // over TOML. Retargeting a `[deploy] host` project as a fleet with
+        // `AUTUMN_DEPLOY__HOSTS=a,b` (and the reverse) must simply work.
+        let mut fleet_over_scalar: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            host = "203.0.113.10"
+            "#,
+        )
+        .expect("[deploy] host should parse");
+        fleet_over_scalar.apply_env_overrides_with_env(
+            &MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", "web-1,web-2"),
+        );
+        let deploy = fleet_over_scalar.deploy.expect("deploy configured");
+        assert_eq!(
+            deploy.hosts,
+            vec!["web-1".to_owned(), "web-2".to_owned()],
+            "the env fleet list must win, got: {:?}",
+            deploy.hosts
+        );
+        assert_eq!(
+            deploy.host, None,
+            "a non-empty AUTUMN_DEPLOY__HOSTS must CLEAR the TOML `host`, got: {:?}",
+            deploy.host
+        );
+        assert!(
+            deploy.validate().is_ok(),
+            "env-over-TOML retarget must not trip mutual exclusion, got: {:?}",
+            deploy.validate()
+        );
+
+        let mut scalar_over_fleet: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            hosts = ["toml-1", "toml-2"]
+            "#,
+        )
+        .expect("[deploy] hosts should parse");
+        scalar_over_fleet
+            .apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOST", "single-1"));
+        let deploy = scalar_over_fleet.deploy.expect("deploy configured");
+        assert_eq!(deploy.host.as_deref(), Some("single-1"));
+        assert!(
+            deploy.hosts.is_empty(),
+            "a non-empty AUTUMN_DEPLOY__HOST must CLEAR the TOML `hosts`, got: {:?}",
+            deploy.hosts
+        );
+        assert!(
+            deploy.validate().is_ok(),
+            "env-over-TOML narrowing must not trip mutual exclusion, got: {:?}",
+            deploy.validate()
+        );
+    }
+
+    #[test]
+    fn two_conflicting_non_empty_deploy_host_env_overrides_are_still_refused() {
+        // #1621 review round 1 (Codex 1), the other half: env-over-TOML precedence
+        // is NOT a licence to pick a winner between two conflicting env vars. Both
+        // spellings set NON-EMPTY in the environment is a genuine operator error —
+        // the rollout order is ambiguous — so both survive and the downstream
+        // mutual-exclusion refusal still fires.
+        for toml_src in [
+            "[deploy]\n",
+            "[deploy]\nhost = \"toml-host\"\n",
+            "[deploy]\nhosts = [\"toml-1\"]\n",
+        ] {
+            let mut config: AutumnConfig =
+                toml::from_str(toml_src).expect("[deploy] table should parse");
+            config.apply_env_overrides_with_env(
+                &MockEnv::new()
+                    .with("AUTUMN_DEPLOY__HOST", "env-single")
+                    .with("AUTUMN_DEPLOY__HOSTS", "env-1,env-2"),
+            );
+            let deploy = config.deploy.expect("deploy configured");
+            assert_eq!(
+                deploy.host.as_deref(),
+                Some("env-single"),
+                "both env spellings must survive so the conflict is visible ({toml_src:?})"
+            );
+            assert_eq!(
+                deploy.hosts,
+                vec!["env-1".to_owned(), "env-2".to_owned()],
+                "both env spellings must survive so the conflict is visible ({toml_src:?})"
+            );
+            assert!(
+                deploy.validate().is_err(),
+                "two conflicting NON-EMPTY env spellings must still be refused ({toml_src:?})",
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_deploy_host_env_override_never_clears_the_toml_alternate_spelling() {
+        // #1621 review round 1 (Codex 1). The established empty-means-unset
+        // semantics must survive the clearing rule above: `AUTUMN_DEPLOY__HOST=`
+        // and `AUTUMN_DEPLOY__HOSTS=` (the shape a CI/compose template emits for an
+        // unfilled slot) say NOTHING about the alternate spelling, so the TOML value
+        // stands.
+        for blank in ["", "   ", ",", " , "] {
+            let mut config: AutumnConfig = toml::from_str(
+                r#"
+                [deploy]
+                host = "203.0.113.10"
+                "#,
+            )
+            .expect("[deploy] host should parse");
+            config
+                .apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", blank));
+            let deploy = config.deploy.expect("deploy configured");
+            assert_eq!(
+                deploy.host.as_deref(),
+                Some("203.0.113.10"),
+                "AUTUMN_DEPLOY__HOSTS={blank:?} must not clear the TOML `host`"
+            );
+            assert!(deploy.hosts.is_empty());
+        }
+
+        for blank in ["", "   "] {
+            let mut config: AutumnConfig = toml::from_str(
+                r#"
+                [deploy]
+                hosts = ["toml-1", "toml-2"]
+                "#,
+            )
+            .expect("[deploy] hosts should parse");
+            config.apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOST", blank));
+            let deploy = config.deploy.expect("deploy configured");
+            assert_eq!(
+                deploy.hosts,
+                vec!["toml-1".to_owned(), "toml-2".to_owned()],
+                "AUTUMN_DEPLOY__HOST={blank:?} must not clear the TOML `hosts`"
+            );
+        }
+        // `AUTUMN_DEPLOY__HOST=` (truly empty) keeps its own documented
+        // clears-the-scalar meaning — the clearing rule above changes nothing here.
+        let mut config = AutumnConfig {
+            deploy: Some(DeployConfig {
+                host: Some("toml-host".to_owned()),
+                ..DeployConfig::default()
+            }),
+            ..AutumnConfig::default()
+        };
+        config.apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOST", ""));
+        assert_eq!(config.deploy.expect("deploy configured").host, None);
     }
 
     // ── server.tls.acme (#1608) ───────────────────────────────────

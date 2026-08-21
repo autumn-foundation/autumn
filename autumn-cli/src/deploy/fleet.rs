@@ -10,7 +10,7 @@
 //! Three rules are load-bearing and easy to break by accident:
 //!
 //! 1. **Each host's ops stay in their OWN `Vec`.** No code path may concatenate
-//!    two hosts' [`exec::DeployOp`] vectors. [`exec::execute_with_teardown`]
+//!    two hosts' [`exec::DeployOp`] vectors. `exec::execute_with_teardown`
 //!    resolves the auto-rollback boundary with
 //!    `ops.iter().position(|op| op.label() == boundary_label)` — the FIRST match —
 //!    so a flat fleet-wide vector would classify every later host's *pre*-flip
@@ -324,7 +324,7 @@ pub(crate) fn fleet_plan_lines(hosts: &[String]) -> Vec<String> {
 ///
 /// The first five variants are deliberately the ones the EXISTING per-host
 /// executor already distinguishes, so nothing is inferred:
-/// [`exec::execute_with_teardown`] returns `CandidateRolledBack`/`FirstDeployTornDown`
+/// `exec::execute_with_teardown` returns `CandidateRolledBack`/`FirstDeployTornDown`
 /// **only** for a failure at or before the go-live boundary (traffic never moved,
 /// the candidate was cleaned up), and the raw error otherwise (the host is live on
 /// the new release). [`classify_post_boundary`] then refines that raw
@@ -389,7 +389,7 @@ pub(crate) enum HostOutcome {
 
 /// How bad a POST-boundary failure is (issue #1621, §4.6).
 ///
-/// "Post-boundary" means [`exec::execute_with_teardown`] returned the RAW executor
+/// "Post-boundary" means `exec::execute_with_teardown` returned the RAW executor
 /// error rather than one of its two clean-failure variants: the go-live op already
 /// succeeded, no teardown ran, and the host **is** on the new release. What to do
 /// about that depends entirely on WHICH step failed, and the three answers are
@@ -578,7 +578,7 @@ pub(crate) fn failed_step_label(err: &exec::DeployExecError) -> &'static str {
 /// host may be touched — so it is asked explicitly rather than inferred from a
 /// synthesized label string.
 ///
-/// [`exec::execute_with_teardown`] attaches the op label to every failure past a
+/// `exec::execute_with_teardown` attaches the op label to every failure past a
 /// known go-live boundary, which is what makes this answerable for the error shapes
 /// that carry none of their own.
 const fn attributed_step_label(err: &exec::DeployExecError) -> Option<&'static str> {
@@ -1109,6 +1109,46 @@ pub(crate) const DRIFT_PROXY_OPTIONS_UNREADABLE: &str =
 pub(crate) const DRIFT_PROXY_PORT_MISMATCH: &str =
     "the installed proxy unit binds a different public port than `[server] port` configures";
 
+/// State drift: this host claims a promoted release its `current` symlink could
+/// not be resolved to (issue #1621, review round 2).
+///
+/// The probe shell tests `[ -L current ]`, which succeeds for a symlink whose
+/// target cannot be canonicalized, so such a host reports `HostMode::Redeploy`
+/// while `readlink -f` yields nothing and the release reads back
+/// [`ReleaseId::Unknown`]. That combination is not "we have not looked" — it is a
+/// host that says it is serving a release nobody can name, which is exactly the
+/// unprovable state this feature fails closed on.
+///
+/// It stays out of VERSION drift (an unknown release still names no version to be
+/// mixed with), and it is the reason the NEXT deploy matters: `commit-markers`
+/// copies `readlink current` verbatim into `previous-release`, so deploying this
+/// host records an unresolvable directory as its rollback target — the rollback
+/// then refuses (`probe_rollback_target_dir` fails closed) instead of working.
+pub(crate) const DRIFT_RELEASE_UNREADABLE: &str = "this host has a `current` symlink but the release it points at could not be read (a broken \
+     symlink or a missing releases dir) — repair it before the next deploy, which would record \
+     that unresolvable target as this host's rollback point";
+
+/// State drift: this host's live slot unit could not be read, so the CLI cannot
+/// prove WHICH maintenance flag file the running app polls (issue #1621, review
+/// round 1).
+///
+/// The maintenance column reports `?` rather than a confident `ON`/`off` — an
+/// operator closing a live window must never be told it is closed on the strength
+/// of a file the running unit may not even read.
+pub(crate) const DRIFT_MAINTENANCE_UNPROVEN: &str = "the live slot unit could not be read, so which maintenance flag file this host's app \
+     polls is unknown — the maintenance column reports `?` rather than guessing";
+
+/// State drift: this host's app polls a maintenance flag file OTHER than the
+/// per-app shared one (issue #1621, review round 1).
+///
+/// Almost always a slot unit rendered BEFORE #1621: it carries no
+/// `AUTUMN_MAINTENANCE_FLAG_FILE`, so the runtime falls back to the cwd-relative
+/// `tmp/autumn-maintenance.json` under its release dir. The maintenance column
+/// reports THAT file (the truth for this host), but the flag is orphaned by the
+/// next cutover and a fleet-wide `deploy maintenance` reaches it only best-effort.
+pub(crate) const DRIFT_MAINTENANCE_UNSHARED_FLAG: &str = "this host's app polls a release-local maintenance flag file, not the shared one (its slot \
+     unit predates AUTUMN_MAINTENANCE_FLAG_FILE) — redeploy it so maintenance survives cutovers";
+
 /// The sentence printed under the status table to bound the `last deploy` column
 /// (issue #1621, AC-6).
 ///
@@ -1159,9 +1199,13 @@ pub(crate) struct HostStatus {
     /// HTTP status the live slot's loopback `/ready` returned, `None` when nothing
     /// answered.
     pub(crate) ready_code: Option<u16>,
-    /// Whether the shared maintenance flag file is present. ORTHOGONAL to
-    /// `ready_code` — see [`MAINTENANCE_DOES_NOT_DRAIN_NOTE`].
-    pub(crate) maintenance_on: bool,
+    /// Maintenance as the host's RUNNING slot unit observes it — three-valued, so
+    /// an unprovable state is never rendered as a confident on/off (issue #1621,
+    /// review round 1). ORTHOGONAL to `ready_code` — see
+    /// [`MAINTENANCE_DOES_NOT_DRAIN_NOTE`].
+    pub(crate) maintenance: exec::MaintenanceStatus,
+    /// Which flag file that verdict came from.
+    pub(crate) maintenance_flag_source: exec::MaintenanceFlagSource,
     /// The `--http-port` the installed proxy unit binds.
     pub(crate) installed_proxy_port: exec::InstalledProxyPort,
     /// The TLS/host options the last forward deploy recorded.
@@ -1195,7 +1239,10 @@ impl HostStatus {
             release: ReleaseId::Unknown,
             live_slot: None,
             ready_code: None,
-            maintenance_on: false,
+            // Nothing was probed, so nothing is proved — and `fleet_drift` never
+            // derives drift from an unreachable host, so this stays a bare `?`.
+            maintenance: exec::MaintenanceStatus::Unknown,
+            maintenance_flag_source: exec::MaintenanceFlagSource::Unknown,
             installed_proxy_port: exec::InstalledProxyPort::Absent,
             proxy_options: exec::ProxyOptionsMarker::Absent,
             public_port: 0,
@@ -1224,7 +1271,8 @@ impl HostStatus {
                 .map_or(ReleaseId::Unknown, |id| ReleaseId::Known(id.to_owned())),
             live_slot: reconcile.as_ref().map(|r| r.live_slot),
             ready_code: probe.ready_code,
-            maintenance_on: probe.maintenance_on,
+            maintenance: probe.maintenance,
+            maintenance_flag_source: probe.maintenance_flag_source,
             installed_proxy_port: probe.deploy.installed_proxy_port.clone(),
             proxy_options: probe.deploy.last_proxy_options.clone(),
             public_port,
@@ -1324,6 +1372,15 @@ pub(crate) fn fleet_drift(hosts: &[HostStatus]) -> DriftReport {
         if status.mode == Some(HostMode::First) && any_release_deployed {
             state_drift.push((status.host.clone(), DRIFT_HOST_NOT_DEPLOYED));
         }
+        // The mirror image, and the one `--strict` used to exit 0 on: the host
+        // PROVED it has a `current` symlink (that is what `Redeploy` means) yet the
+        // release behind it could not be read. Unknown still contributes no VERSION
+        // drift — rule 1 above is untouched — but it is actionable marker damage,
+        // so it is state drift. Judged against nothing: a lone damaged host needs
+        // the same alert a damaged host in a big fleet does.
+        if status.mode == Some(HostMode::Redeploy) && matches!(status.release, ReleaseId::Unknown) {
+            state_drift.push((status.host.clone(), DRIFT_RELEASE_UNREADABLE));
+        }
         if status.live_slot_marker_drift {
             state_drift.push((status.host.clone(), DRIFT_LIVE_SLOT_MARKER));
         }
@@ -1336,6 +1393,23 @@ pub(crate) fn fleet_drift(hosts: &[HostStatus]) -> DriftReport {
         if matches!(status.installed_proxy_port, exec::InstalledProxyPort::Port(port) if port != status.public_port)
         {
             state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_MISMATCH));
+        }
+        // Review round 1: the maintenance column is only as good as the CLI's
+        // knowledge of WHICH file the running unit polls. Both failure shapes are
+        // named here rather than buried in the column, because both need an
+        // operator action (inspect the unit / redeploy the host). A host with
+        // nothing deployed has no slot unit by definition and is already reported
+        // as such, so it is not double-flagged.
+        if status.mode == Some(HostMode::Redeploy) {
+            match status.maintenance_flag_source {
+                exec::MaintenanceFlagSource::Unknown => {
+                    state_drift.push((status.host.clone(), DRIFT_MAINTENANCE_UNPROVEN));
+                }
+                exec::MaintenanceFlagSource::Unshared => {
+                    state_drift.push((status.host.clone(), DRIFT_MAINTENANCE_UNSHARED_FLAG));
+                }
+                exec::MaintenanceFlagSource::Shared => {}
+            }
         }
     }
 
@@ -1371,10 +1445,12 @@ fn status_row_cells(status: &HostStatus, report: &DriftReport) -> [String; 8] {
         status
             .ready_code
             .map_or_else(|| "ready ?".to_owned(), |code| format!("ready {code}")),
-        if status.maintenance_on {
-            "maintenance ON".to_owned()
-        } else {
-            "maintenance off".to_owned()
+        match status.maintenance {
+            exec::MaintenanceStatus::On => "maintenance ON".to_owned(),
+            exec::MaintenanceStatus::Off => "maintenance off".to_owned(),
+            // Fail closed: "we could not tell" is its own cell, never an `off` that
+            // reads as proof the host is serving traffic normally.
+            exec::MaintenanceStatus::Unknown => "maintenance ?".to_owned(),
         },
         match &status.installed_proxy_port {
             exec::InstalledProxyPort::Port(port) => format!("proxy {port}"),
@@ -1441,7 +1517,7 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
                 .state_drift
                 .iter()
                 .any(|(host, _)| *host == status.host)
-                || status.maintenance_on
+                || status.maintenance == exec::MaintenanceStatus::On
             {
                 "\u{26A0}\u{FE0F} "
             } else {
@@ -1483,11 +1559,27 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
         // unknown really is "we could not read it". Describing the first as an
         // unreadable symlink sends the operator to inspect something that was never
         // there.
-        let (not_deployed, unreadable): (Vec<&str>, Vec<&str>) = unknown.iter().partition(|host| {
+        let (not_deployed, rest): (Vec<&str>, Vec<&str>) = unknown.iter().partition(|host| {
             hosts.iter().any(|status| {
                 status.host == **host && status.reachable && status.mode == Some(HostMode::First)
             })
         });
+        // Review round 2: a REACHABLE host that reports a `current` symlink whose
+        // release could not be read is now state drift, and its reason is printed
+        // per host below. Repeating it here under "reported, not counted as drift"
+        // would contradict that line — so this footer now covers only the hosts it
+        // is still true for (chiefly the unreachable ones, whose markers were never
+        // read at all).
+        let unreadable: Vec<&str> = rest
+            .into_iter()
+            .filter(|host| {
+                !hosts.iter().any(|status| {
+                    status.host == **host
+                        && status.reachable
+                        && status.mode == Some(HostMode::Redeploy)
+                })
+            })
+            .collect();
         if !not_deployed.is_empty() {
             lines.push(format!(
                 "  \u{2139}\u{FE0F}  no release deployed on {} \u{2014} nothing is installed \
@@ -1515,7 +1607,10 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
     if hosts.iter().any(|status| status.reachable) {
         lines.push(format!("  \u{2139}\u{FE0F}  {LAST_DEPLOY_SCOPE_NOTE}"));
     }
-    if hosts.iter().any(|status| status.maintenance_on) {
+    if hosts
+        .iter()
+        .any(|status| status.maintenance == exec::MaintenanceStatus::On)
+    {
         lines.push(format!(
             "  \u{2139}\u{FE0F}  {MAINTENANCE_DOES_NOT_DRAIN_NOTE}"
         ));
@@ -3142,7 +3237,8 @@ mod tests {
             release: release.map_or(ReleaseId::Unknown, |id| ReleaseId::Known(id.to_owned())),
             live_slot: Some(exec::SLOT_BLUE),
             ready_code: Some(200),
-            maintenance_on: false,
+            maintenance: exec::MaintenanceStatus::Off,
+            maintenance_flag_source: exec::MaintenanceFlagSource::Shared,
             installed_proxy_port: exec::InstalledProxyPort::Port(3000),
             proxy_options: exec::ProxyOptionsMarker::Options(exec::ProxyServiceOptions {
                 tls: false,
@@ -3319,6 +3415,68 @@ mod tests {
     }
 
     #[test]
+    fn a_deployed_host_whose_release_is_unreadable_is_state_drift() {
+        // #1621 review round 2. `[ -L current ]` succeeds for a symlink whose target
+        // cannot be canonicalized, so such a host reports `Redeploy` while `readlink
+        // -f` yields nothing and the release reads back `Unknown`. That combination
+        // used to produce ONLY the footer line explicitly labelled "reported, not
+        // counted as drift", so `deploy status --strict` exited 0 on a host with
+        // actionable marker damage — and the next deploy's `commit-markers` copies
+        // `readlink current` verbatim into `previous-release`, recording an
+        // unresolvable directory as that host's rollback point.
+        let damaged = status("web-b", None); // Redeploy + ReleaseId::Unknown
+        let rows = [status("web-a", Some("r1")), damaged];
+        let report = fleet_drift(&rows);
+
+        // Rule 1 is untouched: an unknown release still names no version, so it can
+        // never make a converged fleet look mixed.
+        assert!(
+            !report.version_drift,
+            "unknown is still never VERSION drift: {:?}",
+            report.releases
+        );
+        assert_eq!(
+            report.state_drift,
+            vec![("web-b".to_owned(), DRIFT_RELEASE_UNREADABLE)],
+            "the damaged host is named with its own reason"
+        );
+        assert!(
+            report.drifted(),
+            "`deploy status --strict` must exit non-zero on it"
+        );
+
+        // A lone damaged host is still drift — there is no peer to be judged
+        // against, because the damage is on the host itself.
+        let alone = [status("web-a", None)];
+        assert!(fleet_drift(&alone).drifted());
+
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
+        assert!(
+            rendered.contains(DRIFT_RELEASE_UNREADABLE),
+            "the drift reason must be named on the row:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("reported, not counted as drift"),
+            "the footer must not contradict the drift it is now counted as:\n{rendered}"
+        );
+
+        // An UNREACHABLE host keeps the old, still-true footer: its markers were
+        // never read, so nothing about them is drift.
+        let outage = [
+            status("web-a", Some("r1")),
+            HostStatus::unreachable("web-b"),
+        ];
+        let outage_report = fleet_drift(&outage);
+        assert!(outage_report.state_drift.is_empty());
+        assert!(
+            fleet_status_lines(&outage, &outage_report)
+                .join("\n")
+                .contains("reported, not counted as drift"),
+            "an unreachable host is still reported, not blamed",
+        );
+    }
+
+    #[test]
     fn fleet_drift_never_flags_a_host_it_could_not_reach() {
         // An unreachable host has no facts, so inventing drift from its absent
         // markers would report the network outage as a deploy defect. It is listed
@@ -3344,7 +3502,7 @@ mod tests {
         // teach exactly the wrong mental model, so they are separate and the table
         // says so.
         let mut maintained = status("web-b", Some("r1"));
-        maintained.maintenance_on = true;
+        maintained.maintenance = exec::MaintenanceStatus::On;
         let rows = [status("web-a", Some("r1")), maintained];
         let report = fleet_drift(&rows);
         let rendered = fleet_status_lines(&rows, &report).join("\n");

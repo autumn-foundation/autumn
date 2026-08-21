@@ -1547,7 +1547,12 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
         DeployAction::Status => {
             let fleet = ResolvedFleet::resolve(&deploy_cfg, &resolve_project_name())
                 .map_err(DeployError::Config)?;
-            run_status(&load_runtime_config(&resolved)?, &fleet, options)
+            // Review round 1: `status` is READ-ONLY and needs exactly one value
+            // from the app config (`server.port`), so an unrelated invalid
+            // production setting must not take it offline mid-incident. See
+            // `status_public_port`.
+            let port = status_public_port(&resolved)?;
+            run_status(&port, &resolved.profile, &fleet, options)
         }
         DeployAction::MaintenanceOn | DeployAction::MaintenanceOff => {
             let fleet = ResolvedFleet::resolve(&deploy_cfg, &resolve_project_name())
@@ -1834,6 +1839,130 @@ fn load_runtime_config(resolved: &ResolvedDeployConfig) -> Result<AutumnConfig, 
     // `[media]`) as opaque — app boot stays the authoritative strict gate.
     AutumnConfig::load_with_env_lenient_unknown_roots(&forced)
         .map_err(|e| DeployError::Config(e.to_string()))
+}
+
+/// The public port `autumn deploy status` probes each host against, plus the
+/// reason it had to be resolved the hard way (issue #1621, review round 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusPort {
+    /// The port `[server] port` resolves to under the TARGET deploy profile.
+    port: u16,
+    /// `None` on the normal path (the whole runtime config validated). `Some` when
+    /// the config did NOT validate under the deploy profile and the port was read
+    /// from the layered TOML/env without validation — the caller must say so out
+    /// loud rather than report against a silently-chosen port.
+    degraded: Option<String>,
+}
+
+/// Resolve the probe port for `deploy status` WITHOUT making an unrelated
+/// application-config error take the fleet's only read-only incident command
+/// offline (issue #1621, review round 1).
+///
+/// `status` needs exactly one value from the application config: `server.port`,
+/// the public port kamal-proxy binds — the number every per-host slot port is
+/// derived from and the one the proxy-port-mismatch drift rule compares against.
+/// Routing that through [`load_runtime_config`] validated the ENTIRE config under
+/// the deploy profile, so an invalid `[scheduler]`, `[mail]`, `[database]` or
+/// `[security]` setting aborted the command **before a single host was probed** —
+/// exactly when an operator needs to see the fleet.
+///
+/// The strict load stays the primary path, so a project whose config is fine gets
+/// byte-identical behaviour and the identical port. Only when it fails does this
+/// fall back to reading the DECLARED port out of the same base+profile TOML layers
+/// (plus the same `.env.<profile>`/OS env layer) the loader itself resolves it
+/// from, and it reports the degradation. It never guesses: the fallback value is
+/// the operator's own declared port, or the framework default when nothing
+/// declares one.
+///
+/// `check`, `rollback` and `up` deliberately keep the strict load: they grade and
+/// upload runtime VALUES (the signing secret, the DB URL), so an invalid config
+/// must stop them. `plan` never loads the runtime config at all.
+fn status_public_port(resolved: &ResolvedDeployConfig) -> Result<StatusPort, DeployError> {
+    let loaded = load_runtime_config(resolved);
+    status_public_port_with(&manifest_project_dirs(), &resolved.profile, loaded)
+}
+
+/// Pure core of [`status_public_port`] over an explicit search path and an
+/// already-attempted load, so both branches are unit-testable against temp dirs.
+fn status_public_port_with(
+    dirs: &[PathBuf],
+    profile_raw: &str,
+    loaded: Result<AutumnConfig, DeployError>,
+) -> Result<StatusPort, DeployError> {
+    match loaded {
+        Ok(config) => Ok(StatusPort {
+            port: config.server.port,
+            degraded: None,
+        }),
+        Err(err) => {
+            // The `.env.<profile>` + OS env layer, selected exactly as the strict
+            // load selects it — so an `AUTUMN_SERVER__PORT` that only exists in
+            // `.env.prod` still wins here, as it would at runtime. A `.env` that
+            // cannot be read is still fatal: that is not an unrelated app setting.
+            let overlay = deploy_profile_env_overlay(profile_raw)?;
+            Ok(StatusPort {
+                port: declared_server_port_in(dirs, profile_raw, &overlay)
+                    .unwrap_or_else(|| AutumnConfig::default().server.port),
+                degraded: Some(err.to_string()),
+            })
+        }
+    }
+}
+
+/// Read the DECLARED `[server] port` for a deploy profile without validating (or
+/// even fully deserializing) the application config (issue #1621, review round 1).
+///
+/// Layers exactly as [`load_media_host_config_in`] does — base `autumn.toml` ←
+/// inline `[profile.<name>]` ← `autumn-<profile>.toml` — because that is the same
+/// order `AutumnConfig::load_with_env` merges them in, and then applies the env
+/// layer ON TOP, because `AUTUMN_SERVER__PORT` is the highest-priority layer in the
+/// loader too. So the number returned here is the number the strict load would
+/// have produced, minus the validation.
+///
+/// `None` means no layer declares a port; the caller substitutes the framework
+/// default rather than inventing one. A malformed/unreadable layer is skipped
+/// rather than fatal: this function runs only on the already-degraded path, where
+/// refusing again would leave `deploy status` just as unavailable as before.
+fn declared_server_port_in(dirs: &[PathBuf], profile_raw: &str, env: &dyn Env) -> Option<u16> {
+    // Highest layer first: `apply_env_overrides` applies `AUTUMN_SERVER__PORT`
+    // last, so it wins over every TOML layer. An unparseable value is ignored for
+    // the same reason the loader ignores it (it warns and keeps the layered value).
+    if let Ok(raw) = env.var("AUTUMN_SERVER__PORT")
+        && let Ok(port) = raw.trim().parse::<u16>()
+    {
+        return Some(port);
+    }
+
+    let mut merged = toml::Value::Table(toml::map::Map::new());
+    let base_toml: Option<toml::Value> = first_dir_with_file(dirs, "autumn.toml")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok());
+    let canonical = canonicalize_deploy_profile(profile_raw);
+    if let Some(base) = &base_toml {
+        deep_merge_toml(&mut merged, base.clone());
+        for name in profile_inline_lookup_names(&canonical) {
+            if let Some(section) = profile_section_from_base_toml(base, name) {
+                deep_merge_toml(&mut merged, section);
+            }
+        }
+    }
+    for name in autumn_web::config::profile_override_file_lookup_names(&canonical, profile_raw) {
+        let Some(path) = first_dir_with_file(dirs, &format!("autumn-{name}.toml")) else {
+            continue;
+        };
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(overlay) = toml::from_str::<toml::Value>(&text)
+        {
+            deep_merge_toml(&mut merged, overlay);
+        }
+        break;
+    }
+
+    merged
+        .get("server")
+        .and_then(|server| server.get("port"))
+        .and_then(toml::Value::as_integer)
+        .and_then(|port| u16::try_from(port).ok())
 }
 
 /// Build the profile-aware env overlay that [`load_runtime_config`] resolves the
@@ -4072,7 +4201,10 @@ where
 ///   `host` (string), `reachable` (bool), `mode`
 ///   (`"deployed"`/`"not deployed"`/`"unknown"`/`"unreachable"`), `release`
 ///   (string or null when unknown), `live_slot` (string or null), `ready` (HTTP
-///   status number or null), `maintenance` (bool), `proxy_port` (number or null),
+///   status number or null), `maintenance` (`true`/`false` as the host's RUNNING
+///   slot unit observes it, or `null` when the CLI could not prove which flag file
+///   that unit polls — see `fleet::DRIFT_MAINTENANCE_UNPROVEN`), `proxy_port`
+///   (number or null),
 ///   `last_deploy` (AC-6's third fact: `{result, at}` — `result` is `"deployed"`
 ///   or `"rolled back"`, `at` the host's UTC timestamp or null — and the whole
 ///   object is null when the host has never completed a cutover or the marker
@@ -4112,7 +4244,16 @@ fn fleet_status_json(
                 },
                 "live_slot": status.live_slot,
                 "ready": status.ready_code,
-                "maintenance": status.maintenance_on,
+                // Three-valued since #1621 review round 1: `true`/`false` are
+                // proved states of the file the RUNNING slot unit polls, and
+                // `null` is "the CLI could not prove which file that is". Both
+                // false and null stay falsy for a consumer that tests the field
+                // directly, so `maintenance == true` never widens.
+                "maintenance": match status.maintenance {
+                    exec::MaintenanceStatus::On => serde_json::Value::Bool(true),
+                    exec::MaintenanceStatus::Off => serde_json::Value::Bool(false),
+                    exec::MaintenanceStatus::Unknown => serde_json::Value::Null,
+                },
                 "proxy_port": match status.installed_proxy_port {
                     exec::InstalledProxyPort::Port(port) => {
                         serde_json::Value::Number(port.into())
@@ -4148,14 +4289,30 @@ fn fleet_status_json(
 /// per-host table (or `--json`), exiting non-zero on drift only under `--strict`
 /// (issue #1621, AC-6).
 fn run_status(
-    config: &AutumnConfig,
+    port: &StatusPort,
+    profile: &str,
     fleet: &ResolvedFleet,
     options: &DeployOptions,
 ) -> Result<(), DeployError> {
     if !options.json {
         eprintln!("\u{1F342} autumn deploy status\n");
     }
-    let statuses = collect_fleet_status(fleet, config.server.port, |cfg| {
+    // Never silent, and never on stdout: a `--json` consumer keeps the documented
+    // shape while a human still sees WHY the port was resolved the hard way and
+    // WHICH port the report is graded against.
+    if let Some(reason) = &port.degraded {
+        eprintln!(
+            "\u{26A0}\u{FE0F}  this project's configuration does not validate under the \
+             `{profile}` deploy profile: {reason}"
+        );
+        eprintln!(
+            "   `deploy status` is read-only, so it continues against the DECLARED \
+             `[server] port = {}` for that profile (read without validation). \
+             `autumn deploy check`/`up` still refuse to run until the config is fixed.\n",
+            port.port
+        );
+    }
+    let statuses = collect_fleet_status(fleet, port.port, |cfg| {
         exec::SshTarget::from_resolved(cfg)
             .map(exec::SshExecutor::new)
             .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
@@ -5048,6 +5205,132 @@ mod tests {
             env_file.expose().lines().any(|l| l == "AUTUMN_ENV=prod"),
             "env file should pin AUTUMN_ENV=prod by default, got: {:?}",
             env_file.expose()
+        );
+    }
+
+    #[test]
+    fn deploy_status_reads_its_probe_port_under_the_deploy_profile_without_validating() {
+        // #1621 review round 1 (Codex 3). `deploy status` is the read-only command
+        // an operator reaches for mid-incident, and it needs exactly ONE value from
+        // the application config: `server.port`. Routing that through
+        // `load_runtime_config` validated the WHOLE config under the deploy profile,
+        // so an unrelated invalid production setting aborted the command before a
+        // single host was probed.
+        //
+        // The port must still come from the SAME profile resolution the deploy
+        // itself uses, or status reports against the wrong port — so the fallback
+        // layers base ← `[profile.prod]` ← `autumn-prod.toml` ← env, exactly like
+        // the loader.
+        use autumn_web::config::MockEnv;
+
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\n\
+             port = 8080\n\
+             \n\
+             [profile.prod.server]\n\
+             port = 9090\n",
+        )
+        .expect("write autumn.toml");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        // The PROFILE's port wins over the base one — a status graded against 8080
+        // would derive the wrong slot ports and report a bogus proxy-port mismatch.
+        assert_eq!(
+            declared_server_port_in(&dirs, "prod", &MockEnv::new()),
+            Some(9090),
+        );
+        // …and the alias spelling resolves the same file/section set.
+        assert_eq!(
+            declared_server_port_in(&dirs, "production", &MockEnv::new()),
+            Some(9090),
+        );
+        // A different profile falls through to the base declaration.
+        assert_eq!(
+            declared_server_port_in(&dirs, "staging", &MockEnv::new()),
+            Some(8080),
+        );
+        // `AUTUMN_SERVER__PORT` is the loader's highest layer, so it wins here too.
+        assert_eq!(
+            declared_server_port_in(
+                &dirs,
+                "prod",
+                &MockEnv::new().with("AUTUMN_SERVER__PORT", "7070")
+            ),
+            Some(7070),
+        );
+        // The profile override FILE layers on top of the inline section, matching
+        // `AutumnConfig::load_with_env`'s merge order.
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[server]\nport = 9191\n",
+        )
+        .expect("write autumn-prod.toml");
+        assert_eq!(
+            declared_server_port_in(&dirs, "prod", &MockEnv::new()),
+            Some(9191),
+        );
+        // Nothing declared anywhere → `None`, so the caller substitutes the
+        // framework default instead of this function inventing one.
+        let empty = tempfile::TempDir::new().expect("temp dir");
+        assert_eq!(
+            declared_server_port_in(&[empty.path().to_path_buf()], "prod", &MockEnv::new()),
+            None,
+        );
+    }
+
+    #[test]
+    fn deploy_status_degrades_instead_of_aborting_on_an_unrelated_config_error() {
+        // #1621 review round 1 (Codex 3), the seam. A config error under the deploy
+        // profile must NOT take the read-only fleet report offline; it must be
+        // reported, with the probe still graded against the profile's declared port.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nport = 8080\n\n[profile.prod.server]\nport = 9090\n",
+        )
+        .expect("write autumn.toml");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let degraded = status_public_port_with(
+            &dirs,
+            "prod",
+            Err(DeployError::Config(
+                "scheduler.max_concurrency must be greater than 0".to_owned(),
+            )),
+        )
+        .expect("a read-only status must not abort on an unrelated config error");
+        assert_eq!(degraded.port, 9090, "the PROFILE's declared port is used");
+        assert!(
+            degraded
+                .degraded
+                .as_deref()
+                .is_some_and(|reason| reason.contains("scheduler.max_concurrency")),
+            "the degradation must be reported, never silent: {:?}",
+            degraded.degraded
+        );
+
+        // The happy path is unchanged: a config that validates supplies the port and
+        // reports no caveat at all.
+        let ok = status_public_port_with(
+            &dirs,
+            "prod",
+            Ok(AutumnConfig {
+                server: autumn_web::config::ServerConfig {
+                    port: 4321,
+                    ..autumn_web::config::ServerConfig::default()
+                },
+                ..AutumnConfig::default()
+            }),
+        )
+        .expect("a valid config resolves");
+        assert_eq!(
+            ok,
+            StatusPort {
+                port: 4321,
+                degraded: None,
+            },
         );
     }
 
@@ -8452,6 +8735,11 @@ mod tests {
     }
 
     /// Script a host's two read-only status probes.
+    /// The shared maintenance flag path a #1621 slot unit points
+    /// `AUTUMN_MAINTENANCE_FLAG_FILE` at for the `myapp` fleet fixtures — the
+    /// fourth `probe-host-status` section resolves to it on a healthy host.
+    const STATUS_SHARED_FLAG: &str = "/srv/autumn/myapp/shared/autumn-maintenance.json";
+
     fn script_status(
         recorder: fleet::test_support::FleetRecorder,
         host: &str,
@@ -8465,9 +8753,10 @@ mod tests {
                 host,
                 "probe-host-status",
                 format!(
-                    "{ready}\n---autumn-host-status---\n{}\n---autumn-host-status---\n\
-                     deployed\t2026-07-14T12:00:03Z",
-                    if maintenance { "maintenance-on" } else { "" }
+                    "{ready}\n---autumn-host-status---\n{flag}\n---autumn-host-status---\n\
+                     deployed\t2026-07-14T12:00:03Z\n---autumn-host-status---\n\
+                     {STATUS_SHARED_FLAG}\n{flag}",
+                    flag = if maintenance { "maintenance-on" } else { "" }
                 ),
             )
     }
@@ -8485,7 +8774,10 @@ mod tests {
             .script(
                 host,
                 "probe-host-status",
-                format!("200\n---autumn-host-status---\n\n---autumn-host-status---\n{last_deploy}"),
+                format!(
+                    "200\n---autumn-host-status---\n\n---autumn-host-status---\n{last_deploy}\n\
+                     ---autumn-host-status---\n{STATUS_SHARED_FLAG}\n"
+                ),
             )
     }
 
@@ -8573,7 +8865,11 @@ mod tests {
         let statuses = drive_status(&fleet, &recorder).expect("status reports");
         let report = fleet::fleet_drift(&statuses);
         assert!(report.version_drift, "different releases are drift");
-        assert!(statuses[1].maintenance_on, "the flag file is read per host");
+        assert_eq!(
+            statuses[1].maintenance,
+            exec::MaintenanceStatus::On,
+            "the flag file is read per host"
+        );
         assert!(
             statuses[1].ready_code == Some(200),
             "maintenance does NOT change readiness — the two are orthogonal"
