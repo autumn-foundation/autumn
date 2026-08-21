@@ -1888,6 +1888,13 @@ autumn release init --target aws-ecs             # Production AWS path: main.tf/
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
 autumn upgrade                   # preview each release's mechanical app-code migrations (renames) as a per-file diff; writes nothing
 autumn upgrade --apply           # take them; --from/--to override the range, --list-migrations shows what ships (#1629)
+autumn deploy check              # SSH/secret/DB/migrate-safety preflight per configured host; `doctor --online` runs the same graders
+autumn deploy plan               # dry-run: representative unit + ordered steps (+ fleet rollout order when `[deploy] hosts` is set)
+autumn deploy up                 # real deploy over SSH; with `[deploy] hosts` a serial rolling deploy across the fleet (#1621)
+autumn deploy up --only web-2 --no-rollback   # narrow to a subset (repair lever, warns about a mixed fleet) / halt-and-freeze on failure
+autumn deploy rollback           # previous release; with `[deploy] hosts` the whole fleet, newest first (`--only <HOST>` for one)
+autumn deploy status --json --strict          # read-only per-host state + version/state drift; --strict exits non-zero on drift (#1621)
+autumn deploy maintenance on --message "…"    # maintenance mode on EVERY deploy host over SSH; `off` reverses (#1621)
 ```
 
 ### Upgrading an app across releases — `autumn upgrade` (unreleased — trunk-dev, issue #1629)
@@ -2073,6 +2080,66 @@ Pointing the offsite bucket at the app's
 own `[storage.s3]` bucket at the same endpoint needs `allow_shared_bucket = true`. See
 `docs/guide/daemon.md`.
 
+### VPS deploys and fleets — `autumn deploy` (unreleased — trunk-dev, issues #1607/#1621)
+
+`autumn deploy {check | plan | up | rollback | status | maintenance on|off}`
+takes a project to a live, zero-downtime service on Linux servers the user owns
+— no Dockerfile, no registry, no PaaS. Configure the target in `autumn.toml`:
+
+```toml
+[deploy]
+host = "203.0.113.10"                            # ONE server
+# hosts = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]   # …or a FLEET (#1621)
+```
+
+`host` and `hosts` are **mutually exclusive** (both set = refused), blank and
+duplicate entries are refused, and **the `hosts` order IS the rollout order**.
+`AUTUMN_DEPLOY__HOSTS` is the CSV env override and replaces the whole list.
+
+With `hosts`, `deploy up` rolls the fleet **one host at a time** in declaration
+order — each host runs the unchanged per-host blue/green cutover against its own
+kamal-proxy and must finish before the next starts, so the rest of the fleet
+keeps serving. One release id per run. **Migrations run exactly once**, on the
+first host still on a previous release, before its cutover; an all-first-deploy
+fleet migrates nowhere and warns, naming `autumn migrate`. A failure **halts**
+the rollout and (by default) rolls the already-cut-over hosts back in reverse
+order — except post-cutover housekeeping failures (`record-proxy-options`,
+`drain-old`, `prune`), which leave the host live and healthy so the rollout warns
+and continues, and hosts whose rollback target is unprovable, which are reported
+for manual recovery rather than guessed at. **Rollback restores binaries only —
+no migration is ever rolled back**, so tell users to write expand/contract
+migrations. `--only <HOST>` (repeatable, `up` and `rollback`) is a repair lever
+that warns about a mixed fleet; `--no-rollback` halts and freezes instead.
+
+Fleet-unsafe topologies fail closed in the prologue, before any remote command:
+`sqlite://` databases (every host gets the same URL → N independent files),
+`[media.mediamtx] enabled = true` (no teardown path), and `[deploy.tls] enabled
+= true` (each host would ACME the same hostname from behind the LB — terminate
+TLS at the load balancer instead). `[database] auto_migrate` on a fleet is a loud
+warning, not a refusal.
+
+`autumn deploy status [--json] [--strict]` is read-only and safe mid-incident:
+one row per host (mode, release from the `current` symlink, live slot, `/ready`
+code, maintenance flag, proxy port, drift reasons) plus `version_drift` (hosts on
+different releases) and `state_drift` (per-host marker damage that fails the NEXT
+deploy closed). An unreachable host is a row, not an abort; an unreadable release
+is reported as unknown and is **not** drift. `--strict` exits non-zero on any
+drift (cron-alertable); `--json` is a stable contract: `hosts[]` with `host`,
+`reachable`, `mode`, `release`, `live_slot`, `ready`, `maintenance`,
+`proxy_port`, `drift[]`, plus `version_drift`, `state_drift[]`, `drifted`.
+
+`autumn deploy maintenance on|off` fans maintenance mode out to every configured
+host over SSH (same flags and wire format as the local `autumn maintenance on`,
+which only writes THIS machine's working directory). Best-effort-and-aggregate:
+every host attempted, non-zero if any failed, changed hosts NOT reversed.
+**Maintenance does not drain a host from a load balancer** — `/ready` stays 200
+by design — so never tell a user maintenance mode removes a host from rotation.
+Deploy-managed hosts read `{app_dir}/shared/autumn-maintenance.json` because the
+slot units carry `AUTUMN_MAINTENANCE_FLAG_FILE`.
+
+See `docs/guide/fleet-deploys.md`, `docs/guide/deployment.md`, and
+`docs/guide/maintenance-mode.md`.
+
 `autumn destroy` mirrors `autumn generate` argument-for-argument and never
 touches a database — it only reverses generated files/migrations.
 
@@ -2225,6 +2292,9 @@ touched crate so examples compile from an external-consumer perspective.
 - `docs/guide/widget-styling.md`
 - `docs/guide/tabs.md`
 - `docs/guide/maintenance-mode.md`
+- `docs/guide/deployment.md`
+- `docs/guide/fleet-deploys.md`
+- `docs/guide/staged-deploys.md`
 - `docs/guide/dev-loop-latency.md`
 - `docs/guide/system-tests.md`
 - `docs/guide/testing.md`

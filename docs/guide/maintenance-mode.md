@@ -30,6 +30,36 @@ alongside the app and needs no IPC or HTTP endpoint to communicate the state
 change. Any replica that can see the same working directory (local dev, a
 Docker-compose mount, a Fly.io shared volume) reacts in lock-step.
 
+> **"Same working directory" is the limit of that lock-step.** Replicas on
+> *different machines* do not see each other's flag file, so the local
+> `autumn maintenance` cannot gate a multi-host fleet — it only writes the
+> machine it runs on. For hosts managed by `autumn deploy` (`[deploy] host` or
+> `[deploy] hosts`), use
+> [`autumn deploy maintenance on|off`](#fleet-wide-maintenance-autumn-deploy-maintenance),
+> which writes the same flag file to every configured host over SSH.
+
+### Where the flag file lives
+
+The default path is `tmp/autumn-maintenance.json`, **relative to the process's
+working directory**. Set `AUTUMN_MAINTENANCE_FLAG_FILE` to an absolute path to
+put it somewhere else; the app reads that variable both at startup and in the
+500 ms poller, so the two can never disagree. An unset or blank value falls back
+to the default, so an app that does not set it is unaffected.
+
+Hosts deployed by `autumn deploy` get this automatically. Each slot unit is
+written with
+
+```ini
+Environment=AUTUMN_MAINTENANCE_FLAG_FILE=/srv/autumn/myapp/shared/autumn-maintenance.json
+```
+
+pointing at the per-app `shared/` directory. That matters because a slot unit's
+`WorkingDirectory` is the **release** directory, which is new on every deploy: on
+the default cwd-relative path a cutover would orphan an active maintenance flag
+and silently un-maintain the host, and the blue and green slots could not see
+each other's flag at all. The `shared/` directory survives cutovers, rollbacks
+and pruning, and both slots read it.
+
 When maintenance is active, all gated requests receive **503 Service Unavailable**
 with `Retry-After: 120`. The app never returns 200 for application routes while
 the flag is present.
@@ -50,6 +80,11 @@ autumn maintenance off
 
 # Check current status (also surfaced by `autumn doctor`)
 autumn doctor
+
+# Same thing, but on every host `autumn deploy` manages (over SSH)
+autumn deploy maintenance on --message "Down for scheduled maintenance."
+autumn deploy maintenance off
+autumn deploy status            # per-host maintenance + readiness columns
 ```
 
 ---
@@ -244,6 +279,50 @@ calling `autumn migrate` without `--with-maintenance`.
 
 ---
 
+## Fleet-wide maintenance (`autumn deploy maintenance`)
+
+The commands above write **this machine's** working directory. For hosts you
+deploy to with [`autumn deploy`](deployment.md), use the deploy-scoped verb
+instead — it fans the same flag file out to every configured host over SSH:
+
+```bash
+autumn deploy maintenance on --message "Upgrading database schema"
+autumn deploy maintenance on --readonly --allow-ips 10.0.0.0/8
+autumn deploy maintenance on --bypass-header X-Dev-Bypass:mytoken
+autumn deploy maintenance off
+```
+
+It applies to the deploy-configured target(s) — `[deploy] host` (one server) or
+`[deploy] hosts` (a fleet) — and takes exactly the same flags as
+`autumn maintenance on`, because both write the same wire format. Running apps
+react within the same 500 ms poll interval; nothing is restarted and no release
+is deployed.
+
+Three behaviours worth knowing:
+
+- **Best-effort, aggregate, never reversed.** Every host is attempted, a per-host
+  table names what changed, and the command exits non-zero if any host failed.
+  The hosts that *did* change are deliberately **not** rolled back — that would
+  push users straight back into the window you are closing — so the summary names
+  them and the decision is yours.
+- **It writes the shared flag path** (`{app_dir}/shared/autumn-maintenance.json`)
+  that deploy-managed slot units point `AUTUMN_MAINTENANCE_FLAG_FILE` at. For a
+  host still running a unit deployed before that existed, `on` also writes the
+  old release-relative path; if the host's `current` release cannot be resolved,
+  its row says the shared flag only was written.
+- **It does not drain a host from your load balancer.** `/ready` stays `200`
+  while maintenance is on — by design, since gating it would eject every host
+  from the pool the moment maintenance was enabled. A maintained host keeps
+  taking traffic and answers it with `503` + `Retry-After`. Drain at the load
+  balancer if you need a host out of rotation.
+
+`autumn deploy status` reports the maintenance flag per host, in its own column
+next to readiness, precisely because the two are orthogonal. See the
+[fleet deploys guide](fleet-deploys.md#runbook-a-fleet-wide-maintenance-window)
+for the full window runbook.
+
+---
+
 ## `autumn doctor` integration
 
 `autumn doctor` includes a maintenance-mode check. It reports:
@@ -395,12 +474,14 @@ Fly.io setup.
 | Migration safety | [deployment.md](deployment.md) | Ensures migrations run before web replicas start (schema-first rollout). |
 | Graceful shutdown | [deployment.md](deployment.md) | Ensures in-flight requests complete before the process exits (SIGTERM → drain → exit). |
 | Maintenance mode | This guide | Stops new requests from reaching the application while a maintenance operation runs. |
+| `autumn deploy maintenance` | [fleet-deploys.md](fleet-deploys.md) | Applies the same gate to **every deploy-managed host at once** over SSH, so a fleet enters and leaves the window together. Gates traffic; does **not** drain hosts from the load balancer. |
 
-The three features are complementary. A typical zero-downtime destructive
-migration uses all three: graceful shutdown ensures no request is abandoned
+These features are complementary. A typical zero-downtime destructive
+migration uses the first three: graceful shutdown ensures no request is abandoned
 mid-flight when the old replica exits; migration safety ensures the schema is
 updated before new replicas serve traffic; maintenance mode ensures writes are
-paused while the migration runs.
+paused while the migration runs. On a multi-host fleet, the fourth is how you
+open and close that window on every host at once.
 
 ---
 
