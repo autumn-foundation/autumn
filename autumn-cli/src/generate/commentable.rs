@@ -156,41 +156,69 @@ pub fn migration_dir_name(timestamp: &str) -> String {
 /// that is what is matched.
 #[must_use]
 pub fn already_migrated(project_root: &Path) -> bool {
-    !polymorphic_comment_migrations(project_root).is_empty()
+    // Accumulated across the whole migration history, not per file. A project
+    // that converts an existing `comments` table to polymorphic storage does it
+    // in TWO migrations -- one created the table, a later one adds the
+    // discriminator columns by `ALTER TABLE`. `examples/reddit-clone` is
+    // exactly that shape. Requiring both in one `up.sql` would report "no
+    // shared table", emit a second `CREATE TABLE comments`, and fail the next
+    // `migrate` with "relation already exists".
+    let mut creates = false;
+    let mut discriminated = false;
+    for sql in migration_up_sql(project_root) {
+        if let Some(body) = comments_table_body(&sql) {
+            creates = true;
+            if body.contains("commentable_type") && body.contains("commentable_id") {
+                discriminated = true;
+            }
+        }
+        let (altered_type, altered_id) = comments_altered_columns(&sql);
+        if altered_type && altered_id {
+            discriminated = true;
+        }
+    }
+    creates && discriminated
 }
 
-/// Every migration directory under `project_root` whose `up.sql` creates the
-/// polymorphic comments table.
-#[must_use]
-pub fn polymorphic_comment_migrations(project_root: &Path) -> Vec<std::path::PathBuf> {
+/// Every migration's `up.sql`, lowercased with SQL comments stripped.
+fn migration_up_sql(project_root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(project_root.join("migrations")) else {
         return Vec::new();
     };
     entries
         .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|dir| {
-            std::fs::read_to_string(dir.join("up.sql")).is_ok_and(|sql| is_polymorphic_up_sql(&sql))
-        })
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("up.sql")).ok())
+        .map(|sql| strip_sql_comments(&sql.to_ascii_lowercase()))
         .collect()
 }
 
-/// Whether `up_sql` is (a copy of) the shared polymorphic comments migration.
+/// Which discriminator columns `ALTER TABLE comments` adds in `lowered`.
 ///
-/// Deliberately keyed on the two columns that make the table polymorphic rather
-/// than on an exact match: the author may have edited the file — added the
-/// `author_id` foreign key the header suggests, say — and it is still the same
-/// table.
-fn is_polymorphic_up_sql(up_sql: &str) -> bool {
-    let lowered = strip_sql_comments(&up_sql.to_ascii_lowercase());
-    // The discriminator columns have to belong to the `comments` statement
-    // itself. Searching the whole file would let an ordinary `comments` table
-    // sitting beside an unrelated table that happens to carry
-    // `commentable_type`/`commentable_id` pass as the shared migration -- the
-    // generator would then skip emitting it, and every helper would fail on the
-    // columns `comments` does not have.
-    comments_table_body(&lowered)
-        .is_some_and(|body| body.contains("commentable_type") && body.contains("commentable_id"))
+/// The two columns routinely arrive as separate statements, so they are
+/// tracked separately and combined by the caller.
+fn comments_altered_columns(lowered: &str) -> (bool, bool) {
+    let (mut has_type, mut has_id) = (false, false);
+    for prefix in [
+        format!("alter table {COMMENTS_TABLE}"),
+        format!("alter table \"{COMMENTS_TABLE}\""),
+    ] {
+        let mut base = 0usize;
+        while let Some(at) = lowered[base..].find(&prefix) {
+            let start = base + at;
+            let after = &lowered[start + prefix.len()..];
+            // Identifier-exact, so `comments_archive` is not `comments`.
+            if prefix.ends_with('"')
+                || after.is_empty()
+                || after.starts_with(|c: char| c.is_whitespace() || c == ';')
+            {
+                let statement = after.split(';').next().unwrap_or(after);
+                has_type |= statement.contains("commentable_type");
+                has_id |= statement.contains("commentable_id");
+            }
+            base = start + prefix.len();
+        }
+    }
+    (has_type, has_id)
 }
 
 /// `sql` with `--` line comments and `/* … */` blocks removed.
@@ -655,6 +683,63 @@ mod tests {
         assert!(
             already_migrated(tmp.path()),
             "NUMERIC(10, 2) must not end the column list early"
+        );
+    }
+
+    /// A project that CONVERTED an existing `comments` table to polymorphic
+    /// storage did it across two migrations: one created the table, a later one
+    /// added the discriminator columns by `ALTER TABLE`. `examples/reddit-clone`
+    /// is exactly this shape. Requiring both in one file would emit a second
+    /// `CREATE TABLE comments` and fail the next `migrate`.
+    #[test]
+    fn a_table_made_polymorphic_by_a_later_migration_counts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let migrations = tmp.path().join("migrations");
+        let created = migrations.join("20260419000000_create_app");
+        std::fs::create_dir_all(&created).expect("mkdir");
+        std::fs::write(
+            created.join("up.sql"),
+            "CREATE TABLE comments (\n    id BIGSERIAL PRIMARY KEY,\n    \
+             body TEXT NOT NULL,\n    post_id BIGINT NOT NULL\n);\n",
+        )
+        .expect("write");
+
+        // The CREATE alone is not the shared table…
+        assert!(!already_migrated(tmp.path()));
+
+        let converted = migrations.join("20260820000000_polymorphic_comments");
+        std::fs::create_dir_all(&converted).expect("mkdir");
+        std::fs::write(
+            converted.join("up.sql"),
+            "ALTER TABLE comments ADD COLUMN commentable_type TEXT;\n\
+             ALTER TABLE comments ADD COLUMN commentable_id BIGINT;\n",
+        )
+        .expect("write");
+
+        // …but the accumulated history is.
+        assert!(
+            already_migrated(tmp.path()),
+            "a comments table converted by a later ALTER is still the shared table"
+        );
+    }
+
+    /// …and an `ALTER` on a *different* table does not convert `comments`.
+    #[test]
+    fn altering_another_table_does_not_make_comments_polymorphic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let migrations = tmp.path().join("migrations");
+        let dir = migrations.join("0001_app");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL);\n\
+             ALTER TABLE comments_archive ADD COLUMN commentable_type TEXT;\n\
+             ALTER TABLE comments_archive ADD COLUMN commentable_id BIGINT;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "comments_archive is not comments"
         );
     }
 
