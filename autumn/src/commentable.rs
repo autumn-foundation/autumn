@@ -450,6 +450,37 @@ pub fn sharded_commentable_type() -> Option<&'static str> {
         .map(|descriptor| descriptor.type_name)
 }
 
+/// Panic if two `#[commentable]` models share a discriminator.
+///
+/// Called from every public entry point rather than only from [`router`],
+/// because the discriminator collision is a *data* hazard, not a routing one.
+/// The default discriminator is the model's bare type name, so `blog::Post` and
+/// `shop::Post` both store `"Post"` — and then `blog::Post` id 5 and
+/// `shop::Post` id 5 address the same `(commentable_type, commentable_id)`
+/// rows. Each model's parent probe still passes, against its own table, so
+/// nothing looks wrong: one model simply renders and deletes the other's
+/// comments.
+///
+/// An app that never mounts the router (using only the generated
+/// `{Model}Comments` helpers) would otherwise never reach the check at all,
+/// which is exactly the app most likely to have models in separate modules.
+///
+/// Checked once per process — the registry is built at load time and cannot
+/// change afterwards — so this costs one atomic load per call.
+#[cfg(feature = "db")]
+fn assert_unique_discriminators() {
+    static CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    CHECKED.get_or_init(|| {
+        assert!(
+            duplicate_commentable_type().is_none(),
+            "two #[commentable] models share the commentable_type {:?}: the shared comments \
+             table cannot tell their rows apart, so each would read and delete the other's \
+             comments. Give one of them `#[commentable(type_name = \"…\")]`.",
+            duplicate_commentable_type().unwrap_or_default(),
+        );
+    });
+}
+
 // ── Write path ──────────────────────────────────────────────────────────────
 
 /// Post a comment on `(parent_type, parent_id)`, optionally as a reply to
@@ -488,6 +519,8 @@ pub async fn add_comment(
     reply_to: Option<i64>,
     tenant: Option<&str>,
 ) -> AutumnResult<Comment> {
+    // Every entry point checks: a helper-only app never mounts the router.
+    assert_unique_discriminators();
     spec.validate()?;
     let body = body.trim();
     if body.is_empty() {
@@ -575,6 +608,8 @@ pub async fn delete_comment(
     comment_id: i64,
     tenant: Option<&str>,
 ) -> AutumnResult<usize> {
+    // Every entry point checks: a helper-only app never mounts the router.
+    assert_unique_discriminators();
     spec.validate()?;
     let spec = *spec;
     let parent_type = parent_type.to_owned();
@@ -664,6 +699,8 @@ pub async fn recompute_comment_count(
     parent_id: i64,
     tenant: Option<&str>,
 ) -> AutumnResult<i64> {
+    // Every entry point checks: a helper-only app never mounts the router.
+    assert_unique_discriminators();
     spec.validate()?;
     let Some(counter_column) = spec.counter_column else {
         probe_parent(conn, spec, parent_id, tenant, false).await?;
@@ -737,6 +774,8 @@ pub async fn comment_thread(
     parent_id: i64,
     tenant: Option<&str>,
 ) -> AutumnResult<Vec<CommentNode>> {
+    // Every entry point checks: a helper-only app never mounts the router.
+    assert_unique_discriminators();
     spec.validate()?;
     probe_parent(conn, spec, parent_id, tenant, false).await?;
 
@@ -1679,15 +1718,10 @@ where
     S: crate::db::DbState + Clone + Send + Sync + 'static,
 {
     // Two models claiming one discriminator would render each other's threads
-    // and probe each other's tables. There is no request-time answer that is
-    // not silently wrong, so fail at wiring time, where the fix is obvious.
-    assert!(
-        duplicate_commentable_type().is_none(),
-        "two #[commentable] models share the commentable_type {:?}: the shared comments \
-         table cannot tell their rows apart. Give one of them \
-         `#[commentable(type_name = \"…\")]`.",
-        duplicate_commentable_type().unwrap_or_default(),
-    );
+    // and probe each other's tables. Checked here so a mounted router fails at
+    // wiring time, where the fix is obvious — and checked again from every
+    // helper, for the app that never mounts one.
+    assert_unique_discriminators();
     // A sharded model routes every query through the shard its tenant selects;
     // this router checks out the control pool. There is no request-time answer
     // that is not silently wrong, so refuse at wiring time — the repository

@@ -1548,6 +1548,39 @@ async fn an_unregistered_type_is_refused_before_the_authorization_hook() {
     );
 }
 
+/// The discriminator collision is a *data* hazard, not a routing one: two
+/// models defaulting to the same bare type name address the same
+/// `(commentable_type, commentable_id)` rows, so each renders and deletes the
+/// other's comments while both parent probes pass against their own tables.
+///
+/// An app that never mounts the router — using only the generated
+/// `{Model}Comments` helpers — must still hit the check, which is why it lives
+/// at every entry point rather than in `router()` alone. This asserts the
+/// registry this suite actually loads is collision-free, so the guard passing
+/// here means it ran, not that it was skipped.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_helpers_run_the_discriminator_check_without_a_router() {
+    assert!(
+        autumn_web::commentable::duplicate_commentable_type().is_none(),
+        "this suite's own models must not collide, or every helper below would panic"
+    );
+
+    // Reaching a successful helper call proves the guard ran and passed on a
+    // path that never constructs the router.
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    drop(conn);
+
+    let repo = PgCmtPostRepository::with_pool_untracked(pool);
+    repo.add_comment(post, author, "no router in sight", None)
+        .await
+        .expect("comment");
+    assert_eq!(repo.comment_thread(post).await.expect("thread").len(), 1);
+}
+
 /// A sharded repository routes every query through the tenant's shard, and it
 /// does NOT require a `#[shard_key]` on the model — `sharding_across_tenants.rs`
 /// has exactly that shape. Inferring shardedness from the model alone therefore
