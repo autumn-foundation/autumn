@@ -415,8 +415,14 @@ action they need:
 - `this host's app polls a release-local maintenance flag file, not the shared
   one (its slot unit predates AUTUMN_MAINTENANCE_FLAG_FILE) — redeploy it so
   maintenance survives cutovers` — **redeploy that host.** Until you do, its flag
-  is orphaned by the next cutover and a fleet-wide `deploy maintenance` reaches
-  it only best-effort.
+  is orphaned by the next cutover, and a fleet-wide `deploy maintenance` has to
+  write that release-local file as a second write (resolved from the same live
+  slot unit) — reporting the host as a `PARTIAL` failure if it cannot.
+
+The first reason is also the one that makes `autumn deploy maintenance` fail
+closed on that host: if the live slot unit cannot be read, the fan-out writes the
+shared flag and then reports the host as `PARTIAL` with a non-zero exit, rather
+than guessing at a path from the `current` symlink.
 
 > **A broken app config no longer takes `deploy status` offline.** `status` needs
 > only `[server] port` from your application config, so a config that fails to
@@ -427,6 +433,20 @@ action they need:
 > upload runtime *values*, so an invalid config has to stop them. That asymmetry
 > is deliberate: the read-only incident command stays available, the
 > state-changing ones do not.
+>
+> `autumn deploy maintenance` is on the available side of that line too, for the
+> same reason: a window gets closed mid-incident. It prints the same caveat, then
+> continues against the declared port — which it uses **only** to identify which
+> slot unit each host is running:
+>
+> ```
+> ⚠️  this project's configuration does not validate under the `production` deploy
+> profile: <the config error>
+>    `deploy maintenance` continues against the DECLARED `[server] port = 80` for
+> that profile (read without validation); it uses that port only to identify which
+> slot unit each host is running. `autumn deploy check`/`up` still refuse to run
+> until the config is fixed.
+> ```
 
 Each row also carries a `last deploy` cell — the last action that host
 *completed* (`deployed`, `rolled back` or `torn down`, with the host's UTC time;
@@ -565,7 +585,7 @@ maintenance survives cutovers`. Note the column's scope: it proves which file th
 unit polls and whether that file is there, not what the process currently holds
 in memory — the app picks the change up on its own 500 ms poll.
 
-Four things to know before you run it:
+Five things to know before you run it:
 
 - **It is not a drain.** Every host stays in your load-balancer pool and answers
   user traffic with `503`. If the work requires *zero* traffic reaching the app,
@@ -574,6 +594,31 @@ Four things to know before you run it:
   3 stay in maintenance and are named in the summary; the command exits non-zero.
   Reversing them automatically would push users straight back into the window you
   are closing. Reversing by hand (`autumn deploy maintenance off`) is your call.
+  The `Changed anyway: …` line lists only the hosts that changed **fully** — a
+  partially-changed host is named on the failed side instead, so never treat that
+  line as "everything except these is done".
+- **A `PARTIAL` row means that host may still be serving traffic.** The fan-out
+  writes the shared flag first and then, when the host's live slot unit polls a
+  different file (a unit deployed before the shared path existed), that file too.
+  If the live unit cannot be read — or that second write fails — the row is:
+
+  ```
+  ❌ web-3  PARTIAL — shared flag written, but the file this host's RUNNING unit
+  polls was NOT (failed at `detect-maintenance-flag`), so this host may still be
+  serving traffic
+  ```
+
+  This **counts as a failure** and the command exits non-zero, even though the
+  host did change. Treat that host as **not maintained**: its shared flag is set,
+  but a unit that predates the shared path ignores it entirely, so it may still
+  be taking write traffic. Do not start the destructive work until you have
+  either fixed it or accepted it — run `autumn deploy status` to see what that
+  host's unit actually polls (a `maintenance ?` cell means the unit still cannot
+  be read), inspect
+  `/etc/systemd/system/{service}-{slot}.service` on the host, and redeploy it so
+  its unit carries `AUTUMN_MAINTENANCE_FLAG_FILE`. The same row on `off` ends
+  `so this host may still be in maintenance` — there, the host is the one still
+  gated after you thought you had reopened.
 - **The flag survives deploys.** Deploy-managed hosts read
   `{app_dir}/shared/autumn-maintenance.json`, in the shared directory, because
   `autumn deploy` stamps `AUTUMN_MAINTENANCE_FLAG_FILE` into every slot unit. A

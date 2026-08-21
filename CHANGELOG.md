@@ -106,10 +106,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn maintenance on` (`--message`, `--allow-ips`, `--readonly`,
   `--bypass-header`) and the same wire format, so running apps react within their
   500 ms poll with no restart and no deploy — unlike the local command, which
-  only writes the machine it runs on. Best-effort-and-aggregate: every host is
-  attempted, the per-host table names what changed, the command exits non-zero if
-  any host failed, and the hosts that *did* change are deliberately not reversed
-  (that would reopen the window being closed). Every surface repeats the rule
+  only writes the machine it runs on. The authoritative shared flag
+  (`{app_dir}/shared/autumn-maintenance.json`) is written first; for a host whose
+  slot unit predates that override, the file *that unit* polls is written too,
+  resolved from the host's **live slot unit** — the slot the proxy is serving —
+  and never from the `current` symlink, which is rewritten after the proxy flip
+  and so can name a release nothing is running. Best-effort-and-aggregate: every
+  host is attempted, the per-host table names what changed, and the hosts that
+  *did* change are deliberately not reversed (that would reopen the window being
+  closed) — the "Changed anyway" line lists only the fully-changed ones. The
+  command exits non-zero if any host failed, and it **fails closed on a partial
+  change**: a host whose shared flag was written but whose running unit's own
+  file was not (its unit could not be read, or that write failed) renders a
+  `PARTIAL` row and counts as a failure, so `on` never claims a host is
+  maintained when it could not prove which file that host polls, and `off` never
+  claims to have removed one. A host with no promoted release is the one
+  shared-flag-only case, and it is a success. Like `deploy status`, the fan-out
+  keeps running when the app config fails to validate under the deploy profile —
+  same stderr caveat, then the declared `[server] port` read without validation,
+  used only to identify which slot unit each host runs. Every surface repeats the rule
   that matters: **maintenance does not drain a host from a load balancer** —
   `/ready` stays `200` by design, so a maintained host keeps taking traffic and
   answers it with `503`. See `docs/guide/maintenance-mode.md`.

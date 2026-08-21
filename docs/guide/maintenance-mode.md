@@ -77,8 +77,10 @@ and pruning, and both slots read it.
 > [`autumn deploy maintenance on|off`](#fleet-wide-maintenance-autumn-deploy-maintenance)**
 > — from your workstation or CI, not from the host. It writes the path the slot
 > units actually point at (and, for a host still running a unit deployed before
-> this existed, the old release-relative path as well), on every configured host,
-> and reports per host what it changed. The local command remains the right tool
+> this existed, the old release-relative path as well — resolved from that host's
+> **live slot unit**, not from its `current` symlink), on every configured host,
+> and reports per host what it changed, failing closed on any host whose live unit
+> it could not read. The local command remains the right tool
 > for local development and for replicas that share a working directory
 > (docker-compose, a Fly.io volume) — anywhere the app and the CLI see the same
 > directory and no unit is overriding the path.
@@ -346,20 +348,52 @@ is deployed.
 Three behaviours worth knowing:
 
 - **Best-effort, aggregate, never reversed.** Every host is attempted, a per-host
-  table names what changed, and the command exits non-zero if any host failed.
-  The hosts that *did* change are deliberately **not** rolled back — that would
-  push users straight back into the window you are closing — so the summary names
-  them and the decision is yours.
-- **It writes the shared flag path** (`{app_dir}/shared/autumn-maintenance.json`)
-  that deploy-managed slot units point `AUTUMN_MAINTENANCE_FLAG_FILE` at. For a
-  host still running a unit deployed before that existed, `on` also writes the
-  old release-relative path; if the host's `current` release cannot be resolved,
-  its row says the shared flag only was written.
+  table names what changed, and the command exits non-zero if any host failed —
+  including a host that only *partially* changed (see the next bullet). The hosts
+  that *did* change are deliberately **not** rolled back — that would push users
+  straight back into the window you are closing — so the summary names them
+  ("Changed anyway: …", fully-changed hosts only) and the decision is yours.
+- **It writes the shared flag path first**
+  (`{app_dir}/shared/autumn-maintenance.json`), the path deploy-managed slot
+  units point `AUTUMN_MAINTENANCE_FLAG_FILE` at. That write is the authoritative
+  one and it goes first, so a host running a current slot unit reacts within its
+  next 500 ms poll even if anything after it fails. For a host still running a
+  unit deployed *before* that override existed, `on` then also writes the file
+  that unit makes the app poll — resolved from the host's **live slot unit** (the
+  one the proxy is actually serving), the same resolution `deploy status` reads
+  its verdict from, and **never** from the `current` symlink. `current` is
+  rewritten after the proxy flip, so the two disagree exactly when a flip landed
+  and the marker commit did not, and a flag written under `current` would then be
+  a file nothing polls. Two rows follow from that:
+
+  ```
+  ⚠️  host-b  maintenance enabled (shared flag only — no release is promoted on
+  this host, so no running unit polls a release-local flag)
+  ❌ host-c  PARTIAL — shared flag written, but the file this host's RUNNING unit
+  polls was NOT (failed at `detect-maintenance-flag`), so this host may still be
+  serving traffic
+  ```
+
+  The first is a **success**: nothing is promoted, so there is no running unit
+  and the shared write is the whole job. The second **counts as a failure** and
+  the command exits non-zero: the shared flag changed, but the file the running
+  unit polls did not, because that unit could not be read or the write to it
+  failed. `on` never claims a host is maintained when it could not prove which
+  file that host polls, and `off` never claims to have removed one (its rows read
+  `maintenance disabled …` and `shared flag removed …`, ending `so this host may
+  still be in maintenance`).
 - **It does not drain a host from your load balancer.** `/ready` stays `200`
   while maintenance is on — by design, since gating it would eject every host
   from the pool the moment maintenance was enabled. A maintained host keeps
   taking traffic and answers it with `503` + `Retry-After`. Drain at the load
   balancer if you need a host out of rotation.
+
+Like `autumn deploy status`, this command **still runs when your app config does
+not validate** under the deploy profile — a window is closed mid-incident, and an
+unrelated invalid setting must not block it. It prints the same caveat on stderr
+naming the config error, then continues against the declared `[server] port` read
+without validation, which it uses *only* to identify which slot unit each host is
+running. `autumn deploy check`/`up` still refuse until the config is fixed.
 
 `autumn deploy status` reports the maintenance flag per host, in its own column
 next to readiness, precisely because the two are orthogonal. The cell is

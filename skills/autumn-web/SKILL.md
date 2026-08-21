@@ -2194,11 +2194,26 @@ and `rollback` still refuse, deliberately — they grade and upload runtime valu
 `autumn deploy maintenance on|off` fans maintenance mode out to every configured
 host over SSH (same flags and wire format as the local `autumn maintenance on`,
 which only writes THIS machine's working directory). Best-effort-and-aggregate:
-every host attempted, non-zero if any failed, changed hosts NOT reversed.
+every host attempted, non-zero if any failed, changed hosts NOT reversed (the
+"Changed anyway: …" line lists only FULLY changed hosts).
 **Maintenance does not drain a host from a load balancer** — `/ready` stays 200
 by design — so never tell a user maintenance mode removes a host from rotation.
 Deploy-managed hosts read `{app_dir}/shared/autumn-maintenance.json` because the
-slot units carry `AUTUMN_MAINTENANCE_FLAG_FILE`. The local `autumn maintenance`
+slot units carry `AUTUMN_MAINTENANCE_FLAG_FILE`; that shared path is written
+FIRST (authoritative — a current unit reacts within 500 ms even if the next write
+fails). For a host whose unit predates that override, a second write goes to the
+file that unit polls, resolved from the host's **live slot unit** — never from
+the `current` symlink, which is rewritten after the proxy flip and so can name a
+release nothing is running. Two rows to recognise: `shared flag only — no release
+is promoted on this host` is a SUCCESS (nothing running polls anything else), and
+`PARTIAL — shared flag written, but the file this host's RUNNING unit polls was
+NOT` is a FAILURE with a non-zero exit (unit unreadable or that write failed) —
+never tell a user such a host is maintained; `on` may have left it serving
+traffic and `off` may have left it gated. Like `status`, `deploy maintenance`
+does NOT abort on a config that fails to validate under the deploy profile: same
+stderr caveat, then it continues against the DECLARED `[server] port`, used only
+to identify which slot unit each host runs (`deploy status --json`'s shape is
+unchanged by any of this). The local `autumn maintenance`
 has no override for that path — it always writes cwd-relative
 `tmp/autumn-maintenance.json` — so running it ON a deploy-managed host writes a
 file the app never reads and exits 0 with no warning. Always route users to
