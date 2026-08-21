@@ -83,6 +83,28 @@ and pruning, and both slots read it.
 > (docker-compose, a Fly.io volume) — anywhere the app and the CLI see the same
 > directory and no unit is overriding the path.
 
+**`autumn deploy status` resolves this per host rather than assuming it.** Its
+maintenance column does not read one fixed path: for each host it reads the
+**live slot unit** and resolves the flag file that unit makes the app poll —
+`Environment=AUTUMN_MAINTENANCE_FLAG_FILE` when present, otherwise the unit's
+`WorkingDirectory` plus the relative default above — which is the same rule the
+runtime applies. Reading the shared path unconditionally would lie in both
+directions: `off` for a maintained host whose unit polls elsewhere, `ON` for a
+host still taking traffic.
+
+So a host deployed **before** slot units carried
+`AUTUMN_MAINTENANCE_FLAG_FILE` reports its release-local
+`{release_dir}/tmp/autumn-maintenance.json` — the truth for that host — and the
+row also carries a drift reason saying the app polls a release-local flag rather
+than the shared one, whose remedy is to **redeploy that host**. When the live
+slot unit cannot be read at all, the cell reads `maintenance ?` — never a
+confident `off` — and on a host reported as `deployed` that carries a drift
+reason of its own (a host with nothing deployed has no slot unit to read, and is
+already reported as such).
+The column reports which file the running unit polls and whether that file
+exists — it is not a statement about the app's in-memory state, which follows on
+the next 500 ms poll.
+
 When maintenance is active, all gated requests receive **503 Service Unavailable**
 with `Retry-After: 120`. The app never returns 200 for application routes while
 the flag is present.
@@ -340,7 +362,11 @@ Three behaviours worth knowing:
   balancer if you need a host out of rotation.
 
 `autumn deploy status` reports the maintenance flag per host, in its own column
-next to readiness, precisely because the two are orthogonal. See the
+next to readiness, precisely because the two are orthogonal. The cell is
+three-valued — `maintenance ON` / `maintenance off` / `maintenance ?` — and
+reports the flag file that host's *running* slot unit polls; see
+[Where the flag file lives](#where-the-flag-file-lives). In `--json` the same
+field is `true` / `false` / `null`, `null` being the unproven case. See the
 [fleet deploys guide](fleet-deploys.md#runbook-a-fleet-wide-maintenance-window)
 for the full window runbook.
 

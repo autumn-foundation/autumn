@@ -12,7 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Multi-server fleet deploys — `[deploy] hosts` (#1621):** list several
   SSH-reachable servers under `[deploy] hosts` (mutually exclusive with the
   single-server `[deploy] host`; also `AUTUMN_DEPLOY__HOSTS` as CSV) and the same
-  `autumn deploy up` becomes a **rolling deploy across the fleet**. The list
+  `autumn deploy up` becomes a **rolling deploy across the fleet**. Either env
+  spelling, set non-empty, now **clears the other spelling from `autumn.toml`**,
+  so the documented env-over-TOML precedence retargets a single-host project as a
+  fleet (or a fleet project at one server) instead of tripping the
+  mutual-exclusion refusal; setting *both* env spellings non-empty is still
+  refused as an ambiguous rollout order, and an empty or blank value still means
+  *unset* and leaves the TOML spelling alone. The list
   order *is* the rollout order: hosts are replaced strictly one at a time, each
   running the unchanged per-host blue/green cutover against its own kamal-proxy
   and finishing before the next is started, so the rest of the fleet keeps
@@ -60,11 +66,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (per-host marker damage that will fail that host's *next* deploy closed: a
   `live-slot` marker disagreeing with the running proxy, an unreadable
   `shared/proxy-options`, a proxy bound to a different public port than
-  `[server] port`). It mutates nothing, so it is safe mid-incident; an
-  unreachable host is a row, not an abort, and a host whose release cannot be
-  read is reported as unknown and explicitly **not** counted as drift. `--strict`
-  exits non-zero on any drift so it is alertable from cron; `--json` emits a
-  stable report. See `docs/guide/fleet-deploys.md`.
+  `[server] port`, no release deployed while the rest of the fleet serves one,
+  and a `current` symlink that resolves to no readable release). It mutates
+  nothing, so it is safe mid-incident; an unreachable host is a row, not an
+  abort, and a host whose release cannot be read is reported as unknown and
+  explicitly **not** counted as *version* drift — though a reachable host that
+  proved it has a `current` symlink and still resolves to nothing readable is
+  state drift, so `--strict` exits non-zero on it. The **maintenance column
+  reports the flag file that host's *running* slot unit polls**, resolved on the
+  host from that unit's `Environment=AUTUMN_MAINTENANCE_FLAG_FILE` (falling back
+  to its `WorkingDirectory` plus the legacy relative
+  `tmp/autumn-maintenance.json`) rather than reading the shared path
+  unconditionally — which would report `off` for a maintained host whose unit
+  polls elsewhere and `ON` for a host still taking traffic. It is therefore
+  three-valued: `maintenance ON` / `maintenance off` / `maintenance ?`, the last
+  when the live slot unit could not be read at all, which is never rendered as a
+  confident `off`. Two matching state-drift reasons come with it — an unreadable
+  live slot unit, and a host whose app polls a release-local maintenance flag
+  instead of the shared one (a unit predating that override; the remedy is to
+  redeploy it), so a host deployed before this feature reports its release-local
+  flag until it is redeployed. The column states which file the running unit
+  polls and whether that file exists — not the app's in-memory state, which
+  follows on its own 500 ms poll. `--strict` exits non-zero on any drift so it is
+  alertable from cron; `--json` emits a stable report, in which `maintenance` is
+  correspondingly `true` / `false` / `null` (`null` = which file that host's unit
+  polls could not be proved) — both `false` and `null` stay falsy, so an existing
+  `maintenance == true` check is unaffected. Unlike `deploy check`, `up` and
+  `rollback`, `status` does **not** abort when the application config fails to
+  validate under the deploy profile: it needs only `[server] port`, so it prints
+  a caveat on stderr (in `--json` mode too, leaving stdout's shape untouched)
+  naming the config error and the declared port it probes against, and reports
+  the fleet anyway. The state-changing commands still refuse — they grade and
+  upload runtime values, so an invalid config must stop them. See
+  `docs/guide/fleet-deploys.md`.
 
 - **`autumn deploy maintenance on|off` — fleet-wide maintenance over SSH
   (#1621):** turns [maintenance mode](docs/guide/maintenance-mode.md) on or off

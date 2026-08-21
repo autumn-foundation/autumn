@@ -2094,7 +2094,12 @@ host = "203.0.113.10"                            # ONE server
 
 `host` and `hosts` are **mutually exclusive** (both set = refused), blank and
 duplicate entries are refused, and **the `hosts` order IS the rollout order**.
-`AUTUMN_DEPLOY__HOSTS` is the CSV env override and replaces the whole list.
+`AUTUMN_DEPLOY__HOSTS` is the CSV env override and replaces the whole list. Env
+wins over TOML for BOTH spellings: a non-empty `AUTUMN_DEPLOY__HOSTS` clears a
+TOML `[deploy] host` (and vice versa), so an env retarget never produces the
+mutually-exclusive refusal. Setting BOTH env spellings non-empty is still refused
+(ambiguous rollout order — an operator error, not a precedence question), and an
+empty/blank value still means *unset*, leaving the TOML spelling alone.
 
 With `hosts`, `deploy up` rolls the fleet **one host at a time** in declaration
 order — each host runs the unchanged per-host blue/green cutover against its own
@@ -2149,15 +2154,42 @@ one row per host (mode, release from the `current` symlink, live slot, `/ready`
 code, maintenance flag, proxy port, last deploy result, drift reasons) plus
 `version_drift` (hosts on different releases) and `state_drift` (per-host marker
 damage that fails the NEXT deploy closed). An unreachable host is a row, not an
-abort; an unreadable release is reported as unknown and is **not** drift.
+abort; an unreadable release is never **version** drift — but a REACHABLE host
+with a `current` symlink that resolves to no readable release IS state drift and
+exits non-zero under `--strict`.
 `last deploy` is the last action that host COMPLETED (`deployed` / `rolled back`
 / `torn down` + the host's UTC time, `?` when unreadable) — a deploy that failed before cutover
 never rewrites it, so it is never a verdict on the last rollout, and it is
-reported, not drift. `--strict` exits non-zero on any drift (cron-alertable);
+reported, not drift.
+
+The **maintenance cell is three-valued** — `maintenance ON` / `maintenance off` /
+`maintenance ?` — and reports the flag file the host's RUNNING slot unit polls,
+resolved on the host from that unit's `Environment=AUTUMN_MAINTENANCE_FLAG_FILE`
+(falling back to its `WorkingDirectory` + the legacy relative
+`tmp/autumn-maintenance.json`), not the shared path unconditionally. Never
+describe it as the app's in-memory state — it is which file the unit polls plus
+whether that file exists. Two state-drift reasons come from this probe (both only
+on a `deployed` host): the live slot unit could not be read (cell reads `?`,
+nothing is guessed), and the host's
+app polls a release-local flag rather than the shared one — a unit predating
+`AUTUMN_MAINTENANCE_FLAG_FILE`, whose remedy is to **redeploy that host**. So a
+host deployed before this feature reports its release-local flag until redeployed.
+
+`--strict` exits non-zero on any drift (cron-alertable);
 `--json` is a stable contract: `hosts[]` with `host`, `reachable`, `mode`,
 `release`, `live_slot`, `ready`, `maintenance`, `proxy_port`, `last_deploy`
-(`{result, at}` or null), `drift[]`, plus `version_drift`, `state_drift[]`,
-`drifted`.
+(`{result, at}` or null — `result` is `"deployed"`, `"rolled back"` or
+`"torn down"`), `drift[]`, plus `version_drift`, `state_drift[]`, `drifted`.
+`maintenance` is `true` / `false` / **`null`** (null = the CLI could not prove
+which flag file that host's running unit polls); both `false` and `null` are
+falsy, so an existing `maintenance == true` check is unaffected.
+
+Unlike `check`/`up`/`rollback`, `status` does NOT abort when the app config fails
+to validate under the deploy profile: it prints a caveat on **stderr** (text and
+`--json` alike, so stdout's shape is untouched) naming the config error and the
+DECLARED `[server] port` it probes against, then reports the fleet. `check`, `up`
+and `rollback` still refuse, deliberately — they grade and upload runtime values
+(signing secret, DB URL), so an invalid config must stop them.
 
 `autumn deploy maintenance on|off` fans maintenance mode out to every configured
 host over SSH (same flags and wire format as the local `autumn maintenance on`,

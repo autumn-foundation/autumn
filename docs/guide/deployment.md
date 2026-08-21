@@ -158,6 +158,23 @@ deploy subcommand.
 > twice would corrupt its previous-release chain). A one-entry `hosts` list is
 > byte-for-byte the historical single-server deploy.
 
+**Env wins over the file for *both* spellings.** Because the two are mutually
+exclusive, setting one spelling in the environment now **clears the other from
+`autumn.toml`**: a non-empty `AUTUMN_DEPLOY__HOSTS` retargets a `[deploy] host`
+project as a fleet, and a non-empty `AUTUMN_DEPLOY__HOST` retargets a
+`[deploy] hosts` project at a single server. Neither combination is a conflict —
+it is the documented env-over-TOML precedence applied to the spelling you did
+*not* set. Two rules bound it:
+
+- **Setting both env spellings non-empty is still refused**, naming both keys.
+  That is not a precedence question; with both set the rollout order is genuinely
+  ambiguous, so it is treated as an operator error rather than tie-broken.
+- **An empty or blank value still means *unset*** and leaves the TOML spelling
+  alone. `AUTUMN_DEPLOY__HOST=`, a whitespace-only value, `AUTUMN_DEPLOY__HOSTS=`
+  and `AUTUMN_DEPLOY__HOSTS=" , "` are the shape a CI or compose template emits
+  for an unfilled slot, so they can never silently drop a fleet list configured
+  in the file.
+
 Put these two values in a project `.env` (git-ignored — never committed). The
 deploy reads them and writes **only** them to a `0600` env file
 (`app_dir/shared/autumn.env`) **on the server**:
@@ -688,8 +705,30 @@ an unreachable host becomes a row, never an abort. It works for a single
 
 Each row carries: mode (`deployed` / `not deployed` / `unreachable` /
 `unknown`), the deployed release (read from the host's `current` symlink), the
-live slot, the `/ready` status code, the maintenance flag, the proxy's bound
+live slot, the `/ready` status code, the maintenance flag
+(`maintenance ON` / `maintenance off` / `maintenance ?`), the proxy's bound
 port, that host's last deploy result, and any per-host drift reasons.
+
+> **The maintenance cell reports the flag file that host's *running* slot unit
+> polls.** It is resolved on the host from the live slot unit's
+> `Environment=AUTUMN_MAINTENANCE_FLAG_FILE=…`, falling back to that unit's
+> `WorkingDirectory` plus the legacy relative `tmp/autumn-maintenance.json` when
+> the unit carries no override — the same rule the runtime itself applies. It is
+> deliberately *not* a fixed read of the shared path, which would report `off`
+> for a maintained host whose unit polls somewhere else, and `ON` for a host
+> still taking traffic.
+>
+> Two consequences. First, **a host deployed before this feature reports its
+> release-local flag** — its unit carries no `AUTUMN_MAINTENANCE_FLAG_FILE`, so
+> the cell tells the truth about that host while also raising the "polls a
+> release-local maintenance flag file" drift reason below; redeploy it to move
+> it onto the shared path. Second, when the live slot unit cannot be read at all
+> the cell reads `maintenance ?` rather than guessing — "we could not tell" must
+> never render as a confident `off`.
+>
+> It reports which file the running unit polls and whether that file exists. It
+> is not a guarantee about the app's in-memory state: the running process picks
+> the change up on its own 500 ms poll.
 
 > **`last deploy` is the last action that host *completed*.** It reads
 > `last deploy: deployed <UTC time>`, `last deploy: rolled back <UTC time>` or
@@ -715,16 +754,36 @@ Two kinds of drift are reported, and they are deliberately separate:
   that host fail closed or take the wrong slot. Today's reasons are: the
   `live-slot` marker disagrees with the slot kamal-proxy is actually serving (the
   next redeploy would restart the *serving* slot); the `shared/proxy-options`
-  marker is unreadable (the next deploy of that host will refuse); and the
-  installed proxy unit binds a different public port than `[server] port`
-  configures.
+  marker is unreadable (the next deploy of that host will refuse); the installed
+  proxy unit binds a different public port than `[server] port` configures; no
+  release is deployed on this host while the rest of the fleet is serving one;
+  the host has a `current` symlink but the release behind it could not be read;
+  and the two maintenance-probe reasons —
 
-> **"Release unknown" is not drift.** The only release identity a host can be
-> asked for is its `current` symlink, and that can be missing on a
-> never-deployed host, dangling mid-incident, or unreadable because the host did
-> not answer. Those hosts are *named* in the report and explicitly excluded from
-> the version-drift verdict — reporting a mixed fleet that does not exist is
-> worse than reporting nothing.
+  - `the live slot unit could not be read, so which maintenance flag file this
+    host's app polls is unknown — the maintenance column reports ? rather than
+    guessing`, and
+  - `this host's app polls a release-local maintenance flag file, not the shared
+    one (its slot unit predates AUTUMN_MAINTENANCE_FLAG_FILE) — redeploy it so
+    maintenance survives cutovers`.
+
+  The remedy for the second is exactly what it says: **redeploy that host**, so
+  its slot unit is rewritten with the shared flag path and its maintenance flag
+  survives the next cutover.
+
+> **"Release unknown" is never *version* drift — but a broken `current` symlink
+> is *state* drift.** The only release identity a host can be asked for is its
+> `current` symlink, and that can be missing on a never-deployed host, dangling
+> mid-incident, or unreadable because the host did not answer. Those hosts are
+> *named* in the report and explicitly excluded from the version-drift verdict —
+> reporting a mixed fleet that does not exist is worse than reporting nothing.
+>
+> A reachable host that *proved* it has a `current` symlink and still resolves to
+> no readable release is a different case, and it is now **state drift** that
+> `--strict` exits non-zero on (it was previously reported without counting).
+> That host claims to serve a release nobody can name, and deploying it next
+> would copy the unresolvable target into `previous-release` — making a later
+> rollback refuse. Repair it before the next deploy.
 
 `--strict` exits non-zero when **any** drift is found, so drift is alertable from
 cron. The default exits `0`: status is a report, not a judgement. `--json` emits
@@ -733,11 +792,38 @@ a stable machine-readable report on stdout — `hosts[]` (with `host`, `reachabl
 `last_deploy`, `drift[]`), plus `version_drift`, `state_drift[]`, and `drifted`
 (the `--strict` condition).
 
+`maintenance` is **three-valued**: `true` and `false` are proved states of the
+file the host's *running* slot unit polls, and `null` means the CLI could not
+prove which file that is — the same condition the table renders as
+`maintenance ?`. Both `false` and
+`null` are falsy, so an existing `maintenance == true` check is unaffected — no
+consumer that tests the field for truth starts matching more hosts.
+
 `last_deploy` is `{"result", "at"}`, or `null` when the host reports no readable
-marker. `result` is `"deployed"` or `"rolled back"`; `at` is the host's own UTC
-timestamp (`null` for a marker written before the timestamp field existed). It
-records the host's last **completed** action, so a deploy that failed before
-cutover never rewrites it, and it is reported rather than counted as drift.
+marker. `result` is `"deployed"`, `"rolled back"` or `"torn down"`; `at` is the
+host's own UTC timestamp (`null` for a marker written before the timestamp field
+existed). It records the host's last **completed** action, so a deploy that
+failed before cutover never rewrites it, and it is reported rather than counted
+as drift.
+
+> **`deploy status` still runs when the app config does not validate.** It needs
+> exactly one value from your application config — `[server] port`, the public
+> port kamal-proxy binds and every loopback slot port is derived from — so an
+> unrelated invalid `[scheduler]`, `[mail]`, `[database]` or `[security]` setting
+> used to abort the fleet's only read-only incident command before a single host
+> was probed. It no longer does. When the config fails to validate under the
+> deploy profile, `status` prints a caveat **on stderr** (in both text and
+> `--json` mode, so the `--json` shape on stdout is untouched) naming the config
+> error and the declared port it is probing against, then reports the fleet. The
+> fallback port is your own declared `[server] port` for that profile, read from
+> the same TOML + `.env.<profile>`/env layers the loader would have used, just
+> without validation (or the framework default when no layer declares one) —
+> never a guess.
+>
+> **`deploy check`, `deploy up` and `deploy rollback` still refuse**, and that
+> asymmetry is deliberate: they grade and upload runtime *values* (the signing
+> secret, the database URL), so an invalid config must stop them. `status` only
+> reads. The caveat says so too.
 
 ### Fleet maintenance
 
@@ -761,7 +847,9 @@ survives cutovers, rollbacks and pruning and is visible to *both* blue and green
 slots — because `autumn deploy` stamps `AUTUMN_MAINTENANCE_FLAG_FILE` into every
 slot unit it writes. (For a host still running a unit deployed before this
 existed, `maintenance on` also writes the old release-relative path, and the
-per-host row says when it could not.)
+per-host row says when it could not. `autumn deploy status` names those hosts as
+state drift — "polls a release-local maintenance flag file, not the shared one"
+— because their flag is orphaned by the next cutover until they are redeployed.)
 
 The fan-out is **best-effort-and-aggregate**, deliberately the opposite of the
 rollout: every host is attempted, the per-host table names what changed, and the

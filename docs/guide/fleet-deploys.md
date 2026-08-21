@@ -394,6 +394,40 @@ cannot be read is reported as `release unknown` and explicitly **not** counted a
 version drift. A false "your fleet is mixed" alarm at 3 am is worse than no
 alarm.
 
+That exclusion is about *version* drift only. A **reachable** host that proved it
+has a `current` symlink, yet resolves to no readable release, is now **state**
+drift and `--strict` exits non-zero on it (it was previously reported without
+counting). Its row says so:
+
+```
+⚠️  this host has a `current` symlink but the release it points at could not be
+read (a broken symlink or a missing releases dir) — repair it before the next
+deploy, which would record that unresolvable target as this host's rollback point
+```
+
+Two more state-drift reasons come from the maintenance probe, and both name the
+action they need:
+
+- `the live slot unit could not be read, so which maintenance flag file this
+  host's app polls is unknown — the maintenance column reports ? rather than
+  guessing` — inspect the unit on that host; the row's maintenance cell reads
+  `maintenance ?` instead of a confident `ON`/`off`.
+- `this host's app polls a release-local maintenance flag file, not the shared
+  one (its slot unit predates AUTUMN_MAINTENANCE_FLAG_FILE) — redeploy it so
+  maintenance survives cutovers` — **redeploy that host.** Until you do, its flag
+  is orphaned by the next cutover and a fleet-wide `deploy maintenance` reaches
+  it only best-effort.
+
+> **A broken app config no longer takes `deploy status` offline.** `status` needs
+> only `[server] port` from your application config, so a config that fails to
+> validate under the deploy profile is no longer fatal to it: it prints a caveat
+> on **stderr** (in `--json` mode too, leaving stdout's shape intact) naming the
+> config error and the declared port it is probing against, then reports the
+> fleet anyway. `deploy check`, `up` and `rollback` still refuse — they grade and
+> upload runtime *values*, so an invalid config has to stop them. That asymmetry
+> is deliberate: the read-only incident command stays available, the
+> state-changing ones do not.
+
 Each row also carries a `last deploy` cell — the last action that host
 *completed* (`deployed`, `rolled back` or `torn down`, with the host's UTC time;
 `?` when the marker is absent or unreadable). Mid-incident that is what tells a
@@ -512,6 +546,24 @@ autumn migrate
 # 4. Reopen.
 autumn deploy maintenance off
 ```
+
+Step 2 is a real check, not a formality. The `maintenance` column reports the
+flag file **the host's running slot unit actually polls** — resolved from that
+unit's `Environment=AUTUMN_MAINTENANCE_FLAG_FILE`, or from its
+`WorkingDirectory` plus the legacy relative `tmp/autumn-maintenance.json` when
+the unit predates that override. So read it as three answers, not two:
+
+| Cell | What it means | What to do |
+|---|---|---|
+| `maintenance ON` | The file that host's running unit polls exists. | Nothing — the window is closed on that host. |
+| `maintenance off` | That file does not exist. | The host is still serving normally. |
+| `maintenance ?` | The live slot unit could not be read, so *which* file the app polls is unproven. | Inspect the unit; never read this as "off". On a `deployed` host it is also state drift. |
+
+A host whose unit predates the shared flag path reads its **release-local** file
+here — true for that host, and flagged as state drift with `redeploy it so
+maintenance survives cutovers`. Note the column's scope: it proves which file the
+unit polls and whether that file is there, not what the process currently holds
+in memory — the app picks the change up on its own 500 ms poll.
 
 Four things to know before you run it:
 
