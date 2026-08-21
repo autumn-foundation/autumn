@@ -385,3 +385,49 @@ fn a_scaffolded_comment_resource_does_not_suppress_the_shared_table() {
         "the polymorphic table must still be emitted alongside the Comment resource's own"
     );
 }
+
+/// `destroy scaffold` must not delete a polymorphic `comments` migration this
+/// generator never wrote. Generation skips emitting one when the project
+/// already has the table, so on destroy there is nothing of ours to take back
+/// out — and `Plan::revert` matches by the `_create_comments` suffix, so an
+/// unconditional revert action would target the author's own file.
+#[test]
+fn destroy_scaffold_leaves_a_pre_existing_comments_migration_alone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "cmt-preexisting-app"]);
+    let project = tmp.path().join("cmt-preexisting-app");
+
+    // A hand-written polymorphic table, with a comment ours never emits.
+    let hand_written = project.join("migrations/20250101000000_create_comments");
+    fs::create_dir_all(&hand_written).expect("mkdir");
+    let sql = "-- Hand-written, not generated.\nCREATE TABLE comments (\n    \
+               id BIGSERIAL PRIMARY KEY,\n    commentable_type TEXT NOT NULL,\n    \
+               commentable_id BIGINT NOT NULL,\n    parent_id BIGINT,\n    \
+               author_id BIGINT NOT NULL,\n    body TEXT NOT NULL,\n    \
+               created_at TIMESTAMP NOT NULL DEFAULT NOW(),\n    \
+               deleted_at TIMESTAMP\n);\n";
+    fs::write(hand_written.join("up.sql"), sql).expect("write");
+    fs::write(hand_written.join("down.sql"), "DROP TABLE comments;\n").expect("write");
+
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "comments:commentable",
+        ],
+    );
+    run_autumn_ok(&project, &["destroy", "scaffold", "Post", "--force"]);
+
+    assert!(
+        hand_written.join("up.sql").exists(),
+        "destroy must not remove a migration it never created"
+    );
+    assert_eq!(
+        fs::read_to_string(hand_written.join("up.sql")).expect("up.sql"),
+        sql,
+        "…and must not have altered it"
+    );
+}

@@ -483,12 +483,42 @@ pub fn push_commentable_migration(
     if !for_revert && already_migrated(project_root) {
         return false;
     }
+    // …but only take out a migration this generator actually WROTE. A project
+    // whose polymorphic `comments` table predates the scaffold got no migration
+    // from us at all (generation skipped it), and `Plan::revert` matches by the
+    // `_create_comments` suffix — so pushing the action unconditionally would
+    // have `destroy scaffold` delete a hand-written migration, or block on it,
+    // for a file this tool never created. `--force` would delete it outright.
+    //
+    // Ownership is judged by content: byte-identical to what `up_sql` emits for
+    // this backend means ours. An edited copy (the author added the `author_id`
+    // foreign key the header suggests, say) is left alone — leaving a file
+    // behind is recoverable, deleting one is not.
+    if for_revert && !generator_owned_comments_migration(project_root, backend) {
+        return false;
+    }
     let dir = project_root
         .join("migrations")
         .join(migration_dir_name(timestamp));
     plan.create(dir.join("up.sql"), up_sql(backend));
     plan.create(dir.join("down.sql"), down_sql());
     true
+}
+
+/// Whether some migration's `up.sql` is byte-identical to what [`up_sql`]
+/// emits for `backend` — i.e. this generator wrote it.
+#[must_use]
+fn generator_owned_comments_migration(
+    project_root: &Path,
+    backend: autumn_web::config::DatabaseBackend,
+) -> bool {
+    let ours = up_sql(backend);
+    let Ok(entries) = std::fs::read_dir(project_root.join("migrations")) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        std::fs::read_to_string(entry.path().join("up.sql")).is_ok_and(|sql| sql == ours)
+    })
 }
 
 /// Whether **another** model in `project_root` still declares
