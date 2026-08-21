@@ -675,6 +675,21 @@ pub(crate) fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String
     found_token
 }
 
+/// Resolve a session id using the canonical cookie parser and signing-key
+/// rotation rules.  Keeping this helper here prevents edge identity adapters
+/// and backend plugins from growing subtly different authentication rules.
+pub(crate) fn verified_session_id(
+    headers: &http::HeaderMap,
+    cookie_name: &str,
+    signing_keys: &crate::security::config::ResolvedSigningKeys,
+) -> Option<String> {
+    let raw = get_cookie(headers, cookie_name)?;
+    let (id, signature) = raw.split_once('.')?;
+    signing_keys
+        .verify(id.as_bytes(), signature)
+        .then(|| id.to_owned())
+}
+
 /// Fuzzing seam: exercise the cookie-header parser plus the signed-session
 /// cookie verification path (`{session_id}.{hmac_hex}` split + HMAC verify)
 /// over arbitrary bytes. Mirrors the decode performed by `SessionLayer`.
@@ -855,17 +870,8 @@ where
             let existing_id: Option<String> = match (raw_cookie, &signing_keys) {
                 (None, _) => None,
                 (Some(raw), None) => Some(raw),
-                (Some(raw), Some(keys)) => {
-                    // Signed format: "{session_id}.{hmac_hex}"
-                    if let Some((id, sig)) = raw.split_once('.') {
-                        if keys.verify(id.as_bytes(), sig) {
-                            Some(id.to_owned())
-                        } else {
-                            None // bad HMAC — treat as no session
-                        }
-                    } else {
-                        None // unsigned cookie when signing is required
-                    }
+                (Some(_), Some(keys)) => {
+                    verified_session_id(req.headers(), &config.cookie_name, keys)
                 }
             };
 

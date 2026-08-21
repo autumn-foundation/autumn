@@ -740,3 +740,18 @@ indistinguishable, and that logout makes the old cookie unusable. See the
   [`autumn_web::auth`](../../autumn/src/auth.rs),
   [`autumn_web::auth::password`](../../autumn/src/auth/password.rs),
   [`autumn_web::auth::remember`](../../autumn/src/auth/remember.rs).
+
+## Sessions as authoritative edge identity
+
+Edge authentication has separate verification, authoritative storage, and claim
+projection stages ([ADR-0005](../adr/0005-edge-session-identity.md)). Redis is the
+first-party shared path; DragonflyDB and Valkey use the same `[session.redis]`
+URL/prefix configuration and `RedisStore`, not backend-specific store types. The
+adapter uses only `GET`, TTL-bearing `SET`, and `DEL`.
+
+Choose consistency deliberately: logout/revocation requires the authoritative
+store's current answer. An opportunistic cache is not an authority—eviction is a
+miss, and stale hits could retain revoked access. Cross-region authority adds
+latency; colocate it or let identity-required requests fall through to origin.
+Custom stores implement `SessionStore`; custom identity sources implement
+`EdgeIdentityProvider`, keeping cookie and signing rules out of plugins.

@@ -62,12 +62,183 @@
     )
 )]
 
+use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 
 use autumn_edge::EdgeKv;
 
 use crate::cache::Cache;
+
+/// Opaque, validated identifier used while consulting an authoritative store.
+/// It deliberately has no public accessor and is never part of [`EdgeIdentity`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SessionId(String);
+
+/// Stable, normalized user identifier safe to send to an edge capsule.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct EdgeUserId(String);
+
+impl EdgeUserId {
+    /// Construct a normalized edge user id.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    /// Read the normalized value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A normalized authorization role safe to disclose to a capsule.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct EdgeRole(String);
+
+impl EdgeRole {
+    /// Construct a normalized role.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    /// Read the normalized role.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The complete and intentionally small identity envelope crossing the edge wire.
+///
+/// Its private fields make it structurally impossible to expose a cookie,
+/// session id/signature, session map, signing secret, or backend key.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EdgeIdentity {
+    user_id: EdgeUserId,
+    roles: Vec<EdgeRole>,
+}
+
+impl EdgeIdentity {
+    /// Construct an identity from normalized claims only.
+    #[must_use]
+    pub fn new(user_id: EdgeUserId, roles: Vec<EdgeRole>) -> Self {
+        Self { user_id, roles }
+    }
+    /// Authenticated user claim.
+    #[must_use]
+    pub fn user_id(&self) -> &EdgeUserId {
+        &self.user_id
+    }
+    /// Normalized role claims.
+    #[must_use]
+    pub fn roles(&self) -> &[EdgeRole] {
+        &self.roles
+    }
+}
+
+/// Host-only authentication contract for the Autumn edge integration.
+///
+/// `Ok(None)` covers both absent and invalid credentials. `Err` is reserved
+/// for infrastructure failure so callers can fall through to the origin.
+pub trait EdgeIdentityProvider: Send + Sync + 'static {
+    /// Provider-specific infrastructure failure.
+    type Error: std::error::Error + Send + Sync + 'static;
+    /// Resolve an incoming host request without executing capsule code.
+    fn resolve(
+        &self,
+        request: &http::Request<axum::body::Body>,
+    ) -> impl Future<Output = Result<Option<EdgeIdentity>, Self::Error>> + Send;
+}
+
+/// Projects an authoritative session map into explicitly allowed edge claims.
+pub trait EdgeIdentityProjector: Send + Sync + 'static {
+    /// Return no identity when the session is not authenticated.
+    fn project(&self, session: &HashMap<String, String>) -> Option<EdgeIdentity>;
+}
+
+/// Session-backed identity provider that shares Autumn's canonical cookie and
+/// signing-key verification with [`crate::session::SessionLayer`].
+pub struct SessionIdentityProvider<S, P> {
+    store: S,
+    projector: P,
+    cookie_name: String,
+    signing_keys: Arc<crate::security::config::ResolvedSigningKeys>,
+}
+
+impl<S, P> SessionIdentityProvider<S, P> {
+    /// Build an adapter. The caller supplies the configured cookie name and the
+    /// same resolved current/previous keys installed on `SessionLayer`.
+    #[must_use]
+    pub fn new(
+        store: S,
+        projector: P,
+        cookie_name: impl Into<String>,
+        signing_keys: Arc<crate::security::config::ResolvedSigningKeys>,
+    ) -> Self {
+        Self {
+            store,
+            projector,
+            cookie_name: cookie_name.into(),
+            signing_keys,
+        }
+    }
+}
+
+impl<S, P> EdgeIdentityProvider for SessionIdentityProvider<S, P>
+where
+    S: crate::session::SessionStore,
+    P: EdgeIdentityProjector,
+{
+    type Error = crate::session::SessionStoreError;
+
+    fn resolve(
+        &self,
+        request: &http::Request<axum::body::Body>,
+    ) -> impl Future<Output = Result<Option<EdgeIdentity>, Self::Error>> + Send {
+        let raw_id = crate::session::verified_session_id(
+            request.headers(),
+            &self.cookie_name,
+            &self.signing_keys,
+        );
+        async move {
+            let Some(raw_id) = raw_id else {
+                return Ok(None);
+            };
+            let id = SessionId(raw_id);
+            let Some(session) = self.store.load(&id.0).await? else {
+                return Ok(None);
+            };
+            Ok(self.projector.project(&session))
+        }
+    }
+}
+
+/// Default projection using the application's configured `auth.session_key`.
+pub struct AuthSessionProjector {
+    auth_session_key: String,
+}
+
+impl AuthSessionProjector {
+    /// Create a projector from `AutumnConfig::auth.session_key`.
+    #[must_use]
+    pub fn new(auth_session_key: impl Into<String>) -> Self {
+        Self {
+            auth_session_key: auth_session_key.into(),
+        }
+    }
+}
+
+impl EdgeIdentityProjector for AuthSessionProjector {
+    fn project(&self, session: &HashMap<String, String>) -> Option<EdgeIdentity> {
+        session
+            .get(&self.auth_session_key)
+            .map(|id| EdgeIdentity::new(EdgeUserId::new(id), Vec::new()))
+    }
+}
 
 /// An [`EdgeKv`] backed by the application's own cache.
 ///
@@ -139,6 +310,68 @@ impl EdgeKv for CacheEdgeKv {
 mod tests {
     use super::*;
     use crate::cache::{MokaCache, insert_cached};
+    use crate::session::{MemoryStore, SessionStore};
+
+    #[tokio::test]
+    async fn session_identity_projects_only_normalized_claims() {
+        let store = MemoryStore::new();
+        let mut data = HashMap::new();
+        data.insert("account_id".into(), "user-7".into());
+        data.insert("backend_token".into(), "must-not-cross".into());
+        store.save("sid-secret", data).await.expect("memory save");
+        let keys = Arc::new(crate::security::config::ResolvedSigningKeys::new(
+            b"current-secret".to_vec(),
+            Vec::new(),
+        ));
+        let signature = keys.sign(b"sid-secret");
+        let provider = SessionIdentityProvider::new(
+            store,
+            AuthSessionProjector::new("account_id"),
+            "custom.sid",
+            keys,
+        );
+        let request = http::Request::builder()
+            .header(
+                http::header::COOKIE,
+                format!("custom.sid=sid-secret.{signature}"),
+            )
+            .body(axum::body::Body::empty())
+            .expect("request");
+
+        let identity = provider
+            .resolve(&request)
+            .await
+            .expect("store available")
+            .expect("authenticated");
+        assert_eq!(identity.user_id().as_str(), "user-7");
+        let wire = serde_json::to_string(&identity).expect("identity serializes");
+        assert!(!wire.contains("sid-secret"));
+        assert!(!wire.contains("backend_token"));
+        assert!(!wire.contains("must-not-cross"));
+    }
+
+    #[tokio::test]
+    async fn invalid_signature_and_destroyed_session_are_misses() {
+        let store = MemoryStore::new();
+        let keys = Arc::new(crate::security::config::ResolvedSigningKeys::new(
+            b"secret".to_vec(),
+            Vec::new(),
+        ));
+        let provider = SessionIdentityProvider::new(
+            store,
+            AuthSessionProjector::new("user_id"),
+            "autumn.sid",
+            keys,
+        );
+        let request = http::Request::builder()
+            .header(http::header::COOKIE, "autumn.sid=gone.invalid")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        assert_eq!(
+            provider.resolve(&request).await.expect("store available"),
+            None
+        );
+    }
 
     fn cache_with(key: &str, value: &[u8]) -> Arc<dyn Cache> {
         let cache = MokaCache::new(16, None);

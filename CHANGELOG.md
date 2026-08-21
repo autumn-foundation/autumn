@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added the host-only edge identity provider contract, session-backed identity projection, normalized identity claim types, and ADR-0005 security boundary; documented Redis-compatible DragonflyDB and Valkey deployments.
+
 - **`Query<T>` decodes sequences and nested structures (#1972):** the extractor
   no longer delegates to `serde_urlencoded`, whose strict flatness meant a
   `Vec<String>` field fed the conforming `?tags=a&tags=b` form failed with
