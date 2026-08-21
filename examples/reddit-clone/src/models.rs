@@ -1,5 +1,6 @@
 use autumn_web::storage::Blob;
 
+use crate::repositories::PgVoteRepository;
 use crate::schema::{posts, subreddits, tags, users, votes};
 
 // Manual model -- password_hash should never be auto-exposed via API.
@@ -77,6 +78,19 @@ pub struct Subreddit {
 #[autumn_web::model]
 #[belongs_to(User, fk = author_id)]
 #[belongs_to(Subreddit)]
+// #2260 destroyed this post's comments through `#[has_many(Comment, dependent =
+// destroy)]`. That leg is gone with the `Comment` model (#1367), but the
+// behaviour is NOT: the polymorphic table cannot carry a foreign key to two
+// parent tables, so the migration installs a `posts_delete_comments` trigger
+// that deletes `(commentable_type, commentable_id)` rows when their parent goes.
+// It covers every commentable model at once rather than one leg per model.
+//
+// Votes have no deletion hooks or counter-cache leg of their own: `Post::score`
+// belongs to the row being removed. A bulk delete is therefore both safe and
+// preferable. Matching the nullable FK against this post's non-null id deletes
+// only post-targeted votes; comment votes have `post_id = NULL` and are reached
+// through their comment when the trigger removes it.
+#[has_many(Vote, fk = "post_id", name = post_votes, dependent = delete_all)]
 #[has_many(Tag, through = post_tags)]
 #[votable(by = User, aggregate = sum)]
 #[commentable(by = User, author_name = username)]
