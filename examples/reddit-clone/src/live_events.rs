@@ -942,9 +942,20 @@ pub fn comment_created_event(
         "subreddit_slug": subreddit_slug,
         "author_username": author_username,
         "body_preview": comment_body_preview(body),
+        // Built from the widget's own convention, not a hand-written
+        // `#comment-{id}`: the detail page renders each comment as
+        // `{thread_dom_id}-c{comment_id}`, so an invented anchor matches
+        // nothing and the notification opens the post without scrolling.
         "path": format!(
-            "{}#comment-{comment_id}",
-            crate::routes::posts::__autumn_path_show(subreddit_slug, post_slug)
+            "{}#{}",
+            crate::routes::posts::__autumn_path_show(subreddit_slug, post_slug),
+            autumn_web::widgets::comment_dom_id(
+                &autumn_web::commentable::thread_dom_id(
+                    crate::models::Post::COMMENTABLE_TYPE,
+                    post_id,
+                ),
+                comment_id,
+            )
         ),
     })
 }

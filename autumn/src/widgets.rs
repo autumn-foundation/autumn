@@ -1628,10 +1628,20 @@ fn comment_list(cfg: &CommentThread, comments: &[CommentView], depth: usize) -> 
     }
 }
 
+/// The `id` [`comment_thread`] renders on one comment's `<li>`.
+///
+/// Exposed because anything that wants to *link* to a comment — a notification,
+/// an email, a live-feed entry — needs the same string, and hand-assembling it
+/// at each call site is how a link silently stops matching the markup.
+#[must_use]
+pub fn comment_dom_id(thread_dom_id: &str, comment_id: i64) -> String {
+    format!("{thread_dom_id}-c{comment_id}")
+}
+
 /// One comment, its reply affordance, and its own replies.
 #[cfg(feature = "maud")]
 fn comment_node(cfg: &CommentThread, comment: &CommentView, depth: usize) -> maud::Markup {
-    let node_id = format!("{}-c{}", cfg.dom_id, comment.id);
+    let node_id = comment_dom_id(&cfg.dom_id, comment.id);
     // The write path refuses a reply deeper than `max_depth`, so offering the
     // form past it would be an invitation to a 422. `depth` is the parent's
     // level, and the reply lands one below.

@@ -156,32 +156,104 @@ pub fn migration_dir_name(timestamp: &str) -> String {
 /// that is what is matched.
 #[must_use]
 pub fn already_migrated(project_root: &Path) -> bool {
-    // Accumulated across the whole migration history, not per file. A project
-    // that converts an existing `comments` table to polymorphic storage does it
-    // in TWO migrations -- one created the table, a later one adds the
-    // discriminator columns by `ALTER TABLE`. `examples/reddit-clone` is
-    // exactly that shape. Requiring both in one `up.sql` would report "no
-    // shared table", emit a second `CREATE TABLE comments`, and fail the next
-    // `migrate` with "relation already exists".
+    // Replayed in version order, because a migration history is a sequence of
+    // edits and not a bag of facts. Flags that only ever get SET would report a
+    // table that a later `DROP TABLE comments` removed as still present -- the
+    // generator would skip recreating it, and every helper would fail at
+    // runtime on a table that is not there.
     let mut creates = false;
-    let mut discriminated = false;
-    // The two ALTERs accumulate across the WHOLE history too, not just within
-    // one file: nothing requires a conversion to add both columns in the same
-    // migration, and combining them per-file would reintroduce, for
-    // ALTER+ALTER, exactly the one-file assumption this scan exists to remove.
     let (mut altered_type, mut altered_id) = (false, false);
+    let mut created_with_discriminators = false;
+
     for sql in migration_up_sql(project_root) {
-        if let Some(body) = comments_table_body(&sql) {
-            creates = true;
-            if body.contains("commentable_type") && body.contains("commentable_id") {
-                discriminated = true;
+        for event in comments_table_events(&sql) {
+            match event {
+                CommentsEvent::Create { discriminated } => {
+                    creates = true;
+                    created_with_discriminators = discriminated;
+                }
+                CommentsEvent::AddType => altered_type = true,
+                CommentsEvent::AddId => altered_id = true,
+                CommentsEvent::Drop => {
+                    // The table and everything said about its columns.
+                    creates = false;
+                    created_with_discriminators = false;
+                    altered_type = false;
+                    altered_id = false;
+                }
             }
         }
-        let (sql_type, sql_id) = comments_altered_columns(&sql);
-        altered_type |= sql_type;
-        altered_id |= sql_id;
     }
-    creates && (discriminated || (altered_type && altered_id))
+
+    creates && (created_with_discriminators || (altered_type && altered_id))
+}
+
+/// What one statement does to the shared comments table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentsEvent {
+    /// `CREATE TABLE comments (…)`, and whether the body declares both
+    /// discriminator columns.
+    Create { discriminated: bool },
+    /// `ALTER TABLE comments … commentable_type`.
+    AddType,
+    /// `ALTER TABLE comments … commentable_id`.
+    AddId,
+    /// `DROP TABLE comments`.
+    Drop,
+}
+
+/// Every statement in `sql` touching the shared comments table, **in source
+/// order**, so a create and a later drop in one file are seen as a sequence.
+fn comments_table_events(sql: &str) -> Vec<CommentsEvent> {
+    let mut events: Vec<(usize, CommentsEvent)> = Vec::new();
+
+    if let Some(start) = comments_table_statement_start(sql) {
+        let discriminated = comments_table_body(sql).is_some_and(|body| {
+            body.contains("commentable_type") && body.contains("commentable_id")
+        });
+        events.push((start, CommentsEvent::Create { discriminated }));
+    }
+    for (at, statement) in comments_statements(sql, "alter table") {
+        if statement.contains("commentable_type") {
+            events.push((at, CommentsEvent::AddType));
+        }
+        if statement.contains("commentable_id") {
+            events.push((at, CommentsEvent::AddId));
+        }
+    }
+    for (at, _) in comments_statements(sql, "drop table") {
+        events.push((at, CommentsEvent::Drop));
+    }
+
+    events.sort_by_key(|(at, _)| *at);
+    events.into_iter().map(|(_, event)| event).collect()
+}
+
+/// Statements of the form `<verb> [if exists] comments …`, as (offset, body).
+///
+/// Identifier-exact, so `comments_archive` is never mistaken for `comments`.
+fn comments_statements<'a>(lowered: &'a str, verb: &str) -> Vec<(usize, &'a str)> {
+    let mut found = Vec::new();
+    for prefix in [
+        format!("{verb} {COMMENTS_TABLE}"),
+        format!("{verb} \"{COMMENTS_TABLE}\""),
+        format!("{verb} if exists {COMMENTS_TABLE}"),
+        format!("{verb} if exists \"{COMMENTS_TABLE}\""),
+    ] {
+        let mut base = 0usize;
+        while let Some(at) = lowered[base..].find(&prefix) {
+            let start = base + at;
+            let after = &lowered[start + prefix.len()..];
+            if prefix.ends_with('"')
+                || after.is_empty()
+                || after.starts_with(|c: char| c.is_whitespace() || c == ';')
+            {
+                found.push((start, after.split(';').next().unwrap_or(after)));
+            }
+            base = start + prefix.len();
+        }
+    }
+    found
 }
 
 /// Every migration's `up.sql`, lowercased with SQL comments stripped.
@@ -189,40 +261,19 @@ fn migration_up_sql(project_root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(project_root.join("migrations")) else {
         return Vec::new();
     };
-    entries
+    // Sorted by directory name, which carries the timestamp prefix diesel
+    // orders by. Read order from the filesystem is unspecified, and this scan
+    // now depends on sequence: a create followed by a drop is not the same
+    // history as a drop followed by a create.
+    let mut dirs: Vec<std::path::PathBuf> = entries
         .filter_map(Result::ok)
-        .filter_map(|entry| std::fs::read_to_string(entry.path().join("up.sql")).ok())
+        .map(|entry| entry.path())
+        .collect();
+    dirs.sort();
+    dirs.into_iter()
+        .filter_map(|dir| std::fs::read_to_string(dir.join("up.sql")).ok())
         .map(|sql| strip_sql_comments(&sql.to_ascii_lowercase()))
         .collect()
-}
-
-/// Which discriminator columns `ALTER TABLE comments` adds in `lowered`.
-///
-/// The two columns routinely arrive as separate statements, so they are
-/// tracked separately and combined by the caller.
-fn comments_altered_columns(lowered: &str) -> (bool, bool) {
-    let (mut has_type, mut has_id) = (false, false);
-    for prefix in [
-        format!("alter table {COMMENTS_TABLE}"),
-        format!("alter table \"{COMMENTS_TABLE}\""),
-    ] {
-        let mut base = 0usize;
-        while let Some(at) = lowered[base..].find(&prefix) {
-            let start = base + at;
-            let after = &lowered[start + prefix.len()..];
-            // Identifier-exact, so `comments_archive` is not `comments`.
-            if prefix.ends_with('"')
-                || after.is_empty()
-                || after.starts_with(|c: char| c.is_whitespace() || c == ';')
-            {
-                let statement = after.split(';').next().unwrap_or(after);
-                has_type |= statement.contains("commentable_type");
-                has_id |= statement.contains("commentable_id");
-            }
-            base = start + prefix.len();
-        }
-    }
-    (has_type, has_id)
 }
 
 /// `sql` with `--` line comments and `/* … */` blocks removed.
@@ -783,6 +834,60 @@ mod tests {
             already_migrated(tmp.path()),
             "the columns may arrive in separate migrations"
         );
+    }
+
+    /// A history is a sequence, not a bag of facts: a later `DROP TABLE
+    /// comments` undoes an earlier polymorphic create, and the generator must
+    /// emit the table again rather than skip it.
+    #[test]
+    fn a_later_drop_undoes_an_earlier_polymorphic_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let migrations = tmp.path().join("migrations");
+        let created = migrations.join("20260101000000_create");
+        std::fs::create_dir_all(&created).expect("mkdir");
+        std::fs::write(created.join("up.sql"), up_sql(DatabaseBackend::Postgres)).expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "the table exists at this point"
+        );
+
+        let dropped = migrations.join("20260202000000_retire");
+        std::fs::create_dir_all(&dropped).expect("mkdir");
+        std::fs::write(dropped.join("up.sql"), "DROP TABLE comments;\n").expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "a dropped table is not available to reuse"
+        );
+
+        // …and recreating it later brings it back.
+        let again = migrations.join("20260303000000_recreate");
+        std::fs::create_dir_all(&again).expect("mkdir");
+        std::fs::write(again.join("up.sql"), up_sql(DatabaseBackend::Postgres)).expect("write");
+        assert!(already_migrated(tmp.path()));
+    }
+
+    /// Order matters *within* a file too, not only between them.
+    #[test]
+    fn a_drop_after_a_create_in_one_file_leaves_no_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_churn");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n\
+             DROP TABLE comments;\n",
+        )
+        .expect("write");
+        assert!(!already_migrated(tmp.path()));
+
+        // The reverse order does leave one.
+        std::fs::write(
+            dir.join("up.sql"),
+            "DROP TABLE IF EXISTS comments;\n\
+             CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n",
+        )
+        .expect("write");
+        assert!(already_migrated(tmp.path()));
     }
 
     /// The shared migration must survive `destroy scaffold` while any other
