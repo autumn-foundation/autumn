@@ -391,30 +391,52 @@ fn migration_up_sql(project_root: &Path) -> Vec<String> {
 /// otherwise read as the real table and make the generator emit nothing.
 fn strip_sql_comments(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
-    let mut rest = sql;
-    loop {
-        let line = rest.find("--");
-        let block = rest.find("/*");
-        match (line, block) {
-            (None, None) => {
-                out.push_str(rest);
-                return out;
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            // A quoted literal or identifier is TEXT, not syntax: a `--` inside
+            // one (`note TEXT DEFAULT '--'`) is a string, and treating it as a
+            // comment truncated the rest of the statement — dropping the
+            // discriminator columns that came after it and making the generator
+            // emit a duplicate table.
+            quote @ (b'\'' | b'"') => {
+                out.push(quote as char);
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        // A doubled quote is an escaped one, still inside.
+                        if bytes.get(i + 1) == Some(&quote) {
+                            out.push_str(&sql[i..=i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                        out.push(quote as char);
+                        i += 1;
+                        break;
+                    }
+                    let ch = sql[i..].chars().next().unwrap_or(quote as char);
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
             }
-            // Whichever opens first wins; a `--` inside a block comment (and a
-            // `/*` inside a line comment) is just text.
-            (Some(l), b) if b.is_none_or(|b| l < b) => {
-                out.push_str(&rest[..l]);
-                rest = rest[l..].find('\n').map_or("", |nl| &rest[l + nl..]);
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i = sql[i..].find('\n').map_or(bytes.len(), |nl| i + nl);
             }
-            (_, Some(b)) => {
-                out.push_str(&rest[..b]);
-                rest = rest[b + 2..]
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = sql[i + 2..]
                     .find("*/")
-                    .map_or("", |end| &rest[b + 2 + end + 2..]);
+                    .map_or(bytes.len(), |end| i + 2 + end + 2);
             }
-            (Some(_), None) => unreachable!("the guard above covers a line comment first"),
+            _ => {
+                let ch = sql[i..].chars().next().unwrap_or(' ');
+                out.push(ch);
+                i += ch.len_utf8();
+            }
         }
     }
+    out
 }
 
 /// The column list of a `CREATE TABLE` naming **exactly** the shared comments
@@ -1163,6 +1185,42 @@ mod tests {
             !already_migrated(other.path()),
             "archive.comments is not public.comments"
         );
+    }
+
+    /// A comment marker inside a quoted literal is text, not a comment.
+    /// Treating it as one truncated the statement and dropped the discriminator
+    /// columns that followed.
+    #[test]
+    fn a_comment_marker_inside_a_literal_is_not_a_comment() {
+        for sql in [
+            "CREATE TABLE comments (note TEXT DEFAULT '--', \
+             commentable_type TEXT, commentable_id BIGINT);",
+            "CREATE TABLE comments (note TEXT DEFAULT '/* x */', \
+             commentable_type TEXT, commentable_id BIGINT);",
+            // A doubled quote is an escaped one, still inside the literal.
+            "CREATE TABLE comments (note TEXT DEFAULT 'it''s -- fine', \
+             commentable_type TEXT, commentable_id BIGINT);",
+            // …and the same inside a quoted identifier.
+            "CREATE TABLE comments (\"od--d\" TEXT, commentable_type TEXT, commentable_id BIGINT);",
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let dir = tmp.path().join("migrations").join("0001_literal");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("up.sql"), sql).expect("write");
+            assert!(already_migrated(tmp.path()), "{sql}");
+        }
+
+        // A real comment still hides what follows it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_commented");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);\n\
+             -- commentable_type TEXT, commentable_id BIGINT\n",
+        )
+        .expect("write");
+        assert!(!already_migrated(tmp.path()));
     }
 
     /// The shared migration must survive `destroy scaffold` while any other
