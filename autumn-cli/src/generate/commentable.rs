@@ -161,31 +161,39 @@ pub fn already_migrated(project_root: &Path) -> bool {
     // table that a later `DROP TABLE comments` removed as still present -- the
     // generator would skip recreating it, and every helper would fail at
     // runtime on a table that is not there.
+    // One running picture of the table: does it exist, and does it currently
+    // have each discriminator column. Every event edits that picture, so a
+    // column added by a CREATE body and one added by a later ALTER are the same
+    // kind of fact -- which they are, and treating them differently is what let
+    // a rename INTO the discriminator name go unrecognised.
     let mut creates = false;
-    let (mut altered_type, mut altered_id) = (false, false);
-    let mut created_with_discriminators = false;
+    let (mut has_type, mut has_id) = (false, false);
 
     for sql in migration_up_sql(project_root) {
         for event in comments_table_events(&sql) {
             match event {
-                CommentsEvent::Create { discriminated } => {
+                CommentsEvent::Create {
+                    has_type: created_type,
+                    has_id: created_id,
+                } => {
                     creates = true;
-                    created_with_discriminators = discriminated;
+                    has_type = created_type;
+                    has_id = created_id;
                 }
-                CommentsEvent::AddType => altered_type = true,
-                CommentsEvent::AddId => altered_id = true,
+                CommentsEvent::AddType => has_type = true,
+                CommentsEvent::AddId => has_id = true,
+                CommentsEvent::DropType => has_type = false,
+                CommentsEvent::DropId => has_id = false,
                 CommentsEvent::Drop => {
-                    // The table and everything said about its columns.
                     creates = false;
-                    created_with_discriminators = false;
-                    altered_type = false;
-                    altered_id = false;
+                    has_type = false;
+                    has_id = false;
                 }
             }
         }
     }
 
-    creates && (created_with_discriminators || (altered_type && altered_id))
+    creates && has_type && has_id
 }
 
 /// Whether `haystack` mentions `column` as a complete SQL identifier.
@@ -215,15 +223,42 @@ fn mentions_column(haystack: &str, column: &str) -> bool {
 /// What one statement does to the shared comments table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommentsEvent {
-    /// `CREATE TABLE comments (…)`, and whether the body declares both
-    /// discriminator columns.
-    Create { discriminated: bool },
+    /// `CREATE TABLE comments (…)`, and which discriminator columns its body
+    /// declares. A fresh table replaces whatever was known about the old one.
+    Create { has_type: bool, has_id: bool },
     /// `ALTER TABLE comments … commentable_type`.
     AddType,
     /// `ALTER TABLE comments … commentable_id`.
     AddId,
     /// `DROP TABLE comments`.
     Drop,
+    /// `ALTER TABLE comments DROP COLUMN commentable_type` (or a rename away).
+    DropType,
+    /// `ALTER TABLE comments DROP COLUMN commentable_id` (or a rename away).
+    DropId,
+}
+
+/// Whether an `ALTER TABLE comments …` statement takes `column` away.
+///
+/// `DROP COLUMN <column>` removes it outright; `RENAME COLUMN <column> TO …`
+/// removes it under that name, which is all this scan cares about. A
+/// `RENAME COLUMN <other> TO <column>` is the opposite and must not count as a
+/// removal, so the position of the name relative to `to` decides.
+fn alter_removes_column(statement: &str, column: &str) -> bool {
+    if statement.contains("drop column") || statement.contains("drop if exists") {
+        // `ADD COLUMN a, DROP COLUMN b` is legal in one statement, so the
+        // column has to be the one being dropped.
+        if let Some(drop_at) = statement.find("drop column") {
+            return mentions_column(&statement[drop_at..], column);
+        }
+        return mentions_column(statement, column);
+    }
+    if let Some(rename_at) = statement.find("rename column") {
+        let rest = &statement[rename_at..];
+        let (from, to) = rest.split_once(" to ").unwrap_or((rest, ""));
+        return mentions_column(from, column) && !mentions_column(to, column);
+    }
+    false
 }
 
 /// Every statement in `sql` touching the shared comments table, **in source
@@ -232,17 +267,39 @@ fn comments_table_events(sql: &str) -> Vec<CommentsEvent> {
     let mut events: Vec<(usize, CommentsEvent)> = Vec::new();
 
     if let Some(start) = comments_table_statement_start(sql) {
-        let discriminated = comments_table_body(sql).is_some_and(|body| {
-            mentions_column(body, "commentable_type") && mentions_column(body, "commentable_id")
-        });
-        events.push((start, CommentsEvent::Create { discriminated }));
+        let body = comments_table_body(sql).unwrap_or("");
+        events.push((
+            start,
+            CommentsEvent::Create {
+                has_type: mentions_column(body, "commentable_type"),
+                has_id: mentions_column(body, "commentable_id"),
+            },
+        ));
     }
     for (at, statement) in comments_statements(sql, "alter table") {
-        if mentions_column(statement, "commentable_type") {
-            events.push((at, CommentsEvent::AddType));
-        }
-        if mentions_column(statement, "commentable_id") {
-            events.push((at, CommentsEvent::AddId));
+        // An ALTER naming the column may be adding it, dropping it, or renaming
+        // it away. Treating every mention as an add would let
+        // `DROP COLUMN commentable_type` read as proof the column is present.
+        for (column, added, removed) in [
+            (
+                "commentable_type",
+                CommentsEvent::AddType,
+                CommentsEvent::DropType,
+            ),
+            (
+                "commentable_id",
+                CommentsEvent::AddId,
+                CommentsEvent::DropId,
+            ),
+        ] {
+            if !mentions_column(statement, column) {
+                continue;
+            }
+            if alter_removes_column(statement, column) {
+                events.push((at, removed));
+            } else {
+                events.push((at, added));
+            }
         }
     }
     for (at, _) in comments_statements(sql, "drop table") {
@@ -950,6 +1007,56 @@ mod tests {
         )
         .expect("write");
         assert!(already_migrated(tmp.path()));
+    }
+
+    /// An ALTER naming a discriminator column may be REMOVING it. Treating
+    /// every mention as an add would let a dropped column read as present.
+    #[test]
+    fn dropping_or_renaming_a_discriminator_column_undoes_it() {
+        let base = "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n";
+        for removal in [
+            "ALTER TABLE comments DROP COLUMN commentable_type;\n",
+            "ALTER TABLE comments RENAME COLUMN commentable_type TO legacy_kind;\n",
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let migrations = tmp.path().join("migrations");
+            let created = migrations.join("0001_create");
+            std::fs::create_dir_all(&created).expect("mkdir");
+            std::fs::write(created.join("up.sql"), base).expect("write");
+            assert!(already_migrated(tmp.path()));
+
+            let changed = migrations.join("0002_change");
+            std::fs::create_dir_all(&changed).expect("mkdir");
+            std::fs::write(changed.join("up.sql"), removal).expect("write");
+            assert!(
+                !already_migrated(tmp.path()),
+                "the table is no longer polymorphic after:\n{removal}"
+            );
+        }
+
+        // A rename that CREATES the column is the opposite, and must count.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let migrations = tmp.path().join("migrations");
+        let created = migrations.join("0001_create");
+        std::fs::create_dir_all(&created).expect("mkdir");
+        std::fs::write(
+            created.join("up.sql"),
+            "CREATE TABLE comments (kind TEXT, commentable_id BIGINT);\n",
+        )
+        .expect("write");
+        assert!(!already_migrated(tmp.path()));
+
+        let renamed = migrations.join("0002_rename");
+        std::fs::create_dir_all(&renamed).expect("mkdir");
+        std::fs::write(
+            renamed.join("up.sql"),
+            "ALTER TABLE comments RENAME COLUMN kind TO commentable_type;\n",
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "a rename INTO the discriminator name adds it"
+        );
     }
 
     /// The shared migration must survive `destroy scaffold` while any other
