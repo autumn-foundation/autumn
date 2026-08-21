@@ -11759,6 +11759,23 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+    // #1367: tell the comment router that this model's queries route through a
+    // shard. The model macro cannot see this attribute, and a sharded
+    // repository does NOT imply a `#[shard_key]` on the model, so the fact has
+    // to be published from here or the router's guard misses the shape
+    // entirely and serves the model from the control pool.
+    let sharded_model_name = &config.model_name;
+    let sharded_inventory_registration = if config.sharded {
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::commentable::ShardedRepositoryDescriptor {
+                    model: ::core::stringify!(#sharded_model_name),
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
     let versioned_inventory_registration = if config.versioned {
         quote! {
             ::autumn_web::reexports::inventory::submit! {
@@ -18001,6 +18018,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #hook_inventory_registration
         #versioned_inventory_registration
+        #sharded_inventory_registration
         #retention_inventory_registration
 
         #api_handlers

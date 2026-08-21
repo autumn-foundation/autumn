@@ -765,6 +765,9 @@ pub fn emit_commentable_items(
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::commentable::CommentableDescriptor {
                 type_name: #type_name,
+                // The model's own name, which `type_name` may have renamed.
+                // The sharded-repository registry is keyed on this.
+                model: ::core::stringify!(#model_ident),
                 spec: &#spec_static,
             }
         }

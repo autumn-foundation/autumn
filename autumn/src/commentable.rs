@@ -359,11 +359,40 @@ struct TargetRow {
 pub struct CommentableDescriptor {
     /// The discriminator this model stores in `commentable_type`.
     pub type_name: &'static str,
+    /// The model type's name, as written. Distinct from `type_name`, which a
+    /// `#[commentable(type_name = "…")]` override can rename; this is what the
+    /// repository registry is keyed on.
+    pub model: &'static str,
     /// The model's binding.
     pub spec: &'static CommentableSpec,
 }
 
 inventory::collect!(CommentableDescriptor);
+
+/// A model whose `#[repository(...)]` opted into `sharded`.
+///
+/// Registered by the repository macro rather than the model macro, because
+/// **that** is where the fact lives: `#[repository(..., sharded)]` routes every
+/// query through the tenant's shard whether or not the model carries a
+/// `#[shard_key]` (see `sharding_across_tenants.rs`, where a sharded repository
+/// has no shard key at all). Inferring shardedness from the model alone misses
+/// exactly that shape — and the miss is silent, because the router would then
+/// happily serve the model from the control pool.
+#[cfg(feature = "db")]
+pub struct ShardedRepositoryDescriptor {
+    /// The model type's name, as written (`stringify!` of the ident).
+    pub model: &'static str,
+}
+
+#[cfg(feature = "db")]
+inventory::collect!(ShardedRepositoryDescriptor);
+
+/// Whether `model` has a sharded repository registered in this binary.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn model_has_sharded_repository(model: &str) -> bool {
+    inventory::iter::<ShardedRepositoryDescriptor>().any(|descriptor| descriptor.model == model)
+}
 
 /// The spec registered for `type_name`, or `None` when no `#[commentable]`
 /// model in this binary claims it.
@@ -409,7 +438,15 @@ pub fn duplicate_commentable_type() -> Option<&'static str> {
 #[must_use]
 pub fn sharded_commentable_type() -> Option<&'static str> {
     inventory::iter::<CommentableDescriptor>()
-        .find(|descriptor| descriptor.spec.parent_sharded)
+        .find(|descriptor| {
+            // Two independent ways to be sharded, and BOTH have to be checked.
+            // `parent_sharded` is the model's own `#[shard_key]`; the registry
+            // is the repository's `#[repository(..., sharded)]`, which routes
+            // through the tenant's shard even when the model carries no shard
+            // key. Checking only the first leaves that shape served from the
+            // control pool — silently the wrong database.
+            descriptor.spec.parent_sharded || model_has_sharded_repository(descriptor.model)
+        })
         .map(|descriptor| descriptor.type_name)
 }
 

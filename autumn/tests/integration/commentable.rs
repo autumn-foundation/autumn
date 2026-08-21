@@ -1548,6 +1548,27 @@ async fn an_unregistered_type_is_refused_before_the_authorization_hook() {
     );
 }
 
+/// A sharded repository routes every query through the tenant's shard, and it
+/// does NOT require a `#[shard_key]` on the model — `sharding_across_tenants.rs`
+/// has exactly that shape. Inferring shardedness from the model alone therefore
+/// misses it, and the miss is silent: the router would serve the model from the
+/// control pool, reading and writing the wrong database.
+///
+/// This pins the fact that the *repository* macro publishes shardedness, which
+/// is the only place that knows it.
+#[test]
+fn a_sharded_repository_registers_its_model_even_without_a_shard_key() {
+    assert!(
+        autumn_web::commentable::model_has_sharded_repository("ShardedTenantPost"),
+        "a #[repository(..., sharded)] model must be discoverable by name, so the \
+         comment router's wiring-time guard can refuse to serve it"
+    );
+    assert!(
+        !autumn_web::commentable::model_has_sharded_repository("CmtPost"),
+        "an ordinary model must not be mistaken for a sharded one"
+    );
+}
+
 /// A browser submits an *empty* hidden input as `reply_to=`. Reading that as
 /// malformed would 422 every top-level comment posted from the widget.
 #[tokio::test]
