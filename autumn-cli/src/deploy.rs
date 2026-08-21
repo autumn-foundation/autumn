@@ -678,10 +678,38 @@ impl ResolvedFleet {
 
     /// Whether this fleet is a single server — the shape every pre-#1621 config
     /// resolves to, and the one that must behave identically to today.
+    ///
+    /// This answers "how many hosts is this RUN targeting?", which is **not** the
+    /// same question as "is this the byte-identical pre-#1621 single-host deploy?" —
+    /// a three-host config narrowed by `--only` to one host is a one-host fleet but
+    /// not a single-host deploy. Use [`is_single_host_deploy`] for the latter.
     #[must_use]
     pub const fn is_single(&self) -> bool {
         self.hosts.len() == 1
     }
+}
+
+/// Whether this run is the genuine pre-#1621 **single-host deploy**: the config
+/// declares ONE host and `--only` has not narrowed anything (issue #1621, AC-1).
+///
+/// This is the one predicate every "does this run keep the pre-#1621 shape?"
+/// decision asks, so those decisions can never drift apart. It is deliberately
+/// stricter than [`ResolvedFleet::is_single`]: a three-host fleet narrowed to one
+/// host resolves to a one-host `ResolvedFleet`, but it is NOT a single-host deploy —
+/// the other two hosts exist and are on another release, so the run keeps the fleet
+/// vocabulary, the state table, the compensation semantics, and — the reason this
+/// was extracted — **host attribution on every message**. An unattributed refusal
+/// during a `--only` repair is exactly the wrong output at exactly the wrong moment.
+/// See [`FleetUpInput::configured_host_count`].
+///
+/// Asked at three sites: the rollout driver ([`run_up_with`]), the per-host probe
+/// refusals ([`probe_host_for_up`]), and the preflight report
+/// ([`collect_fleet_preflight`]). [`run_rollback`] deliberately still branches on
+/// `is_single()` alone — that is a choice of which CODE PATH runs, not of how a
+/// message is worded, and narrowing a rollback to one host genuinely is a
+/// single-host rollback; it is tracked separately.
+const fn is_single_host_deploy(fleet: &ResolvedFleet, configured_host_count: usize) -> bool {
+    fleet.is_single() && configured_host_count <= 1
 }
 
 /// A single ordered step in a deploy or rollback plan. Purely descriptive — a
@@ -1500,10 +1528,18 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
         // and DB URL, so they must see those VALUES resolved under the TARGET
         // deploy profile — not the operator's ambient/dev config. Reload here.
         // `check`/`rollback` deliberately do NOT load the media config.
-        DeployAction::Check => run_check(&load_runtime_config(&resolved)?, &resolved, &targets),
-        DeployAction::Rollback => {
-            run_rollback(&load_runtime_config(&resolved)?, &resolved, &targets)
-        }
+        DeployAction::Check => run_check(
+            &load_runtime_config(&resolved)?,
+            &resolved,
+            &targets,
+            host_list.len(),
+        ),
+        DeployAction::Rollback => run_rollback(
+            &load_runtime_config(&resolved)?,
+            &resolved,
+            &targets,
+            host_list.len(),
+        ),
         // The read-only fleet surfaces (#1621). Both resolve through
         // `ResolvedFleet::resolve` — the seam that rejects a malformed/absent target
         // with one actionable message — and neither loads the media config (they
@@ -1966,11 +2002,15 @@ fn collect_project_preflight(
 /// must come out in declaration order, and threading them would put a `Sync` bound
 /// on machinery the `RefCell`-based recording fake cannot satisfy. Parallelising
 /// the pure TCP graders is a later, isolated change.
-fn collect_fleet_preflight(config: &AutumnConfig, fleet: &ResolvedFleet) -> Vec<PreflightCheck> {
+fn collect_fleet_preflight(
+    config: &AutumnConfig,
+    fleet: &ResolvedFleet,
+    configured_host_count: usize,
+) -> Vec<PreflightCheck> {
     let Some(shared) = fleet.hosts.first() else {
         return Vec::new();
     };
-    if fleet.is_single() {
+    if is_single_host_deploy(fleet, configured_host_count) {
         return collect_preflight(config, shared);
     }
     let mut checks: Vec<PreflightCheck> = fleet
@@ -2067,11 +2107,12 @@ fn run_check(
     config: &AutumnConfig,
     resolved: &ResolvedDeployConfig,
     hosts: &[String],
+    configured_host_count: usize,
 ) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy check\n");
 
     let fleet = ResolvedFleet::from_targets(resolved, hosts);
-    let checks = collect_fleet_preflight(config, &fleet);
+    let checks = collect_fleet_preflight(config, &fleet, configured_host_count);
     let failed = report_preflight(&checks);
 
     if failed == 0 {
@@ -2750,7 +2791,7 @@ fn run_up(
     // Fail fast: run the full preflight and abort BEFORE any remote call. Every
     // host is graded here, so an unreachable host in position 3 is reported before
     // host 1 is touched.
-    let checks = collect_fleet_preflight(config, &fleet);
+    let checks = collect_fleet_preflight(config, &fleet, configured_host_count);
     let failed = report_preflight(&checks);
     if failed > 0 {
         return Err(DeployError::PreflightFailed(failed));
@@ -2943,7 +2984,10 @@ where
     P: ProxyController,
 {
     let host = cfg.host.as_deref().unwrap_or_default();
-    let single = input.fleet.is_single();
+    // The SAME question the driver asks (`is_single_host_deploy`), not
+    // `fleet.is_single()`: a `--only`-narrowed repair on a multi-host fleet must
+    // keep naming the host it is refusing to touch.
+    let single = is_single_host_deploy(input.fleet, input.configured_host_count);
     // Host attribution is carried in the MESSAGE, never in an op label: labels are
     // `&'static str` and are load-bearing for the auto-rollback boundary lookup and
     // for every exact-vector test (#1621).
@@ -3121,7 +3165,7 @@ where
     // The pre-#1621 path is for a config that declares ONE host — see
     // [`FleetUpInput::configured_host_count`] for why a `--only`-narrowed fleet is
     // deliberately NOT single.
-    let single = fleet.is_single() && input.configured_host_count <= 1;
+    let single = is_single_host_deploy(fleet, input.configured_host_count);
     let total = fleet.hosts.len();
 
     // ── FLEET-WIDE FAIL-CLOSED REFUSALS (§4.8) ───────────────────────────────
@@ -3669,6 +3713,7 @@ fn run_rollback(
     config: &AutumnConfig,
     resolved: &ResolvedDeployConfig,
     hosts: &[String],
+    configured_host_count: usize,
 ) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy rollback\n");
 
@@ -3676,14 +3721,20 @@ fn run_rollback(
     // spelling) resolves to a one-host fleet whose only element IS today's
     // `resolved`, so the branch below is the pre-#1621 sequence at N = 1.
     let fleet = ResolvedFleet::from_targets(resolved, hosts);
+    // Which rollback path this run takes, decided ONCE and reused by the preflight
+    // gate below and the driver branch further down, so the two can never disagree.
+    // Note this is `is_single()`, not `is_single_host_deploy`: rolling ONE host back
+    // — whether that is the whole config or a `--only` narrowing of it — really is a
+    // single-host rollback, and the fleet driver has no second host to converge with.
+    let fleet_rollback = !fleet.is_single();
 
     // Fail fast: the same preflight as `up`, before any remote call. Every host is
     // graded, so an unreachable host in position 3 is reported before host 3 — or
     // any other host — is touched. The GATE is narrower than `up`'s, though: see
     // [`blocking_rollback_failures`].
-    let checks = collect_fleet_preflight(config, &fleet);
+    let checks = collect_fleet_preflight(config, &fleet, configured_host_count);
     let failed = report_preflight(&checks);
-    if blocking_rollback_failures(&checks) > 0 {
+    if blocking_rollback_failures(&checks, fleet_rollback) > 0 {
         return Err(DeployError::PreflightFailed(failed));
     }
     if failed > 0 {
@@ -3707,7 +3758,7 @@ fn run_rollback(
     let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs)
         .with_tls_host(resolved.tls_host.clone());
 
-    if !fleet.is_single() {
+    if fleet_rollback {
         return run_fleet_rollback_with(&checks, &fleet, &proxy, public_port, |cfg| {
             exec::SshTarget::from_resolved(cfg)
                 .map(exec::SshExecutor::new)
@@ -3773,12 +3824,18 @@ fn is_per_host_reachability(check: &PreflightCheck) -> bool {
 ///
 /// Everything else keeps the hard gate. A project-wide grader describes the release
 /// being rolled back TO rather than one host's reachability, and a SINGLE-host
-/// rollback keeps the pre-#1621 gate verbatim — its checks are unscoped, so none of
-/// them qualify (AC-1).
-fn blocking_rollback_failures(checks: &[PreflightCheck]) -> usize {
+/// rollback keeps the pre-#1621 gate verbatim (AC-1) — which is what
+/// `fleet_rollback` is for: the softening only makes sense when
+/// [`run_fleet_rollback_with`] is the code that actually runs, because only it
+/// skips-and-reports the unreachable host. The single-host path would sail past the
+/// gate straight into an SSH it already knows will fail, so for it EVERY failure
+/// blocks, exactly as before #1621. (Pre-#1621 this fell out of the rows being
+/// unscoped; since a `--only`-narrowed run now scopes its rows for attribution, the
+/// gate keys on the path instead of inferring it.)
+fn blocking_rollback_failures(checks: &[PreflightCheck], fleet_rollback: bool) -> usize {
     checks
         .iter()
-        .filter(|check| check.blocking() && !is_per_host_reachability(check))
+        .filter(|check| check.blocking() && !(fleet_rollback && is_per_host_reachability(check)))
         .count()
 }
 
@@ -4745,7 +4802,7 @@ mod tests {
 
         let one = ResolvedFleet::resolve(&fleet_cfg(&["web-1.example.test"]), "myapp")
             .expect("one-host fleet resolves");
-        let checks = collect_fleet_preflight(&config, &one);
+        let checks = collect_fleet_preflight(&config, &one, 1);
         assert!(
             checks.iter().all(|check| check.scope.is_none()),
             "a single-host fleet must carry no scope (AC-1): {:?}",
@@ -4760,7 +4817,7 @@ mod tests {
             "myapp",
         )
         .expect("two-host fleet resolves");
-        let checks = collect_fleet_preflight(&config, &many);
+        let checks = collect_fleet_preflight(&config, &many, 2);
         let scoped: Vec<(&str, Option<&str>)> = checks
             .iter()
             .map(|check| (check.name, check.scope.as_deref()))
@@ -4806,7 +4863,7 @@ mod tests {
         ] {
             let fleet =
                 ResolvedFleet::resolve(&fleet_cfg(&hosts), "myapp").expect("fleet resolves");
-            for check in collect_fleet_preflight(&config, &fleet) {
+            for check in collect_fleet_preflight(&config, &fleet, hosts.len()) {
                 assert!(
                     !check.deferred,
                     "fleet grader `{}` must never defer (scope {:?}): {}",
@@ -4861,7 +4918,7 @@ mod tests {
             "myapp",
         )
         .expect("fleet resolves");
-        let emitted: Vec<&str> = collect_fleet_preflight(&preflight_config(), &fleet)
+        let emitted: Vec<&str> = collect_fleet_preflight(&preflight_config(), &fleet, 2)
             .iter()
             .map(|check| check.name)
             .collect();
@@ -7387,6 +7444,63 @@ mod tests {
     }
 
     #[test]
+    fn a_compensated_first_deploy_stops_reporting_a_successful_last_deploy() {
+        // #1621 (AC-6, audit gap G3). `CompensatedTeardown` returns web-a to
+        // nothing-installed — but its first deploy had already written
+        // `shared/last-deploy = deployed <ts>` via `record-proxy-options`. Left
+        // alone, `deploy status` would show `last deploy: deployed <ts>` for a host
+        // carrying no release at all, which is the worst possible moment for a
+        // wrong value: the operator is inspecting the fleet precisely BECAUSE the
+        // rollout halted.
+        //
+        // The teardown's last op rewrites the marker to `torn down`, so the column
+        // reports what actually happened instead of a deploy that was undone.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_first_deploy(recorder, "web-a");
+        recorder = script_redeploy(recorder, "web-b").fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        let calls = recorder.calls_for("web-a");
+        let last_deploy_writes: Vec<(&'static str, &str)> = calls
+            .iter()
+            .filter_map(|call| match call {
+                exec::test_support::RecordedCall::Run { label, shell }
+                    if shell.contains("shared/last-deploy") =>
+                {
+                    Some((*label, shell.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let (last_label, last_shell) = *last_deploy_writes
+            .last()
+            .expect("the compensated host writes the last-deploy marker at least once");
+        assert_eq!(
+            last_label, "teardown-last-deploy",
+            "the TEARDOWN must have the last word on this host's last-deploy marker, \
+             got: {last_deploy_writes:?}"
+        );
+        assert!(
+            last_shell.contains("'torn down'") && !last_shell.contains("'deployed'"),
+            "a torn-down host must not report a successful deploy: {last_shell}"
+        );
+        // Non-vacuous: the first deploy really did claim `deployed` before the
+        // compensation ran, so this is a correction, not an absence.
+        assert!(
+            last_deploy_writes
+                .iter()
+                .any(|(label, shell)| *label == "record-proxy-options"
+                    && shell.contains("'deployed'")),
+            "the first deploy must have recorded `deployed` first: {last_deploy_writes:?}"
+        );
+    }
+
+    #[test]
     fn a_failed_compensation_does_not_stop_the_earlier_hosts() {
         // #1621 (AC-3, T1.13 case d). Host 3 fails post-boundary; compensation runs
         // c → b → a and host 2's rollback fails at `restart-previous`. Stopping there
@@ -8147,6 +8261,94 @@ mod tests {
         let halt = fleet_halt_of(&err);
         assert_eq!(halt.failed_host, "web-b");
         assert_eq!(halt.failed_step, "readiness-gate");
+    }
+
+    #[test]
+    fn a_narrowed_probe_refusal_still_names_its_host() {
+        // #1621 (AC-1 boundary, audit gap G10). "Is this really a single-host
+        // deploy?" has ONE answer, `is_single_host_deploy`, and every site asks it
+        // the same way. `probe_host_for_up` used to ask `fleet.is_single()` alone,
+        // so a three-host fleet narrowed to one lost the `host {x}: ` prefix on a
+        // probe-phase refusal — an unattributed error during a repair operation on
+        // a fleet whose other hosts are on another release.
+        let narrowed = fleet_of(&["web-b"]);
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-b", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-b", "detect-current", redeploy_probe())
+            .script("web-b", "probe-release-dir", "present");
+        let fixture = FleetFixture::new();
+        let input = FleetUpInput {
+            configured_host_count: 3,
+            ..fixture.input(&narrowed)
+        };
+
+        let narrowed_message = run_up_with(&input, |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("an existing release dir must refuse the rollout")
+            .to_string();
+        assert!(
+            narrowed_message.contains("host web-b: release directory"),
+            "a narrowed run keeps fleet attribution on probe refusals, got: \
+             {narrowed_message}"
+        );
+
+        // …and a GENUINE one-host config is byte-identical to the pre-#1621 text:
+        // no prefix, nothing else changed (AC-1).
+        let single = fleet_of(&["web-b"]);
+        let single_recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-b", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-b", "detect-current", redeploy_probe())
+            .script("web-b", "probe-release-dir", "present");
+        let single_message = run_up_with(&fixture.input(&single), |cfg| {
+            Ok(single_recorder.executor(cfg))
+        })
+        .expect_err("an existing release dir must refuse the rollout")
+        .to_string();
+        assert!(
+            !single_message.contains("host web-b: "),
+            "a genuine single-host refusal must keep the unattributed pre-#1621 \
+             text, got: {single_message}"
+        );
+        assert_eq!(
+            narrowed_message.replace("host web-b: ", ""),
+            single_message,
+            "the two must differ ONLY by the attribution prefix"
+        );
+    }
+
+    #[test]
+    fn a_narrowed_preflight_still_scopes_its_reachability_row() {
+        // #1621 (AC-1 boundary, audit gap G10). The same predicate governs the
+        // preflight report: `deploy up --only web-2` on a three-host config is not
+        // the single-host path, so its `ssh_reachability` row still names the host
+        // it graded. A genuine one-host config stays unscoped (AC-1).
+        let config = preflight_config();
+        let narrowed = ResolvedFleet::resolve(&fleet_cfg(&["web-2.example.test"]), "myapp")
+            .expect("a narrowed fleet resolves");
+
+        let scoped = collect_fleet_preflight(&config, &narrowed, 3);
+        assert_eq!(
+            scoped
+                .iter()
+                .filter(|check| check.name == SSH_REACHABILITY_CHECK)
+                .map(|check| check.scope.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("web-2.example.test")],
+            "a narrowed run must keep host attribution: {:?}",
+            scoped
+                .iter()
+                .map(|c| (c.name, &c.scope))
+                .collect::<Vec<_>>()
+        );
+
+        let genuine = collect_fleet_preflight(&config, &narrowed, 1);
+        assert!(
+            genuine.iter().all(|check| check.scope.is_none()),
+            "a genuine one-host config must stay unscoped (AC-1): {:?}",
+            genuine
+                .iter()
+                .map(|c| (c.name, &c.scope))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -8934,7 +9136,7 @@ mod tests {
             .scoped(Some("web-b".to_owned())),
         ];
         assert_eq!(
-            blocking_rollback_failures(&reachable_fleet),
+            blocking_rollback_failures(&reachable_fleet, true),
             0,
             "a per-host reachability failure must not block the reachable hosts"
         );
@@ -8946,22 +9148,40 @@ mod tests {
             "fix them",
         ));
         assert_eq!(
-            blocking_rollback_failures(&project_wide),
+            blocking_rollback_failures(&project_wide, true),
             1,
             "a project-wide grader still aborts the whole command"
         );
 
-        // The single-host path is untouched: its rows carry no scope, so its
-        // reachability failure is still blocking (pre-#1621 behavior verbatim).
+        // The single-host path is untouched: every failure blocks it (pre-#1621
+        // behavior verbatim).
         let single = vec![PreflightCheck::fail(
             "ssh_reachability",
             "cannot reach web-a:22",
             "check the host",
         )];
         assert_eq!(
-            blocking_rollback_failures(&single),
+            blocking_rollback_failures(&single, false),
             1,
             "a single-host rollback must keep aborting before touching the server"
+        );
+        // …including when the row IS scoped. A `--only`-narrowed rollback scopes its
+        // reachability row for attribution (#1621 audit gap G10) but still runs the
+        // single-host path, which has no skip-and-report step — so downgrading the
+        // row there would send it straight into an SSH the preflight already knows
+        // will fail. The gate keys on the PATH, never on the scope alone.
+        let narrowed = vec![
+            PreflightCheck::fail(
+                "ssh_reachability",
+                "cannot reach web-b:22",
+                "check the host",
+            )
+            .scoped(Some("web-b".to_owned())),
+        ];
+        assert_eq!(
+            blocking_rollback_failures(&narrowed, false),
+            1,
+            "a narrowed single-host rollback must still abort before touching the server"
         );
     }
 

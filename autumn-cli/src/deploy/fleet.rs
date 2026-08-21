@@ -3361,6 +3361,43 @@ mod tests {
     }
 
     #[test]
+    fn a_torn_down_host_never_renders_as_a_successful_deploy() {
+        // #1621 (AC-6, audit gap G3). A host compensated by `CompensatedTeardown`
+        // has nothing installed, and its teardown records
+        // `LAST_DEPLOY_TORN_DOWN` over the `deployed` its first deploy wrote. The
+        // status column must show that verbatim: `not deployed` in the mode cell
+        // and a last-deploy cell that does not claim a deploy.
+        let mut torn_down = status("web-a", None);
+        torn_down.mode = Some(HostMode::First);
+        torn_down.release = ReleaseId::Unknown;
+        torn_down.last_deploy = Some(exec::LastDeploy {
+            result: exec::LAST_DEPLOY_TORN_DOWN.to_owned(),
+            at: Some("2026-07-14T12:00:09Z".to_owned()),
+        });
+        let rows = [torn_down, status("web-b", Some("r1"))];
+        let report = fleet_drift(&rows);
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
+
+        assert!(
+            rendered.contains("last deploy: torn down 2026-07-14T12:00:09Z"),
+            "the torn-down host must report what actually happened:\n{rendered}"
+        );
+        let web_a_row = rendered
+            .lines()
+            .find(|line| line.contains("web-a"))
+            .expect("web-a has a row");
+        assert!(
+            !web_a_row.contains("last deploy: deployed"),
+            "a host with nothing installed must never read as a successful \
+             deploy: {web_a_row}"
+        );
+        assert!(
+            web_a_row.contains("not deployed"),
+            "…and the mode cell still says so out loud: {web_a_row}"
+        );
+    }
+
+    #[test]
     fn fleet_status_table_names_every_drift_reason() {
         let mut drifted = status("web-b", Some("r2"));
         drifted.proxy_options = exec::ProxyOptionsMarker::Unreadable;

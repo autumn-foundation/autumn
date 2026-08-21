@@ -603,6 +603,13 @@ pub const LAST_DEPLOY_DEPLOYED: &str = "deployed";
 /// halted rollout (AC-3). See [`last_deploy_marker`].
 pub const LAST_DEPLOY_ROLLED_BACK: &str = "rolled back";
 
+/// Marker word for a host whose install was REMOVED again: a first deploy that was
+/// torn down, either by its own pre-boundary failure or by the fleet driver
+/// compensating a halted rollout (`CompensatedTeardown`). See
+/// [`first_deploy_teardown_ops`] for why a teardown REWRITES this marker instead of
+/// deleting it. See [`last_deploy_marker`].
+pub const LAST_DEPLOY_TORN_DOWN: &str = "torn down";
+
 /// Shell fragment that records `result` into the [`last_deploy_marker`], written
 /// atomically (mktemp + `mv -f`) like every other marker.
 ///
@@ -1095,6 +1102,12 @@ pub fn cutover_ops(
 /// driven through [`run_teardown`], which swallows executor errors — so a flaky
 /// cleanup can never mask the real deploy failure. Removing the release dir means
 /// a re-run uploads a fresh copy rather than reusing a half-written one.
+///
+/// It deliberately does NOT touch the [`last_deploy_marker`], unlike
+/// [`first_deploy_teardown_ops`]. A torn-down CANDIDATE leaves the PREVIOUS release
+/// serving and never moved traffic, so the marker's existing record still describes
+/// the release that is actually live; rewriting it would report a change that never
+/// happened and erase the true one.
 #[must_use]
 pub fn candidate_teardown_ops(
     cfg: &ResolvedDeployConfig,
@@ -1129,6 +1142,27 @@ pub fn candidate_teardown_ops(
 /// fails on a missing path) and driven through [`run_teardown`], which swallows
 /// executor errors so a flaky cleanup can never mask the real deploy failure.
 ///
+/// **It also records `torn down` in the [`last_deploy_marker`]** (issue #1621,
+/// AC-6). A first deploy writes `deployed` into that marker as part of
+/// [`record_proxy_options`], so a host the fleet driver compensates with this
+/// teardown — `HostOutcome::CompensatedTeardown`, i.e. nothing installed — would
+/// otherwise keep reporting `last deploy: deployed <ts>` in `deploy status` with no
+/// release on it at all. That is a wrong value in the column an operator reads
+/// first while triaging a halted rollout.
+///
+/// The marker is REWRITTEN rather than deleted, deliberately. An absent marker
+/// renders `last deploy: ?`, which is also what a host that was never deployed (or
+/// whose marker write failed) shows — so clearing it would erase precisely the fact
+/// triage needs: this host WAS taken back down, on purpose, at this time. The
+/// alternative loses information; this one adds it, and `mode: not deployed` plus
+/// the `DRIFT_HOST_NOT_DEPLOYED` reason already sit beside it in the same row.
+///
+/// Two safety properties, both load-bearing: the record is the LAST op, so an
+/// earlier failure stops [`run_ops`] before the marker is rewritten and the host
+/// keeps its previous — still true — record; and the write is the same advisory
+/// `{ … || true; }` fragment the cutover uses, so it can never turn a clean
+/// compensation into `HostOutcome::CompensationFailed`.
+///
 /// This must NOT be used for a redeploy: the redeploy teardown deliberately
 /// leaves the old release's `current`/live-slot markers intact because that old
 /// release is still serving.
@@ -1150,6 +1184,14 @@ pub fn first_deploy_teardown_ops(
             shell_quote(&live_slot_marker(cfg)),
             shell_quote(&previous_release_marker(cfg)),
         ),
+    )));
+    // AC-6: correct the last-deploy marker the first deploy already wrote, so a
+    // host with nothing installed can never report a successful deploy. LAST, and
+    // advisory — see this function's doc comment for why both matter and why the
+    // marker is rewritten rather than removed.
+    ops.push(DeployOp::Run(RemoteCommand::new(
+        "teardown-last-deploy",
+        record_last_deploy_fragment(cfg, LAST_DEPLOY_TORN_DOWN),
     )));
     ops
 }
@@ -4565,7 +4607,10 @@ mod tests {
         let plan = SlotPlan::first(3000);
         let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
         let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
-        // It is a superset of the candidate teardown, PLUS the marker cleanup.
+        // It is a superset of the candidate teardown, PLUS the marker cleanup, PLUS
+        // the `torn down` last-deploy record (#1621 audit gap G3) — see
+        // `first_deploy_teardown_records_the_torn_down_result` for why the marker is
+        // rewritten rather than removed.
         assert_eq!(
             labels,
             vec![
@@ -4573,6 +4618,7 @@ mod tests {
                 "teardown-candidate-dir",
                 "teardown-current-symlink",
                 "teardown-slot-markers",
+                "teardown-last-deploy",
             ],
             "first-deploy teardown must also clean current + markers: {labels:?}"
         );
@@ -4598,6 +4644,60 @@ mod tests {
     }
 
     #[test]
+    fn first_deploy_teardown_records_the_torn_down_result() {
+        // #1621 (AC-6, audit gap G3). A first-deploy teardown returns the host to
+        // NOTHING INSTALLED — that is what `CompensatedTeardown` means. Leaving
+        // `shared/last-deploy` untouched made `deploy status` report
+        // `last deploy: deployed <ts>` for a host carrying no release at all: a
+        // wrong value in the column an operator reads FIRST when inspecting a
+        // halted rollout.
+        //
+        // The teardown RECORDS `torn down` rather than deleting the marker. An
+        // absent marker renders `last deploy: ?`, which is also what a host that
+        // was never deployed shows, so clearing it would erase exactly the fact
+        // triage needs: this host WAS taken back down, on purpose, at this time.
+        let cfg = resolved();
+        let plan = SlotPlan::first(3000);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
+        let exec = RecordingExecutor::new();
+        run_teardown(&teardown, &exec);
+
+        let shell = exec
+            .shell_for("teardown-last-deploy")
+            .expect("teardown-last-deploy ran");
+        assert!(
+            shell.contains("printf '%s\\t%s' 'torn down'")
+                && shell.contains("date -u +%Y-%m-%dT%H:%M:%SZ"),
+            "the teardown must record `torn down` plus a UTC timestamp: {shell}"
+        );
+        assert!(
+            shell.contains("mv -f \"$rtmp\" '/srv/autumn/myapp/shared/last-deploy'"),
+            "it must land on the same marker `deploy status` reads: {shell}"
+        );
+        assert!(
+            !shell.contains("'deployed'"),
+            "a torn-down host must never claim a successful deploy: {shell}"
+        );
+        // ADVISORY, like the cutover's own fragment: `compensate_teardown` drives
+        // these ops through `run_ops`, so a marker write that could fail would turn
+        // a clean compensation into `CompensationFailed`.
+        assert!(
+            shell.contains("|| true; }"),
+            "the teardown's last-deploy write must never be able to fail the op: {shell}"
+        );
+
+        // It runs LAST, so it only claims a teardown that actually completed: if an
+        // earlier op fails, `run_ops` stops before the marker is rewritten and the
+        // host keeps its previous — still true — record.
+        let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
+        assert_eq!(
+            labels.last().copied(),
+            Some("teardown-last-deploy"),
+            "the last-deploy record must be the final teardown op: {labels:?}"
+        );
+    }
+
+    #[test]
     fn redeploy_teardown_leaves_current_and_markers_intact() {
         // The REDEPLOY teardown must NOT remove the old release's current/live-slot
         // markers — the old release is still serving after a candidate rollback.
@@ -4615,6 +4715,14 @@ mod tests {
         assert!(
             !labels.contains(&"teardown-slot-markers"),
             "redeploy teardown must not remove the live-slot marker: {labels:?}"
+        );
+        // …and it must not touch the last-deploy marker either (#1621 audit gap G3):
+        // a torn-down CANDIDATE leaves the PREVIOUS release serving, so the marker's
+        // existing record still describes the release that is actually live.
+        assert!(
+            !labels.contains(&"teardown-last-deploy"),
+            "redeploy teardown must not rewrite the last-deploy marker — the previous \
+             release is still serving: {labels:?}"
         );
     }
 
