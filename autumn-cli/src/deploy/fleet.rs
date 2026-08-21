@@ -784,9 +784,10 @@ pub(crate) fn fleet_rollout_lines(
 ) -> Vec<String> {
     let count = plan.hosts.len();
     let mut lines = Vec::with_capacity(count + 3);
+    let host_word = if count == 1 { "host" } else { "hosts" };
     lines.push(format!(
-        "Rolling release {release_id} across {count} hosts, ONE AT A TIME, in `[deploy] hosts` \
-         order:"
+        "Rolling release {release_id} across {count} {host_word}, ONE AT A TIME, in \
+         `[deploy] hosts` order:"
     ));
     for (index, host) in plan.hosts.iter().enumerate() {
         let mode = match host.mode {
@@ -803,11 +804,21 @@ pub(crate) fn fleet_rollout_lines(
                 .filter(|h| h.host != migrating.host)
                 .map(|h| h.host.as_str())
                 .collect();
-            lines.push(format!(
-                "  \u{2192} migrate ({} only \u{2014} the schema is fleet-wide; {} skip it)",
-                migrating.host,
-                skipped.join(", "),
-            ));
+            // A `--only`-narrowed repair reaches here with a one-host plan, so there
+            // is nobody left to skip the migration; the "; N skip it" clause would
+            // render as a dangling fragment ("fleet-wide;  skip it").
+            lines.push(if skipped.is_empty() {
+                format!(
+                    "  \u{2192} migrate ({} only \u{2014} the schema is fleet-wide)",
+                    migrating.host,
+                )
+            } else {
+                format!(
+                    "  \u{2192} migrate ({} only \u{2014} the schema is fleet-wide; {} skip it)",
+                    migrating.host,
+                    skipped.join(", "),
+                )
+            });
             // Hosts listed AHEAD of the migrating one that are first deploys cut over
             // before the schema moves (AC-4). Named rather than reordered — see
             // `FLEET_FIRST_BEFORE_MIGRATE_NOTE`.
@@ -977,6 +988,66 @@ pub(crate) fn fleet_summary_lines(
     lines
 }
 
+/// The closing line of a successful fleet rollout (issue #1621, §8.2).
+///
+/// Pure so both shapes can be pinned by a unit test rather than by reading
+/// stderr. Two axes, and both must be said out loud:
+///
+/// * **Degraded hosts.** Every host serves the new release, so this is still a
+///   success — but a host whose `record-proxy-options` never landed fails its
+///   NEXT deploy closed, so an unqualified "complete" would hide it.
+/// * **A narrowed run.** `--only` builds the plan, the outcomes and the state
+///   table over the SELECTED hosts only, so `total` is the narrowed count. Saying
+///   "all {total} hosts serving …" there reads as a full-fleet success while the
+///   hosts the operator deliberately skipped are still on their old release —
+///   hundreds of lines after the `--only` warning that said so. The excluded hosts
+///   are counted, never named as a state: their state was never probed (probing
+///   skipped hosts is deliberately refused), so naming a release for them would be
+///   inventing it.
+pub(crate) fn fleet_completion_line(
+    release_id: &str,
+    total: usize,
+    configured_host_count: usize,
+    degraded: usize,
+) -> String {
+    let hosts_word = if total == 1 { "host" } else { "hosts" };
+    let untouched = configured_host_count.saturating_sub(total);
+    let degraded_clause = if degraded == 0 {
+        String::new()
+    } else {
+        format!(
+            " {degraded} finished with post-cutover housekeeping failures (above) \u{2014} \
+             repair them before the next deploy."
+        )
+    };
+    let marker = if degraded == 0 {
+        "\u{2705}"
+    } else {
+        "\u{26A0}\u{FE0F} "
+    };
+    if untouched == 0 {
+        // Byte-identical to pre-review for a full fleet.
+        return if degraded == 0 {
+            format!(
+                "\n\u{2705} Fleet deploy complete \u{2014} all {total} hosts serving {release_id}."
+            )
+        } else {
+            format!(
+                "\n\u{26A0}\u{FE0F}  Fleet deploy complete \u{2014} all {total} hosts serve \
+                 {release_id}, but {degraded} finished with post-cutover housekeeping failures \
+                 (above). Repair them before the next deploy."
+            )
+        };
+    }
+    let untouched_word = if untouched == 1 { "host" } else { "hosts" };
+    format!(
+        "\n{marker} `--only` run complete \u{2014} the {total} {hosts_word} it targeted now serve \
+         {release_id}.{degraded_clause} THIS RUN WAS NARROWED: the other {untouched} configured \
+         {untouched_word} were NOT touched and may be on another release \u{2014} finish with a \
+         full `autumn deploy up` (no `--only`) so the fleet converges."
+    )
+}
+
 // ── `deploy status`: per-host state and drift (issue #1621, AC-6) ────────────
 
 /// The deployed release a host reports, or the honest absence of one.
@@ -1038,6 +1109,21 @@ pub(crate) const DRIFT_PROXY_OPTIONS_UNREADABLE: &str =
 pub(crate) const DRIFT_PROXY_PORT_MISMATCH: &str =
     "the installed proxy unit binds a different public port than `[server] port` configures";
 
+/// The sentence printed under the status table to bound the `last deploy` column
+/// (issue #1621, AC-6).
+///
+/// The column exists because AC-6 asks for the per-host last deploy result, and no
+/// other on-host artefact answers it. Its scope is narrow and stating it is the
+/// whole point: the marker is written by the ops that COMPLETE a cutover, so a
+/// deploy that failed BEFORE the cutover boundary is torn down without touching
+/// it and the host still shows its previous action. It is therefore the host's own
+/// last completed action, never a verdict on the last fleet rollout — the rollout
+/// itself exits non-zero and prints the per-host outcome table.
+pub(crate) const LAST_DEPLOY_SCOPE_NOTE: &str = "`last deploy` is the last action each host COMPLETED (`deployed` / `rolled back`, with \
+     the host's UTC time) \u{2014} a `rolled back` host was compensated or rolled back after its \
+     last cutover. A deploy that failed BEFORE cutover never changes it, so it is not a verdict \
+     on the last rollout, and it is reported rather than counted as drift.";
+
 /// The sentence every maintenance-related surface prints, because the mechanism is
 /// counter-intuitive and getting it wrong causes an outage (plan §6.4).
 ///
@@ -1084,6 +1170,15 @@ pub(crate) struct HostStatus {
     pub(crate) public_port: u16,
     /// Whether the live-slot marker disagrees with the running proxy.
     pub(crate) live_slot_marker_drift: bool,
+    /// The last state-changing deploy action this host COMPLETED (AC-6's third
+    /// per-host fact), or `None` when the host has never completed one and when
+    /// the marker could not be read.
+    ///
+    /// Scope is narrow and stated in the output: it is the host's own last
+    /// completed action (`deployed` / `rolled back` + when), NOT a verdict on the
+    /// last fleet rollout — a host whose deploy failed before the cutover boundary
+    /// is torn down without rewriting it. See `exec::last_deploy_marker`.
+    pub(crate) last_deploy: Option<exec::LastDeploy>,
 }
 
 impl HostStatus {
@@ -1105,6 +1200,7 @@ impl HostStatus {
             proxy_options: exec::ProxyOptionsMarker::Absent,
             public_port: 0,
             live_slot_marker_drift: false,
+            last_deploy: None,
         }
     }
 
@@ -1133,6 +1229,7 @@ impl HostStatus {
             proxy_options: probe.deploy.last_proxy_options.clone(),
             public_port,
             live_slot_marker_drift: reconcile.is_some_and(|r| r.repair),
+            last_deploy: probe.last_deploy.clone(),
         }
     }
 }
@@ -1249,11 +1346,16 @@ pub(crate) fn fleet_drift(hosts: &[HostStatus]) -> DriftReport {
     }
 }
 
-/// One status row's seven display cells, in column order: mode, release, slot,
-/// readiness, maintenance, proxy port, drift reasons. Extracted from
+/// One status row's eight display cells, in column order: mode, release, slot,
+/// readiness, maintenance, proxy port, last deploy, drift reasons. Extracted from
 /// [`fleet_status_lines`] so the renderer stays within the line budget and the
 /// cell wording has one home.
-fn status_row_cells(status: &HostStatus, report: &DriftReport) -> [String; 7] {
+///
+/// The last-deploy cell is AC-6's third per-host fact. It reads `last deploy: ?`
+/// whenever the marker is absent — a host that has never completed a cutover, or
+/// one deployed by a CLI that predates the marker — because "we could not tell"
+/// must never render as a result.
+fn status_row_cells(status: &HostStatus, report: &DriftReport) -> [String; 8] {
     [
         match status.mode {
             _ if !status.reachable => "unreachable".to_owned(),
@@ -1279,6 +1381,17 @@ fn status_row_cells(status: &HostStatus, report: &DriftReport) -> [String; 7] {
             exec::InstalledProxyPort::Absent => "proxy absent".to_owned(),
             exec::InstalledProxyPort::Unreadable => "proxy ?".to_owned(),
         },
+        status.last_deploy.as_ref().map_or_else(
+            || "last deploy: ?".to_owned(),
+            |last| {
+                let mut cell = format!("last deploy: {}", last.result);
+                if let Some(at) = &last.at {
+                    cell.push(' ');
+                    cell.push_str(at);
+                }
+                cell
+            },
+        ),
         {
             let reasons: Vec<&str> = report
                 .state_drift
@@ -1304,14 +1417,14 @@ fn status_row_cells(status: &HostStatus, report: &DriftReport) -> [String; 7] {
 /// Readiness and maintenance are deliberately SEPARATE columns; see
 /// [`MAINTENANCE_DOES_NOT_DRAIN_NOTE`].
 pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> Vec<String> {
-    let cells: Vec<[String; 7]> = hosts
+    let cells: Vec<[String; 8]> = hosts
         .iter()
         .map(|status| status_row_cells(status, report))
         .collect();
 
     // Column widths, so the composite "state" the shared row renderer prints is
     // itself aligned. The last column is ragged by design (it is prose).
-    let mut widths = [0_usize; 7];
+    let mut widths = [0_usize; 8];
     for row in &cells {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.chars().count());
@@ -1394,6 +1507,13 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
     }
     for (host, reason) in &report.state_drift {
         lines.push(format!("  \u{26A0}\u{FE0F}  {host}: {reason}"));
+    }
+    // AC-6's third fact carries its own limits, printed where it is read rather
+    // than only in the guide — a column whose scope is misread is worse than no
+    // column. Only when there is a reachable host, so an all-unreachable report
+    // stays about the outage.
+    if hosts.iter().any(|status| status.reachable) {
+        lines.push(format!("  \u{2139}\u{FE0F}  {LAST_DEPLOY_SCOPE_NOTE}"));
     }
     if hosts.iter().any(|status| status.maintenance_on) {
         lines.push(format!(
@@ -2266,6 +2386,37 @@ mod tests {
     }
 
     #[test]
+    fn the_rollout_header_drops_the_skip_clause_for_a_one_host_plan() {
+        // #1621 review finding 4. A `--only`-narrowed repair reaches this renderer
+        // with a ONE-host plan (`single` is false whenever the config declares more
+        // than one host), so nobody is left to "skip it": `skipped.join(", ")` is
+        // empty and the sentence used to render as "…fleet-wide;  skip it)" — a
+        // dangling clause with a doubled space, on the one line that tells the
+        // operator where the fleet's single migration lands.
+        let fleet = fleet_of(&["web-b"]);
+        let plan =
+            plan_fleet(&fleet, &[HostMode::Redeploy]).expect("a one-host plan is well-formed");
+        let rendered = fleet_rollout_lines(&plan, "20260714T120000Z", true).join("\n");
+
+        assert!(
+            rendered.contains("  \u{2192} migrate (web-b only \u{2014} the schema is fleet-wide)"),
+            "a one-host plan must render the migrate line with no skip clause:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("skip it"),
+            "there is no other host in this run to skip the migration:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(";  "),
+            "no dangling clause may survive on the migrate line:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("across 1 host,"),
+            "a one-host plan must not say `across 1 hosts`:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn the_rollout_header_warns_when_first_deploys_cut_over_before_the_migration() {
         // #1621 (AC-4): the migration lands on the first REDEPLOY host in rollout
         // order, so every first-deploy host listed ahead of it goes live on the new
@@ -2342,6 +2493,57 @@ mod tests {
         assert!(
             !quiet.contains(FLEET_NO_MIGRATION_NOTE),
             "an app with no writable database has no schema to warn about:\n{quiet}"
+        );
+    }
+
+    #[test]
+    fn the_completion_line_is_honest_about_a_narrowed_run() {
+        // #1621 review finding 2. `--only` narrows the plan, the outcomes AND the
+        // state table, so `total` is the SELECTED count: "all 1 hosts serving R2"
+        // on a 3-host config reads as a full-fleet success while web-a/web-c are
+        // still on the previous release. The closing line must say it was narrowed
+        // and that the untouched hosts may be on another release.
+        let narrowed = fleet_completion_line("20260714T120000Z", 1, 3, 0);
+        assert!(
+            !narrowed.contains("Fleet deploy complete"),
+            "a narrowed run must not claim the fleet is complete:\n{narrowed}"
+        );
+        assert!(
+            narrowed.contains("`--only` run complete")
+                && narrowed.contains("the 1 host it targeted now serve 20260714T120000Z")
+                && narrowed.contains("THIS RUN WAS NARROWED")
+                && narrowed.contains("the other 2 configured hosts were NOT touched")
+                && narrowed.contains("may be on another release")
+                && narrowed.contains("full `autumn deploy up` (no `--only`)"),
+            "the narrowed line must name the narrowing, the untouched count and the \
+             converging command:\n{narrowed}"
+        );
+        // Degraded hosts on a narrowed run keep BOTH warnings.
+        let narrowed_degraded = fleet_completion_line("20260714T120000Z", 2, 5, 1);
+        assert!(
+            narrowed_degraded.contains("THIS RUN WAS NARROWED")
+                && narrowed_degraded.contains("the other 3 configured hosts")
+                && narrowed_degraded.contains("post-cutover housekeeping failures"),
+            "a narrowed run with a degraded host must say both:\n{narrowed_degraded}"
+        );
+
+        // A FULL run is byte-identical to the pre-review text — the e2e harness
+        // pins this exact string.
+        assert_eq!(
+            fleet_completion_line("20260714T120000Z", 2, 2, 0),
+            "\n\u{2705} Fleet deploy complete \u{2014} all 2 hosts serving 20260714T120000Z.",
+        );
+        assert_eq!(
+            fleet_completion_line("20260714T120000Z", 3, 3, 1),
+            "\n\u{26A0}\u{FE0F}  Fleet deploy complete \u{2014} all 3 hosts serve \
+             20260714T120000Z, but 1 finished with post-cutover housekeeping failures (above). \
+             Repair them before the next deploy.",
+        );
+        // `configured_host_count` is never *smaller* than the plan, but a defensive
+        // saturating subtraction must not turn an ordinary run into a narrowed one.
+        assert!(
+            fleet_completion_line("R", 3, 0, 0).contains("Fleet deploy complete"),
+            "an under-reported configured count must not fabricate a narrowed run"
         );
     }
 
@@ -2948,6 +3150,10 @@ mod tests {
             }),
             public_port: 3000,
             live_slot_marker_drift: false,
+            last_deploy: Some(exec::LastDeploy {
+                result: exec::LAST_DEPLOY_DEPLOYED.to_owned(),
+                at: Some("2026-07-14T12:00:03Z".to_owned()),
+            }),
         }
     }
 

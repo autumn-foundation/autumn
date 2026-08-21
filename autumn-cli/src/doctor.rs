@@ -6173,6 +6173,22 @@ fn deploy_profile_config_load_check(
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
+/// Remedy printed when `[deploy] host` / `[deploy] hosts` are spelled in a way the
+/// shared validator refuses (both keys set, a blank entry, a duplicate).
+///
+/// A named constant so a unit test can pin its exact text: it is a `hint` field on
+/// `CheckResult`, so it is emitted verbatim into `autumn doctor --json` as well as
+/// the terminal, and a dropped `\` continuation would ship a run of spaces
+/// mid-sentence on a machine-readable surface (issue #1621).
+const DEPLOY_HOST_SPELLING_HINT: &str = "Fix the [deploy] host spelling in autumn.toml — \
+     set either `host` (one server) or `hosts` (a fleet), never both (see `autumn deploy \
+     check`)";
+
+/// Remedy printed on the SSH-reachability row when the host spelling itself is
+/// broken, so there is no list to probe. See [`DEPLOY_HOST_SPELLING_HINT`].
+const DEPLOY_HOST_SPELLING_REACHABILITY_HINT: &str = "Fix the [deploy] host spelling in autumn.toml before probing reachability (see \
+     `autumn deploy check`)";
+
 /// Run all doctor checks and report results.
 ///
 /// Checks are organised in two phases:
@@ -6707,9 +6723,7 @@ pub fn run(opts: DoctorOptions) {
                     name: "deploy_host",
                     status: CheckStatus::Fail,
                     detail: Some(message.clone()),
-                    hint: Some(
-                        "Fix the [deploy] host spelling in autumn.toml — set either `host`                          (one server) or `hosts` (a fleet), never both (see `autumn deploy                          check`)",
-                    ),
+                    hint: Some(DEPLOY_HOST_SPELLING_HINT),
                 },
             }
         }));
@@ -6732,9 +6746,7 @@ pub fn run(opts: DoctorOptions) {
                     name: crate::deploy::DOCTOR_PREFLIGHT_GRADERS[0],
                     status: CheckStatus::Fail,
                     detail: Some(message.clone()),
-                    hint: Some(
-                        "Fix the [deploy] host spelling in autumn.toml before probing                          reachability (see `autumn deploy check`)",
-                    ),
+                    hint: Some(DEPLOY_HOST_SPELLING_REACHABILITY_HINT),
                 },
             }));
         }
@@ -8275,6 +8287,33 @@ mod tests {
     /// One marked, registered, guard-free handler — the healthy shape.
     fn healthy_edge_scan() -> crate::edge_scan::EdgeScan {
         edge_scan_of("#[edge]\nfn greet() {}\nfn wire() { edge_routes![greet]; }")
+    }
+
+    /// #1621 review finding 12. Both hints are `hint` fields on `CheckResult`, so
+    /// they are serialized verbatim into `autumn doctor --json`; a dropped `\`
+    /// line continuation bakes the source indentation into the message as a long
+    /// run of spaces mid-sentence. Pin the exact text.
+    #[test]
+    fn deploy_host_spelling_hints_carry_no_line_continuation_gutter() {
+        assert_eq!(
+            DEPLOY_HOST_SPELLING_HINT,
+            "Fix the [deploy] host spelling in autumn.toml \u{2014} set either `host` (one \
+             server) or `hosts` (a fleet), never both (see `autumn deploy check`)",
+        );
+        assert_eq!(
+            DEPLOY_HOST_SPELLING_REACHABILITY_HINT,
+            "Fix the [deploy] host spelling in autumn.toml before probing reachability \
+             (see `autumn deploy check`)",
+        );
+        for hint in [
+            DEPLOY_HOST_SPELLING_HINT,
+            DEPLOY_HOST_SPELLING_REACHABILITY_HINT,
+        ] {
+            assert!(
+                !hint.contains("   "),
+                "a run of spaces mid-sentence means a `\\` continuation was dropped: {hint}",
+            );
+        }
     }
 
     #[test]

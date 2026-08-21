@@ -7617,9 +7617,12 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     parse_env_option_string(env, "AUTUMN_DEPLOY__HOST", &mut deploy.host);
     // #1621: the fleet host list, as CSV. It REPLACES the whole TOML list (a
     // fleet-level retarget), matching every other `AUTUMN_DEPLOY__*` override.
-    // Entries are trimmed by `parse_env_csv`; blank/duplicate entries are
-    // rejected downstream by the CLI's `ResolvedFleet::resolve`.
-    parse_env_csv(env, "AUTUMN_DEPLOY__HOSTS", &mut deploy.hosts);
+    // Entries are trimmed by `parse_env_csv_non_empty`, which also DROPS blank
+    // segments: `AUTUMN_DEPLOY__HOSTS=` means unset (as `AUTUMN_DEPLOY__HOST=`
+    // does) and a trailing/doubled comma is tolerated, rather than reaching the
+    // CLI as a blank fleet entry that refuses every deploy subcommand. Duplicate
+    // entries are still rejected downstream by the CLI's `ResolvedFleet::resolve`.
+    parse_env_csv_non_empty(env, "AUTUMN_DEPLOY__HOSTS", &mut deploy.hosts);
     parse_env_string(env, "AUTUMN_DEPLOY__USER", &mut deploy.user);
     parse_env(env, "AUTUMN_DEPLOY__SSH_PORT", &mut deploy.ssh_port);
     parse_env_option_string(env, "AUTUMN_DEPLOY__APP_NAME", &mut deploy.app_name);
@@ -7715,6 +7718,33 @@ fn parse_env_option_bool(env: &dyn Env, key: &str, target: &mut Option<bool>) {
 fn parse_env_csv(env: &dyn Env, key: &str, target: &mut Vec<String>) {
     if let Ok(val) = env.var(key) {
         *target = val.split(',').map(|s| s.trim().to_owned()).collect();
+    }
+}
+
+/// CSV env override that drops blank segments (issue #1621).
+///
+/// Same shape as [`parse_env_csv`], but an empty/whitespace-only segment is not a
+/// list entry. Two consequences, both deliberate:
+///
+/// * `KEY=` (or `KEY="   "`) means **unset**, i.e. the list is cleared rather than
+///   set to a one-element vector holding a blank string. That is the shape a CI or
+///   compose env template produces for a not-yet-filled-in value, and it matches
+///   [`parse_env_option_string`]'s empty-is-unset rule for the sibling scalar keys
+///   (and `crate::maintenance::flag_file_path_from`'s blank-is-unset rule).
+/// * A trailing or doubled comma — routine in generated env lists — is tolerated
+///   instead of surfacing downstream as a blank entry.
+///
+/// Used only for `AUTUMN_DEPLOY__HOSTS`, whose downstream consumer turns a blank
+/// entry into a hard refusal of every `autumn deploy` subcommand; the other CSV
+/// overrides keep [`parse_env_csv`]'s long-standing behaviour.
+fn parse_env_csv_non_empty(env: &dyn Env, key: &str, target: &mut Vec<String>) {
+    if let Ok(val) = env.var(key) {
+        *target = val
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
     }
 }
 
@@ -13028,6 +13058,73 @@ path = "/healthz"
             "env must REPLACE the TOML fleet list (and trim each entry), got: {:?}",
             deploy.hosts
         );
+    }
+
+    #[test]
+    fn an_empty_deploy_hosts_env_override_behaves_as_unset() {
+        // #1621 review finding 13. `AUTUMN_DEPLOY__HOSTS=` is the shape a CI or
+        // compose env template produces for "fill in for a fleet" — exactly what
+        // the sibling `AUTUMN_DEPLOY__HOST=` harmlessly takes. Splitting it
+        // unconditionally yielded `[""]`, a NON-empty fleet list holding a blank
+        // string, so a project keeping `[deploy] host` in autumn.toml hard-failed
+        // every `autumn deploy` subcommand (and `autumn doctor`) with "`[deploy]
+        // host` and `[deploy] hosts` are mutually exclusive" — naming a key the
+        // operator never set.
+        for blank in ["", "   ", ",", " , "] {
+            let mut config: AutumnConfig = toml::from_str(
+                r#"
+                [deploy]
+                host = "203.0.113.10"
+                "#,
+            )
+            .expect("[deploy] host should parse");
+            let env = MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", blank);
+            config.apply_env_overrides_with_env(&env);
+            let deploy = config.deploy.expect("deploy configured");
+            assert!(
+                deploy.hosts.is_empty(),
+                "AUTUMN_DEPLOY__HOSTS={blank:?} must behave as unset, got: {:?}",
+                deploy.hosts
+            );
+            assert_eq!(deploy.host.as_deref(), Some("203.0.113.10"));
+            assert!(
+                deploy.validate().is_ok(),
+                "a blank fleet override must not trip the mutual-exclusion refusal, got: {:?}",
+                deploy.validate()
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_comma_in_the_deploy_hosts_env_override_is_tolerated() {
+        // #1621 review finding 13. Generated env lists routinely carry a trailing
+        // (or doubled) comma; the blank segment it produces used to reach the CLI
+        // as a blank fleet entry and refuse the whole command. Blank segments are
+        // dropped, so the list is exactly the addresses the operator wrote.
+        for (value, expected) in [
+            ("10.0.0.1,10.0.0.2,", vec!["10.0.0.1", "10.0.0.2"]),
+            ("10.0.0.1,,10.0.0.2", vec!["10.0.0.1", "10.0.0.2"]),
+            (" 10.0.0.1 , 10.0.0.2 , ", vec!["10.0.0.1", "10.0.0.2"]),
+        ] {
+            let mut config = AutumnConfig::default();
+            let env = MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", value);
+            config.apply_env_overrides_with_env(&env);
+            let deploy = config.deploy.expect("deploy configured");
+            assert_eq!(
+                deploy.hosts,
+                expected
+                    .iter()
+                    .map(|h| (*h).to_owned())
+                    .collect::<Vec<String>>(),
+                "AUTUMN_DEPLOY__HOSTS={value:?} must drop blank segments, got: {:?}",
+                deploy.hosts
+            );
+            assert!(
+                deploy.validate().is_ok(),
+                "a tolerated trailing comma must not refuse the fleet, got: {:?}",
+                deploy.validate()
+            );
+        }
     }
 
     // ── server.tls.acme (#1608) ───────────────────────────────────

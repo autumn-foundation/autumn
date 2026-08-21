@@ -1058,7 +1058,8 @@ fn maintenance_help_cross_references_the_deploy_fan_out() {
     let combined = format!("{stdout}{stderr}");
     assert!(
         combined.contains("deploy maintenance"),
-        "the local maintenance help must cross-reference `autumn deploy maintenance`          for deploy-managed hosts\n{combined}"
+        "the local maintenance help must cross-reference `autumn deploy maintenance` \
+         for deploy-managed hosts\n{combined}"
     );
 }
 

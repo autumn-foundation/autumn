@@ -122,7 +122,8 @@ pub enum DeployError {
     /// error exists so drift is alertable from cron — the default (non-`--strict`)
     /// status never fails on drift.
     #[error(
-        "fleet drift detected — the status table above names each host and reason          (`--strict` exits non-zero on drift so it can be alerted on)"
+        "fleet drift detected — the status table above names each host and reason \
+         (`--strict` exits non-zero on drift so it can be alerted on)"
     )]
     DriftDetected,
 
@@ -134,7 +135,9 @@ pub enum DeployError {
     /// that would reopen the window the operator is closing), and this carries
     /// only counts — never a host-derived string.
     #[error(
-        "fleet maintenance {verb} incomplete: {failed} of {total} host(s) failed — the          table above names the hosts that DID change, so they can be reversed by hand          if the fleet must stay consistent"
+        "fleet maintenance {verb} incomplete: {failed} of {total} host(s) failed — the \
+         table above names the hosts that DID change, so they can be reversed by hand \
+         if the fleet must stay consistent"
     )]
     FleetMaintenanceFailed {
         /// Which verb was fanned out (`"on"` / `"off"`).
@@ -2643,6 +2646,61 @@ fn fleet_auto_migrate_warning(
     (configured_hosts > 1 && enabled).then_some(FLEET_AUTO_MIGRATE_WARNING)
 }
 
+/// The loud line printed when a fleet deploys an app whose background-work
+/// backends are per-process (issue #1621, AC-8).
+///
+/// A **warning, not a refusal**, for the same reason as
+/// [`FLEET_AUTO_MIGRATE_WARNING`] and more so: `[jobs] backend = "local"` and
+/// `[scheduler] backend = "in_process"` are the DEFAULTS every un-configured app
+/// runs, and they are exactly right on one host. Refusing would break every
+/// existing single-host user's scale-up — the one flow AC-8's guide exists to
+/// make easy — for a hazard the rollout itself does not depend on.
+///
+/// Composed rather than constant because it names only the key(s) that actually
+/// apply; see [`fleet_shared_backend_warning`].
+const FLEET_SHARED_BACKEND_WARNING_TAIL: &str = "each host then runs its OWN copy, so work enqueued on one host is only ever run by \
+     that host, whatever is still queued dies when the next rollout drains that host's \
+     old slot, `unique`/`concurrency` limits stop being enforced fleet-wide, and every \
+     scheduled task fires once PER HOST. Move them to a shared backend (`postgres` or \
+     `redis`) before you rely on background work across the fleet \u{2014} see \
+     docs/guide/fleet-deploys.md (#1621).";
+
+/// Whether the fleet must be warned that its background-work backends are
+/// per-process (issue #1621, AC-8) — pure.
+///
+/// `jobs_backend` is compared case-insensitively after trimming, and anything that
+/// is not the in-process `local` default is treated as durable: a backend this CLI
+/// does not know about is the operator having configured something deliberately,
+/// and over-warning them every deploy is worse than staying quiet.
+///
+/// Returns `None` for a single-host config — the in-process defaults are correct
+/// there, and this must be silent on the byte-identical N==1 path (AC-1).
+fn fleet_shared_backend_warning(
+    configured_hosts: usize,
+    jobs_backend: &str,
+    scheduler_in_process: bool,
+) -> Option<String> {
+    if configured_hosts <= 1 {
+        return None;
+    }
+    let jobs_local = jobs_backend.trim().eq_ignore_ascii_case("local");
+    let keys = match (jobs_local, scheduler_in_process) {
+        (true, true) => {
+            "`[jobs] backend = \"local\"` (an in-process queue) and `[scheduler] \
+                         backend = \"in_process\"` (a per-process timer) are in effect"
+        }
+        (true, false) => "`[jobs] backend = \"local\"` (an in-process queue) is in effect",
+        (false, true) => {
+            "`[scheduler] backend = \"in_process\"` (a per-process timer) is in effect"
+        }
+        (false, false) => return None,
+    };
+    Some(format!(
+        "{keys} and this deploy targets more than one host \u{2014} they are PER HOST: \
+         {FLEET_SHARED_BACKEND_WARNING_TAIL}"
+    ))
+}
+
 /// Whether the resolved writable database URL names a `SQLite` backend (issue
 /// #1621, §4.8).
 ///
@@ -2743,6 +2801,11 @@ fn run_up(
                 auto_migrate: config.database.auto_migrate,
                 auto_migrate_in_production: config.database.auto_migrate_in_production,
             },
+            jobs_backend: &config.jobs.backend,
+            scheduler_in_process: matches!(
+                config.scheduler.backend,
+                autumn_web::config::SchedulerBackend::InProcess
+            ),
             // AC-3's default: a halted rollout compensates the hosts that already
             // cut over rather than leaving the fleet on two versions. `--no-rollback`
             // is halt-and-freeze: stop, report, change nothing else.
@@ -2828,6 +2891,13 @@ struct FleetUpInput<'a, P: ProxyController> {
     /// What this project's `[database]` config means for the rollout — resolved
     /// once in the prologue, never re-read here.
     db: FleetDatabaseFacts,
+    /// `[jobs] backend`, verbatim — for the per-host background-work warning
+    /// (AC-8). Not a secret and not host-derived; see
+    /// [`fleet_shared_backend_warning`].
+    jobs_backend: &'a str,
+    /// Whether `[scheduler] backend` is the per-process timer (the default), for
+    /// the same warning.
+    scheduler_in_process: bool,
     /// Whether a halted rollout automatically compensates the hosts that already
     /// cut over (issue #1621, §4.7). `true` in production; `false` is halt-and-freeze
     /// — the rollout stops and reports, leaving every host exactly as it is for
@@ -3074,6 +3144,16 @@ where
     ) {
         eprintln!("\u{26A0}\u{FE0F}  {warning}\n");
     }
+    // Same rule, same reason (AC-8): the in-process job queue and scheduler are
+    // the DEFAULTS every un-configured app runs and are correct on one host, so a
+    // fleet is warned rather than refused.
+    if let Some(warning) = fleet_shared_backend_warning(
+        input.configured_host_count,
+        input.jobs_backend,
+        input.scheduler_in_process,
+    ) {
+        eprintln!("\u{26A0}\u{FE0F}  {warning}\n");
+    }
 
     // ONE executor per host, built up front and reused for that host's read-only
     // probe AND its execution.
@@ -3295,21 +3375,18 @@ where
         // Every host serves the new release either way; a degraded host is live and
         // healthy, so this is a success — but claiming an unqualified "complete"
         // when a host's `record-proxy-options` never landed would hide the thing
-        // that fails its NEXT deploy closed.
-        if degraded.is_empty() {
-            eprintln!(
-                "\n\u{2705} Fleet deploy complete \u{2014} all {total} hosts serving {}.",
+        // that fails its NEXT deploy closed. And on a `--only`-narrowed run `total`
+        // is the SELECTED count, so "all N hosts" would read as a full-fleet
+        // success while the skipped hosts sit on their old release.
+        eprintln!(
+            "{}",
+            fleet::fleet_completion_line(
                 input.release_id,
-            );
-        } else {
-            eprintln!(
-                "\n\u{26A0}\u{FE0F}  Fleet deploy complete \u{2014} all {total} hosts serve {}, \
-                 but {} finished with post-cutover housekeeping failures (above). Repair \
-                 them before the next deploy.",
-                input.release_id,
+                total,
+                input.configured_host_count,
                 degraded.len(),
-            );
-        }
+            )
+        );
     }
     Ok(())
 }
@@ -3939,7 +4016,13 @@ where
 ///   (`"deployed"`/`"not deployed"`/`"unknown"`/`"unreachable"`), `release`
 ///   (string or null when unknown), `live_slot` (string or null), `ready` (HTTP
 ///   status number or null), `maintenance` (bool), `proxy_port` (number or null),
-///   and `drift` (array of reason strings, empty when none).
+///   `last_deploy` (AC-6's third fact: `{result, at}` — `result` is `"deployed"`
+///   or `"rolled back"`, `at` the host's UTC timestamp or null — and the whole
+///   object is null when the host has never completed a cutover or the marker
+///   could not be read), and `drift` (array of reason strings, empty when none).
+///   `last_deploy` is the host's own last COMPLETED action, not a verdict on the
+///   last rollout: a deploy that failed before cutover never rewrites it (see
+///   `fleet::LAST_DEPLOY_SCOPE_NOTE`).
 /// - `version_drift` (bool), `state_drift` (array of `{host, reason}`), and
 ///   `drifted` (bool — the `--strict` condition).
 ///
@@ -3979,6 +4062,10 @@ fn fleet_status_json(
                     }
                     _ => serde_json::Value::Null,
                 },
+                "last_deploy": status.last_deploy.as_ref().map_or(
+                    serde_json::Value::Null,
+                    |last| serde_json::json!({ "result": last.result, "at": last.at }),
+                ),
                 "drift": report
                     .state_drift
                     .iter()
@@ -4169,7 +4256,12 @@ fn maintenance_one_host<E: exec::DeployExecutor>(
             label: "maintenance-write-shared",
             contents: exec::FileContents::Plain(body.to_owned()),
             remote_path: shared,
-            mode: Some(0o644),
+            // 0600: the body can carry the `--bypass-header NAME:VALUE` token (a
+            // credential that skips the 503 gate) and the `--allow-ips` list, and
+            // this mode is applied to the local staging copy too. The flag is
+            // written and read by the same `cfg.user` the slot unit runs as, so
+            // 0600 is sufficient — same rule as the 0600 env file (AC-5).
+            mode: Some(0o600),
         });
         if let Some(dir) = &current {
             // Legacy path for units deployed before #1621 (amendment A2). The
@@ -4183,7 +4275,8 @@ fn maintenance_one_host<E: exec::DeployExecutor>(
                 label: "maintenance-write-release",
                 contents: exec::FileContents::Plain(body.to_owned()),
                 remote_path: format!("{dir}/{}", autumn_web::maintenance::MAINTENANCE_FLAG_FILE),
-                mode: Some(0o644),
+                // 0600 for the same reason as the shared write above.
+                mode: Some(0o600),
             });
         }
     } else {
@@ -6691,6 +6784,10 @@ mod tests {
                     writable_configured: true,
                     ..FleetDatabaseFacts::default()
                 },
+                // Durable by default in the fakes: the AC-8 warning has its own
+                // unit test, and it must not add a line to every driver tape.
+                jobs_backend: "postgres",
+                scheduler_in_process: false,
                 auto_rollback: true,
             }
         }
@@ -7884,6 +7981,53 @@ mod tests {
         assert!(fleet_auto_migrate_warning(3, None, false).is_none());
     }
 
+    #[test]
+    fn per_host_job_and_scheduler_backends_warn_for_a_fleet_and_stay_silent_for_one_host() {
+        // #1621. `[jobs] backend` defaults to `local` (an in-process queue) and
+        // `[scheduler] backend` to `in_process` (a per-process timer). On ONE host
+        // that is correct and is what every un-configured app runs; on N hosts it
+        // silently means N independent queues and N schedulers — enqueued work is
+        // only ever run by the host that took the request, pending work dies with
+        // every `drain-old`, `unique`/`concurrency` stop being enforced fleet-wide,
+        // and every cron fires N times. A WARNING, never a refusal: these are the
+        // DEFAULTS, so refusing would break every existing single-host user's
+        // scale-up (same rule as `FLEET_AUTO_MIGRATE_WARNING`).
+        let warning = fleet_shared_backend_warning(3, "local", true)
+            .expect("a fleet on the in-process defaults must be warned");
+        assert!(
+            warning.contains("[jobs] backend")
+                && warning.contains("[scheduler] backend")
+                && warning.contains("#1621"),
+            "the warning must name both keys and the issue: {warning}"
+        );
+        assert!(
+            warning.to_lowercase().contains("per host") && warning.contains("drain"),
+            "the warning must name the mechanism (a queue per host, drained away): {warning}"
+        );
+
+        // Each backend alone still warns, naming only the key that applies.
+        let jobs_only = fleet_shared_backend_warning(2, "local", false)
+            .expect("a per-host job queue alone must warn");
+        assert!(
+            jobs_only.contains("[jobs] backend") && !jobs_only.contains("[scheduler] backend"),
+            "a durable scheduler must not be named as a problem: {jobs_only}"
+        );
+        let scheduler_only = fleet_shared_backend_warning(2, "postgres", true)
+            .expect("a per-host scheduler alone must warn");
+        assert!(
+            scheduler_only.contains("[scheduler] backend")
+                && !scheduler_only.contains("[jobs] backend"),
+            "a durable job backend must not be named as a problem: {scheduler_only}"
+        );
+
+        // Silent for a single host — the in-process defaults are exactly right
+        // there, and a warning on every `autumn deploy up` would be noise.
+        assert!(fleet_shared_backend_warning(1, "local", true).is_none());
+        // Silent for durable backends, whatever their spelling/case.
+        assert!(fleet_shared_backend_warning(5, "postgres", false).is_none());
+        assert!(fleet_shared_backend_warning(5, " Redis ", false).is_none());
+    }
+
     // ── `--only` (issue #1621, slice 5, §3.2) ────────────────────────────────
 
     #[test]
@@ -8119,9 +8263,27 @@ mod tests {
                 host,
                 "probe-host-status",
                 format!(
-                    "{ready}\n---autumn-host-status---\n{}",
+                    "{ready}\n---autumn-host-status---\n{}\n---autumn-host-status---\n\
+                     deployed\t2026-07-14T12:00:03Z",
                     if maintenance { "maintenance-on" } else { "" }
                 ),
+            )
+    }
+
+    /// `script_status`, but with an explicit last-deploy marker body (AC-6's third
+    /// fact) — `""` scripts a host whose marker is absent/unreadable.
+    fn script_status_last_deploy(
+        recorder: fleet::test_support::FleetRecorder,
+        host: &str,
+        release: &str,
+        last_deploy: &str,
+    ) -> fleet::test_support::FleetRecorder {
+        recorder
+            .script(host, "detect-current", status_probe(release))
+            .script(
+                host,
+                "probe-host-status",
+                format!("200\n---autumn-host-status---\n\n---autumn-host-status---\n{last_deploy}"),
             )
     }
 
@@ -8226,6 +8388,70 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_the_last_deploy_result_per_host() {
+        // #1621 AC-6, third per-host fact. Its motivating case: a rollout halts,
+        // compensation succeeds, and ten minutes later every host reads back
+        // `deployed / R1 / ready 200 / no drift` — a healthy converged fleet with
+        // no trace that the last deploy failed and was compensated. `last deploy`
+        // is what distinguishes those two fleets.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder =
+            script_status_last_deploy(recorder, "web-a", "r1", "rolled back\t2026-07-14T12:31:10Z");
+        recorder =
+            script_status_last_deploy(recorder, "web-b", "r1", "deployed\t2026-07-14T12:00:03Z");
+        // A host that has never completed a cutover (or whose marker is
+        // unreadable) reports the honest absence, never a fabricated result.
+        recorder = script_status_last_deploy(recorder, "web-c", "r1", "");
+
+        let statuses = drive_status(&fleet, &recorder).expect("status reports");
+        assert_eq!(
+            statuses[0].last_deploy.as_ref().map(|l| l.result.as_str()),
+            Some("rolled back"),
+        );
+        assert_eq!(
+            statuses[0]
+                .last_deploy
+                .as_ref()
+                .and_then(|l| l.at.as_deref()),
+            Some("2026-07-14T12:31:10Z"),
+        );
+        assert_eq!(
+            statuses[1].last_deploy.as_ref().map(|l| l.result.as_str()),
+            Some("deployed"),
+        );
+        assert_eq!(statuses[2].last_deploy, None);
+
+        let report = fleet::fleet_drift(&statuses);
+        // Reported, NOT counted as drift: the fleet is genuinely converged on r1,
+        // and turning a past rollback into a standing alert would page forever.
+        assert!(!report.drifted(), "a past rollback is not fleet drift");
+
+        let rendered = fleet::fleet_status_lines(&statuses, &report).join("\n");
+        assert!(
+            rendered.contains("last deploy: rolled back 2026-07-14T12:31:10Z")
+                && rendered.contains("last deploy: deployed 2026-07-14T12:00:03Z")
+                && rendered.contains("last deploy: ?"),
+            "every host's last-deploy cell must be rendered:\n{rendered}"
+        );
+        // The column's LIMITS are printed where it is read, not only in the guide:
+        // a pre-cutover failure never rewrites the marker, so this is the host's
+        // own last completed action rather than a verdict on the last rollout.
+        assert!(
+            rendered.contains(fleet::LAST_DEPLOY_SCOPE_NOTE),
+            "the status table must state what `last deploy` does and does not know:\n{rendered}"
+        );
+
+        // And the machine-readable surface carries it as a documented object.
+        let json = fleet_status_json(&statuses, &report);
+        assert_eq!(
+            json["hosts"][0]["last_deploy"],
+            serde_json::json!({ "result": "rolled back", "at": "2026-07-14T12:31:10Z" }),
+        );
+        assert_eq!(json["hosts"][2]["last_deploy"], serde_json::Value::Null);
+    }
+
+    #[test]
     fn fleet_status_json_shape_is_stable_and_carries_no_secret() {
         // The repo's own skills are a first-class consumer of `--json`, so the field
         // names are a contract. Nothing here is derived from a shell line or a driver
@@ -8247,6 +8473,7 @@ mod tests {
             "ready",
             "maintenance",
             "proxy_port",
+            "last_deploy",
             "drift",
         ] {
             assert!(
@@ -8344,6 +8571,65 @@ mod tests {
                 "{host} must create the release tmp dir before writing into it"
             );
         }
+    }
+
+    #[test]
+    fn fleet_maintenance_flag_is_written_0600_and_never_echoes_the_bypass_token() {
+        // #1621 review finding 8. The flag body embeds `--bypass-header NAME:VALUE`
+        // — a credential that lets a request skip the 503 gate for the whole
+        // maintenance window — plus the `--allow-ips` list. Both the remote file
+        // and the local staging copy inherit the op's mode, so 0644 exposed the
+        // token to every local account on every fleet host AND in the operator's
+        // own `/tmp`. The file is written and read by the same `cfg.user` that
+        // `render_app_unit` emits as `User=`, so 0600 works exactly as it does for
+        // the env file carrying the signing secret (`exec::env_file` / AC-5).
+        let hosts = ["web-a", "web-b"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_status(recorder, host, "r1", "200", false);
+        }
+
+        let args = MaintenanceOnArgs {
+            message: Some("Upgrading the database".to_owned()),
+            allow_ips: vec!["10.0.0.0/8".to_owned()],
+            readonly: true,
+            bypass_header: Some(("X-Dev-Bypass".to_owned(), "s3cr3t-bypass".to_owned())),
+        };
+        drive_maintenance(&fleet, &recorder, DeployAction::MaintenanceOn, Some(&args))
+            .expect("every host accepts the write");
+
+        for host in hosts {
+            let uploads: Vec<(String, Option<u32>)> = recorder
+                .calls_for(host)
+                .iter()
+                .filter_map(|call| match call {
+                    exec::test_support::RecordedCall::Upload { remote_path, mode } => {
+                        Some((remote_path.clone(), *mode))
+                    }
+                    exec::test_support::RecordedCall::Run { .. } => None,
+                })
+                .collect();
+            assert_eq!(
+                uploads.len(),
+                2,
+                "{host} writes the shared and the release-scoped flag: {uploads:?}"
+            );
+            for (path, mode) in &uploads {
+                assert_eq!(
+                    *mode,
+                    Some(0o600),
+                    "{host}: {path} carries the bypass token, so it must not be world-readable"
+                );
+            }
+        }
+
+        // The token must never ride in an op label or a rendered shell line.
+        let calls_debug = format!("{:#?}", recorder.calls_for("web-a"));
+        assert!(
+            !calls_debug.contains("s3cr3t-bypass"),
+            "the bypass token leaked into the recorded executor calls: {calls_debug}"
+        );
     }
 
     #[test]
@@ -8800,5 +9086,43 @@ mod tests {
             ),
             "expected all-hosts-unrolled, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn operator_facing_fleet_error_text_carries_no_line_continuation_gutter() {
+        // #1621 review finding 12. These messages are `\`-continued multi-line
+        // literals; a missing continuation backslash bakes the source indentation
+        // into the message as a long run of spaces mid-sentence. `DriftDetected`
+        // has no placeholders, so its Display output is the literal byte-for-byte.
+        assert_eq!(
+            DeployError::DriftDetected.to_string(),
+            "fleet drift detected \u{2014} the status table above names each host and reason \
+             (`--strict` exits non-zero on drift so it can be alerted on)",
+        );
+        assert_eq!(
+            DeployError::FleetMaintenanceFailed {
+                verb: "on",
+                failed: 1,
+                total: 3,
+            }
+            .to_string(),
+            "fleet maintenance on incomplete: 1 of 3 host(s) failed \u{2014} the table above \
+             names the hosts that DID change, so they can be reversed by hand if the fleet \
+             must stay consistent",
+        );
+        for rendered in [
+            DeployError::DriftDetected.to_string(),
+            DeployError::FleetMaintenanceFailed {
+                verb: "off",
+                failed: 2,
+                total: 5,
+            }
+            .to_string(),
+        ] {
+            assert!(
+                !rendered.contains("   "),
+                "a run of spaces mid-sentence means a `\\` continuation was dropped: {rendered}",
+            );
+        }
     }
 }

@@ -569,6 +569,97 @@ fn proxy_options_marker(cfg: &ResolvedDeployConfig) -> String {
     format!("{}/shared/proxy-options", cfg.app_dir)
 }
 
+/// Remote marker file recording the LAST state-changing deploy action this host
+/// completed, stored as `{result}\t{utc-timestamp}` (issue #1621, AC-6).
+///
+/// AC-6 asks `deploy status` for the per-host *last deploy result*, and no other
+/// on-host artefact answers it: `current`, `live-slot` and `previous-release` all
+/// describe the release a host is serving, never how it got there. After a halted
+/// rollout that compensated cleanly, every host reads back as healthy and
+/// converged — which is exactly the state the operator wants distinguished from a
+/// fleet that simply deployed.
+///
+/// **What it knows, precisely.** It is written by the ops that COMPLETE a cutover
+/// ([`commit_markers_command`] and [`record_proxy_options`]), so it records the
+/// last action that actually moved this host: [`LAST_DEPLOY_DEPLOYED`] or
+/// [`LAST_DEPLOY_ROLLED_BACK`]. A deploy that fails BEFORE the cutover boundary
+/// never reaches those ops (the host keeps serving its old release and is torn
+/// down), so the marker still names the previous action — it is the host's last
+/// completed action, not a verdict on the last rollout. `deploy status` says so
+/// where it prints it.
+///
+/// Mirrors [`live_slot_marker`]'s path convention (all markers live under
+/// `shared/`), so it survives cutovers and is pruned with nothing.
+fn last_deploy_marker(cfg: &ResolvedDeployConfig) -> String {
+    format!("{}/shared/last-deploy", cfg.app_dir)
+}
+
+/// Marker word for a host that last completed a forward deploy (first deploy or
+/// redeploy cutover). See [`last_deploy_marker`].
+pub const LAST_DEPLOY_DEPLOYED: &str = "deployed";
+
+/// Marker word for a host whose last completed action was a rollback — an
+/// operator-invoked `autumn deploy rollback`, or the fleet driver compensating a
+/// halted rollout (AC-3). See [`last_deploy_marker`].
+pub const LAST_DEPLOY_ROLLED_BACK: &str = "rolled back";
+
+/// Shell fragment that records `result` into the [`last_deploy_marker`], written
+/// atomically (mktemp + `mv -f`) like every other marker.
+///
+/// **Advisory by construction.** The fragment is a `{ … || true; }` group, so a
+/// failure to write it can never fail the op it is appended to. That is
+/// deliberate: it rides on `commit-markers` — whose failure is the one the fleet
+/// driver refuses to auto-roll-back from, because a partially-applied marker
+/// triple makes the rollback target unprovable — and a cosmetic status field must
+/// not be able to push a host into that state.
+fn record_last_deploy_fragment(cfg: &ResolvedDeployConfig, result: &str) -> String {
+    let shared = cfg.shared_dir();
+    let tmpl = format!("{shared}/last-deploy.tmp.XXXXXX");
+    format!(
+        "{{ rtmp=$(mktemp {tmpl}) && printf '%s\\t%s' {result} \
+         \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$rtmp\" && mv -f \"$rtmp\" {marker} || true; }}",
+        tmpl = shell_quote(&tmpl),
+        result = shell_quote(result),
+        marker = shell_quote(&last_deploy_marker(cfg)),
+    )
+}
+
+/// The last completed deploy action a host reports, parsed from the
+/// [`last_deploy_marker`] (issue #1621, AC-6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastDeploy {
+    /// The recorded action word — [`LAST_DEPLOY_DEPLOYED`] or
+    /// [`LAST_DEPLOY_ROLLED_BACK`]. Kept as the raw string so a marker written by
+    /// a newer CLI is reported verbatim rather than degrading to "unknown".
+    pub result: String,
+    /// When it was recorded, as the host's UTC `date -u +%Y-%m-%dT%H:%M:%SZ`, or
+    /// `None` for a marker written before the timestamp field existed.
+    pub at: Option<String>,
+}
+
+/// Parse a [`last_deploy_marker`] body (`{result}\t{timestamp}`).
+///
+/// Degrades to `None` for an empty/whitespace-only body — a missing marker (a host
+/// that has never completed a cutover) and an unreadable one are the same "we
+/// cannot tell", never a fabricated result.
+fn parse_last_deploy(raw: &str) -> Option<LastDeploy> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (result, at) = raw.split_once('\t').unwrap_or((raw, ""));
+    let result = result.trim();
+    if result.is_empty() {
+        return None;
+    }
+    Some(LastDeploy {
+        result: result.to_owned(),
+        at: Some(at.trim())
+            .filter(|at| !at.is_empty())
+            .map(ToOwned::to_owned),
+    })
+}
+
 /// The resolved blue/green slot layout for a deploy.
 ///
 /// The candidate always takes the slot the live release is NOT using, so both
@@ -969,6 +1060,7 @@ pub fn cutover_ops(
                 slot: plan.live_slot,
                 port: plan.live_port,
             },
+            LAST_DEPLOY_DEPLOYED,
         )),
         // Record the proxy TLS/host options this cutover registered on the new
         // release (issue #2074) — the controller's NEW `tls_host`, NOT the preserved
@@ -1263,6 +1355,7 @@ pub fn rollback_ops(
                 slot: other_slot(target.slot),
                 port: former_live_fallback_port,
             },
+            LAST_DEPLOY_ROLLED_BACK,
         )),
         DeployOp::Run(RemoteCommand::new(
             "readiness-gate",
@@ -1362,10 +1455,15 @@ fn record_proxy_options(
     RemoteCommand::new(
         "record-proxy-options",
         format!(
-            "otmp=$(mktemp {tmpl}) && printf '%s' {value} > \"$otmp\" && mv -f \"$otmp\" {marker}",
+            "otmp=$(mktemp {tmpl}) && printf '%s' {value} > \"$otmp\" && mv -f \"$otmp\" {marker} \
+             && {last_deploy}",
             tmpl = shell_quote(&tmpl),
             value = shell_quote(&options.marker_value()),
             marker = shell_quote(&proxy_options_marker(cfg)),
+            // AC-6: this op is the LAST marker write on both forward paths (first
+            // deploy and redeploy cutover), so it is where "this host completed a
+            // deploy" is true. Advisory — see `record_last_deploy_fragment`.
+            last_deploy = record_last_deploy_fragment(cfg, LAST_DEPLOY_DEPLOYED),
         ),
     )
 }
@@ -1422,6 +1520,7 @@ fn commit_markers_command(
     slot: &str,
     port: u16,
     prev_fallback: PrevMarkerFallback<'_>,
+    last_deploy_result: &str,
 ) -> RemoteCommand {
     let shared = cfg.shared_dir();
     let prev_tmpl = format!("{shared}/previous-release.tmp.XXXXXX");
@@ -1443,7 +1542,14 @@ fn commit_markers_command(
              ln -sfn {release_dir} {current} && \
              ltmp=$(mktemp {live_tmpl}) && \
              printf '%s\\t%s' {slot} {port} > \"$ltmp\" && \
-             mv -f \"$ltmp\" {live_marker}",
+             mv -f \"$ltmp\" {live_marker} && \
+             {last_deploy}",
+            // AC-6: the last-deploy marker rides on the transaction that COMPLETES
+            // the cutover, so it is the one place both the redeploy and the
+            // rollback path agree on. Advisory — its failure can never turn a
+            // successful marker commit into the AmbiguousMarkers state (see
+            // `record_last_deploy_fragment`).
+            last_deploy = record_last_deploy_fragment(cfg, last_deploy_result),
             current = shell_quote(&cfg.current_symlink()),
             live_marker = shell_quote(&live_slot_marker(cfg)),
             prev_slot = shell_quote(prev_fallback.slot),
@@ -1912,6 +2018,14 @@ pub struct HostStatusProbe {
     /// point `AUTUMN_MAINTENANCE_FLAG_FILE` at — so the answer survives a cutover,
     /// which is the whole reason that override exists.
     pub maintenance_on: bool,
+    /// The last state-changing deploy action this host COMPLETED, from the
+    /// `shared/last-deploy` marker (AC-6), or `None` when the marker is absent or
+    /// unreadable.
+    ///
+    /// See [`last_deploy_marker`] for exactly what it does and does not know: a
+    /// deploy that failed before the cutover boundary never rewrites it, so it is
+    /// the host's last completed action rather than a verdict on the last rollout.
+    pub last_deploy: Option<LastDeploy>,
 }
 
 impl HostStatusProbe {
@@ -1979,17 +2093,26 @@ pub fn probe_host_status(
         "curl -o /dev/null -s -m 5 -w '%{{http_code}}' http://127.0.0.1:{port}/ready 2>/dev/null \
          || true; \
          printf '\\n{delim}\\n'; \
-         if [ -f {flag} ]; then printf '%s' '{on}'; fi",
+         if [ -f {flag} ]; then printf '%s' '{on}'; fi; \
+         printf '\\n{delim}\\n'; \
+         cat {last_deploy} 2>/dev/null || true",
         port = slot_app_port(public_port, live_slot),
         delim = HOST_STATUS_DELIM,
         flag = shell_quote(&cfg.maintenance_flag_file()),
         on = MAINTENANCE_ON_SENTINEL,
+        // AC-6, third fact: the last COMPLETED deploy action. Folded into this
+        // existing round-trip rather than a new per-host ssh — `deploy status` is
+        // run mid-incident across the whole fleet, and every extra round-trip is
+        // paid N times.
+        last_deploy = shell_quote(&last_deploy_marker(cfg)),
     );
     let out = exec.run(&RemoteCommand::new("probe-host-status", shell))?;
-    let (ready_section, maintenance_section) = out
-        .stdout
-        .split_once(HOST_STATUS_DELIM)
-        .unwrap_or((out.stdout.as_str(), ""));
+    // Section-count tolerant: a host still running a pre-#1621 probe shape (or a
+    // fixture written against it) simply reports no last-deploy section.
+    let mut sections = out.stdout.split(HOST_STATUS_DELIM);
+    let ready_section = sections.next().unwrap_or_default();
+    let maintenance_section = sections.next().unwrap_or_default();
+    let last_deploy_section = sections.next().unwrap_or_default();
     Ok(HostStatusProbe {
         deploy,
         // `curl` writes `000` when it never got a response; that is "nothing
@@ -2001,6 +2124,7 @@ pub fn probe_host_status(
             .ok()
             .filter(|code| *code > 0),
         maintenance_on: maintenance_section.trim() == MAINTENANCE_ON_SENTINEL,
+        last_deploy: parse_last_deploy(last_deploy_section),
     })
 }
 
@@ -5323,6 +5447,144 @@ mod tests {
              ---autumn-current-release---\n/srv/autumn/myapp/releases/{release}",
             proxy_list_serving("myapp", live_port)
         )
+    }
+
+    /// #1621 AC-6, third per-host fact. `deploy status` must report the last
+    /// deploy RESULT, and no other on-host artefact answers it — `current`,
+    /// `live-slot` and `previous-release` all describe which release a host
+    /// serves, never how it got there, so a cleanly compensated halt reads back as
+    /// a healthy converged fleet. The marker is written by the ops that COMPLETE a
+    /// cutover, so it rides on round-trips that already happen.
+    #[test]
+    fn the_cutover_and_the_rollback_record_the_last_deploy_result() {
+        let cfg = resolved();
+        let marker = "'/srv/autumn/myapp/shared/last-deploy'";
+
+        // Forward cutover: `commit-markers` (the transaction that completes the
+        // flip) records "deployed", and so does `record-proxy-options` — the last
+        // marker write on BOTH forward paths, which is how a FIRST deploy (whose
+        // ops contain no `commit-markers`) gets one too.
+        let ops = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let exec = RecordingExecutor::new();
+        run_ops(&ops, &exec).expect("recording executor never fails");
+        for label in ["commit-markers", "record-proxy-options"] {
+            let shell = exec.shell_for(label).expect("op ran");
+            assert!(
+                shell.contains("mktemp '/srv/autumn/myapp/shared/last-deploy.tmp.XXXXXX'")
+                    && shell.contains(&format!("mv -f \"$rtmp\" {marker}")),
+                "{label} must write the last-deploy marker atomically: {shell}"
+            );
+            assert!(
+                shell.contains("printf '%s\\t%s' 'deployed'")
+                    && shell.contains("date -u +%Y-%m-%dT%H:%M:%SZ"),
+                "{label} must record `deployed` plus a UTC timestamp: {shell}"
+            );
+            // ADVISORY: the write is a `{ … || true; }` group, so it can never
+            // fail the op it rides on. That matters most on `commit-markers`,
+            // whose failure is the one the fleet driver refuses to auto-roll-back
+            // from — a cosmetic status field must not be able to push a host into
+            // that state.
+            assert!(
+                shell.contains("|| true; }"),
+                "the last-deploy write must be advisory, never able to fail its op: {shell}"
+            );
+        }
+
+        // A first deploy takes the same `record-proxy-options` route.
+        let first = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let first_exec = RecordingExecutor::new();
+        run_ops(&first, &first_exec).expect("recording executor never fails");
+        let first_record = first_exec
+            .shell_for("record-proxy-options")
+            .expect("first deploy records proxy options");
+        assert!(
+            first_record.contains("printf '%s\\t%s' 'deployed'") && first_record.contains(marker),
+            "a first deploy must record its result too: {first_record}"
+        );
+
+        // Rollback records the OPPOSITE word through the same shared op, so a
+        // compensated host is distinguishable from one that simply deployed —
+        // exactly the state that is invisible once the rollout's output scrolls
+        // away.
+        let rb_exec = RecordingExecutor::new().with_stdout(
+            "resolve-previous",
+            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tblue\t3001",
+        );
+        let target =
+            resolve_rollback_target(&cfg, 3000, &rb_exec).expect("previous release resolves");
+        let rb_ops = rollback_ops(&cfg, &proxy(), &target);
+        run_ops(&rb_ops, &rb_exec).expect("recording executor never fails");
+        let rb = rb_exec
+            .shell_for("commit-markers")
+            .expect("commit-markers ran");
+        assert!(
+            rb.contains("printf '%s\\t%s' 'rolled back'") && rb.contains(marker),
+            "a rollback must record `rolled back`, not `deployed`: {rb}"
+        );
+    }
+
+    #[test]
+    fn the_status_probe_reads_the_last_deploy_marker_and_degrades_to_unknown() {
+        // The marker rides on the EXISTING status round-trip — `deploy status` is
+        // run fleet-wide mid-incident, so a new per-host ssh would be paid N times.
+        let cfg = resolved();
+        let probe_with = |stdout: &str| {
+            let exec = RecordingExecutor::new()
+                .with_stdout(
+                    "detect-current",
+                    status_probe_stdout("20260714T120000Z", 3001),
+                )
+                .with_stdout("probe-host-status", stdout.to_owned());
+            (probe_host_status(&cfg, 3000, &exec).unwrap(), exec)
+        };
+
+        let (probe, exec) = probe_with(
+            "200\n---autumn-host-status---\n\n---autumn-host-status---\n\
+             rolled back\t2026-07-14T12:31:10Z",
+        );
+        assert_eq!(
+            probe.last_deploy,
+            Some(LastDeploy {
+                result: "rolled back".to_owned(),
+                at: Some("2026-07-14T12:31:10Z".to_owned()),
+            })
+        );
+        // Still read-only, still one round-trip, and still the shared path.
+        let shell = exec
+            .shell_for("probe-host-status")
+            .expect("status probe ran");
+        assert!(
+            shell.contains("cat '/srv/autumn/myapp/shared/last-deploy'"),
+            "the marker is read from the release-independent shared dir: {shell}"
+        );
+        assert_eq!(
+            exec.run_labels(),
+            vec!["detect-current", "probe-host-status"]
+        );
+
+        // A marker that predates the timestamp field still reports its result.
+        let (older, _) =
+            probe_with("200\n---autumn-host-status---\n\n---autumn-host-status---\ndeployed");
+        assert_eq!(
+            older.last_deploy,
+            Some(LastDeploy {
+                result: "deployed".to_owned(),
+                at: None,
+            })
+        );
+
+        // Absent/empty marker, and a host whose probe shape predates the section:
+        // both are "we could not tell", never a fabricated result.
+        for stdout in [
+            "200\n---autumn-host-status---\n\n---autumn-host-status---\n",
+            "200\n---autumn-host-status---\nmaintenance-on",
+        ] {
+            let (unknown, _) = probe_with(stdout);
+            assert_eq!(
+                unknown.last_deploy, None,
+                "an unreadable marker must not be reported as a result: {stdout:?}"
+            );
+        }
     }
 
     #[test]
