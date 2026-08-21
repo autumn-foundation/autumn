@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 /// The safe, allocator-backed region for the allocation classes Autumn can
@@ -639,6 +639,11 @@ pub struct TenantCellRegistry {
 
 struct RegistryInner {
     cells: RwLock<HashMap<String, Arc<TenantCell>>>,
+    /// Weak index of every still-live accounting domain, including domains
+    /// evicted from `cells` but retained by an in-flight request/allocation.
+    /// Re-creation for the same tenant upgrades this entry instead of minting a
+    /// zero-usage generation that could admit a second full quota.
+    domains: Mutex<HashMap<String, Weak<TenantCellInner>>>,
     global_tracked: Arc<AtomicUsize>,
     /// Maximum number of resident cells; least-recently-used cells are evicted
     /// once the count exceeds this. `0` disables the bound (unlimited).
@@ -688,6 +693,7 @@ impl TenantCellRegistry {
         Self {
             inner: Arc::new(RegistryInner {
                 cells: RwLock::new(HashMap::new()),
+                domains: Mutex::new(HashMap::new()),
                 global_tracked: Arc::new(AtomicUsize::new(0)),
                 max_cells,
                 idle_ttl,
@@ -792,11 +798,34 @@ impl TenantCellRegistry {
             cell.set_quota_bytes(quota_bytes);
             return cell;
         }
-        let cell = Arc::new(TenantCell::new(
-            tenant_id.to_string(),
-            quota_bytes,
-            Arc::clone(&self.inner.global_tracked),
-        ));
+        // An evicted cell may still be alive through an in-flight request or a
+        // typed arena allocation. Reuse that accounting domain so eviction can
+        // never reset usage and let one tenant retain multiple quota-sized
+        // generations concurrently.
+        let cell = {
+            let mut domains = self
+                .inner
+                .domains
+                .lock()
+                .expect("tenant cell domain index lock poisoned");
+            domains.retain(|_, domain| domain.strong_count() > 0);
+            domains.get(tenant_id).and_then(Weak::upgrade).map_or_else(
+                || {
+                    let cell = Arc::new(TenantCell::new(
+                        tenant_id.to_string(),
+                        quota_bytes,
+                        Arc::clone(&self.inner.global_tracked),
+                    ));
+                    domains.insert(tenant_id.to_string(), Arc::downgrade(&cell.inner));
+                    cell
+                },
+                |inner| {
+                    let cell = Arc::new(TenantCell { inner });
+                    cell.set_quota_bytes(quota_bytes);
+                    cell
+                },
+            )
+        };
         // Capture `now` under the write guard, immediately before stamping the
         // new cell and sweeping, so the age comparison in `enforce_limits_locked`
         // uses a fresh wall-clock reading rather than one taken before the lock

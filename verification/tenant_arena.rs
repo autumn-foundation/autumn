@@ -49,6 +49,20 @@ pub open spec fn teardown_transition(pre: ArenaState) -> ArenaState {
     }
 }
 
+/// Registry eviction drops residency only. While an allocation/reference is
+/// reachable, rebinding the tenant must preserve its domain and usage rather
+/// than manufacture a zeroed generation.
+pub open spec fn eviction_transition(pre: ArenaState) -> ArenaState {
+    ArenaState {
+        tenant: pre.tenant,
+        domain: pre.domain,
+        quota: pre.quota,
+        finite: pre.finite,
+        usage: pre.usage,
+        reachable: pre.reachable,
+    }
+}
+
 pub proof fn successful_allocation(pre: ArenaState, bytes: nat, post: ArenaState)
     requires
         arena_invariant(pre),
@@ -70,6 +84,15 @@ pub proof fn failed_reservation_does_not_mutate(pre: ArenaState, post: ArenaStat
         post.usage == pre.usage,
         post.reachable == pre.reachable,
         same_domain(pre, post),
+{}
+
+pub proof fn rebind_live_domain_preserves_accounting(pre: ArenaState)
+    requires arena_invariant(pre), pre.reachable > 0
+    ensures
+        arena_invariant(eviction_transition(pre)),
+        same_domain(pre, eviction_transition(pre)),
+        eviction_transition(pre).usage == pre.usage,
+        eviction_transition(pre).reachable == pre.reachable,
 {}
 
 pub proof fn final_teardown_reclaims_all(pre: ArenaState)

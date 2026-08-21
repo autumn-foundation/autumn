@@ -48,13 +48,17 @@ stateDiagram-v2
     Owned --> Domain: allocation dropped / release charge
     Domain --> Reclaimed: eviction with no outstanding references
     EvictedAlive --> EvictedAlive: outstanding references remain usable
+    EvictedAlive --> Owned: later request rebinds same live domain and usage
     EvictedAlive --> Reclaimed: final reference drops / arena, allocations, gauge reclaimed
     Reclaimed --> [*]: modeled reachable allocations = 0
 ```
 
 Eviction removes only the registry reference. It does not invalidate an
 in-flight request; final reclamation occurs only after every outstanding
-reference and arena-owned value is dropped.
+reference and arena-owned value is dropped. A weak domain index prevents quota
+reset across generations: if a new request for the same tenant arrives while an
+evicted domain is still live, the registry rebinds that domain and its existing
+usage instead of creating a zero-usage accounting domain.
 
 ## Verification and consequences
 

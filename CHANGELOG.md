@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through eviction until final reclamation. ADR 0012 and a Verus lifecycle
   specification precisely reject hard-isolation/RSS claims: ordinary Rust,
   framework, third-party, stack, allocator, and native allocations remain
-  outside this cooperative tracked-memory boundary.
+  outside this cooperative tracked-memory boundary. Evicted-but-live domains
+  are weakly indexed and rebound for later requests, so LRU/TTL churn cannot
+  reset usage and admit overlapping full-quota allocation generations.
 
 - **`autumn generate webhook` for signed, replay-safe provider intake
   (#1366):** the `SignedWebhook` substrate has shipped since 0.4.0, but every

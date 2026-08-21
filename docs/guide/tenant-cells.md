@@ -192,9 +192,12 @@ app state. Two properties matter operationally:
 Eviction is safe to do mid-request. Each in-flight request caches the cell it
 first materialized, so evicting a tenant while one of its requests is running
 does **not** reset that request's state or hand it a fresh empty cell: the
-running request keeps its own cached `Arc` and its stable cell to completion,
-its memory reclaiming on drop, and the eviction takes effect for subsequent
-requests. The registry also exposes `len()`, `is_empty()`, and
+  running request keeps its own cached `Arc` and its stable cell to completion,
+  its memory reclaiming on drop, and the eviction takes effect for subsequent
+  requests. If a subsequent request arrives before those references drop, it
+  rebinds the still-live accounting domain and observes its usage; eviction
+  cannot reset the counter or permit overlapping full-quota generations. The
+  registry also exposes `len()`, `is_empty()`, and
 `total_tracked_bytes()` for observability.
 
 **Dynamic quota.** A cell's `quota_bytes` is stored atomically rather than

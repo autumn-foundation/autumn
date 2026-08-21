@@ -65,6 +65,37 @@ fn final_eviction_makes_all_supported_arena_allocations_unreachable() {
     assert_eq!(registry.total_tracked_bytes(), 0);
 }
 
+/// Eviction removes residency, not the tenant's live accounting domain. A new
+/// request while an old arena allocation survives must observe the old usage
+/// and cannot acquire a second full quota.
+#[test]
+fn evicted_generation_reuses_live_accounting_domain() {
+    let registry = TenantCellRegistry::with_limits(1, None);
+    let old_cell = registry.get_or_create("tenant", 64);
+    let old_allocation = old_cell.arena().try_bytes(64).expect("fills quota");
+
+    // Materializing another tenant exceeds max_cells and LRU-evicts `tenant`
+    // while its arena allocation remains alive.
+    let _other = registry.get_or_create("other", 64);
+    drop(old_cell);
+    assert!(registry.get("tenant").is_none());
+
+    let rebound = registry.get_or_create("tenant", 64);
+    assert_eq!(rebound.tracked_bytes(), 64, "rebind observes live usage");
+    rebound
+        .arena()
+        .try_bytes(1)
+        .expect_err("eviction must not reset the tenant quota");
+
+    drop(old_allocation);
+    assert_eq!(rebound.tracked_bytes(), 0);
+    let replacement = rebound
+        .arena()
+        .try_bytes(64)
+        .expect("quota becomes available after final old allocation drop");
+    assert_eq!(replacement.tracked_bytes(), 64);
+}
+
 /// A charge raises both the per-tenant and process-wide gauges by exactly its
 /// size, and dropping it returns them to zero.
 #[test]
