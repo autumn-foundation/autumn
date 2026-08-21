@@ -11764,17 +11764,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // repository does NOT imply a `#[shard_key]` on the model, so the fact has
     // to be published from here or the router's guard misses the shape
     // entirely and serves the model from the control pool.
-    let sharded_model_name = &config.model_name;
-    let sharded_inventory_registration = if config.sharded {
-        quote! {
-            ::autumn_web::reexports::inventory::submit! {
-                ::autumn_web::commentable::ShardedRepositoryDescriptor {
-                    model: || ::core::any::type_name::<#sharded_model_name>(),
-                }
+    let facts_model_name = &config.model_name;
+    let (facts_sharded, facts_tenant_scoped) = (config.sharded, config.tenant_scoped);
+    // Registered for EVERY repository, not only the opted-in ones: the router
+    // has to distinguish "this repository opted out" from "no repository said
+    // anything", and only an unconditional entry can tell those apart.
+    let sharded_inventory_registration = quote! {
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::commentable::RepositoryFacts {
+                model: || ::core::any::type_name::<#facts_model_name>(),
+                sharded: #facts_sharded,
+                tenant_scoped: #facts_tenant_scoped,
             }
         }
-    } else {
-        quote! {}
     };
     let versioned_inventory_registration = if config.versioned {
         quote! {

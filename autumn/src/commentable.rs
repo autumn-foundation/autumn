@@ -387,7 +387,7 @@ inventory::collect!(CommentableDescriptor);
 /// exactly that shape — and the miss is silent, because the router would then
 /// happily serve the model from the control pool.
 #[cfg(feature = "db")]
-pub struct ShardedRepositoryDescriptor {
+pub struct RepositoryFacts {
     /// The model type's fully-qualified name.
     ///
     /// A function pointer to [`core::any::type_name`] rather than a
@@ -399,16 +399,45 @@ pub struct ShardedRepositoryDescriptor {
     /// routinely live in different modules; the *type* is the one identity both
     /// macros agree on.
     pub model: fn() -> &'static str,
+    /// `#[repository(..., sharded)]` — queries route through the tenant's shard.
+    pub sharded: bool,
+    /// `#[repository(..., tenant_scoped)]` — queries carry a tenant predicate.
+    pub tenant_scoped: bool,
 }
 
 #[cfg(feature = "db")]
-inventory::collect!(ShardedRepositoryDescriptor);
+inventory::collect!(RepositoryFacts);
 
 /// Whether `model` has a sharded repository registered in this binary.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn model_has_sharded_repository(model: &str) -> bool {
-    inventory::iter::<ShardedRepositoryDescriptor>().any(|descriptor| (descriptor.model)() == model)
+    repository_facts_for(model).is_some_and(|facts| facts.sharded)
+}
+
+/// The repository opt-ins registered for `model`, if a repository was declared.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn repository_facts_for(model: &str) -> Option<&'static RepositoryFacts> {
+    inventory::iter::<RepositoryFacts>().find(|facts| (facts.model)() == model)
+}
+
+/// Whether `model`'s comment routes must resolve a tenant.
+///
+/// The model's own `tenant_id` column is necessary but not sufficient: routing
+/// is enabled by `#[repository(..., tenant_scoped)]`, and a model can carry the
+/// column while its repository deliberately does not scope on it.
+///
+/// The two conditions are NOT symmetric, and the default matters. A missing
+/// registration downgrades nothing: absent positive evidence that the
+/// repository opted OUT, a model with a tenant column stays scoped. Getting
+/// this backwards would fail open — serving one tenant's comments to another —
+/// whereas the conservative direction's worst case is the 500 this exists to
+/// stop being spurious.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn model_requires_tenant(model: &str, has_tenant_column: bool) -> bool {
+    has_tenant_column && repository_facts_for(model).is_none_or(|facts| facts.tenant_scoped)
 }
 
 /// The spec registered for `type_name`, or `None` when no `#[commentable]`
@@ -418,6 +447,19 @@ pub fn commentable_spec_for(type_name: &str) -> Option<&'static CommentableSpec>
     inventory::iter::<CommentableDescriptor>()
         .find(|descriptor| descriptor.type_name == type_name)
         .map(|descriptor| descriptor.spec)
+}
+
+/// The model type name registered for `type_name`, or `None` when no
+/// `#[commentable]` model claims it.
+///
+/// Distinct from the discriminator: `#[commentable(type_name = "…")]` can
+/// rename the latter, while the repository registry is keyed on the former.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn commentable_model_for(type_name: &str) -> Option<&'static str> {
+    inventory::iter::<CommentableDescriptor>()
+        .find(|descriptor| descriptor.type_name == type_name)
+        .map(|descriptor| (descriptor.model)())
 }
 
 /// Every `commentable_type` registered in this binary, in unspecified order.
@@ -1524,6 +1566,25 @@ mod tests {
     /// A spec built by hand — the one way past the macro's guarantee — is
     /// refused by `validate`, in release builds too. A `debug_assert` here
     /// would be erased in exactly the build where it matters.
+    /// Tenancy is the one place where "no information" must not mean "no
+    /// scoping". A model with a tenant column stays scoped unless a repository
+    /// positively says it opted out — guessing the other way would serve one
+    /// tenant's comments to another.
+    #[test]
+    fn an_unregistered_model_stays_tenant_scoped() {
+        // No repository facts are registered for these names.
+        assert!(
+            model_requires_tenant("nobody::Unregistered", true),
+            "absent positive evidence of opting out, a tenant column scopes"
+        );
+        assert!(
+            !model_requires_tenant("nobody::Unregistered", false),
+            "…but a model with no tenant column is never scoped"
+        );
+        // The lookup failing entirely is the same conservative answer.
+        assert!(model_requires_tenant("", true));
+    }
+
     #[test]
     fn validate_refuses_a_hand_built_spec_carrying_sql() {
         let spec = sample_spec();
@@ -1854,10 +1915,13 @@ struct CommentSubmission {
 /// and no tenant is in scope: that is a middleware wiring mistake, not
 /// something the caller can fix.
 #[cfg(all(feature = "db", feature = "maud"))]
-fn request_tenant(spec: &CommentableSpec) -> AutumnResult<Option<String>> {
+fn request_tenant(commentable_type: &str, spec: &CommentableSpec) -> AutumnResult<Option<String>> {
     // A model with no tenant column emits no tenant predicate at all, so
-    // reading the task-local would only ever produce a value nothing uses.
-    if spec.parent_tenant_column.is_none() {
+    // reading the task-local would only ever produce a value nothing uses —
+    // and neither does one whose repository deliberately opted out of
+    // `tenant_scoped` while the model happens to carry a `tenant_id` column.
+    let model = commentable_model_for(commentable_type).unwrap_or("");
+    if !model_requires_tenant(model, spec.parent_tenant_column.is_some()) {
         return Ok(None);
     }
     crate::tenancy::CURRENT_TENANT
@@ -1982,7 +2046,7 @@ async fn show_thread(
     mut db: crate::db::Db,
 ) -> AutumnResult<maud::Markup> {
     let spec = resolve_spec(&commentable_type)?;
-    let tenant = request_tenant(spec)?;
+    let tenant = request_tenant(&commentable_type, spec)?;
     let thread = comment_thread(
         &mut db,
         spec,
@@ -2054,7 +2118,7 @@ async fn post_comment(
                 .map_err(|_| AutumnError::bad_request_msg("Invalid reply target"))?,
         ),
     };
-    let tenant = request_tenant(spec)?;
+    let tenant = request_tenant(&commentable_type, spec)?;
     // Only a relative, single-slash path is ever honoured, so a crafted
     // `return_to` cannot become an open redirect — and the same validated value
     // is echoed back into the re-rendered forms, so the NEXT no-JS submit still
