@@ -1459,6 +1459,95 @@ async fn router_reports_each_created_comment_to_the_app() {
     );
 }
 
+/// `on_comment` is documented as the place for a database-backed side effect —
+/// a notification that resolves a username, a search-index write. If the
+/// request still held its connection while awaiting the hook, an app on a small
+/// pool would deadlock instead of answering.
+///
+/// Same shape as the authorization test: a pool of exactly one, and a hook that
+/// takes a connection from it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_creation_hook_runs_after_the_connection_is_released() {
+    let (pool, _container) = setup_pool_with_size(1).await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    drop(conn);
+
+    let hook_pool = pool.clone();
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = std::sync::Arc::clone(&bodies);
+    let config = autumn_web::commentable::CommentsConfig::default().on_comment(move |created| {
+        let pool = hook_pool.clone();
+        let recorder = std::sync::Arc::clone(&recorder);
+        Box::pin(async move {
+            let mut conn = pool
+                .get()
+                .await
+                .expect("on_comment ran while the request still held the only connection");
+            diesel::sql_query("SELECT 1")
+                .execute(&mut conn)
+                .await
+                .expect("the hook's connection must be usable");
+            recorder.lock().expect("not poisoned").push(created.body);
+        })
+    });
+
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        call_with_author(
+            comment_app(pool.clone(), config),
+            form_post(
+                &format!("/comments/CmtPost/{post}"),
+                "body=++padded++&reply_to=",
+            ),
+            author,
+        ),
+    )
+    .await
+    .expect("a database-backed on_comment hook must not deadlock the pool");
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        bodies.lock().expect("not poisoned").as_slice(),
+        ["padded"],
+        "the hook is told the body as ACCEPTED — add_comment trims before it \
+         validates and inserts, so the submitted form value is not what was stored"
+    );
+}
+
+/// `CommentAccess` tells the callback that `commentable_type` names a
+/// registered model, so an unregistered one must 404 before the callback runs
+/// — not hand arbitrary path strings to application policy code.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_unregistered_type_is_refused_before_the_authorization_hook() {
+    let (pool, _container) = setup_pool().await;
+
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&asked);
+    let config = autumn_web::commentable::CommentsConfig::default().authorize(move |_access| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move { true })
+    });
+
+    let (status, _) = call(
+        comment_app(pool.clone(), config),
+        get("/comments/NoSuchModel/1"),
+    )
+    .await;
+
+    assert_eq!(status, 404);
+    assert_eq!(
+        // Fully qualified: diesel's `RunQueryDsl::load` is in scope here and
+        // wins method resolution against the atomic's inherent `load`.
+        std::sync::atomic::AtomicUsize::load(&asked, std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an unregistered type must never reach the app's policy callback"
+    );
+}
+
 /// A browser submits an *empty* hidden input as `reply_to=`. Reading that as
 /// malformed would 422 every top-level comment posted from the widget.
 #[tokio::test]

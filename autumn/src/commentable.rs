@@ -1723,6 +1723,15 @@ where
             axum::extract::Path::<(String, i64)>::from_request_parts(parts, state).await?;
         let session = crate::session::Session::from_request_parts(parts, state).await?;
 
+        // `CommentAccess` promises the callback that `commentable_type` names a
+        // registered model. Resolve it here, before the callback runs: an
+        // unregistered type is a 404 whatever the app's policy would say, and
+        // letting an arbitrary path string reach application code invites
+        // policy or database work on a name that can never resolve -- and
+        // breaks any callback that dispatches exhaustively over the models it
+        // knows.
+        resolve_spec(&commentable_type)?;
+
         // A write is the method that creates a comment; everything else reads.
         let write = parts.method == axum::http::Method::POST;
         let author_id = session_author(&session, &config).await;
@@ -1844,42 +1853,65 @@ async fn post_comment(
     // response by default, so returning the error would make the button look
     // broken; re-rendering the thread with the message above the form is the
     // only feedback a no-JS visitor gets either.
-    let error = match outcome {
-        Ok(created) => {
-            // After the commit, so the row a notifier goes looking for is
-            // already durable and visible on another connection.
-            if let Some(hook) = config.on_comment.as_ref() {
-                hook(CommentCreated {
-                    commentable_type: commentable_type.clone(),
-                    parent_id,
-                    comment_id: created.id,
-                    reply_to,
-                    author_id,
-                    body: submission.body.clone(),
-                })
-                .await;
-            }
-            None
+    //
+    // The created comment is carried past this match so the hook can be told
+    // about it *after* this request has let go of its connection -- see below.
+    let (created, error) = match outcome {
+        Ok(created) => (Some(created), None),
+        Err(err) if err.status() == http::StatusCode::UNPROCESSABLE_ENTITY => {
+            (None, Some(err.to_string()))
         }
-        Err(err) if err.status() == http::StatusCode::UNPROCESSABLE_ENTITY => Some(err.to_string()),
         Err(err) => return Err(err),
     };
 
-    if error.is_none()
-        && !htmx.is_htmx
-        && let Some(return_to) = return_to
+    let redirecting = error.is_none() && !htmx.is_htmx && return_to.is_some();
+
+    // Read everything this response still needs from the database BEFORE the
+    // hook runs, so the connection can be released first.
+    let thread = if redirecting {
+        Vec::new()
+    } else {
+        comment_thread(
+            &mut db,
+            spec,
+            &commentable_type,
+            parent_id,
+            tenant.as_deref(),
+        )
+        .await?
+    };
+
+    // Release the checkout before awaiting the hook. `on_comment` is documented
+    // as the place for a database-backed side effect -- a notification that
+    // resolves a username, a search index write -- and holding this connection
+    // across that await would let `pool_size` concurrent submissions each pin
+    // one while waiting for a second that can never be issued. The row is
+    // already committed, so nothing here needs the connection any more.
+    drop(db);
+
+    if let Some(created) = created
+        && let Some(hook) = config.on_comment.as_ref()
     {
+        hook(CommentCreated {
+            commentable_type: commentable_type.clone(),
+            parent_id,
+            comment_id: created.id,
+            reply_to,
+            author_id,
+            // The body as *accepted*, not as submitted: `add_comment` trims
+            // before validating and inserting, so the submitted form value can
+            // differ from the stored row -- and padding a short body with
+            // whitespace would otherwise hand the hook a payload larger than
+            // `max_body_bytes` claims to allow.
+            body: created.body,
+        })
+        .await;
+    }
+
+    if redirecting && let Some(return_to) = return_to {
         return Ok(crate::Redirect::to(return_to).into_response());
     }
 
-    let thread = comment_thread(
-        &mut db,
-        spec,
-        &commentable_type,
-        parent_id,
-        tenant.as_deref(),
-    )
-    .await?;
     Ok(render(
         &config,
         spec,
