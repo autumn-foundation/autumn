@@ -89,6 +89,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/form.rs:default
   autumn/src/nested_form.rs:default
   autumn/src/extract.rs:default
+  autumn/src/query_string.rs:default
   autumn/src/idempotency.rs:default
   autumn/src/time_math.rs:default
   autumn/src/mail.rs:mail
@@ -137,7 +138,7 @@ REQUEST_PATH_MODULES=(
 # cannot quietly shrink the gate's surface. It tracks the manifest's length, so
 # it moves with every addition too — otherwise a one-entry revert would shrink
 # the manifest back under the floor while the gate still passed.
-MODULE_COUNT_FLOOR=44
+MODULE_COUNT_FLOOR=45
 
 # Gated modules whose feature is KNOWINGLY not enabled by any enforcing CI clippy
 # lane, as `<path>:<feature>`. Their headers are real but unenforced: the deny

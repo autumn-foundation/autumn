@@ -536,10 +536,9 @@ resource "aws_apprunner_service" "this" {
           AUTUMN_PROFILE = "prod"
         }
 
-        runtime_environment_secrets = {
-          AUTUMN_DATABASE__PRIMARY_URL    = aws_secretsmanager_secret.database_url.arn
-          AUTUMN_SECURITY__SIGNING_SECRET = aws_secretsmanager_secret.signing_secret.arn
-        }
+        # The public bootstrap image only serves a health check and must
+        # never receive production secrets. The deploy walkthrough supplies
+        # them when it replaces this image with the trusted application.
       }
     }
 
@@ -549,7 +548,9 @@ resource "aws_apprunner_service" "this" {
   instance_configuration {
     cpu                = var.instance_cpu
     memory             = var.instance_memory
-    instance_role_arn  = aws_iam_role.apprunner_instance.arn
+    # Do not give the public bootstrap image the secret-reading runtime
+    # role. The real-image cutover attaches it in the same update-service
+    # operation that supplies RuntimeEnvironmentSecrets.
   }
 
   network_configuration {
@@ -570,19 +571,8 @@ resource "aws_apprunner_service" "this" {
     path     = "/"
   }
 
-  # The database_url/signing_secret *version* resources (not just the
-  # secret containers referenced by ARN above) must exist before App Runner
-  # starts: runtime_environment_secrets only implies a dependency on the
-  # empty secret container, since that's the resource actually referenced
-  # by .arn — without this, Terraform is free to create the service as soon
-  # as the (still-valueless) secret exists, racing the version write. App
-  # Runner then fails to resolve the secret value at bootstrap-image
-  # startup and the first apply never stabilizes.
   depends_on = [
     aws_iam_role_policy_attachment.apprunner_access,
-    aws_iam_role_policy.apprunner_instance_secrets,
-    aws_secretsmanager_secret_version.database_url,
-    aws_secretsmanager_secret_version.signing_secret,
   ]
 
   lifecycle {
@@ -601,6 +591,6 @@ resource "aws_apprunner_service" "this" {
     # too, a later `terraform apply` would see that as drift from this
     # resource's own declared "/" and revert it — breaking the real app's
     # health check the moment anyone re-applies.
-    ignore_changes = [source_configuration, health_check_configuration]
+    ignore_changes = [source_configuration, instance_configuration, health_check_configuration]
   }
 }

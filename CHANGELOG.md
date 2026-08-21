@@ -109,6 +109,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target host configured" hint now names `[deploy] hosts` alongside
   `[deploy] host`. See `docs/guide/deployment.md`.
 
+- **`Query<T>` decodes sequences and nested structures (#1972):** the extractor
+  no longer delegates to `serde_urlencoded`, whose strict flatness meant a
+  `Vec<String>` field fed the conforming `?tags=a&tags=b` form failed with
+  `invalid type: string "a", expected a sequence`, and a nested struct field was
+  unrepresentable by any encoding — so builders fell back to comma-separated
+  strings and JSON-in-a-string. It now decodes a **superset** of the flat form
+  (a query string of unique scalar keys behaves exactly as before) that also
+  accepts repeated keys (`tags=a&tags=b`), the append and indexed sequence forms
+  (`tags[]=a`, `tags[0]=a`), nested objects (`filter[status]=open`), and arrays
+  of objects (`items[0][sku]=A-1`) — the same bracketed dialect
+  `NestedChangesetForm` already uses for `has_many` rows. Scalar coercion,
+  present-but-empty `Option` handling, and unknown-key tolerance keep
+  `serde_urlencoded` parity; decode errors now name the failing field path
+  (`filter.limit: invalid value …`). Nesting is depth-capped and indices key an
+  ordered map rather than a `Vec`, so neither deep nesting nor `tags[4000000000]`
+  can drive unbounded allocation.
+- **MCP `tools/call` dispatch honors structured query arguments (#1972):** the
+  dispatcher already expanded an array query argument to repeated keys, which
+  the handler then rejected — a tool whose derived `inputSchema` advertised
+  `tags: array` dispatched a request its own handler answered with 400. Query
+  arguments are now rendered into the extractor's own wire format (scalars flat,
+  scalar arrays as repeated keys, containers bracketed), so the advertised
+  contract and the dispatch actually agree. A JSON `null` renders no parameter
+  at all instead of the literal text `null`, and nesting past the decoder's cap
+  is refused up front. An argument the encoding cannot carry — an empty array or
+  object, a `null` array element, an object field name containing `[` or `]` —
+  is an invalid-params error rather than a silently altered dispatch, and one
+  call's query expansion is bounded. The build-time "nested query field" warning
+  is gone — nested query fields are now honored rather than steered away — while
+  the opaque-`{"type":"object"}`-placeholder warnings remain.
 - **`autumn generate webhook` for signed, replay-safe provider intake
   (#1366):** the `SignedWebhook` substrate has shipped since 0.4.0, but every
   Stripe/GitHub/Slack integration still hand-rolled the route, the endpoint
@@ -276,6 +306,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `runtime-only` — and when a mostly-provable dimension ships with a caveat
   instead of a demotion, with outbound HTTP worked through as `declared` — is
   now documented in `docs/guide/security-posture-manifest.md` (#1627).
+
+### Changed
+
+- **`Query<T>` treats `[` and `]` in a query key as structure (#1972).** A
+  target that types a parameter as a plain value — `Query<HashMap<String,
+  String>>` is the common one — used to receive `?filter[a]=1` as the literal
+  key `"filter[a]"`; it now sees a nested object and reports a decode error
+  naming the fix. Give such a field a nested type, or accept it as
+  `serde_json::Value`. A key the grammar cannot resolve (one name used as both a
+  scalar and a container, or nesting past the cap) fails only if the target
+  actually claims it, so an unrecognised parameter stays ignorable exactly as
+  before.
+- **`Query<T>` rejects a duplicated key in a single-valued position (#1972).**
+  `?q=a&q=b` against a `String` field is a 400, as it was under
+  `serde_urlencoded` + serde's derive (`duplicate field`). A **map**-typed
+  target previously resolved this silently to the last value; resolving
+  parameter pollution quietly is how the resulting bugs are built, so it is now
+  loud. A sequence field still takes every occurrence.
+- **Query decode errors no longer echo the submitted value (#1972).** A
+  coercion failure names the field path and the expected type
+  (`page: invalid u32 value`) but never the text — the message is returned in
+  the 400 Problem Details body and recorded by every error reporter, and a query
+  parameter can hold a secret. Key text embedded in an error is bounded and
+  stripped of control characters.
+- **`Query<Vec<(String, String)>>` yields key-sorted pairs (#1972)** rather than
+  submission order; occurrences of one key keep their relative order. The
+  `#[edge]` extractor is unaffected — `autumn_edge`'s prelude re-exports axum's
+  `Query`.
 
 ### Fixed
 

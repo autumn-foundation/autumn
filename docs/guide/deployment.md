@@ -1725,6 +1725,7 @@ export AWS_REGION="$(terraform output -raw region)"
 ECR="$(terraform output -raw ecr_repository_url)"
 SERVICE_ARN="$(terraform output -raw service_arn)"
 ACCESS_ROLE="$(terraform output -raw apprunner_access_role_arn)"
+INSTANCE_ROLE="$(terraform output -raw apprunner_instance_role_arn)"
 DATABASE_URL_ARN="$(terraform output -raw database_url_secret_arn)"
 SIGNING_SECRET_ARN="$(terraform output -raw signing_secret_secret_arn)"
 TAG="$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
@@ -1804,6 +1805,7 @@ APP_URL="$(terraform output -raw app_url)"   # known only after the FIRST apply 
 # — main.tf's bootstrap revision used "/" (nginx's own default response)
 # since the bootstrap placeholder doesn't serve /health.
 OPERATION_ID=$(aws apprunner update-service --service-arn "$SERVICE_ARN" \
+  --instance-configuration "{\"InstanceRoleArn\": \"$INSTANCE_ROLE\"}" \
   --health-check-configuration "{\"Protocol\": \"HTTP\", \"Path\": \"/health\"}" \
   --source-configuration "{
   \"ImageRepository\": {
@@ -1973,12 +1975,16 @@ docker push "$ECR:$TAG"
 # would exit immediately. The "migrate" family's own command (`autumn
 # migrate`) is intentional and permanent, not bootstrap-specific, so it's
 # left untouched.
+APP_SECRETS=$(aws ecs describe-task-definition \
+  --task-definition "$(terraform output -raw migrate_task_family)" \
+  --query 'taskDefinition.containerDefinitions[0].secrets' --output json)
 for FAMILY_OUT in app_task_family:APP migrate_task_family:MIGRATE; do
   FAMILY="$(terraform output -raw "${FAMILY_OUT%%:*}")"
   STRIP_ENTRYPOINT="del(.containerDefinitions[0].entryPoint, .containerDefinitions[0].command) | "
   [ "${FAMILY_OUT##*:}" = "MIGRATE" ] && STRIP_ENTRYPOINT=""
   NEW_DEF=$(aws ecs describe-task-definition --task-definition "$FAMILY" --query 'taskDefinition' | \
-    jq --arg IMAGE "$ECR:$TAG" ".containerDefinitions[0].image = \$IMAGE | ${STRIP_ENTRYPOINT}
+    jq --arg IMAGE "$ECR:$TAG" --argjson SECRETS "$APP_SECRETS" ".containerDefinitions[0].image = \$IMAGE |
+      (if \"${FAMILY_OUT##*:}\" == \"APP\" then .containerDefinitions[0].secrets = \$SECRETS else . end) | ${STRIP_ENTRYPOINT}
       del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities,
           .registeredAt, .registeredBy, .deregisteredAt)")
   ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition --cli-input-json file:///dev/stdin \
