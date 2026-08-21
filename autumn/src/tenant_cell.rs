@@ -656,7 +656,7 @@ impl TenantCellRegistry {
                 .resident
                 .insert(tenant_id.to_string(), Arc::clone(&cell));
             let now = self.now_millis();
-            self.enforce_limits_locked(&mut state.resident, now);
+            self.enforce_limits_locked(&mut state, now);
             return cell;
         }
         state.lifecycle.remove(tenant_id);
@@ -682,41 +682,57 @@ impl TenantCellRegistry {
         // Enforce eviction limits while we already hold the write lock. The
         // just-touched new cell has the newest access time and the greatest
         // access sequence, so it is never the idle or LRU victim.
-        self.enforce_limits_locked(&mut state.resident, now);
+        self.enforce_limits_locked(&mut state, now);
         drop(state);
         cell
     }
 
-    /// Evict idle and over-capacity cells from an already write-locked map.
+    /// Evict idle and over-capacity cells and sweep expired lifecycle records
+    /// from already write-locked registry state.
     ///
-    /// Must be called while holding the `cells` write lock; it never re-locks,
+    /// Must be called while holding the `state` write lock; it never re-locks,
     /// so it is safe to invoke from inside [`get_or_create`]'s miss branch.
     /// Removal is a plain `HashMap::remove`, which drops only the registry's
     /// strong reference — any outstanding `Arc<TenantCell>` (e.g. one held by an
     /// in-flight request) stays valid and reclaims deterministically on drop.
-    fn enforce_limits_locked(&self, cells: &mut HashMap<String, Arc<TenantCell>>, now: u64) {
+    fn enforce_limits_locked(&self, state: &mut RegistryState, now: u64) {
         if let Some(ttl) = self.inner.idle_ttl {
             let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
-            cells.retain(|_, cell| now.saturating_sub(cell.last_access_millis()) <= ttl_millis);
+            state
+                .resident
+                .retain(|_, cell| now.saturating_sub(cell.last_access_millis()) <= ttl_millis);
         }
         let max_cells = self.inner.max_cells;
         if max_cells > 0 {
-            while cells.len() > max_cells {
+            while state.resident.len() > max_cells {
                 // Evict the least-recently-used cell, chosen by the smallest
                 // access *sequence*. The sequence is globally unique and
                 // monotonic, so there are no ties (unlike millisecond
                 // timestamps) and the just-inserted cell — which drew the
                 // greatest sequence above — is never the victim.
-                let Some(victim) = cells
+                let Some(victim) = state
+                    .resident
                     .iter()
                     .min_by_key(|(_, cell)| cell.last_access_seq())
                     .map(|(key, _)| key.clone())
                 else {
                     break;
                 };
-                cells.remove(&victim);
+                state.resident.remove(&victim);
             }
         }
+        Self::sweep_expired_lifecycles_locked(state);
+    }
+
+    /// Remove weak lifecycle records whose accounting domain has torn down.
+    /// Live records are never removed, preserving same-tenant resurrection.
+    fn sweep_expired_lifecycles_locked(state: &mut RegistryState) {
+        state.lifecycle.retain(|_, lifecycle| {
+            // No registry operation can create a new strong reference without
+            // this write lock, so a failed upgrade is permanently dead and its
+            // owned tenant-id key is safe to reclaim.
+            lifecycle.upgrade().is_some()
+        });
     }
 
     /// Evict `tenant_id`'s cell from the resident cache and return it.
@@ -731,12 +747,13 @@ impl TenantCellRegistry {
     /// Panics if the registry lock is poisoned.
     #[must_use = "the evicted cell is returned so it (and its memory) can be dropped"]
     pub fn evict(&self, tenant_id: &str) -> Option<Arc<TenantCell>> {
-        self.inner
+        let mut state = self
+            .inner
             .state
             .write()
-            .expect("tenant cell registry lock poisoned")
-            .resident
-            .remove(tenant_id)
+            .expect("tenant cell registry lock poisoned");
+        Self::sweep_expired_lifecycles_locked(&mut state);
+        state.resident.remove(tenant_id)
     }
 
     /// Evict every resident cell whose most recent access is older than `ttl`
@@ -766,7 +783,10 @@ impl TenantCellRegistry {
         state
             .resident
             .retain(|_, cell| now.saturating_sub(cell.last_access_millis()) <= ttl_millis);
-        before - state.resident.len()
+        let removed = before - state.resident.len();
+        Self::sweep_expired_lifecycles_locked(&mut state);
+        drop(state);
+        removed
     }
 
     /// The configured maximum number of resident cells (`0` = unbounded).
@@ -796,13 +816,34 @@ impl TenantCellRegistry {
             .len()
     }
 
+    /// Number of tenant accounting lifecycle records, including resident cells
+    /// and evicted domains still owned by in-flight work.
+    ///
+    /// Expired weak records are removed by the next mutating registry operation,
+    /// so this count remains bounded under churn when eviction is configured.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry lock is poisoned.
+    #[must_use]
+    pub fn accounting_domain_count(&self) -> usize {
+        self.inner
+            .state
+            .read()
+            .expect("tenant cell registry lock poisoned")
+            .lifecycle
+            .len()
+    }
+
     /// Whether the registry holds no cells.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Total bytes tracked across every resident cell.
+    /// Total bytes tracked across every live accounting domain, whether its
+    /// cell is resident or temporarily held only by in-flight work after
+    /// eviction.
     #[must_use]
     pub fn total_tracked_bytes(&self) -> usize {
         self.inner.global_tracked.load(Ordering::Relaxed)

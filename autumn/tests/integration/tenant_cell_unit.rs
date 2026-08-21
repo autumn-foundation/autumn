@@ -187,6 +187,35 @@ fn eviction_does_not_split_a_live_tenant_accounting_domain() {
     assert_eq!(registry.total_tracked_bytes(), 0);
 }
 
+/// Dead weak lifecycle tombstones must not turn a bounded resident cache into
+/// an unbounded tenant-id string cache under one-off, request-controlled IDs.
+#[test]
+fn eviction_sweeps_expired_lifecycle_tombstones_under_churn() {
+    let registry = TenantCellRegistry::with_limits(1, None);
+
+    for i in 0..1_000 {
+        let cell = registry.get_or_create(&format!("one-off-{i}"), 1_000);
+        drop(cell);
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.accounting_domain_count(),
+            1,
+            "capacity enforcement must discard dead tenant lifecycle keys"
+        );
+    }
+
+    // A live evicted domain is preserved, then swept only after its last handle
+    // drops and the next mutation gives the registry an opportunity to prune.
+    let live = registry.get_or_create("live", 1_000);
+    let evicted = registry.evict("live").expect("live tenant was resident");
+    assert!(registry.accounting_domain_count() >= 1);
+    drop(live);
+    drop(evicted);
+    let next = registry.get_or_create("next", 1_000);
+    drop(next);
+    assert_eq!(registry.accounting_domain_count(), 1);
+}
+
 /// Density smoke test: 1000 concurrent cells each holding a small buffer track
 /// exactly, and evicting all of them reclaims everything.
 #[test]
