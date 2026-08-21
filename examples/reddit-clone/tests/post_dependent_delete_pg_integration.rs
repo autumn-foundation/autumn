@@ -67,7 +67,7 @@ async fn setup() -> (PgHandle, Pool<AsyncPgConnection>) {
     let mut conn = pool.get().await.expect("connection");
     if std::env::var("AUTUMN_TEST_PG_URL").is_ok() {
         conn.batch_execute(
-             "DROP TABLE IF EXISTS post_tags, tags, comments, votes, live_feed_events, \
+            "DROP TABLE IF EXISTS post_tags, tags, comments, votes, live_feed_events, \
              posts, subreddits, users CASCADE;
              DROP FUNCTION IF EXISTS reject_comment_delete();
              DROP FUNCTION IF EXISTS reject_parent_before_reply();
