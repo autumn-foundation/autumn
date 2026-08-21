@@ -576,6 +576,12 @@ surprises:
   time. It is what `deploy status` reads for its `last deploy` cell.
   The fragment can never fail the op it rides on, and it adds one small file
   under `shared/`; the op labels and everything else those ops do are unchanged.
+  The first-deploy teardown writes it too, through one extra
+  `teardown-last-deploy` op recording `torn down`, so a host whose first deploy
+  was removed again can never keep reporting a successful one. That op runs only
+  on the first-deploy failure and compensation path — a redeploy's candidate
+  teardown leaves the marker alone, because the previous release is still serving
+  and the marker still describes it.
 - **The `detect-current` probe reads one more thing.** Its shell gained a
   delimited section that resolves the `current` symlink, so the deployed release
   id comes back in the same round-trip the deploy already made. Same op, same
@@ -686,13 +692,16 @@ live slot, the `/ready` status code, the maintenance flag, the proxy's bound
 port, that host's last deploy result, and any per-host drift reasons.
 
 > **`last deploy` is the last action that host *completed*.** It reads
-> `last deploy: deployed <UTC time>` or `last deploy: rolled back <UTC time>` —
+> `last deploy: deployed <UTC time>`, `last deploy: rolled back <UTC time>` or
+> `last deploy: torn down <UTC time>` —
 > the host's own `date -u` clock, from a marker written by the ops that complete
 > a cutover. A deploy that failed *before* the cutover boundary never rewrites
 > it, so the host still shows its previous action: this is a per-host fact, not
 > a verdict on the last fleet rollout (the rollout itself exits non-zero and
 > prints its own per-host outcome table). A `rolled back` host was rolled back
-> by hand or compensated after a halted rollout. The cell reads
+> by hand or compensated after a halted rollout. A `torn down` host had its
+> first deploy removed again by a halted rollout's compensation — nothing is
+> installed on it, and the row's `not deployed` mode says so too. The cell reads
 > `last deploy: ?` when the marker is absent or unreadable — a host that has
 > never completed a cutover, or one last deployed by a CLI that predates the
 > marker — because "we could not tell" must never render as a result. It is

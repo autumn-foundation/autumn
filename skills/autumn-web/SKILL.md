@@ -2151,7 +2151,7 @@ code, maintenance flag, proxy port, last deploy result, drift reasons) plus
 damage that fails the NEXT deploy closed). An unreachable host is a row, not an
 abort; an unreadable release is reported as unknown and is **not** drift.
 `last deploy` is the last action that host COMPLETED (`deployed` / `rolled back`
-+ the host's UTC time, `?` when unreadable) — a deploy that failed before cutover
+/ `torn down` + the host's UTC time, `?` when unreadable) — a deploy that failed before cutover
 never rewrites it, so it is never a verdict on the last rollout, and it is
 reported, not drift. `--strict` exits non-zero on any drift (cron-alertable);
 `--json` is a stable contract: `hosts[]` with `host`, `reachable`, `mode`,

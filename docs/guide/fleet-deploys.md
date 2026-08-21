@@ -395,10 +395,13 @@ version drift. A false "your fleet is mixed" alarm at 3 am is worse than no
 alarm.
 
 Each row also carries a `last deploy` cell — the last action that host
-*completed* (`deployed` or `rolled back`, with the host's UTC time; `?` when the
-marker is absent or unreadable). Mid-incident that is what tells a compensated
-host apart from one that simply deployed, since both read back healthy and on
-the same release. Mind its scope: a deploy that failed *before* cutover never
+*completed* (`deployed`, `rolled back` or `torn down`, with the host's UTC time;
+`?` when the marker is absent or unreadable). Mid-incident that is what tells a
+compensated host apart from one that simply deployed, since both read back
+healthy and on the same release. A host the rollout compensated by removing its
+first deploy reads `torn down <time>`, which is how you tell it from a host that
+was never deployed at all — that one reads `?`. Mind its scope: a deploy that
+failed *before* cutover never
 rewrites it, so it is that host's own last completed action rather than a
 verdict on the last rollout, and it is reported, never counted as drift.
 

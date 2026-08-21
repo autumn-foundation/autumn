@@ -101,7 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn deploy maintenance` there. Three smaller changes complete the list: the
   ops that complete a cutover append an advisory fragment recording a
   `shared/last-deploy` marker naming the action that completed (what
-  `deploy status` reads, and it can never fail the op it rides on); the existing
+  `deploy status` reads, and it can never fail the op it rides on — a
+  compensated first-deploy teardown records `torn down`, so a host with nothing
+  installed never reads back as deployed); the existing
   `detect-current` probe resolves the `current`
   symlink in the same round-trip via one extra delimited section; and the "no
   target host configured" hint now names `[deploy] hosts` alongside
