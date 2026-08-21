@@ -183,14 +183,40 @@ pub fn polymorphic_comment_migrations(project_root: &Path) -> Vec<std::path::Pat
 /// table.
 fn is_polymorphic_up_sql(up_sql: &str) -> bool {
     let lowered = up_sql.to_ascii_lowercase();
-    // The discriminator pair is required for BOTH spellings. Matching an
-    // `IF NOT EXISTS` variant on the table name alone would mistake somebody
-    // else's idempotent `comments` table for this one, skip the shared
-    // migration, and report it as reused -- the same false positive the
-    // name-only check had, just narrower.
-    let creates_comments = lowered.contains(&format!("table if not exists {COMMENTS_TABLE}"))
-        || lowered.contains(&format!("table {COMMENTS_TABLE}"));
-    creates_comments && lowered.contains("commentable_type") && lowered.contains("commentable_id")
+    creates_comments_table(&lowered)
+        && lowered.contains("commentable_type")
+        && lowered.contains("commentable_id")
+}
+
+/// Whether `lowered` contains a `CREATE TABLE` naming **exactly** the shared
+/// comments table.
+///
+/// A prefix match is not enough: `CREATE TABLE comments_archive (...)` carrying
+/// the discriminator columns would satisfy every other check, and the generator
+/// would then skip the real table while reporting that it was reused. The name
+/// has to end where the identifier ends -- at whitespace, an opening paren, or
+/// the closing quote of a quoted identifier.
+fn creates_comments_table(lowered: &str) -> bool {
+    for prefix in [
+        format!("table if not exists {COMMENTS_TABLE}"),
+        format!("table if not exists \"{COMMENTS_TABLE}\""),
+        format!("table {COMMENTS_TABLE}"),
+        format!("table \"{COMMENTS_TABLE}\""),
+    ] {
+        let mut rest = lowered;
+        while let Some(at) = rest.find(&prefix) {
+            let after = &rest[at + prefix.len()..];
+            // A quoted spelling already ended at its closing quote.
+            if prefix.ends_with('"')
+                || after.is_empty()
+                || after.starts_with(|c: char| c.is_whitespace() || c == '(' || c == ';')
+            {
+                return true;
+            }
+            rest = &rest[at + prefix.len()..];
+        }
+    }
+    false
 }
 
 /// Push the shared comments migration onto `plan`, unless the project already
@@ -433,6 +459,38 @@ mod tests {
             !already_migrated(tmp.path()),
             "IF NOT EXISTS does not make an unrelated table polymorphic"
         );
+    }
+
+    /// A table whose name merely *starts* with `comments` is a different
+    /// table, even when it carries the discriminator columns.
+    #[test]
+    fn a_comments_prefixed_table_is_not_the_shared_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_archive");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments_archive (\n    id BIGSERIAL PRIMARY KEY,\n    \
+             commentable_type TEXT NOT NULL,\n    commentable_id BIGINT NOT NULL\n);\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "`comments_archive` is not `comments`"
+        );
+
+        // …while the real thing, quoted or not, still is.
+        for sql in [
+            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);",
+            "CREATE TABLE \"comments\" (commentable_type TEXT, commentable_id BIGINT);",
+            "CREATE TABLE IF NOT EXISTS comments(commentable_type TEXT, commentable_id BIGINT);",
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let dir = tmp.path().join("migrations").join("0001_real");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("up.sql"), sql).expect("write");
+            assert!(already_migrated(tmp.path()), "{sql}");
+        }
     }
 
     /// The shared migration must survive `destroy scaffold` while any other

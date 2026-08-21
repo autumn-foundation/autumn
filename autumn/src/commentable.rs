@@ -161,6 +161,14 @@ pub struct CommentableSpec {
     /// single-tenant app's SQL is byte-for-byte what it would be without this
     /// field.
     pub parent_tenant_column: Option<&'static str>,
+    /// Whether the parent model is sharded (`#[shard_key = "…"]`).
+    ///
+    /// The generic router refuses to serve a sharded model: it extracts a
+    /// plain `Db`, which always checks out the control pool, while the
+    /// generated repository helpers route through the shard the tenant
+    /// selects. Serving one from the other would probe and mutate the wrong
+    /// database — silently, wherever the same tables exist in both.
+    pub parent_sharded: bool,
     /// The author model's table, e.g. `users`, for resolving display names in
     /// [`comment_thread`]. `None` leaves [`Comment::author_name`] unresolved.
     pub author_table: Option<&'static str>,
@@ -392,6 +400,16 @@ pub fn duplicate_commentable_type() -> Option<&'static str> {
     let mut seen = std::collections::HashSet::new();
     inventory::iter::<CommentableDescriptor>()
         .find(|descriptor| !seen.insert(descriptor.type_name))
+        .map(|descriptor| descriptor.type_name)
+}
+
+/// The `commentable_type` of a registered model that is sharded, if any.
+///
+/// Used by [`router`] to refuse at wiring time: see [`CommentableSpec::parent_sharded`].
+#[must_use]
+pub fn sharded_commentable_type() -> Option<&'static str> {
+    inventory::iter::<CommentableDescriptor>()
+        .find(|descriptor| descriptor.spec.parent_sharded)
         .map(|descriptor| descriptor.type_name)
 }
 
@@ -1312,6 +1330,7 @@ mod tests {
             parent_soft_delete: false,
             counter_column: Some("comment_count"),
             parent_tenant_column: None,
+            parent_sharded: false,
             author_table: Some("users"),
             author_pk: "id",
             author_name_column: Some("username"),
@@ -1592,6 +1611,18 @@ where
          table cannot tell their rows apart. Give one of them \
          `#[commentable(type_name = \"…\")]`.",
         duplicate_commentable_type().unwrap_or_default(),
+    );
+    // A sharded model routes every query through the shard its tenant selects;
+    // this router checks out the control pool. There is no request-time answer
+    // that is not silently wrong, so refuse at wiring time — the repository
+    // helpers still work from the app's own (shard-aware) handlers.
+    assert!(
+        sharded_commentable_type().is_none(),
+        "#[commentable] model {:?} is sharded, and the generic comment router cannot serve it: \
+         it checks out the control database, while the model's repository helpers route through \
+         the tenant's shard. Serve its comments from your own handlers using the generated \
+         `{{Model}}Comments` methods.",
+        sharded_commentable_type().unwrap_or_default(),
     );
     axum::Router::new()
         .route(

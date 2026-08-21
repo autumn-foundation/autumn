@@ -5295,9 +5295,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 vis,
                 spec,
                 &table_name,
-                cmt_has_deleted_at,
-                cmt_has_tenant_id,
-                cmt_pk_ident,
+                &crate::commentable::ParentShape {
+                    has_deleted_at: cmt_has_deleted_at,
+                    has_tenant_id: cmt_has_tenant_id,
+                    is_sharded: shard_key_field.is_some(),
+                    pk_ident: cmt_pk_ident,
+                },
             )
         }
     };

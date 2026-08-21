@@ -458,6 +458,22 @@ pub fn resolve_commentable(
         .transpose()
 }
 
+/// What the parent model's own shape contributes to the emitted spec.
+///
+/// Bundled rather than passed as three adjacent `bool`s: transposing
+/// `has_tenant_id` and `is_sharded` at the call site would compile and then
+/// mis-scope every query the router runs.
+pub struct ParentShape<'a> {
+    /// The model has a `deleted_at` column, so the parent probe filters on it.
+    pub has_deleted_at: bool,
+    /// The model has a `tenant_id` column, so the probe can scope on it.
+    pub has_tenant_id: bool,
+    /// The model is `#[shard_key = "…"]`, which the generic router refuses.
+    pub is_sharded: bool,
+    /// The model's primary key field, for the `i64` guard.
+    pub pk_ident: Option<&'a syn::Ident>,
+}
+
 /// Emit everything a `#[commentable]` declaration generates.
 ///
 /// `pk_ident` is the model's primary-key field, resolved by the caller exactly
@@ -477,10 +493,14 @@ pub fn emit_commentable_items(
     vis: &syn::Visibility,
     spec: &CommentableSpec,
     parent_table: &str,
-    has_deleted_at: bool,
-    has_tenant_id: bool,
-    pk_ident: Option<&syn::Ident>,
+    parent: &ParentShape<'_>,
 ) -> TokenStream {
+    let ParentShape {
+        has_deleted_at,
+        has_tenant_id,
+        is_sharded,
+        pk_ident,
+    } = *parent;
     let model_snake = pascal_to_snake(&model_ident.to_string());
     let spec_static = format_ident!("__AUTUMN_COMMENTABLE_SPEC_{}", model_snake.to_uppercase());
     let trait_ident = format_ident!("{model_ident}Comments");
@@ -732,6 +752,7 @@ pub fn emit_commentable_items(
                 parent_soft_delete: #has_deleted_at,
                 counter_column: #counter_column,
                 parent_tenant_column: #parent_tenant_column,
+                parent_sharded: #is_sharded,
                 author_table: #author_table,
                 author_pk: #author_pk,
                 author_name_column: #author_name_column,
@@ -1139,9 +1160,20 @@ mod tests {
         let model: syn::Ident = syn::parse_quote!(Post);
         let vis: syn::Visibility = syn::parse_quote!(pub);
         let pk: syn::Ident = syn::parse_quote!(id);
-        let emitted = emit_commentable_items(&model, &vis, &spec, "posts", false, false, Some(&pk))
-            .to_token_stream()
-            .to_string();
+        let emitted = emit_commentable_items(
+            &model,
+            &vis,
+            &spec,
+            "posts",
+            &ParentShape {
+                has_deleted_at: false,
+                has_tenant_id: false,
+                is_sharded: false,
+                pk_ident: Some(&pk),
+            },
+        )
+        .to_token_stream()
+        .to_string();
 
         assert!(emitted.contains("PostComments"), "the trait name");
         assert!(emitted.contains("COMMENTABLE_TYPE"));
@@ -1165,18 +1197,40 @@ mod tests {
         let vis: syn::Visibility = syn::parse_quote!(pub);
         let pk: syn::Ident = syn::parse_quote!(id);
 
-        let plain = emit_commentable_items(&model, &vis, &spec, "posts", false, false, Some(&pk))
-            .to_token_stream()
-            .to_string();
+        let plain = emit_commentable_items(
+            &model,
+            &vis,
+            &spec,
+            "posts",
+            &ParentShape {
+                has_deleted_at: false,
+                has_tenant_id: false,
+                is_sharded: false,
+                pk_ident: Some(&pk),
+            },
+        )
+        .to_token_stream()
+        .to_string();
         assert!(plain.contains("parent_soft_delete : false"), "{plain}");
         assert!(
             plain.contains("parent_tenant_column : :: core :: option :: Option :: None"),
             "{plain}"
         );
 
-        let tenanted = emit_commentable_items(&model, &vis, &spec, "posts", true, true, Some(&pk))
-            .to_token_stream()
-            .to_string();
+        let tenanted = emit_commentable_items(
+            &model,
+            &vis,
+            &spec,
+            "posts",
+            &ParentShape {
+                has_deleted_at: true,
+                has_tenant_id: true,
+                is_sharded: false,
+                pk_ident: Some(&pk),
+            },
+        )
+        .to_token_stream()
+        .to_string();
         assert!(tenanted.contains("parent_soft_delete : true"), "{tenanted}");
         assert!(tenanted.contains("\"tenant_id\""), "{tenanted}");
     }
