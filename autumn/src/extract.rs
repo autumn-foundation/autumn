@@ -1,7 +1,10 @@
-//! Re-exports of Axum extractors for use in Autumn handlers.
+//! Autumn's request extractors.
 //!
-//! These are provided so users don't need `axum` as a direct dependency
-//! for the most common extractor types.
+//! Most are thin wrappers over the Axum extractor of the same name, provided so
+//! users don't need `axum` as a direct dependency and so parse failures use
+//! Autumn's Problem Details error contract. [`Query`] is the exception: it
+//! decodes through [`crate::query_string`], which accepts sequences and nested
+//! structures the flat `serde_urlencoded` form cannot express.
 //!
 //! | Extractor | Purpose |
 //! |-----------|---------|
@@ -144,29 +147,34 @@ where
 
 /// Deserialize URL query string parameters.
 ///
-/// Wraps [`axum::extract::Query`] so query parse failures use Autumn's
-/// Problem Details error contract.
+/// Query parse failures use Autumn's Problem Details error contract.
 ///
-/// # Query strings are flat
+/// # Sequences and nested structures
 ///
-/// Deserialization goes through
-/// [`serde_urlencoded`](https://docs.rs/serde_urlencoded), which is **strictly
-/// flat**: it decodes scalar fields (`?q=foo&page=2`) and nothing else. It
-/// **cannot** deserialize a nested struct by any encoding — neither bracketed
-/// (`key[sub]=`) nor JSON-in-a-string — and it **cannot** collect repeated
-/// keys into a sequence: a `Vec<String>` field fed `?tags=a&tags=b` fails with
-/// `invalid type: string "a", expected a sequence`. If a request needs a
-/// sequence or structured/nested input, take it as a JSON body
-/// ([`Json<T>`](crate::extract::Json)) instead of a query struct.
+/// Decoding goes through [`query_string`](crate::query_string), a **superset**
+/// of the flat `serde_urlencoded` form: a query string of unique scalar keys
+/// decodes exactly as it always did, and on top of that
+///
+/// ```text
+/// tags=a&tags=b               // repeated key   → Vec<String>
+/// tags[]=a&tags[]=b           // append form    → Vec<String>
+/// tags[0]=a&tags[2]=c         // indexed form   → Vec<String> (gaps compacted)
+/// filter[status]=open         // nested object  → struct field
+/// items[0][sku]=A-1           // array of objects
+/// ```
+///
+/// are all accepted — a bracketed dialect whose `items[0][sku]` shape matches
+/// the repeated-row encoding [`nested_form`](crate::nested_form) renders,
+/// generalized to arbitrary objects, sequences and depths. It applies to the
+/// query string only: [`Form<T>`] still decodes request bodies through
+/// `serde_urlencoded`. See [`query_string`](crate::query_string) for the exact
+/// semantics — scalar coercion, duplicate-key rejection, shape conflicts, the
+/// depth cap, and what changed for `HashMap`-typed targets.
 ///
 /// This also shapes MCP tool exposure (issue #1972): a `Query<T>` becomes the
-/// tool's `query` object property, and dispatch renders it as flat `key=value`
-/// pairs. A `Query<T>` whose schema has a nested object / array-of-object field
-/// therefore cannot round-trip, and Autumn emits a build-time `tracing::warn`
-/// steering that input to a JSON body. See the [MCP guide]'s "Query is flat"
-/// note.
-///
-/// [MCP guide]: https://docs.rs/autumn-web (guide/mcp.md)
+/// tool's `query` object property, and `tools/call` dispatch renders that
+/// object into this same wire format, so a tool advertising a sequence or a
+/// nested object round-trips back into the handler's typed struct.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Query<T>(pub T);
 
@@ -175,19 +183,23 @@ impl_extractor_deref!(Query);
 impl<S, T> FromRequestParts<S> for Query<T>
 where
     S: Send + Sync,
-    axum::extract::Query<T>:
-        FromRequestParts<S, Rejection = axum::extract::rejection::QueryRejection>,
+    T: serde::de::DeserializeOwned,
 {
     type Rejection = crate::AutumnError;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
-        state: &S,
+        _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        axum::extract::Query::from_request_parts(parts, state)
-            .await
-            .map(|axum::extract::Query(value)| Self(value))
-            .map_err(|err| rejection_to_error(err.status(), err.body_text()))
+        let query = parts.uri.query().unwrap_or_default();
+        crate::query_string::from_query_str::<T>(query)
+            .map(Self)
+            .map_err(|err| {
+                rejection_to_error(
+                    http::StatusCode::BAD_REQUEST,
+                    format!("Failed to deserialize query string: {err}"),
+                )
+            })
     }
 }
 
