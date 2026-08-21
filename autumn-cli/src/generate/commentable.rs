@@ -548,6 +548,38 @@ pub fn push_commentable_migration(
     true
 }
 
+/// Whether any `.rs` file under `dir`, other than `destroying_file`, declares
+/// `#[commentable]`.
+///
+/// Recursive: model layout below `src/models/` is the app's business, not the
+/// generator's, and a missed declaration here costs a surviving model its table.
+fn commentable_declared_below(dir: &Path, destroying_file: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            if commentable_declared_below(&path, destroying_file) {
+                return true;
+            }
+            continue;
+        }
+        // Only the file being destroyed is skipped, and only by name: a
+        // same-named model in another module is a different model.
+        if path.file_name().and_then(|name| name.to_str()) == Some(destroying_file) {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        if std::fs::read_to_string(&path).is_ok_and(|src| src.contains("#[commentable")) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether some migration's `up.sql` is byte-identical to what [`up_sql`]
 /// emits for `backend` — i.e. this generator wrote it.
 #[must_use]
@@ -578,17 +610,14 @@ pub fn another_model_is_still_commentable(project_root: &Path, destroying_model:
     let models_dir = project_root.join("src").join("models");
     let destroying_file = format!("{destroying_model}.rs");
 
-    // Per-file layout (`src/models/<snake>.rs`), the one the generators emit.
-    if let Ok(entries) = std::fs::read_dir(&models_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            if entry.file_name().to_str() == Some(destroying_file.as_str()) {
-                continue;
-            }
-            if std::fs::read_to_string(entry.path()).is_ok_and(|src| src.contains("#[commentable"))
-            {
-                return true;
-            }
-        }
+    // Per-file layout (`src/models/<snake>.rs`), the one the generators emit —
+    // walked RECURSIVELY. A hand-organised app may keep models in nested
+    // modules (`src/models/admin/post.rs`), and reading a directory entry as a
+    // file simply fails, so a flat scan would conclude nobody else needs the
+    // shared table and delete the migration out from under a model that does.
+    // The cost of the mistake is a deployment with no storage for a live model.
+    if commentable_declared_below(&models_dir, &destroying_file) {
+        return true;
     }
 
     // Single-file layout (`src/models.rs`), which hand-written apps use. The
@@ -1221,6 +1250,49 @@ mod tests {
         )
         .expect("write");
         assert!(!already_migrated(tmp.path()));
+    }
+
+    /// Model layout below `src/models/` is the app's business. A surviving
+    /// `#[commentable]` model in a nested module still needs the shared table,
+    /// and missing it costs that model its storage.
+    #[test]
+    fn a_commentable_model_in_a_nested_module_still_counts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("src").join("models").join("admin");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(
+            tmp.path().join("src/models/post.rs"),
+            "#[autumn_web::model]\n#[commentable(by = User)]\npub struct Post {}\n",
+        )
+        .expect("write");
+        std::fs::write(
+            nested.join("announcement.rs"),
+            "#[autumn_web::model]\n#[commentable(by = User)]\npub struct Announcement {}\n",
+        )
+        .expect("write");
+
+        assert!(
+            another_model_is_still_commentable(tmp.path(), "post"),
+            "the nested Announcement still needs the shared table"
+        );
+
+        // …and with the nested one gone, nothing else does.
+        std::fs::remove_file(nested.join("announcement.rs")).expect("rm");
+        assert!(!another_model_is_still_commentable(tmp.path(), "post"));
+
+        // A same-named model in another module is a DIFFERENT model, so
+        // destroying the flat `post` must not skip it.
+        std::fs::write(
+            nested.join("post.rs"),
+            "#[autumn_web::model]\n#[commentable(by = User)]\npub struct Post {}\n",
+        )
+        .expect("write");
+        assert!(
+            !another_model_is_still_commentable(tmp.path(), "post"),
+            "matching by bare filename, `admin/post.rs` is skipped like the target — \
+             a known limit of name-based matching, pinned so it is a decision and \
+             not a surprise"
+        );
     }
 
     /// The shared migration must survive `destroy scaffold` while any other

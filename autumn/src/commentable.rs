@@ -2030,10 +2030,14 @@ async fn post_comment(
     csrf: Option<crate::security::csrf::CsrfToken>,
     csrf_field: Option<crate::security::csrf::CsrfFormField>,
     htmx: crate::htmx::HxRequest,
-    // Before `Db`, as in `show_thread`: a policy check that reads the database
-    // must not run while this request is already holding a connection.
+    // Before the checkout, as in `show_thread`: a policy check that reads the
+    // database must not run while this request is already holding a connection.
     AuthorizedComment { author_id }: AuthorizedComment,
-    mut db: crate::db::Db,
+    // NOT `Db`. An eager checkout here would be taken before axum runs the
+    // `Form` extractor below, so the connection would be held for as long as
+    // the client takes to send its body — which the client chooses. Enough
+    // slow-body requests would pin the whole pool.
+    deferred_db: crate::db::DeferredDb,
     axum::extract::Form(submission): axum::extract::Form<CommentSubmission>,
 ) -> AutumnResult<axum::response::Response> {
     use axum::response::IntoResponse as _;
@@ -2059,6 +2063,10 @@ async fn post_comment(
         .return_to
         .as_deref()
         .filter(|path| is_safe_return_path(path));
+
+    // The body is read and validated, so take the connection now. A malformed
+    // submission is rejected above without ever touching the pool.
+    let mut db = deferred_db.checkout().await?;
 
     let outcome = add_comment(
         &mut db,

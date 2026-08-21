@@ -601,6 +601,12 @@ fn is_update_writable(
         // excludes its own column) — referencing `new_row.<position_field>`
         // here would fail to compile.
         && !field.kind.is_position()
+        // Issue #1367: the same reasoning, one field kind over. The
+        // `#[commentable]` counter is emitted `#[default]`, so it is absent from
+        // `New{Model}`/`Update{Model}` too, and `Patch::Set(new_row.comment_count)`
+        // would not compile. Hiding the control (see the `FieldKind` arm above)
+        // was only half of it: the control and the write path have to agree.
+        && !field.kind.is_commentable()
         && !matches!(field.kind, FieldKind::Bytea)
         // Issue #1340: an at-rest encrypted column is not updatable through the
         // admin. The plugin renders its edit control disabled and WITHOUT a
@@ -1741,6 +1747,35 @@ mod tests {
             !admin.contains("new_row.rank") && !admin.contains("rank: Patch::Set"),
             "a position field must never be referenced in the New/Update struct \
              construction, both of which exclude it:\n{admin}"
+        );
+        assert!(
+            admin.contains("title: Patch::Set(new_row.title)"),
+            "the ordinary field must still be writable:\n{admin}"
+        );
+    }
+
+    #[test]
+    fn commentable_counter_excluded_from_admin_update_body() {
+        // Issue #1367: the `comments:commentable` counter is emitted
+        // `#[default]`, so it is absent from `New{Model}`/`Update{Model}` just
+        // like `#[position]` — and `Patch::Set(new_row.comment_count)` would
+        // fail to compile. Hiding the edit control was only half the fix; the
+        // control and the write path have to agree.
+        let tmp = project_with_model("post");
+        let plan = plan_admin(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "comments:commentable".into()],
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
+        assert!(
+            !admin.contains("new_row.comment_count")
+                && !admin.contains("comment_count: Patch::Set"),
+            "the commentable counter must never be referenced in the New/Update \
+             struct construction:\n{admin}"
         );
         assert!(
             admin.contains("title: Patch::Set(new_row.title)"),
