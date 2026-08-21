@@ -270,7 +270,7 @@ impl<'a> Parser<'a> {
         &self.input[start..self.pos]
     }
 
-    fn skip_whitespace(&mut self) {
+    const fn skip_whitespace(&mut self) {
         while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
             self.pos += 1;
         }
@@ -906,7 +906,7 @@ const fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
 }
 
-fn skip_ws(chars: &[char], i: &mut usize) {
+const fn skip_ws(chars: &[char], i: &mut usize) {
     while *i < chars.len() && chars[*i].is_whitespace() {
         *i += 1;
     }

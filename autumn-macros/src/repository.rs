@@ -19709,7 +19709,7 @@ mod tests {
             .find("async fn delete_by_id")
             .expect("repository must generate delete_by_id");
         let rest = &generated[start + "async fn delete_by_id".len()..];
-        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        let end = rest.find("async fn ").unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -19720,7 +19720,7 @@ mod tests {
             .find("async fn delete_many")
             .expect("repository must generate delete_many");
         let rest = &generated[start + "async fn delete_many".len()..];
-        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        let end = rest.find("async fn ").unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -19733,7 +19733,7 @@ mod tests {
             .find(needle)
             .expect("repository must generate update");
         let rest = &generated[start + needle.len()..];
-        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        let end = rest.find("async fn ").unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -19786,7 +19786,7 @@ mod tests {
             .find("async fn find_by_id")
             .expect("repository must generate find_by_id");
         let rest = &generated[find_start + "async fn find_by_id".len()..];
-        let find_by_id = &rest[..rest.find("async fn ").map_or(rest.len(), |p| p)];
+        let find_by_id = &rest[..rest.find("async fn ").unwrap_or(rest.len())];
         assert!(
             !find_by_id.contains("scoped_immediate_transaction"),
             "find_by_id (read) must not open an immediate write transaction: {find_by_id}"

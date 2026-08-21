@@ -249,7 +249,7 @@ pub(super) fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
 
 /// Whether the byte before `i` is an identifier-continuation char, used to
 /// avoid mistaking a trailing `r`/`b` inside an identifier for a raw string.
-fn prev_is_ident_char(bytes: &[u8], i: usize) -> bool {
+const fn prev_is_ident_char(bytes: &[u8], i: usize) -> bool {
     i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')
 }
 

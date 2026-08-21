@@ -1391,6 +1391,13 @@ fn in_flight_lock_owner(entropy: &dyn crate::entropy::Entropy) -> String {
     entropy.uuid_v4().to_string()
 }
 
+// `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
+// 128 bytes — that is `axum::response::Response`'s own size, not something this
+// crate chose. Returning a ready-made rejection response IS the idiom here, and
+// boxing it would add an allocation to every rejection path to satisfy a size
+// heuristic. Allowed at the site rather than workspace-wide so the lint stays
+// armed for error types we do control.
+#[allow(clippy::result_large_err)]
 async fn prepare_idempotency_request(
     idempotency_key: String,
     req: Request<Body>,
