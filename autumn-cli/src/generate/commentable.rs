@@ -217,7 +217,11 @@ fn comments_table_spellings(verb: &str) -> Vec<String> {
         format!("\"public\".{COMMENTS_TABLE}"),
         format!("\"public\".\"{COMMENTS_TABLE}\""),
     ];
-    let existence = ["", "if exists ", "if not exists "];
+    // `ONLY` is PostgreSQL's "do not recurse to inheritance children" marker
+    // and sits exactly where `IF EXISTS` does, so a converted table spelled
+    // `ALTER TABLE ONLY comments ADD COLUMN commentable_type …` would otherwise
+    // go unrecognised and the generator would emit a duplicate table.
+    let existence = ["", "if exists ", "if not exists ", "only "];
     let mut spellings = Vec::with_capacity(names.len() * existence.len());
     for exists in existence {
         for name in &names {
@@ -1577,6 +1581,48 @@ mod tests {
             !already_migrated(tmp.path()),
             "the last create declares no discriminator columns"
         );
+    }
+
+    /// `ONLY` sits where `IF EXISTS` does, and a converted table is commonly
+    /// spelled with it.
+    #[test]
+    fn alter_table_only_is_recognised() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let migrations = tmp.path().join("migrations");
+        let created = migrations.join("0001_create");
+        std::fs::create_dir_all(&created).expect("mkdir");
+        std::fs::write(
+            created.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);\n",
+        )
+        .expect("write");
+        assert!(!already_migrated(tmp.path()));
+
+        let altered = migrations.join("0002_convert");
+        std::fs::create_dir_all(&altered).expect("mkdir");
+        std::fs::write(
+            altered.join("up.sql"),
+            "ALTER TABLE ONLY comments ADD COLUMN commentable_type TEXT;\n\
+             ALTER TABLE ONLY comments ADD COLUMN commentable_id BIGINT;\n",
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "ALTER TABLE ONLY converts the table just as ALTER TABLE does"
+        );
+
+        // …and ONLY does not make another table's name match.
+        let other = tempfile::tempdir().expect("tempdir");
+        let dir = other.path().join("migrations").join("0001_other");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);\n\
+             ALTER TABLE ONLY comments_archive ADD COLUMN commentable_type TEXT;\n\
+             ALTER TABLE ONLY comments_archive ADD COLUMN commentable_id BIGINT;\n",
+        )
+        .expect("write");
+        assert!(!already_migrated(other.path()));
     }
 
     /// The shared migration must survive `destroy scaffold` while any other

@@ -452,6 +452,82 @@ pub(super) fn builtin_stories() -> Vec<Story> {
         },
         story! {
             "Display",
+            "Comment thread",
+            {
+                use autumn_web::widgets::{CommentThread, CommentView, comment_dom_id, comment_thread};
+
+                // The view half of `#[commentable]`. The router hands back a
+                // nested thread; this renders it with an inline reply form per
+                // node. Plain POST forms, swapped in place by htmx when it is
+                // present and a full page load when it is not.
+                let thread = vec![
+                    CommentView {
+                        id: 7,
+                        author: "ada".to_owned(),
+                        body: "Does this nest?".to_owned(),
+                        datetime: Some("2026-08-21T09:30:00Z".to_owned()),
+                        timestamp: "2026-08-21 09:30".to_owned(),
+                        replies: vec![CommentView {
+                            id: 8,
+                            author: "grace".to_owned(),
+                            body: "It does — up to `max_depth`,\nafter which the reply form stops rendering.".to_owned(),
+                            datetime: Some("2026-08-21T09:41:00Z".to_owned()),
+                            timestamp: "2026-08-21 09:41".to_owned(),
+                            replies: Vec::new(),
+                        }],
+                    },
+                    CommentView {
+                        id: 9,
+                        author: "linus".to_owned(),
+                        body: "A second top-level comment.".to_owned(),
+                        datetime: None,
+                        timestamp: String::new(),
+                        replies: Vec::new(),
+                    },
+                ];
+
+                let signed_in = CommentThread::new("comments-post-42", "/comments/Post/42")
+                    .label("Post comments")
+                    .csrf_token("story-token")
+                    .return_to("/posts/42");
+
+                // Anything linking to one comment — a notification, an email —
+                // needs the id the widget actually renders, so the convention
+                // has one definition rather than a copy per caller.
+                let deep_link = comment_dom_id("comments-post-42", 8);
+
+                maud::html! {
+                    (comment_thread(&signed_in, &thread))
+
+                    // Signed out: the thread still reads, the form is replaced
+                    // by a prompt rather than a control that would 401.
+                    (comment_thread(
+                        &CommentThread::new("comments-post-43", "/comments/Post/43")
+                            .label("Signed-out view")
+                            .read_only()
+                            .sign_in_prompt("Log in to comment."),
+                        &thread,
+                    ))
+
+                    // Empty, and a rejected submission re-rendered inline —
+                    // a bare 422 would be swallowed by htmx.
+                    (comment_thread(
+                        &CommentThread::new("comments-post-44", "/comments/Post/44")
+                            .label("Empty and errored")
+                            .empty_text("No comments yet. Start the conversation!")
+                            .csrf_token("story-token")
+                            .error("Comment cannot be empty."),
+                        &[],
+                    ))
+
+                    p class="text-sm text-gray-500" {
+                        "Deep link to the nested reply: #" (deep_link)
+                    }
+                }
+            }
+        },
+        story! {
+            "Display",
             "Reaction controls",
             {
                 use autumn_web::widgets::{ReactionControls, reaction_controls};
