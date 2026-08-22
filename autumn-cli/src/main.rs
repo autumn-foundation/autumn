@@ -841,19 +841,42 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Release(ReleaseCommands),
 
-    /// Push-button, zero-downtime deploys to a VPS (issue #1607).
+    /// Push-button, zero-downtime deploys to a VPS or a fleet (issues #1607, #1621).
     ///
-    /// Run from the project root. `check` runs a local preflight, `plan` and
-    /// `rollback` print dry-run plans, and `up` performs a real first deploy over
-    /// SSH (cutover/rollback land in follow-ups). Configure the target under
-    /// `[deploy]` in autumn.toml.
+    /// Run from the project root. `check` runs a preflight against every configured
+    /// host, `plan` prints the dry-run plan, `up` performs a real rolling deploy over
+    /// SSH, and `rollback` returns the fleet to its previous release. Configure the
+    /// target under `[deploy] host` (one server) or `[deploy] hosts` (a fleet, in
+    /// rollout order) in autumn.toml.
+    ///
+    /// Fleet flags:
+    ///   --only <HOST>   repeatable; restrict `up`/`rollback` to these hosts. A
+    ///                   REPAIR LEVER: it leaves the skipped hosts on their current
+    ///                   release, so the fleet may end up mixed.
+    ///   --no-rollback   on `up`, halt and FREEZE a failed rollout for inspection
+    ///                   instead of automatically rolling the cut-over hosts back.
+    ///
+    /// Fleet visibility and control (issue #1621):
+    ///   status          read-only per-host state (release, readiness, maintenance,
+    ///                   proxy) plus version/state drift; `--json` for machines,
+    ///                   `--strict` exits non-zero on drift (cron-alertable).
+    ///   maintenance     turn maintenance mode on|off on EVERY configured host over
+    ///                   SSH (the local `autumn maintenance` only writes this
+    ///                   machine's working directory). NOTE: maintenance does not
+    ///                   drain a host from your load balancer — /ready stays 200.
     ///
     /// # Examples
     ///
     ///   autumn deploy check
     ///   autumn deploy plan
     ///   autumn deploy rollback
+    ///   autumn deploy rollback --only web-2.example.com
     ///   autumn deploy up
+    ///   autumn deploy up --only web-2.example.com
+    ///   autumn deploy up --no-rollback
+    ///   autumn deploy status --json --strict
+    ///   autumn deploy maintenance on --message "Upgrading database schema"
+    ///   autumn deploy maintenance off
     #[command(subcommand, verbatim_doc_comment)]
     Deploy(DeployCommands),
 
@@ -1106,6 +1129,11 @@ enum Commands {
     /// Writes (or removes) a JSON flag file that the running app polls every
     /// 500 ms. Within one second every replica responds 503 to non-bypassed
     /// HTTP traffic while health-check routes stay green.
+    ///
+    /// LOCAL only: the flag lands in THIS working directory. For servers
+    /// managed by `autumn deploy` (`[deploy] host`/`hosts`), use
+    /// `autumn deploy maintenance on|off`, which fans the same flag out to
+    /// every host over SSH (issue #1621).
     ///
     /// # Examples
     ///
@@ -2197,7 +2225,18 @@ enum DeployCommands {
     /// Resolves the previous release on the target, brings its slot back up,
     /// flips the proxy back to it, repoints `current`, and re-probes `/ready`.
     /// Fails loudly (non-zero) when there is no previous release to roll back to.
-    Rollback,
+    ///
+    /// With `[deploy] hosts` this rolls back EVERY host, newest first, continuing
+    /// past a host that fails (each is reported) and exiting non-zero if any host
+    /// did not come back.
+    Rollback {
+        /// Roll back only this host; repeat the flag for several (issue #1621).
+        ///
+        /// Each value must appear in `[deploy] hosts`. The hosts left out keep
+        /// running whatever they are running now, so the fleet may end up mixed.
+        #[arg(long, value_name = "HOST")]
+        only: Vec<String>,
+    },
 
     /// Run the preflight, then perform a REAL deploy over SSH.
     ///
@@ -2207,7 +2246,100 @@ enum DeployCommands {
     /// installs the proxy and stands the release up behind it; a redeploy runs a
     /// zero-downtime cutover and auto-rolls-back the candidate on a pre-cutover
     /// failure.
-    Up,
+    ///
+    /// With `[deploy] hosts` the hosts are replaced ONE AT A TIME in declaration
+    /// order, migrations run exactly once, and a mid-rollout failure halts the
+    /// rollout and rolls the hosts that already cut over back.
+    Up {
+        /// Deploy only this host; repeat the flag for several (issue #1621).
+        ///
+        /// Each value must appear in `[deploy] hosts`. A REPAIR LEVER, not a faster
+        /// deploy: the skipped hosts keep their current release, so finish with a
+        /// full `autumn deploy up` to converge the fleet.
+        #[arg(long, value_name = "HOST")]
+        only: Vec<String>,
+
+        /// Halt and FREEZE a failed rollout instead of rolling the cut-over hosts
+        /// back (issue #1621).
+        ///
+        /// Every host is left exactly as it is — including the ones already on the
+        /// new release — and named in the final state table, so the failure can be
+        /// inspected before anything else moves.
+        #[arg(long)]
+        no_rollback: bool,
+    },
+
+    /// Report every configured host's deploy state, read-only (issue #1621).
+    ///
+    /// One row per `[deploy] hosts` entry: mode, deployed release (from the
+    /// `current` symlink), live slot, /ready status, maintenance flag, and proxy
+    /// port — plus version drift (hosts on different releases) and state drift
+    /// (per-host marker damage that will fail the NEXT deploy closed). Touches
+    /// nothing; safe mid-incident.
+    Status {
+        /// Emit the stable JSON report on stdout instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero when ANY drift is detected, so drift is alertable from
+        /// cron. The default exits 0 — status is a report, not a judgement.
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Fleet-wide maintenance mode over SSH (issue #1621).
+    ///
+    /// Applies to the DEPLOY-CONFIGURED host(s) — `[deploy] host` or `[deploy]
+    /// hosts` — unlike the top-level `autumn maintenance`, which only writes this
+    /// machine's own working directory. Best-effort: every host is attempted, the
+    /// per-host table names what changed, and the command exits non-zero if any
+    /// host failed (the changed hosts are NOT reversed).
+    ///
+    /// Maintenance mode does NOT drain a host from your load balancer: /ready
+    /// stays 200 by design, so a maintained host keeps taking traffic and answers
+    /// it with 503. Drain at the load balancer if you need a host out of rotation.
+    #[command(subcommand)]
+    Maintenance(DeployMaintenanceCommands),
+}
+
+/// Subcommands for `autumn deploy maintenance` (issue #1621).
+#[derive(Subcommand)]
+enum DeployMaintenanceCommands {
+    /// Enable maintenance mode on every configured deploy host.
+    ///
+    /// Writes the same flag file the local `autumn maintenance on` writes, to the
+    /// per-app shared dir on each host (and, for hosts still running pre-#1621
+    /// units, to the current release's tmp/ dir), so running apps react within
+    /// 500 ms without a restart.
+    ///
+    /// # Examples
+    ///
+    ///   autumn deploy maintenance on
+    ///   autumn deploy maintenance on --message "Upgrading database schema"
+    ///   autumn deploy maintenance on --readonly
+    ///   autumn deploy maintenance on --allow-ips 10.0.0.0/8 --bypass-header X-Dev-Bypass:mytoken
+    #[command(verbatim_doc_comment)]
+    On {
+        /// Human-readable message shown to users in the 503 response body.
+        #[arg(long, value_name = "MSG")]
+        message: Option<String>,
+        /// CIDR block or IP address whose requests bypass maintenance.
+        /// Repeatable: `--allow-ips 10.0.0.0/8 --allow-ips 172.16.0.1`
+        #[arg(long, value_name = "CIDR")]
+        allow_ips: Vec<String>,
+        /// Allow GET, HEAD, OPTIONS through while blocking writes.
+        #[arg(long)]
+        readonly: bool,
+        /// Bypass header in NAME:VALUE format.
+        /// Requests carrying this header+value bypass the 503.
+        /// Example: `--bypass-header X-Autumn-Maintenance-Bypass:mytoken`
+        #[arg(long, value_name = "NAME:VALUE")]
+        bypass_header: Option<String>,
+    },
+    /// Disable maintenance mode on every configured deploy host.
+    ///
+    /// Removes the flag file(s); a host where maintenance was already off is a
+    /// success, not an error.
+    Off,
 }
 
 /// Subcommands for `autumn generate`.
@@ -4065,14 +4197,81 @@ fn run_release_command(cmd: ReleaseCommands) {
     }
 }
 
+/// Map a `deploy` subcommand onto the (action, options) pair `deploy::run` takes.
+///
+/// [`deploy::DeployAction`] stays a fieldless `Copy` enum and the flags travel
+/// beside it in [`deploy::DeployOptions`] (issue #1621, §3.1), so adding a flag
+/// never ripples through the action enum or its call sites. Every construction here
+/// spreads `..Default::default()` for the same reason.
 fn run_deploy_command(cmd: &DeployCommands) {
-    let action = match cmd {
-        DeployCommands::Check => deploy::DeployAction::Check,
-        DeployCommands::Plan => deploy::DeployAction::Plan,
-        DeployCommands::Rollback => deploy::DeployAction::Rollback,
-        DeployCommands::Up => deploy::DeployAction::Up,
+    let (action, options) = match cmd {
+        DeployCommands::Check => (
+            deploy::DeployAction::Check,
+            deploy::DeployOptions::default(),
+        ),
+        DeployCommands::Plan => (deploy::DeployAction::Plan, deploy::DeployOptions::default()),
+        DeployCommands::Rollback { only } => (
+            deploy::DeployAction::Rollback,
+            deploy::DeployOptions {
+                only: only.clone(),
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Up { only, no_rollback } => (
+            deploy::DeployAction::Up,
+            deploy::DeployOptions {
+                only: only.clone(),
+                no_rollback: *no_rollback,
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Status { json, strict } => (
+            deploy::DeployAction::Status,
+            deploy::DeployOptions {
+                json: *json,
+                strict: *strict,
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Maintenance(cmd) => match cmd {
+            DeployMaintenanceCommands::On {
+                message,
+                allow_ips,
+                readonly,
+                bypass_header,
+            } => {
+                // Same parse (and same failure behavior) as the local
+                // `autumn maintenance on`, so the two surfaces reject a malformed
+                // NAME:VALUE identically.
+                let parsed_bypass = bypass_header.as_deref().map(|s| {
+                    maintenance::parse_bypass_header(s).map_or_else(
+                        |e| {
+                            eprintln!("autumn deploy maintenance on: {e}");
+                            std::process::exit(1);
+                        },
+                        |(name, value)| (name.to_owned(), value.to_owned()),
+                    )
+                });
+                (
+                    deploy::DeployAction::MaintenanceOn,
+                    deploy::DeployOptions {
+                        maintenance: Some(deploy::MaintenanceOnArgs {
+                            message: message.clone(),
+                            allow_ips: allow_ips.clone(),
+                            readonly: *readonly,
+                            bypass_header: parsed_bypass,
+                        }),
+                        ..deploy::DeployOptions::default()
+                    },
+                )
+            }
+            DeployMaintenanceCommands::Off => (
+                deploy::DeployAction::MaintenanceOff,
+                deploy::DeployOptions::default(),
+            ),
+        },
     };
-    if let Err(e) = deploy::run(action) {
+    if let Err(e) = deploy::run(action, &options) {
         eprintln!("autumn deploy: {e}");
         std::process::exit(1);
     }

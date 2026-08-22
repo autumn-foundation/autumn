@@ -30,6 +30,83 @@ alongside the app and needs no IPC or HTTP endpoint to communicate the state
 change. Any replica that can see the same working directory (local dev, a
 Docker-compose mount, a Fly.io shared volume) reacts in lock-step.
 
+> **"Same working directory" is the limit of that lock-step.** Replicas on
+> *different machines* do not see each other's flag file, so the local
+> `autumn maintenance` cannot gate a multi-host fleet — it only writes the
+> machine it runs on. For hosts managed by `autumn deploy` (`[deploy] host` or
+> `[deploy] hosts`), use
+> [`autumn deploy maintenance on|off`](#fleet-wide-maintenance-autumn-deploy-maintenance),
+> which writes the same flag file to every configured host over SSH. Running the
+> local command *on* a deploy-managed host does not help either — it writes a
+> path the app no longer reads, silently and with exit `0`. See
+> [Where the flag file lives](#where-the-flag-file-lives).
+
+### Where the flag file lives
+
+The default path is `tmp/autumn-maintenance.json`, **relative to the process's
+working directory**. Set `AUTUMN_MAINTENANCE_FLAG_FILE` to an absolute path to
+put it somewhere else; the app reads that variable both at startup and in the
+500 ms poller, so the two can never disagree. An unset or blank value falls back
+to the default, so an app that does not set it is unaffected.
+
+Hosts deployed by `autumn deploy` get this automatically. Each slot unit is
+written with
+
+```ini
+Environment=AUTUMN_MAINTENANCE_FLAG_FILE=/srv/autumn/myapp/shared/autumn-maintenance.json
+```
+
+pointing at the per-app `shared/` directory. That matters because a slot unit's
+`WorkingDirectory` is the **release** directory, which is new on every deploy: on
+the default cwd-relative path a cutover would orphan an active maintenance flag
+and silently un-maintain the host, and the blue and green slots could not see
+each other's flag at all. The `shared/` directory survives cutovers, rollbacks
+and pruning, and both slots read it.
+
+> **On a deploy-managed host, the local `autumn maintenance` command no longer
+> does anything.** `autumn maintenance on|off` always writes and removes
+> `tmp/autumn-maintenance.json` relative to its own working directory — it is a
+> separate process from the app, it does not read the unit's `Environment=`, and
+> it has no flag to point it elsewhere. On a host deployed by `autumn deploy`,
+> the app reads `{app_dir}/shared/autumn-maintenance.json`, so SSH-ing in and
+> running `autumn maintenance on` writes a file nothing reads: the command exits
+> `0`, and the host keeps serving traffic normally. There is no error to warn
+> you.
+>
+> **On deploy-managed hosts, use
+> [`autumn deploy maintenance on|off`](#fleet-wide-maintenance-autumn-deploy-maintenance)**
+> — from your workstation or CI, not from the host. It writes the path the slot
+> units actually point at (and, for a host still running a unit deployed before
+> this existed, the old release-relative path as well — resolved from that host's
+> **live slot unit**, not from its `current` symlink), on every configured host,
+> and reports per host what it changed, failing closed on any host whose live unit
+> it could not read. The local command remains the right tool
+> for local development and for replicas that share a working directory
+> (docker-compose, a Fly.io volume) — anywhere the app and the CLI see the same
+> directory and no unit is overriding the path.
+
+**`autumn deploy status` resolves this per host rather than assuming it.** Its
+maintenance column does not read one fixed path: for each host it reads the
+**live slot unit** and resolves the flag file that unit makes the app poll —
+`Environment=AUTUMN_MAINTENANCE_FLAG_FILE` when present, otherwise the unit's
+`WorkingDirectory` plus the relative default above — which is the same rule the
+runtime applies. Reading the shared path unconditionally would lie in both
+directions: `off` for a maintained host whose unit polls elsewhere, `ON` for a
+host still taking traffic.
+
+So a host deployed **before** slot units carried
+`AUTUMN_MAINTENANCE_FLAG_FILE` reports its release-local
+`{release_dir}/tmp/autumn-maintenance.json` — the truth for that host — and the
+row also carries a drift reason saying the app polls a release-local flag rather
+than the shared one, whose remedy is to **redeploy that host**. When the live
+slot unit cannot be read at all, the cell reads `maintenance ?` — never a
+confident `off` — and on a host reported as `deployed` that carries a drift
+reason of its own (a host with nothing deployed has no slot unit to read, and is
+already reported as such).
+The column reports which file the running unit polls and whether that file
+exists — it is not a statement about the app's in-memory state, which follows on
+the next 500 ms poll.
+
 When maintenance is active, all gated requests receive **503 Service Unavailable**
 with `Retry-After: 120`. The app never returns 200 for application routes while
 the flag is present.
@@ -50,6 +127,11 @@ autumn maintenance off
 
 # Check current status (also surfaced by `autumn doctor`)
 autumn doctor
+
+# Same thing, but on every host `autumn deploy` manages (over SSH)
+autumn deploy maintenance on --message "Down for scheduled maintenance."
+autumn deploy maintenance off
+autumn deploy status            # per-host maintenance + readiness columns
 ```
 
 ---
@@ -244,6 +326,86 @@ calling `autumn migrate` without `--with-maintenance`.
 
 ---
 
+## Fleet-wide maintenance (`autumn deploy maintenance`)
+
+The commands above write **this machine's** working directory. For hosts you
+deploy to with [`autumn deploy`](deployment.md), use the deploy-scoped verb
+instead — it fans the same flag file out to every configured host over SSH:
+
+```bash
+autumn deploy maintenance on --message "Upgrading database schema"
+autumn deploy maintenance on --readonly --allow-ips 10.0.0.0/8
+autumn deploy maintenance on --bypass-header X-Dev-Bypass:mytoken
+autumn deploy maintenance off
+```
+
+It applies to the deploy-configured target(s) — `[deploy] host` (one server) or
+`[deploy] hosts` (a fleet) — and takes exactly the same flags as
+`autumn maintenance on`, because both write the same wire format. Running apps
+react within the same 500 ms poll interval; nothing is restarted and no release
+is deployed.
+
+Three behaviours worth knowing:
+
+- **Best-effort, aggregate, never reversed.** Every host is attempted, a per-host
+  table names what changed, and the command exits non-zero if any host failed —
+  including a host that only *partially* changed (see the next bullet). The hosts
+  that *did* change are deliberately **not** rolled back — that would push users
+  straight back into the window you are closing — so the summary names them
+  ("Changed anyway: …", fully-changed hosts only) and the decision is yours.
+- **It writes the shared flag path first**
+  (`{app_dir}/shared/autumn-maintenance.json`), the path deploy-managed slot
+  units point `AUTUMN_MAINTENANCE_FLAG_FILE` at. That write is the authoritative
+  one and it goes first, so a host running a current slot unit reacts within its
+  next 500 ms poll even if anything after it fails. For a host still running a
+  unit deployed *before* that override existed, `on` then also writes the file
+  that unit makes the app poll — resolved from the host's **live slot unit** (the
+  one the proxy is actually serving), the same resolution `deploy status` reads
+  its verdict from, and **never** from the `current` symlink. `current` is
+  rewritten after the proxy flip, so the two disagree exactly when a flip landed
+  and the marker commit did not, and a flag written under `current` would then be
+  a file nothing polls. Two rows follow from that:
+
+  ```
+  ⚠️  host-b  maintenance enabled (shared flag only — no release is promoted on
+  this host, so no running unit polls a release-local flag)
+  ❌ host-c  PARTIAL — shared flag written, but the file this host's RUNNING unit
+  polls was NOT (failed at `detect-maintenance-flag`), so this host may still be
+  serving traffic
+  ```
+
+  The first is a **success**: nothing is promoted, so there is no running unit
+  and the shared write is the whole job. The second **counts as a failure** and
+  the command exits non-zero: the shared flag changed, but the file the running
+  unit polls did not, because that unit could not be read or the write to it
+  failed. `on` never claims a host is maintained when it could not prove which
+  file that host polls, and `off` never claims to have removed one (its rows read
+  `maintenance disabled …` and `shared flag removed …`, ending `so this host may
+  still be in maintenance`).
+- **It does not drain a host from your load balancer.** `/ready` stays `200`
+  while maintenance is on — by design, since gating it would eject every host
+  from the pool the moment maintenance was enabled. A maintained host keeps
+  taking traffic and answers it with `503` + `Retry-After`. Drain at the load
+  balancer if you need a host out of rotation.
+
+Like `autumn deploy status`, this command **still runs when your app config does
+not validate** under the deploy profile — a window is closed mid-incident, and an
+unrelated invalid setting must not block it. It prints the same caveat on stderr
+naming the config error, then continues against the declared `[server] port` read
+without validation, which it uses *only* to identify which slot unit each host is
+running. `autumn deploy check`/`up` still refuse until the config is fixed.
+
+`autumn deploy status` reports the maintenance flag per host, in its own column
+next to readiness, precisely because the two are orthogonal. The cell is
+three-valued — `maintenance ON` / `maintenance off` / `maintenance ?` — and
+reports the flag file that host's *running* slot unit polls; see
+[Where the flag file lives](#where-the-flag-file-lives). In `--json` the same
+field is `true` / `false` / `null`, `null` being the unproven case. See the
+[fleet deploys guide](fleet-deploys.md#runbook-a-fleet-wide-maintenance-window)
+for the full window runbook.
+
+---
+
 ## `autumn doctor` integration
 
 `autumn doctor` includes a maintenance-mode check. It reports:
@@ -395,12 +557,14 @@ Fly.io setup.
 | Migration safety | [deployment.md](deployment.md) | Ensures migrations run before web replicas start (schema-first rollout). |
 | Graceful shutdown | [deployment.md](deployment.md) | Ensures in-flight requests complete before the process exits (SIGTERM → drain → exit). |
 | Maintenance mode | This guide | Stops new requests from reaching the application while a maintenance operation runs. |
+| `autumn deploy maintenance` | [fleet-deploys.md](fleet-deploys.md) | Applies the same gate to **every deploy-managed host at once** over SSH, so a fleet enters and leaves the window together. Gates traffic; does **not** drain hosts from the load balancer. |
 
-The three features are complementary. A typical zero-downtime destructive
-migration uses all three: graceful shutdown ensures no request is abandoned
+These features are complementary. A typical zero-downtime destructive
+migration uses the first three: graceful shutdown ensures no request is abandoned
 mid-flight when the old replica exits; migration safety ensures the schema is
 updated before new replicas serve traffic; maintenance mode ensures writes are
-paused while the migration runs.
+paused while the migration runs. On a multi-host fleet, the fourth is how you
+open and close that window on every host at once.
 
 ---
 

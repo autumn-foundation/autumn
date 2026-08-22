@@ -10907,6 +10907,65 @@ mod trusted_host_tests {
         );
     }
 
+    /// `/ready` must keep answering 200 while maintenance mode is ON (issue
+    /// #1621, T1.25) — this pins an EXISTING, deliberate contract that a fleet
+    /// deploy depends on, so nobody "fixes" it later.
+    ///
+    /// [`build_maintenance_layer`] wires `with_probe_paths(probe_bypass_paths(cfg))`,
+    /// which includes `health.ready_path`. The consequence operators must be told
+    /// about: **maintenance mode does not drain a host from a load balancer.** The
+    /// host stays in rotation (its `/ready` is green) and serves 503s with
+    /// `Retry-After` to real users — by design, because the alternative would make
+    /// every LB-fronted deployment eject every host the moment maintenance is
+    /// enabled. `autumn deploy status` therefore reports readiness and maintenance
+    /// as SEPARATE columns, and `autumn deploy maintenance on` says so out loud.
+    #[tokio::test]
+    async fn ready_probe_stays_green_while_maintenance_mode_is_active() {
+        let cfg = AutumnConfig::default();
+        let state = crate::state::AppState::for_test();
+        // Startup must be complete or `/ready` is 503 for an unrelated reason and
+        // the assertion below would pass vacuously.
+        state.probes().mark_startup_complete();
+        let maintenance = crate::maintenance::MaintenanceState::new();
+        maintenance.enable(crate::maintenance::MaintenanceConfig::default());
+        state.insert_extension(maintenance);
+        let router = build_router(vec![], &cfg, state);
+
+        let ready = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&cfg.health.ready_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ready.status(),
+            StatusCode::OK,
+            "/ready must BYPASS maintenance mode: it is the load balancer's health \
+             signal, and gating it would eject every host from rotation the moment \
+             maintenance is enabled (#1621)"
+        );
+
+        // …while ordinary traffic IS gated, proving the layer is actually active.
+        let app_route = router
+            .oneshot(
+                Request::builder()
+                    .uri("/some-app-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            app_route.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "maintenance mode must still gate non-probe traffic"
+        );
+    }
+
     #[tokio::test]
     async fn trusted_host_release_rejects_loopback_unless_listed() {
         let mut cfg = AutumnConfig {

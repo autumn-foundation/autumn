@@ -34,11 +34,18 @@ internet connection.
 ## Push-button deploy to your own server (`autumn deploy`)
 
 `autumn deploy` takes a fresh project to a live, zero-downtime service on a
-single Linux VPS you control — no Dockerfile, no container registry, no PaaS
+Linux VPS you control — no Dockerfile, no container registry, no PaaS
 account. It uploads a single embedded binary, supervises it with systemd behind
 a reverse proxy, migrates before cutover, health-gates on `/ready`, and flips
 traffic atomically. Re-running it is a zero-downtime redeploy; one command rolls
 back.
+
+List several servers under `[deploy] hosts` instead of one under `[deploy] host`
+and the same command becomes a **rolling deploy across the fleet**: hosts are
+replaced one at a time in declaration order, migrations run exactly once, and a
+mid-rollout failure halts and rolls the hosts that already cut over back. See
+[Rolling deploy across a fleet](#rolling-deploy-across-a-fleet) and the
+[fleet deploys guide](fleet-deploys.md).
 
 This is the **primary** deployment path. A few alternatives remain documented
 below and are better fits in specific cases:
@@ -124,6 +131,10 @@ Point the deploy at your server by adding a `[deploy]` section to `autumn.toml`:
 ```toml
 [deploy]
 host = "203.0.113.10"     # SSH-reachable IP or hostname of your VPS (required)
+# hosts = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+#                         # a FLEET instead of one server (see "Rolling deploy
+#                         # across a fleet"). Mutually exclusive with `host`;
+#                         # the list order IS the rollout order.
 # user = "root"           # SSH user (default: root)
 # ssh_port = 22           # SSH port (default: 22)
 # app_dir = "/srv/autumn/myapp"   # remote install dir (default: /srv/autumn/<app_name>)
@@ -132,8 +143,37 @@ host = "203.0.113.10"     # SSH-reachable IP or hostname of your VPS (required)
 ```
 
 Every key also has an environment override (`AUTUMN_DEPLOY__HOST`,
-`AUTUMN_DEPLOY__USER`, `AUTUMN_DEPLOY__SSH_PORT`, …) if you prefer to keep the
-host out of the file.
+`AUTUMN_DEPLOY__HOSTS`, `AUTUMN_DEPLOY__USER`, `AUTUMN_DEPLOY__SSH_PORT`, …) if
+you prefer to keep the host out of the file. `AUTUMN_DEPLOY__HOSTS` takes a
+comma-separated list (`AUTUMN_DEPLOY__HOSTS=10.0.0.1,10.0.0.2`) and **replaces**
+the whole `hosts` list from the file rather than appending to it. Entries are
+trimmed and blank segments are dropped, so a trailing or doubled comma is
+tolerated, and `AUTUMN_DEPLOY__HOSTS=` (empty) means *unset* — the same as
+`AUTUMN_DEPLOY__HOST=` — rather than a blank fleet entry that would refuse every
+deploy subcommand.
+
+> **`host` and `hosts` are mutually exclusive.** Setting both is refused before
+> anything runs — with both set the rollout order would be ambiguous. A blank
+> entry or a repeated entry in `hosts` is refused too (deploying the same server
+> twice would corrupt its previous-release chain). A one-entry `hosts` list is
+> byte-for-byte the historical single-server deploy.
+
+**Env wins over the file for *both* spellings.** Because the two are mutually
+exclusive, setting one spelling in the environment now **clears the other from
+`autumn.toml`**: a non-empty `AUTUMN_DEPLOY__HOSTS` retargets a `[deploy] host`
+project as a fleet, and a non-empty `AUTUMN_DEPLOY__HOST` retargets a
+`[deploy] hosts` project at a single server. Neither combination is a conflict —
+it is the documented env-over-TOML precedence applied to the spelling you did
+*not* set. Two rules bound it:
+
+- **Setting both env spellings non-empty is still refused**, naming both keys.
+  That is not a precedence question; with both set the rollout order is genuinely
+  ambiguous, so it is treated as an operator error rather than tie-broken.
+- **An empty or blank value still means *unset*** and leaves the TOML spelling
+  alone. `AUTUMN_DEPLOY__HOST=`, a whitespace-only value, `AUTUMN_DEPLOY__HOSTS=`
+  and `AUTUMN_DEPLOY__HOSTS=" , "` are the shape a CI or compose template emits
+  for an unfilled slot, so they can never silently drop a fleet list configured
+  in the file.
 
 Put these two values in a project `.env` (git-ignored — never committed). The
 deploy reads them and writes **only** them to a `0600` env file
@@ -210,7 +250,15 @@ from pending migrations — an old destructive migration file left in the direct
 fails the check even after it has been applied. Keep `migrations/` rolling-safe
 (remove or adjust an already-applied destructive migration if it trips the scan).
 The preflight exits non-zero if anything fails, so nothing touches the server
-until it is green:
+until it is green.
+
+With a fleet (`[deploy] hosts`), **every host the run targets is graded before
+any host is touched**: SSH reachability is probed once per host and reported on
+its own line (`ssh_reachability (10.0.0.3)`), while the project-wide graders —
+signing secret, database URL, migrate-safety — run once. So an unreachable host
+in position 3 is named before host 1 is deployed, not after two hosts have
+already cut over. `autumn deploy up` and `autumn deploy rollback` re-run this
+same fleet-wide preflight and abort on any failure.
 
 ```bash
 autumn deploy check      # doctor --online runs the same graders (plain doctor skips network probes)
@@ -277,6 +325,390 @@ Because the run stops at the first failure, a bad migration or a candidate that
 never reports `/ready` leaves the previous version serving and tears the
 candidate down automatically — there is no half-deployed state serving traffic.
 
+### Rolling deploy across a fleet
+
+List more than one server under `[deploy] hosts` and the same `autumn deploy up`
+becomes a **rolling deploy across the fleet** — no new command, no new flags
+required:
+
+```toml
+[deploy]
+hosts = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+```
+
+```bash
+autumn build --embed
+autumn deploy up
+```
+
+**The list order is the rollout order.** Nothing sorts or regroups it: hosts are
+replaced strictly front to back, **one at a time**, and each host must finish its
+own cutover before the next host is started. Every host runs the *same*
+zero-downtime blue/green sequence documented above, against its own kamal-proxy,
+so a host being replaced never stops serving and the hosts behind it in the
+queue are still on the old release — your load balancer always has healthy
+upstreams. See the [fleet deploys guide](fleet-deploys.md) for the load-balancer
+contract, the shared-state prerequisites, and the scale-up walkthrough.
+
+**No host is ever drained for the rollout's sake.** The host being replaced is
+not removed from your load-balancer pool and its `/ready` never goes `503`: the
+candidate comes up on that host's idle loopback slot, is health-gated there, and
+that host's own kamal-proxy flips upstreams atomically, with the old slot drained
+and stopped only afterwards. `autumn deploy` never touches your load balancer's
+membership — draining a host for a reboot or a scale-down stays your job.
+
+The whole run mints **one release id**, so every host's `current` symlink
+resolves to the same release and drift is meaningful.
+
+Abridged output for a three-host fleet:
+
+```
+Rolling release 20260821T101500Z across 3 hosts, ONE AT A TIME, in `[deploy] hosts` order:
+  1. 10.0.0.1 — zero-downtime redeploy
+  2. 10.0.0.2 — zero-downtime redeploy
+  3. 10.0.0.3 — zero-downtime redeploy
+  → migrate (10.0.0.1 only — the schema is fleet-wide; 10.0.0.2, 10.0.0.3 skip it)
+
+[1/3 10.0.0.1] deploying release 20260821T101500Z (zero-downtime redeploy)…
+✅ [1/3 10.0.0.1] serving 20260821T101500Z
+…
+Fleet state:
+  ✅ 10.0.0.1  serving 20260821T101500Z
+  ✅ 10.0.0.2  serving 20260821T101500Z
+  ✅ 10.0.0.3  serving 20260821T101500Z
+
+✅ Fleet deploy complete — all 3 hosts serving 20260821T101500Z.
+```
+
+#### Migrations run exactly once
+
+The schema is fleet-wide, so the rollout runs the pre-cutover migration on
+**exactly one host**: the first host in rollout order that is still on a previous
+release, immediately before *its* cutover. Every other host builds its cutover
+with the migrate step omitted. A first-deploy host is never chosen — it has no
+live release to keep serving if the migration fails.
+
+If **no** host in the fleet is on a previous release (a brand-new fleet where
+every host is a first deploy), the rollout runs **no migrations at all** and says
+so loudly, because a first deploy has never run migrations (see
+[Limitations](#limitations-and-known-gaps)):
+
+```
+⚠️  no host in this fleet is on a previous release, so this rollout runs NO
+migrations (a first deploy never does) — run `autumn migrate` yourself before
+serving traffic
+```
+
+That warning only appears when a writable database is configured — an app with
+no database has no schema to be behind.
+
+**Put already-deployed hosts first in the list.** Because the migration lands on
+the first host that is still on a previous release, a *first-deploy* host listed
+ahead of it cuts over with no migrate step at all — it goes live on the new
+release while the schema is still the old one, and stays that way until the
+rollout reaches the migrating host. That is the one case where "migrations run
+before the first host cutover" does not hold, and it is exactly the shape of a
+scale-up: `hosts = ["<new>", "<new>", "<existing>"]`. Order the list
+`["<existing>", "<new>", "<new>"]` instead and the migration runs first. The
+rollout will not reorder it for you — declaration order is the contract — but it
+does name the hazard and the hosts it applies to before touching anything:
+
+```
+⚠️  10.0.0.2, 10.0.0.3 go live on the new release BEFORE the migration runs
+(a first deploy never migrates) — if this release needs the new schema they will
+serve against the old one until the migrating host is reached; list an
+already-deployed host first to avoid it
+```
+
+Like the warning above, it is gated on a writable database being resolvable from
+your config. See the [fleet deploys guide](fleet-deploys.md#list-the-already-deployed-hosts-first).
+
+Once the migrating host cuts over, the rollout says so:
+
+```
+⚠️  the schema has moved; from here an automatic rollback restores BINARIES
+only — it never rolls a migration back
+```
+
+Design your migrations **expand/contract** so the old and new binaries can both
+run against the migrated schema — that is what makes the automatic rollback below
+safe. `autumn migrate check` (already part of the preflight) classifies your
+local `migrations/` by rolling-deploy risk; the
+[fleet deploys guide](fleet-deploys.md) covers the pattern in full.
+
+##### The three schema notes on the `Fleet state:` summary
+
+The same binaries-versus-schema truth is repeated once at the end of the run, on
+the `Fleet state:` table described [below](#a-failure-halts-the-rollout-and-rolls-the-fleet-back).
+The question being answered is never "did the fleet compensate" — it is **the
+schema is at the new release; where are the binaries?** So the gate is the
+migration: the summary says nothing at all unless this run actually scheduled a
+migration *and* reached the host carrying it. (A fleet where every host is a
+first deploy schedules no migration and stays silent — the prologue already told
+you to run `autumn migrate` yourself.) Beyond that gate the fleet's shape only
+picks which sentence is true:
+
+- **Some host is still forward.** At least one host is on the new release —
+  deployed, degraded, left alone because its rollback target was in doubt, or one
+  whose compensating rollback *failed*. You get:
+
+  ```
+  ⚠️  the schema has moved; from here an automatic rollback restores BINARIES
+  only — it never rolls a migration back
+  ```
+
+  Forward-looking: it describes what a rollback you run *from here* will and will
+  not undo. It is the same sentence the rollout printed mid-run, repeated because
+  the run is ending with hosts still on the new release.
+
+- **The fleet actually put hosts back.** Compensation *restored* a host to its
+  previous release or *removed* a just-completed first deploy. You get:
+
+  ```
+  ⚠️  the compensating rollback restored BINARIES only — the migration that
+  already ran was NOT rolled back; confirm the schema still fits the release now
+  serving
+  ```
+
+  Past-tense: something already moved back underneath you. A compensation that
+  only **failed** does not count here — that host is still serving the new
+  release, so it lands in the first case instead, and claiming a rollback
+  "restored binaries" would be false.
+
+  These two are independent. A halt that compensated some hosts and left others
+  forward (a `NOT rolled back automatically` row, or a compensation that failed)
+  prints **both**.
+
+- **Nothing forward, and nothing compensated.** No host is on the new release and
+  the fleet never had anything to undo — because the migrating host itself failed
+  at a step *after* `migrate` but *before* its cutover (a `readiness-gate`
+  timeout is the ordinary shape) and tore its own candidate down, leaving every
+  later host untouched. The table is then all "previous release still serving"
+  rows with the database already moved on underneath them, so the summary says so
+  explicitly:
+
+  ```
+  ⚠️  no host is serving the new release, but the migration that already ran was
+  NOT rolled back — the binaries went back and the schema did not; confirm the
+  release now serving still fits the migrated schema
+  ```
+
+  This is the case that is easiest to misread as a clean no-op. It is not one:
+  the rollout aborted, but the migration stands.
+
+The gate is deliberately conservative. The rollout cannot prove from a failing
+step label whether the one-shot `migrate` itself succeeded, so it errs toward
+"the schema moved" — one extra line of output is cheaper than an operator rolling
+binaries back believing the schema came with them.
+
+#### A failure halts the rollout and rolls the fleet back
+
+A host that fails **stops the rollout**: the hosts behind it are never touched.
+What happens to the hosts already on the new release depends on *where* the
+failure landed relative to the **go-live step** — `proxy-flip` on a redeploy,
+`proxy-route` on a first deploy:
+
+| Where it failed | What the host is | What the fleet does |
+|---|---|---|
+| At or before go-live, on a redeploy | Previous release still serving (the candidate was torn down) | Already clean — nothing to undo |
+| At or before go-live, on a first deploy | Nothing serving (the candidate was torn down) | Already clean — nothing to undo |
+| After go-live, in housekeeping (`record-proxy-options`, `drain-old`, `prune`) | **Live and healthy on the new release** | **Warn and keep rolling** — the host is fine; only bookkeeping failed |
+| After go-live, at `commit-markers` | Live on the new release, markers mid-transaction | Halt, and **never** auto-roll this host back — the rollback target cannot be trusted |
+| After go-live, anything else | Live on the new release | Halt and compensate, this host included |
+
+(The redeploy sequence is `start-candidate` → `migrate` → `readiness-gate` →
+`proxy-flip` → `commit-markers` → `record-proxy-options` → `drain-old` →
+`prune`, so a failed migration or a candidate that never reports `/ready` is
+always a pre-go-live failure with the old release still serving.)
+
+Compensation walks the hosts that are on the new release in **strict reverse
+rollout order** (newest cutover first — that shrinks the mixed window from the
+newest end) and, per host, either rolls it back to its previous release with the
+same primitives `autumn deploy rollback` uses, or — for a host whose *first*
+deploy had just completed — removes that first deploy so the host returns to
+nothing-installed. It is best-effort-**continue**: a failed compensation on one
+host never stops the next, and every result is named.
+
+Two things compensation deliberately does **not** do:
+
+- **It restores binaries, never schema.** A migration that already ran stays
+  applied. The summary says so out loud — but only when compensation actually
+  *restored* a host to its previous release or *removed* a just-completed first
+  deploy. A compensation that merely **failed** leaves that host serving the new
+  release, so the summary prints the forward-looking `the schema has moved …`
+  note for it instead. Either way, confirm the schema still fits the release now
+  serving; the three notes and when each appears are spelled out under
+  [The three schema notes on the `Fleet state:` summary](#the-three-schema-notes-on-the-fleet-state-summary).
+- **It does not touch a host whose rollback target is in doubt.** Markers left
+  mid-transaction, a missing or unverifiable target release dir, or no recorded
+  previous release each produce a `NOT rolled back automatically` row plus the
+  exact read-only command to inspect that host's markers by hand (see
+  [Troubleshooting](#troubleshooting)).
+
+A **degraded** host — live and healthy on the new release, but whose post-cutover
+housekeeping failed — is worth repairing promptly: a failed `record-proxy-options`
+makes the **next** deploy of that host fail closed. A redeploy of that host
+repairs it, and the run's final line says how many hosts finished degraded.
+
+Every exit path — success, halt, or halt-plus-compensation — ends with the
+per-host `Fleet state:` table, printed **after** any compensation so it describes
+where the fleet actually is. On a halt it is your only source of truth about
+which host is running what. It names every host currently on the new release
+along with the levers for reversing them:
+
+```
+  On 20260821T101500Z: 10.0.0.2, 10.0.0.3. Roll ONE back with `autumn deploy
+  rollback --only <host>`, or the whole fleet with `autumn deploy rollback`.
+```
+
+#### `--only`: the repair lever
+
+```bash
+autumn deploy up --only 10.0.0.3          # repeatable: --only a --only b
+autumn deploy rollback --only 10.0.0.3
+```
+
+`--only` narrows `up` or `rollback` to a subset of `[deploy] hosts`. Each value
+must appear in that list **verbatim** — nothing is prefix-matched or DNS-resolved,
+so a typo can never deploy the wrong machine — and the selection keeps
+*declaration* order regardless of the order you typed the flags, so `--only c
+--only a` cannot invert a rolling deploy.
+
+It is a **repair lever, not a faster deploy.** Whenever it excludes a configured
+host the command says so before it starts:
+
+```
+⚠️  `--only` narrows this command to part of the fleet, so the hosts it skips
+keep running whatever they are running now — THE FLEET MAY END UP MIXED. This is
+a repair lever, not a faster deploy: finish with a full `autumn deploy up` (no
+`--only`) so every host converges on one release (#1621).
+   this run touches: 10.0.0.3
+   left as they are: 10.0.0.1, 10.0.0.2
+```
+
+Finish with a full `autumn deploy up`.
+
+#### `--no-rollback`: freeze a failed rollout
+
+```bash
+autumn deploy up --no-rollback
+```
+
+Halt and **freeze** instead of compensating: every host is left exactly as it is
+— including the ones already on the new release — and named in the final state
+table, so you can inspect the failure before anything else moves. Use it when you
+would rather diagnose a half-rolled fleet than automatically reverse it.
+
+#### Topologies a fleet deploy refuses
+
+Three configurations are refused in the rollout prologue, **before a single
+remote command runs**, because they cannot be deployed safely across more than
+one host. Each is gated on the number of *configured* hosts, so `--only` does not
+unlock them:
+
+| Config | Why it is refused |
+|---|---|
+| `[database] url` is a `sqlite://` target | Every host receives the same database URL, which for SQLite means N independent database *files* — no shared schema, no lock to serialize migrations, and every host serving a different dataset behind your load balancer. Point `[database] url` at a Postgres server every host can reach. |
+| `[media.mediamtx] enabled = true` | Host media provisioning has no teardown or rollback path; fanning it out would leave one MediaMTX daemon per host on identical ports with nothing to undo them with. Deploy media on a single host with `[deploy] host`. |
+| `[deploy.tls] enabled = true` | The deploy-managed kamal-proxy runs on **every** host, so each would request a certificate for the same `[deploy.tls] host` from behind your load balancer; only one can answer a given ACME challenge and the rest burn Let's Encrypt rate limits. **Terminate TLS at the load balancer that fronts the fleet** and set `[deploy.tls] enabled = false`. |
+
+One more fleet condition is a loud **warning** rather than a refusal:
+`[database] auto_migrate` (or the `auto_migrate_in_production` alias) on a
+multi-host deploy means every host applies migrations at boot, so the hosts race
+each other during the rollout and a checksum mismatch exits the process under
+`Restart=on-failure` — a crash loop mid-rollout. Turn it off for fleets and let
+the rollout's single `migrate` step own the schema.
+
+#### What fleet support changed for an existing single-host deploy
+
+`[deploy] hosts = ["x"]` behaves exactly like `[deploy] host = "x"` — one entry
+is one host, and the two spellings produce byte-identical output, uploads and
+remote commands. What that guarantee does *not* mean is that a single-host deploy
+is unchanged from the release before fleets landed. Several hardening changes
+apply to **every** deploy, one host or five. In full, so an upgrade holds no
+surprises:
+
+- **A release-directory collision is now refused, and that is a new hard
+  failure.** The release id has one-second granularity, so a fast re-run can
+  reuse it. Re-uploading into a directory that `shared/previous-release` still
+  points at would put the *new* binary there — a later rollback would roll
+  *forward*. The deploy now probes for that directory first and refuses before
+  writing anything, as it does when the probe cannot prove the directory is
+  absent. **Concretely: a second `autumn deploy up` inside the same second now
+  exits 1 with `release directory … already exists` where it previously went
+  ahead.** Wait a second and re-run, or remove the directory if you are certain
+  it is stale. The probe also costs one extra SSH round-trip per deploy, before
+  anything is mutated.
+- **SSH sessions are bounded.** Every `ssh`/`scp` invocation carries
+  `ConnectTimeout=10`, `ServerAliveInterval=15` and `ServerAliveCountMax=4`
+  alongside `BatchMode=yes`. The preflight is a TCP connect, which proves a host
+  *accepts* a connection, not that its SSH daemon will ever answer; without these
+  a wedged host would hang the deploy forever. For one server that is a stuck
+  command someone cancels — for a fleet it would be a rollout frozen mid-flight
+  with no error to compensate. Turning an infinite hang into a finite error is
+  what lets the fleet halt and roll back. A host that accepts TCP and then wedges
+  now fails the deploy instead of hanging it.
+- **The maintenance flag file moved to `shared/`.** Every slot unit is now
+  written with
+  `Environment=AUTUMN_MAINTENANCE_FLAG_FILE={app_dir}/shared/autumn-maintenance.json`,
+  so after the next deploy the app reads the flag from the shared directory
+  instead of the release directory's `tmp/`. This fixes a real bug — a cutover
+  used to orphan an active maintenance flag — but it is a behaviour change, and
+  it means the **local** `autumn maintenance on`, run on a deploy-managed host,
+  now writes a path the app no longer reads. Use `autumn deploy maintenance`
+  there; see [Maintenance mode](maintenance-mode.md#where-the-flag-file-lives).
+- **A `shared/last-deploy` marker appears.** The ops that complete a cutover
+  (`commit-markers`, and `record-proxy-options` on a first deploy) now append an
+  advisory shell fragment recording the action that completed plus the host's UTC
+  time. It is what `deploy status` reads for its `last deploy` cell.
+  The fragment can never fail the op it rides on, and it adds one small file
+  under `shared/`; the op labels and everything else those ops do are unchanged.
+  The first-deploy teardown writes it too, through one extra
+  `teardown-last-deploy` op recording `torn down`, so a host whose first deploy
+  was removed again can never keep reporting a successful one. That op runs only
+  on the first-deploy failure and compensation path — a redeploy's candidate
+  teardown leaves the marker alone, because the previous release is still serving
+  and the marker still describes it.
+- **The `detect-current` probe reads one more thing.** Its shell gained a
+  delimited section that resolves the `current` symlink, so the deployed release
+  id comes back in the same round-trip the deploy already made. Same op, same
+  label, no extra round-trip; only the remote shell text differs.
+- **The "no host configured" hint now mentions `hosts`.** A project with neither
+  key set still fails with `no target host configured`, but the remediation hint
+  gained the fleet spelling:
+
+  ```
+  no target host configured: Set `[deploy] host` in autumn.toml to your server's
+  SSH-reachable address (or `[deploy] hosts = ["<address>", …]` to deploy a fleet)
+  ```
+
+  Stderr text only; the failure and its exit code are unchanged.
+
+One further change is invisible on a single host and listed only for
+completeness: a post-cutover failure is now wrapped in an error type that records
+which step it landed on, so the fleet driver can decide whether that host may be
+auto-rolled-back. Its `Display` delegates to the wrapped error verbatim, so the
+single-host path prints byte-for-byte what it printed before.
+
+`autumn deploy --help` was also rewritten, and `up`/`rollback` gained `--only`
+and `--no-rollback`; no existing flag changed meaning.
+
+> **Known limitation — a single-host deploy that fails after its migration ran
+> says nothing about the schema (#2276).** On one host, a failure at any point is
+> reported as the plain per-host error and the command returns right there: the
+> single-host path deliberately keeps its pre-fleet output byte-for-byte, so it
+> renders no `Fleet state:` summary and therefore none of
+> [the three schema notes](#the-three-schema-notes-on-the-fleet-state-summary).
+> If the failure landed *after* `migrate` but before the cutover — a
+> `readiness-gate` timeout is the ordinary shape — the candidate is torn down and
+> your previous release keeps serving, **against the already-migrated schema**,
+> with nothing on screen saying so. The fleet path does warn in exactly this
+> situation; the single-host path does not yet. This is tracked as
+> [#2276](https://github.com/autumn-foundation/autumn/issues/2276) and is not fixed. Until
+> it is: after any failed single-host `deploy up`, check `autumn migrate status`
+> before assuming the failure left nothing behind — and write expand/contract
+> migrations so the still-serving release fits the migrated schema either way.
+
 ### Rollback
 
 Roll back to the previous release on demand:
@@ -290,15 +722,263 @@ the proxy back to it (health-gated on `/ready`), repoints `current`, and
 re-probes `/ready`. It fails loudly and non-zero when there is no previous
 release to return to.
 
+**With `[deploy] hosts` this rolls back the whole fleet**, one host at a time, in
+**reverse** declaration order (newest cutover first — the mirror of the rollout,
+and of the automatic compensation above). It is best-effort-**continue**: a host
+that fails does not stop the others, because stopping would leave *more* hosts on
+the release you are trying to leave. Each host reports one of three outcomes:
+
+| Outcome | Meaning |
+|---|---|
+| `previous release restored` | The host is serving its previous release again. |
+| `SKIPPED — no previous release recorded on this host` | Nothing to roll back to (a first deploy clears the marker; a host just added to the fleet never had one). It keeps serving what it served before. |
+| `NOT rolled back — failed at <step>` | The attempt failed; this host still serves what it served before. |
+
+**The command exits non-zero unless *every* host rolled back** — a skip counts as
+a failure here. That is deliberate: the contract of a fleet rollback is that the
+*fleet* returns to its previous release, and a fleet where one host could not
+follow the others is mixed. The per-host table distinguishes the two cases, which
+is what your next move turns on; retry a single host with `autumn deploy rollback
+--only <host>`, or deploy the intended release to it explicitly.
+
+> **`--only` down to one host runs the single-host rollback path.** Everything
+> above describes a rollback with more than one target. Narrow it to one and you
+> get the pre-fleet behaviour instead: no per-host outcome table — just
+> `Rolling back <host> to <release>…` and `✅ Rollback complete.`, or a plain
+> error — and no benefit from the reachability softening described below, which
+> exists so that the *rest* of a fleet can still move past a dead host. With one
+> target there is no rest: a host that does not answer stops the command non-zero
+> having changed nothing. Worth knowing before an incident, because a stranded
+> host is exactly when this command gets reached for. Follow it with
+> `autumn deploy status` for the fleet-wide picture.
+
+Like the automatic compensation, a fleet rollback **restores binaries only** — no
+migration is rolled back. Confirm the schema still fits the release now serving.
+
 > **Rollback runs the same local preflight as `deploy up` first.** Before it
 > makes any remote call — before it even resolves the previous release on the
 > host — `autumn deploy rollback` runs the identical local preflight graders
-> (signing secret, database URL, migrate-safety) and aborts non-zero if any fail.
+> (signing secret, database URL, migrate-safety, and — for a fleet — SSH
+> reachability for every host it targets) and aborts non-zero if any fail.
+>
+> One class is deliberately downgraded, and only on a multi-host rollback: a
+> per-host `ssh_reachability` failure is reported and the rollback continues
+> without that host, which is then named as `NOT rolled back` and still makes the
+> command exit non-zero. Refusing to move the healthy majority off a bad release
+> because one host is dead would strand *more* hosts on the release you are
+> abandoning. Every other grader keeps the hard gate, and a single-host rollback
+> — including a fleet narrowed with `--only` to one host — keeps it for
+> reachability too.
+>
 > So it needs the same local inputs as a deploy — your project's `.env`/signing
 > secret and database URL, and the `migrations/` dir — available **wherever you
 > invoke it**: an emergency rollback from a bare CI checkout or a machine without
 > the project's secrets fails preflight before it ever reaches the host. Keep the
 > deploy inputs available where you would run a rollback.
+
+### Fleet status
+
+```bash
+autumn deploy status
+autumn deploy status --json
+autumn deploy status --strict
+```
+
+`deploy status` probes every configured host **read-only** and prints one row per
+host, in `[deploy] hosts` order. It mutates nothing, so it is safe mid-incident;
+an unreachable host becomes a row, never an abort. It works for a single
+`[deploy] host` too (one row).
+
+Each row carries: mode (`deployed` / `not deployed` / `unreachable` /
+`unknown`), the deployed release (read from the host's `current` symlink), the
+live slot, the `/ready` status code, the maintenance flag
+(`maintenance ON` / `maintenance off` / `maintenance ?`), the proxy's bound
+port, that host's last deploy result, and any per-host drift reasons.
+
+> **The maintenance cell reports the flag file that host's *running* slot unit
+> polls.** It is resolved on the host from the live slot unit's
+> `Environment=AUTUMN_MAINTENANCE_FLAG_FILE=…`, falling back to that unit's
+> `WorkingDirectory` plus the legacy relative `tmp/autumn-maintenance.json` when
+> the unit carries no override — the same rule the runtime itself applies. It is
+> deliberately *not* a fixed read of the shared path, which would report `off`
+> for a maintained host whose unit polls somewhere else, and `ON` for a host
+> still taking traffic.
+>
+> Two consequences. First, **a host deployed before this feature reports its
+> release-local flag** — its unit carries no `AUTUMN_MAINTENANCE_FLAG_FILE`, so
+> the cell tells the truth about that host while also raising the "polls a
+> release-local maintenance flag file" drift reason below; redeploy it to move
+> it onto the shared path. Second, when the live slot unit cannot be read at all
+> the cell reads `maintenance ?` rather than guessing — "we could not tell" must
+> never render as a confident `off`.
+>
+> It reports which file the running unit polls and whether that file exists. It
+> is not a guarantee about the app's in-memory state: the running process picks
+> the change up on its own 500 ms poll.
+
+> **`last deploy` is the last action that host *completed*.** It reads
+> `last deploy: deployed <UTC time>`, `last deploy: rolled back <UTC time>` or
+> `last deploy: torn down <UTC time>` —
+> the host's own `date -u` clock, from a marker written by the ops that complete
+> a cutover. A deploy that failed *before* the cutover boundary never rewrites
+> it, so the host still shows its previous action: this is a per-host fact, not
+> a verdict on the last fleet rollout (the rollout itself exits non-zero and
+> prints its own per-host outcome table). A `rolled back` host was rolled back
+> by hand or compensated after a halted rollout. A `torn down` host had its
+> first deploy removed again by a halted rollout's compensation — nothing is
+> installed on it, and the row's `not deployed` mode says so too. The cell reads
+> `last deploy: ?` when the marker is absent or unreadable — a host that has
+> never completed a cutover, or one last deployed by a CLI that predates the
+> marker — because "we could not tell" must never render as a result. It is
+> **reported, never counted as drift**.
+
+Two kinds of drift are reported, and they are deliberately separate:
+
+- **Version drift** — more than one *distinct known* release across the fleet.
+  The remedy is `autumn deploy up` to converge, or `autumn deploy rollback`.
+- **State drift** — per-host marker damage that will make a **future** deploy of
+  that host fail closed or take the wrong slot. Today's reasons are: the
+  `live-slot` marker disagrees with the slot kamal-proxy is actually serving (the
+  next redeploy would restart the *serving* slot); the `shared/proxy-options`
+  marker is unreadable (the next deploy of that host will refuse); the installed
+  proxy unit binds a different public port than `[server] port` configures; no
+  release is deployed on this host while the rest of the fleet is serving one;
+  the host has a `current` symlink but the release behind it could not be read;
+  and the two maintenance-probe reasons —
+
+  - `the live slot unit could not be read, so which maintenance flag file this
+    host's app polls is unknown — the maintenance column reports ? rather than
+    guessing`, and
+  - `this host's app polls a release-local maintenance flag file, not the shared
+    one (its slot unit predates AUTUMN_MAINTENANCE_FLAG_FILE) — redeploy it so
+    maintenance survives cutovers`.
+
+  The remedy for the second is exactly what it says: **redeploy that host**, so
+  its slot unit is rewritten with the shared flag path and its maintenance flag
+  survives the next cutover.
+
+> **"Release unknown" is never *version* drift — but a broken `current` symlink
+> is *state* drift.** The only release identity a host can be asked for is its
+> `current` symlink, and that can be missing on a never-deployed host, dangling
+> mid-incident, or unreadable because the host did not answer. Those hosts are
+> *named* in the report and explicitly excluded from the version-drift verdict —
+> reporting a mixed fleet that does not exist is worse than reporting nothing.
+>
+> A reachable host that *proved* it has a `current` symlink and still resolves to
+> no readable release is a different case, and it is now **state drift** that
+> `--strict` exits non-zero on (it was previously reported without counting).
+> That host claims to serve a release nobody can name, and deploying it next
+> would copy the unresolvable target into `previous-release` — making a later
+> rollback refuse. Repair it before the next deploy.
+
+`--strict` exits non-zero when **any** drift is found, so drift is alertable from
+cron. The default exits `0`: status is a report, not a judgement. `--json` emits
+a stable machine-readable report on stdout — `hosts[]` (with `host`, `reachable`,
+`mode`, `release`, `live_slot`, `ready`, `maintenance`, `proxy_port`,
+`last_deploy`, `drift[]`), plus `version_drift`, `state_drift[]`, and `drifted`
+(the `--strict` condition).
+
+`maintenance` is **three-valued**: `true` and `false` are proved states of the
+file the host's *running* slot unit polls, and `null` means the CLI could not
+prove which file that is — the same condition the table renders as
+`maintenance ?`. Both `false` and
+`null` are falsy, so an existing `maintenance == true` check is unaffected — no
+consumer that tests the field for truth starts matching more hosts.
+
+`last_deploy` is `{"result", "at"}`, or `null` when the host reports no readable
+marker. `result` is `"deployed"`, `"rolled back"` or `"torn down"`; `at` is the
+host's own UTC timestamp (`null` for a marker written before the timestamp field
+existed). It records the host's last **completed** action, so a deploy that
+failed before cutover never rewrites it, and it is reported rather than counted
+as drift.
+
+> **`deploy status` still runs when the app config does not validate.** It needs
+> exactly one value from your application config — `[server] port`, the public
+> port kamal-proxy binds and every loopback slot port is derived from — so an
+> unrelated invalid `[scheduler]`, `[mail]`, `[database]` or `[security]` setting
+> used to abort the fleet's only read-only incident command before a single host
+> was probed. It no longer does. When the config fails to validate under the
+> deploy profile, `status` prints a caveat **on stderr** (in both text and
+> `--json` mode, so the `--json` shape on stdout is untouched) naming the config
+> error and the declared port it is probing against, then reports the fleet. The
+> fallback port is your own declared `[server] port` for that profile, read from
+> the same TOML + `.env.<profile>`/env layers the loader would have used, just
+> without validation (or the framework default when no layer declares one) —
+> never a guess.
+>
+> **`deploy check`, `deploy up` and `deploy rollback` still refuse**, and that
+> asymmetry is deliberate: they grade and upload runtime *values* (the signing
+> secret, the database URL), so an invalid config must stop them. `status` only
+> reads. The caveat says so too.
+
+### Fleet maintenance
+
+```bash
+autumn deploy maintenance on --message "Upgrading database schema"
+autumn deploy maintenance on --readonly --allow-ips 10.0.0.0/8
+autumn deploy maintenance off
+```
+
+`autumn deploy maintenance` turns [maintenance mode](maintenance-mode.md) on or
+off on **every deploy-configured host over SSH**, writing the same JSON flag file
+the local `autumn maintenance on` writes and taking the same flags
+(`--message`, `--allow-ips`, `--readonly`, `--bypass-header`). The running apps
+react within their 500 ms poll interval — no restart, no deploy.
+
+The distinction from the top-level `autumn maintenance` matters: that command
+writes **this machine's own working directory**, which is useless for a host you
+deploy to over SSH. Deploy-managed hosts get their flag file at
+`{app_dir}/shared/autumn-maintenance.json` — a path in the shared directory that
+survives cutovers, rollbacks and pruning and is visible to *both* blue and green
+slots — because `autumn deploy` stamps `AUTUMN_MAINTENANCE_FLAG_FILE` into every
+slot unit it writes. The shared path is written **first**, because it is the
+authoritative one: a host running a current slot unit reacts within its next
+500 ms poll even if anything after it fails.
+
+For a host still running a unit deployed *before* that override existed,
+`maintenance on` then also writes the release-relative file that unit polls —
+resolved from the host's **live slot unit**, the slot the proxy is actually
+serving, and never from the `current` symlink (which is rewritten only after the
+proxy flip, so the two disagree exactly when a flip landed and the marker commit
+did not). `autumn deploy status` names those hosts as state drift — "polls a
+release-local maintenance flag file, not the shared one" — because their flag is
+orphaned by the next cutover until they are redeployed.
+
+The fan-out is **best-effort-and-aggregate**, deliberately the opposite of the
+rollout: every host is attempted, the per-host table names what changed, and the
+command exits non-zero if any host failed. Hosts that *did* change are **not**
+reversed automatically — reversing them would push users back into the very
+window you are closing — so the summary names them explicitly (the
+"Changed anyway: …" line, fully-changed hosts only), and reversing by hand is
+your call.
+
+Two per-host rows are worth recognising:
+
+- `maintenance enabled (shared flag only — no release is promoted on this host,
+  so no running unit polls a release-local flag)` — a **success**. Nothing is
+  promoted, so no unit is running and the shared write was the whole job.
+- `PARTIAL — shared flag written, but the file this host's RUNNING unit polls was
+  NOT (failed at …), so this host may still be serving traffic` — a **failure**,
+  and the command exits non-zero on it. The live slot unit could not be read (or
+  the write to its file failed), so which file the app polls was never proved.
+  `on` will not claim a host is maintained it could not prove, and `off` will not
+  claim to have released one (there the row ends `so this host may still be in
+  maintenance`).
+
+Like `deploy status`, `deploy maintenance` **still runs when the app config does
+not validate** — a maintenance window gets closed mid-incident, and an unrelated
+invalid setting must not stand in the way. It prints the same caveat on stderr
+naming the config error, and continues against the declared `[server] port` for
+that profile read without validation; it uses that port only to identify which
+slot unit each host is running. `autumn deploy check`/`up` still refuse until the
+config is fixed.
+
+> **Maintenance mode does not drain a host from your load balancer.** `/ready`
+> stays `200` while maintenance is on, by design: gating it would eject every
+> host from the pool the moment maintenance was enabled. A maintained host keeps
+> taking traffic and answers it with `503` + `Retry-After`. Drain at the load
+> balancer if you need a host out of rotation. This is why `deploy status`
+> reports readiness and maintenance in separate columns.
 
 ### Inspect the plan without touching the server
 
@@ -323,6 +1003,15 @@ redeploy starts the candidate first and then runs the pre-cutover migration. Use
 `plan` to review the shape and what happens, not as a byte-exact order or unit
 reference.
 
+With `[deploy] hosts` set, `plan` adds a **fleet rollout** section listing the
+hosts in rollout order and stating the migrate-placement rule. That section is
+descriptive for the same reason: `plan` contacts no host, so it cannot know which
+hosts are first deploys and which are redeploys. It therefore renders the
+migration as the *rule* `autumn deploy up` applies after probing every host —
+"`[migrate]` runs once, on the first host still on a previous release, before its
+cutover — hosts 2..N skip it" — never as a named host. `deploy up` names the
+actual host once it has probed the fleet.
+
 ### Where secrets live
 
 The signing secret and database URL are written **only** to
@@ -344,6 +1033,38 @@ or error messages.
   up` uploads the pre-built binary, it does not build for you.
 - **Nothing answers on the public port** — confirm the app's `server.port`
   matches the port you are curling, and that the host firewall allows it.
+- **A fleet rollout halted part-way.** Read the `Fleet state:` table it printed —
+  it describes where the fleet actually *is*, after any automatic compensation.
+  Then run `autumn deploy status` for an independent read-only view. To converge,
+  either re-run `autumn deploy up` (fix the cause first) or `autumn deploy
+  rollback` to take the whole fleet back. Remember that a migration which already
+  ran is still applied.
+- **One host is stranded on the new release.** Roll just that host back with
+  `autumn deploy rollback --only <host>`, then finish with a full `autumn deploy
+  up` (no `--only`) so the fleet converges on one release. `autumn deploy status
+  --strict` exits non-zero while the fleet is still mixed, which makes a good
+  gate for the "am I done?" question.
+- **A host says `NOT rolled back automatically`.** The fleet declined to touch it
+  because its rollback *target* is in doubt — release markers left
+  mid-transaction by `commit-markers`, a missing or unverifiable target release
+  dir, or no previous release recorded at all. Deliberately, the guidance is
+  **not** "run `deploy rollback --only <host>`": that command trusts the very
+  target that is in question. Read the markers first — the deploy prints the exact
+  read-only command for that host:
+
+  ```bash
+  ssh root@10.0.0.2 'cat /srv/autumn/myapp/shared/previous-release /srv/autumn/myapp/shared/live-slot; ls /srv/autumn/myapp/releases'
+  ```
+
+  The `previous-release` marker names the release dir, slot and port the host
+  should return to. Restore it by hand before deploying the fleet again.
+- **A host finished `DEGRADED`.** It is live and healthy on the new release; only
+  post-cutover bookkeeping failed. Repair it before the next deploy — a redeploy
+  of that host does — because a failed `record-proxy-options` makes the next
+  deploy of that host fail closed.
+- **`release directory … already exists`** — the one-second release id was reused
+  by a fast re-run. Wait a second and re-run `autumn deploy up`, or remove that
+  directory if you are certain it is stale.
 
 ### Limitations and known gaps
 
@@ -380,9 +1101,38 @@ or error messages.
   `deploy up` stands the release up and health-gates it. For a database-backed
   app, ensure the schema is applied (e.g. a follow-up `autumn deploy up`, or an
   out-of-band `autumn migrate` against the primary) before relying on DB routes.
-- **Single host.** `[deploy] host` targets one server; there is no multi-host
-  fan-out. For horizontally scaled setups behind a shared load balancer, see
-  [Multi-replica setup](#multi-replica-setup).
+  The same limitation generalises to a fleet: a rollout where **every** host is a
+  first deploy migrates nowhere, and says so loudly, naming `autumn migrate` (see
+  [Migrations run exactly once](#migrations-run-exactly-once)).
+- **One load balancer, many app hosts — but the load balancer is yours.**
+  `[deploy] hosts` rolls a release across as many app servers as you list, but
+  `autumn deploy` provisions no load balancer and performs no LB membership
+  changes: kamal-proxy is per host and binds that host's public port. Run your
+  load balancer on a separate host in front of the fleet, health-check `/ready`,
+  and terminate TLS there (a fleet deploy refuses `[deploy.tls]` for exactly this
+  reason). See the [fleet deploys guide](fleet-deploys.md) for the contract, and
+  [Multi-replica setup](#multi-replica-setup) for the shared state every replica
+  needs.
+- **Fleet rollback restores binaries, never schema.** Neither the automatic
+  compensation nor `autumn deploy rollback` runs a `migrate down` — an unattended
+  down-migration mid-flip would run exactly the SQL nothing reviews. Use
+  expand/contract migrations so a rolled-back binary still fits the migrated
+  schema.
+- **A failed *single-host* deploy never warns that the schema moved** (#2276).
+  A fleet ends every run with a `Fleet state:` summary that names the
+  binaries-versus-schema state; the single-host path returns the per-host error
+  directly and renders no summary, so a failure after `migrate` but before the
+  cutover leaves the previous release serving against the migrated schema with
+  nothing saying so. See
+  [What fleet support changed for an existing single-host deploy](#what-fleet-support-changed-for-an-existing-single-host-deploy).
+- **A compensated first deploy leaves its proxy route behind.** When the fleet
+  removes a host's just-completed *first* deploy, that host's kamal-proxy still
+  holds a route pointing at the (now stopped) slot, so its public port answers
+  `502` instead of refusing the connection until the host is deployed again. The
+  state table names the host so this is never a surprise.
+- **Host identity is compared literally.** Duplicate `[deploy] hosts` entries are
+  refused after trimming, but two DNS names for the same machine are not detected
+  — the same limitation `autumn migrate` has for duplicate target URLs.
 - **Remote state is updated step-by-step, not transactionally** (#1938). The
   `current` symlink and the live/previous-release markers are written by
   individual SSH commands, so an interrupted deploy can leave state mid-flight;
@@ -499,9 +1249,15 @@ systemd + kamal-proxy — nothing is mocked:
 
 - **Container e2e (every CI run):** `autumn-cli/tests/deploy_e2e.rs` drives first
   deploy, zero-downtime redeploy, on-demand rollback, and forced-failure
-  auto-rollback against a privileged systemd+sshd container. A container cannot
-  power-cycle, prep a stock host from scratch, or reproduce a real
-  pam_systemd session, so those are deferred to the real-VPS job below.
+  auto-rollback against a privileged systemd+sshd container. The same binary also
+  drives a **two-host fleet lifecycle** across two containers — rolling both
+  hosts onto one release, counting the migrate one-shot on each host to prove it
+  ran on exactly one, halting a rollout mid-fleet (the untouched host stays on
+  its old release), auto-rolling the already-cut-over host back, and asserting
+  `deploy status --json` / `--strict` — so the multi-host claims on this page are
+  covered by the same real ssh/scp + systemd + kamal-proxy harness, not by mocks.
+  A container cannot power-cycle, prep a stock host from scratch, or reproduce a
+  real pam_systemd session, so those are deferred to the real-VPS job below.
 - **Real-VPS validation (opt-in):** the
   [`Deploy real-VPS validation`](../../.github/workflows/deploy-real-vps.yml)
   GitHub Actions workflow provisions a throwaway Hetzner Cloud VM from a **stock

@@ -358,6 +358,29 @@ pub enum DeployExecError {
         #[source]
         source: Box<Self>,
     },
+    /// A step failed strictly AFTER the go-live boundary: traffic had already
+    /// moved, so nothing was torn down and the candidate is live. The wrapper
+    /// exists for ONE reason — to name the op that was actually running (issue
+    /// #1621, §4.6).
+    ///
+    /// Several executor errors carry no label of their own ([`Self::Spawn`],
+    /// [`Self::UploadFailed`], [`Self::Stage`]), and post-boundary the fleet's
+    /// never-auto-roll-back guard is keyed on the op label: a dropped transport
+    /// during `commit-markers` must fail closed exactly like a non-zero exit from
+    /// it, because either way the marker triple may be mid-transaction and the
+    /// rollback target unprovable.
+    ///
+    /// `Display` delegates to the wrapped error verbatim, so every operator-facing
+    /// message — the single-host path's included — is byte-for-byte what it was
+    /// before this wrapper existed. Only the fleet classifier looks inside.
+    #[error("{source}")]
+    PostCutover {
+        /// Label of the op that was running when the failure landed.
+        failed_step: &'static str,
+        /// The underlying failure (its `Display` is already redacted).
+        #[source]
+        source: Box<Self>,
+    },
 }
 
 /// Executes remote operations for a deploy. Injectable so tests can substitute a
@@ -417,11 +440,35 @@ impl SshTarget {
 /// prevents any password prompt from hanging a deploy, and
 /// `StrictHostKeyChecking=accept-new` pins a first-seen host key without
 /// blocking on an interactive yes/no.
-const SSH_BATCH_OPTS: [&str; 4] = [
+///
+/// **The three liveness options are load-bearing for fleets (issue #1621, R2).**
+/// [`SshExecutor::run`] shells out with `Command::output()`, which has no timeout,
+/// and the deploy preflight is a bare TCP connect — it proves a host accepts a
+/// connection, not that its SSH daemon will ever answer. A host that accepts TCP
+/// and then hangs (a wedged sshd, a black-holing firewall, a box mid-freeze) would
+/// therefore block the deploy **forever**. For one server that is a stuck deploy
+/// someone Ctrl-Cs. For a fleet it is a rollout frozen mid-flight with *k* hosts
+/// already on the new release and the rest on the old one — the mixed fleet the
+/// whole rollout design exists to prevent, entered by way of a hang rather than a
+/// failure, and with no error for the driver to compensate. `ConnectTimeout` bounds
+/// the handshake; `ServerAliveInterval`/`ServerAliveCountMax` bound a session that
+/// goes silent AFTER connecting (60s of silence ends it), which is the shape a long
+/// `migrate` or binary upload actually fails in. Turning an infinite hang into a
+/// finite error is what lets the fleet driver halt and compensate.
+///
+/// `scp` forwards `-o` to its own ssh transport, so uploads — the longest single
+/// operation in a deploy — get the same bounds.
+const SSH_BATCH_OPTS: [&str; 10] = [
     "-o",
     "BatchMode=yes",
     "-o",
     "StrictHostKeyChecking=accept-new",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
 ];
 
 /// Build the argv passed to the system `ssh` binary to run `remote_shell` on the
@@ -522,6 +569,104 @@ fn proxy_options_marker(cfg: &ResolvedDeployConfig) -> String {
     format!("{}/shared/proxy-options", cfg.app_dir)
 }
 
+/// Remote marker file recording the LAST state-changing deploy action this host
+/// completed, stored as `{result}\t{utc-timestamp}` (issue #1621, AC-6).
+///
+/// AC-6 asks `deploy status` for the per-host *last deploy result*, and no other
+/// on-host artefact answers it: `current`, `live-slot` and `previous-release` all
+/// describe the release a host is serving, never how it got there. After a halted
+/// rollout that compensated cleanly, every host reads back as healthy and
+/// converged — which is exactly the state the operator wants distinguished from a
+/// fleet that simply deployed.
+///
+/// **What it knows, precisely.** It is written by the ops that COMPLETE a cutover
+/// ([`commit_markers_command`] and [`record_proxy_options`]), so it records the
+/// last action that actually moved this host: [`LAST_DEPLOY_DEPLOYED`] or
+/// [`LAST_DEPLOY_ROLLED_BACK`]. A deploy that fails BEFORE the cutover boundary
+/// never reaches those ops (the host keeps serving its old release and is torn
+/// down), so the marker still names the previous action — it is the host's last
+/// completed action, not a verdict on the last rollout. `deploy status` says so
+/// where it prints it.
+///
+/// Mirrors [`live_slot_marker`]'s path convention (all markers live under
+/// `shared/`), so it survives cutovers and is pruned with nothing.
+fn last_deploy_marker(cfg: &ResolvedDeployConfig) -> String {
+    format!("{}/shared/last-deploy", cfg.app_dir)
+}
+
+/// Marker word for a host that last completed a forward deploy (first deploy or
+/// redeploy cutover). See [`last_deploy_marker`].
+pub const LAST_DEPLOY_DEPLOYED: &str = "deployed";
+
+/// Marker word for a host whose last completed action was a rollback — an
+/// operator-invoked `autumn deploy rollback`, or the fleet driver compensating a
+/// halted rollout (AC-3). See [`last_deploy_marker`].
+pub const LAST_DEPLOY_ROLLED_BACK: &str = "rolled back";
+
+/// Marker word for a host whose install was REMOVED again: a first deploy that was
+/// torn down, either by its own pre-boundary failure or by the fleet driver
+/// compensating a halted rollout (`CompensatedTeardown`). See
+/// [`first_deploy_teardown_ops`] for why a teardown REWRITES this marker instead of
+/// deleting it. See [`last_deploy_marker`].
+pub const LAST_DEPLOY_TORN_DOWN: &str = "torn down";
+
+/// Shell fragment that records `result` into the [`last_deploy_marker`], written
+/// atomically (mktemp + `mv -f`) like every other marker.
+///
+/// **Advisory by construction.** The fragment is a `{ … || true; }` group, so a
+/// failure to write it can never fail the op it is appended to. That is
+/// deliberate: it rides on `commit-markers` — whose failure is the one the fleet
+/// driver refuses to auto-roll-back from, because a partially-applied marker
+/// triple makes the rollback target unprovable — and a cosmetic status field must
+/// not be able to push a host into that state.
+fn record_last_deploy_fragment(cfg: &ResolvedDeployConfig, result: &str) -> String {
+    let shared = cfg.shared_dir();
+    let tmpl = format!("{shared}/last-deploy.tmp.XXXXXX");
+    format!(
+        "{{ rtmp=$(mktemp {tmpl}) && printf '%s\\t%s' {result} \
+         \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$rtmp\" && mv -f \"$rtmp\" {marker} || true; }}",
+        tmpl = shell_quote(&tmpl),
+        result = shell_quote(result),
+        marker = shell_quote(&last_deploy_marker(cfg)),
+    )
+}
+
+/// The last completed deploy action a host reports, parsed from the
+/// [`last_deploy_marker`] (issue #1621, AC-6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastDeploy {
+    /// The recorded action word — [`LAST_DEPLOY_DEPLOYED`] or
+    /// [`LAST_DEPLOY_ROLLED_BACK`]. Kept as the raw string so a marker written by
+    /// a newer CLI is reported verbatim rather than degrading to "unknown".
+    pub result: String,
+    /// When it was recorded, as the host's UTC `date -u +%Y-%m-%dT%H:%M:%SZ`, or
+    /// `None` for a marker written before the timestamp field existed.
+    pub at: Option<String>,
+}
+
+/// Parse a [`last_deploy_marker`] body (`{result}\t{timestamp}`).
+///
+/// Degrades to `None` for an empty/whitespace-only body — a missing marker (a host
+/// that has never completed a cutover) and an unreadable one are the same "we
+/// cannot tell", never a fabricated result.
+fn parse_last_deploy(raw: &str) -> Option<LastDeploy> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (result, at) = raw.split_once('\t').unwrap_or((raw, ""));
+    let result = result.trim();
+    if result.is_empty() {
+        return None;
+    }
+    Some(LastDeploy {
+        result: result.to_owned(),
+        at: Some(at.trim())
+            .filter(|at| !at.is_empty())
+            .map(ToOwned::to_owned),
+    })
+}
+
 /// The resolved blue/green slot layout for a deploy.
 ///
 /// The candidate always takes the slot the live release is NOT using, so both
@@ -568,6 +713,45 @@ impl SlotPlan {
             live_port: slot_app_port(public_port, live_slot),
         }
     }
+}
+
+/// Whether a cutover runs the pending-migration one-shot (issue #1621, AC-4).
+///
+/// A fleet's schema is **fleet-wide**, so a rollout migrates exactly once. A naive
+/// per-host loop would run the `AUTUMN_MIGRATE=1` one-shot on every host: the
+/// Postgres session advisory lock (`autumn/src/migrate.rs`) keeps that *correct*,
+/// but hosts 2..N each pay the lock wait and, far worse, a migration failing on
+/// host 2 **after** host 1 has already cut over is precisely the mixed-version
+/// fleet #1621 forbids. So the fleet driver schedules the migration on ONE host
+/// and builds every other host's cutover with [`Self::Skip`].
+///
+/// The op stays **inside** [`cutover_ops`] rather than being hoisted into a fleet
+/// pre-phase: in its historical position (between `start-candidate` and
+/// `readiness-gate`) it sits PRE-boundary relative to `proxy-flip`, so a failed
+/// migration keeps the entire existing, already-tested auto-rollback path for free
+/// — [`execute_with_teardown`] runs `candidate_teardown_ops`, the old release keeps
+/// serving, and the caller gets `CandidateRolledBack { failed_step: "migrate" }`.
+/// A standalone pre-phase would have to re-implement candidate teardown from
+/// scratch for zero gain.
+///
+/// This is an **enum, not a `bool`**, deliberately: Phase 2 of #1621 (role-based
+/// rollout — a designated migrator host, worker roles) needs to express more than
+/// yes/no and must not force a second signature break on [`cutover_ops`], the
+/// most exact-vector-asserted builder in the deploy path.
+///
+/// [`first_deploy_ops`] takes no such parameter: a first deploy has **never** run
+/// migrations (a documented single-host limitation), and keeping it byte-identical
+/// is what lets the one-entry-`hosts` fleet stay indistinguishable from today's
+/// single-server deploy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrateStep {
+    /// Run the pending-migration one-shot before the flip — today's behavior, in
+    /// today's exact position.
+    Run,
+    /// Omit ONLY the migrate op; every other step keeps its identity and relative
+    /// position (the cutover boundary in particular). Used for every host in a
+    /// fleet run except the one that carries the migration.
+    Skip,
 }
 
 /// Build the ordered FIRST-deploy operation sequence (Slice 1 + proxy front).
@@ -723,7 +907,11 @@ pub fn first_deploy_ops(
 /// 6. start the candidate via `enable` + `restart` (old release untouched;
 ///    restart, not `enable --now`, so an already-active slot relaunches the
 ///    freshly written unit — see the op's comment),
-/// 7. run pending migrations BEFORE cutover (`AUTUMN_MIGRATE=1` one-shot),
+/// 7. run pending migrations BEFORE cutover (`AUTUMN_MIGRATE=1` one-shot) — the
+///    ONLY step this builder parameterises: `migrate` is [`MigrateStep::Run`] for
+///    a single-host deploy and for the one fleet host that carries the migration,
+///    and [`MigrateStep::Skip`] for every other fleet host (issue #1621, AC-4).
+///    `Skip` omits this op and nothing else,
 /// 8. bounded `/ready` poll on the candidate's separate loopback port,
 /// 9. health-gated proxy flip old→candidate (THE cutover),
 /// 10. commit the state markers as ONE atomic remote op (#1938): record the
@@ -748,6 +936,7 @@ pub fn cutover_ops(
     release_id: &str,
     plan: &SlotPlan,
     reregister_options: &ProxyServiceOptions,
+    migrate: MigrateStep,
 ) -> Vec<DeployOp> {
     let release_dir = format!("{}/{release_id}", cfg.releases_dir());
     let remote_binary = format!("{release_dir}/{}", cfg.app_name);
@@ -838,10 +1027,20 @@ pub fn cutover_ops(
                  systemctl restart {candidate_unit}.service"
             ),
         )),
-        // Migrations run BEFORE the flip. `systemd-run --wait` returns the
-        // child's exit status, so a failed migration surfaces a non-zero error
-        // that stops run_ops before the flip — old release still serving (AC-3).
-        DeployOp::Run(release_migrate_command(cfg, &release_dir)),
+    ]);
+    // Migrations run BEFORE the flip. `systemd-run --wait` returns the child's
+    // exit status, so a failed migration surfaces a non-zero error that stops
+    // run_ops before the flip — old release still serving (AC-3).
+    //
+    // #1621: this is the ONE op a fleet parameterises. The position is unchanged
+    // (between `start-candidate` and `readiness-gate`, i.e. PRE-boundary, so the
+    // existing candidate-teardown path still covers a failed migration), and
+    // `MigrateStep::Skip` omits ONLY this op — hosts 2..N of a fleet, whose shared
+    // schema the first redeploying host already migrated. See [`MigrateStep`].
+    if matches!(migrate, MigrateStep::Run) {
+        ops.push(DeployOp::Run(release_migrate_command(cfg, &release_dir)));
+    }
+    ops.extend([
         DeployOp::Run(RemoteCommand::new(
             "readiness-gate",
             readiness_poll_shell(plan.candidate_port, cfg.readiness_timeout_secs),
@@ -868,6 +1067,7 @@ pub fn cutover_ops(
                 slot: plan.live_slot,
                 port: plan.live_port,
             },
+            LAST_DEPLOY_DEPLOYED,
         )),
         // Record the proxy TLS/host options this cutover registered on the new
         // release (issue #2074) — the controller's NEW `tls_host`, NOT the preserved
@@ -902,6 +1102,12 @@ pub fn cutover_ops(
 /// driven through [`run_teardown`], which swallows executor errors — so a flaky
 /// cleanup can never mask the real deploy failure. Removing the release dir means
 /// a re-run uploads a fresh copy rather than reusing a half-written one.
+///
+/// It deliberately does NOT touch the [`last_deploy_marker`], unlike
+/// [`first_deploy_teardown_ops`]. A torn-down CANDIDATE leaves the PREVIOUS release
+/// serving and never moved traffic, so the marker's existing record still describes
+/// the release that is actually live; rewriting it would report a change that never
+/// happened and erase the true one.
 #[must_use]
 pub fn candidate_teardown_ops(
     cfg: &ResolvedDeployConfig,
@@ -936,6 +1142,27 @@ pub fn candidate_teardown_ops(
 /// fails on a missing path) and driven through [`run_teardown`], which swallows
 /// executor errors so a flaky cleanup can never mask the real deploy failure.
 ///
+/// **It also records `torn down` in the [`last_deploy_marker`]** (issue #1621,
+/// AC-6). A first deploy writes `deployed` into that marker as part of
+/// [`record_proxy_options`], so a host the fleet driver compensates with this
+/// teardown — `HostOutcome::CompensatedTeardown`, i.e. nothing installed — would
+/// otherwise keep reporting `last deploy: deployed <ts>` in `deploy status` with no
+/// release on it at all. That is a wrong value in the column an operator reads
+/// first while triaging a halted rollout.
+///
+/// The marker is REWRITTEN rather than deleted, deliberately. An absent marker
+/// renders `last deploy: ?`, which is also what a host that was never deployed (or
+/// whose marker write failed) shows — so clearing it would erase precisely the fact
+/// triage needs: this host WAS taken back down, on purpose, at this time. The
+/// alternative loses information; this one adds it, and `mode: not deployed` plus
+/// the `DRIFT_HOST_NOT_DEPLOYED` reason already sit beside it in the same row.
+///
+/// Two safety properties, both load-bearing: the record is the LAST op, so an
+/// earlier failure stops [`run_ops`] before the marker is rewritten and the host
+/// keeps its previous — still true — record; and the write is the same advisory
+/// `{ … || true; }` fragment the cutover uses, so it can never turn a clean
+/// compensation into `HostOutcome::CompensationFailed`.
+///
 /// This must NOT be used for a redeploy: the redeploy teardown deliberately
 /// leaves the old release's `current`/live-slot markers intact because that old
 /// release is still serving.
@@ -957,6 +1184,14 @@ pub fn first_deploy_teardown_ops(
             shell_quote(&live_slot_marker(cfg)),
             shell_quote(&previous_release_marker(cfg)),
         ),
+    )));
+    // AC-6: correct the last-deploy marker the first deploy already wrote, so a
+    // host with nothing installed can never report a successful deploy. LAST, and
+    // advisory — see this function's doc comment for why both matter and why the
+    // marker is rewritten rather than removed.
+    ops.push(DeployOp::Run(RemoteCommand::new(
+        "teardown-last-deploy",
+        record_last_deploy_fragment(cfg, LAST_DEPLOY_TORN_DOWN),
     )));
     ops
 }
@@ -1162,6 +1397,7 @@ pub fn rollback_ops(
                 slot: other_slot(target.slot),
                 port: former_live_fallback_port,
             },
+            LAST_DEPLOY_ROLLED_BACK,
         )),
         DeployOp::Run(RemoteCommand::new(
             "readiness-gate",
@@ -1261,10 +1497,15 @@ fn record_proxy_options(
     RemoteCommand::new(
         "record-proxy-options",
         format!(
-            "otmp=$(mktemp {tmpl}) && printf '%s' {value} > \"$otmp\" && mv -f \"$otmp\" {marker}",
+            "otmp=$(mktemp {tmpl}) && printf '%s' {value} > \"$otmp\" && mv -f \"$otmp\" {marker} \
+             && {last_deploy}",
             tmpl = shell_quote(&tmpl),
             value = shell_quote(&options.marker_value()),
             marker = shell_quote(&proxy_options_marker(cfg)),
+            // AC-6: this op is the LAST marker write on both forward paths (first
+            // deploy and redeploy cutover), so it is where "this host completed a
+            // deploy" is true. Advisory — see `record_last_deploy_fragment`.
+            last_deploy = record_last_deploy_fragment(cfg, LAST_DEPLOY_DEPLOYED),
         ),
     )
 }
@@ -1321,6 +1562,7 @@ fn commit_markers_command(
     slot: &str,
     port: u16,
     prev_fallback: PrevMarkerFallback<'_>,
+    last_deploy_result: &str,
 ) -> RemoteCommand {
     let shared = cfg.shared_dir();
     let prev_tmpl = format!("{shared}/previous-release.tmp.XXXXXX");
@@ -1342,7 +1584,14 @@ fn commit_markers_command(
              ln -sfn {release_dir} {current} && \
              ltmp=$(mktemp {live_tmpl}) && \
              printf '%s\\t%s' {slot} {port} > \"$ltmp\" && \
-             mv -f \"$ltmp\" {live_marker}",
+             mv -f \"$ltmp\" {live_marker} && \
+             {last_deploy}",
+            // AC-6: the last-deploy marker rides on the transaction that COMPLETES
+            // the cutover, so it is the one place both the redeploy and the
+            // rollback path agree on. Advisory — its failure can never turn a
+            // successful marker commit into the AmbiguousMarkers state (see
+            // `record_last_deploy_fragment`).
+            last_deploy = record_last_deploy_fragment(cfg, last_deploy_result),
             current = shell_quote(&cfg.current_symlink()),
             live_marker = shell_quote(&live_slot_marker(cfg)),
             prev_slot = shell_quote(prev_fallback.slot),
@@ -1581,6 +1830,27 @@ const NO_PROXY_UNIT_SENTINEL: &str = "---autumn-no-proxy-unit---";
 /// refuse guard never fires on synthetic input).
 const PROXY_OPTIONS_DELIM: &str = "---autumn-kamal-proxy-options---";
 
+/// Delimiter appended after the `shared/proxy-options` marker, before
+/// `readlink -f {app_dir}/current` (issue #1621, AC-6), so all five sections ride
+/// in ONE round-trip. Its ABSENCE (a host deployed before this feature, older
+/// recorded output, or a scripted test) leaves an empty section →
+/// [`DeployProbe::current_release_dir`] `None` — "unknown", never a guessed id.
+const CURRENT_RELEASE_DELIM: &str = "---autumn-current-release---";
+
+/// The release id encoded in a resolved `current` release dir: its basename
+/// (issue #1621, AC-6).
+///
+/// `None` for an empty or root-only path, so an unreadable symlink can never be
+/// mistaken for a release named `""` — the drift report treats an unknown release
+/// as a DISTINCT reported state and never as drift, and that distinction depends on
+/// this returning `None` rather than something empty-but-`Some`.
+#[must_use]
+pub fn release_id_from_dir(dir: &str) -> Option<&str> {
+    let trimmed = dir.trim().trim_end_matches('/');
+    let id = trimmed.rsplit('/').next().unwrap_or_default();
+    (!id.is_empty()).then_some(id)
+}
+
 /// The outcome of the deploy-start probe: the first-vs-redeploy [`DeployMode`],
 /// the raw `kamal-proxy list` output, AND the installed proxy unit's `--http-port`
 /// state — all captured in the SAME remote round-trip, so a drifted live-slot
@@ -1600,6 +1870,38 @@ pub struct DeployProbe {
     /// the redeploy path to PRESERVE the old release's options on the durability
     /// re-register — or FAIL CLOSED when the marker is present but unreadable.
     pub last_proxy_options: ProxyOptionsMarker,
+    /// The release dir the host's `current` symlink resolves to (#1621, AC-6); its
+    /// basename is the deployed release id ([`release_id_from_dir`]).
+    ///
+    /// `None` when the symlink is absent, dangling, or the probe output predates
+    /// this section — reported as "unknown", never guessed. `deploy status` and the
+    /// fleet `maintenance` fan-out read it; the rollout path ignores it.
+    pub current_release_dir: Option<String>,
+}
+
+impl DeployProbe {
+    /// The live-slot decision for this host, reconciled against the running proxy —
+    /// pure, and `None` for a host with no promoted release at all.
+    ///
+    /// The ONE seam every fleet surface decides "which slot, and therefore which
+    /// unit, is live" through: `deploy status` READS the maintenance flag off it and
+    /// the `deploy maintenance` fan-out WRITES to it (review round 3). Sharing it is
+    /// what stops the read path and the write path from disagreeing about which file
+    /// matters — a `current` symlink can name a different release than the unit the
+    /// proxy is actually serving (a flip that landed with a `commit-markers` that
+    /// did not), and only the unit's own view is true for the running app.
+    #[must_use]
+    pub fn reconcile(&self, cfg: &ResolvedDeployConfig, public_port: u16) -> Option<SlotReconcile> {
+        match &self.mode {
+            DeployMode::First => None,
+            DeployMode::Redeploy { live_slot } => Some(reconcile_live_slot(
+                live_slot,
+                &self.proxy_list,
+                &cfg.service_name,
+                public_port,
+            )),
+        }
+    }
 }
 
 /// Parse the probe's unit section into an [`InstalledProxyPort`] (#2073).
@@ -1669,7 +1971,9 @@ pub fn probe_deploy_state(
          if [ -f {unit} ]; then grep -hoE -e '--http-port[[:space:]]+[0-9]+' {unit} 2>/dev/null || true; \
          else printf '%s' '{no_unit}'; fi; \
          printf '\\n{opts_delim}\\n'; \
-         cat {opts_marker} 2>/dev/null || true",
+         cat {opts_marker} 2>/dev/null || true; \
+         printf '\\n{current_delim}\\n'; \
+         readlink -f {current} 2>/dev/null || true",
         current = shell_quote(&cfg.current_symlink()),
         marker = shell_quote(&live_slot_marker(cfg)),
         blue = SLOT_BLUE,
@@ -1679,6 +1983,7 @@ pub fn probe_deploy_state(
         no_unit = NO_PROXY_UNIT_SENTINEL,
         opts_delim = PROXY_OPTIONS_DELIM,
         opts_marker = shell_quote(&proxy_options_marker(cfg)),
+        current_delim = CURRENT_RELEASE_DELIM,
     );
     let out = exec.run(&RemoteCommand::new("detect-current", shell))?;
     let (mode_part, rest) = out
@@ -1688,21 +1993,34 @@ pub fn probe_deploy_state(
     // Split the proxy list from the installed-unit section. A missing unit delimiter
     // (older/scripted output) → empty unit + options sections → `Absent`/`Absent`
     // (never a spurious refuse, always proceed-as-legacy).
-    let (proxy_list, installed_proxy_port, last_proxy_options) =
+    let (proxy_list, installed_proxy_port, last_proxy_options, current_release_dir) =
         match rest.split_once(PROXY_UNIT_DELIM) {
             Some((list, after_unit)) => {
                 // The installed-unit section further splits into the `--http-port` grep and
                 // the proxy-options marker; a missing options delimiter → empty → `Absent`.
-                let (unit_section, opts_section) = after_unit
+                let (unit_section, after_opts) = after_unit
                     .split_once(PROXY_OPTIONS_DELIM)
                     .unwrap_or((after_unit, ""));
+                // …and the options section further splits into the marker `cat` and the
+                // `readlink -f current` result (#1621). A missing delimiter (a host
+                // deployed before this feature, or a scripted test) leaves an empty
+                // current section → `None` = "release unknown", never a guessed id.
+                let (opts_section, current_section) = after_opts
+                    .split_once(CURRENT_RELEASE_DELIM)
+                    .unwrap_or((after_opts, ""));
                 (
                     list,
                     parse_installed_proxy_port(unit_section),
                     parse_proxy_options(opts_section),
+                    parse_current_release(current_section),
                 )
             }
-            None => (rest, InstalledProxyPort::Absent, ProxyOptionsMarker::Absent),
+            None => (
+                rest,
+                InstalledProxyPort::Absent,
+                ProxyOptionsMarker::Absent,
+                None,
+            ),
         };
     let mode = mode_part
         .trim()
@@ -1722,6 +2040,408 @@ pub fn probe_deploy_state(
         proxy_list: proxy_list.to_owned(),
         installed_proxy_port,
         last_proxy_options,
+        current_release_dir,
+    })
+}
+
+/// Parse the probe's `readlink -f {app_dir}/current` section (#1621, AC-6).
+///
+/// Empty (absent/dangling symlink, or a probe capture predating this section) →
+/// `None`. Anything else is the resolved release DIR, trimmed of surrounding
+/// whitespace/newlines. Deliberately NOT fail-closed: this section is read-only
+/// reporting, and refusing to report a status because a symlink is unreadable would
+/// make `deploy status` useless on exactly the drifted host it exists to surface.
+fn parse_current_release(section: &str) -> Option<String> {
+    let trimmed = section.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Delimiter separating the two facts only `deploy status` needs — the live slot's
+/// `/ready` HTTP code and the maintenance-flag presence — in one round-trip
+/// (issue #1621, AC-6).
+const HOST_STATUS_DELIM: &str = "---autumn-host-status---";
+
+/// Sentinel the status probe prints when a maintenance flag file exists.
+const MAINTENANCE_ON_SENTINEL: &str = "maintenance-on";
+
+/// Whether a host is in maintenance, **as the unit it is actually running sees
+/// it** (issue #1621, review round 1).
+///
+/// Deliberately three-valued rather than a `bool`. The flag file the runtime polls
+/// is chosen by `AUTUMN_MAINTENANCE_FLAG_FILE` (see
+/// [`autumn_web::maintenance::flag_file_path_from`]), which slot units only carry
+/// from #1621 onwards — so on a host whose unit predates this feature the app polls
+/// a release-local path the fleet switch does not own. Reading one fixed path and
+/// calling the answer `on`/`off` therefore lies in both directions: `off` for a
+/// host that is maintained, and `ON` for a host still taking traffic. When the CLI
+/// cannot prove WHICH file the running unit polls it says so instead of guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceStatus {
+    /// The file the running unit polls exists: the app is serving maintenance.
+    On,
+    /// The file the running unit polls does not exist: the app is serving traffic.
+    Off,
+    /// The live slot unit could not be read, so the file the app polls is unknown.
+    /// **Fails closed** — never rendered as a confident `ON`/`off`.
+    Unknown,
+}
+
+/// Which maintenance flag file the host's live slot unit resolves to (issue #1621,
+/// review round 1).
+///
+/// Reported alongside [`MaintenanceStatus`] because it is the actionable half: a
+/// host that does not poll the shared path will have its flag orphaned by the next
+/// cutover, and a fleet-wide `deploy maintenance on` cannot reach it reliably.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceFlagSource {
+    /// The unit declares `AUTUMN_MAINTENANCE_FLAG_FILE` and it is exactly the
+    /// per-app shared path this CLI manages — the #1621 shape.
+    Shared,
+    /// The unit resolves to some OTHER file: no override at all (a pre-#1621 unit,
+    /// polling `WorkingDirectory`-relative `tmp/autumn-maintenance.json`), or an
+    /// override pointing somewhere this CLI does not write.
+    Unshared,
+    /// The unit could not be read, so nothing about the flag path is proved.
+    Unknown,
+}
+
+/// The maintenance flag file the app on one slot ACTUALLY polls, resolved on the
+/// host from that slot's unit (issue #1621, review round 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveMaintenanceFlag {
+    /// The path the unit makes the runtime poll: its `AUTUMN_MAINTENANCE_FLAG_FILE`
+    /// when non-blank, else its `WorkingDirectory` joined with the cwd-relative
+    /// legacy path — the same rule
+    /// [`autumn_web::maintenance::flag_file_path_from`] applies at runtime.
+    pub path: String,
+    /// Whether that file existed at probe time.
+    pub present: bool,
+}
+
+/// Shell that resolves, ON THE HOST, the maintenance flag file `live_slot`'s unit
+/// makes the app poll — and whether it exists (issue #1621, review round 3).
+///
+/// The single copy of that rule. `deploy status` embeds it in its batched status
+/// round-trip to REPORT the flag, and the `deploy maintenance` fan-out runs it via
+/// [`probe_live_maintenance_flag`] to decide where to WRITE; a second copy is
+/// exactly how the two would drift back apart into reporting one file and writing
+/// another.
+///
+/// Prints nothing at all when the unit cannot be read — the caller's fail-closed
+/// signal, never a fallback to a path the running app may not poll.
+fn live_maintenance_flag_shell(cfg: &ResolvedDeployConfig, live_slot: &str) -> String {
+    format!(
+        "if [ -f {unit} ]; then \
+         autumn_mf=$(sed -n 's|^Environment={flag_env}=||p' {unit} 2>/dev/null | tail -n 1); \
+         autumn_wd=$(sed -n 's|^WorkingDirectory=||p' {unit} 2>/dev/null | tail -n 1); \
+         if [ -z \"$autumn_mf\" ] && [ -n \"$autumn_wd\" ]; then \
+         autumn_mf=\"$autumn_wd/{legacy_rel}\"; fi; \
+         if [ -n \"$autumn_mf\" ]; then printf '%s\\n' \"$autumn_mf\"; \
+         if [ -f \"$autumn_mf\" ]; then printf '%s' '{on}'; fi; fi; fi",
+        unit = shell_quote(&format!(
+            "/etc/systemd/system/{}.service",
+            slot_unit_name(&cfg.service_name, live_slot)
+        )),
+        flag_env = autumn_web::maintenance::MAINTENANCE_FLAG_FILE_ENV,
+        legacy_rel = autumn_web::maintenance::MAINTENANCE_FLAG_FILE,
+        on = MAINTENANCE_ON_SENTINEL,
+    )
+}
+
+/// Parse what [`live_maintenance_flag_shell`] printed: `{path}\n[{sentinel}]`.
+///
+/// `None` — a blank or absent path — means the unit could not be read. It is
+/// deliberately NOT degraded to the shared path: the whole point is that a
+/// pre-#1621 unit polls somewhere else entirely.
+fn parse_live_maintenance_flag(section: &str) -> Option<LiveMaintenanceFlag> {
+    let mut lines = section.trim_start_matches('\n').lines();
+    let path = lines.next().unwrap_or_default().trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(LiveMaintenanceFlag {
+        path: path.to_owned(),
+        present: lines
+            .next()
+            .is_some_and(|line| line.trim() == MAINTENANCE_ON_SENTINEL),
+    })
+}
+
+/// Resolve the maintenance flag file the host's live slot unit polls, in ONE
+/// read-only round-trip (issue #1621, review round 3).
+///
+/// `Ok(None)` is the fail-closed answer — the unit is absent or unreadable, so
+/// nothing about the running app's flag path is proved and the caller must not act
+/// as though it were.
+///
+/// # Errors
+///
+/// Returns the executor's error only when the probe command cannot run at all.
+pub fn probe_live_maintenance_flag(
+    cfg: &ResolvedDeployConfig,
+    live_slot: &str,
+    exec: &impl DeployExecutor,
+) -> Result<Option<LiveMaintenanceFlag>, DeployExecError> {
+    let out = exec.run(&RemoteCommand::new(
+        "detect-maintenance-flag",
+        live_maintenance_flag_shell(cfg, live_slot),
+    ))?;
+    Ok(parse_live_maintenance_flag(&out.stdout))
+}
+
+/// Everything `autumn deploy status` reads from ONE host (issue #1621, AC-6).
+///
+/// Deliberately a superset of [`DeployProbe`] rather than an extension of it:
+/// `deploy up` must NOT pay for a `curl` and a flag-file `test` on every host, and
+/// the fields below are meaningless to a rollout. Keeping them here is what lets
+/// [`probe_deploy_state`] stay exactly as costly as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostStatusProbe {
+    /// The shared deploy-state probe: mode + live-slot marker, `kamal-proxy list`,
+    /// the installed proxy port, the proxy-options marker and the `current` release.
+    pub deploy: DeployProbe,
+    /// HTTP status the live slot's loopback `/ready` answered with, or `None` when
+    /// nothing answered (connection refused, no `curl`, a timeout, an
+    /// unparseable code). `None` is "we could not tell", never "unhealthy".
+    pub ready_code: Option<u16>,
+    /// Whether the SHARED maintenance flag file exists on this host.
+    ///
+    /// Read from `{app_dir}/shared/…` — the release-independent path the #1621 slot
+    /// units point `AUTUMN_MAINTENANCE_FLAG_FILE` at — so the answer survives a
+    /// cutover, which is the whole reason that override exists. It is the state of
+    /// ONE file, not a verdict: see [`Self::maintenance`] for what the RUNNING unit
+    /// observes.
+    pub shared_maintenance_flag: bool,
+    /// Maintenance as the host's live slot unit actually observes it — the fact
+    /// `deploy status` reports (issue #1621, review round 1).
+    pub maintenance: MaintenanceStatus,
+    /// Which file that verdict came from.
+    pub maintenance_flag_source: MaintenanceFlagSource,
+    /// The last state-changing deploy action this host COMPLETED, from the
+    /// `shared/last-deploy` marker (AC-6), or `None` when the marker is absent or
+    /// unreadable.
+    ///
+    /// See [`last_deploy_marker`] for exactly what it does and does not know: a
+    /// deploy that failed before the cutover boundary never rewrites it, so it is
+    /// the host's last completed action rather than a verdict on the last rollout.
+    pub last_deploy: Option<LastDeploy>,
+}
+
+impl HostStatusProbe {
+    /// The live-slot decision for this host, reconciled against the running proxy —
+    /// pure, and `None` for a host with no promoted release at all.
+    ///
+    /// Shared with the rollout path's slot selection ([`reconcile_live_slot`]) and
+    /// with the `deploy maintenance` fan-out through [`DeployProbe::reconcile`], so
+    /// `status` reports the same slot a deploy would plan from — and the same one
+    /// maintenance writes to — including the same proxy-over-marker precedence on a
+    /// disagreement.
+    #[must_use]
+    pub fn reconcile(&self, cfg: &ResolvedDeployConfig, public_port: u16) -> Option<SlotReconcile> {
+        self.deploy.reconcile(cfg, public_port)
+    }
+}
+
+/// The read-only status probe: the shared deploy-state round-trip PLUS the live
+/// slot's `/ready` code and the maintenance-flag presence (issue #1621, AC-6).
+///
+/// Used ONLY by `deploy status`, never by `up` — see [`HostStatusProbe`]. Both
+/// commands it runs are read-only (`readlink`/`cat`/`grep`, then `curl` and
+/// `[ -f ]`), so this can be pointed at a production fleet mid-incident.
+///
+/// The readiness probe hits the LIVE slot's loopback port (the same
+/// `http://127.0.0.1:{slot_port}/ready` the deploy's readiness gate polls), not the
+/// public port: the public port is kamal-proxy's, and asking the proxy would report
+/// the proxy's health rather than the release's. It is bounded by `--max-time` so a
+/// hung app cannot stall a fleet-wide status, and its failure is never fatal —
+/// `deploy status` must report the whole fleet or it is useless during the incident
+/// it exists for.
+///
+/// # Errors
+///
+/// Returns the executor's error only when a probe command cannot run at all — the
+/// caller renders that host as unreachable rather than aborting the fleet report.
+pub fn probe_host_status(
+    cfg: &ResolvedDeployConfig,
+    public_port: u16,
+    exec: &impl DeployExecutor,
+) -> Result<HostStatusProbe, DeployExecError> {
+    let deploy = probe_deploy_state(cfg, exec)?;
+    // Poll whichever slot the proxy is actually serving; on a host with nothing
+    // promoted yet, blue is the slot a first deploy takes, and the probe simply
+    // reports that nothing answered.
+    let live_slot = deploy
+        .reconcile(cfg, public_port)
+        .map_or(SLOT_BLUE, |reconcile| reconcile.live_slot);
+    let shared_flag = cfg.maintenance_flag_file();
+    let shell = format!(
+        "curl -o /dev/null -s -m 5 -w '%{{http_code}}' http://127.0.0.1:{port}/ready 2>/dev/null \
+         || true; \
+         printf '\\n{delim}\\n'; \
+         if [ -f {flag} ]; then printf '%s' '{on}'; fi; \
+         printf '\\n{delim}\\n'; \
+         cat {last_deploy} 2>/dev/null || true; \
+         printf '\\n{delim}\\n'; \
+         {unit_flag}",
+        port = slot_app_port(public_port, live_slot),
+        delim = HOST_STATUS_DELIM,
+        flag = shell_quote(&shared_flag),
+        on = MAINTENANCE_ON_SENTINEL,
+        // AC-6, third fact: the last COMPLETED deploy action. Folded into this
+        // existing round-trip rather than a new per-host ssh — `deploy status` is
+        // run mid-incident across the whole fleet, and every extra round-trip is
+        // paid N times.
+        last_deploy = shell_quote(&last_deploy_marker(cfg)),
+        // Review round 1: resolve, ON THE HOST, the flag file the LIVE SLOT UNIT
+        // actually makes the app poll — doing it from the unit rather than from
+        // `current` is what makes the answer true for a unit rendered before #1621,
+        // which carries no override line at all. Folded into this round-trip (round
+        // 3 moved the fragment itself into `live_maintenance_flag_shell`, shared
+        // with the `deploy maintenance` WRITE path) so `deploy status` stays at the
+        // same two round-trips per host.
+        unit_flag = live_maintenance_flag_shell(cfg, live_slot),
+    );
+    let out = exec.run(&RemoteCommand::new("probe-host-status", shell))?;
+    // Section-count tolerant: a host still running a pre-#1621 probe shape (or a
+    // fixture written against it) simply reports no last-deploy section, and a
+    // capture predating the unit section leaves the maintenance verdict `Unknown`.
+    let mut sections = out.stdout.split(HOST_STATUS_DELIM);
+    let ready_section = sections.next().unwrap_or_default();
+    let shared_flag_section = sections.next().unwrap_or_default();
+    let last_deploy_section = sections.next().unwrap_or_default();
+    let unit_flag_section = sections.next().unwrap_or_default();
+    // The unit section is `{resolved path}\n[{sentinel}]`. A blank/absent path is
+    // "the unit could not be read" — fail closed rather than fall back to the
+    // shared path, whose state the running unit may well not observe.
+    let (maintenance, maintenance_flag_source) =
+        match parse_live_maintenance_flag(unit_flag_section) {
+            None => (MaintenanceStatus::Unknown, MaintenanceFlagSource::Unknown),
+            Some(flag) => (
+                if flag.present {
+                    MaintenanceStatus::On
+                } else {
+                    MaintenanceStatus::Off
+                },
+                if flag.path == shared_flag {
+                    MaintenanceFlagSource::Shared
+                } else {
+                    MaintenanceFlagSource::Unshared
+                },
+            ),
+        };
+    Ok(HostStatusProbe {
+        deploy,
+        // `curl` writes `000` when it never got a response; that is "nothing
+        // answered", not an HTTP status, so it degrades to `None` like every other
+        // unreadable capture.
+        ready_code: ready_section
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|code| *code > 0),
+        shared_maintenance_flag: shared_flag_section.trim() == MAINTENANCE_ON_SENTINEL,
+        maintenance,
+        maintenance_flag_source,
+        last_deploy: parse_last_deploy(last_deploy_section),
+    })
+}
+
+/// Sentinel [`probe_release_dir`] prints when `{releases_dir}/{release_id}` already
+/// exists on the host.
+const RELEASE_DIR_PRESENT: &str = "present";
+
+/// Sentinel [`probe_release_dir`] prints when the release dir is free.
+const RELEASE_DIR_ABSENT: &str = "absent";
+
+/// Whether this run's release dir already exists on a host (issue #1621, §4.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseDirState {
+    /// The release dir is free — the normal case.
+    Absent,
+    /// The release dir already exists: a previous run of THIS release id already
+    /// wrote into it. Refused (see [`probe_release_dir`]).
+    Present,
+    /// The probe printed neither sentinel, so the dir's state cannot be proved.
+    /// **Fails closed** — the collision below is destructive and silent.
+    Unreadable,
+}
+
+/// Read-only probe: does `{releases_dir}/{release_id}` already exist on this host?
+/// (issue #1621, §4.9.)
+///
+/// `release_id` is a UTC timestamp with **one-second granularity**
+/// (`default_release_id`), and exactly ONE id is minted per fleet run. A fast
+/// retry within the same second therefore re-uses the id and would upload a NEW
+/// binary into the release dir `shared/previous-release` still points at — so the
+/// host's "previous release" would hold the new binary and a rollback would roll
+/// *forward*, silently. There is no marker that can detect this after the fact,
+/// so the deploy refuses up front, before anything is written.
+///
+/// It is deliberately its OWN round-trip rather than a fifth section on
+/// [`probe_deploy_state`]: that probe's shell is pinned by exact-content tests and
+/// its sections are all about the *live* release, while this one is about the
+/// *candidate* dir and must fail closed rather than degrade to `Absent`.
+///
+/// # Errors
+///
+/// Returns the executor's error if the probe command cannot run.
+pub fn probe_release_dir(
+    cfg: &ResolvedDeployConfig,
+    release_id: &str,
+    exec: &impl DeployExecutor,
+) -> Result<ReleaseDirState, DeployExecError> {
+    let release_dir = format!("{}/{release_id}", cfg.releases_dir());
+    probe_dir_state("probe-release-dir", &release_dir, exec)
+}
+
+/// Read-only probe: does the release dir a fleet compensation is about to roll a
+/// host back TO still exist? (issue #1621, §4.7.)
+///
+/// The same `[ -d … ]` shell as [`probe_release_dir`] under a DISTINCT label, so a
+/// tape can tell the two apart and the strict test fake can require it to be
+/// scripted. It is a separate call rather than a flag because it asks the opposite
+/// question about the opposite directory: the deploy refuses when this run's
+/// candidate dir is PRESENT, while compensation refuses when the rollback target is
+/// ABSENT.
+///
+/// It exists because `prune` runs per host and hosts with divergent deploy history
+/// legitimately retain different sets: `resolve_rollback_target` can name a dir a
+/// later prune already removed. Rolling back to it anyway would write a slot unit
+/// whose `ExecStart` points nowhere, start it successfully as far as systemd is
+/// concerned, and then fail the readiness gate — POST-boundary, with no teardown,
+/// turning a one-host incident into a two-host one. Missing → the caller declines
+/// the automatic rollback and reports the host.
+///
+/// # Errors
+///
+/// Returns the executor's error if the probe command cannot run.
+pub fn probe_rollback_target_dir(
+    release_dir: &str,
+    exec: &impl DeployExecutor,
+) -> Result<ReleaseDirState, DeployExecError> {
+    probe_dir_state("probe-rollback-target", release_dir, exec)
+}
+
+/// The shared read-only `[ -d … ]` directory probe behind [`probe_release_dir`] and
+/// [`probe_rollback_target_dir`]: two printf sentinels, nothing else, and any other
+/// capture fails closed to [`ReleaseDirState::Unreadable`] (an empty capture is the
+/// exact trap every other probe in this file degrades on).
+fn probe_dir_state(
+    label: &'static str,
+    dir: &str,
+    exec: &impl DeployExecutor,
+) -> Result<ReleaseDirState, DeployExecError> {
+    let shell = format!(
+        "if [ -d {dir} ]; then printf '%s' '{RELEASE_DIR_PRESENT}'; \
+         else printf '%s' '{RELEASE_DIR_ABSENT}'; fi",
+        dir = shell_quote(dir),
+    );
+    let out = exec.run(&RemoteCommand::new(label, shell))?;
+    Ok(match out.stdout.trim() {
+        RELEASE_DIR_PRESENT => ReleaseDirState::Present,
+        RELEASE_DIR_ABSENT => ReleaseDirState::Absent,
+        // Fail closed: an unexpected capture cannot prove the dir's state.
+        _ => ReleaseDirState::Unreadable,
     })
 }
 
@@ -2112,14 +2832,26 @@ fn execute_with_teardown(
     let boundary = ops.iter().position(|op| op.label() == boundary_label);
     for (index, op) in ops.iter().enumerate() {
         if let Err(source) = run_one(op, exec) {
-            // Fail safe: if the boundary op was never found (`None`), we do NOT
-            // know whether the candidate is already live, so we must never tear
-            // it down — a missing/mislabeled boundary surfaces the raw error
-            // instead of risking teardown of a possibly-live app. Only a known
-            // boundary index at or after the failing step permits teardown.
-            let at_or_before_boundary = boundary.is_some_and(|b| index <= b);
-            if !at_or_before_boundary {
-                return Err(source);
+            match boundary {
+                // Past a KNOWN boundary: traffic already moved, so the candidate is
+                // live and nothing may be torn down. The error is attributed to the
+                // op that was running — several executor errors carry no label of
+                // their own, and post-boundary policy is decided by op
+                // (`DeployExecError::PostCutover`, issue #1621 §4.6).
+                Some(b) if index > b => {
+                    return Err(DeployExecError::PostCutover {
+                        failed_step: op.label(),
+                        source: Box::new(source),
+                    });
+                }
+                // Fail safe: if the boundary op was never found (`None`), we do NOT
+                // know whether the candidate is already live, so we must never tear
+                // it down — a missing/mislabeled boundary surfaces the raw error
+                // instead of risking teardown of a possibly-live app, and does not
+                // claim to know which side of the cutover the failure landed on.
+                None => return Err(source),
+                // At or before a known boundary: teardown is safe.
+                Some(_) => {}
             }
             eprintln!(
                 "  \u{2717} {} failed — {}\u{2026}",
@@ -2152,14 +2884,15 @@ fn execute_with_teardown(
 ///
 /// The deploy/rollback entrypoints drive their sequences through
 /// [`execute_with_teardown`] (which adds boundary-aware teardown on failure); this
-/// plain driver is the un-gated form used by the pure-sequence tests, so it is
-/// allowed to be unused in the non-test binary build.
+/// plain driver is the un-gated form, used by the pure-sequence tests and by the
+/// fleet compensation path (issue #1621, §4.7), which tears a completed first
+/// deploy down and must **report** a failed step rather than swallow it the way
+/// [`run_teardown`] deliberately does.
 ///
 /// # Errors
 ///
 /// Returns the first [`DeployExecError`] produced by the executor (or by staging
 /// a local temp file for a [`DeployOp::WriteFile`]).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_ops(ops: &[DeployOp], exec: &impl DeployExecutor) -> Result<(), DeployExecError> {
     for op in ops {
         run_one(op, exec)?;
@@ -2317,100 +3050,252 @@ impl DeployExecutor for SshExecutor {
     }
 }
 
+/// The recording executor fake, shared across the deploy module's test suites.
+///
+/// Lives outside `mod tests` (and is `pub(crate)`) so the fleet rollout driver's
+/// tests can drive N of these — one per host — against the SAME fake as the
+/// single-host op-sequence tests, instead of growing a third near-duplicate copy
+/// (issue #1621, plan §9.2). `#[cfg(test)]`, so nothing here reaches a release
+/// build.
 #[cfg(test)]
-mod tests {
-    use super::*;
+// In this bin-only crate `deploy` is a private module, so clippy flags every
+// `pub(crate)` here as redundant; they are kept to document the intended
+// visibility (crate-internal test support) rather than widening to `pub`.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod test_support {
+    use super::{CommandOutput, DeployExecError, DeployExecutor, Path, RemoteCommand};
     use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// The fleet-wide `(host, call)` tape shared by every host's executor in one
+    /// rollout — the structure cross-host ordering assertions read.
+    pub(crate) type FleetTape = Rc<RefCell<Vec<(String, RecordedCall)>>>;
+
+    /// Command labels whose **stdout is parsed** by the caller, i.e. the read-only
+    /// probes. An unscripted probe is the single most dangerous silent hole in this
+    /// fake: `run` returns `Ok` with EMPTY stdout for anything unscripted, and
+    /// [`super::probe_deploy_state`] reads an empty section as
+    /// [`super::DeployMode::First`] / `Absent`. A fleet test that forgets to script
+    /// host N's probe would therefore exercise the first-deploy branch and still
+    /// pass. [`RecordingExecutor::strict`] turns that into a loud panic.
+    pub(crate) const PROBE_LABELS: [&str; 7] = [
+        "proxy-compat-probe",
+        "detect-current",
+        "probe-release-dir",
+        "probe-rollback-target",
+        "resolve-previous",
+        "probe-host-status",
+        // Round 3: the maintenance WRITE path parses this one to decide which file
+        // the running unit polls. Unscripted, it reads as "the unit could not be
+        // read" and the fan-out would fail closed for the wrong reason.
+        "detect-maintenance-flag",
+    ];
+
+    /// One recorded executor call. Uploads carry no local path: op building is
+    /// pure, so the local path is an input the assertions never need.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum RecordedCall {
+        /// A `run` call.
+        Run {
+            /// The op's stable `&'static str` label.
+            label: &'static str,
+            /// The rendered remote shell line.
+            shell: String,
+        },
+        /// An `upload` call (a `UploadFile` or a staged `WriteFile`).
+        Upload {
+            /// Remote destination path.
+            remote_path: String,
+            /// Requested mode, when the op set one.
+            mode: Option<u32>,
+        },
+    }
+
+    impl RecordedCall {
+        /// The label of a `Run` call, or `None` for an upload.
+        pub(crate) const fn run_label(&self) -> Option<&'static str> {
+            match self {
+                Self::Run { label, .. } => Some(*label),
+                Self::Upload { .. } => None,
+            }
+        }
+    }
 
     /// A recording fake executor: it records every `run`/`upload` call in order
     /// and returns scripted outputs, so tests assert the exact remote-command
     /// sequence (and env-file mode) without a live host.
     #[derive(Default)]
-    struct RecordingExecutor {
+    pub(crate) struct RecordingExecutor {
         calls: RefCell<Vec<RecordedCall>>,
         /// Labels whose `run` should return a scripted failure (e.g. to simulate
         /// a readiness-gate timeout).
         fail_labels: Vec<&'static str>,
+        /// #1621: labels whose `run` should fail as a TRANSPORT error — ssh itself
+        /// could not be launched — rather than as a remote non-zero exit. The
+        /// distinction matters to the fleet: [`super::DeployExecError::Spawn`]
+        /// carries no op label, so it classifies as a FUNCTIONAL post-boundary
+        /// failure (fail closed) where a `CommandFailed` on the same step might be
+        /// mere housekeeping.
+        transport_fail_labels: Vec<&'static str>,
         /// Scripted stdout returned for a given command label.
         stdout_by_label: Vec<(&'static str, String)>,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum RecordedCall {
-        Run {
-            label: &'static str,
-            shell: String,
-        },
-        Upload {
-            remote_path: String,
-            mode: Option<u32>,
-        },
+        /// #1621: remote-path fragments whose `upload` should fail. Uploads carry
+        /// no label, so failure is keyed on the destination path — the only
+        /// identity an upload has. This is what lets a test fail a `WriteFile` op
+        /// (the maintenance fan-out's flag write) the way a dying scp would.
+        upload_fail_paths: Vec<String>,
+        /// #1621: the host this executor targets, recorded onto the shared fleet
+        /// tape. Empty for the single-host fakes, which never set a tape.
+        host: String,
+        /// #1621: a tape shared by every host's executor in one fleet run, so
+        /// CROSS-host interleaving ("host B's first mutating op came after host A's
+        /// `proxy-flip`") is assertable — something a per-host call list cannot
+        /// express.
+        tape: Option<FleetTape>,
+        /// #1621: panic on an unscripted [`PROBE_LABELS`] entry instead of
+        /// silently returning empty stdout.
+        strict: bool,
     }
 
     impl RecordingExecutor {
-        fn new() -> Self {
+        /// A fake that scripts nothing and fails nothing.
+        pub(crate) fn new() -> Self {
             Self::default()
         }
 
-        fn failing_on(label: &'static str) -> Self {
+        /// A fake whose `run` fails for `label`.
+        pub(crate) fn failing_on(label: &'static str) -> Self {
             Self {
                 fail_labels: vec![label],
                 ..Self::default()
             }
         }
 
+        /// Chainable sibling of [`Self::failing_on`], so one fake can fail on more
+        /// than one label (a fleet script needs per-host failure injection).
+        pub(crate) fn failing(mut self, label: &'static str) -> Self {
+            self.fail_labels.push(label);
+            self
+        }
+
+        /// Make one host's `label` fail as a TRANSPORT error (the ssh process could
+        /// not be launched) instead of a remote non-zero exit (#1621).
+        ///
+        /// This is the only realistic way to produce a FUNCTIONAL post-boundary
+        /// failure against today's op set: every op after `proxy-flip` is either
+        /// housekeeping or `commit-markers`, so the "the host is live on the new
+        /// release and something that matters broke" case arrives as a dropped
+        /// transport rather than a labelled remote failure.
+        pub(crate) fn transport_failing(mut self, label: &'static str) -> Self {
+            self.transport_fail_labels.push(label);
+            self
+        }
+
         /// Script the stdout returned for a given command label (used to drive
-        /// [`probe_deploy_state`]'s first-vs-redeploy probe).
-        fn with_stdout(mut self, label: &'static str, stdout: impl Into<String>) -> Self {
+        /// [`super::probe_deploy_state`]'s first-vs-redeploy probe).
+        pub(crate) fn with_stdout(
+            mut self,
+            label: &'static str,
+            stdout: impl Into<String>,
+        ) -> Self {
             self.stdout_by_label.push((label, stdout.into()));
             self
         }
 
-        fn calls(&self) -> Vec<RecordedCall> {
+        /// Make `upload` fail for any remote path containing `fragment` (#1621).
+        ///
+        /// The upload is still RECORDED first, mirroring `run`'s scripted
+        /// failures, so a test can assert the attempt happened.
+        pub(crate) fn failing_upload(mut self, fragment: impl Into<String>) -> Self {
+            self.upload_fail_paths.push(fragment.into());
+            self
+        }
+
+        /// Fail LOUDLY (panic) on an unscripted read-only probe label instead of
+        /// returning empty stdout, which every probe parser degrades to
+        /// "absent / first deploy" (issue #1621, plan §9.2).
+        pub(crate) fn strict(mut self) -> Self {
+            self.strict = true;
+            self
+        }
+
+        /// Record this executor's calls onto a fleet-wide `tape` under `host`, in
+        /// addition to its own per-host list.
+        pub(crate) fn recording_as(mut self, host: impl Into<String>, tape: FleetTape) -> Self {
+            self.host = host.into();
+            self.tape = Some(tape);
+            self
+        }
+
+        /// Every recorded call, in order.
+        pub(crate) fn calls(&self) -> Vec<RecordedCall> {
             self.calls.borrow().clone()
         }
 
         /// Labels of the recorded `Run` calls, in order (upload calls excluded).
-        fn run_labels(&self) -> Vec<&'static str> {
+        pub(crate) fn run_labels(&self) -> Vec<&'static str> {
             self.calls
                 .borrow()
                 .iter()
-                .filter_map(|c| match c {
-                    RecordedCall::Run { label, .. } => Some(*label),
-                    RecordedCall::Upload { .. } => None,
-                })
+                .filter_map(RecordedCall::run_label)
                 .collect()
         }
 
         /// The shell recorded for the first `Run` with `label`, if any.
-        fn shell_for(&self, label: &str) -> Option<String> {
+        pub(crate) fn shell_for(&self, label: &str) -> Option<String> {
             self.calls.borrow().iter().find_map(|c| match c {
                 RecordedCall::Run { label: l, shell } if *l == label => Some(shell.clone()),
                 _ => None,
             })
         }
+
+        /// Push one call onto the per-host list and, when set, the fleet tape.
+        fn record(&self, call: RecordedCall) {
+            if let Some(tape) = &self.tape {
+                tape.borrow_mut().push((self.host.clone(), call.clone()));
+            }
+            self.calls.borrow_mut().push(call);
+        }
     }
 
     impl DeployExecutor for RecordingExecutor {
         fn run(&self, cmd: &RemoteCommand) -> Result<CommandOutput, DeployExecError> {
-            self.calls.borrow_mut().push(RecordedCall::Run {
+            self.record(RecordedCall::Run {
                 label: cmd.label,
                 shell: cmd.shell.clone(),
             });
+            if self.transport_fail_labels.contains(&cmd.label) {
+                return Err(DeployExecError::Spawn {
+                    program: "ssh".to_owned(),
+                    source: std::io::Error::other("scripted transport failure"),
+                });
+            }
             if self.fail_labels.contains(&cmd.label) {
                 return Err(DeployExecError::CommandFailed {
                     label: cmd.label,
                     message: "scripted failure".to_owned(),
                 });
             }
-            let stdout = self
+            let scripted = self
                 .stdout_by_label
                 .iter()
                 .find(|(l, _)| *l == cmd.label)
-                .map(|(_, out)| out.clone())
-                .unwrap_or_default();
+                .map(|(_, out)| out.clone());
+            assert!(
+                !(self.strict && scripted.is_none() && PROBE_LABELS.contains(&cmd.label)),
+                "unscripted probe `{}`{}: this fake would return EMPTY stdout, which every \
+                 probe parser degrades to \"absent / first deploy\" — script it with \
+                 `.with_stdout(\"{}\", …)` (issue #1621)",
+                cmd.label,
+                if self.host.is_empty() {
+                    String::new()
+                } else {
+                    format!(" on host {}", self.host)
+                },
+                cmd.label,
+            );
             Ok(CommandOutput {
-                stdout,
+                stdout: scripted.unwrap_or_default(),
                 stderr: String::new(),
             })
         }
@@ -2421,13 +3306,29 @@ mod tests {
             remote_path: &str,
             mode: Option<u32>,
         ) -> Result<(), DeployExecError> {
-            self.calls.borrow_mut().push(RecordedCall::Upload {
+            self.record(RecordedCall::Upload {
                 remote_path: remote_path.to_owned(),
                 mode,
             });
+            if self
+                .upload_fail_paths
+                .iter()
+                .any(|fragment| remote_path.contains(fragment.as_str()))
+            {
+                return Err(DeployExecError::CommandFailed {
+                    label: "upload",
+                    message: "scripted upload failure".to_owned(),
+                });
+            }
             Ok(())
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{RecordedCall, RecordingExecutor};
+    use super::*;
 
     fn resolved() -> ResolvedDeployConfig {
         ResolvedDeployConfig::resolve(
@@ -2491,6 +3392,13 @@ mod tests {
     /// the redeploy path refuses a concurrent `server.port` change at pre-flight
     /// (#2073), so the public port is unchanged and derived == actual.
     fn sample_cutover_ops(env: Secret) -> Vec<DeployOp> {
+        sample_cutover_ops_with(env, MigrateStep::Run)
+    }
+
+    /// [`sample_cutover_ops`] with an explicit [`MigrateStep`] (issue #1621), so the
+    /// fleet's skip-the-migrate-op parameterisation is assertable while every
+    /// existing exact-vector call site keeps building today's `Run` sequence.
+    fn sample_cutover_ops_with(env: Secret, migrate: MigrateStep) -> Vec<DeployOp> {
         let cfg = resolved();
         let plan = SlotPlan::redeploy(3000, SLOT_BLUE);
         let unit = super::super::render_app_unit(
@@ -2514,6 +3422,7 @@ mod tests {
                 tls: false,
                 host: None,
             },
+            migrate,
         )
     }
 
@@ -2800,6 +3709,50 @@ mod tests {
             "commit the markers before draining the old release"
         );
         assert!(pos("drain-old") < pos("prune"), "drain before prune");
+    }
+
+    #[test]
+    fn cutover_ops_skip_omits_only_the_migrate_op() {
+        // #1621 (AC-4): a fleet's schema is fleet-wide, so it migrates EXACTLY
+        // ONCE — hosts 2..N build their cutover with `MigrateStep::Skip`. Skipping
+        // must remove the `migrate` op and NOTHING else: the boundary label
+        // (`proxy-flip`) keeps its identity and every other step keeps its relative
+        // position, or `execute_with_teardown`'s boundary lookup (and with it the
+        // per-host auto-rollback the fleet driver depends on) would silently change
+        // meaning on every host after the first.
+        //
+        // The assertion is differential — `Skip`'s vector is derived from `Run`'s —
+        // so it can never drift from the exact vector pinned by
+        // `redeploy_produces_exact_zero_downtime_sequence`.
+        let labels = |ops: &[DeployOp]| ops.iter().map(DeployOp::label).collect::<Vec<_>>();
+        let run = labels(&sample_cutover_ops_with(
+            Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"),
+            MigrateStep::Run,
+        ));
+        let skip = labels(&sample_cutover_ops_with(
+            Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"),
+            MigrateStep::Skip,
+        ));
+
+        assert_eq!(
+            run.iter().filter(|l| **l == "migrate").count(),
+            1,
+            "MigrateStep::Run must emit exactly one migrate op, got: {run:?}"
+        );
+        let expected: Vec<&'static str> = run.iter().copied().filter(|l| *l != "migrate").collect();
+        assert_eq!(
+            skip, expected,
+            "MigrateStep::Skip must be MigrateStep::Run minus exactly the `migrate` \
+             op\n  run:  {run:?}\n  skip: {skip:?}"
+        );
+        assert!(
+            !skip.contains(&"migrate"),
+            "a skipped cutover must carry no migrate op, got: {skip:?}"
+        );
+        assert!(
+            skip.contains(&"proxy-flip"),
+            "skipping the migration must not disturb the cutover boundary, got: {skip:?}"
+        );
     }
 
     #[test]
@@ -3834,7 +4787,10 @@ mod tests {
         let plan = SlotPlan::first(3000);
         let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
         let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
-        // It is a superset of the candidate teardown, PLUS the marker cleanup.
+        // It is a superset of the candidate teardown, PLUS the marker cleanup, PLUS
+        // the `torn down` last-deploy record (#1621 audit gap G3) — see
+        // `first_deploy_teardown_records_the_torn_down_result` for why the marker is
+        // rewritten rather than removed.
         assert_eq!(
             labels,
             vec![
@@ -3842,6 +4798,7 @@ mod tests {
                 "teardown-candidate-dir",
                 "teardown-current-symlink",
                 "teardown-slot-markers",
+                "teardown-last-deploy",
             ],
             "first-deploy teardown must also clean current + markers: {labels:?}"
         );
@@ -3867,6 +4824,60 @@ mod tests {
     }
 
     #[test]
+    fn first_deploy_teardown_records_the_torn_down_result() {
+        // #1621 (AC-6, audit gap G3). A first-deploy teardown returns the host to
+        // NOTHING INSTALLED — that is what `CompensatedTeardown` means. Leaving
+        // `shared/last-deploy` untouched made `deploy status` report
+        // `last deploy: deployed <ts>` for a host carrying no release at all: a
+        // wrong value in the column an operator reads FIRST when inspecting a
+        // halted rollout.
+        //
+        // The teardown RECORDS `torn down` rather than deleting the marker. An
+        // absent marker renders `last deploy: ?`, which is also what a host that
+        // was never deployed shows, so clearing it would erase exactly the fact
+        // triage needs: this host WAS taken back down, on purpose, at this time.
+        let cfg = resolved();
+        let plan = SlotPlan::first(3000);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
+        let exec = RecordingExecutor::new();
+        run_teardown(&teardown, &exec);
+
+        let shell = exec
+            .shell_for("teardown-last-deploy")
+            .expect("teardown-last-deploy ran");
+        assert!(
+            shell.contains("printf '%s\\t%s' 'torn down'")
+                && shell.contains("date -u +%Y-%m-%dT%H:%M:%SZ"),
+            "the teardown must record `torn down` plus a UTC timestamp: {shell}"
+        );
+        assert!(
+            shell.contains("mv -f \"$rtmp\" '/srv/autumn/myapp/shared/last-deploy'"),
+            "it must land on the same marker `deploy status` reads: {shell}"
+        );
+        assert!(
+            !shell.contains("'deployed'"),
+            "a torn-down host must never claim a successful deploy: {shell}"
+        );
+        // ADVISORY, like the cutover's own fragment: `compensate_teardown` drives
+        // these ops through `run_ops`, so a marker write that could fail would turn
+        // a clean compensation into `CompensationFailed`.
+        assert!(
+            shell.contains("|| true; }"),
+            "the teardown's last-deploy write must never be able to fail the op: {shell}"
+        );
+
+        // It runs LAST, so it only claims a teardown that actually completed: if an
+        // earlier op fails, `run_ops` stops before the marker is rewritten and the
+        // host keeps its previous — still true — record.
+        let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
+        assert_eq!(
+            labels.last().copied(),
+            Some("teardown-last-deploy"),
+            "the last-deploy record must be the final teardown op: {labels:?}"
+        );
+    }
+
+    #[test]
     fn redeploy_teardown_leaves_current_and_markers_intact() {
         // The REDEPLOY teardown must NOT remove the old release's current/live-slot
         // markers — the old release is still serving after a candidate rollback.
@@ -3884,6 +4895,14 @@ mod tests {
         assert!(
             !labels.contains(&"teardown-slot-markers"),
             "redeploy teardown must not remove the live-slot marker: {labels:?}"
+        );
+        // …and it must not touch the last-deploy marker either (#1621 audit gap G3):
+        // a torn-down CANDIDATE leaves the PREVIOUS release serving, so the marker's
+        // existing record still describes the release that is actually live.
+        assert!(
+            !labels.contains(&"teardown-last-deploy"),
+            "redeploy teardown must not rewrite the last-deploy marker — the previous \
+             release is still serving: {labels:?}"
         );
     }
 
@@ -4213,6 +5232,148 @@ mod tests {
     }
 
     #[test]
+    fn probe_release_dir_is_read_only_and_fails_closed() {
+        // #1621 (§4.9): the release id has one-second granularity and exactly one
+        // is minted per run, so a fast retry re-uses it. Uploading into a release
+        // dir `shared/previous-release` still points at would put the NEW binary
+        // behind the "previous release" and make a rollback roll FORWARD — silently
+        // and undetectably. So the deploy probes for the collision up front.
+        let cfg = resolved();
+
+        let absent = RecordingExecutor::new().with_stdout("probe-release-dir", "absent");
+        assert_eq!(
+            probe_release_dir(&cfg, RELEASE_ID, &absent).unwrap(),
+            ReleaseDirState::Absent,
+            "a free release dir is the normal case"
+        );
+
+        // The probe is READ-ONLY: a `[ -d … ]` test and two printfs, nothing else,
+        // aimed at this run's release dir.
+        let shell = absent.shell_for("probe-release-dir").expect("probe ran");
+        assert_eq!(
+            shell,
+            format!(
+                "if [ -d '{RELEASE_DIR}' ]; then printf '%s' 'present'; \
+                     else printf '%s' 'absent'; fi"
+            ),
+            "the collision probe must be a read-only directory test",
+        );
+        assert_eq!(
+            absent.run_labels(),
+            vec!["probe-release-dir"],
+            "the probe runs exactly one command and mutates nothing"
+        );
+
+        let present = RecordingExecutor::new().with_stdout("probe-release-dir", "present\n");
+        assert_eq!(
+            probe_release_dir(&cfg, RELEASE_ID, &present).unwrap(),
+            ReleaseDirState::Present,
+            "an existing release dir is reported"
+        );
+
+        // Neither sentinel → we cannot PROVE the dir is free, and the failure mode
+        // is destructive, so fail closed rather than degrade to Absent.
+        let garbled = RecordingExecutor::new().with_stdout("probe-release-dir", "bash: -c: line 0");
+        assert_eq!(
+            probe_release_dir(&cfg, RELEASE_ID, &garbled).unwrap(),
+            ReleaseDirState::Unreadable,
+            "an unexpected capture must fail closed, never degrade to Absent"
+        );
+        let empty = RecordingExecutor::new();
+        assert_eq!(
+            probe_release_dir(&cfg, RELEASE_ID, &empty).unwrap(),
+            ReleaseDirState::Unreadable,
+            "empty output must fail closed (the trap every other probe degrades on)"
+        );
+    }
+
+    #[test]
+    fn probe_rollback_target_dir_is_read_only_and_distinctly_labelled() {
+        // #1621 (§4.7): before a fleet compensation flips a host back, it proves the
+        // release dir it is about to point at still exists — `prune` runs per host,
+        // so the previous-release marker can legitimately name a dir this host no
+        // longer has. Rolling back to a removed dir writes a unit whose ExecStart
+        // points nowhere, starts "successfully", and then fails the readiness gate
+        // POST-boundary with no teardown: a second broken host.
+        let previous = "/srv/autumn/myapp/releases/20260101T000000Z";
+
+        let present = RecordingExecutor::new().with_stdout("probe-rollback-target", "present");
+        assert_eq!(
+            probe_rollback_target_dir(previous, &present).unwrap(),
+            ReleaseDirState::Present,
+            "a retained rollback target is the normal case"
+        );
+        assert_eq!(
+            present
+                .shell_for("probe-rollback-target")
+                .expect("probe ran"),
+            format!(
+                "if [ -d '{previous}' ]; then printf '%s' 'present'; \
+                 else printf '%s' 'absent'; fi"
+            ),
+            "the target probe must be the same read-only directory test",
+        );
+        assert_eq!(
+            present.run_labels(),
+            vec!["probe-rollback-target"],
+            "the probe runs exactly one command, under its OWN label so a tape can \
+             tell it apart from the candidate-dir collision probe, and mutates nothing"
+        );
+
+        let absent = RecordingExecutor::new().with_stdout("probe-rollback-target", "absent\n");
+        assert_eq!(
+            probe_rollback_target_dir(previous, &absent).unwrap(),
+            ReleaseDirState::Absent,
+            "a pruned rollback target must be reported so the caller declines"
+        );
+        // Fail closed in the SAME direction as every other probe: proving nothing is
+        // not proving it is there.
+        let garbled =
+            RecordingExecutor::new().with_stdout("probe-rollback-target", "bash: -c: line 0");
+        assert_eq!(
+            probe_rollback_target_dir(previous, &garbled).unwrap(),
+            ReleaseDirState::Unreadable,
+            "an unexpected capture must fail closed, never degrade to Present"
+        );
+    }
+
+    #[test]
+    fn strict_recording_executor_refuses_to_fake_an_unscripted_probe() {
+        // #1621 (plan §9.2): the fake returns Ok+EMPTY stdout for anything
+        // unscripted, and every probe parser reads empty as "absent / first
+        // deploy". A fleet test that forgot to script host N's probe would
+        // therefore exercise the first-deploy branch and PASS. Strict mode turns
+        // that silent hole into a panic.
+        let cfg = resolved();
+        let strict = RecordingExecutor::new().strict();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = probe_deploy_state(&cfg, &strict);
+        }));
+        assert!(
+            panicked.is_err(),
+            "an unscripted probe must fail loudly under strict mode"
+        );
+
+        // A scripted probe is unaffected, and non-probe labels never need scripting.
+        let scripted = RecordingExecutor::new()
+            .strict()
+            .with_stdout("detect-current", "first\n");
+        assert_eq!(
+            probe_deploy_state(&cfg, &scripted).unwrap().mode,
+            DeployMode::First,
+            "strict mode changes nothing for a scripted probe"
+        );
+        assert!(
+            run_ops(
+                &[DeployOp::Run(RemoteCommand::new("prune", "true"))],
+                &RecordingExecutor::new().strict()
+            )
+            .is_ok(),
+            "strict mode only guards labels whose stdout is parsed"
+        );
+    }
+
+    #[test]
     fn parse_installed_proxy_port_classifies_the_unit_section() {
         // Sentinel → Absent.
         assert_eq!(
@@ -4472,6 +5633,597 @@ mod tests {
             ProxyOptionsMarker::Unreadable,
             "an unparseable proxy-options marker fails closed as Unreadable",
         );
+    }
+
+    #[test]
+    fn probe_deploy_state_captures_the_current_release_dir() {
+        // #1621 (AC-6, plan §7.1): `autumn deploy status` needs each host's DEPLOYED
+        // RELEASE, and the only honest source is the `current` symlink's target — no
+        // runtime endpoint reports a release id (the probe body's `version` is the
+        // FRAMEWORK crate version, identical on every host forever). It rides as a
+        // FIFTH delimited section on the existing probe, so `status` costs the same
+        // one ssh round-trip `up` already pays and it works retroactively on hosts
+        // deployed before this feature.
+        let cfg = resolved();
+        let stdout = format!(
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n{}\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n\
+             ---autumn-kamal-proxy-options---\n0\t\n\
+             ---autumn-current-release---\n/srv/autumn/myapp/releases/20260714T120000Z",
+            proxy_list_serving("myapp", 3001)
+        );
+        let exec = RecordingExecutor::new().with_stdout("detect-current", stdout);
+        let probe = probe_deploy_state(&cfg, &exec).unwrap();
+        assert_eq!(
+            probe.current_release_dir.as_deref(),
+            Some("/srv/autumn/myapp/releases/20260714T120000Z"),
+        );
+        assert_eq!(
+            release_id_from_dir(probe.current_release_dir.as_deref().unwrap()),
+            Some("20260714T120000Z"),
+            "the release id is the release dir's basename"
+        );
+        // The earlier sections are still cleanly split off — the new delimiter must
+        // not leak into the proxy-options marker.
+        assert_eq!(
+            probe.last_proxy_options,
+            ProxyOptionsMarker::Options(ProxyServiceOptions {
+                tls: false,
+                host: None,
+            })
+        );
+        assert_eq!(probe.installed_proxy_port, InstalledProxyPort::Port(80));
+
+        // The probe shell resolves the symlink behind its own delimiter, best-effort.
+        let shell = exec.shell_for("detect-current").expect("probe ran");
+        assert!(
+            shell.contains("---autumn-current-release---")
+                && shell.contains("readlink -f '/srv/autumn/myapp/current'"),
+            "probe resolves the current symlink behind its delimiter: {shell}"
+        );
+        // The LABEL is unchanged: it is load-bearing for every exact-vector test and
+        // for the strict test fake's probe allow-list.
+        assert_eq!(
+            exec.run_labels(),
+            vec!["detect-current"],
+            "the probe's op label must not change when a section is added"
+        );
+    }
+
+    #[test]
+    fn probe_deploy_state_degrades_when_the_current_release_section_is_missing() {
+        // #1621: a host deployed before this feature (or a scripted test that stubs
+        // only the earlier sections) has no fifth delimiter. That degrades to
+        // "unknown", exactly like every other section — never to a guessed release id,
+        // because drift reporting treats Unknown as a DISTINCT state and never as
+        // drift. A false "these hosts differ" at 3 am is worse than no warning.
+        let cfg = resolved();
+        let legacy = RecordingExecutor::new().with_stdout(
+            "detect-current",
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80",
+        );
+        assert!(
+            probe_deploy_state(&cfg, &legacy)
+                .unwrap()
+                .current_release_dir
+                .is_none(),
+            "a missing fifth delimiter degrades to unknown"
+        );
+
+        // Present but empty (`readlink` on a dangling/absent symlink prints nothing).
+        let empty = RecordingExecutor::new().with_stdout(
+            "detect-current",
+            "first\n---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n---autumn-no-proxy-unit---\n\
+             ---autumn-kamal-proxy-options---\n\n---autumn-current-release---\n",
+        );
+        let probe = probe_deploy_state(&cfg, &empty).unwrap();
+        assert_eq!(probe.mode, DeployMode::First);
+        assert!(
+            probe.current_release_dir.is_none(),
+            "an empty current section is unknown, not an empty release id"
+        );
+    }
+
+    /// Full five-section `detect-current` stdout for a redeploy host on `release`.
+    fn status_probe_stdout(release: &str, live_port: u16) -> String {
+        format!(
+            "redeploy:blue\t{live_port}\n---autumn-kamal-proxy-list---\n{}\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 3000\n\
+             ---autumn-kamal-proxy-options---\n0\t\n\
+             ---autumn-current-release---\n/srv/autumn/myapp/releases/{release}",
+            proxy_list_serving("myapp", live_port)
+        )
+    }
+
+    /// #1621 AC-6, third per-host fact. `deploy status` must report the last
+    /// deploy RESULT, and no other on-host artefact answers it — `current`,
+    /// `live-slot` and `previous-release` all describe which release a host
+    /// serves, never how it got there, so a cleanly compensated halt reads back as
+    /// a healthy converged fleet. The marker is written by the ops that COMPLETE a
+    /// cutover, so it rides on round-trips that already happen.
+    #[test]
+    fn the_cutover_and_the_rollback_record_the_last_deploy_result() {
+        let cfg = resolved();
+        let marker = "'/srv/autumn/myapp/shared/last-deploy'";
+
+        // Forward cutover: `commit-markers` (the transaction that completes the
+        // flip) records "deployed", and so does `record-proxy-options` — the last
+        // marker write on BOTH forward paths, which is how a FIRST deploy (whose
+        // ops contain no `commit-markers`) gets one too.
+        let ops = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let exec = RecordingExecutor::new();
+        run_ops(&ops, &exec).expect("recording executor never fails");
+        for label in ["commit-markers", "record-proxy-options"] {
+            let shell = exec.shell_for(label).expect("op ran");
+            assert!(
+                shell.contains("mktemp '/srv/autumn/myapp/shared/last-deploy.tmp.XXXXXX'")
+                    && shell.contains(&format!("mv -f \"$rtmp\" {marker}")),
+                "{label} must write the last-deploy marker atomically: {shell}"
+            );
+            assert!(
+                shell.contains("printf '%s\\t%s' 'deployed'")
+                    && shell.contains("date -u +%Y-%m-%dT%H:%M:%SZ"),
+                "{label} must record `deployed` plus a UTC timestamp: {shell}"
+            );
+            // ADVISORY: the write is a `{ … || true; }` group, so it can never
+            // fail the op it rides on. That matters most on `commit-markers`,
+            // whose failure is the one the fleet driver refuses to auto-roll-back
+            // from — a cosmetic status field must not be able to push a host into
+            // that state.
+            assert!(
+                shell.contains("|| true; }"),
+                "the last-deploy write must be advisory, never able to fail its op: {shell}"
+            );
+        }
+
+        // A first deploy takes the same `record-proxy-options` route.
+        let first = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let first_exec = RecordingExecutor::new();
+        run_ops(&first, &first_exec).expect("recording executor never fails");
+        let first_record = first_exec
+            .shell_for("record-proxy-options")
+            .expect("first deploy records proxy options");
+        assert!(
+            first_record.contains("printf '%s\\t%s' 'deployed'") && first_record.contains(marker),
+            "a first deploy must record its result too: {first_record}"
+        );
+
+        // Rollback records the OPPOSITE word through the same shared op, so a
+        // compensated host is distinguishable from one that simply deployed —
+        // exactly the state that is invisible once the rollout's output scrolls
+        // away.
+        let rb_exec = RecordingExecutor::new().with_stdout(
+            "resolve-previous",
+            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tblue\t3001",
+        );
+        let target =
+            resolve_rollback_target(&cfg, 3000, &rb_exec).expect("previous release resolves");
+        let rb_ops = rollback_ops(&cfg, &proxy(), &target);
+        run_ops(&rb_ops, &rb_exec).expect("recording executor never fails");
+        let rb = rb_exec
+            .shell_for("commit-markers")
+            .expect("commit-markers ran");
+        assert!(
+            rb.contains("printf '%s\\t%s' 'rolled back'") && rb.contains(marker),
+            "a rollback must record `rolled back`, not `deployed`: {rb}"
+        );
+    }
+
+    #[test]
+    fn the_status_probe_reads_the_last_deploy_marker_and_degrades_to_unknown() {
+        // The marker rides on the EXISTING status round-trip — `deploy status` is
+        // run fleet-wide mid-incident, so a new per-host ssh would be paid N times.
+        let cfg = resolved();
+        let probe_with = |stdout: &str| {
+            let exec = RecordingExecutor::new()
+                .with_stdout(
+                    "detect-current",
+                    status_probe_stdout("20260714T120000Z", 3001),
+                )
+                .with_stdout("probe-host-status", stdout.to_owned());
+            (probe_host_status(&cfg, 3000, &exec).unwrap(), exec)
+        };
+
+        let (probe, exec) = probe_with(
+            "200\n---autumn-host-status---\n\n---autumn-host-status---\n\
+             rolled back\t2026-07-14T12:31:10Z",
+        );
+        assert_eq!(
+            probe.last_deploy,
+            Some(LastDeploy {
+                result: "rolled back".to_owned(),
+                at: Some("2026-07-14T12:31:10Z".to_owned()),
+            })
+        );
+        // Still read-only, still one round-trip, and still the shared path.
+        let shell = exec
+            .shell_for("probe-host-status")
+            .expect("status probe ran");
+        assert!(
+            shell.contains("cat '/srv/autumn/myapp/shared/last-deploy'"),
+            "the marker is read from the release-independent shared dir: {shell}"
+        );
+        assert_eq!(
+            exec.run_labels(),
+            vec!["detect-current", "probe-host-status"]
+        );
+
+        // A marker that predates the timestamp field still reports its result.
+        let (older, _) =
+            probe_with("200\n---autumn-host-status---\n\n---autumn-host-status---\ndeployed");
+        assert_eq!(
+            older.last_deploy,
+            Some(LastDeploy {
+                result: "deployed".to_owned(),
+                at: None,
+            })
+        );
+
+        // Absent/empty marker, and a host whose probe shape predates the section:
+        // both are "we could not tell", never a fabricated result.
+        for stdout in [
+            "200\n---autumn-host-status---\n\n---autumn-host-status---\n",
+            "200\n---autumn-host-status---\nmaintenance-on",
+        ] {
+            let (unknown, _) = probe_with(stdout);
+            assert_eq!(
+                unknown.last_deploy, None,
+                "an unreadable marker must not be reported as a result: {stdout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_host_status_consults_the_live_slot_unit_for_the_maintenance_flag_path() {
+        // #1621 review round 1 (Codex 2). The status probe used to read ONLY the
+        // shared flag path. A host still running a slot unit rendered BEFORE #1621
+        // has no `Environment=AUTUMN_MAINTENANCE_FLAG_FILE=` line, so the app it is
+        // running polls the cwd-relative (release-local) `tmp/autumn-maintenance
+        // .json` instead — and `deploy status` reported the SHARED path's state for
+        // it anyway. So it could print `maintenance off` for a host that is
+        // actually maintained, and `maintenance ON` for one whose legacy write
+        // failed and which is therefore still taking traffic.
+        //
+        // The probe must instead ask the LIVE SLOT UNIT which file the running app
+        // polls, resolving it exactly as `maintenance::flag_file_path_from` does
+        // (the override when set, else `WorkingDirectory` + the legacy relative
+        // path), and report THAT file's presence.
+        let cfg = resolved();
+        let exec = RecordingExecutor::new()
+            .with_stdout("detect-current", status_probe_stdout(RELEASE_ID, 3001))
+            .with_stdout("probe-host-status", "200\n---autumn-host-status---\n");
+        probe_host_status(&cfg, 3000, &exec).expect("status probe runs");
+        let shell = exec
+            .shell_for("probe-host-status")
+            .expect("status probe ran");
+        assert!(
+            shell.contains("'/etc/systemd/system/myapp-blue.service'"),
+            "the status probe must read the LIVE SLOT UNIT to learn which flag file \
+             the running app polls: {shell}"
+        );
+        assert!(
+            shell.contains(autumn_web::maintenance::MAINTENANCE_FLAG_FILE_ENV),
+            "the probe must resolve the unit's flag-file override: {shell}"
+        );
+        assert!(
+            shell.contains(autumn_web::maintenance::MAINTENANCE_FLAG_FILE),
+            "the probe must fall back to the legacy cwd-relative path for a unit \
+             that declares no override: {shell}"
+        );
+        // Still read-only: exactly the two probe labels, nothing mutating.
+        assert_eq!(
+            exec.run_labels(),
+            vec!["detect-current", "probe-host-status"],
+            "`deploy status` must never mutate a host"
+        );
+    }
+
+    #[test]
+    fn the_status_read_and_the_maintenance_write_resolve_the_flag_with_one_shell() {
+        // #1621 review round 3. `deploy status` REPORTS the flag file the live slot
+        // unit polls; the `deploy maintenance` fan-out WRITES it. While the write
+        // path derived its path from the `current` symlink instead, the two
+        // disagreed exactly when it matters — a proxy flip that landed with a
+        // `commit-markers` that did not leaves `current` naming another release than
+        // the unit that is running — so `maintenance on` could report success while
+        // the application carried on serving traffic. One shell fragment, used by
+        // both, is what makes that class of drift unrepresentable.
+        let cfg = resolved();
+        let exec = RecordingExecutor::new()
+            .with_stdout("detect-current", status_probe_stdout(RELEASE_ID, 3001))
+            .with_stdout("probe-host-status", "200\n---autumn-host-status---\n")
+            .with_stdout(
+                "detect-maintenance-flag",
+                "/srv/autumn/myapp/releases/r9/tmp/autumn-maintenance.json\n",
+            );
+        probe_host_status(&cfg, 3000, &exec).expect("status probe runs");
+        let status_shell = exec
+            .shell_for("probe-host-status")
+            .expect("status probe ran");
+        let resolution = live_maintenance_flag_shell(&cfg, SLOT_BLUE);
+        assert!(
+            status_shell.contains(&resolution),
+            "`deploy status` must resolve the flag through the shared fragment: \
+             {status_shell}"
+        );
+
+        let flag = probe_live_maintenance_flag(&cfg, SLOT_BLUE, &exec)
+            .expect("the flag probe runs")
+            .expect("the unit resolved a path");
+        assert_eq!(
+            exec.shell_for("detect-maintenance-flag"),
+            Some(resolution),
+            "the write path must run the SAME resolution, not a second copy of it"
+        );
+        assert_eq!(
+            flag.path, "/srv/autumn/myapp/releases/r9/tmp/autumn-maintenance.json",
+            "the resolved path is the unit's, whatever `current` happens to say"
+        );
+        assert!(!flag.present, "no sentinel line means the file is absent");
+
+        // Fails closed: an unreadable unit prints nothing, and that is never
+        // degraded into "the shared path".
+        let blank = RecordingExecutor::new().with_stdout("detect-maintenance-flag", "");
+        assert_eq!(
+            probe_live_maintenance_flag(&cfg, SLOT_BLUE, &blank).expect("the probe runs"),
+            None,
+            "an unreadable unit proves nothing about which file the app polls"
+        );
+    }
+
+    /// Build a `probe-host-status` capture from its four sections: the `/ready`
+    /// code, the shared-flag sentinel, the last-deploy marker, and the resolved
+    /// unit flag path + its own presence sentinel.
+    fn host_status_capture(ready: &str, shared_on: bool, unit_section: &str) -> String {
+        format!(
+            "{ready}\n{HOST_STATUS_DELIM}\n{shared}\n{HOST_STATUS_DELIM}\n\n{unit_section}",
+            shared = if shared_on {
+                MAINTENANCE_ON_SENTINEL
+            } else {
+                ""
+            },
+        )
+    }
+
+    #[test]
+    fn probe_host_status_reports_the_flag_state_the_running_unit_observes() {
+        // #1621 review round 1 (Codex 2), the semantics. In every case the reported
+        // state is the one the RUNNING unit sees, not the one the shared path holds.
+        let cfg = resolved();
+        let legacy_flag = format!(
+            "{RELEASE_DIR}/{}",
+            autumn_web::maintenance::MAINTENANCE_FLAG_FILE
+        );
+        let probe_with_sections = |shared_on: bool, unit_section: String| {
+            let exec = RecordingExecutor::new()
+                .with_stdout("detect-current", status_probe_stdout(RELEASE_ID, 3001))
+                .with_stdout(
+                    "probe-host-status",
+                    host_status_capture("200", shared_on, &unit_section),
+                );
+            probe_host_status(&cfg, 3000, &exec).expect("status probe runs")
+        };
+
+        // 1. A pre-#1621 unit whose LEGACY flag is present while the shared flag is
+        //    absent: the app IS maintained. Reporting `off` here is the defect.
+        let maintained = probe_with_sections(
+            false,
+            format!("{HOST_STATUS_DELIM}\n{legacy_flag}\n{MAINTENANCE_ON_SENTINEL}"),
+        );
+        assert_eq!(maintained.maintenance, MaintenanceStatus::On);
+        assert_eq!(
+            maintained.maintenance_flag_source,
+            MaintenanceFlagSource::Unshared,
+            "a unit with no override polls a path the fleet switch does not own",
+        );
+
+        // 2. The same host after a `maintenance on` whose legacy write FAILED: the
+        //    shared flag exists but the running app never sees it, so the host is
+        //    still taking traffic. `off` is the truthful answer — a confident `ON`
+        //    would send the operator into a live window believing it closed.
+        let shared_only =
+            probe_with_sections(true, format!("{HOST_STATUS_DELIM}\n{legacy_flag}\n"));
+        assert_eq!(shared_only.maintenance, MaintenanceStatus::Off);
+        assert_eq!(
+            shared_only.maintenance_flag_source,
+            MaintenanceFlagSource::Unshared
+        );
+
+        // 3. A #1621 unit: the resolved path IS the shared one, and its state is
+        //    reported with confidence — the pre-existing behaviour, unchanged.
+        let shared_path = cfg.maintenance_flag_file();
+        let modern = probe_with_sections(
+            true,
+            format!("{HOST_STATUS_DELIM}\n{shared_path}\n{MAINTENANCE_ON_SENTINEL}"),
+        );
+        assert_eq!(modern.maintenance, MaintenanceStatus::On);
+        assert_eq!(
+            modern.maintenance_flag_source,
+            MaintenanceFlagSource::Shared
+        );
+        let cleared = probe_with_sections(false, format!("{HOST_STATUS_DELIM}\n{shared_path}\n"));
+        assert_eq!(cleared.maintenance, MaintenanceStatus::Off);
+        assert_eq!(
+            cleared.maintenance_flag_source,
+            MaintenanceFlagSource::Shared
+        );
+    }
+
+    #[test]
+    fn probe_host_status_fails_closed_when_the_flag_path_cannot_be_proved() {
+        // #1621 review round 1 (Codex 2), the fail-closed half. A host whose live
+        // slot unit could not be read at all (absent, unreadable, or a capture that
+        // predates this section) leaves the CLI unable to say WHICH file the running
+        // app polls. That is "we could not tell" — never a confident `ON`/`off`,
+        // even though the shared flag below is set.
+        let cfg = resolved();
+        for unit_section in [
+            // No unit section at all (a capture from a CLI predating this probe).
+            String::new(),
+            // Section present but empty: no unit file on the host.
+            format!("{HOST_STATUS_DELIM}\n"),
+            // Section present but the path line is blank: the unit declared neither
+            // an override nor a `WorkingDirectory`, so nothing was probed.
+            format!("{HOST_STATUS_DELIM}\n   \n"),
+        ] {
+            let exec = RecordingExecutor::new()
+                .with_stdout("detect-current", status_probe_stdout(RELEASE_ID, 3001))
+                .with_stdout(
+                    "probe-host-status",
+                    host_status_capture("200", true, &unit_section),
+                );
+            let probe = probe_host_status(&cfg, 3000, &exec).expect("status probe runs");
+            assert_eq!(
+                probe.maintenance,
+                MaintenanceStatus::Unknown,
+                "an unprovable flag path must not render as a confident on/off: \
+                 {unit_section:?}"
+            );
+            assert_eq!(
+                probe.maintenance_flag_source,
+                MaintenanceFlagSource::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn probe_host_status_reads_readiness_and_maintenance_off_the_live_slot() {
+        // #1621 (AC-6, plan §7.1): `deploy status` needs two facts `up` must never
+        // pay for — the live slot's `/ready` code and whether the SHARED maintenance
+        // flag exists. They ride on their own labelled round-trip so
+        // `probe_deploy_state` (and therefore every `deploy up`) is unchanged.
+        let cfg = resolved();
+        let exec = RecordingExecutor::new()
+            .with_stdout(
+                "detect-current",
+                status_probe_stdout("20260714T120000Z", 3001),
+            )
+            .with_stdout(
+                "probe-host-status",
+                format!(
+                    "200\n---autumn-host-status---\nmaintenance-on\n---autumn-host-status---\n\n\
+                     ---autumn-host-status---\n{}\nmaintenance-on",
+                    resolved().maintenance_flag_file()
+                ),
+            );
+        let probe = probe_host_status(&cfg, 3000, &exec).unwrap();
+        assert_eq!(probe.ready_code, Some(200));
+        assert!(probe.shared_maintenance_flag);
+        assert_eq!(probe.maintenance, MaintenanceStatus::On);
+        assert_eq!(
+            probe.deploy.current_release_dir.as_deref(),
+            Some("/srv/autumn/myapp/releases/20260714T120000Z")
+        );
+
+        // It polls the LIVE slot's loopback port (blue = public + 1), not the public
+        // port — the public port is kamal-proxy's, and asking it would report the
+        // proxy's health rather than the release's.
+        let shell = exec
+            .shell_for("probe-host-status")
+            .expect("status probe ran");
+        assert!(
+            shell.contains("http://127.0.0.1:3001/ready"),
+            "readiness is polled on the live slot's loopback port: {shell}"
+        );
+        // Bounded, so one hung app cannot stall a fleet-wide status.
+        assert!(shell.contains("-m 5"), "the curl must be bounded: {shell}");
+        // The maintenance flag is read from the RELEASE-INDEPENDENT shared path —
+        // reading a release dir would report "off" for every host after a cutover,
+        // which is the very defect the shared path exists to fix.
+        assert!(
+            shell.contains("'/srv/autumn/myapp/shared/autumn-maintenance.json'"),
+            "the maintenance flag is read from the shared dir: {shell}"
+        );
+        assert!(
+            !shell.contains("/releases/"),
+            "the status probe must not look for a release-scoped flag: {shell}"
+        );
+        // Read-only: exactly the two probe labels, nothing mutating.
+        assert_eq!(
+            exec.run_labels(),
+            vec!["detect-current", "probe-host-status"],
+            "`deploy status` must never mutate a host"
+        );
+    }
+
+    #[test]
+    fn probe_host_status_degrades_to_unknown_readiness_rather_than_failing() {
+        // A host with no `curl`, a refused connection, or a timeout writes `000`
+        // (or nothing). That is "we could not tell" — reporting it as an HTTP status
+        // would be a lie, and failing the probe would make `deploy status` useless on
+        // exactly the broken host it exists to surface.
+        let cfg = resolved();
+        for capture in [
+            "000\n---autumn-host-status---\n",
+            "---autumn-host-status---\n",
+            "",
+        ] {
+            let exec = RecordingExecutor::new()
+                .with_stdout("detect-current", status_probe_stdout("r1", 3001))
+                .with_stdout("probe-host-status", capture);
+            let probe = probe_host_status(&cfg, 3000, &exec).unwrap();
+            assert_eq!(
+                probe.ready_code, None,
+                "capture {capture:?} must degrade to unknown readiness"
+            );
+            assert!(
+                !probe.shared_maintenance_flag,
+                "no sentinel means the shared flag is absent, never unknown-as-on"
+            );
+            // …and with no unit section at all the VERDICT is `Unknown`, not a
+            // confident `off` (review round 1, Codex 2).
+            assert_eq!(probe.maintenance, MaintenanceStatus::Unknown);
+        }
+    }
+
+    #[test]
+    fn probe_host_status_polls_the_slot_the_proxy_is_actually_serving() {
+        // The live-slot marker can drift from what kamal-proxy serves (an interrupted
+        // post-flip marker write). `status` reconciles exactly like the rollout path
+        // does, so it reports the slot a deploy would plan from — polling the marker's
+        // slot instead would report the IDLE release's readiness.
+        let cfg = resolved();
+        let drifted = format!(
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n{}\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 3000\n\
+             ---autumn-kamal-proxy-options---\n0\t\n\
+             ---autumn-current-release---\n/srv/autumn/myapp/releases/r1",
+            // the proxy is serving GREEN (public + 2) while the marker says blue
+            proxy_list_serving("myapp", 3002)
+        );
+        let exec = RecordingExecutor::new()
+            .with_stdout("detect-current", drifted)
+            .with_stdout("probe-host-status", "200\n---autumn-host-status---\n");
+        let probe = probe_host_status(&cfg, 3000, &exec).unwrap();
+        let reconcile = probe
+            .reconcile(&cfg, 3000)
+            .expect("a redeploy host reconciles");
+        assert_eq!(reconcile.live_slot, SLOT_GREEN);
+        assert!(reconcile.repair, "the disagreement is reported as drift");
+        let shell = exec
+            .shell_for("probe-host-status")
+            .expect("status probe ran");
+        assert!(
+            shell.contains("http://127.0.0.1:3002/ready"),
+            "readiness must follow the PROXY's slot, not the marker's: {shell}"
+        );
+    }
+
+    #[test]
+    fn release_id_from_dir_takes_the_basename_and_rejects_junk() {
+        assert_eq!(
+            release_id_from_dir("/srv/autumn/myapp/releases/20260714T120000Z"),
+            Some("20260714T120000Z")
+        );
+        // Trailing slash (some readlink/shell shapes) still yields the id.
+        assert_eq!(
+            release_id_from_dir("/srv/autumn/myapp/releases/20260714T120000Z/"),
+            Some("20260714T120000Z")
+        );
+        assert_eq!(release_id_from_dir(""), None);
+        assert_eq!(release_id_from_dir("/"), None);
     }
 
     /// A compatible `kamal-proxy deploy --help` capture for the compat probe tests.
@@ -4871,6 +6623,14 @@ mod tests {
 
     #[test]
     fn ssh_and_scp_argv_are_built_correctly() {
+        // #1621 (R2, T1.23) DELIBERATELY updated this vector: the three liveness
+        // options below are new, and they apply to single-host and fleet deploys
+        // alike. `SshExecutor::run` uses `Command::output()` with no timeout and the
+        // preflight is a bare TCP connect, so before this a host that accepted TCP
+        // and then hung the SSH handshake blocked the deploy FOREVER — which at
+        // fleet scale means a permanently half-flipped fleet with no timeout to
+        // recover from. Assert the exact argv (never `contains`), so any future
+        // change to the option set is a conscious one.
         let target = SshTarget {
             host: "203.0.113.10".to_owned(),
             user: "deploy".to_owned(),
@@ -4887,6 +6647,12 @@ mod tests {
                 "BatchMode=yes".to_owned(),
                 "-o".to_owned(),
                 "StrictHostKeyChecking=accept-new".to_owned(),
+                "-o".to_owned(),
+                "ConnectTimeout=10".to_owned(),
+                "-o".to_owned(),
+                "ServerAliveInterval=15".to_owned(),
+                "-o".to_owned(),
+                "ServerAliveCountMax=4".to_owned(),
                 "deploy@203.0.113.10".to_owned(),
                 "systemctl daemon-reload".to_owned(),
             ]
@@ -4907,6 +6673,14 @@ mod tests {
                 "BatchMode=yes".to_owned(),
                 "-o".to_owned(),
                 "StrictHostKeyChecking=accept-new".to_owned(),
+                // scp forwards -o to its ssh transport, so an upload — the longest
+                // single operation in a deploy — gets the same liveness guarantees.
+                "-o".to_owned(),
+                "ConnectTimeout=10".to_owned(),
+                "-o".to_owned(),
+                "ServerAliveInterval=15".to_owned(),
+                "-o".to_owned(),
+                "ServerAliveCountMax=4".to_owned(),
                 "/local/target/release/myapp".to_owned(),
                 "deploy@203.0.113.10:/srv/autumn/myapp/releases/r1/myapp".to_owned(),
             ]

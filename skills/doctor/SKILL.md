@@ -71,6 +71,7 @@ These names match what `autumn doctor --json` actually emits in the `name` field
 | `jobs_queue_coverage` **(trunk-dev)** | Add the uncovered queue(s) to a tier's `jobs.pin` in `[jobs.fleet].tiers`, or run an unpinned tier that drains everything (fails once `[jobs.fleet]` is declared and a needed queue is uncovered; informational when `[jobs.fleet]` is absent) |
 | `offsite_backup` **(trunk-dev)** | Set `backup.offsite.s3.bucket`, or set `backup.offsite.allow_shared_bucket = true` if intentionally reusing the app `[storage.s3]` bucket |
 | `edge_target` **(trunk-dev)** | Run `rustup target add wasm32-wasip1` — the project has `#[edge]` routes, so `autumn build` needs that target to compile the edge capsule (passes with "no `#[edge]` routes" when the project has none) |
+| `deploy_host` **(trunk-dev)** | Set a deploy target in `autumn.toml`: `[deploy] host = "<address>"` (one server) **or** `[deploy] hosts = ["<a>", "<b>"]` (a fleet, in rollout order) — never both. Blank or duplicate `hosts` entries are refused (issue #1621) |
 | `edge_routes` **(trunk-dev)** | Fails when an `#[edge]` handler also carries `#[secured]`/`#[authorize]`/`#[step_up]`/`#[throttle]`/`#[intercept]`: remove one of the two — edge routes are unauthenticated read-path routes served without origin middleware. Warns when a marked handler is missing from `edge_routes![]`, or when `src/bin/edge-capsule.rs` is absent |
 
 ## Operator alert checks (unreleased — trunk-dev)
@@ -172,18 +173,48 @@ probes, gated behind the CLI `acme` feature:
 
 Offline stored-cert expiry is also graded. See issue #1858.
 
-## Deploy preflight checks (unreleased — trunk-dev, issue #1607)
+## Deploy preflight checks (unreleased — trunk-dev, issues #1607/#1621)
 
 When a `[deploy]` section is present in `autumn.toml`, `autumn doctor` runs the
 deploy preflight as a config-gated section, emitting deploy-namespaced checks:
-`deploy_config` (the `[deploy]` section parses), `deploy_host` (`[deploy] host`
-is set / SSH-reachable), `deploy_signing_secret`, and `deploy_database_url`. The
+`deploy_config` (the `[deploy]` section parses), `deploy_host` (a deploy target
+is configured), `deploy_ssh_reachability` (`--online` only),
+`deploy_signing_secret`, `deploy_database_url`, and `deploy_migrate_check`. The
 same graders back the standalone `autumn deploy check`, so the offline `doctor`
 and online `deploy check` surfaces report identically. The `[deploy]` profile
 defaults to the **production** profile (`"prod"`). The full flow is
-`autumn deploy {check | plan | up | rollback}` (SSH: install proxy on first
-deploy, zero-downtime cutover with auto-rollback on redeploy, and on-demand
-`rollback`).
+`autumn deploy {check | plan | up | rollback | status | maintenance on|off}`
+(SSH: install proxy on first deploy, zero-downtime cutover with auto-rollback on
+redeploy, on-demand `rollback`, and — with `[deploy] hosts` — a serial rolling
+deploy across a fleet).
+
+### Fleet grading (issue #1621)
+
+The deploy target is a **list**: `[deploy] host` (one server) or `[deploy] hosts`
+(a fleet, in rollout order). `doctor` enumerates it through the same validator
+`autumn deploy check` uses, so a fleet config is graded rather than reported as
+"no target host configured":
+
+- `deploy_host` — **passes** naming every configured host in rollout order
+  (`3 deploy target hosts configured, in rollout order: …`). It **fails** on a
+  malformed spelling — `host` and `hosts` both set, a blank `hosts` entry, or a
+  duplicate entry — with the same hard refusal `autumn deploy check` makes.
+  Remedy: keep either `host` or `hosts`, never both, and make every `hosts` entry
+  a distinct non-blank address.
+- `deploy_ssh_reachability` (`--online`) — probes **every** host and fails if
+  **any** is unreachable, naming the unreachable ones. A broken host spelling
+  fails this check too (there is no list to probe), so the `--json` key set never
+  changes shape.
+
+`doctor` keeps **one check per grader name** even for a fleet — `CheckResult.name`
+is a stable `--json` key — so the per-host detail rides in the `detail` text.
+`autumn deploy check` is the surface that prints one `ssh_reachability` line per
+host, scoped as `ssh_reachability (10.0.0.3)`.
+
+For live per-host state (deployed release, live slot, `/ready`, maintenance flag,
+proxy port, version/state drift) use `autumn deploy status [--json] [--strict]`
+rather than `doctor` — it probes the hosts read-only and `--strict` exits
+non-zero on drift. See `docs/guide/fleet-deploys.md`.
 
 ## SQLite backend awareness (unreleased — trunk-dev, issue #1614)
 
