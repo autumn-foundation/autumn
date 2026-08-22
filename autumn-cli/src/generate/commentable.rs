@@ -186,33 +186,33 @@ fn comments_table_state(project_root: &Path) -> (bool, bool) {
     // kind of fact -- which they are, and treating them differently is what let
     // a rename INTO the discriminator name go unrecognised.
     let mut creates = false;
-    let (mut has_type, mut has_id) = (false, false);
+    let mut present: Vec<&'static str> = Vec::new();
 
     for sql in migration_up_sql(project_root) {
         for event in comments_table_events(&sql) {
             match event {
-                CommentsEvent::Create {
-                    has_type: created_type,
-                    has_id: created_id,
-                } => {
+                CommentsEvent::Create(columns) => {
                     creates = true;
-                    has_type = created_type;
-                    has_id = created_id;
+                    present = columns;
                 }
-                CommentsEvent::AddType => has_type = true,
-                CommentsEvent::AddId => has_id = true,
-                CommentsEvent::DropType => has_type = false,
-                CommentsEvent::DropId => has_id = false,
+                CommentsEvent::Add(column) => {
+                    if !present.contains(&column) {
+                        present.push(column);
+                    }
+                }
+                CommentsEvent::Remove(column) => present.retain(|held| *held != column),
                 CommentsEvent::Drop => {
                     creates = false;
-                    has_type = false;
-                    has_id = false;
+                    present.clear();
                 }
             }
         }
     }
 
-    (creates, has_type && has_id)
+    let complete = REQUIRED_COLUMNS
+        .iter()
+        .all(|column| present.contains(column));
+    (creates, complete)
 }
 
 /// Every spelling of the shared comments table this scan accepts after `verb`.
@@ -275,22 +275,42 @@ fn mentions_column(haystack: &str, column: &str) -> bool {
 }
 
 /// What one statement does to the shared comments table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CommentsEvent {
-    /// `CREATE TABLE comments (…)`, and which discriminator columns its body
+    /// `CREATE TABLE comments (…)`, and which of [`REQUIRED_COLUMNS`] its body
     /// declares. A fresh table replaces whatever was known about the old one.
-    Create { has_type: bool, has_id: bool },
-    /// `ALTER TABLE comments … commentable_type`.
-    AddType,
-    /// `ALTER TABLE comments … commentable_id`.
-    AddId,
+    Create(Vec<&'static str>),
+    /// `ALTER TABLE comments … <column>`, adding it.
+    Add(&'static str),
+    /// `ALTER TABLE comments DROP COLUMN <column>` (or a rename away).
+    Remove(&'static str),
     /// `DROP TABLE comments`.
     Drop,
-    /// `ALTER TABLE comments DROP COLUMN commentable_type` (or a rename away).
-    DropType,
-    /// `ALTER TABLE comments DROP COLUMN commentable_id` (or a rename away).
-    DropId,
 }
+
+/// Every column the generated helpers read or write on the shared table.
+///
+/// The discriminator PAIR is not the contract, only its most obvious part. A
+/// pre-existing polymorphic `comments` table — a Rails-style one carrying
+/// `user_id` where the helpers expect `author_id`, or one with no `parent_id` —
+/// satisfies a pair-only check, suppresses the shared migration, and then fails
+/// at run time with `42703 undefined_column` on every comment operation. Worse,
+/// generation would have SAID it was reusing the table.
+///
+/// So the whole schema is the question. A table missing any of these is not the
+/// shared table: the generator emits its own and, if the name is taken, says so
+/// (see `conflicting_comments_table`). A loud collision at migrate time beats a
+/// reassuring message and an app that breaks on its first comment.
+const REQUIRED_COLUMNS: &[&str] = &[
+    "id",
+    "commentable_type",
+    "commentable_id",
+    "parent_id",
+    "author_id",
+    "body",
+    "created_at",
+    "deleted_at",
+];
 
 /// Whether an `ALTER TABLE comments …` statement takes `column` away.
 ///
@@ -366,35 +386,27 @@ fn comments_table_events(sql: &str) -> Vec<CommentsEvent> {
     for (start, body) in comments_creations(sql) {
         events.push((
             start,
-            CommentsEvent::Create {
-                has_type: mentions_column(body, "commentable_type"),
-                has_id: mentions_column(body, "commentable_id"),
-            },
+            CommentsEvent::Create(
+                REQUIRED_COLUMNS
+                    .iter()
+                    .copied()
+                    .filter(|column| mentions_column(body, column))
+                    .collect(),
+            ),
         ));
     }
     for (at, statement) in comments_statements(sql, "alter table") {
         // An ALTER naming the column may be adding it, dropping it, or renaming
         // it away. Treating every mention as an add would let
         // `DROP COLUMN commentable_type` read as proof the column is present.
-        for (column, added, removed) in [
-            (
-                "commentable_type",
-                CommentsEvent::AddType,
-                CommentsEvent::DropType,
-            ),
-            (
-                "commentable_id",
-                CommentsEvent::AddId,
-                CommentsEvent::DropId,
-            ),
-        ] {
+        for column in REQUIRED_COLUMNS.iter().copied() {
             if !mentions_column(statement, column) {
                 continue;
             }
             if alter_removes_column(statement, column) {
-                events.push((at, removed));
+                events.push((at, CommentsEvent::Remove(column)));
             } else {
-                events.push((at, added));
+                events.push((at, CommentsEvent::Add(column)));
             }
         }
     }
@@ -440,13 +452,7 @@ fn comments_table_events(sql: &str) -> Vec<CommentsEvent> {
             // The conservative direction, since claiming the table IS
             // polymorphic would instead produce helpers querying columns that
             // may not be there.
-            events.push((
-                at,
-                CommentsEvent::Create {
-                    has_type: false,
-                    has_id: false,
-                },
-            ));
+            events.push((at, CommentsEvent::Create(Vec::new())));
         }
     }
 
@@ -1106,7 +1112,9 @@ mod tests {
         std::fs::write(
             dir.join("up.sql"),
             "CREATE TABLE comments (\n    id BIGSERIAL PRIMARY KEY,\n    \
-             body TEXT NOT NULL,\n    post_id BIGINT NOT NULL\n);\n",
+             body TEXT NOT NULL,\n    post_id BIGINT NOT NULL,\n    \
+             parent_id BIGINT,\n    author_id BIGINT,\n    \
+             created_at TIMESTAMP,\n    deleted_at TIMESTAMP\n);\n",
         )
         .expect("write");
         assert!(
@@ -1145,7 +1153,7 @@ mod tests {
         std::fs::write(
             dir.join("up.sql"),
             "CREATE TABLE comments_archive (\n    id BIGSERIAL PRIMARY KEY,\n    \
-             commentable_type TEXT NOT NULL,\n    commentable_id BIGINT NOT NULL\n);\n",
+             commentable_type TEXT NOT NULL,\n    commentable_id BIGINT NOT NULL,\n    id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP\n);\n",
         )
         .expect("write");
         assert!(
@@ -1155,9 +1163,9 @@ mod tests {
 
         // …while the real thing, quoted or not, still is.
         for sql in [
-            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);",
-            "CREATE TABLE \"comments\" (commentable_type TEXT, commentable_id BIGINT);",
-            "CREATE TABLE IF NOT EXISTS comments(commentable_type TEXT, commentable_id BIGINT);",
+            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);",
+            "CREATE TABLE \"comments\" (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);",
+            "CREATE TABLE IF NOT EXISTS comments(commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);",
         ] {
             let tmp = tempfile::tempdir().expect("tempdir");
             let dir = tmp.path().join("migrations").join("0001_real");
@@ -1177,7 +1185,7 @@ mod tests {
         std::fs::write(
             dir.join("up.sql"),
             "DROP TABLE comments;\nCREATE TABLE comments_archive (\n    \
-             commentable_type TEXT NOT NULL,\n    commentable_id BIGINT NOT NULL\n);\n",
+             commentable_type TEXT NOT NULL,\n    commentable_id BIGINT NOT NULL,\n    id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP\n);\n",
         )
         .expect("write");
         assert!(
@@ -1193,7 +1201,7 @@ mod tests {
         for sql in [
             "-- CREATE TABLE comments (\n--   commentable_type TEXT NOT NULL,\n\
              --   commentable_id BIGINT NOT NULL\n-- );\nCREATE TABLE notes (id BIGSERIAL);\n",
-            "/* CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT); */\n\
+            "/* CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP); */\n\
              CREATE TABLE notes (id BIGSERIAL);\n",
         ] {
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -1227,7 +1235,7 @@ mod tests {
             "CREATE TABLE comments (\n    id BIGSERIAL PRIMARY KEY,\n    \
              body TEXT NOT NULL,\n    post_id BIGINT NOT NULL\n);\n\
              CREATE TABLE audit_log (\n    id BIGSERIAL PRIMARY KEY,\n    \
-             commentable_type TEXT NOT NULL,\n    commentable_id BIGINT NOT NULL\n);\n",
+             commentable_type TEXT NOT NULL,\n    commentable_id BIGINT NOT NULL,\n    id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP\n);\n",
         )
         .expect("write");
         assert!(
@@ -1246,7 +1254,7 @@ mod tests {
             dir.join("up.sql"),
             "CREATE TABLE comments (\n    id BIGSERIAL PRIMARY KEY,\n    \
              score NUMERIC(10, 2) NOT NULL DEFAULT 0,\n    \
-             commentable_type TEXT NOT NULL,\n    commentable_id BIGINT NOT NULL\n);\n",
+             commentable_type TEXT NOT NULL,\n    commentable_id BIGINT NOT NULL,\n    id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP\n);\n",
         )
         .expect("write");
         assert!(
@@ -1269,7 +1277,9 @@ mod tests {
         std::fs::write(
             created.join("up.sql"),
             "CREATE TABLE comments (\n    id BIGSERIAL PRIMARY KEY,\n    \
-             body TEXT NOT NULL,\n    post_id BIGINT NOT NULL\n);\n",
+             body TEXT NOT NULL,\n    post_id BIGINT NOT NULL,\n    \
+             parent_id BIGINT,\n    author_id BIGINT,\n    \
+             created_at TIMESTAMP,\n    deleted_at TIMESTAMP\n);\n",
         )
         .expect("write");
 
@@ -1301,7 +1311,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("up.sql"),
-            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL);\n\
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL, parent_id BIGINT, author_id BIGINT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
              ALTER TABLE comments_archive ADD COLUMN commentable_type TEXT;\n\
              ALTER TABLE comments_archive ADD COLUMN commentable_id BIGINT;\n",
         )
@@ -1322,7 +1332,7 @@ mod tests {
         for (dir, sql) in [
             (
                 "0001_create",
-                "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL);\n",
+                "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL, parent_id BIGINT, author_id BIGINT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
             ),
             (
                 "0002_add_type",
@@ -1388,7 +1398,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("up.sql"),
-            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n\
+            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
              DROP TABLE comments;\n",
         )
         .expect("write");
@@ -1398,7 +1408,7 @@ mod tests {
         std::fs::write(
             dir.join("up.sql"),
             "DROP TABLE IF EXISTS comments;\n\
-             CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n",
+             CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(already_migrated(tmp.path()));
@@ -1415,7 +1425,7 @@ mod tests {
             dir.join("up.sql"),
             "CREATE TABLE comments (\n    id BIGSERIAL PRIMARY KEY,\n    \
              legacy_commentable_type TEXT NOT NULL,\n    \
-             legacy_commentable_id BIGINT NOT NULL\n);\n",
+             legacy_commentable_id BIGINT NOT NULL,\n    parent_id BIGINT,\n    author_id BIGINT,\n    body TEXT,\n    created_at TIMESTAMP,\n    deleted_at TIMESTAMP\n);\n",
         )
         .expect("write");
         assert!(
@@ -1436,7 +1446,7 @@ mod tests {
         std::fs::write(
             dir.join("up.sql"),
             "CREATE TABLE comments (\n    \"commentable_type\" TEXT NOT NULL,\n    \
-             commentable_id BIGINT NOT NULL\n);\n",
+             id BIGINT,\n    commentable_id BIGINT NOT NULL,\n    parent_id BIGINT,\n    author_id BIGINT,\n    body TEXT,\n    created_at TIMESTAMP,\n    deleted_at TIMESTAMP\n);\n",
         )
         .expect("write");
         assert!(already_migrated(tmp.path()));
@@ -1446,7 +1456,7 @@ mod tests {
     /// every mention as an add would let a dropped column read as present.
     #[test]
     fn dropping_or_renaming_a_discriminator_column_undoes_it() {
-        let base = "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n";
+        let base = "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n";
         for removal in [
             "ALTER TABLE comments DROP COLUMN commentable_type;\n",
             "ALTER TABLE comments RENAME COLUMN commentable_type TO legacy_kind;\n",
@@ -1474,7 +1484,7 @@ mod tests {
         std::fs::create_dir_all(&created).expect("mkdir");
         std::fs::write(
             created.join("up.sql"),
-            "CREATE TABLE comments (kind TEXT, commentable_id BIGINT);\n",
+            "CREATE TABLE comments (kind TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(!already_migrated(tmp.path()));
@@ -1510,7 +1520,7 @@ mod tests {
                 format!(
                     "{create} (\n    id BIGSERIAL PRIMARY KEY,\n    \
                      commentable_type TEXT NOT NULL,\n    \
-                     commentable_id BIGINT NOT NULL\n);\n"
+                     commentable_id BIGINT NOT NULL,\n    parent_id BIGINT,\n    author_id BIGINT,\n    body TEXT,\n    created_at TIMESTAMP,\n    deleted_at TIMESTAMP\n);\n"
                 ),
             )
             .expect("write");
@@ -1524,7 +1534,7 @@ mod tests {
         std::fs::create_dir_all(&created).expect("mkdir");
         std::fs::write(
             created.join("up.sql"),
-            "CREATE TABLE public.comments (commentable_type TEXT, commentable_id BIGINT);\n",
+            "CREATE TABLE public.comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         let dropped = migrations.join("0002_drop");
@@ -1538,7 +1548,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("up.sql"),
-            "CREATE TABLE archive.comments (commentable_type TEXT, commentable_id BIGINT);\n",
+            "CREATE TABLE archive.comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(
@@ -1554,14 +1564,14 @@ mod tests {
     fn a_comment_marker_inside_a_literal_is_not_a_comment() {
         for sql in [
             "CREATE TABLE comments (note TEXT DEFAULT '--', \
-             commentable_type TEXT, commentable_id BIGINT);",
+             commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);",
             "CREATE TABLE comments (note TEXT DEFAULT '/* x */', \
-             commentable_type TEXT, commentable_id BIGINT);",
+             commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);",
             // A doubled quote is an escaped one, still inside the literal.
             "CREATE TABLE comments (note TEXT DEFAULT 'it''s -- fine', \
-             commentable_type TEXT, commentable_id BIGINT);",
+             commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);",
             // …and the same inside a quoted identifier.
-            "CREATE TABLE comments (\"od--d\" TEXT, commentable_type TEXT, commentable_id BIGINT);",
+            "CREATE TABLE comments (\"od--d\" TEXT, commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);",
         ] {
             let tmp = tempfile::tempdir().expect("tempdir");
             let dir = tmp.path().join("migrations").join("0001_literal");
@@ -1576,8 +1586,8 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("up.sql"),
-            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);\n\
-             -- commentable_type TEXT, commentable_id BIGINT\n",
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
+             -- commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP\n",
         )
         .expect("write");
         assert!(!already_migrated(tmp.path()));
@@ -1630,7 +1640,7 @@ mod tests {
     /// contain all four.
     #[test]
     fn sql_string_literals_are_not_read_as_ddl() {
-        let real = "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n";
+        let real = "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n";
 
         // A `)` inside a literal must not close the column list early.
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1639,7 +1649,7 @@ mod tests {
         std::fs::write(
             dir.join("up.sql"),
             "CREATE TABLE comments (note TEXT DEFAULT ')', \
-             commentable_type TEXT, commentable_id BIGINT);\n",
+             commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(
@@ -1675,7 +1685,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("up.sql"),
-            "CREATE TABLE \"comments\" (\"commentable_type\" TEXT, \"commentable_id\" BIGINT);\n",
+            "CREATE TABLE \"comments\" (\"commentable_type\" TEXT, \"commentable_id\" BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(already_migrated(tmp.path()), "quoted identifiers are names");
@@ -1690,7 +1700,7 @@ mod tests {
         std::fs::create_dir_all(&created).expect("mkdir");
         std::fs::write(
             created.join("up.sql"),
-            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n",
+            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(already_migrated(tmp.path()));
@@ -1726,7 +1736,13 @@ mod tests {
         std::fs::write(
             columns.join("up.sql"),
             "ALTER TABLE comments ADD COLUMN commentable_type TEXT;\n\
-             ALTER TABLE comments ADD COLUMN commentable_id BIGINT;\n",
+             ALTER TABLE comments ADD COLUMN commentable_id BIGINT;\n\
+             ALTER TABLE comments ADD COLUMN id BIGINT;\n\
+             ALTER TABLE comments ADD COLUMN parent_id BIGINT;\n\
+             ALTER TABLE comments ADD COLUMN author_id BIGINT;\n\
+             ALTER TABLE comments ADD COLUMN body TEXT;\n\
+             ALTER TABLE comments ADD COLUMN created_at TIMESTAMP;\n\
+             ALTER TABLE comments ADD COLUMN deleted_at TIMESTAMP;\n",
         )
         .expect("write");
         assert!(already_migrated(tmp.path()));
@@ -1741,9 +1757,9 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("up.sql"),
-            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);\n\
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
              DROP TABLE comments;\n\
-             CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n",
+             CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(
@@ -1754,9 +1770,9 @@ mod tests {
         // …and the reverse order still ends with no table.
         std::fs::write(
             dir.join("up.sql"),
-            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT);\n\
+            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
              DROP TABLE comments;\n\
-             CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);\n",
+             CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(
@@ -1775,7 +1791,7 @@ mod tests {
         std::fs::create_dir_all(&created).expect("mkdir");
         std::fs::write(
             created.join("up.sql"),
-            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);\n",
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(!already_migrated(tmp.path()));
@@ -1799,7 +1815,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("up.sql"),
-            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);\n\
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
              ALTER TABLE ONLY comments_archive ADD COLUMN commentable_type TEXT;\n\
              ALTER TABLE ONLY comments_archive ADD COLUMN commentable_id BIGINT;\n",
         )
@@ -1886,7 +1902,8 @@ mod tests {
         let dir = tmp.path().join("migrations").join("0001_d");
         std::fs::create_dir_all(&dir).expect("mkdir");
         let create = "CREATE TABLE comments (commentable_type TEXT NOT NULL, \
-                      commentable_id BIGINT NOT NULL);\n";
+                      commentable_id BIGINT NOT NULL, id BIGINT, parent_id BIGINT, \
+                      author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n";
 
         for drop in [
             "ALTER TABLE comments DROP COLUMN commentable_type;",
@@ -1927,7 +1944,8 @@ mod tests {
         let dir = tmp.path().join("migrations").join("0001_c");
         std::fs::create_dir_all(&dir).expect("mkdir");
         let create = "CREATE TABLE comments (commentable_type TEXT NOT NULL, \
-                      commentable_id BIGINT NOT NULL);\n";
+                      commentable_id BIGINT NOT NULL, id BIGINT, parent_id BIGINT, \
+                      author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n";
 
         // Renaming the discriminator AWAY leaves the table non-polymorphic,
         // whichever spelling the migration used.
@@ -1944,7 +1962,7 @@ mod tests {
 
         // Renaming another column INTO the discriminator name ADDS it — the
         // `to` side is what decides, so neither spelling may read as a removal.
-        let bare = "CREATE TABLE comments (kind TEXT NOT NULL, commentable_id BIGINT NOT NULL);\n";
+        let bare = "CREATE TABLE comments (kind TEXT NOT NULL, commentable_id BIGINT NOT NULL, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n";
         for rename in [
             "ALTER TABLE comments RENAME COLUMN kind TO commentable_type;",
             "ALTER TABLE comments RENAME kind TO commentable_type;",
@@ -1968,6 +1986,64 @@ mod tests {
         );
     }
 
+    /// The discriminator pair is not the contract. A table carrying it but
+    /// missing a column the helpers query is NOT the shared table: reusing it
+    /// suppresses the migration and every comment operation then fails at run
+    /// time on `42703 undefined_column` — after generation said it was reusing.
+    #[test]
+    fn a_polymorphic_table_missing_a_required_column_is_not_the_shared_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rails");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // Rails-style: the pair is there, but the author column is `user_id`.
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGINT, commentable_type TEXT, \
+             commentable_id BIGINT, parent_id BIGINT, user_id BIGINT, body TEXT, \
+             created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "`user_id` is not `author_id`, so the helpers would 42703"
+        );
+        // It IS a name collision, so the caller warns rather than silently
+        // emitting a second `CREATE TABLE comments`.
+        assert!(conflicting_comments_table(tmp.path()));
+
+        // Every other required column, one at a time, for the same reason.
+        for missing in REQUIRED_COLUMNS.iter().copied() {
+            let columns: Vec<String> = REQUIRED_COLUMNS
+                .iter()
+                .filter(|column| **column != missing)
+                .map(|column| format!("{column} BIGINT"))
+                .collect();
+            std::fs::write(
+                dir.join("up.sql"),
+                format!("CREATE TABLE comments ({});\n", columns.join(", ")),
+            )
+            .expect("write");
+            assert!(
+                !already_migrated(tmp.path()),
+                "a table with no `{missing}` is not the shared table"
+            );
+        }
+
+        // …and the complete set IS the shared table.
+        let columns: Vec<String> = REQUIRED_COLUMNS
+            .iter()
+            .map(|column| format!("{column} BIGINT"))
+            .collect();
+        std::fs::write(
+            dir.join("up.sql"),
+            format!("CREATE TABLE comments ({});\n", columns.join(", ")),
+        )
+        .expect("write");
+        assert!(already_migrated(tmp.path()));
+        assert!(!conflicting_comments_table(tmp.path()));
+    }
+
     /// A `Comment` model scaffolded the ordinary way owns a `comments` table
     /// with no discriminator columns. That is neither "already migrated" (the
     /// helpers would query columns that are not there) nor a clean slate — the
@@ -1979,7 +2055,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("up.sql"),
-            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL);\n",
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL, parent_id BIGINT, author_id BIGINT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(!already_migrated(tmp.path()), "no discriminator columns");
@@ -1991,7 +2067,7 @@ mod tests {
         // The polymorphic table is NOT a conflict — it is the thing we reuse.
         std::fs::write(
             dir.join("up.sql"),
-            "CREATE TABLE comments (commentable_type TEXT NOT NULL, commentable_id BIGINT NOT NULL);\n",
+            "CREATE TABLE comments (commentable_type TEXT NOT NULL, commentable_id BIGINT NOT NULL, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(already_migrated(tmp.path()));
@@ -2017,7 +2093,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("up.sql"),
-            "CREATE TABLE \"Comments\" (commentable_type TEXT, commentable_id BIGINT);\n",
+            "CREATE TABLE \"Comments\" (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(
@@ -2028,7 +2104,7 @@ mod tests {
         // Unquoted SQL stays case-INsensitive, so keywords in any case match.
         std::fs::write(
             dir.join("up.sql"),
-            "CrEaTe TaBlE Comments (CommentAble_Type TEXT, COMMENTABLE_ID BIGINT);\n",
+            "CrEaTe TaBlE Comments (CommentAble_Type TEXT, COMMENTABLE_ID BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(
@@ -2039,7 +2115,7 @@ mod tests {
         // …and the quoted lowercase spelling is still the shared table.
         std::fs::write(
             dir.join("up.sql"),
-            "CREATE TABLE \"comments\" (\"commentable_type\" TEXT, \"commentable_id\" BIGINT);\n",
+            "CREATE TABLE \"comments\" (\"commentable_type\" TEXT, \"commentable_id\" BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
         )
         .expect("write");
         assert!(already_migrated(tmp.path()));
