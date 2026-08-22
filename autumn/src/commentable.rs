@@ -90,6 +90,34 @@ const FOR_NO_KEY_UPDATE: &str = " FOR NO KEY UPDATE";
 #[cfg(feature = "sqlite")]
 const FOR_NO_KEY_UPDATE: &str = "";
 
+/// The author key types the comments API can carry.
+///
+/// `author_id` is `i64` across the whole public surface — [`CommentCreated`],
+/// `add_comment`, the shared table's `BIGINT` column — so an author model keyed
+/// by anything else cannot work. Nothing said so before: `#[commentable(by =
+/// User)]` checked only that the type EXISTS, so a UUID-keyed `User` compiled
+/// happily and then failed at run time. `session_author` parses the session
+/// value with `str::parse::<i64>`, so every authenticated POST looked
+/// signed-out and returned 401, and an `author_name` lookup compared a UUID key
+/// against a bound `BIGINT`.
+///
+/// `i32` is admitted alongside `i64`: those ids widen losslessly, they parse,
+/// and PostgreSQL compares `INTEGER` to `BIGINT` without complaint, so an
+/// `i32`-keyed author model works today and must keep working.
+///
+/// Sealed, because implementing it for a wider type would re-open exactly the
+/// runtime failure it exists to prevent.
+pub trait CommentAuthorKey: sealed::Sealed {}
+
+impl CommentAuthorKey for i64 {}
+impl CommentAuthorKey for i32 {}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for i64 {}
+    impl Sealed for i32 {}
+}
+
 /// The soft-delete marker column. Autumn's `soft_delete` convention is fixed,
 /// so the predicate is a constant rather than another spec field.
 const DELETED_AT: &str = "deleted_at";

@@ -581,9 +581,36 @@ pub fn emit_commentable_items(
             };
         }
     });
+    // Not merely "this type exists". `author_id` is `i64` across the whole
+    // comments surface — `CommentCreated`, `add_comment`, the shared table's
+    // `BIGINT` column — so an author model keyed by anything else cannot work:
+    // `session_author` parses the session value with `str::parse::<i64>`, and a
+    // UUID-keyed `User` compiled happily, then returned 401 from every
+    // authenticated POST with nothing pointing at the cause.
+    //
+    // Read through the FIELD, exactly as `counter_guard` above reads the
+    // parent's counter, so the check lands on a hand-written author struct too
+    // — the common case, since an author model is often kept manual to stop a
+    // password hash being auto-exposed. A trait bound would have demanded
+    // `#[model]`, which those structs deliberately do not derive.
     let author_guard = spec.author_model.as_ref().map(|author_model| {
+        let author_pk = format_ident!("{}", spec.author_pk);
         quote! {
-            const _: ::core::marker::PhantomData<#author_model> = ::core::marker::PhantomData;
+            const _: fn(&#author_model) = |__autumn_commentable_author| {
+                // The bound is on the FIELD's type, and the trait is autumn's
+                // own: a plain `Into<i64>` would report the failure by listing
+                // every `From` impl `i64` has, including whatever the
+                // dependency graph adds, which makes the expected-output
+                // fixture brittle. `CommentAuthorKey` is sealed over `i32` and
+                // `i64`, so the error names those two and nothing else.
+                fn __autumn_commentable_author_key<
+                    T: ::autumn_web::commentable::CommentAuthorKey,
+                >(
+                    _: &T,
+                ) {
+                }
+                __autumn_commentable_author_key(&__autumn_commentable_author.#author_pk);
+            };
         }
     });
     let author_model_name = spec

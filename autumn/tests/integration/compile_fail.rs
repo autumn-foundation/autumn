@@ -74,6 +74,10 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/model_commentable_composite_key.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_commentable_max_depth_too_large.rs");
+    // `author_id` is `i64` everywhere in the comments API, so a non-integer
+    // author key is a compile error rather than a 401 from every POST.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_author_key_not_integer.rs");
 
     // Declarative reactions (#1362): every `#[votable(...)]` misuse is a
     // directed compile error rather than a runtime surprise on the first vote.
