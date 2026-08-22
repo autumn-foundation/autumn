@@ -2264,6 +2264,7 @@ async fn show_thread(
             .as_deref()
             .filter(|p| is_safe_return_path(p)),
         None,
+        None,
     ))
 }
 
@@ -2353,6 +2354,9 @@ async fn post_comment(
         }
         Err(err) => return Err(err),
     };
+    // The draft rides with the error, never without it: these two are the same
+    // event — "we refused this, here it is back".
+    let draft = error.is_some().then(|| (reply_to, submission.body.clone()));
 
     let redirecting = error.is_none() && !htmx.is_htmx && return_to.is_some();
 
@@ -2424,6 +2428,11 @@ async fn post_comment(
         true,
         return_to,
         error,
+        // Only on rejection: a successful submit renders the new comment and
+        // must leave the textarea empty, or the visitor is invited to post it
+        // twice. `submission.body` is the raw text as typed, not the trimmed
+        // value `add_comment` stored, so nothing the visitor wrote is lost.
+        draft,
     )
     .into_response())
 }
@@ -2479,6 +2488,9 @@ fn render(
     can_comment: bool,
     return_to: Option<&str>,
     error: Option<String>,
+    // The rejected body and the form it came from, so a 422 re-render gives the
+    // visitor their draft back instead of an empty textarea.
+    draft: Option<(Option<i64>, String)>,
 ) -> maud::Markup {
     let mut widget = crate::widgets::CommentThread::from_spec(
         thread_dom_id(commentable_type, parent_id),
@@ -2502,6 +2514,9 @@ fn render(
     }
     if let Some(error) = error {
         widget = widget.error(error);
+    }
+    if let Some((reply_to, body)) = draft {
+        widget = widget.draft(reply_to, body);
     }
     if !can_comment {
         widget = widget

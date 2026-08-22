@@ -521,6 +521,13 @@ pub fn parent_cleanup_sql(
              {function}\n\
              -- `{commentable_type}`'s comments go when the row does. The polymorphic key\n\
              -- cannot be a foreign key, so this trigger is the cascade.\n\
+             --\n\
+             -- KEEP IN SYNC WITH `#[commentable]` ON THIS MODEL.\n\
+             -- The discriminator below is this trigger's ONLY link to the comments;\n\
+             -- nothing checks it at run time. Overriding `type_name`, `table` or the\n\
+             -- discriminator columns on the model without editing this trigger leaves it\n\
+             -- deleting rows that no longer exist, so a deleted parent keeps its thread —\n\
+             -- silently, and visibly again if the id is ever reused.\n\
              CREATE TRIGGER {parent_table}_delete_{COMMENTS_TABLE}\n\
              \x20   AFTER DELETE ON {parent_table}\n\
              \x20   FOR EACH ROW\n\
@@ -531,6 +538,13 @@ pub fn parent_cleanup_sql(
             "\n\
              -- `{commentable_type}`'s comments go when the row does. SQLite triggers take\n\
              -- no arguments, so the discriminator is inlined here rather than shared.\n\
+             --\n\
+             -- KEEP IN SYNC WITH `#[commentable]` ON THIS MODEL.\n\
+             -- The discriminator below is this trigger's ONLY link to the comments;\n\
+             -- nothing checks it at run time. Overriding `type_name`, `table` or the\n\
+             -- discriminator columns on the model without editing this trigger leaves it\n\
+             -- deleting rows that no longer exist, so a deleted parent keeps its thread —\n\
+             -- silently, and visibly again if the id is ever reused.\n\
              CREATE TRIGGER IF NOT EXISTS {parent_table}_delete_{COMMENTS_TABLE}\n\
              \x20   AFTER DELETE ON {parent_table}\n\
              \x20   FOR EACH ROW\n\
@@ -1819,6 +1833,20 @@ mod tests {
             "and defines it BEFORE the trigger that calls it:\n{trigger}"
         );
         assert!(trigger.contains("AFTER DELETE ON posts"));
+
+        // The trigger's discriminator is its ONLY link to the comments, and
+        // nothing checks it at run time: a later `#[commentable(type_name =
+        // "Article")]` on the model would leave this trigger deleting `'Post'`
+        // rows that never existed, orphaning the thread silently. The generator
+        // cannot see a future edit, so it says so where the editor will look.
+        for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
+            let sql = parent_cleanup_sql(backend, "posts", "Post");
+            assert!(
+                sql.contains("KEEP IN SYNC WITH `#[commentable]` ON THIS MODEL."),
+                "{backend:?} migration must say the coupling out loud:\n{sql}"
+            );
+            assert!(sql.contains("type_name"), "{sql}");
+        }
         assert!(
             trigger.contains("EXECUTE FUNCTION comments_delete_for_parent('Post')"),
             "the discriminator is passed, so one function serves every model:\n{trigger}"

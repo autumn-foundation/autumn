@@ -1359,6 +1359,18 @@ pub struct CommentThread {
     max_body_bytes: Option<usize>,
     /// A rejection to show above the form, rendered `role="alert"`.
     error: Option<String>,
+    /// The rejected body, re-filled into the form that submitted it.
+    ///
+    /// A 422 re-renders the whole thread, and the htmx swap is `outerHTML` — so
+    /// without this the user's typed comment is replaced by an empty textarea
+    /// and simply gone. `maxlength` does not save them: it counts CHARACTERS
+    /// while `max_body` counts BYTES, so an ordinary multibyte comment passes
+    /// the browser and is refused by the server.
+    draft: Option<String>,
+    /// Which form the [`draft`](Self::draft) belongs to — `None` for the
+    /// top-level one, `Some(id)` for the reply under that comment. A draft
+    /// re-filled into every form would duplicate it down the page.
+    draft_reply_to: Option<i64>,
 }
 
 #[cfg(feature = "maud")]
@@ -1392,6 +1404,8 @@ impl CommentThread {
             return_to: None,
             max_body_bytes: None,
             error: None,
+            draft: None,
+            draft_reply_to: None,
         }
     }
 
@@ -1429,6 +1443,18 @@ impl CommentThread {
     #[must_use]
     pub fn error(mut self, error: impl Into<String>) -> Self {
         self.error = Some(error.into());
+        self
+    }
+
+    /// Re-fill a rejected submission into the form that sent it.
+    ///
+    /// `reply_to` selects the form: `None` is the top-level one, `Some(id)` the
+    /// reply under that comment — which is also opened, since a draft restored
+    /// inside a collapsed disclosure looks exactly like a lost one.
+    #[must_use]
+    pub fn draft(mut self, reply_to: Option<i64>, body: impl Into<String>) -> Self {
+        self.draft = Some(body.into());
+        self.draft_reply_to = reply_to;
         self
     }
 
@@ -1639,6 +1665,26 @@ pub fn comment_dom_id(thread_dom_id: &str, comment_id: i64) -> String {
 }
 
 /// One comment, its reply affordance, and its own replies.
+/// Split a stored comment body into paragraphs on blank lines.
+///
+/// Splitting on `"\n\n"` alone was wrong for the ordinary case: an HTML form
+/// submits a textarea with CRLF line endings, so a blank line arrives as
+/// `"\r\n\r\n"` and the whole comment rendered as ONE paragraph — the break
+/// collapsing to a space, because the CSS does not preserve whitespace.
+///
+/// `str::lines` is what makes this line-ending agnostic: it splits on `\n` and
+/// strips a trailing `\r`, so LF and CRLF bodies produce identical paragraphs.
+/// Runs of blank lines collapse to a single break rather than empty `<p>`s.
+#[cfg(feature = "maud")]
+fn comment_paragraphs(body: &str) -> Vec<String> {
+    body.lines()
+        .collect::<Vec<_>>()
+        .split(|line| line.trim().is_empty())
+        .filter(|group| group.iter().any(|line| !line.trim().is_empty()))
+        .map(|group| group.join("\n").trim().to_string())
+        .collect()
+}
+
 #[cfg(feature = "maud")]
 fn comment_node(cfg: &CommentThread, comment: &CommentView, depth: usize) -> maud::Markup {
     let node_id = comment_dom_id(&cfg.dom_id, comment.id);
@@ -1660,14 +1706,13 @@ fn comment_node(cfg: &CommentThread, comment: &CommentView, depth: usize) -> mau
                 }
             }
             div class="autumn-comment-body" {
-                @for paragraph in comment.body.split("\n\n") {
-                    @if !paragraph.trim().is_empty() {
-                        p { (paragraph.trim()) }
-                    }
+                @for paragraph in comment_paragraphs(&comment.body) {
+                    p { (paragraph) }
                 }
             }
             @if can_reply {
-                details class="autumn-comment-reply" {
+                details class="autumn-comment-reply"
+                    open[cfg.draft.is_some() && cfg.draft_reply_to == Some(comment.id)] {
                     summary class="autumn-comment-reply-toggle" aria-label=(reply_label) {
                         (cfg.reply_label)
                     }
@@ -1724,7 +1769,17 @@ fn comment_form(
             }
             label class="autumn-comment-label" for=(textarea_id) { (field_label) }
             textarea id=(textarea_id) class="autumn-comment-input" name=(cfg.body_field)
-                rows="3" required maxlength=[maxlength] placeholder=(cfg.placeholder) {}
+                rows="3" required maxlength=[maxlength] placeholder=(cfg.placeholder) {
+                // Only the form that was actually submitted: `draft_reply_to`
+                // is `None` for the top-level form and `Some(id)` for a reply,
+                // which is exactly how `reply_to` identifies this one. Maud
+                // escapes the text, so a body full of markup is inert.
+                @if let Some(draft) = &cfg.draft
+                    && reply_to == cfg.draft_reply_to
+                {
+                    (draft)
+                }
+            }
             button type="submit" class="autumn-comment-submit" { (submit_label) }
         }
     }
@@ -5889,6 +5944,80 @@ pub fn line_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud
 #[cfg(all(test, feature = "maud"))]
 mod tests {
     use super::*;
+
+    /// A browser submits a textarea with CRLF, so paragraph splitting must not
+    /// depend on the line ending. Splitting on `"\n\n"` alone rendered an
+    /// ordinary two-paragraph comment as one.
+    #[test]
+    fn comment_paragraphs_split_on_blank_lines_of_either_line_ending() {
+        let expected = vec!["first".to_string(), "second".to_string()];
+        assert_eq!(comment_paragraphs("first\n\nsecond"), expected, "LF");
+        assert_eq!(
+            comment_paragraphs("first\r\n\r\nsecond"),
+            expected,
+            "CRLF — the case a real form submission produces"
+        );
+        // A run of blank lines is one break, not several empty paragraphs.
+        assert_eq!(comment_paragraphs("first\r\n\r\n\r\n\r\nsecond"), expected);
+        // A single newline stays INSIDE one paragraph, as before.
+        assert_eq!(
+            comment_paragraphs("one\r\ntwo"),
+            vec!["one\ntwo".to_string()]
+        );
+        // Nothing but whitespace yields no paragraphs at all.
+        assert!(comment_paragraphs("   \r\n\r\n  ").is_empty());
+        assert!(comment_paragraphs("").is_empty());
+    }
+
+    /// A 422 re-renders the thread and htmx swaps `outerHTML`, so a draft that
+    /// is not carried back is simply gone from the visitor's screen. It must
+    /// land in the form that SENT it, and nowhere else.
+    #[test]
+    fn a_rejected_draft_is_refilled_into_the_form_that_sent_it() {
+        let view = vec![CommentView {
+            id: 7,
+            author: "ada".into(),
+            body: "parent".into(),
+            datetime: None,
+            timestamp: String::new(),
+            replies: Vec::new(),
+        }];
+
+        // Top-level draft: the top-level textarea carries it, the reply does not.
+        let widget = CommentThread::new("t", "/c").draft(None, "my long draft");
+        let html = comment_thread(&widget, &view).into_string();
+        assert_eq!(
+            html.matches("my long draft").count(),
+            1,
+            "exactly one form is prefilled:\n{html}"
+        );
+
+        // Reply draft: it lands in that comment's reply form, which is OPEN —
+        // a draft restored inside a collapsed disclosure reads as a lost one.
+        let widget = CommentThread::new("t", "/c").draft(Some(7), "reply draft");
+        let html = comment_thread(&widget, &view).into_string();
+        assert_eq!(html.matches("reply draft").count(), 1, "{html}");
+        assert!(
+            html.contains("<details class=\"autumn-comment-reply\" open"),
+            "{html}"
+        );
+
+        // No draft: every textarea is empty, so a SUCCESSFUL post never invites
+        // the visitor to submit the same comment twice.
+        let widget = CommentThread::new("t", "/c");
+        let html = comment_thread(&widget, &view).into_string();
+        assert!(html.contains("></textarea>"), "{html}");
+        assert!(
+            !html.contains("<details class=\"autumn-comment-reply\" open"),
+            "{html}"
+        );
+
+        // The body is TEXT, not markup: maud escapes it.
+        let widget = CommentThread::new("t", "/c").draft(None, "<script>x</script>");
+        let html = comment_thread(&widget, &view).into_string();
+        assert!(!html.contains("<script>x</script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
 
     // ── comment_thread (#1367) ─────────────────────────────────────────
 
