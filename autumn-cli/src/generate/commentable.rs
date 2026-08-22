@@ -227,6 +227,21 @@ fn comments_table_state(project_root: &Path) -> (bool, bool) {
 /// Only `public` is accepted. Another schema is a genuinely different table
 /// unless the app's `search_path` says otherwise, and guessing at that would
 /// trade this false negative for a false positive.
+/// The `CREATE` verbs that produce a PERSISTENT `comments` relation.
+///
+/// `UNLOGGED` is a durability setting, not a different kind of object: the
+/// relation is still permanent and still occupies the name, so a later
+/// `CREATE TABLE comments` fails with "already exists" — confirmed against
+/// PostgreSQL, not assumed. Missing it made the scan report no table and emit a
+/// duplicate migration.
+///
+/// `TEMPORARY`/`TEMP` is deliberately NOT here, and that is the more
+/// interesting half. A temp table lives in a session-local schema and does
+/// **not** collide with a permanent one — also confirmed — so a migration that
+/// creates a temp `comments` must not suppress the shared table. Accepting
+/// every modifier would have traded one bug for its mirror image.
+const CREATE_VERBS: &[&str] = &["create table", "create unlogged table"];
+
 fn comments_table_spellings(verb: &str) -> Vec<String> {
     let names = [
         COMMENTS_TABLE.to_owned(),
@@ -833,7 +848,10 @@ fn comments_table_statement_start(lowered: &str) -> Option<usize> {
     // opening paren, or a closing quote -- so `comments_archive` is not
     // mistaken for `comments`.
     let mut best: Option<usize> = None;
-    for prefix in comments_table_spellings("create table") {
+    for prefix in CREATE_VERBS
+        .iter()
+        .flat_map(|verb| comments_table_spellings(verb))
+    {
         let mut base = 0usize;
         while let Some(at) = lowered[base..].find(&prefix) {
             let start = base + at;
@@ -1999,6 +2017,43 @@ mod tests {
             already_migrated(tmp.path()),
             "renaming a constraint leaves the columns alone"
         );
+    }
+
+    /// `UNLOGGED` still occupies the name; `TEMPORARY` does not. Both halves
+    /// were checked against a real PostgreSQL before being encoded here.
+    #[test]
+    fn an_unlogged_comments_table_counts_and_a_temporary_one_does_not() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_unlogged");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let columns = "id BIGINT, commentable_type TEXT, commentable_id BIGINT, \
+                       parent_id BIGINT, author_id BIGINT, body TEXT, \
+                       created_at TIMESTAMP, deleted_at TIMESTAMP";
+
+        // Persistent under a different durability setting: a later
+        // `CREATE TABLE comments` would fail with "already exists".
+        for create in [
+            "CREATE UNLOGGED TABLE comments",
+            "CREATE UNLOGGED TABLE IF NOT EXISTS comments",
+            "CREATE UNLOGGED TABLE public.comments",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{create} ({columns});\n")).expect("write");
+            assert!(already_migrated(tmp.path()), "`{create}` occupies the name");
+        }
+
+        // A temp table lives in a session-local schema and does NOT collide,
+        // so it must not suppress the shared migration.
+        for create in [
+            "CREATE TEMP TABLE comments",
+            "CREATE TEMPORARY TABLE comments",
+            "CREATE LOCAL TEMP TABLE comments",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{create} ({columns});\n")).expect("write");
+            assert!(
+                !already_migrated(tmp.path()),
+                "`{create}` is session-local and collides with nothing"
+            );
+        }
     }
 
     /// `ALTER TABLE [ IF EXISTS ] [ ONLY ] name [ * ]` — the modifiers COMBINE,

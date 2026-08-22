@@ -1715,6 +1715,40 @@ mod tests {
     /// A spec built by hand — the one way past the macro's guarantee — is
     /// refused by `validate`, in release builds too. A `debug_assert` here
     /// would be erased in exactly the build where it matters.
+    /// A draft may only be pinned to a form that will actually be rendered.
+    #[cfg(all(feature = "db", feature = "maud"))]
+    #[test]
+    fn a_reply_form_exists_only_while_the_target_can_still_be_replied_to() {
+        fn node(id: i64, depth: usize, replies: Vec<CommentNode>) -> CommentNode {
+            CommentNode {
+                comment: Comment {
+                    id,
+                    parent_id: None,
+                    author_id: 1,
+                    body: String::new(),
+                    created_at: chrono::NaiveDateTime::default(),
+                    author_name: None,
+                },
+                depth,
+                replies,
+            }
+        }
+
+        let thread = vec![node(1, 0, vec![node(2, 1, vec![node(3, 2, Vec::new())])])];
+
+        // Present and shallow enough: the form is there to fill.
+        assert!(reply_form_exists(&thread, 1, 3));
+        // Nested targets are found too — the thread is a tree, not a list.
+        assert!(reply_form_exists(&thread, 3, 3));
+        // At the cap the widget offers no form, so a draft must not be pinned
+        // to one: `can_reply` is `depth < max_depth`.
+        assert!(!reply_form_exists(&thread, 3, 3 - 1));
+        // A target that is simply gone — deleted between render and submit, or
+        // never real — is the case that erased the visitor's body.
+        assert!(!reply_form_exists(&thread, 99, 3));
+        assert!(!reply_form_exists(&[], 1, 3));
+    }
+
     /// The soft-delete counterpart of the tenancy rule below, with the same
     /// link-order independence — and one case that is a documented cost rather
     /// than a win: see [`soft_deletes_from`] and #2284.
@@ -2382,10 +2416,6 @@ async fn post_comment(
         }
         Err(err) => return Err(err),
     };
-    // The draft rides with the error, never without it: these two are the same
-    // event — "we refused this, here it is back".
-    let draft = error.is_some().then(|| (reply_to, submission.body.clone()));
-
     let redirecting = error.is_none() && !htmx.is_htmx && return_to.is_some();
 
     // Read everything this response still needs from the database BEFORE the
@@ -2441,6 +2471,20 @@ async fn post_comment(
     // surface.
     let thread = thread?;
 
+    // The draft rides with the error, never without it: these two are the same
+    // event — "we refused this, here it is back".
+    //
+    // Pinned to a reply form only if the REFRESHED thread still has one for
+    // that comment. A reply target deleted between render and submit — or one
+    // a client invented — leaves no form for the widget to fill, and the
+    // `outerHTML` swap would erase the body exactly as it did before drafts
+    // were carried at all. Falling back to the top-level form keeps the text on
+    // screen where the visitor can copy it, which is the whole point.
+    let draft = error.is_some().then(|| {
+        let target = reply_to.filter(|id| reply_form_exists(&thread, *id, spec.max_depth));
+        (target, submission.body.clone())
+    });
+
     if redirecting && let Some(return_to) = return_to {
         return Ok(crate::Redirect::to(return_to).into_response());
     }
@@ -2463,6 +2507,20 @@ async fn post_comment(
         draft,
     )
     .into_response())
+}
+
+/// Whether the refreshed thread will render a reply form for `target`.
+///
+/// Mirrors the widget's own `can_reply`: a form is offered only while the
+/// comment's depth is still under [`CommentableSpec::max_depth`], because the
+/// write path refuses a deeper reply. A draft pinned to a comment with no form
+/// would be dropped silently by the `outerHTML` swap.
+#[cfg(all(feature = "db", feature = "maud"))]
+fn reply_form_exists(nodes: &[CommentNode], target: i64, max_depth: u32) -> bool {
+    nodes.iter().any(|node| {
+        (node.comment.id == target && node.depth < max_depth as usize)
+            || reply_form_exists(&node.replies, target, max_depth)
+    })
 }
 
 /// Whether `path` is a same-origin relative path safe to `Location:`.

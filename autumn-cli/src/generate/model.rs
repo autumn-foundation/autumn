@@ -225,6 +225,14 @@ fn plan_model_with_options_impl(
     if backend == autumn_web::config::DatabaseBackend::Sqlite && options.id_type == IdType::Uuid {
         return Err(super::sqlite_uuid_pk_unsupported_error());
     }
+    // `comments:commentable` on a UUID-keyed model would plan every file and
+    // then hand back a project that does not compile: the shared table stores
+    // `commentable_id BIGINT` and the generated helpers take `parent_id: i64`.
+    // Refused here, before anything is written, exactly as the SQLite/UUID
+    // combination above is.
+    if options.id_type == IdType::Uuid && fields.iter().any(|f| f.kind.is_commentable()) {
+        return Err(super::uuid_pk_commentable_unsupported_error());
+    }
     // A few DSL field kinds still render to Rust model types with no working
     // diesel SQLite FromSql/ToSql (Uuid, Decimal, Enum). #1924 wired DateTime<Utc>
     // (TimestamptzSqlite) and Attachment (autumn-web's local Blob Text/Sqlite
