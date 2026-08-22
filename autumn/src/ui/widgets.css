@@ -1619,3 +1619,155 @@
     white-space: nowrap;
     border: 0;
 }
+
+/* ── Comment threads (autumn-comment-*, issue #1367) ──────────────────────── */
+
+/* The region landmark wrapping the whole thread. It is also the htmx swap
+   target, so it must not itself be positioned or transformed -- an outerHTML
+   swap replaces this element wholesale. */
+.autumn-comments {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+/* Every nesting level is an `<ol>`: the order is meaningful (chronological),
+   and a list is what a screen reader announces the depth of. The list markers
+   are suppressed; the indent guide below is the visual cue instead. */
+.autumn-comment-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+/* A nested level indents behind a rule, which is what makes depth legible
+   without a per-level class (the widget renders arbitrarily deep). The
+   `border-inline-start` is logical, so it flips for RTL locales. */
+.autumn-comment .autumn-comment-list {
+    margin-block-start: 0.75rem;
+    padding-inline-start: 0.875rem;
+    border-inline-start: 2px solid var(--border);
+}
+
+.autumn-comment {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+}
+
+.autumn-comment-meta {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+
+.autumn-comment-author {
+    font-weight: 600;
+    color: var(--text);
+}
+
+/* `tabular-nums` keeps a column of timestamps from shifting as digits change. */
+.autumn-comment-time {
+    font-variant-numeric: tabular-nums;
+}
+
+/* `overflow-wrap` rather than `word-break`: a pasted URL has to wrap, but
+   ordinary prose must still break on spaces. */
+.autumn-comment-body {
+    color: var(--text);
+    overflow-wrap: anywhere;
+}
+
+.autumn-comment-body p {
+    margin: 0 0 0.5rem;
+}
+
+.autumn-comment-body p:last-child {
+    margin-bottom: 0;
+}
+
+/* `<details>`/`<summary>` gives progressive disclosure with no JavaScript at
+   all -- the reply form is in the DOM and reachable by keyboard whether or not
+   htmx (or any script) loaded. */
+.autumn-comment-reply {
+    font-size: 0.875rem;
+}
+
+.autumn-comment-reply-toggle {
+    cursor: pointer;
+    color: var(--primary);
+    width: fit-content;
+}
+
+.autumn-comment-reply-toggle:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-comment-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    margin: 0.5rem 0 0;
+}
+
+/* The label doubles as the visible prompt, so it is not visually hidden -- a
+   placeholder alone is not an accessible name. */
+.autumn-comment-label {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+
+.autumn-comment-input {
+    width: 100%;
+    padding: 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background-color: var(--surface);
+    color: var(--text);
+    font: inherit;
+    resize: vertical;
+}
+
+.autumn-comment-input:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 1px;
+}
+
+.autumn-comment-submit {
+    align-self: flex-start;
+    padding: 0.375rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background-color: var(--surface);
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+}
+
+.autumn-comment-submit:hover {
+    border-color: var(--primary);
+}
+
+.autumn-comment-submit:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-comments-empty,
+.autumn-comments-prompt {
+    margin: 0;
+    color: var(--text-muted);
+}
+
+/* A rejected comment, announced via `role="alert"`. Colour is a redundant cue
+   only -- the role is the machine-readable state. */
+.autumn-comments-error {
+    margin: 0;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--danger, #b3261e);
+    border-radius: var(--radius);
+    color: var(--danger, #b3261e);
+}

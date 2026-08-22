@@ -492,6 +492,26 @@ pub enum FieldKind {
     /// the named column (typically a `references` foreign key). At most one
     /// `position` field is allowed per model.
     Position,
+    /// `commentable` (e.g. `comments:commentable`) — threaded, **polymorphic**
+    /// comments on this model (issue #1367).
+    ///
+    /// Storage-wise this is the counter-cache *source* column: a plain
+    /// `i64`/`BIGINT`, never nullable (the maintenance is `c = c + 1`, and
+    /// `NULL + 1` is `NULL`), never hand-assigned, and — like
+    /// [`Position`](Self::Position) — excluded from the generated
+    /// `New*`/`Update*` structs and the create/edit form, because the
+    /// framework maintains it inside each comment's own transaction. The
+    /// declared field name is normalised to `{singular}_count`
+    /// (`comments:commentable` → `comment_count`), matching `#[model]`'s
+    /// `{snake(child)}_count` convention.
+    ///
+    /// The rest of the feature is not a column at all: the token additionally
+    /// emits the shared `comments(commentable_type, commentable_id, parent_id,
+    /// …)` migration — once per project, since the table is shared — and
+    /// `#[commentable(...)]` on the generated `#[model]`, which is what brings
+    /// the repository's `add_comment`/`comment_thread`/`delete_comment`
+    /// helpers into existence. At most one `commentable` field per model.
+    Commentable,
 }
 
 impl FieldKind {
@@ -509,7 +529,7 @@ impl FieldKind {
             Self::I32 => "i32",
             // `References` and `Position` are always `i64`, matching the
             // default `i64` PK convention.
-            Self::I64 | Self::References | Self::Position => "i64",
+            Self::I64 | Self::References | Self::Position | Self::Commentable => "i64",
             Self::Bool => "bool",
             Self::F32 => "f32",
             Self::F64 => "f64",
@@ -529,7 +549,7 @@ impl FieldKind {
         match self {
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "Text",
             Self::I32 => "Int4",
-            Self::I64 | Self::References | Self::Position => "Int8",
+            Self::I64 | Self::References | Self::Position | Self::Commentable => "Int8",
             Self::Bool => "Bool",
             Self::F32 => "Float4",
             Self::F64 => "Float8",
@@ -548,7 +568,7 @@ impl FieldKind {
         match self {
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "TEXT",
             Self::I32 => "INTEGER",
-            Self::I64 | Self::References | Self::Position => "BIGINT",
+            Self::I64 | Self::References | Self::Position | Self::Commentable => "BIGINT",
             Self::Bool => "BOOLEAN",
             Self::F32 => "REAL",
             Self::F64 => "DOUBLE PRECISION",
@@ -591,7 +611,12 @@ impl FieldKind {
     pub const fn sqlite_sql_type(self) -> &'static str {
         match self {
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "TEXT",
-            Self::I32 | Self::I64 | Self::References | Self::Position | Self::Bool => "INTEGER",
+            Self::I32
+            | Self::I64
+            | Self::References
+            | Self::Position
+            | Self::Commentable
+            | Self::Bool => "INTEGER",
             Self::F32 | Self::F64 => "REAL",
             Self::Uuid => "TEXT",
             Self::NaiveDateTime | Self::DateTime => "TEXT",
@@ -665,7 +690,7 @@ impl FieldKind {
         match self {
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "Text",
             Self::I32 => "Int4",
-            Self::I64 | Self::References | Self::Position => "Int8",
+            Self::I64 | Self::References | Self::Position | Self::Commentable => "Int8",
             Self::Bool => "Bool",
             Self::F32 => "Float4",
             Self::F64 => "Float8",
@@ -763,6 +788,7 @@ impl FieldKind {
             Self::Decimal { .. } => "decimal{…}",
             Self::Slug => "slug{…}",
             Self::Position => "position",
+            Self::Commentable => "commentable",
         }
     }
 
@@ -828,6 +854,29 @@ impl FieldKind {
     #[must_use]
     pub const fn is_position(self) -> bool {
         matches!(self, Self::Position)
+    }
+
+    /// Returns `true` for a `commentable` polymorphic-comments field (issue
+    /// #1367).
+    ///
+    /// Used by the model/migration/scaffold generators to: keep the counter
+    /// column out of `New*`/`Update*` structs and the create/edit form, write
+    /// `#[commentable(...)]` onto the generated model, and emit the shared
+    /// `comments` table migration.
+    #[must_use]
+    pub const fn is_commentable(self) -> bool {
+        matches!(self, Self::Commentable)
+    }
+
+    /// Returns `true` for a column the *framework* assigns and maintains, so
+    /// no generated form, `New*` struct or `Update*` struct may offer it.
+    ///
+    /// One predicate rather than a growing `is_position() || is_commentable()
+    /// || …` chain at every call site — a new server-managed kind is then a
+    /// one-line change here instead of a hunt through the generators.
+    #[must_use]
+    pub const fn is_server_managed(self) -> bool {
+        matches!(self, Self::Position | Self::Commentable)
     }
 }
 
@@ -953,7 +1002,8 @@ impl IdType {
 pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
     enum{a,b,…}, decimal{precision,scale}, slug{from:col}, position (optionally \
-    position{scope:col}), Option<…>, :unique, String{encrypted}, String{encrypted:deterministic}";
+    position{scope:col}), commentable, Option<…>, :unique, String{encrypted}, \
+    String{encrypted:deterministic}";
 
 /// The DSL field kinds that map to a working diesel `SQLite` conversion
 /// (issue #1614 AC #4; #1924) — the complement of the kinds
@@ -962,7 +1012,7 @@ pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, 
 /// field kinds a `SQLite` app supports today.
 pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
     NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
-    slug{from:col}, position (optionally position{scope:col}), Option<…>, :unique";
+    slug{from:col}, position (optionally position{scope:col}), commentable, Option<…>, :unique";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -1211,9 +1261,53 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     // rather than doubling the suffix.
     let name = if kind == FieldKind::References && !name.ends_with("_id") {
         format!("{name}_id")
+    } else if kind == FieldKind::Commentable {
+        // `comments:commentable` names the *feature*, not the column. The
+        // column it actually adds is the counter-cache source, whose name
+        // follows `#[model]`'s `{snake(child)}_count` convention — so the
+        // declared name is singularised and suffixed, and an already-suffixed
+        // name is left alone rather than doubled.
+        if name.ends_with("_count") {
+            name.to_owned()
+        } else {
+            format!("{}_count", naming::singularize(name))
+        }
     } else {
         name.to_owned()
     };
+
+    // `commentable` is a whole feature behind one token, not a value the caller
+    // supplies: the counter it adds is maintained by the framework inside each
+    // comment's transaction, so it can be neither nullable (`NULL + 1` is
+    // `NULL`) nor `:unique` (every model starts at 0), and it takes no `{…}`
+    // modifiers at all.
+    if kind == FieldKind::Commentable {
+        if nullable {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `commentable` field cannot be nullable — it is the \
+                         framework-maintained comment counter, and `NULL + 1` is `NULL`"
+                    .into(),
+            });
+        }
+        if unique {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `commentable` field cannot be `:unique` — it is a comment \
+                         counter, and every model starts at 0"
+                    .into(),
+            });
+        }
+        if !constraints.is_empty() {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `commentable` field takes no `{…}` modifiers — configure the \
+                         association on the generated model's `#[commentable(...)]` \
+                         attribute instead"
+                    .into(),
+            });
+        }
+    }
 
     // A `slug` field (issue #1260) is always the record's routing key: it
     // can never be nullable (every record needs a URL) and always needs a
@@ -1852,9 +1946,12 @@ fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
         FieldKind::Position => "scope:col",
         _ => "(none — this field type takes no constraint modifiers)",
     };
+    // Reported by the DSL token the author actually typed (`commentable`),
+    // not by the Rust type it happens to lower to (`i64`) — the latter reads
+    // like a different field entirely.
     format!(
-        "unknown constraint '{token}' for {} fields; supported: {accepted}",
-        kind.rust_type()
+        "unknown constraint '{token}' for `{}` fields; supported: {accepted}",
+        kind.dsl_token()
     )
 }
 
@@ -2078,6 +2175,7 @@ pub fn parse_fields(tokens: &[String]) -> Result<Vec<Field>, GenerateError> {
     }
     validate_slug_fields(tokens, &fields)?;
     validate_position_fields(tokens, &fields)?;
+    validate_commentable_fields(tokens, &fields)?;
     Ok(fields)
 }
 
@@ -2147,6 +2245,35 @@ fn validate_position_fields(tokens: &[String], fields: &[Field]) -> Result<(), G
                 ),
             });
         }
+    }
+    Ok(())
+}
+
+/// Cross-field validation for `commentable` fields (issue #1367) — see
+/// [`parse_fields`].
+///
+/// At most one per model: a second token would mean a second counter column
+/// *and* a second `#[commentable]` attribute, and `#[model]` rejects the
+/// latter outright (both would generate the same `{Model}Comments` trait). The
+/// DSL refuses first so the error names the token rather than surfacing as a
+/// macro error in generated code the author did not write.
+fn validate_commentable_fields(tokens: &[String], fields: &[Field]) -> Result<(), GenerateError> {
+    let commentable: Vec<(usize, &Field)> = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.kind.is_commentable())
+        .collect();
+    if let [(_, first), (second_idx, second), ..] = commentable[..] {
+        return Err(GenerateError::InvalidField {
+            token: tokens[second_idx].clone(),
+            reason: format!(
+                "only one `commentable` field is supported per model — found both '{}' and \
+                 '{}'. One shared comments table already attaches to every model; a second \
+                 token would add a second counter column and a second `#[commentable]` \
+                 attribute, which `#[model]` rejects.",
+                first.name, second.name
+            ),
+        });
     }
     Ok(())
 }
@@ -2309,6 +2436,7 @@ fn atomic_type(ty: &str) -> Option<FieldKind> {
         // position (issue #1358): a server-managed contiguous ordering
         // column, e.g. `rank:position` or `rank:position{scope:board_id}`.
         "position" | "Position" => Some(FieldKind::Position),
+        "commentable" | "Commentable" => Some(FieldKind::Commentable),
         _ => {
             // Allow `Vec<u8>` as a synonym for `Bytea`.
             strip_wrapper(ty, "Vec").and_then(|inner| {

@@ -11759,6 +11759,27 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+    // #1367: tell the comment router that this model's queries route through a
+    // shard. The model macro cannot see this attribute, and a sharded
+    // repository does NOT imply a `#[shard_key]` on the model, so the fact has
+    // to be published from here or the router's guard misses the shape
+    // entirely and serves the model from the control pool.
+    let facts_model_name = &config.model_name;
+    let (facts_sharded, facts_tenant_scoped, facts_soft_delete) =
+        (config.sharded, config.tenant_scoped, config.soft_delete);
+    // Registered for EVERY repository, not only the opted-in ones: the router
+    // has to distinguish "this repository opted out" from "no repository said
+    // anything", and only an unconditional entry can tell those apart.
+    let sharded_inventory_registration = quote! {
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::commentable::RepositoryFacts {
+                model: || ::core::any::type_name::<#facts_model_name>(),
+                sharded: #facts_sharded,
+                tenant_scoped: #facts_tenant_scoped,
+                soft_delete: #facts_soft_delete,
+            }
+        }
+    };
     let versioned_inventory_registration = if config.versioned {
         quote! {
             ::autumn_web::reexports::inventory::submit! {
@@ -18001,6 +18022,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #hook_inventory_registration
         #versioned_inventory_registration
+        #sharded_inventory_registration
         #retention_inventory_registration
 
         #api_handlers
@@ -19709,7 +19731,7 @@ mod tests {
             .find("async fn delete_by_id")
             .expect("repository must generate delete_by_id");
         let rest = &generated[start + "async fn delete_by_id".len()..];
-        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        let end = rest.find("async fn ").unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -19720,7 +19742,7 @@ mod tests {
             .find("async fn delete_many")
             .expect("repository must generate delete_many");
         let rest = &generated[start + "async fn delete_many".len()..];
-        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        let end = rest.find("async fn ").unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -19733,7 +19755,7 @@ mod tests {
             .find(needle)
             .expect("repository must generate update");
         let rest = &generated[start + needle.len()..];
-        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        let end = rest.find("async fn ").unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -19786,7 +19808,7 @@ mod tests {
             .find("async fn find_by_id")
             .expect("repository must generate find_by_id");
         let rest = &generated[find_start + "async fn find_by_id".len()..];
-        let find_by_id = &rest[..rest.find("async fn ").map_or(rest.len(), |p| p)];
+        let find_by_id = &rest[..rest.find("async fn ").unwrap_or(rest.len())];
         assert!(
             !find_by_id.contains("scoped_immediate_transaction"),
             "find_by_id (read) must not open an immediate write transaction: {find_by_id}"

@@ -23,6 +23,7 @@ mod replay;
 mod repo_hygiene;
 mod scaffold_belongs_to;
 mod scaffold_bulk_delete;
+mod scaffold_commentable;
 mod scaffold_csv_export;
 mod scaffold_encrypted;
 mod scaffold_form_for;

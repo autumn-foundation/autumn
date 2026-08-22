@@ -5609,8 +5609,7 @@ impl AutumnConfig {
         let has_dest_key = OFFSITE_DEST_KEYS.iter().any(|k| env.var(k).is_ok());
         let auto_upload_truthy = env
             .var("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD")
-            .ok()
-            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
         if self.backup.offsite.is_none() && !has_dest_key && !auto_upload_truthy {
             return;
         }

@@ -120,12 +120,20 @@ impl IntoResponse for EdgeCacheUnavailable {
 impl<S: Send + Sync> FromRequestParts<S> for EdgeCache {
     type Rejection = EdgeCacheUnavailable;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        parts
-            .extensions
-            .get::<Self>()
-            .cloned()
-            .ok_or(EdgeCacheUnavailable)
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> {
+        // Not `async fn`: the body only reads a request extension, so there is
+        // nothing to await and clippy's `unused_async_trait_impl` rightly
+        // objects to the generated state machine.
+        std::future::ready(
+            parts
+                .extensions
+                .get::<Self>()
+                .cloned()
+                .ok_or(EdgeCacheUnavailable),
+        )
     }
 }
 

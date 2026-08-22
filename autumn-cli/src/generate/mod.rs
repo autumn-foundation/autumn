@@ -13,6 +13,7 @@
 pub mod admin;
 pub mod auth;
 pub mod channel;
+pub mod commentable;
 pub mod config;
 pub mod controller;
 pub mod counter_cache;
@@ -114,6 +115,19 @@ fn format_collisions(paths: &[PathBuf]) -> String {
 /// that silently accepts NULL ids, generation fails here with an actionable
 /// message (AC #4).
 #[must_use]
+/// `--id uuid` cannot be combined with `comments:commentable`.
+///
+/// The shared table stores `commentable_id BIGINT` and every generated helper
+/// takes `parent_id: i64`, so a UUID-keyed parent has nowhere to go. Without
+/// this the command SUCCEEDS and writes a project that does not compile, which
+/// is the worst of both: the user is told it worked and finds out from rustc.
+pub fn uuid_pk_commentable_unsupported_error() -> GenerateError {
+    GenerateError::Config(
+ "`comments:commentable` needs an integer primary key, so it cannot be combined with `--id uuid`. The shared `comments` table keys its rows on `commentable_id BIGINT` — one column serving every commentable model — and the generated helpers take `parent_id: i64`, so a UUID-keyed parent has no representation there. Re-run without `--id uuid` to use the default BIGINT primary key, or without `comments:commentable` and attach comments to a model that has one."
+ .to_owned(),
+ )
+}
+
 pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
     GenerateError::Config(
         "UUID primary keys (--id uuid) are not yet supported on SQLite apps; Postgres uses \

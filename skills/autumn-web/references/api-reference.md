@@ -268,6 +268,50 @@ returning a per-shard-partial answer. `DateBucket` and the `GroupedAggregate`
 builder live in `autumn_web::aggregate`. See "Grouped aggregate queries" in
 `docs/guide/repositories.md`.
 
+**(unreleased)** — `#[commentable]` polymorphic comment helpers (#1367):
+declaring `#[commentable(by = User, author_name = username)]` on a `#[model]`
+emits `Model::COMMENTABLE_TYPE`, `Model::commentable_spec()`, an `inventory`
+registration, and a `{Model}Comments` trait blanket-implemented for that
+model's repository (same `M2mConnSource<Model = M>` bound as the m2m/votable
+helpers). Import the trait as `_`, then:
+
+```rust
+use crate::models::PostComments as _;
+use autumn_web::commentable::{Comment, CommentNode};
+
+async fn add_comment(&self, parent_id: i64, author_id: i64, body: &str,
+                     reply_to: Option<i64>) -> AutumnResult<Comment>;
+async fn comment_thread(&self, parent_id: i64) -> AutumnResult<Vec<CommentNode>>;
+async fn delete_comment(&self, parent_id: i64, comment_id: i64) -> AutumnResult<usize>;
+async fn recompute_comment_count(&self, parent_id: i64) -> AutumnResult<i64>;
+
+pub struct Comment { pub id: i64, pub parent_id: Option<i64>, pub author_id: i64,
+                     pub body: String, pub created_at: chrono::NaiveDateTime,
+                     pub author_name: Option<String> }
+pub struct CommentNode { pub comment: Comment, pub depth: usize,
+                         pub replies: Vec<CommentNode> }
+```
+
+One `comments` table keyed on `(commentable_type, commentable_id)` serves every
+commentable model; `parent_id` threads replies. `#[commentable]` must be
+written **below** `#[model]`. The model's `#[id]` and counter fields must both
+be `i64` — both are compile-checked. `add_comment` row-locks the parent (the
+polymorphic column has no foreign key, so the probe is the referential check),
+enforces `max_depth` (default 5) and same-record `reply_to`, and moves
+`comment_count` with the #1325 counter-cache primitive in the same transaction.
+`comment_thread` is one query at any depth; `delete_comment` cascades to the
+descendant subtree and is idempotent, and takes `parent_id` so a comment id
+alone is never authority over a comment on another record.
+`recompute_comment_count` is the drift repair (`counter_cache_recompute` would
+be WRONG here — it keys on the fk column alone, which is shared across models).
+Like `react()`, all four take their own pooled connection — never hold a `Db`
+extractor across one. `autumn_web::commentable::router(cfg)` serves
+`GET`/`POST /{commentable_type}/{parent_id}` for every registered model from a
+single mount; it authorizes the **tenant**, never the record, so an app with
+private records must set `CommentsConfig::authorize(...)`. Build a host page's
+own thread with `commentable::thread_dom_id`/`thread_action` so the router's
+re-render lands on the same element. See `docs/guide/commentable.md`.
+
 **(unreleased)** — `#[votable]` reaction helpers (#1362): declaring
 `#[votable(by = User, aggregate = sum|count)]` on a `#[model]` emits a
 `{Model}Reactions` trait blanket-implemented for that model's repository (no
@@ -543,6 +587,34 @@ Per-primitive setters (in addition to the shared set):
   `.autumn-reaction-up` / `.autumn-reaction-down` / `.autumn-reaction-like` /
   `.autumn-reaction-button` / `.autumn-reaction-active` /
   `.autumn-reaction-count`. Prelude re-exported.
+- `autumn_web::widgets::{CommentThread, CommentView, comment_thread}` (#1367) —
+  the view half of `#[commentable]`. `CommentThread::new(dom_id, action)`, then
+  `.csrf_token(s)` / `.csrf_field(s)`, `.return_to(path)` (where a **non-htmx**
+  submit comes back to; the framework router honours only a relative,
+  single-slash path, so it cannot become an open redirect), `.max_depth(n)`
+  (pass the model's own, so the UI never offers a reply the write path would
+  `422`), `.label(s)` / `.empty_text(s)` / `.submit_label(s)` /
+  `.reply_label(s)` / `.placeholder(s)`, `.body_field(s)` / `.reply_field(s)`,
+  `.hx_target(s)` (defaults `#{dom_id}`), and `.read_only(Option<String>)` for
+  a signed-out visitor (thread renders, every form disappears, prompt shown).
+  Render with `comment_thread(&cfg, &CommentView::from_thread(&nodes)) ->
+  Markup`; `CommentView` is a plain view struct so the widget compiles without
+  `db` and can be built from any source. Nested `<ol>`s (depth is exposed to
+  assistive technology, not just indented), one `<details>`-disclosed inline
+  reply form per node, each an ordinary `<form method="post">` carrying
+  `hx-post` / `hx-target` / `hx-swap="outerHTML"` — so it works with scripting
+  off and swaps in place when htmx is present. Bodies are escaped and split on
+  blank lines into `<p>`s; never HTML. `dom_id` is interpolated into the
+  default `hx-target` selector and into each node's id, so build it yourself.
+  Every form shares one `hx-sync="#{dom_id}:replace"` scope so two quick replies
+  cannot race, the list is `aria-live="polite"`, and each reply control is named
+  for the comment it answers. CSS hooks `.autumn-comments` /
+  `.autumn-comments-error` / `.autumn-comments-empty` /
+  `.autumn-comments-prompt` / `.autumn-comment-list` / `.autumn-comment` /
+  `.autumn-comment-meta` / `.autumn-comment-author` / `.autumn-comment-time` /
+  `.autumn-comment-body` / `.autumn-comment-reply` /
+  `.autumn-comment-reply-toggle` / `.autumn-comment-form` /
+  `.autumn-comment-label` / `.autumn-comment-input` / `.autumn-comment-submit`.
 - `autumn_web::widgets::{BulkActionsConfig, bulk_actions_form,
   bulk_select_checkbox, bulk_actions_toolbar}` (#1312) — the no-JavaScript
   bulk-select + delete-selected flow. `BulkActionsConfig::new(action_url)`

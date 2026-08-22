@@ -18,12 +18,13 @@ use scoped_futures::ScopedFutureExt;
 
 use crate::jobs::{PostPublicationArgs, PostPublicationJob};
 use crate::models::{
-    Comment, CommentAssociations, NewTag, Post, PostAssociations, PostReactions as _,
-    PostTagsMutations, Subreddit, Tag,
+    NewTag, Post, PostAssociations, PostComments as _, PostReactions as _, PostTagsMutations,
+    Subreddit, Tag,
 };
 use crate::repositories::{PgPostRepository, PgVoteRepository, PostRepository};
 use crate::schema::{posts, subreddits, tags};
 use autumn_web::slugify;
+use autumn_web::widgets::{CommentThread, CommentView, comment_thread as comment_thread_widget};
 
 fn posts_per_page() -> i64 {
     crate::config_svc()
@@ -630,10 +631,20 @@ pub async fn show_by_id(Path(post_id): Path<i64>, mut db: Db) -> AutumnResult<Re
 
 #[allow(clippy::too_many_lines)] // Template-heavy function
 #[get("/r/{sub_slug}/posts/{post_slug}")]
+// Every argument is a distinct extractor -- path, session, CSRF token, CSRF
+// field name, connection, repository, flags, flash. An axum handler's arguments
+// ARE its request-state declaration; bundling them into a struct would only
+// move the same list one level down.
+#[allow(clippy::too_many_arguments)]
 pub async fn show(
     Path((sub_slug, post_slug)): Path<(String, String)>,
     session: Session,
     csrf: CsrfToken,
+    // The widget's hidden input has to carry the field name `CsrfLayer` will
+    // look for. It scans a URL-encoded body for the CONFIGURED name only, so an
+    // app that set `security.csrf.form_field` would otherwise render a thread
+    // whose very first submit is a 403.
+    csrf_field: CsrfFormField,
     mut db: Db,
     repo: PgPostRepository,
     flags: Flags,
@@ -662,34 +673,53 @@ pub async fn show(
     // primary too (`on_primary`) to keep both reads on one consistent role.
     drop(db);
 
-    // Eager-load the post's author, its comments (each with their author),
-    // and its tags (#1324, many-to-many through `post_tags`) -- replacing
-    // the per-row author lookup + hand-written comment/author join, and what
-    // would otherwise be a hand-rolled `post_tags` join query. For a post
-    // with N comments and M tags this is a fixed 2 extra queries
-    // (post.author, comments) + 1 (comments.author) + 1 (post.tags) = at
-    // most 4 here, never `3 + N + M`.
+    // Eager-load the post's author and its tags (#1324, many-to-many through
+    // `post_tags`) -- replacing the per-row author lookup and what would
+    // otherwise be a hand-rolled `post_tags` join query. For a post with M
+    // tags this is a fixed 2 extra queries, never `1 + M`.
     let mut loaded = repo
         .on_primary()
-        .preload(
-            vec![post],
-            Post::preload()
-                .author()
-                .comments_with(Comment::preload().author())
-                .tags(),
-        )
+        .preload(vec![post], Post::preload().author().tags())
         .await?;
     let post = loaded.remove(0);
     let author = post.author()?;
     let post_tags = post.tags()?;
 
-    // Show top-level comments (parent_id IS NULL), highest score first.
-    let mut post_comments: Vec<&autumn_web::preload::Preloaded<Comment>> = post
-        .comments()?
-        .iter()
-        .filter(|c| c.parent_id.is_none())
-        .collect();
-    post_comments.sort_by_key(|c| std::cmp::Reverse(c.score));
+    // Threaded comments (#1367). One call, whatever the nesting depth: the
+    // whole live thread comes back nested, in stable order, with author names
+    // resolved -- no hand-written join, no N+1 walk, no sort to write. What
+    // used to be a `has_many(Comment)` preload plus a 30-line render plus a
+    // 188-line `routes/comments.rs` is this and the widget below.
+    let comment_thread = repo.comment_thread(post.id).await?;
+
+    // The widget posts to the one framework-mounted comment route, keyed on
+    // this model's `commentable_type`. `return_to` is the no-JS round trip:
+    // with htmx the reply swaps the thread in place, without it the browser
+    // comes straight back to this page.
+    //
+    // The dom id and action come from the framework, not from here: the router
+    // re-renders this same region after every reply, and an id of our own
+    // devising would be replaced by the router's on the first htmx swap, so
+    // every later swap would miss.
+    let post_path = __autumn_path_show(&sub.slug, &post.slug);
+    let comments_config = autumn_web::commentable::CommentsConfig::default();
+    let mut comment_config = CommentThread::from_spec(
+        autumn_web::commentable::thread_dom_id(Post::COMMENTABLE_TYPE, post.id),
+        autumn_web::commentable::thread_action(&comments_config, Post::COMMENTABLE_TYPE, post.id),
+        Post::commentable_spec(),
+    )
+    .label("Post comments")
+    .empty_text("No comments yet. Start the conversation!")
+    .return_to(&post_path);
+    if current_user.is_some() {
+        comment_config = comment_config
+            .csrf_token(csrf.token())
+            .csrf_field(csrf_field.0.clone());
+    } else {
+        comment_config = comment_config
+            .read_only()
+            .sign_in_prompt("Log in to comment.");
+    }
 
     let viewer_id = current_user_id
         .as_ref()
@@ -816,64 +846,19 @@ pub async fn show(
                 }
             }
 
-            // Comment form
-            @if current_user.is_some() {
-                form action=(super::comments::__autumn_path_create(&sub.slug, &post.slug))
-                     method="post"
-                     class="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-6" {
-                    input type="hidden" name="_csrf" value=(csrf.token());
-                    textarea name="body" rows="4" required
-                             aria-label="Comment body"
-                             placeholder="What are your thoughts?"
-                             class="w-full border border-gray-300 rounded px-3 py-2 text-sm mb-3 \
-                                    focus:outline-none focus:ring-2 focus:ring-orange-400" {}
-                    button type="submit"
-                           class="px-4 py-2 bg-orange-500 text-white rounded text-sm \
-                                  hover:bg-orange-600" {
-                        "Comment"
-                    }
-                }
-            } @else {
-                div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-6 \
-                           text-center text-sm text-gray-500" {
-                    a href="/login" class="text-orange-600 hover:underline" { "Log in" }
-                    " to comment"
-                }
-            }
-
-            // Comments
-            div class="space-y-3" {
-                h2 class="font-semibold text-gray-700 mb-2" {
-                    (post.comment_count) " Comments"
-                }
-                @for comment in &post_comments {
-                    @let comment_author = comment.author().ok().flatten();
-                    div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4" {
-                        div class="flex items-center gap-2 text-xs text-gray-400 mb-2" {
-                            @if let Some(comment_author) = comment_author {
-                                a href=(super::auth::__autumn_path_profile(&comment_author.username))
-                                   class="font-medium text-gray-600 hover:underline" {
-                                    "u/" (comment_author.username)
-                                }
-                            }
-                            "\u{2022} " (time_ago(&comment.created_at))
-                            "\u{2022} " (comment.score) " points"
-                        }
-                        div class="text-sm text-gray-700" {
-                            @for para in comment.body.split("\n\n") {
-                                @if !para.trim().is_empty() {
-                                    p class="mb-1" { (para.trim()) }
-                                }
-                            }
-                        }
-                    }
-                }
-                @if post_comments.is_empty() {
-                    p class="text-gray-400 text-center py-8 text-sm" {
-                        "No comments yet. Start the conversation!"
-                    }
-                }
-            }
+            // Comments (#1367). `comment_thread` renders the nested list AND an
+            // inline reply form on every node, posting to the framework's
+            // generic comment route -- with htmx it swaps the thread in place,
+            // and without any JavaScript at all it is an ordinary form POST
+            // that comes back here via `return_to`.
+            // Deliberately no count here. An htmx reply swaps ONLY the widget's
+            // own region (`hx-target` / `outerHTML`), so anything rendered
+            // outside it -- a heading like this one -- would still show the
+            // pre-reply number until a full page load. A stale count next to a
+            // freshly posted comment is worse than no count; the listings show
+            // `comment_count`, and those are always full loads.
+            h2 class="font-semibold text-gray-700 mb-2" { "Comments" }
+            (comment_thread_widget(&comment_config, &CommentView::from_thread(&comment_thread)))
         },
     ))
 }

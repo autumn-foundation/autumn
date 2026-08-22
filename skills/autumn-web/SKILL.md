@@ -521,6 +521,75 @@ the `reaction_controls` widget (see the widgets section), threading the CSRF
 token so the no-JS form POST works. See `docs/guide/votable.md` and `examples/reddit-clone`
 (`src/routes/votes.rs`).
 
+**Never hand-roll a comments table.** `#[commentable]` on a `#[model]` is
+Autumn's fifth association kind — the **polymorphic** one **(unreleased —
+trunk-dev, #1367)**. `belongs_to`/`has_many`/`has_one`/`through` pin the child
+to one parent table; this does not:
+
+```rust
+#[autumn_web::model]
+#[commentable(by = User, author_name = username)]   // always BELOW #[model]
+pub struct Post {
+    #[id]
+    pub id: i64,              // must be i64
+    #[default]
+    pub comment_count: i64,   // the counter column, must be i64
+}
+```
+
+One `comments(commentable_type, commentable_id, parent_id, author_id, body,
+created_at, deleted_at)` table serves EVERY commentable model — adding comments
+to a second model is that attribute plus a `comment_count` column, nothing
+else. Defaults: `type_name = <Rust type name>`, `table = comments`,
+`counter_cache = comment_count` (or `false`), `max_depth = 5` (top level is
+depth 0), `max_body = 10000` bytes; `author_name` is unset by default (the
+framework will not guess a column, and a scaffolded `User` carries an `email`).
+Renaming the struct changes `type_name` and orphans existing rows — pin it
+first. `autumn generate scaffold post title:string comments:commentable`
+emits the table (once per project), the column, and the attribute.
+
+The model emits a `{Model}Comments` trait blanket-implemented for that model's
+repository — import it as `_`:
+
+```rust
+use crate::models::PostComments as _;
+
+let c = posts.add_comment(post_id, author_id, "first!", None).await?;
+let r = posts.add_comment(post_id, author_id, "…", Some(c.id)).await?;  // reply
+let thread: Vec<CommentNode> = posts.comment_thread(post_id).await?;    // nested
+let removed: usize = posts.delete_comment(post_id, c.id).await?;        // + subtree
+let live: i64 = posts.recompute_comment_count(post_id).await?;          // drift repair
+```
+
+`comment_thread` is ONE query whatever the depth (nested in Rust, stable
+`(created_at, id)` order, soft-delete aware). `add_comment` probes and
+row-locks the parent first — `commentable_id` has no foreign key, so that
+probe IS the referential check: an unknown/soft-deleted/foreign-tenant parent
+is `404`, a `reply_to` on a different record or past `max_depth` is `422`, and
+`comment_count` moves via the counter-cache primitive in the **same
+transaction**. `delete_comment` is idempotent and decrements by the rows it
+actually removed. **Like `react()`, these take their own pooled connection —
+never hold a `Db` extractor across the call.**
+
+Mount the routes ONCE for the whole app; the registry dispatches on the type
+segment, so a third commentable model needs no route:
+
+```rust
+.nest("/comments", autumn_web::commentable::router(Default::default()))
+// GET/POST /comments/{commentable_type}/{parent_id}
+```
+
+The router authorizes the **tenant**, never the record — an app with private or
+role-gated records MUST set `CommentsConfig::authorize(|access| ...)`, or skip
+the router and call the helpers from its own authorized handlers. Build a host
+page's own thread with `commentable::thread_dom_id`/`thread_action`, or the
+router's re-render lands on a different element and every htmx swap after the
+first one misses.
+
+Render with the no-JS `comment_thread` widget (see the widgets section),
+threading the CSRF token and `return_to`. See `docs/guide/commentable.md` and
+`examples/reddit-clone` (`Post` **and** `Subreddit`, zero comment routes).
+
 **Never hand-write `count + 1` on a parent.** `counter_cache` on a child's
 `#[belongs_to]` maintains a denormalised `{child}_count` column on the parent
 **(unreleased — trunk-dev, #1325)**:
@@ -1295,6 +1364,7 @@ for the common cases:
 | `toast(message, variant)` / `toast_region(DEFAULT_TOAST_REGION_ID)` / `toast_in(region_id, ...)` | Transient htmx action feedback: drop `toast_region` once in the layout, then return `toast(...)` next to your swapped fragment — it appends into the region OOB (`hx-swap-oob="beforeend:#toast-region"`). CSS-only auto-dismiss (no `<script>`); `variant` reuses `AlertVariant`. `toast_region` is a persistent `aria-live="polite"` region — non-error toasts inherit its politeness (no own `role`/`aria-live`); `Error` announces assertively via its own `role="alert"` |
 | `infinite_feed(items, next_cursor, &FeedConfig)` / `feed_page(items, next_cursor, &FeedConfig)` | htmx infinite-scroll / "Load more" feed from a `CursorPage`: single `hx-get` sentinel carries the cursor and appends the next page in place (no reload, no duplicate rows). `FeedMode::{Reveal,Button}`; progressive `<a href>` fallback. `feed_page` is the append fragment a handler returns for each page (`page.next_cursor.as_deref()`) |
 | `bulk_actions_form(&BulkActionsConfig, csrf_token, csrf_field, submit_token, submit_field, content)` / `bulk_select_checkbox(id, &cfg)` / `bulk_actions_toolbar(&cfg)` | No-JS bulk-select + "Delete selected" over a list (#1312): wrap the list in `bulk_actions_form` (a `POST` form carrying the hidden CSRF and one-time submit-token fields plus the submit button), and put one `bulk_select_checkbox` — `name="ids"`, `aria-label="Select row <id>"` — in each row's first cell. Keep page furniture ("New …" link, search box) *outside* the form. Always pass the submit-token pair on a destructive form: a tokenless request passes through `SubmitTokenLayer` unguarded, so a double-click would re-run the whole batch. `BulkActionsConfig::new(action)` + `.field_name(..)`/`.submit_label(..)`/`.select_label(..)`. The toolbar emits no confirmation prompt: inline `onclick` confirms are blocked by the default `script-src 'self'` CSP, and `confirm_action` submits its own form so it cannot carry the selection — to confirm a batch, post it to an interstitial page that lists the rows and asks for a second submit. `autumn generate scaffold` wires all of this automatically |
+| `comment_thread(&cfg, &CommentView::from_thread(&nodes))` / `CommentThread::new(dom_id, action)` | The view half of `#[commentable]` (#1367): nested `<ol>` comment thread with a `<details>`-disclosed inline reply form on every node. Ordinary `<form method="post">` (works with scripting off) that also carries `hx-post`/`hx-target`/`hx-swap="outerHTML"` to swap the thread in place. Thread `.csrf_token(...)` and `.return_to(path)` for the no-JS round trip, `.max_depth(n)` so the UI never offers a reply the write path would `422`, `.read_only(Some(prompt))` for a signed-out visitor |
 | `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
 
 ### Whole-form rendering — `form_for` (unreleased — trunk-dev, not in published 0.5.0)

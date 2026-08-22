@@ -81,6 +81,8 @@ set.
 | `post:references` | `i64`                           | `Int8`             | `BIGINT`            |
 | `slug:slug{from:title}` | `String`                  | `Text`              | `TEXT`              |
 | `config:json` *(or `jsonb`)* | `serde_json::Value`    | `Jsonb`             | `JSONB`              |
+| `rank:position` *(or `position{scope:col}`)* | `i64` (server-managed) | `Int8`  | `BIGINT`            |
+| `comments:commentable` | `i64` (server-managed `comment_count`) | `Int8` | `BIGINT`            |
 
 Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
@@ -1243,6 +1245,48 @@ no routes file, so there is no form to be inconsistent with, and
 (`slug` is refused because a slug scaffold keys its update off the
 editable, reusable slug rather than the primary key, so
 `WHERE slug = … AND lock_version = …` does not identify a stable row.)
+
+### Threaded comments on anything with `commentable`
+
+Declare a field with the `commentable` type and the scaffold wires a threaded,
+**polymorphic** comment system (issue #1367) — one `comments` table that
+attaches to *any* number of models — with **zero hand-written comment routes,
+queries, or threading SQL**:
+
+```bash
+autumn generate scaffold Post title:String comments:commentable
+```
+
+- The token names the *feature*, not the column. The column it adds is the
+  counter-cache source, normalised to `{singular}_count` — `comments:commentable`
+  → `comment_count BIGINT NOT NULL DEFAULT 0`. Like `position`, it is
+  server-managed: excluded from `NewPost`/`UpdatePost` and from the generated
+  create/edit form, because the framework maintains it inside each comment's
+  own transaction.
+- A **second migration** creates the shared
+  `comments(commentable_type, commentable_id, parent_id, author_id, body,
+  created_at, deleted_at)` table, with an index covering the thread read and
+  another for the delete cascade. It is emitted **once per project**: run the
+  same token on a second model and the generator reuses the existing table and
+  says so.
+- The **model** gets `#[commentable(by = User, counter_cache = comment_count)]`
+  — `by` only when the project actually has a `User` model, since naming a
+  missing one would be a compile error in a file you did not write. That
+  attribute is what brings `add_comment` / `comment_thread` / `delete_comment`
+  onto the generated repository and registers the model with the framework's
+  comment router.
+- **No comment routes are generated at all.** Mount the framework's once:
+
+  ```rust
+  .nest("/comments", autumn_web::commentable::router(Default::default()))
+  ```
+
+  and render a thread with `autumn_web::widgets::comment_thread`. Adding a
+  third commentable model needs no change there.
+
+At most one `commentable` field per model, and it takes no `{…}` modifiers —
+everything else is configured on the model's `#[commentable(...)]` attribute.
+See [Threaded Comments on Anything](commentable.md) for the full option list.
 
 ### User-orderable lists with `position`
 

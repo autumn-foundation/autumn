@@ -152,3 +152,19 @@ nursery = { level = "warn", priority = -1 }
 # at their own crate root instead; `scripts/check-determinism-gate.sh` verifies
 # that a gated module never sits under such an allow.
 disallowed_methods = "allow"
+# rustc 1.98 added `clippy::unused_async_trait_impl` (nursery), which fires on
+# an `async fn` in a trait impl whose body never awaits — 49 sites across the
+# workspace, 37 of them `FromRequestParts::from_request_parts` extractors that
+# only read a request extension.
+#
+# Grandfathered rather than rewritten. The suggested transform changes each
+# signature from `async fn f() -> T` to `fn f() -> impl Future<Output = T>`,
+# which alters what auto-traits leak through the returned future; doing that
+# unverified across 28 files, several of them security-sensitive (`csrf`,
+# `submit_token`, `rate_limit`), buys a state machine the optimizer already
+# handles and risks far more than it saves. `async fn` is also the spelling the
+# trait definitions themselves use, so the impls read as their traits do.
+#
+# Revisit deliberately if the extractor hot path ever shows up in a profile —
+# it is a real (if small) win, just not one to take blind.
+unused_async_trait_impl = "allow"

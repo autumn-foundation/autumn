@@ -292,6 +292,13 @@ pub mod sharding;
 #[cfg(feature = "db")]
 pub(crate) mod counter_cache;
 
+// Threaded, polymorphic comments — autumn's fifth association kind (#1367).
+// Documented from inside the module: an outer `///` here would make rustdoc
+// resolve the module's own intra-doc links in *this* scope instead of the
+// module's.
+#[cfg(feature = "db")]
+pub mod commentable;
+
 #[cfg(feature = "db")]
 pub mod repository;
 #[cfg(feature = "db")]

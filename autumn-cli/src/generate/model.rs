@@ -60,9 +60,20 @@ pub struct ModelMetadata {
     /// field is searchable.
     search_language: Option<String>,
     searchable: Vec<(String, char)>,
+    /// The author model `#[commentable(by = ...)]` should name (issue #1367),
+    /// detected from the project by
+    /// [`super::commentable::detect_author_model`]. `None` emits a bare
+    /// `#[commentable]`, which compiles — naming a model that does not exist
+    /// would not.
+    commentable_author: Option<String>,
 }
 
 impl ModelMetadata {
+    /// Record the author model `#[commentable(by = ...)]` will name.
+    pub fn set_commentable_author(&mut self, author: Option<&str>) {
+        self.commentable_author = author.map(str::to_owned);
+    }
+
     #[must_use]
     pub fn has_validator_rules(&self) -> bool {
         !self.validations.is_empty()
@@ -195,7 +206,11 @@ fn plan_model_with_options_impl(
     }
     let pascal_name = pascal(name);
     validate_enum_field_collisions(&pascal_name, &fields)?;
-    let metadata = parse_model_metadata(&fields, options)?;
+    let mut metadata = parse_model_metadata(&fields, options)?;
+    // Issue #1367: `#[commentable(by = ...)]` may only name a model that
+    // actually exists in this project — naming a missing one would be a
+    // compile error in a file the author did not write.
+    metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
 
     // Determine the target app's database backend so the emitted DDL / diesel
     // schema is backend-aware (SQLite foundation, issue #1614). Full-text search
@@ -209,6 +224,14 @@ fn plan_model_with_options_impl(
     // `TEXT PRIMARY KEY` column that would accept NULL/omitted ids (AC #4).
     if backend == autumn_web::config::DatabaseBackend::Sqlite && options.id_type == IdType::Uuid {
         return Err(super::sqlite_uuid_pk_unsupported_error());
+    }
+    // `comments:commentable` on a UUID-keyed model would plan every file and
+    // then hand back a project that does not compile: the shared table stores
+    // `commentable_id BIGINT` and the generated helpers take `parent_id: i64`.
+    // Refused here, before anything is written, exactly as the SQLite/UUID
+    // combination above is.
+    if options.id_type == IdType::Uuid && fields.iter().any(|f| f.kind.is_commentable()) {
+        return Err(super::uuid_pk_commentable_unsupported_error());
     }
     // A few DSL field kinds still render to Rust model types with no working
     // diesel SQLite FromSql/ToSql (Uuid, Decimal, Enum). #1924 wired DateTime<Utc>
@@ -307,6 +330,59 @@ fn plan_model_with_options_impl(
         Some(options.id_type),
     )?;
 
+    // ── Polymorphic comments (issue #1367) ─────────────────────────────────
+    // The `comments:commentable` token also has to bring the shared comments
+    // table, or this model's `#[commentable]` compiles and then fails at
+    // runtime with `relation "comments" does not exist`. `generate scaffold`
+    // routes through its own copy of this because it owns the warnings; this is
+    // the `generate model` path, which the scaffold does not reach.
+    // On the destroy path the field tokens are not repeated, so the
+    // declaration is recovered from the model file instead.
+    if fields.iter().any(|f| f.kind.is_commentable())
+        || (for_revert && super::commentable::model_declares_commentable(project_root, &snake_name))
+    {
+        // On a revert the shared table stays as long as ANY other model still
+        // declares `#[commentable]`: it is one table for all of them.
+        let revert_would_orphan_another_model = for_revert
+            && super::commentable::another_model_is_still_commentable(project_root, &snake_name);
+        let emitted = !revert_would_orphan_another_model
+            && super::commentable::push_commentable_migration(
+                &mut plan,
+                project_root,
+                timestamp,
+                backend,
+                for_revert,
+            );
+        if !for_revert {
+            if emitted && super::commentable::conflicting_comments_table(project_root) {
+                plan.warn(format!(
+                    "This project already has a `{table}` table that is NOT the \
+                     polymorphic one — a `Comment` model scaffolded the ordinary way \
+                     creates exactly that, and the shared table takes the same name. \
+                     Both `CREATE TABLE {table}` statements will be applied and \
+                     `migrate` will stop on \"already exists\". Rename or drop the \
+                     existing table, or add `commentable_type TEXT NOT NULL` and \
+                     `commentable_id BIGINT NOT NULL` to it and delete the migration \
+                     just written.",
+                    table = super::commentable::COMMENTS_TABLE,
+                ));
+            }
+            plan.warn(if emitted {
+                format!(
+                    "Added the shared `{table}` table. Every `#[commentable]` model attaches \
+                     to it, so later models need no migration of their own.",
+                    table = super::commentable::COMMENTS_TABLE,
+                )
+            } else {
+                format!(
+                    "Reusing the existing `{table}` table — the polymorphic comments table \
+                     is shared across every `#[commentable]` model.",
+                    table = super::commentable::COMMENTS_TABLE,
+                )
+            });
+        }
+    }
+
     // (a) `src/models/<snake>.rs` + `src/models/mod.rs`
     let models_dir = project_root.join("src").join("models");
     let model_file = models_dir.join(format!("{snake_name}.rs"));
@@ -395,6 +471,32 @@ fn plan_model_with_options_impl(
     } else {
         format!("{position_down}{down_sql}")
     };
+    // Issue #1367: the cascade a polymorphic foreign key cannot express. The
+    // shared `comments` table is created once and cannot know which models will
+    // later attach to it, so each commentable parent carries its own cleanup
+    // trigger. Without it a deleted parent leaves its thread behind —
+    // unreachable, and worse than unreachable if the id is ever reused, since
+    // the old comments would surface under the new record.
+    let commentable_up = if fields.iter().any(|f| f.kind.is_commentable()) {
+        super::commentable::parent_cleanup_sql(backend, &table, &pascal_name)
+    } else {
+        String::new()
+    };
+    let (up_sql, down_sql) = if commentable_up.is_empty() {
+        (up_sql, down_sql)
+    } else {
+        (
+            format!("{up_sql}{commentable_up}"),
+            // Dropped before the table so the trigger never outlives its
+            // target. The statement is backend-split: SQLite's DROP TRIGGER
+            // takes no `ON <table>`.
+            format!(
+                "{}{down_sql}",
+                super::commentable::parent_cleanup_down_sql(backend, &table)
+            ),
+        )
+    };
+
     plan.create(migration_dir.join("up.sql"), up_sql);
     plan.create(migration_dir.join("down.sql"), down_sql);
 
@@ -1782,8 +1884,14 @@ pub fn parse_model_metadata(
     // splice), the same two-step "DB default, then app-managed overwrite"
     // shape `lock_version` uses above. Recording it here also drops the
     // column from the scaffold's generated HTML form, same as `lock_version`.
+    //
+    // Issue #1367: a `commentable` counter column is the same shape — DB
+    // managed, `#[default]` on the model, `DEFAULT 0` in SQL — except that the
+    // overwrite comes from the framework's comment write path rather than an
+    // insert hook. `NOT NULL DEFAULT 0` is load-bearing rather than tidy: the
+    // maintenance is `SET c = c + 1`, and `NULL + 1` is `NULL`.
     for f in fields {
-        if f.kind.is_position() {
+        if f.kind.is_server_managed() {
             metadata
                 .defaults
                 .entry(f.name.clone())
@@ -2383,7 +2491,11 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
         | FieldKind::Slug
         // A position's value is always assigned by the repository on insert
         // (issue #1358), never a static default.
-        | FieldKind::Position => Err(format!(
+        | FieldKind::Position
+        // A commentable counter always starts at 0 and is thereafter moved by
+        // the framework (issue #1367); the migration's own `DEFAULT 0` is the
+        // only default it may have.
+        | FieldKind::Commentable => Err(format!(
             "defaults for {} fields are not supported by `autumn generate` yet",
             field.rust_type()
         )),
@@ -2588,7 +2700,35 @@ fn render_model_file(
             out.push('\n');
         }
     }
+    // Struct-level `#[commentable(...)]` (issue #1367) — emitted by the
+    // `comments:commentable` DSL token. It is what brings the repository's
+    // `add_comment`/`comment_thread`/`delete_comment` helpers into existence
+    // and registers this model with the framework's generic comment router.
+    //
+    // `by = User` is the convention `autumn generate auth` produces; a project
+    // whose author model is named differently changes that one word. No
+    // `author_name` is emitted on purpose: the generated `User` carries an
+    // `email`, and defaulting a *public* display name to it would leak
+    // addresses into every rendered thread.
+    if fields.iter().any(|f| f.kind.is_commentable()) {
+        out.push_str(
+            "// Threaded, polymorphic comments (#1367): one shared `comments` table,\n\
+             // keyed on `(commentable_type, commentable_id)`, attaches to any number of\n\
+             // models. Point `by` at this app's author model, and add\n\
+             // `author_name = <column>` to render display names instead of `user #id`.\n",
+        );
+    }
     out.push_str("#[autumn_web::model]\n");
+    // `#[commentable]` is consumed by `#[model]`, so it must sit BELOW it —
+    // attribute macros are applied top-down, and above it the compiler would
+    // report `cannot find attribute commentable in this scope`.
+    if let Some(counter) = fields.iter().find(|f| f.kind.is_commentable()) {
+        let by = metadata
+            .commentable_author
+            .as_deref()
+            .map_or_else(String::new, |author| format!("by = {author}, "));
+        let _ = writeln!(out, "#[commentable({by}counter_cache = {})]", counter.name);
+    }
     // Struct-level `#[searchable(language = "…")]` (issue #1319) opts the model
     // into full-text search; the per-field `#[searchable(weight = "…")]` below
     // declare which columns feed the `search_vector` and at what rank weight.

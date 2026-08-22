@@ -548,6 +548,13 @@ where
 }
 
 /// Decode a form body — URL-encoded always, multipart when that feature is on.
+// `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
+// 128 bytes — that is `axum::response::Response`'s own size, not something this
+// crate chose. Returning a ready-made rejection response IS the idiom here, and
+// boxing it would add an allocation to every rejection path to satisfy a size
+// heuristic. Allowed at the site rather than workspace-wide so the lint stays
+// armed for error types we do control.
+#[allow(clippy::result_large_err)]
 async fn decode_form_body<T, S>(req: Request, state: &S) -> Result<T, axum::response::Response>
 where
     T: serde::de::DeserializeOwned + validator::Validate + Send,
@@ -671,6 +678,10 @@ pub fn __fuzz_decode_urlencoded(bytes: &[u8]) {
 /// The collected text pairs are re-encoded as URL-encoded so that
 /// `serde_urlencoded` handles the same type coercions axum's `Form` does.
 #[cfg(feature = "multipart")]
+// Same as `decode_form_body` above: the `Err` variant is an
+// `axum::response::Response`, which IS the rejection, and boxing it would cost
+// an allocation on every rejection to satisfy a size heuristic.
+#[allow(clippy::result_large_err)]
 async fn decode_multipart<T, S>(req: Request, state: &S) -> Result<T, axum::response::Response>
 where
     T: serde::de::DeserializeOwned,

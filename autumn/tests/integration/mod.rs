@@ -40,6 +40,8 @@ mod chaos_state_loom;
 mod circuit_breaker_integration;
 mod clock_integration;
 mod cluster_two_node;
+#[cfg(feature = "db")]
+mod commentable;
 mod commit_hook_drain;
 mod compile_fail;
 mod compression_middleware;

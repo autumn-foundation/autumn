@@ -16,6 +16,7 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
+mod commentable;
 mod edge;
 mod edge_routes_macro;
 mod event;
