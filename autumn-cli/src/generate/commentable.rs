@@ -743,6 +743,26 @@ fn migration_up_sql(project_root: &Path) -> Vec<String> {
 /// comments (commentable_type …)` in a migration's header, which is exactly the
 /// kind of thing a header explaining the shared table would contain — would
 /// otherwise read as the real table and make the generator emit nothing.
+/// Whether the quote at `quote` opens a PostgreSQL escape string (`E'…'`).
+///
+/// Only these honour backslash escapes; an ordinary literal treats `\` as data
+/// under the default `standard_conforming_strings = on`. The `E` must be the
+/// prefix and not the tail of a longer word, so the character before it has to
+/// be a non-identifier one — otherwise a column whose name ends in `e` sitting
+/// next to a literal would turn escaping on by accident.
+fn is_escape_string_prefix(sql: &str, quote: usize) -> bool {
+    let bytes = sql.as_bytes();
+    let Some(prev) = quote.checked_sub(1) else {
+        return false;
+    };
+    if !matches!(bytes[prev], b'E' | b'e') {
+        return false;
+    }
+    prev.checked_sub(1)
+        .map(|before| bytes[before])
+        .is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+}
+
 /// Length of the `$tag$` opening a dollar-quoted literal, if `text` starts one.
 ///
 /// `$$…$$` and `$tag$…$tag$` are PostgreSQL's quote-free string syntax. The tag
@@ -787,9 +807,32 @@ fn strip_sql_comments(sql: &str) -> String {
             // valid: `comments_table_events` sorts events by position, and the
             // body slice is taken by index.
             b'\'' => {
+                // In an E-STRING — and ONLY there — a backslash escapes the
+                // next character, so `E'can\'t; DROP TABLE comments;'` does not
+                // end at that apostrophe. Closing it there left the rest of the
+                // literal to be replayed as DDL.
+                //
+                // The restriction to E-strings is the important half. Under
+                // `standard_conforming_strings = on` (the default, checked)
+                // PostgreSQL treats a backslash in an ORDINARY literal as an
+                // ordinary character: `'can\'t X'` is an ERROR precisely
+                // because the quote still closes, and `'ends_with_backslash\'`
+                // closes normally. Honouring escapes everywhere would swallow
+                // the statements after such a literal — the same bug pointing
+                // the other way.
+                let escapes = is_escape_string_prefix(sql, i);
                 out.push('\'');
                 i += 1;
                 while i < bytes.len() {
+                    if escapes && bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        // The backslash and whatever it escapes are both data.
+                        let ch = sql[i + 1..].chars().next().unwrap_or(' ');
+                        for _ in 0..=ch.len_utf8() {
+                            out.push(' ');
+                        }
+                        i += 1 + ch.len_utf8();
+                        continue;
+                    }
                     if bytes[i] == b'\'' {
                         // A doubled quote is an escaped one, still inside.
                         if bytes.get(i + 1) == Some(&b'\'') {
@@ -2119,6 +2162,70 @@ mod tests {
             already_migrated(tmp.path()),
             "renaming a constraint leaves the columns alone"
         );
+    }
+
+    /// Backslash escapes belong to `E'…'` and to nothing else. Both halves
+    /// were checked against a real PostgreSQL.
+    #[test]
+    fn backslash_escapes_are_honoured_only_in_escape_strings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_estring");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let create = "CREATE TABLE comments (id BIGINT, commentable_type TEXT, \
+                      commentable_id BIGINT, parent_id BIGINT, author_id BIGINT, \
+                      body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n";
+
+        // `E'can\'t; DROP TABLE comments;'` is ONE literal: the escaped
+        // apostrophe does not end it, so nothing inside is DDL.
+        for literal in [
+            r"INSERT INTO audit_log(msg) VALUES (E'can\'t; DROP TABLE comments;');",
+            r"INSERT INTO audit_log(msg) VALUES (e'lower\'s; DROP TABLE comments;');",
+            // A backslash escaping something else, with a real quote after.
+            r"INSERT INTO audit_log(msg) VALUES (E'tab\there; DROP TABLE comments;');",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{create}{literal}\n")).expect("write");
+            assert!(
+                already_migrated(tmp.path()),
+                "`{literal}` is one literal, not a drop"
+            );
+        }
+
+        // The other half, and the one a careless fix breaks: in an ORDINARY
+        // literal a backslash is DATA, so the quote still closes. PostgreSQL
+        // returns `ends_with_backslash\` for the first value here — if the
+        // masker swallowed onward, the following DROP would vanish.
+        std::fs::write(
+            dir.join("up.sql"),
+            format!(
+                "{create}INSERT INTO audit_log(msg) VALUES ('ends\\');\nDROP TABLE comments;\n"
+            ),
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "a backslash does not escape the closing quote of an ordinary literal"
+        );
+
+        // An identifier merely ENDING in `e` must not turn escaping on.
+        std::fs::write(
+            dir.join("up.sql"),
+            format!("{create}INSERT INTO audit_log(role)VALUES('x\\');\nDROP TABLE comments;\n"),
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "`role` ending in `e` is not an E-string prefix"
+        );
+
+        // A REAL drop after a genuine E-string still registers.
+        std::fs::write(
+            dir.join("up.sql"),
+            format!(
+                "{create}INSERT INTO audit_log(msg) VALUES (E'hi\\'there');\nDROP TABLE comments;\n"
+            ),
+        )
+        .expect("write");
+        assert!(!already_migrated(tmp.path()), "the real drop still counts");
     }
 
     /// `$tag$…$tag$` is a string, not DDL. Every case here was checked

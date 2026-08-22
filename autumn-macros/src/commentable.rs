@@ -215,6 +215,24 @@ pub fn parse_commentable_attr(
                         integer: None,
                     }
                 };
+                // `by` names a TYPE, so a bare identifier is the only thing it
+                // can be. A quoted `by = "User"` or a numeric one parses
+                // happily as a generic value and then does NOTHING:
+                // `author_model` stays `None`, the attribute behaves exactly as
+                // if `by` had been omitted, the author-key guard never runs,
+                // and the author the user asked for is silently discarded.
+                if key == "by" && author_model.is_none() {
+                    return Err(syn::Error::new(
+                        parsed.span,
+                        format!(
+                            "`#[commentable(by = ...)]` takes a bare type name, \
+                             found `{}`: write `by = User`, not `by = \"User\"` \
+                             — a quoted or numeric value would be accepted and \
+                             then ignored, leaving the model with no author",
+                            parsed.value
+                        ),
+                    ));
+                }
                 // A repeat would silently win last-write, so a typo'd
                 // `table = a, table = b` would build SQL against the wrong one.
                 if let Some(previous) = pairs.insert(key.to_string(), parsed) {
@@ -965,6 +983,30 @@ mod tests {
 
     fn error(attr: &proc_macro2::TokenStream) -> String {
         parse(attr).expect_err("expected a rejection").to_string()
+    }
+
+    /// `by` names a type. A quoted or numeric value used to parse fine and
+    /// then do nothing at all — no author model, no key guard, no warning.
+    #[test]
+    fn by_must_be_a_bare_identifier() {
+        for attr in [
+            quote! { (by = "User") },
+            quote! { (by = 123) },
+            quote! { (by = true) },
+        ] {
+            let message = error(&attr);
+            assert!(
+                message.contains("bare type name"),
+                "expected a directed rejection, got: {message}"
+            );
+        }
+
+        // The valid spelling still works, and still records the model.
+        let spec = parse(&quote! { (by = User) }).expect("`by = User` is valid");
+        assert_eq!(
+            spec.author_model.map(|model| model.to_string()).as_deref(),
+            Some("User")
+        );
     }
 
     #[test]
