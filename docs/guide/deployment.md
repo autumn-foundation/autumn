@@ -34,8 +34,8 @@ internet connection.
 ## Push-button deploy to your own server (`autumn deploy`)
 
 `autumn deploy` takes a fresh project to a live, zero-downtime service on a
-Linux VPS you control — no Dockerfile, no container registry, no PaaS
-account. It uploads a single embedded binary, supervises it with systemd behind
+Linux VPS you control — no Dockerfile for your app, no registry to publish it
+to, no PaaS account. It uploads a single embedded binary, supervises it with systemd behind
 a reverse proxy, migrates before cutover, health-gates on `/ready`, and flips
 traffic atomically. Re-running it is a zero-downtime redeploy; one command rolls
 back.
@@ -94,9 +94,8 @@ below and are better fits in specific cases:
 
 ### Preconditions
 
-Everything except two host prerequisites is automated by `autumn deploy up` —
-and one of those two is only a *local* prerequisite. The target host needs no
-preparation beyond a stock Ubuntu LTS with SSH access:
+`autumn deploy up` automates everything on the target: the only host prerequisite
+is SSH access, and the only other prerequisite is on your own machine.
 
 - **Key-based SSH access as `root` (or an equivalently privileged account) to a
   stock Ubuntu LTS (or other systemd) host.** The deploy runs non-interactively
@@ -116,6 +115,12 @@ preparation beyond a stock Ubuntu LTS with SSH access:
 The reverse proxy **binary**, the reverse proxy service, install directories,
 systemd units, release layout, and the secret env file are all created for you.
 
+A host that still needs the reverse-proxy binary installed additionally needs
+**apt** (host preparation is Debian/Ubuntu-only — on another systemd distro,
+install `kamal-proxy` yourself and set `install_proxy = false`) and **outbound
+HTTPS** to your distro mirrors and to Docker Hub. Once prepared, neither is
+needed again. See [Host preparation](#host-preparation-install_proxy).
+
 #### Host preparation (`install_proxy`)
 
 `autumn deploy up` prepares the target itself. Before anything else runs it
@@ -124,26 +129,35 @@ probes the host for a working `kamal-proxy`, and:
 - **a host that already has one** is left completely untouched — the probe is a
   read-only `kamal-proxy deploy --help`, and nothing else runs;
 - **a host that has none** gets the pinned build installed at
-  `/usr/local/bin/kamal-proxy`, then re-probed. kamal-proxy publishes no release
-  binaries (upstream ships it as a container image), so the deploy installs the
-  packages a minimal image may lack — `curl` (the readiness gate polls `/ready`
-  *on the host*) and a container runtime — copies the binary out of the pinned
-  `basecamp/kamal-proxy` image, and moves it into place. Only genuinely missing
-  packages are installed. The deploy says so:
+  `/usr/local/bin/kamal-proxy`. kamal-proxy publishes no release binaries
+  (upstream ships it as a container image), so the deploy installs the packages a
+  minimal image may lack — `curl` (the readiness gate polls `/ready` *on the
+  host*) and a container runtime — copies the binary out of the
+  `basecamp/kamal-proxy` image **pinned by digest**, and moves it into place. Only
+  genuinely missing packages are installed; the container runtime and the pulled
+  image are left on the host afterwards. The step announces itself before it runs:
 
   ```
-  host preparation: installed kamal-proxy v0.9.2 at /usr/local/bin/kamal-proxy (the host had none)
+  host preparation: no kamal-proxy on this host — installing v0.9.2 at
+  /usr/local/bin/kamal-proxy, from the pinned basecamp/kamal-proxy image. This also
+  installs, and leaves behind, any of `curl` and a container runtime the host is
+  missing. Decline with `[deploy] install_proxy = false`.
   ```
+
+  The install ends by running the binary it just placed, so an install that
+  "succeeded" without producing a working proxy fails the deploy there rather than
+  at the first cutover. It also refuses outright if anything already exists at
+  `/usr/local/bin/kamal-proxy`, so it can never replace a binary the probe merely
+  failed to reach.
 
 - **a host whose kamal-proxy responds but whose CLI surface has drifted** (a
-  renamed or removed subcommand/flag) is *never* silently replaced — that binary
-  may be shared with something else on the host. The deploy aborts with a message
-  naming exactly what is missing and the version to pin, before touching live
-  traffic.
+  renamed or removed subcommand/flag) is *never* replaced — that binary may be
+  shared with something else on the host. The deploy aborts with a message naming
+  exactly what is missing and the version to pin, before touching live traffic.
 
-If the install can't be done — no outbound network, no package manager able to
-install a container runtime — the deploy fails fast, before anything is uploaded
-or cut over, and tells you what to install.
+If the install can't be done — no outbound network, no apt, Docker Hub rate
+limits — the deploy fails fast, before anything is uploaded or cut over, with a
+message naming what the host needs and the `install_proxy = false` opt-out.
 
 To provision the proxy yourself (a pinned internal build, your own package, or a
 host you don't want a container runtime on), decline host preparation:
@@ -748,6 +762,15 @@ and `--no-rollback`; no existing flag changed meaning.
 > it is: after any failed single-host `deploy up`, check `autumn migrate status`
 > before assuming the failure left nothing behind — and write expand/contract
 > migrations so the still-serving release fits the migrated schema either way.
+>
+> Since a **first** deploy migrates too
+> ([Migration ordering](#migration-ordering-first-deploy-included)), this now has a
+> second shape: a single-host *first* deploy that migrates and then fails its
+> readiness gate tears the release down and leaves **nothing serving at all**
+> against a schema that has already moved. The same advice applies, and more
+> sharply — `autumn migrate status` is how you find out, and the fix for the next
+> attempt is usually just re-running `autumn deploy up`, which is idempotent about
+> an already-applied migration.
 
 ### Rollback
 
@@ -1048,7 +1071,7 @@ hosts in rollout order and stating the migrate-placement rule. That section is
 descriptive for the same reason: `plan` contacts no host, so it cannot know which
 hosts are first deploys and which are redeploys. It therefore renders the
 migration as the *rule* `autumn deploy up` applies after probing every host —
-"`[migrate]` runs once, on the first host still on a previous release, before its
+"`[migrate]` runs once, on the first host in rollout order, before its
 cutover — hosts 2..N skip it" — never as a named host. `deploy up` names the
 actual host once it has probed the fleet.
 
@@ -1146,7 +1169,9 @@ or error messages.
   down-migration mid-flip would run exactly the SQL nothing reviews. Use
   expand/contract migrations so a rolled-back binary still fits the migrated
   schema.
-- **A failed *single-host* deploy never warns that the schema moved** (#2276).
+- **A failed *single-host* deploy never warns that the schema moved** (#2276) —
+  including a failed *first* deploy, which since #1607 migrates before it starts
+  the release, and so can leave a moved schema with nothing serving.
   A fleet ends every run with a `Fleet state:` summary that names the
   binaries-versus-schema state; the single-host path returns the per-host error
   directly and renders no summary, so a failure after `migrate` but before the

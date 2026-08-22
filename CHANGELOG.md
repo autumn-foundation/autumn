@@ -20,16 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `/usr/local/bin/kamal-proxy` (plus `curl`, which the readiness gate uses **on
     the host**, and a container runtime — kamal-proxy publishes no release binaries,
     so the pinned `basecamp/kamal-proxy` image is the source). Only genuinely
-    missing packages are installed, the binary is staged and moved into place so the
-    supervised path is never half-written, and the install verifies itself before
-    the deploy continues. A host that already has a working proxy is **untouched**;
+    missing packages are installed, the image is pinned **by digest** (a Docker Hub
+    tag is mutable, and the binary is executed as root), the binary is staged and
+    moved into place so the supervised path is never half-written, the install
+    refuses outright if anything already exists at that path, and it verifies the
+    binary it landed before the deploy continues. Host preparation is
+    Debian/Ubuntu-only and needs outbound HTTPS; a failure names exactly that, plus
+    the opt-out. A host that already has a working proxy is **untouched**;
     a proxy that responds but whose CLI surface has **drifted** is still never
     replaced — that stays the actionable, fail-closed refusal it has been. In a
     fleet the install is the first op of that host's own turn, not part of the
     all-hosts probe phase, so "no host is touched until every host is graded" still
     holds and a failed install halts and compensates like any other pre-cutover
-    failure. Decline it with `[deploy] install_proxy = false` (default `true`) if
-    you provision the proxy yourself.
+    failure. Decline it with `[deploy] install_proxy = false` (default `true`, env
+    override `AUTUMN_DEPLOY__INSTALL_PROXY`) if you provision the proxy yourself.
   - **Migrations on the first deploy.** `first_deploy_ops` now runs the same
     blocking `AUTUMN_MIGRATE=1` one-shot the redeploy path does — **before** the
     initial release is started, so the app never boots against a schema that was
@@ -38,7 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     host in rollout order** whatever its mode: an all-first-deploy fleet migrates on
     host 1 instead of migrating nowhere, the schema always moves before any host cuts
     over, and both of the migration-ordering hazard warnings a scale-up used to
-    print are gone because neither state is reachable any more.
+    print are gone because neither state is reachable any more. The one-shot now
+    also loads the release's own uploaded `autumn.toml` (`AUTUMN_MANIFEST_DIR`,
+    matching the slot unit), so a config-only database topology is no longer
+    invisible to it; and the fleet summary stops claiming "the migration that
+    already ran was NOT rolled back" for a rollout that failed *before* reaching its
+    migration.
   - The container end-to-end test asserts the first deploy's migration over real
     ssh (a marker written by the one-shot itself), and the nightly real-VPS
     workflow now provisions a **stock** image, asserts it has no kamal-proxy, and

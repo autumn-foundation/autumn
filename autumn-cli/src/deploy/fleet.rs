@@ -771,16 +771,30 @@ pub(crate) const FLEET_SCHEMA_AHEAD_OF_BINARIES_NOTE: &str = "no host is serving
 
 /// Whether this rollout moved the schema, judged conservatively (issue #1621).
 ///
-/// True when the plan scheduled a migration AND the host carrying it was reached at
-/// all. It deliberately does NOT try to prove the one-shot itself succeeded: the
-/// only signal available is the failing step label, and a pre-boundary failure
-/// *after* `migrate` (a readiness timeout, say) moves the schema and still rolls
-/// the candidate back. Erring toward "the schema moved" costs one line of output;
-/// erring the other way lets an operator roll binaries back believing the schema
-/// came with them.
+/// True when the plan scheduled a migration AND the host carrying it got far enough
+/// to have run it. It deliberately does NOT try to prove the one-shot itself
+/// succeeded: a pre-boundary failure *after* `migrate` (a readiness timeout, say)
+/// moves the schema and still rolls the candidate back. Erring toward "the schema
+/// moved" costs one line of output; erring the other way lets an operator roll
+/// binaries back believing the schema came with them.
+///
+/// The one thing it WILL rule out is a host that provably never reached its
+/// migration: a pre-boundary failure whose step label is in
+/// [`exec::PRE_MIGRATE_LABELS`] — a failed upload, a failed host preparation. Since
+/// #1607 every rollout schedules a migration (on host 1), so without this a fleet
+/// that died while uploading its binary would tell the operator "the migration that
+/// already ran was NOT rolled back" about a migration that never ran. Anything the
+/// label list does not recognise still counts as "it may have".
 pub(crate) fn schema_moved(plan: &FleetPlan, outcomes: &[HostOutcome]) -> bool {
     plan.hosts.iter().zip(outcomes).any(|(host, outcome)| {
-        host.migrate == MigrateStep::Run && !matches!(outcome, HostOutcome::Untouched)
+        host.migrate == MigrateStep::Run
+            && match outcome {
+                HostOutcome::Untouched => false,
+                HostOutcome::RolledBack { failed_step } | HostOutcome::TornDown { failed_step } => {
+                    !exec::failed_before_migrating(failed_step)
+                }
+                _ => true,
+            }
     })
 }
 
@@ -985,11 +999,11 @@ pub(crate) fn fleet_summary_lines(
     //   binary went back on its own and the schema stayed put. This last case used
     //   to print NOTHING at all, which is the worst of the three to be silent about.
     //
-    // Gating on the migration and not on liveness also keeps an all-first-deploy
-    // fleet silent: it schedules no migration, and the same run's header already
-    // told the operator to run `autumn migrate` themselves — asserting the schema
-    // moved here would negate that instruction on the last line before the green
-    // one.
+    // Gating on the migration and not on liveness also keeps a rollout that never
+    // GOT to its migration silent — one that failed while preparing the host or
+    // uploading the binary (see `schema_moved`, which rules those out by failing
+    // step). Since #1607 every rollout schedules a migration, so that, rather than
+    // "this fleet migrates nowhere", is the case this gate exists to keep quiet.
     if schema_moved(plan, outcomes) {
         if !on_new.is_empty() {
             lines.push(format!("  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_MOVED_NOTE}"));
@@ -2373,6 +2387,43 @@ mod tests {
     }
 
     #[test]
+    fn a_mixed_fleet_migrates_once_on_host_one_before_any_cutover() {
+        // The scale-up shape — a NEW host listed ahead of an already-deployed one —
+        // is the case #1621's placement rule made hazardous and #1607's fixed. Assert
+        // it at the OPS level, not just in the rendered header: the leading
+        // first-deploy host carries the migration, and it lands before any host in
+        // the fleet cuts over.
+        let (plan, per_host) =
+            plan_and_build(&["web-a", "web-b"], &[HostMode::First, HostMode::Redeploy]);
+        assert_eq!(
+            plan.hosts
+                .iter()
+                .filter(|h| h.migrate == MigrateStep::Run)
+                .map(|h| h.host.as_str())
+                .collect::<Vec<_>>(),
+            vec!["web-a"],
+            "the leading first-deploy host carries the migration: {:?}",
+            plan.hosts
+        );
+        let flat: Vec<&'static str> = per_host.iter().flat_map(|ops| labels(ops)).collect();
+        assert_eq!(
+            flat.iter().filter(|l| **l == "migrate").count(),
+            1,
+            "a mixed fleet migrates exactly once, got: {flat:?}"
+        );
+        let migrate = flat.iter().position(|l| *l == "migrate").expect("migrates");
+        let boundary = flat
+            .iter()
+            .position(|l| *l == "proxy-route" || *l == "proxy-flip")
+            .expect("the fleet cuts over");
+        assert!(
+            migrate < boundary,
+            "the migration must precede the earliest cutover: migrate at {migrate}, \
+             boundary at {boundary}, labels: {flat:?}"
+        );
+    }
+
+    #[test]
     fn an_all_first_deploy_fleet_migrates_exactly_once_on_host_one() {
         // #1607 (AC-3): the companion of the placement rule at the op level. A brand
         // new fleet used to migrate NOWHERE and tell the operator to run `autumn
@@ -3036,6 +3087,61 @@ mod tests {
     }
 
     #[test]
+    fn a_rollout_that_died_before_migrating_never_claims_the_schema_moved() {
+        // #1607: every rollout now schedules a migration (on host 1), so the old
+        // "was the migrating host reached at all" gate would report "the migration
+        // that already ran was NOT rolled back" for a fleet that failed while
+        // installing the proxy or uploading the binary — a migration that never ran.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let plan = plan_fleet(&fleet, &[HostMode::First, HostMode::First])
+            .expect("a well-formed fleet plans");
+
+        for failed_step in ["install-proxy", "upload", "prepare-dirs", "daemon-reload"] {
+            assert!(
+                !schema_moved(
+                    &plan,
+                    &[
+                        HostOutcome::TornDown { failed_step },
+                        HostOutcome::Untouched
+                    ]
+                ),
+                "a host that died at `{failed_step}` never reached its migration"
+            );
+            let rendered = fleet_summary_lines(
+                &plan,
+                &[
+                    HostOutcome::TornDown { failed_step },
+                    HostOutcome::Untouched,
+                ],
+                "20260714T120000Z",
+            )
+            .join("\n");
+            assert!(
+                !rendered.contains(FLEET_SCHEMA_AHEAD_OF_BINARIES_NOTE)
+                    && !rendered.contains(FLEET_SCHEMA_MOVED_NOTE),
+                "no schema statement belongs on a rollout that died at \
+                 `{failed_step}`:\n{rendered}"
+            );
+        }
+
+        // …but the conservative direction is untouched: a failure AT or AFTER the
+        // migration still says the schema moved, and so does anything the label list
+        // does not recognise.
+        for failed_step in ["migrate", "readiness-gate", "some-future-op"] {
+            assert!(
+                schema_moved(
+                    &plan,
+                    &[
+                        HostOutcome::TornDown { failed_step },
+                        HostOutcome::Untouched
+                    ]
+                ),
+                "a host that died at `{failed_step}` may have moved the schema"
+            );
+        }
+    }
+
+    #[test]
     fn the_schema_note_tracks_whether_the_migration_host_was_reached() {
         // #1621 (T1.12): the note is conservative by design — it fires whenever the
         // migrating host was REACHED, because the only evidence available is a step
@@ -3097,6 +3203,34 @@ mod tests {
             "a rollout that reached no migrating host must never claim the schema \
              moved:\n{rendered}"
         );
+        // The newly-reachable case #1607 creates: an all-first-deploy fleet that
+        // migrated on host 1 and was then COMPENSATED. The binaries went back; the
+        // schema did not, and the summary must say so — before this change such a
+        // fleet migrated nowhere, so it could never reach this state.
+        assert!(
+            schema_moved(
+                &first_only,
+                &[
+                    HostOutcome::CompensatedTeardown,
+                    HostOutcome::CompensatedTeardown,
+                ]
+            ),
+            "a compensated all-first fleet still migrated on host 1"
+        );
+        let compensated = fleet_summary_lines(
+            &first_only,
+            &[
+                HostOutcome::CompensatedTeardown,
+                HostOutcome::CompensatedTeardown,
+            ],
+            "20260714T120000Z",
+        )
+        .join("\n");
+        assert!(
+            compensated.contains(FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE),
+            "the compensating rollback restored binaries only — say so:\n{compensated}"
+        );
+
         // A first-deploy fleet that DID reach host 1 and is serving names both the
         // schema move and the recovery lever.
         let served = fleet_summary_lines(

@@ -767,10 +767,10 @@ pub enum MigrateStep {
 /// 4. write the secret env file (`0600`, AC-5),
 /// 5. write the blue slot's systemd unit (binds `127.0.0.1:{blue_port}`),
 /// 6. point `current` at the new release,
-/// 7. run pending migrations (`AUTUMN_MIGRATE=1` one-shot) — [`MigrateStep::Run`]
+/// 7. `systemctl daemon-reload` (loads the unit; starts nothing),
+/// 8. run pending migrations (`AUTUMN_MIGRATE=1` one-shot) — [`MigrateStep::Run`]
 ///    for a single-host first deploy and for the fleet host carrying the
 ///    migration, [`MigrateStep::Skip`] for the rest,
-/// 8. `systemctl daemon-reload`,
 /// 9. `systemctl enable {service}-blue.service && systemctl restart
 ///    {service}-blue.service` (restart, not `enable --now`, so an already-active
 ///    slot always relaunches the freshly written unit — see the op's comment),
@@ -856,6 +856,10 @@ pub fn first_deploy_ops(
                 shell_quote(&current)
             ),
         )),
+        DeployOp::Run(RemoteCommand::new(
+            "daemon-reload",
+            "systemctl daemon-reload",
+        )),
     ]);
     // Pending migrations run BEFORE the initial release is even started (issue
     // #1607, AC-3). `systemd-run --wait` returns the child's exit status, so a
@@ -863,16 +867,17 @@ pub fn first_deploy_ops(
     // slot never starts, the proxy is never routed at it, and the caller's
     // first-deploy teardown removes the half-written release.
     //
+    // It sits AFTER `daemon-reload` (which only reloads unit files and starts
+    // nothing) rather than before it, so `daemon-reload` is unambiguously a
+    // PRE-migrate step on BOTH builders — see [`PRE_MIGRATE_LABELS`], which the
+    // fleet summary uses to tell "died before migrating" from "the schema moved".
+    //
     // `MigrateStep::Skip` omits ONLY this op (a fleet migrates exactly once); see
     // [`MigrateStep`].
     if matches!(migrate, MigrateStep::Run) {
         ops.push(DeployOp::Run(release_migrate_command(cfg, &release_dir)));
     }
     ops.extend([
-        DeployOp::Run(RemoteCommand::new(
-            "daemon-reload",
-            "systemctl daemon-reload",
-        )),
         // enable = boot-persistence; restart = start-or-relaunch. We deliberately
         // use `restart` (not `enable --now`) because an already-active slot — one
         // left running by drift — must ALWAYS relaunch the freshly written unit:
@@ -1633,6 +1638,52 @@ fn commit_markers_command(
     )
 }
 
+/// Op labels that both per-host builders emit strictly BEFORE their `migrate` op.
+///
+/// A host whose deploy failed at one of these never reached its migration, so the
+/// schema cannot have moved — which is what lets the fleet summary
+/// (`fleet::schema_moved`) stop claiming "the migration that already ran was NOT
+/// rolled back" for a rollout that died while uploading. Any label NOT listed here
+/// is treated as "at or after the migration", so a new step defaults to the
+/// conservative side.
+///
+/// The list is kept honest by `pre_migrate_labels_match_both_builders`, which
+/// derives the true pre-`migrate` prefix from `first_deploy_ops` and `cutover_ops`
+/// and asserts it against this constant — so adding, removing or moving an op
+/// fails that test rather than silently making the summary lie.
+pub const PRE_MIGRATE_LABELS: &[&str] = &[
+    "install-proxy",
+    "proxy-snapshot-unit",
+    "proxy-write-unit",
+    "proxy-install",
+    "proxy-restart-if-changed",
+    "prepare-dirs",
+    "upload-binary",
+    "upload-config",
+    "write-env",
+    "write-unit",
+    "write-candidate-unit",
+    "link-current",
+    "daemon-reload",
+    "start-candidate",
+    // Transport-level attributions for the uploads above (`failed_step_label`
+    // reports a fixed label rather than the remote path): every upload on both
+    // deploy paths precedes `migrate`.
+    "upload",
+    "stage-local-file",
+];
+
+/// Whether a host that failed at `failed_step` had already run its migration.
+///
+/// Conservative by design: only a label this crate KNOWS runs before `migrate`
+/// ([`PRE_MIGRATE_LABELS`]) proves the schema did not move. Anything else — the
+/// `migrate` op itself, everything after it, and any label this list does not
+/// recognise — counts as "it may have".
+#[must_use]
+pub fn failed_before_migrating(failed_step: &str) -> bool {
+    PRE_MIGRATE_LABELS.contains(&failed_step)
+}
+
 /// Command that runs the uploaded release's pending migrations as a one-shot,
 /// BEFORE cutover.
 ///
@@ -1643,6 +1694,13 @@ fn commit_markers_command(
 /// (`AppBuilder::run` → `run_migrate_only_mode`), which applies pending embedded
 /// migrations with the same locked applier a normal boot uses and exits without
 /// starting the server.
+///
+/// It also sets `AUTUMN_MANIFEST_DIR` to the release dir, exactly as the slot unit
+/// does ([`super::render_app_unit`]), so the one-shot loads the SAME uploaded
+/// `autumn.toml` the release will boot with (#1952). Without it the migration ran
+/// against built-in defaults plus the env file: a config-only database topology —
+/// `[[database.shards]]`, a `primary_url` that lives in the manifest — was invisible
+/// to it, so it could migrate a different set of targets than the app then uses.
 fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> RemoteCommand {
     let bin = format!("{release_dir}/{}", cfg.app_name);
     // Scope the transient unit to this release so overlapping deploys (or a prior
@@ -1653,9 +1711,11 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
         "migrate",
         format!(
             "systemd-run --wait --collect --quiet --unit={service}-migrate-{release_id} \
-             --property=EnvironmentFile={env} --setenv=AUTUMN_MIGRATE=1 {bin}",
+             --property=EnvironmentFile={env} --setenv=AUTUMN_MIGRATE=1 \
+             --setenv=AUTUMN_MANIFEST_DIR={manifest} {bin}",
             service = cfg.service_name,
             env = shell_quote(&cfg.env_file()),
+            manifest = shell_quote(release_dir),
             bin = shell_quote(&bin),
         ),
     )
@@ -2568,15 +2628,29 @@ pub fn assess_proxy_readiness(
 
     // Only an ABSENT binary is host prep's business, and only when this deploy is
     // allowed to prepare the host and the controller knows how.
-    let fixable = failure.binary_missing
-        && provisioning == ProxyProvisioning::Auto
-        && proxy.binary_install_ops().is_some();
-    if fixable {
-        Ok(ProxyReadiness::NeedsInstall)
-    } else {
-        Err(DeployExecError::ProxyIncompatible {
+    if !failure.binary_missing {
+        // A responding binary whose CLI surface drifted: never ours to replace.
+        return Err(DeployExecError::ProxyIncompatible {
             message: failure.message,
-        })
+        });
+    }
+    match (provisioning, proxy.binary_install_ops()) {
+        (ProxyProvisioning::Auto, Some(_)) => Ok(ProxyReadiness::NeedsInstall),
+        // The host COULD have been prepared, but the operator declined it. Say which
+        // setting is in force, so the message names the reason this deploy stopped
+        // rather than describing the branch that is not running.
+        (ProxyProvisioning::Disabled, _) => Err(DeployExecError::ProxyIncompatible {
+            message: format!(
+                "{} (`[deploy] install_proxy = false` declines host preparation, so this \
+                 deploy will not install it for you)",
+                failure.message,
+            ),
+        }),
+        // The controller has no installer at all (it expects its binary to arrive
+        // some other way): report the missing binary unchanged.
+        (ProxyProvisioning::Auto, None) => Err(DeployExecError::ProxyIncompatible {
+            message: failure.message,
+        }),
     }
 }
 
@@ -3660,15 +3734,29 @@ mod tests {
                 && migrate < pos("proxy-route").expect("proxy is routed"),
             "migrations must precede the readiness gate and the route: {labels:?}"
         );
-        // The env file the one-shot reads must already exist.
-        assert!(
-            exec.calls().iter().any(|c| matches!(
-                c,
-                RecordedCall::Upload { remote_path, .. }
-                    if remote_path == "/srv/autumn/myapp/shared/autumn.env"
-            )),
-            "the migrate one-shot's EnvironmentFile is uploaded before it runs"
-        );
+        // The env file the one-shot reads, and the binary it runs, must be uploaded
+        // BEFORE it — an existence check alone would stay green if either upload
+        // moved after the migration.
+        let calls = exec.calls();
+        let migrate_call = calls
+            .iter()
+            .position(|c| c.run_label() == Some("migrate"))
+            .expect("migrate is recorded");
+        for path in [
+            "/srv/autumn/myapp/shared/autumn.env",
+            "/srv/autumn/myapp/releases/20260714T120000Z/myapp",
+        ] {
+            let uploaded = calls
+                .iter()
+                .position(|c| {
+                    matches!(c, RecordedCall::Upload { remote_path, .. } if remote_path == path)
+                })
+                .unwrap_or_else(|| panic!("{path} is uploaded"));
+            assert!(
+                uploaded < migrate_call,
+                "{path} must be in place before the migrate one-shot runs: {calls:?}"
+            );
+        }
         // The same real, blocking one-shot the redeploy path uses: `--wait` is what
         // makes a failed migration stop `run_ops` before anything takes traffic.
         let shell = exec.shell_for("migrate").expect("migrate ran");
@@ -6464,6 +6552,46 @@ mod tests {
             }
             other => panic!("expected ProxyIncompatible, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pre_migrate_labels_match_both_builders() {
+        // `PRE_MIGRATE_LABELS` is what lets the fleet summary stop claiming a
+        // migration ran on a rollout that died while uploading. It is only true if
+        // it actually matches the builders, so derive the real pre-`migrate` prefix
+        // from both and check it — a moved, added or renamed op fails HERE rather
+        // than making the summary lie at 3 a.m.
+        let first = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let redeploy = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        for (path, ops) in [("first deploy", &first), ("redeploy", &redeploy)] {
+            let labels: Vec<&str> = ops.iter().map(DeployOp::label).collect();
+            let migrate = labels
+                .iter()
+                .position(|l| *l == "migrate")
+                .unwrap_or_else(|| panic!("{path} runs a migration: {labels:?}"));
+            for label in &labels[..migrate] {
+                assert!(
+                    PRE_MIGRATE_LABELS.contains(label),
+                    "{path}: `{label}` runs before `migrate` but is missing from \
+                     PRE_MIGRATE_LABELS — a host that failed there would be reported as \
+                     having moved the schema"
+                );
+            }
+            for label in &labels[migrate..] {
+                assert!(
+                    !PRE_MIGRATE_LABELS.contains(label),
+                    "{path}: `{label}` runs at or after `migrate` but is listed as \
+                     PRE-migrate — a host that failed there would be reported as NOT \
+                     having moved the schema, which is the dangerous direction"
+                );
+            }
+        }
+        // The driver splices host preparation ahead of everything (#1607), so it is
+        // pre-migrate too even though no builder emits it.
+        assert!(failed_before_migrating("install-proxy"));
+        // Anything unrecognised errs toward "the schema may have moved".
+        assert!(!failed_before_migrating("readiness-gate"));
+        assert!(!failed_before_migrating("some-future-op"));
     }
 
     // ── Host preparation: provisioning the proxy binary (#1607, AC-1) ────────

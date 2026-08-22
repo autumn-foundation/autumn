@@ -242,8 +242,9 @@ You have a working single-host deploy. Here is the whole change.
 
 Each new host needs exactly what the first one needed
 ([Preconditions](deployment.md#preconditions)): key-based SSH access for
-`[deploy] user`, and the `kamal-proxy` binary at `/usr/local/bin/kamal-proxy`.
-Nothing else — the release layout, units and directories are created for you.
+`[deploy] user`. Nothing else — the reverse-proxy binary, release layout, units
+and directories are all created for you, per host, on its own turn in the rollout
+(see [Host preparation](deployment.md#host-preparation-install_proxy)).
 
 ### 2. Move the shared state off the app host
 

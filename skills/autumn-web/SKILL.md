@@ -2162,6 +2162,18 @@ host = "203.0.113.10"                            # ONE server
 # hosts = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]   # …or a FLEET (#1621)
 ```
 
+The only target-host precondition is **key-based SSH as a root-equivalent user**
+(#1607). `deploy up` PREPARES the host: it probes read-only for a working
+kamal-proxy and, on a host that has none, installs the digest-pinned build at
+`/usr/local/bin/kamal-proxy` — which also installs, and leaves behind, any of
+`curl` and a container runtime the host lacks (kamal-proxy ships only as an
+image). A host that already has a working proxy is untouched; one whose proxy
+responds but has drifted is never replaced (hard refusal). Preparation is
+Debian/Ubuntu-only and needs outbound HTTPS. Tell users to set `[deploy]
+install_proxy = false` (or `AUTUMN_DEPLOY__INSTALL_PROXY=false`) if they
+provision the proxy themselves or are on another distro. In a fleet it runs as
+the first op of each host's own turn, never during the all-hosts probe phase.
+
 `host` and `hosts` are **mutually exclusive** (both set = refused), blank and
 duplicate entries are refused, and **the `hosts` order IS the rollout order**.
 `AUTUMN_DEPLOY__HOSTS` is the CSV env override and replaces the whole list. Env
@@ -2175,14 +2187,12 @@ With `hosts`, `deploy up` rolls the fleet **one host at a time** in declaration
 order — each host runs the unchanged per-host blue/green cutover against its own
 kamal-proxy and must finish before the next starts, so the rest of the fleet
 keeps serving. One release id per run. **Migrations run exactly once**, on the
-first host still on a previous release, before its cutover; an all-first-deploy
-fleet migrates nowhere and warns, naming `autumn migrate`. **When a user adds
-hosts to an existing fleet, tell them to list the already-deployed host(s)
-first**: a first-deploy host ahead of the migrating host cuts over with no
-migrate step, so it serves the new release against the OLD schema until the
-rollout reaches the migrating host. The rollout warns by name (it never reorders
-the list — declaration order is the contract), and the warning is gated on a
-writable DB URL being resolvable locally. A failure **halts**
+**first host in rollout order** whatever its mode, before its cutover — so the
+schema always moves before ANY host takes traffic on the new release. A first
+deploy migrates too (#1607), so a brand-new fleet migrates on host 1 rather than
+migrating nowhere: there is no out-of-band `autumn migrate` step to tell users
+about, and rollout order is no longer load-bearing for migration safety. A
+failure **halts**
 the rollout and (by default) rolls the already-cut-over hosts back in reverse
 order — except post-cutover housekeeping failures (`record-proxy-options`,
 `drain-old`, `prune`), which leave the host live and healthy so the rollout warns
@@ -2198,10 +2208,12 @@ leaves that host forward, so it takes the first note, and both can print
 together); nothing forward and nothing compensated, because the migrating host
 failed after `migrate` but before its cutover and tore its own candidate down →
 `no host is serving the new release, but the migration that already ran was NOT
-rolled back …`. An all-first-deploy fleet migrates nowhere and prints none of
-them. **A failed SINGLE-host deploy prints no summary and so warns about none of
-this** (known gap, #2276) — if a user's one-host `deploy up` failed, tell them to
-check `autumn migrate status` before assuming nothing was applied.
+rolled back …`. A rollout that died BEFORE its migration (a failed host
+preparation or upload) prints none of them. **A failed SINGLE-host deploy prints
+no summary and so warns about none of this** (known gap, #2276) — if a user's
+one-host `deploy up` failed, tell them to check `autumn migrate status` before
+assuming nothing was applied. That now includes a failed FIRST deploy, which
+migrates before it starts the release.
 `--only <HOST>` (repeatable, `up` and `rollback`) is a repair lever
 that warns about a mixed fleet; `--no-rollback` halts and freezes instead.
 `--only` narrowed to ONE host takes the single-host path: `deploy rollback --only

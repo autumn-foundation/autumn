@@ -67,6 +67,30 @@ pub const KAMAL_PROXY_UNIT_PATH: &str = "/etc/systemd/system/kamal-proxy.service
 /// the version to pin to when the compat probe fails on an existing install.
 pub const KAMAL_PROXY_KNOWN_GOOD_VERSION: &str = "v0.9.2";
 
+/// Content digest of the `basecamp/kamal-proxy` image
+/// [`KAMAL_PROXY_KNOWN_GOOD_VERSION`] named when this constant was last verified
+/// (an OCI image index covering linux/amd64 and linux/arm64).
+///
+/// Host preparation pulls `…:{version}@{digest}`, never the bare tag. A Docker Hub
+/// tag is MUTABLE — whatever it resolves to at pull time would become a
+/// root-executed binary at [`KAMAL_PROXY_BIN`] on every bare host — and `docker
+/// create` will happily reuse a poisoned *local* image under that tag without ever
+/// contacting the registry. Digest-pinning closes both: the daemon verifies the
+/// manifest digest on pull and on local lookup, so a re-pushed tag fails the
+/// install instead of silently replacing the binary.
+///
+/// Bump this together with [`KAMAL_PROXY_KNOWN_GOOD_VERSION`], and only after
+/// re-reading the digest from the registry for the new tag:
+///
+/// ```text
+/// T=$(curl -sS "https://auth.docker.io/token?service=registry.docker.io&scope=repository:basecamp/kamal-proxy:pull" | jq -r .token)
+/// curl -sSI -H "Authorization: Bearer $T" \
+///   -H "Accept: application/vnd.oci.image.index.v1+json" \
+///   https://registry-1.docker.io/v2/basecamp/kamal-proxy/manifests/<tag> | grep -i docker-content-digest
+/// ```
+pub const KAMAL_PROXY_KNOWN_GOOD_DIGEST: &str =
+    "sha256:826a6f66c6ba26ac26197ac8755804403c9bb617b90cfac25c7972154c5328ab";
+
 /// The exact `deploy`-subcommand flags [`KamalProxyController::deploy_shell`]
 /// emits on every route/flip. These ARE the cutover contract: if a future
 /// kamal-proxy renames or removes one of them, a real cutover would break with no
@@ -267,6 +291,17 @@ pub trait ProxyController {
     fn binary_install_ops(&self) -> Option<Vec<DeployOp>> {
         None
     }
+
+    /// One line naming what [`Self::binary_install_ops`] is about to do to the
+    /// operator's server, printed before the install runs.
+    ///
+    /// Host preparation is the one part of a deploy that changes the target beyond
+    /// the app, so it is announced rather than merely logged as an op label — and
+    /// the announcement belongs to the controller that owns the ops, not to the
+    /// driver, which knows nothing about which proxy it is driving.
+    fn binary_install_note(&self) -> String {
+        "installing the reverse-proxy binary".to_owned()
+    }
 }
 
 /// [`ProxyController`] backed by [kamal-proxy](https://github.com/basecamp/kamal-proxy).
@@ -408,6 +443,17 @@ impl KamalProxyController {
     /// (`scripts/deploy-real-vps-validate.sh`). Kamal itself installs a container
     /// runtime on the target during `kamal setup` for the same reason.
     ///
+    /// # Never replaces an existing binary
+    ///
+    /// The whole op is gated on the compat probe reporting no usable binary, but the
+    /// verdict is an INFERENCE from `--help` output: a `kamal-proxy` that resolves
+    /// through a different `PATH` entry, or a future release whose CLI surface drifted
+    /// so far that no required flag rendered, both classify as "no binary". Neither is
+    /// ours to overwrite — the binary may be shared with another service on the host —
+    /// so the invariant is ENFORCED here rather than merely inferred upstream: the op
+    /// refuses outright when anything already exists at the target path. The operator
+    /// then gets that message instead of a silently downgraded proxy.
+    ///
     /// # What it does, in order
     ///
     /// 1. install the two host packages a deploy needs and a minimal image may
@@ -432,9 +478,14 @@ impl KamalProxyController {
     /// `curl`, exactly as it was before host preparation existed.
     fn install_shell() -> String {
         let pin = KAMAL_PROXY_KNOWN_GOOD_VERSION;
+        let digest = KAMAL_PROXY_KNOWN_GOOD_DIGEST;
         let bin = KAMAL_PROXY_BIN;
         format!(
-            "set -e; \
+            "( set -e; \
+             if [ -e '{bin}' ]; then \
+             echo 'kamal-proxy is already installed at {bin}; refusing to replace it' >&2; \
+             exit 1; \
+             fi; \
              need=''; \
              command -v curl >/dev/null 2>&1 || need=\"$need curl\"; \
              command -v docker >/dev/null 2>&1 || need=\"$need docker.io\"; \
@@ -444,13 +495,19 @@ impl KamalProxyController {
              apt-get install -y -qq --no-install-recommends $need; \
              fi; \
              systemctl start docker >/dev/null 2>&1 || true; \
-             cid=$(docker create 'basecamp/kamal-proxy:{pin}'); \
+             cid=$(docker create 'basecamp/kamal-proxy:{pin}@{digest}'); \
              docker cp \"$cid:/usr/local/bin/kamal-proxy\" '{bin}.autumn-new'; \
              docker rm -f \"$cid\" >/dev/null 2>&1 || true; \
              chmod 755 '{bin}.autumn-new'; \
              mv -f '{bin}.autumn-new' '{bin}'; \
              '{bin}' deploy --help >/dev/null 2>&1 || {{ \
-             echo 'installed kamal-proxy is not usable' >&2; exit 1; }}"
+             echo 'the installed kamal-proxy does not run on this host' >&2; exit 1; }} \
+             ) || {{ \
+             echo 'autumn deploy could not prepare this host with kamal-proxy {pin}. It needs \
+an apt-based (Debian/Ubuntu) host, outbound HTTPS to the distro mirrors and to Docker Hub, and \
+an SSH user that can install packages. Install kamal-proxy {pin} at {bin} yourself and set \
+`[deploy] install_proxy = false` in autumn.toml to skip this step.' >&2; \
+             exit 1; }}"
         )
     }
 
@@ -726,6 +783,15 @@ impl ProxyController for KamalProxyController {
         ))])
     }
 
+    fn binary_install_note(&self) -> String {
+        format!(
+            "no kamal-proxy on this host — installing {KAMAL_PROXY_KNOWN_GOOD_VERSION} at \
+             {KAMAL_PROXY_BIN}, from the pinned basecamp/kamal-proxy image. This also \
+             installs, and leaves behind, any of `curl` and a container runtime the host \
+             is missing. Decline with `[deploy] install_proxy = false`."
+        )
+    }
+
     fn compat_probe(&self) -> Option<ProxyCompatProbe> {
         // Capture the required flag set (which depends on this controller's TLS
         // config) into the pure verdict closure, so the probe is self-contained
@@ -774,12 +840,13 @@ impl KamalProxyCompatIssue {
         match self {
             Self::BinaryUnusable => format!(
                 "the kamal-proxy binary at `{KAMAL_PROXY_BIN}` did not respond to \
-                 `kamal-proxy deploy --help` (missing or not executable). `autumn \
-                 deploy` installs it for you (pin {pin}) unless `[deploy] \
-                 install_proxy = false` declines host preparation; with it declined, \
-                 install a known-good kamal-proxy on the target yourself — see \
-                 scripts/deploy-real-vps-validate.sh. Aborting before any cutover, so \
-                 live traffic was not touched."
+                 `kamal-proxy deploy --help` (missing or not executable). Install \
+                 kamal-proxy {pin} there — e.g. `docker create \
+                 basecamp/kamal-proxy:{pin}` then `docker cp \
+                 <id>:/usr/local/bin/kamal-proxy {KAMAL_PROXY_BIN} && chmod 755 \
+                 {KAMAL_PROXY_BIN}` — or let `autumn deploy` install it for you by \
+                 leaving `[deploy] install_proxy` at its default `true`. Aborting \
+                 before any cutover, so live traffic was not touched."
             ),
             Self::DeploySubcommandMissing => format!(
                 "the installed kamal-proxy has no `deploy` subcommand — the CLI \
@@ -1751,14 +1818,59 @@ mod tests {
             "the binary is staged, marked executable, then moved into place: {shell}"
         );
         assert!(
-            shell.starts_with("set -e;"),
+            shell.starts_with("( set -e;"),
             "any failing step must fail the whole op: {shell}"
+        );
+        // Digest-pinned, so a re-pushed tag (or a poisoned local image) cannot
+        // become a root-executed binary on the target.
+        assert!(
+            shell.contains(&format!(
+                "{KAMAL_PROXY_KNOWN_GOOD_VERSION}@{KAMAL_PROXY_KNOWN_GOOD_DIGEST}"
+            )),
+            "the image is pinned by DIGEST, not just by tag: {shell}"
+        );
+        // Never clobbers: the invariant is enforced at the point of action, not
+        // merely inferred from the probe verdict upstream.
+        assert!(
+            shell.contains(&format!("if [ -e '{KAMAL_PROXY_BIN}' ]"))
+                && shell.contains("refusing to replace it"),
+            "the install must refuse to replace an existing binary: {shell}"
+        );
+        // Any failure carries the remedy — this is the most likely new failure on a
+        // stock host, and the raw apt/docker stderr alone says nothing useful.
+        assert!(
+            shell.contains("install_proxy = false") && shell.contains("outbound HTTPS"),
+            "a failed install must name what the host needs and the opt-out: {shell}"
+        );
+    }
+
+    #[test]
+    fn the_install_op_is_a_valid_posix_shell_script() {
+        // The install shell is the one op with no PR-time end-to-end coverage (the
+        // container fixture bakes kamal-proxy in, so the e2e always takes the
+        // already-equipped path, and only the nightly real-VPS job runs it for
+        // real). A syntax check is cheap and catches the whole class of quoting and
+        // structure regressions on every PR.
+        let shell = KamalProxyController::install_shell();
+        let out = std::process::Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(&shell)
+            .output()
+            .expect("spawn sh -n");
+        assert!(
+            out.status.success(),
+            "the generated install shell must parse as POSIX sh:\n{shell}\n--- sh said ---\n{}",
+            String::from_utf8_lossy(&out.stderr)
         );
         // Self-verifying: an install that lands nothing usable fails HERE rather
         // than at the first cutover.
         assert!(
-            shell.contains("deploy --help >/dev/null 2>&1 ||"),
-            "the install proves the binary it landed actually works: {shell}"
+            shell.contains(&format!(
+                "'{KAMAL_PROXY_BIN}' deploy --help >/dev/null 2>&1 ||"
+            )),
+            "the install proves the binary at the SUPERVISED path works — verifying \
+             the staging path would prove nothing about what was installed: {shell}"
         );
     }
 }

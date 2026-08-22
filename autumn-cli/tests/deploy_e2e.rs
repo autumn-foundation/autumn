@@ -664,12 +664,17 @@ fn deploy_e2e_full_lifecycle() {
         "the first deploy must run its pending migrations (#1607, AC-3)"
     );
     // …and it ran BEFORE the release was started, so the app never boots against a
-    // schema that was never applied. The deploy echoes each op label as it runs.
+    // schema that was never applied. The deploy echoes each op as `  → {label}` as
+    // it runs; match THAT form, not a bare substring — the preflight report printed
+    // earlier in the same stream contains a `migrate_check` grader line, and
+    // searching for "migrate" would find it instead and make this assertion pass
+    // for any op ordering whatsoever.
+    let op_line = |label: &str| format!("\u{2192} {label}\n");
     let migrate_at = first_deploy_log
-        .find("migrate")
+        .find(&op_line("migrate"))
         .expect("the first deploy logs its migrate op");
     let start_at = first_deploy_log
-        .find("enable-now")
+        .find(&op_line("enable-now"))
         .expect("the first deploy logs its app start");
     assert!(
         migrate_at < start_at,
