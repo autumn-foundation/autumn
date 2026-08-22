@@ -184,8 +184,9 @@ pub fn install_locale_defaults(default_locale: &str, chain: Vec<String>) {
 
 /// The process-wide fallback chain installed by [`install_locale_defaults`].
 ///
-/// Empty when nothing has been installed; [`effective_chain`] is what
-/// resolution actually walks.
+/// Empty when nothing has been installed — resolution itself never walks an
+/// empty chain, falling back to the default locale instead (see
+/// [`default_locale_snapshot`]).
 #[must_use]
 pub fn fallback_chain_snapshot() -> Vec<String> {
     DEFAULTS
@@ -195,8 +196,10 @@ pub fn fallback_chain_snapshot() -> Vec<String> {
         .map_or_else(Vec::new, |d| d.chain.to_vec())
 }
 
-/// The process-wide default locale, or [`LAST_RESORT_LOCALE`] when none was
-/// installed.
+/// The process-wide default locale, or `"en"` when none was installed.
+///
+/// The locale a write with no ambient scope lands in, and the one a legacy
+/// plain-text column is attributed to.
 #[must_use]
 pub fn default_locale_snapshot() -> Arc<str> {
     DEFAULTS

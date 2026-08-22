@@ -826,7 +826,8 @@ where
 ///
 /// # Cost
 ///
-/// Unlike [`HttpInterceptorLayer`](crate::router::HttpInterceptorLayer) this
+/// Unlike the framework's other hand-rolled request-scope layers (which return
+/// a named `TaskLocalFuture` and never allocate), this
 /// layer boxes its future: resolving the locale means running an `async`
 /// extractor (the session lookup step is async) before the inner service is
 /// called, so there is a genuine `await` to suspend on either way. It is
