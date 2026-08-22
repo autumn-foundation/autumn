@@ -1213,8 +1213,13 @@ mod tests {
         assert!(emitted.contains("comment_thread"));
         assert!(emitted.contains("delete_comment"));
         // The author guard is what turns a typo'd `by` into a name-resolution
-        // error rather than silence.
-        assert!(emitted.contains("PhantomData"));
+        // error rather than silence — and now also a UUID-keyed author into a
+        // compile error rather than a 401 from every authenticated POST.
+        assert!(emitted.contains("CommentAuthorKey"), "the author key bound");
+        assert!(
+            emitted.contains("author_pk") || emitted.contains("id"),
+            "read through the author's key field"
+        );
     }
 
     /// A model with neither a tenant nor a soft-delete column must emit no
