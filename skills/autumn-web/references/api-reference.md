@@ -220,7 +220,9 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `#[lock_version]`, `#[position]`, `#[serde(rename)]` and
   `#[diesel(column_name)]`. `Option<Translated>` is a compile error — the empty
   container already means "no translation". A pre-existing plain-text column can
-  be declared `#[translatable]` with **no data migration**.
+  be declared `#[translatable]` with **no data migration**; keys are never gated
+  on locale-tag shape, so every key an app can write round-trips through the
+  column.
 - `#[normalize(trim, downcase, upcase, squish, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`

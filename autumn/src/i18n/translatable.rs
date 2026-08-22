@@ -37,8 +37,9 @@
 //!   default locale's translation (see [`Translated::decode_column`]), so an
 //!   existing plain-text column can be declared `#[translatable]` with no data
 //!   backfill. The flip side is that a column already holding a JSON
-//!   string-map of *something else* would be read as translations; declare
-//!   `#[translatable]` only on columns that hold human-readable text.
+//!   string-map of *something else* is read as translations (values preserved,
+//!   but keyed by whatever that object used); declare `#[translatable]` only on
+//!   columns that hold human-readable text.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -503,18 +504,36 @@ impl Translated {
 
     /// Decode a stored column value.
     ///
-    /// A JSON object is the translation map when **every key looks like a
-    /// locale tag and every value is a string**. Any other content — bare text
-    /// from before the column was declared translatable, a JSON scalar, an
-    /// object of some other shape, malformed JSON — is taken as
-    /// `default_locale`'s translation, so a plain-text column upgrades in place
-    /// with no backfill and a read can never fail.
+    /// A JSON object whose values are **all strings** is the translation map.
+    /// Any other content — bare text from before the column was declared
+    /// translatable, a JSON scalar or array, an object with a non-string value,
+    /// malformed JSON — is taken as `default_locale`'s translation, so a
+    /// plain-text column upgrades in place with no backfill and a read can
+    /// never fail.
     ///
-    /// The key check is what keeps the upgrade path from misreading a column
-    /// that already held an unrelated JSON string-map (`{"host": "db1"}`) as
-    /// translations. It cannot be airtight — `{"en": "…"}` is a plausible
-    /// non-translation map too — so declare `#[translatable]` only on columns
-    /// that hold human-readable text.
+    /// # Why keys are not inspected
+    ///
+    /// An earlier revision also required every key to *look like* a locale tag,
+    /// to keep a column that already held an unrelated JSON string-map
+    /// (`{"host": "db1"}`) from being read as translations. That heuristic is
+    /// deliberately gone, because it made the two directions disagree: any key
+    /// the writer accepted but the shape test rejected — `en_US`, a four-letter
+    /// BCP-47 primary subtag, an app's own convention — made the **whole**
+    /// container decode as legacy text, hiding every translation and letting
+    /// the next save escape the JSON into the column permanently. That is data
+    /// corruption from one odd key.
+    ///
+    /// Dropping the key test trades it for a strictly milder failure: a column
+    /// that genuinely held a JSON object of strings before the attribute was
+    /// added now reads as a container. Its values are **preserved** — they are
+    /// simply keyed by whatever the object used, so `resolve` finds nothing and
+    /// the field renders as the empty sentinel until the app rewrites it.
+    /// Recoverable, and it only happens on a column that was never
+    /// human-readable text — which the guide already says not to declare
+    /// `#[translatable]`.
+    ///
+    /// The invariant this buys is total: **every key `set` accepts round-trips
+    /// through the column**, for any string whatsoever.
     #[must_use]
     pub fn decode_column(raw: &str, default_locale: &str) -> Self {
         if raw.is_empty() {
@@ -524,7 +543,7 @@ impl Translated {
             let mut values = BTreeMap::new();
             for (k, v) in obj {
                 match v {
-                    serde_json::Value::String(s) if looks_like_locale_tag(&k) => {
+                    serde_json::Value::String(s) => {
                         values.insert(k, s);
                     }
                     // Not a translation map after all — treat the whole column
@@ -536,53 +555,6 @@ impl Translated {
         }
         Self::from_pairs([(default_locale, raw)])
     }
-}
-
-/// Whether `key` has the shape of a BCP-47 language tag, in either of the two
-/// forms that can appear as a locale: a **langtag** (`en`, `es-MX`,
-/// `zh-Hant-TW`) — a 2-3 letter primary subtag followed by `-`-joined
-/// alphanumeric subtags of 1-8 characters — or a **singleton-led** tag, which
-/// covers private use (`x-private`) and the grandfathered irregular forms
-/// (`i-klingon`).
-///
-/// Deliberately a shape test, not a registry lookup: a private-use or
-/// not-yet-registered tag must still round-trip. The rule this function exists
-/// to uphold is that **whatever [`Translated::set`] accepts,
-/// [`Translated::decode_column`] must recognise on the way back** — a key the
-/// writer stores and the reader rejects makes the whole container decode as
-/// legacy text, hiding every translation and letting the next save escape the
-/// JSON into the column permanently.
-///
-/// # Known limits
-///
-/// BCP-47 also permits 4-8 letter primary subtags (reserved and registered
-/// ranges, essentially unused in practice). They are **not** accepted here:
-/// admitting them would also admit ordinary English words like `host` or
-/// `name`, and this test's other job is to keep a column that already held an
-/// unrelated JSON string-map from being mistaken for translations. Two-letter
-/// keys are inherently ambiguous (`{"db": "primary"}` reads as a translation
-/// map) — the test cannot be airtight, which is why `#[translatable]` belongs
-/// only on columns that hold human-readable text.
-fn looks_like_locale_tag(key: &str) -> bool {
-    let mut parts = key.split('-');
-    let Some(primary) = parts.next() else {
-        return false;
-    };
-    let mut rest = parts.peekable();
-    if primary.len() == 1 {
-        // Singleton-led: `x-…` (private use) and `i-…` (grandfathered
-        // irregular). A bare singleton with no subtag is not a tag.
-        let Some(byte) = primary.bytes().next() else {
-            return false;
-        };
-        if !matches!(byte.to_ascii_lowercase(), b'x' | b'i') || rest.peek().is_none() {
-            return false;
-        }
-    } else if !(2..=3).contains(&primary.len()) || !primary.bytes().all(|b| b.is_ascii_alphabetic())
-    {
-        return false;
-    }
-    rest.all(|p| (1..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// Renders the active locale's value, or the empty string when the fallback
@@ -749,7 +721,6 @@ mod tests {
         Translated, fallback_chain_snapshot, install_locale_defaults, with_locale,
         with_locale_chain_sync,
     };
-    use super::looks_like_locale_tag;
 
     fn chain(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
@@ -941,47 +912,38 @@ mod tests {
         assert_eq!(after.get("en"), None, "assignment is replace, not merge");
     }
 
+    /// A column that genuinely held an unrelated JSON string-map before the
+    /// attribute was added now decodes as a container. The values are
+    /// **preserved** — the documented, milder half of the trade-off that buys
+    /// the total round-trip guarantee below.
     #[test]
-    fn locale_tag_shape_gates_the_translation_map_decoding() {
-        for tag in [
-            "en",
-            "es-MX",
-            "zh-Hant-TW",
-            // BCP-47 private use and the grandfathered irregular forms are
-            // singleton-led. `set` accepts them, so decoding must too.
-            "x-private",
-            "i-klingon",
-            "X-Private",
-        ] {
-            assert!(looks_like_locale_tag(tag), "{tag} should be tag-shaped");
-        }
-        for not_a_tag in [
-            "host",
-            "a",
-            "",
-            "en_US",
-            "x",
-            "i",
-            "q-",
-            "-en",
-            "en-toolongsubtag",
-        ] {
-            assert!(
-                !looks_like_locale_tag(not_a_tag),
-                "{not_a_tag} should not be tag-shaped"
-            );
-        }
-        // An unrelated JSON string-map in a column that predates the attribute
-        // is read as text, not mistaken for translations.
+    fn an_unrelated_json_string_map_decodes_as_a_container_without_losing_values() {
         let t = Translated::decode_column("{\"host\":\"db1\"}", "en");
-        assert_eq!(t.get("en"), Some("{\"host\":\"db1\"}"));
+        assert_eq!(t.get("host"), Some("db1"), "values are never dropped");
+        // It resolves to nothing under any real locale, so the field renders
+        // the empty sentinel rather than leaking a config value as prose.
+        let rendered = with_locale_chain_sync("en", chain(&["en"]), || t.to_string());
+        assert_eq!(rendered, "");
     }
 
-    /// The invariant behind `looks_like_locale_tag`: anything `set` accepts has
-    /// to survive `encode_column` -> `decode_column`. A key the writer stores
-    /// and the reader rejects makes the WHOLE container decode as legacy text —
-    /// every translation goes unreachable, and the next save escapes the JSON
-    /// into the column permanently.
+    /// An object with a non-string value is still not a container — that is
+    /// what keeps genuine prose that happens to be JSON from being shredded.
+    #[test]
+    fn an_object_with_a_non_string_value_is_still_read_as_text() {
+        let t = Translated::decode_column("{\"en\":42}", "en");
+        assert_eq!(t.get("en"), Some("{\"en\":42}"));
+    }
+
+    /// The invariant `decode_column` now guarantees **totally**: anything `set`
+    /// accepts survives `encode_column` -> `decode_column`. A key the writer
+    /// stores and the reader rejects would make the WHOLE container decode as
+    /// legacy text — every translation unreachable, and the next save escaping
+    /// the JSON into the column permanently.
+    ///
+    /// The list deliberately includes keys that are **not** well-formed BCP-47
+    /// (`en_US`, `host`, a four-letter primary subtag): the guarantee is about
+    /// what `set` accepts, not about what is a valid locale, because those are
+    /// exactly the keys an earlier key-shape heuristic silently corrupted.
     #[test]
     fn every_writable_locale_tag_survives_a_column_round_trip() {
         for tag in [
@@ -993,6 +955,11 @@ mod tests {
             "sgn-BE-FR",
             "x-private",
             "i-klingon",
+            // Not well-formed, but writable — and therefore must round-trip.
+            "en_US",
+            "host",
+            "qaai",
+            "SOME_APP_CONVENTION",
         ] {
             let mut written = Translated::new();
             written.set(tag, "value");

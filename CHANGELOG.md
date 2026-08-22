@@ -51,9 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it as **safe**, with no new operation type and no backfill job. A stored value
   that is not a JSON object of strings reads as the default locale's
   translation, so an existing plain-text column can be declared `#[translatable]`
-  with **no data migration** — an object is read as translations only when every
-  key has the shape of a locale tag and every value is a string, so a column
-  already holding an unrelated JSON string-map is not mistaken for one. Purely
+  with **no data migration** (an object is read as translations when every value
+  is a string; keys are not inspected, so every key an app can write is
+  guaranteed to round-trip). Purely
   additive and opt-in per field: a model without the attribute is unchanged
   apart from an empty `__AUTUMN_TRANSLATABLE_COLUMNS` constant, and the UI `t!`
   path is untouched. `autumn generate model` enables autumn-web's non-default

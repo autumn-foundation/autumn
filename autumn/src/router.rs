@@ -5010,7 +5010,32 @@ pub fn try_build_router_with_static_inner(
         custom_layers_require_fail_closed_idempotency(&ctx.custom_layers)
             || custom_layers_require_fail_closed_idempotency(&ctx.static_gate_layers),
     );
-    let custom_layers = std::mem::take(&mut ctx.custom_layers);
+    let mut custom_layers = std::mem::take(&mut ctx.custom_layers);
+
+    // #1384: the ambient-locale layer must NOT drain out with the rest. It runs
+    // `Locale::from_request_parts`, whose session step reads the signed session
+    // — and everything drained here is applied OUTSIDE the static-first
+    // middleware, i.e. outside `SessionLayer`. Out there the session extension
+    // does not exist yet, so a locale persisted by the documented
+    // `set_locale_in_session` switcher would be invisible and content would
+    // silently resolve from `Accept-Language` instead, disagreeing with the UI
+    // chrome on the same page. A handler that deliberately takes no `Locale`
+    // argument — the whole point of the feature — never runs an extractor later
+    // to correct it either.
+    //
+    // Putting it back on the inner router's context lands it in
+    // `apply_middleware`'s merged tuple, which is INSIDE `session_layer` on
+    // both this path and the fully-dynamic one. The bundle `Extension` still
+    // drains out and is therefore still outer, so the layer can read it.
+    #[cfg(feature = "i18n")]
+    {
+        let (session_scoped, outside): (Vec<_>, Vec<_>) = custom_layers
+            .into_iter()
+            .partition(|r| r.type_id == std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>());
+        ctx.custom_layers = session_scoped;
+        custom_layers = outside;
+    }
+    let custom_layers = custom_layers;
 
     // Pre-static gate layers (AppBuilder::static_gate) are likewise extracted
     // and applied OUTSIDE the static-first middleware (the outermost layer of

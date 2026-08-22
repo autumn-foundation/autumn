@@ -371,8 +371,16 @@ struct FieldAttrs {
     is_indexed: bool,
     is_unique: bool,
     is_default: bool,
+    /// `#[translatable]` (issue #1384). The type lowers to plain `Text`, so
+    /// this marker is the only carrier of the column's empty-container default.
+    is_translatable: bool,
     reference: ReferenceSpec,
 }
+
+/// The SQL default a `#[translatable]` column's storage requires — the empty
+/// JSON container. Kept identical to `dsl::Field::sql_default`, which is what
+/// `generate model` writes into the migration.
+const TRANSLATABLE_COLUMN_DEFAULT: &str = "'{}'";
 
 fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
     let mut out = FieldAttrs {
@@ -380,6 +388,7 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
         is_indexed: false,
         is_unique: false,
         is_default: false,
+        is_translatable: false,
         reference: ReferenceSpec::None,
     };
     for attr in &field.attrs {
@@ -395,6 +404,13 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
             // with `#[default]`, so a hand-written `created_at` WITHOUT the marker
             // gets no inferred NOW() default.
             "default" => out.is_default = true,
+            // #1384: the per-locale container column is `TEXT NOT NULL` with an
+            // empty-JSON-object default. The type alone does not carry that —
+            // `Translated` lowers to plain `Text` — so the marker has to be
+            // recorded here or the declarative lane emits `ADD COLUMN … TEXT NOT
+            // NULL` with no DEFAULT: potentially blocking on Postgres, and
+            // refused outright by `emit_add_column` on SQLite.
+            "translatable" => out.is_translatable = true,
             "references" => {
                 let mut target = None;
                 if !matches!(attr.meta, syn::Meta::Path(_)) {
@@ -533,6 +549,15 @@ fn build_table(
         // their value lives in the migration, not the struct.
         column.default = column
             .default
+            .or_else(|| {
+                // #1384: a `#[translatable]` column's empty-container default is
+                // part of its storage contract, not a convention — carry it into
+                // the schema IR so a declarative `ADD COLUMN` matches what
+                // `generate model` emits (`TEXT NOT NULL DEFAULT '{}'`).
+                raw.attrs
+                    .is_translatable
+                    .then(|| ColumnDefault::Sql(TRANSLATABLE_COLUMN_DEFAULT.to_owned()))
+            })
             .or_else(|| convention_default(&raw.name, &ty, is_pk, raw.attrs.is_default, backend));
 
         // Foreign key: infer the target table from the generator's convention
@@ -722,6 +747,55 @@ mod tests {
             .iter()
             .find(|c| c.name == name)
             .unwrap_or_else(|| panic!("column `{name}` not found in {:?}", table.name))
+    }
+
+    /// #1384: `Translated` lowers to plain `Text`, so the type alone cannot
+    /// carry the column's empty-container default. Without the `#[translatable]`
+    /// marker recorded here, a declarative `ADD COLUMN` would emit
+    /// `TEXT NOT NULL` with no DEFAULT — potentially blocking on Postgres and
+    /// refused outright on SQLite.
+    #[test]
+    fn translatable_column_carries_the_empty_container_default() {
+        let src = r#"
+            #[autumn_web::model]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                #[translatable]
+                pub title: autumn_web::i18n::Translated,
+                pub slug: String,
+            }
+        "#;
+        let table = parse_one(src);
+
+        let title = col(&table, "title");
+        assert_eq!(title.ty, ColumnType::Text, "storage is a plain TEXT column");
+        assert!(!title.nullable);
+        assert_eq!(
+            title.default,
+            Some(ColumnDefault::Sql("'{}'".to_owned())),
+            "the empty-container default is part of the storage contract"
+        );
+
+        // A plain column beside it is untouched.
+        let slug = col(&table, "slug");
+        assert_eq!(slug.ty, ColumnType::Text);
+        assert_eq!(slug.default, None);
+    }
+
+    /// The default is emitted for the marker, not for the type name: a field
+    /// that happens to be `Text` gains nothing.
+    #[test]
+    fn a_plain_text_column_gains_no_translatable_default() {
+        let src = r#"
+            #[autumn_web::model]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+            }
+        "#;
+        assert_eq!(col(&parse_one(src), "title").default, None);
     }
 
     #[test]

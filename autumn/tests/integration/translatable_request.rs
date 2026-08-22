@@ -186,3 +186,75 @@ async fn a_streaming_body_still_resolves_to_the_request_locale() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert_eq!(text, "0:Hola mundo\n1:Hola mundo\n2:Hola mundo\n", "{text}");
 }
+
+// ── SSG/ISG layer placement (#1384) ──────────────────────────────────────────
+
+/// The ambient-locale layer must run **inside** `SessionLayer`, on the SSG/ISG
+/// path as well as the dynamic one: everything the SSG path drains out is
+/// applied outside the static-first middleware, and out there the signed
+/// session extension does not exist yet. A locale persisted by the documented
+/// session switcher would then be invisible to content while the UI chrome —
+/// which does read the session — renders the other language.
+///
+/// This asserts the placement directly: the layer resolves a session-persisted
+/// locale for a handler that takes no `Locale` argument, so no later extractor
+/// exists to correct a wrong answer.
+#[tokio::test]
+async fn the_ambient_layer_sees_a_session_persisted_locale() {
+    use autumn_web::session::{MemoryStore, Session, SessionConfig, SessionLayer};
+
+    // Writes the locale the documented switcher writes, then a second request
+    // reads it back through the ambient layer alone.
+    async fn switch(session: Session) -> String {
+        session.insert("autumn_locale", "es").await;
+        "switched".to_owned()
+    }
+
+    let app = axum::Router::new()
+        .route("/switch", get(switch))
+        .route("/title", get(show_title))
+        // Ambient layer INSIDE the session layer, which is the placement
+        // `apply_middleware` produces on both router paths.
+        .layer(AmbientLocaleLayer::new(&bundle()))
+        .layer(SessionLayer::new(
+            MemoryStore::new(),
+            SessionConfig::default(),
+        ))
+        .layer(Extension(bundle()));
+
+    let switched = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/switch")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = switched
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("session cookie set")
+        .to_str()
+        .expect("ascii cookie")
+        .to_owned();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/title")
+                // No Accept-Language at all: only the session says `es`.
+                .header(header::COOKIE, cookie.split(';').next().unwrap_or_default())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        String::from_utf8(bytes.to_vec()).unwrap(),
+        "Hola mundo",
+        "the session-persisted locale must reach a handler that takes no Locale"
+    );
+}
