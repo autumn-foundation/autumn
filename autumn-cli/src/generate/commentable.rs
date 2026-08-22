@@ -743,6 +743,32 @@ fn migration_up_sql(project_root: &Path) -> Vec<String> {
 /// comments (commentable_type …)` in a migration's header, which is exactly the
 /// kind of thing a header explaining the shared table would contain — would
 /// otherwise read as the real table and make the generator emit nothing.
+/// Length of the `$tag$` opening a dollar-quoted literal, if `text` starts one.
+///
+/// `$$…$$` and `$tag$…$tag$` are PostgreSQL's quote-free string syntax. The tag
+/// is an identifier: letters, digits and underscores, but it may NOT begin with
+/// a digit — `$1abc$x$1abc$` is rejected as "trailing junk after parameter",
+/// which is exactly why `$1` and `$2` placeholders must pass through untouched
+/// rather than being read as the start of a literal. Verified against
+/// PostgreSQL rather than recalled.
+fn dollar_tag_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'$') {
+        return None;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'$' => return Some(i + 1),
+            b'_' | b'a'..=b'z' | b'A'..=b'Z' => i += 1,
+            // A digit is fine inside the tag, never at its head.
+            b'0'..=b'9' if i > 1 => i += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn strip_sql_comments(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
@@ -781,6 +807,40 @@ fn strip_sql_comments(sql: &str) -> String {
                         out.push(' ');
                     }
                     i += ch.len_utf8();
+                }
+            }
+            // A DOLLAR-QUOTED literal is data as much as a single-quoted one,
+            // and blanking only `'…'` left it exposed: PostgreSQL's
+            // `$msg$DROP TABLE comments;$msg$` is an ordinary way to store a
+            // string containing quotes, and its contents were being scanned as
+            // executable DDL. A migration that merely LOGS such a line emitted
+            // a false `Drop`, `already_migrated` went false, and the next
+            // scaffold wrote a duplicate `CREATE TABLE comments`.
+            b'$' => {
+                if let Some(tag_len) = dollar_tag_len(&sql[i..]) {
+                    let tag = &sql[i..i + tag_len];
+                    out.push_str(tag);
+                    i += tag_len;
+                    if let Some(rel) = sql[i..].find(tag) {
+                        // One space per BYTE, holding the offset.
+                        for _ in 0..rel {
+                            out.push(' ');
+                        }
+                        out.push_str(tag);
+                        i += rel + tag_len;
+                    } else {
+                        // Unterminated: whatever follows is inside the literal,
+                        // so none of it is DDL.
+                        for _ in i..bytes.len() {
+                            out.push(' ');
+                        }
+                        i = bytes.len();
+                    }
+                } else {
+                    // `$1` is a parameter placeholder, not a tag — PostgreSQL
+                    // rejects `$1abc$…$1abc$`, so a digit cannot START a tag.
+                    out.push('$');
+                    i += 1;
                 }
             }
             // A double-quoted IDENTIFIER is a name — exactly what the matchers
@@ -2058,6 +2118,58 @@ mod tests {
         assert!(
             already_migrated(tmp.path()),
             "renaming a constraint leaves the columns alone"
+        );
+    }
+
+    /// `$tag$…$tag$` is a string, not DDL. Every case here was checked
+    /// against a real PostgreSQL before being encoded.
+    #[test]
+    fn dollar_quoted_literals_are_not_read_as_ddl() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_dollar");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let create = "CREATE TABLE comments (id BIGINT, commentable_type TEXT, \
+                      commentable_id BIGINT, parent_id BIGINT, author_id BIGINT, \
+                      body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n";
+
+        // DDL text stored as data must not move the replay.
+        for literal in [
+            "INSERT INTO audit_log(msg) VALUES ($msg$DROP TABLE comments;$msg$);",
+            "INSERT INTO audit_log(msg) VALUES ($$DROP TABLE comments;$$);",
+            "INSERT INTO audit_log(msg) VALUES ($tag_1$DROP TABLE comments;$tag_1$);",
+            // A function body is the usual home for this.
+            "CREATE FUNCTION f() RETURNS void AS $do$ BEGIN DROP TABLE comments; END $do$ \
+             LANGUAGE plpgsql;",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{create}{literal}\n")).expect("write");
+            assert!(
+                already_migrated(tmp.path()),
+                "`{literal}` is data, not a drop"
+            );
+        }
+
+        // A REAL drop after such a literal still registers — the masking must
+        // not swallow the rest of the file.
+        std::fs::write(
+            dir.join("up.sql"),
+            format!(
+                "{create}INSERT INTO audit_log(msg) VALUES ($msg$hello$msg$);\n\
+                     DROP TABLE comments;\n"
+            ),
+        )
+        .expect("write");
+        assert!(!already_migrated(tmp.path()), "the real drop still counts");
+
+        // `$1` is a parameter placeholder, not a tag: a digit cannot start one,
+        // so the text after it must still be scanned.
+        std::fs::write(
+            dir.join("up.sql"),
+            format!("{create}PREPARE p AS SELECT $1;\nDROP TABLE comments;\n"),
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "`$1` must not open a literal that swallows the drop"
         );
     }
 
