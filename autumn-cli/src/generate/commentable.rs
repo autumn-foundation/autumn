@@ -299,18 +299,56 @@ enum CommentsEvent {
 /// `RENAME COLUMN <other> TO <column>` is the opposite and must not count as a
 /// removal, so the position of the name relative to `to` decides.
 fn alter_removes_column(statement: &str, column: &str) -> bool {
-    if statement.contains("drop column") || statement.contains("drop if exists") {
-        // `ADD COLUMN a, DROP COLUMN b` is legal in one statement, so the
-        // column has to be the one being dropped.
-        if let Some(drop_at) = statement.find("drop column") {
-            return mentions_column(&statement[drop_at..], column);
+    // COLUMN is optional in a drop as well (`ALTER TABLE comments DROP
+    // commentable_type`), so the keyword cannot be what identifies one. Every
+    // `DROP` in the statement is examined because one ALTER may carry several
+    // (`DROP CONSTRAINT ck, DROP COLUMN commentable_type`).
+    for (at, _) in statement.match_indices(" drop ") {
+        let rest = statement[at + " drop ".len()..].trim_start();
+        // These drop something OTHER than a column: a constraint, or a property
+        // of one (`ALTER COLUMN commentable_type DROP NOT NULL` names the column
+        // but keeps it). Reading them as removals would report a polymorphic
+        // table as broken and emit a duplicate migration.
+        if [
+            "constraint ",
+            "default",
+            "not null",
+            "expression",
+            "identity",
+        ]
+        .iter()
+        .any(|kw| rest.starts_with(kw))
+        {
+            continue;
         }
-        return mentions_column(statement, column);
+        // Only the name actually being dropped: `DROP COLUMN kind, ADD COLUMN
+        // commentable_type` must not read as dropping the discriminator.
+        let name = rest.strip_prefix("column ").unwrap_or(rest).trim_start();
+        let name = name.strip_prefix("if exists ").unwrap_or(name).trim_start();
+        let name = name.split([' ', ',', ';']).next().unwrap_or("");
+        if mentions_column(name, column) {
+            return true;
+        }
     }
-    if let Some(rename_at) = statement.find("rename column") {
-        let rest = &statement[rename_at..];
-        let (from, to) = rest.split_once(" to ").unwrap_or((rest, ""));
-        return mentions_column(from, column) && !mentions_column(to, column);
+    // PostgreSQL makes COLUMN optional: `RENAME commentable_type TO kind`
+    // renames the column exactly as `RENAME COLUMN commentable_type TO kind`
+    // does. Matching only the spelled-out form read the bare one as "the column
+    // is still there", so the scan reported a polymorphic table, skipped the
+    // shared migration, and left every helper querying a column that had been
+    // renamed away — silently, at runtime.
+    //
+    // One branch serves both spellings: what follows `RENAME` is either
+    // `COLUMN <name>` or the bare `<name>`, and the `from` side covers each.
+    if let Some(at) = statement.find(" rename ") {
+        let rest = statement[at + " rename ".len()..].trim_start();
+        // `RENAME TO <table>` renames the TABLE and `RENAME CONSTRAINT …` a
+        // constraint. Neither one touches a column.
+        if !rest.starts_with("to ") && !rest.starts_with("constraint ") {
+            let (from, to) = rest.split_once(" to ").unwrap_or((rest, ""));
+            // Renaming the column AWAY removes it; renaming another column INTO
+            // the discriminator name adds it, so the `to` side has to be clear.
+            return mentions_column(from, column) && !mentions_column(to, column);
+        }
     }
     false
 }
@@ -1809,6 +1847,96 @@ mod tests {
         assert!(
             !parent_cleanup_down_sql(DatabaseBackend::Sqlite, "posts").contains(" ON "),
             "SQLite must not"
+        );
+    }
+
+    /// `COLUMN` is optional in a DROP too, and one ALTER may carry several
+    /// drops — only some of which remove a column.
+    #[test]
+    fn a_column_drop_is_recognised_with_or_without_the_column_keyword() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_d");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let create = "CREATE TABLE comments (commentable_type TEXT NOT NULL, \
+                      commentable_id BIGINT NOT NULL);\n";
+
+        for drop in [
+            "ALTER TABLE comments DROP COLUMN commentable_type;",
+            "ALTER TABLE comments DROP commentable_type;",
+            "ALTER TABLE comments DROP COLUMN IF EXISTS commentable_type;",
+            // The discriminator drop trails a constraint drop in one statement.
+            "ALTER TABLE comments DROP CONSTRAINT ck, DROP COLUMN commentable_type;",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{create}{drop}\n")).expect("write");
+            assert!(
+                !already_migrated(tmp.path()),
+                "the discriminator was dropped by: {drop}"
+            );
+        }
+
+        // Dropping something that is NOT a column leaves the table polymorphic
+        // — including a property OF the discriminator column, which names it.
+        for keep in [
+            "ALTER TABLE comments ALTER COLUMN commentable_type DROP NOT NULL;",
+            "ALTER TABLE comments ALTER COLUMN commentable_type DROP DEFAULT;",
+            "ALTER TABLE comments DROP CONSTRAINT comments_pkey;",
+            // A different column goes; the discriminator is only added here.
+            "ALTER TABLE comments DROP COLUMN kind;",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{create}{keep}\n")).expect("write");
+            assert!(
+                already_migrated(tmp.path()),
+                "the discriminator survives: {keep}"
+            );
+        }
+    }
+
+    /// PostgreSQL makes `COLUMN` optional in a column rename, so both spellings
+    /// have to be read the same way — in both directions.
+    #[test]
+    fn a_column_rename_is_recognised_with_or_without_the_column_keyword() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_c");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let create = "CREATE TABLE comments (commentable_type TEXT NOT NULL, \
+                      commentable_id BIGINT NOT NULL);\n";
+
+        // Renaming the discriminator AWAY leaves the table non-polymorphic,
+        // whichever spelling the migration used.
+        for rename in [
+            "ALTER TABLE comments RENAME COLUMN commentable_type TO kind;",
+            "ALTER TABLE comments RENAME commentable_type TO kind;",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{create}{rename}\n")).expect("write");
+            assert!(
+                !already_migrated(tmp.path()),
+                "the discriminator was renamed away by: {rename}"
+            );
+        }
+
+        // Renaming another column INTO the discriminator name ADDS it — the
+        // `to` side is what decides, so neither spelling may read as a removal.
+        let bare = "CREATE TABLE comments (kind TEXT NOT NULL, commentable_id BIGINT NOT NULL);\n";
+        for rename in [
+            "ALTER TABLE comments RENAME COLUMN kind TO commentable_type;",
+            "ALTER TABLE comments RENAME kind TO commentable_type;",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{bare}{rename}\n")).expect("write");
+            assert!(
+                already_migrated(tmp.path()),
+                "the discriminator was renamed INTO place by: {rename}"
+            );
+        }
+
+        // A TABLE rename and a CONSTRAINT rename touch no column at all.
+        std::fs::write(
+            dir.join("up.sql"),
+            format!("{create}ALTER TABLE comments RENAME CONSTRAINT ck TO ck2;\n"),
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "renaming a constraint leaves the columns alone"
         );
     }
 
