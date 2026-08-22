@@ -33,10 +33,11 @@
 //!    has a single target. Regenerating per host would give un-comparable version
 //!    identities and permanent reported drift.
 //!
-//! The migration is scheduled by [`migrate_placement`]: the first host in rollout
-//! order that is a *redeploy*, since a first-deploy host has no live release to
-//! keep serving if the migration fails, and [`exec::first_deploy_ops`] carries no
-//! migrate op at all. Every other host builds with [`exec::MigrateStep::Skip`].
+//! The migration is scheduled by [`migrate_placement`]: the FIRST host in rollout
+//! order, whatever its mode. Since #1607's AC-3 fix both per-host builders carry a
+//! migrate op, so the earliest possible placement is also the safest one — the
+//! schema moves before ANY host in the fleet cuts over. Every other host builds
+//! with [`exec::MigrateStep::Skip`].
 
 // Every item here is crate-internal by design (see the note on `mod fleet` in
 // `deploy.rs`). In this bin-only crate `deploy` is a private module, so clippy
@@ -57,8 +58,8 @@ use super::{ResolvedDeployConfig, ResolvedFleet};
 /// Held as a constant so the plan text and the drift guard that checks it against
 /// the real op sequence (`fleet_plan_matches_fleet_ops_sequence`) can never
 /// disagree about what was promised.
-pub(crate) const FLEET_MIGRATE_PLACEMENT_NOTE: &str = "[migrate] runs once, on the first host still on a previous release, before its \
-     cutover — hosts 2..N skip it";
+pub(crate) const FLEET_MIGRATE_PLACEMENT_NOTE: &str = "[migrate] runs once, on the first host in rollout order, before its cutover — \
+     hosts 2..N skip it";
 
 /// Which path a single host takes in a fleet rollout.
 ///
@@ -88,25 +89,33 @@ impl HostMode {
     }
 }
 
-/// Where in the rollout the single fleet-wide migration runs (issue #1621, AC-4).
+/// Where in the rollout the single fleet-wide migration runs (issue #1621, AC-4;
+/// re-placed by #1607, AC-3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MigratePlacement {
-    /// Index, in rollout order, of the first host taking the redeploy path.
-    FirstRedeploy(usize),
-    /// No host in this fleet is a redeploy, so nothing migrates — today's
-    /// documented "the first deploy does not migrate" limitation, generalised.
+    /// Index, in rollout order, of the host carrying the fleet's one migration —
+    /// always the first one, whatever its [`HostMode`].
+    FirstHost(usize),
+    /// The rollout targets no hosts at all, so there is nothing to migrate on.
     None,
 }
 
-/// The index of the first host in rollout order whose mode is
-/// [`HostMode::Redeploy`], or [`MigratePlacement::None`].
+/// The index of the first host in rollout order, or [`MigratePlacement::None`] for
+/// an empty rollout.
 ///
-/// Pure and total: an empty slice, or one with no redeploy, yields `None`.
-pub(crate) fn migrate_placement(modes: &[HostMode]) -> MigratePlacement {
-    modes
-        .iter()
-        .position(|mode| matches!(mode, HostMode::Redeploy))
-        .map_or(MigratePlacement::None, MigratePlacement::FirstRedeploy)
+/// Both per-host builders carry a migrate op since #1607 (a first deploy migrates
+/// before it starts its release), so the migration always lands on host 1 — the
+/// earliest point in the rollout, and therefore before ANY host cuts over. The
+/// mode slice is still the input so the placement rule stays expressed in terms of
+/// the plan it belongs to rather than a bare length.
+///
+/// Pure and total: an empty slice yields `None`.
+pub(crate) const fn migrate_placement(modes: &[HostMode]) -> MigratePlacement {
+    if modes.is_empty() {
+        MigratePlacement::None
+    } else {
+        MigratePlacement::FirstHost(0)
+    }
 }
 
 /// What one host does in a fleet rollout.
@@ -196,12 +205,11 @@ pub(crate) fn plan_fleet(
             // `expect`-ing an invariant enforced two modules away.
             host: cfg.host.clone().unwrap_or_default(),
             mode: *mode,
-            // Exactly one host runs the migration; everyone else skips it. A
-            // `HostMode::First` host can never be the placement (a first deploy
-            // has no live release to keep serving if the migration fails, and
-            // `first_deploy_ops` carries no migrate op), so its `Skip` is both
-            // correct and inert.
-            migrate: if placement == MigratePlacement::FirstRedeploy(index) {
+            // Exactly one host runs the migration; everyone else skips it. Since
+            // #1607 that host is simply the first in rollout order — a
+            // `HostMode::First` host carries the migrate op too, so the schema is
+            // guaranteed to move before any host in the fleet cuts over.
+            migrate: if placement == MigratePlacement::FirstHost(index) {
                 MigrateStep::Run
             } else {
                 MigrateStep::Skip
@@ -244,9 +252,9 @@ pub(crate) struct HostOpsInput<'a, P: ProxyController> {
 /// builders — unchanged, unwrapped, and never concatenated with another host's
 /// (rule 1).
 ///
-/// A [`HostMode::First`] host always plans [`MigrateStep::Skip`]
-/// ([`exec::first_deploy_ops`] has no migrate op at all), so `plan.migrate` only
-/// ever reaches [`exec::cutover_ops`].
+/// `plan.migrate` reaches BOTH per-host builders since #1607: a first deploy runs
+/// its pending migrations before starting the initial release, so host 1 of an
+/// all-first-deploy fleet migrates just like a redeploying one would.
 pub(crate) fn host_ops<P: ProxyController>(
     plan: &HostPlan,
     input: &HostOpsInput<'_, P>,
@@ -261,6 +269,7 @@ pub(crate) fn host_ops<P: ProxyController>(
             input.manifests,
             input.release_id,
             input.slots,
+            plan.migrate,
         ),
         HostMode::Redeploy => exec::cutover_ops(
             input.cfg,
@@ -718,32 +727,6 @@ pub(crate) fn classify_host_outcome(err: &exec::DeployExecError) -> HostOutcome 
     }
 }
 
-/// The loud line printed when a fleet rollout schedules no migration at all.
-///
-/// [`exec::first_deploy_ops`] carries no migrate op (a first deploy has never run
-/// migrations — a documented single-host limitation), so an all-first-deploy fleet
-/// migrates NOWHERE. That is fine for a brand-new app and catastrophic for one
-/// with pending migrations, so it is said out loud rather than inferred from the
-/// absence of a `migrate` line.
-pub(crate) const FLEET_NO_MIGRATION_NOTE: &str = "no host in this fleet is on a previous release, so this rollout runs NO migrations \
-     (a first deploy never does) — run `autumn migrate` yourself before serving traffic";
-
-/// The loud line printed when first-deploy hosts sit AHEAD of the fleet's single
-/// migration in rollout order (issue #1621, AC-4).
-///
-/// [`migrate_placement`] puts the migration on the first host whose probed mode is
-/// `Redeploy` — a first-deploy host has no live release to keep serving if the
-/// migration fails, so it is the wrong place for it. The consequence is that any
-/// first deploy listed BEFORE that host runs [`exec::first_deploy_ops`] (which
-/// carries no migrate op) and goes live on the new release while the schema is
-/// still the old one. Declaration order is a documented contract — the guide tells
-/// operators to order the list themselves — so the rollout is not silently
-/// reordered; the hazard is named, with the hosts it applies to and the one-line
-/// remedy.
-pub(crate) const FLEET_FIRST_BEFORE_MIGRATE_NOTE: &str = "go live on the new release BEFORE the migration runs (a first deploy never migrates) \
-     — if this release needs the new schema they will serve against the old one until \
-     the migrating host is reached; list an already-deployed host first to avoid it";
-
 /// The one-line reminder printed once, after the fleet's single migration lands.
 pub(crate) const FLEET_SCHEMA_MOVED_NOTE: &str = "the schema has moved; from here an automatic rollback restores BINARIES only — \
      it never rolls a migration back";
@@ -836,14 +819,11 @@ pub(crate) fn manual_recovery_lines(cfg: &ResolvedDeployConfig, reason: &str) ->
 /// Rendered **only** when more than one host is configured, so single-host output
 /// stays byte-identical to pre-#1621.
 ///
-/// `writable_db_configured` gates the no-migration warning: an app with no
-/// writable database has no schema to be behind, so warning about it would be
-/// noise.
-pub(crate) fn fleet_rollout_lines(
-    plan: &FleetPlan,
-    release_id: &str,
-    writable_db_configured: bool,
-) -> Vec<String> {
+/// Since #1607 every rollout with at least one host migrates, and it migrates on
+/// host 1 — so the two hazard warnings this used to carry (a fleet that migrates
+/// nowhere, and first-deploy hosts cutting over ahead of the migration) describe
+/// states that can no longer occur and are gone.
+pub(crate) fn fleet_rollout_lines(plan: &FleetPlan, release_id: &str) -> Vec<String> {
     let count = plan.hosts.len();
     let mut lines = Vec::with_capacity(count + 3);
     let host_word = if count == 1 { "host" } else { "hosts" };
@@ -858,50 +838,30 @@ pub(crate) fn fleet_rollout_lines(
         };
         lines.push(format!("  {}. {} — {mode}", index + 1, host.host));
     }
-    match plan.migrating_host() {
-        Some(migrating) => {
-            let skipped: Vec<&str> = plan
-                .hosts
-                .iter()
-                .filter(|h| h.host != migrating.host)
-                .map(|h| h.host.as_str())
-                .collect();
-            // A `--only`-narrowed repair reaches here with a one-host plan, so there
-            // is nobody left to skip the migration; the "; N skip it" clause would
-            // render as a dangling fragment ("fleet-wide;  skip it").
-            lines.push(if skipped.is_empty() {
-                format!(
-                    "  \u{2192} migrate ({} only \u{2014} the schema is fleet-wide)",
-                    migrating.host,
-                )
-            } else {
-                format!(
-                    "  \u{2192} migrate ({} only \u{2014} the schema is fleet-wide; {} skip it)",
-                    migrating.host,
-                    skipped.join(", "),
-                )
-            });
-            // Hosts listed AHEAD of the migrating one that are first deploys cut over
-            // before the schema moves (AC-4). Named rather than reordered — see
-            // `FLEET_FIRST_BEFORE_MIGRATE_NOTE`.
-            let before_migration: Vec<&str> = plan
-                .hosts
-                .iter()
-                .take_while(|h| h.host != migrating.host)
-                .filter(|h| h.mode == HostMode::First)
-                .map(|h| h.host.as_str())
-                .collect();
-            if writable_db_configured && !before_migration.is_empty() {
-                lines.push(format!(
-                    "  \u{26A0}\u{FE0F}  {} {FLEET_FIRST_BEFORE_MIGRATE_NOTE}",
-                    before_migration.join(", "),
-                ));
-            }
-        }
-        None if writable_db_configured => {
-            lines.push(format!("  \u{26A0}\u{FE0F}  {FLEET_NO_MIGRATION_NOTE}"));
-        }
-        None => {}
+    // A plan always has at least one host, so `migrating_host()` is always `Some`;
+    // `if let` keeps the renderer total rather than panicking on the impossible.
+    if let Some(migrating) = plan.migrating_host() {
+        let skipped: Vec<&str> = plan
+            .hosts
+            .iter()
+            .filter(|h| h.host != migrating.host)
+            .map(|h| h.host.as_str())
+            .collect();
+        // A `--only`-narrowed repair reaches here with a one-host plan, so there
+        // is nobody left to skip the migration; the "; N skip it" clause would
+        // render as a dangling fragment ("fleet-wide;  skip it").
+        lines.push(if skipped.is_empty() {
+            format!(
+                "  \u{2192} migrate ({} only \u{2014} the schema is fleet-wide)",
+                migrating.host,
+            )
+        } else {
+            format!(
+                "  \u{2192} migrate ({} only \u{2014} the schema is fleet-wide; {} skip it)",
+                migrating.host,
+                skipped.join(", "),
+            )
+        });
     }
     lines
 }
@@ -2359,28 +2319,24 @@ mod tests {
     }
 
     #[test]
-    fn migrate_placement_picks_the_first_redeploy_host_in_rollout_order() {
-        // #1621 (AC-4, T1.10): the migration runs on the first host that is ALREADY
-        // on a previous release — a first-deploy host has no live release to keep
-        // serving if the migration fails, and `first_deploy_ops` deliberately
-        // carries no migrate op at all.
+    fn migrate_placement_picks_the_first_host_in_rollout_order() {
+        // #1607 (AC-3): both per-host builders carry a migrate op now, so the fleet's
+        // one migration lands on host 1 whatever its mode — the earliest point in the
+        // rollout, and therefore before ANY host cuts over.
         assert_eq!(
             migrate_placement(&[HostMode::First, HostMode::Redeploy, HostMode::Redeploy]),
-            MigratePlacement::FirstRedeploy(1),
-            "the migration belongs to the first REDEPLOY host, not the first host"
+            MigratePlacement::FirstHost(0),
+            "a leading first-deploy host carries the migration rather than deferring it"
         );
         assert_eq!(
             migrate_placement(&[HostMode::Redeploy, HostMode::Redeploy]),
-            MigratePlacement::FirstRedeploy(0),
+            MigratePlacement::FirstHost(0),
             "an all-redeploy fleet migrates on host 1"
         );
-        // An all-first-deploy fleet migrates NOWHERE — today's documented
-        // single-host limitation, generalised. (The operator warning that names
-        // `autumn migrate` lands with the driver.)
         assert_eq!(
             migrate_placement(&[HostMode::First, HostMode::First]),
-            MigratePlacement::None,
-            "an all-first-deploy fleet has no host to migrate on"
+            MigratePlacement::FirstHost(0),
+            "an all-first-deploy fleet migrates on host 1 (it no longer migrates nowhere)"
         );
         assert_eq!(
             migrate_placement(&[]),
@@ -2417,21 +2373,39 @@ mod tests {
     }
 
     #[test]
-    fn an_all_first_deploy_fleet_schedules_no_migration() {
-        // #1621 (AC-4): the companion of the placement rule at the op level —
-        // `first_deploy_ops` stays byte-identical, so an all-first fleet carries no
-        // `migrate` op anywhere.
+    fn an_all_first_deploy_fleet_migrates_exactly_once_on_host_one() {
+        // #1607 (AC-3): the companion of the placement rule at the op level. A brand
+        // new fleet used to migrate NOWHERE and tell the operator to run `autumn
+        // migrate` by hand; now host 1 carries the one migration and hosts 2..N skip
+        // it, exactly like an all-redeploy fleet.
         let (plan, per_host) =
             plan_and_build(&["web-a", "web-b"], &[HostMode::First, HostMode::First]);
-        assert!(
-            plan.hosts.iter().all(|h| h.migrate == MigrateStep::Skip),
-            "no first-deploy host may be assigned the migration, got: {:?}",
+        assert_eq!(
+            plan.hosts
+                .iter()
+                .filter(|h| h.migrate == MigrateStep::Run)
+                .map(|h| h.host.as_str())
+                .collect::<Vec<_>>(),
+            vec!["web-a"],
+            "host 1 alone carries the migration, got: {:?}",
             plan.hosts
         );
         let flat: Vec<&'static str> = per_host.iter().flat_map(|ops| labels(ops)).collect();
+        assert_eq!(
+            flat.iter().filter(|l| **l == "migrate").count(),
+            1,
+            "an all-first-deploy fleet must migrate exactly once, got: {flat:?}"
+        );
+        // ... and before the first host takes traffic anywhere in the fleet.
+        let migrate = flat.iter().position(|l| *l == "migrate").expect("migrates");
+        let first_route = flat
+            .iter()
+            .position(|l| *l == "proxy-route")
+            .expect("the fleet routes its first host");
         assert!(
-            !flat.contains(&"migrate"),
-            "an all-first-deploy fleet must schedule no migration, got: {flat:?}"
+            migrate < first_route,
+            "the migration must precede the earliest cutover: migrate at {migrate}, \
+             first route at {first_route}, labels: {flat:?}"
         );
     }
 
@@ -2575,7 +2549,7 @@ mod tests {
             &[HostMode::First, HostMode::Redeploy, HostMode::Redeploy],
         )
         .expect("a well-formed fleet plans");
-        let rendered = fleet_rollout_lines(&plan, "20260714T120000Z", true).join("\n");
+        let rendered = fleet_rollout_lines(&plan, "20260714T120000Z").join("\n");
 
         assert!(
             rendered.contains("1. web-a — first deploy")
@@ -2583,13 +2557,10 @@ mod tests {
                 && rendered.contains("3. web-c — zero-downtime redeploy"),
             "the header must show rollout order and each host's probed mode:\n{rendered}"
         );
+        // #1607: host 1 carries the migration even though it is a first deploy.
         assert!(
-            rendered.contains("migrate (web-b only") && rendered.contains("web-a, web-c skip it"),
+            rendered.contains("migrate (web-a only") && rendered.contains("web-b, web-c skip it"),
             "the header must name the migrating host and the hosts that skip:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains(FLEET_NO_MIGRATION_NOTE),
-            "a fleet that DOES migrate must not warn that it does not:\n{rendered}"
         );
     }
 
@@ -2604,7 +2575,7 @@ mod tests {
         let fleet = fleet_of(&["web-b"]);
         let plan =
             plan_fleet(&fleet, &[HostMode::Redeploy]).expect("a one-host plan is well-formed");
-        let rendered = fleet_rollout_lines(&plan, "20260714T120000Z", true).join("\n");
+        let rendered = fleet_rollout_lines(&plan, "20260714T120000Z").join("\n");
 
         assert!(
             rendered.contains("  \u{2192} migrate (web-b only \u{2014} the schema is fleet-wide)"),
@@ -2625,83 +2596,37 @@ mod tests {
     }
 
     #[test]
-    fn the_rollout_header_warns_when_first_deploys_cut_over_before_the_migration() {
-        // #1621 (AC-4): the migration lands on the first REDEPLOY host in rollout
-        // order, so every first-deploy host listed ahead of it goes live on the new
-        // release before the schema moves — `first_deploy_ops` carries no migrate op.
-        // Declaration order is a documented contract and reordering it silently would
-        // be worse, so the hazard is said out loud, naming the hosts it applies to.
+    fn every_rollout_migrates_on_host_one_whatever_the_mix() {
+        // #1607 (AC-3) retires BOTH hazard warnings this header used to carry:
+        //   * first-deploy hosts cutting over ahead of the fleet's migration, and
+        //   * an all-first-deploy fleet migrating nowhere and telling the operator
+        //     to run `autumn migrate` by hand.
+        // Neither state is reachable now that `first_deploy_ops` carries a migrate
+        // op and the placement is simply host 1, so the header states the placement
+        // and warns about nothing.
         let fleet = fleet_of(&["10.0.0.2", "10.0.0.3", "10.0.0.1"]);
-        let plan = plan_fleet(
-            &fleet,
-            &[HostMode::First, HostMode::First, HostMode::Redeploy],
-        )
-        .expect("a well-formed fleet plans");
-
-        let warned = fleet_rollout_lines(&plan, "20260714T120000Z", true).join("\n");
-        assert!(
-            warned.contains(FLEET_FIRST_BEFORE_MIGRATE_NOTE),
-            "hosts that cut over before the fleet's only migration must be warned \
-             about:\n{warned}"
-        );
-        assert!(
-            warned.contains("10.0.0.2, 10.0.0.3") && !warned.contains("10.0.0.1 go live"),
-            "the warning must name exactly the hosts ahead of the migrating one:\n{warned}"
-        );
-        let quiet = fleet_rollout_lines(&plan, "20260714T120000Z", false).join("\n");
-        assert!(
-            !quiet.contains(FLEET_FIRST_BEFORE_MIGRATE_NOTE),
-            "an app with no writable database has no schema to be behind:\n{quiet}"
-        );
-
-        // The mixed fleet whose migrating host runs FIRST is silent: nothing goes
-        // live before the schema moves, which is what AC-4 asks for.
-        let ordered = plan_fleet(
-            &fleet,
-            &[HostMode::Redeploy, HostMode::First, HostMode::First],
-        )
-        .expect("a well-formed fleet plans");
-        let silent = fleet_rollout_lines(&ordered, "20260714T120000Z", true).join("\n");
-        assert!(
-            !silent.contains(FLEET_FIRST_BEFORE_MIGRATE_NOTE),
-            "the migration runs before any cutover here — there is nothing to \
-             warn about:\n{silent}"
-        );
-        // …and so is an all-redeploy fleet, whose every host waits for the migration.
-        let all_redeploy = plan_fleet(
-            &fleet,
-            &[HostMode::Redeploy, HostMode::Redeploy, HostMode::Redeploy],
-        )
-        .expect("a well-formed fleet plans");
-        assert!(
-            !fleet_rollout_lines(&all_redeploy, "20260714T120000Z", true)
-                .join("\n")
-                .contains(FLEET_FIRST_BEFORE_MIGRATE_NOTE),
-            "no first deploy, no pre-migration cutover"
-        );
-    }
-
-    #[test]
-    fn an_all_first_deploy_fleet_warns_only_when_a_database_is_configured() {
-        // #1621 (AC-4): `first_deploy_ops` carries no migrate op, so an
-        // all-first-deploy fleet migrates NOWHERE — today's documented single-host
-        // limitation, generalised. That is fine for a brand-new app and
-        // catastrophic for one with pending migrations, so it is said out loud —
-        // but only when there is a writable database to be behind.
-        let fleet = fleet_of(&["web-a", "web-b"]);
-        let plan = plan_fleet(&fleet, &[HostMode::First, HostMode::First])
-            .expect("a well-formed fleet plans");
-
-        let warned = fleet_rollout_lines(&plan, "20260714T120000Z", true).join("\n");
-        assert!(
-            warned.contains(FLEET_NO_MIGRATION_NOTE) && warned.contains("autumn migrate"),
-            "a database-backed all-first fleet must name the operator's step:\n{warned}"
-        );
-        let quiet = fleet_rollout_lines(&plan, "20260714T120000Z", false).join("\n");
-        assert!(
-            !quiet.contains(FLEET_NO_MIGRATION_NOTE),
-            "an app with no writable database has no schema to warn about:\n{quiet}"
-        );
+        for modes in [
+            [HostMode::First, HostMode::First, HostMode::Redeploy],
+            [HostMode::Redeploy, HostMode::First, HostMode::First],
+            [HostMode::First, HostMode::First, HostMode::First],
+            [HostMode::Redeploy, HostMode::Redeploy, HostMode::Redeploy],
+        ] {
+            let plan = plan_fleet(&fleet, &modes).expect("a well-formed fleet plans");
+            let rendered = fleet_rollout_lines(&plan, "20260714T120000Z").join("\n");
+            assert!(
+                rendered.contains("migrate (10.0.0.2 only")
+                    && rendered.contains("10.0.0.3, 10.0.0.1 skip it"),
+                "host 1 carries the migration for {modes:?}:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("\u{26A0}\u{FE0F}"),
+                "no migration-ordering hazard survives for {modes:?}:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("autumn migrate"),
+                "the operator is never told to migrate by hand for {modes:?}:\n{rendered}"
+            );
+        }
     }
 
     #[test]
@@ -3137,20 +3062,28 @@ mod tests {
             ),
             "an unreached migrating host migrated nothing"
         );
+        // #1607 (AC-3): an all-first-deploy fleet migrates too — on host 1, before it
+        // starts its release — so the same conservative rule applies to it. What used
+        // to be the "this fleet migrates nowhere" case is now just "host 1 was not
+        // reached".
         let first_only = plan_fleet(&fleet, &[HostMode::First, HostMode::First])
             .expect("a well-formed fleet plans");
         assert!(
-            !schema_moved(&first_only, &[HostOutcome::Serving, HostOutcome::Serving]),
-            "an all-first-deploy fleet schedules no migration at all"
+            schema_moved(&first_only, &[HostOutcome::Serving, HostOutcome::Serving]),
+            "an all-first-deploy fleet migrates on host 1, so a reached host moved the schema"
         );
-        // A compensated fleet that never migrated must not claim a schema it does
-        // not have.
+        assert!(
+            !schema_moved(
+                &first_only,
+                &[HostOutcome::Untouched, HostOutcome::Untouched]
+            ),
+            "an all-first-deploy fleet whose host 1 was never reached migrated nothing"
+        );
+        // A fleet whose migrating host was never reached must not claim a schema it
+        // does not have.
         let rendered = fleet_summary_lines(
             &first_only,
-            &[
-                HostOutcome::CompensatedTeardown,
-                HostOutcome::CompensatedTeardown,
-            ],
+            &[HostOutcome::Untouched, HostOutcome::Untouched],
             "20260714T120000Z",
         )
         .join("\n");
@@ -3158,10 +3091,14 @@ mod tests {
             !rendered.contains(FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE),
             "no migration ran, so there is no schema statement to make:\n{rendered}"
         );
-        // …and neither must the SUCCESS path. An all-first-deploy fleet is the shape
-        // the header warns runs NO migrations ("run `autumn migrate` yourself before
-        // serving traffic"); ending the same run with "the schema has moved" negates
-        // that instruction on the last line the operator reads before the green one.
+        // The success path of that same untouched-host shape says nothing either.
+        assert!(
+            !rendered.contains(FLEET_SCHEMA_MOVED_NOTE),
+            "a rollout that reached no migrating host must never claim the schema \
+             moved:\n{rendered}"
+        );
+        // A first-deploy fleet that DID reach host 1 and is serving names both the
+        // schema move and the recovery lever.
         let served = fleet_summary_lines(
             &first_only,
             &[HostOutcome::Serving, HostOutcome::Serving],
@@ -3169,8 +3106,9 @@ mod tests {
         )
         .join("\n");
         assert!(
-            !served.contains(FLEET_SCHEMA_MOVED_NOTE),
-            "a rollout that scheduled no migration must never claim the schema moved:\n{served}"
+            served.contains(FLEET_SCHEMA_MOVED_NOTE),
+            "host 1 migrated before it took traffic, so the schema statement is \
+             true here:\n{served}"
         );
         assert!(
             served.contains(FLEET_RECOVERY_HINT),

@@ -18,9 +18,9 @@
 //!
 //! ## What is real vs simulated/deferred (honest annotations)
 //!
-//! * REAL: first deploy, zero-downtime redeploy (AC-2), forced-failure
-//!   auto-rollback (AC-4), and on-demand rollback — each asserted against the
-//!   public port served through `kamal-proxy`.
+//! * REAL: first deploy (including its pre-start migration, AC-3), zero-downtime
+//!   redeploy (AC-2), forced-failure auto-rollback (AC-4), and on-demand rollback
+//!   — each asserted against the public port served through `kamal-proxy`.
 //! * SIMULATED: reboot survival (AC — "comes back after reboot") is asserted via
 //!   `systemctl is-enabled {service}-{slot}` returning `enabled` (boot
 //!   persistence), NOT a real kernel reboot of the container.
@@ -621,6 +621,7 @@ fn deploy_e2e_full_lifecycle() {
         "first `deploy up` failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let first_deploy_log = String::from_utf8_lossy(&out.stderr).into_owned();
     let body = wait_for_http_ok(public_host_port, "/", Duration::from_secs(30));
     assert!(
         body.contains("e2eapp v1"),
@@ -644,6 +645,37 @@ fn deploy_e2e_full_lifecycle() {
         String::from_utf8_lossy(&en.stdout)
     );
     eprintln!("[e2e]    (simulated reboot survival: {APP_NAME}-blue.service is enabled)");
+
+    // AC-3 (#1607) on the FIRST deploy: pending migrations run before the new
+    // version takes traffic. The migrate one-shot writes a marker next to the
+    // release binary it was launched from (see `fixtures/deploy/app_template.rs`),
+    // so this proves the real `systemd-run --wait … AUTUMN_MIGRATE=1` one-shot ran
+    // against THIS release — not that the CLI merely planned it.
+    let migrated = ws.ssh(
+        ssh_port,
+        &format!(
+            "test -f /srv/autumn/{APP_NAME}/current/{APP_NAME}.migrated && echo present \
+             || echo missing"
+        ),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&migrated.stdout).trim(),
+        "present",
+        "the first deploy must run its pending migrations (#1607, AC-3)"
+    );
+    // …and it ran BEFORE the release was started, so the app never boots against a
+    // schema that was never applied. The deploy echoes each op label as it runs.
+    let migrate_at = first_deploy_log
+        .find("migrate")
+        .expect("the first deploy logs its migrate op");
+    let start_at = first_deploy_log
+        .find("enable-now")
+        .expect("the first deploy logs its app start");
+    assert!(
+        migrate_at < start_at,
+        "the first deploy must migrate before starting the release:\n{first_deploy_log}"
+    );
+    eprintln!("[e2e]    (#1607 AC-3: pending migrations ran before the first release started)");
 
     // AC (#1952): the project `autumn.toml` is uploaded into the per-release dir
     // (coupled to the binary) and the slot unit points AUTUMN_MANIFEST_DIR at that

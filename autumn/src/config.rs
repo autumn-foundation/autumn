@@ -1357,6 +1357,7 @@ pub struct DeployTlsConfig {
 /// readiness_timeout_secs = 60 # readiness window before rollback (default: 60)
 /// keep_releases = 3          # releases retained on the host (default: 3)
 /// profile = "prod"           # profile the deployed app runs under (default: "prod")
+/// install_proxy = true       # install the reverse proxy on a bare host (default: true)
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeployConfig {
@@ -1431,6 +1432,28 @@ pub struct DeployConfig {
     /// the historical HTTP-only behavior. See [`DeployTlsConfig`].
     #[serde(default)]
     pub tls: DeployTlsConfig,
+
+    /// Whether `autumn deploy` may PREPARE the target host by installing the
+    /// reverse-proxy binary when the host has none. Default: `true` (issue #1607,
+    /// AC-1 — the documented target-host precondition is at most a stock Ubuntu
+    /// LTS with SSH access, so the command performs the remaining host preparation
+    /// itself).
+    ///
+    /// Probe-gated and idempotent: a host that already has a working proxy binary
+    /// is never touched, and a binary that responds but whose CLI surface has
+    /// drifted is never replaced (that stays a hard, actionable refusal).
+    ///
+    /// Set to `false` when you provision the proxy yourself — a pinned internal
+    /// build, your own package, or a host you do not want a container runtime
+    /// installed on. A missing binary is then an actionable deploy failure instead
+    /// of something the deploy fixes.
+    #[serde(default = "default_deploy_install_proxy")]
+    pub install_proxy: bool,
+}
+
+/// Default for [`DeployConfig::install_proxy`]: prepare the host (issue #1607).
+const fn default_deploy_install_proxy() -> bool {
+    true
 }
 
 impl Default for DeployConfig {
@@ -1449,6 +1472,7 @@ impl Default for DeployConfig {
             keep_releases: default_deploy_keep_releases(),
             profile: default_deploy_profile(),
             tls: DeployTlsConfig::default(),
+            install_proxy: default_deploy_install_proxy(),
         }
     }
 }
