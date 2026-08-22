@@ -190,6 +190,37 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   *set* it). `autumn doctor` warns (`model_private_columns`) when a
   sensitively-named column (`password`, `token`, `secret`, `*_hash`) is not
   marked `#[private]`.
+- `#[translatable]` (issue #1384, needs the `i18n` feature) — the column stores
+  an **independent value per locale tag** and resolves to the request's active
+  locale with no locale argument in the handler. The field type becomes
+  `autumn_web::i18n::Translated`, a per-locale container persisted as a JSON
+  object in the field's own `TEXT` column (portable Postgres + `SQLite`);
+  `Display` renders the active locale, so `html! { h1 { (post.title) } }` serves
+  Spanish under `Accept-Language: es`. Resolution mirrors `Bundle`'s own
+  algorithm — exact active locale, then each link of
+  `I18nConfig::resolved_fallback_chain`, then one documented sentinel (`None`
+  from `resolve()`, `""` from `Display`); never a panic or a 500, in or out of a
+  request. An `AmbientLocaleLayer` (installed with the translation bundle, and
+  inside each `/{locale}/…` nest) publishes the locale for the whole handler and
+  wraps the response body, so a streaming/SSE render still resolves per frame;
+  `i18n::with_locale(tag, fut)` scopes one explicitly for a job or mailer.
+  Generated: per-field `<f>_localized()` / `<f>_in(locale)` /
+  `set_<f>(locale, value)` / `<f>_locales()` / `<f>_is_translated(locale)`, plus
+  field-name-keyed `available_locales(field)` / `is_translated(field, locale)` /
+  `translated(field)` / `localized(field)` / `Model::translatable_fields()`, and
+  an `i18n::TranslatableColumnDescriptor` inventory registration.
+  **Write semantics matter**: the value *is* the whole map, so `find` →
+  `set_title("es", …)` → `update` leaves every other locale intact, but
+  *assigning* a `Translated` replaces the container — use
+  `Translated::merge_from(&incoming)` for a partial update. `Serialize` is
+  lossless (a map); `Deserialize` refuses a bare string, so
+  `PUT {"title": "Hola"}` is a 422 rather than a silent wipe of every other
+  language. Refused in combination with `#[encrypted]`, `#[searchable]`,
+  `unique`/`indexed`, `#[normalize]`, `#[state_machine]`, `#[id]`,
+  `#[lock_version]`, `#[position]`, `#[serde(rename)]` and
+  `#[diesel(column_name)]`. `Option<Translated>` is a compile error — the empty
+  container already means "no translation". A pre-existing plain-text column can
+  be declared `#[translatable]` with **no data migration**.
 - `#[normalize(trim, downcase, upcase, squish, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
