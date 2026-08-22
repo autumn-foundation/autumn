@@ -484,10 +484,35 @@ fn requires_tenant_from<'a>(
 #[cfg(feature = "db")]
 #[must_use]
 pub fn model_soft_deletes(model: &str) -> Option<bool> {
+    soft_deletes_from(repository_facts_for(model))
+}
+
+/// The aggregation behind [`model_soft_deletes`], split out so the choice it
+/// makes across MULTIPLE repositories can be tested directly.
+///
+/// ANY repository soft-deleting makes the model soft-deleting here. That is a
+/// deliberate conservative default, and it is not free: a model carrying both a
+/// `soft_delete` repository and an ordinary one gets `deleted_at IS NULL` on
+/// every helper, so a caller working through the ordinary repository sees a 404
+/// for rows that repository's own finders would return.
+///
+/// It is still the better error of the two available. The helpers take a spec
+/// and a connection, never a repository handle, so there is no "the repository
+/// being used" to consult — and the opposite rule (soft-deleting only when
+/// EVERY repository opts in) would let one admin repository that sees deleted
+/// rows switch the filter off for the application repository beside it,
+/// attaching comments to rows the app treats as gone. Erring toward 404 is
+/// recoverable; erring toward writing is not.
+///
+/// Threading the caller's own repository fact through the helper API would beat
+/// both, the way `tenant: Option<&str>` already does for tenancy — that is a
+/// signature change to generated helpers, filed as #2284.
+#[cfg(feature = "db")]
+fn soft_deletes_from<'a>(facts: impl Iterator<Item = &'a RepositoryFacts>) -> Option<bool> {
     let mut any = false;
     let mut registered = false;
-    for facts in repository_facts_for(model) {
-        any |= facts.soft_delete;
+    for entry in facts {
+        any |= entry.soft_delete;
         registered = true;
     }
     registered.then_some(any)
@@ -1662,6 +1687,43 @@ mod tests {
     /// A spec built by hand — the one way past the macro's guarantee — is
     /// refused by `validate`, in release builds too. A `debug_assert` here
     /// would be erased in exactly the build where it matters.
+    /// The soft-delete counterpart of the tenancy rule below, with the same
+    /// link-order independence — and one case that is a documented cost rather
+    /// than a win: see [`soft_deletes_from`] and #2284.
+    #[test]
+    fn any_soft_deleting_repository_filters_deleted_parents() {
+        let soft = RepositoryFacts {
+            model: || "app::Post",
+            sharded: false,
+            tenant_scoped: false,
+            soft_delete: true,
+        };
+        let plain = RepositoryFacts {
+            model: || "app::Post",
+            sharded: false,
+            tenant_scoped: false,
+            soft_delete: false,
+        };
+
+        // Both visitation orders, because inventory order is link order.
+        assert_eq!(
+            soft_deletes_from([&soft, &plain].into_iter()),
+            Some(true),
+            "soft first"
+        );
+        assert_eq!(
+            soft_deletes_from([&plain, &soft].into_iter()),
+            Some(true),
+            "plain first — the answer must not change"
+        );
+
+        // Every registration opting out IS positive evidence, and must not be
+        // confused with nothing being registered: the caller falls back to what
+        // the column implies only in the latter case.
+        assert_eq!(soft_deletes_from([&plain].into_iter()), Some(false));
+        assert_eq!(soft_deletes_from(std::iter::empty()), None);
+    }
+
     /// A model may have more than one repository. Taking the FIRST registration
     /// would let link order decide whether the tenant predicate is applied —
     /// and an unscoped admin repository beside a scoped application one would
