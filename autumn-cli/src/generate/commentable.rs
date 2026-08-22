@@ -242,15 +242,57 @@ fn comments_table_state(project_root: &Path) -> (bool, bool) {
 /// every modifier would have traded one bug for its mirror image.
 const CREATE_VERBS: &[&str] = &["create table", "create unlogged table"];
 
-fn comments_table_spellings(verb: &str) -> Vec<String> {
-    let names = [
+/// Offsets of every `DROP TABLE` that takes the shared `comments` table away.
+///
+/// `DROP TABLE [ IF EXISTS ] name [, ...] [ CASCADE | RESTRICT ]` — the LIST is
+/// the point. Requiring `comments` immediately after the verb missed
+/// `DROP TABLE audit_log, comments;`, which really does drop it (confirmed
+/// against PostgreSQL). The replay then kept a table the database no longer
+/// has, the next scaffold skipped creating it, and every generated helper
+/// queried a missing relation — silently, until the first request.
+fn comments_drops(lowered: &str) -> Vec<usize> {
+    let names = comments_table_names();
+    let mut found = Vec::new();
+    for (at, _) in lowered.match_indices("drop table") {
+        let rest = lowered[at + "drop table".len()..].trim_start();
+        let rest = rest.strip_prefix("if exists").unwrap_or(rest).trim_start();
+        // Only this statement's own name list.
+        let statement = rest.split(';').next().unwrap_or(rest);
+        let drops_comments = statement.split(',').any(|entry| {
+            // The name is the first token: `CASCADE` / `RESTRICT` trail the
+            // list, and `ONLY` may lead an entry.
+            let entry = entry.trim();
+            let entry = entry.strip_prefix("only ").unwrap_or(entry).trim_start();
+            entry
+                .split_whitespace()
+                .next()
+                .is_some_and(|name| names.iter().any(|accepted| accepted == name))
+        });
+        if drops_comments {
+            found.push(at);
+        }
+    }
+    found
+}
+
+/// Every spelling of the shared table's NAME, without a verb in front.
+///
+/// Split out because `DROP TABLE` takes a LIST — `name [, ...]` — so the name
+/// is not always the token after the verb, and a scan anchored on the verb
+/// missed `DROP TABLE audit_log, comments;` entirely.
+fn comments_table_names() -> Vec<String> {
+    vec![
         COMMENTS_TABLE.to_owned(),
         format!("\"{COMMENTS_TABLE}\""),
         format!("public.{COMMENTS_TABLE}"),
         format!("public.\"{COMMENTS_TABLE}\""),
         format!("\"public\".{COMMENTS_TABLE}"),
         format!("\"public\".\"{COMMENTS_TABLE}\""),
-    ];
+    ]
+}
+
+fn comments_table_spellings(verb: &str) -> Vec<String> {
+    let names = comments_table_names();
     // `ONLY` is PostgreSQL's "do not recurse to inheritance children" marker,
     // and it does NOT sit where `IF EXISTS` does — the grammar is
     // `ALTER TABLE [ IF EXISTS ] [ ONLY ] name [ * ]`, so the two COMBINE.
@@ -440,7 +482,7 @@ fn comments_table_events(sql: &str) -> Vec<CommentsEvent> {
             }
         }
     }
-    for (at, _) in comments_statements(sql, "drop table") {
+    for at in comments_drops(sql) {
         events.push((at, CommentsEvent::Drop));
     }
     // `ALTER TABLE comments RENAME TO archived_comments` mentions no
@@ -2017,6 +2059,47 @@ mod tests {
             already_migrated(tmp.path()),
             "renaming a constraint leaves the columns alone"
         );
+    }
+
+    /// `DROP TABLE name [, ...]` — the shared table may sit anywhere in the
+    /// list, and a similarly-named neighbour must not be mistaken for it.
+    #[test]
+    fn a_drop_finds_comments_anywhere_in_the_name_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_drop");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let create = "CREATE TABLE comments (id BIGINT, commentable_type TEXT, \
+                      commentable_id BIGINT, parent_id BIGINT, author_id BIGINT, \
+                      body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n";
+
+        for drop in [
+            "DROP TABLE comments;",
+            "DROP TABLE audit_log, comments;",
+            "DROP TABLE comments, audit_log;",
+            "DROP TABLE IF EXISTS a, public.comments CASCADE;",
+            "DROP TABLE a, \"comments\", b RESTRICT;",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{create}{drop}\n")).expect("write");
+            assert!(
+                !already_migrated(tmp.path()),
+                "`{drop}` takes the shared table away"
+            );
+        }
+
+        // A list that does NOT name it must leave the table standing —
+        // including neighbours whose names merely contain "comments".
+        for drop in [
+            "DROP TABLE audit_log;",
+            "DROP TABLE comments_archive, audit_log;",
+            "DROP TABLE a, archive.comments;",
+            "DROP TABLE old_comments;",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{create}{drop}\n")).expect("write");
+            assert!(
+                already_migrated(tmp.path()),
+                "`{drop}` leaves the shared table alone"
+            );
+        }
     }
 
     /// `UNLOGGED` still occupies the name; `TEMPORARY` does not. Both halves
