@@ -376,8 +376,11 @@ fn a_scaffolded_comment_resource_does_not_suppress_the_shared_table() {
         .expect("migrations dir")
         .filter_map(Result::ok)
         .filter(|entry| {
+            // The column DEFINITION, not any mention of it: a commentable
+            // parent's own migration names `commentable_type` too, inside the
+            // cleanup trigger that deletes its comments.
             fs::read_to_string(entry.path().join("up.sql"))
-                .is_ok_and(|sql| sql.contains("commentable_type"))
+                .is_ok_and(|sql| sql.contains("commentable_type TEXT NOT NULL"))
         })
         .count();
     assert_eq!(

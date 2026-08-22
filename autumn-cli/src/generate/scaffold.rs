@@ -821,6 +821,19 @@ fn plan_scaffold_with_options_impl(
             );
         if !for_revert {
             if emitted {
+                if super::commentable::conflicting_comments_table(project_root) {
+                    plan.warn(format!(
+                        "This project already has a `{table}` table that is NOT the \
+                         polymorphic one — a `Comment` model scaffolded the ordinary \
+                         way creates exactly that, and the shared table takes the same \
+                         name. Both `CREATE TABLE {table}` statements will be applied \
+                         and `migrate` will stop on \"already exists\". Rename or drop \
+                         the existing table, or add `commentable_type TEXT NOT NULL` \
+                         and `commentable_id BIGINT NOT NULL` to it and delete the \
+                         migration just written.",
+                        table = super::commentable::COMMENTS_TABLE,
+                    ));
+                }
                 plan.warn(format!(
                     "Added the shared `{table}` table. Every `#[commentable]` model \
                      attaches to it, so later models need no migration of their own. \

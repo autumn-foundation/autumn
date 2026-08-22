@@ -86,7 +86,6 @@ pub fn up_sql(backend: autumn_web::config::DatabaseBackend) -> String {
         ts,
         ts_not_null_default_now,
     } = CommentsDdl::for_backend(backend);
-    let cleanup = shared_cleanup_sql(backend);
     format!(
         "-- Threaded, polymorphic comments (issue #1367).\n\
          --\n\
@@ -117,8 +116,7 @@ pub fn up_sql(backend: autumn_web::config::DatabaseBackend) -> String {
          \n\
          -- The delete cascade walks children by parent_id.\n\
          CREATE INDEX IF NOT EXISTS idx_{COMMENTS_TABLE}_parent_id\n\
-         \x20   ON {COMMENTS_TABLE} (parent_id);\n\
-         {cleanup}"
+         \x20   ON {COMMENTS_TABLE} (parent_id);\n"
     )
 }
 
@@ -158,6 +156,25 @@ pub fn migration_dir_name(timestamp: &str) -> String {
 /// that is what is matched.
 #[must_use]
 pub fn already_migrated(project_root: &Path) -> bool {
+    let (exists, polymorphic) = comments_table_state(project_root);
+    exists && polymorphic
+}
+
+/// A `comments` table that exists but is NOT the polymorphic one.
+///
+/// A `Comment` model scaffolded the ordinary way creates exactly that, and the
+/// shared table takes the same name — so emitting ours produces a second
+/// `CREATE TABLE comments` and `migrate` stops on "already exists". Skipping
+/// ours instead would be worse (every helper would query discriminator columns
+/// that are not there), so generation still emits and the caller warns. See
+/// #2283 for turning this into a refusal at generate time.
+pub fn conflicting_comments_table(project_root: &Path) -> bool {
+    let (exists, polymorphic) = comments_table_state(project_root);
+    exists && !polymorphic
+}
+
+/// Replay the history once: does a `comments` table exist, and is it polymorphic.
+fn comments_table_state(project_root: &Path) -> (bool, bool) {
     // Replayed in version order, because a migration history is a sequence of
     // edits and not a bag of facts. Flags that only ever get SET would report a
     // table that a later `DROP TABLE comments` removed as still present -- the
@@ -195,7 +212,7 @@ pub fn already_migrated(project_root: &Path) -> bool {
         }
     }
 
-    creates && has_type && has_id
+    (creates, has_type && has_id)
 }
 
 /// Every spelling of the shared comments table this scan accepts after `verb`.
@@ -419,37 +436,35 @@ fn comments_creations(sql: &str) -> Vec<(usize, &str)> {
     found
 }
 
-/// The cascade a polymorphic foreign key cannot express.
+/// The plpgsql function behind every parent's cleanup trigger.
 ///
-/// `commentable_id` carries no `REFERENCES`, so deleting a parent leaves its
-/// comments behind — unreachable, because the framework's parent probe 404s,
-/// and worse than unreachable if the parent's id is ever reused, since the old
-/// thread would reappear under the new record.
+/// Emitted by each PARENT migration rather than by the shared table migration,
+/// and `CREATE OR REPLACE` so repeating it is free.
 ///
-/// PostgreSQL gets one shared trigger function, parameterised by discriminator,
-/// so each commentable parent costs a single `CREATE TRIGGER`. SQLite has no
-/// parameterised trigger functions, so its cleanup is emitted per parent
-/// instead (see [`parent_cleanup_sql`]).
-fn shared_cleanup_sql(backend: autumn_web::config::DatabaseBackend) -> String {
-    match backend {
-        autumn_web::config::DatabaseBackend::Postgres => format!(
-            "\n\
-             -- Deleting a parent must take its comments with it. TG_ARGV[0] is the\n\
-             -- parent's `commentable_type`, so ONE function serves every model and each\n\
-             -- new commentable parent costs a single CREATE TRIGGER.\n\
-             CREATE OR REPLACE FUNCTION {COMMENTS_TABLE}_delete_for_parent()\n\
-             RETURNS TRIGGER AS $$\n\
-             BEGIN\n\
-             \x20   DELETE FROM {COMMENTS_TABLE}\n\
-             \x20    WHERE commentable_type = TG_ARGV[0]\n\
-             \x20      AND commentable_id = OLD.id;\n\
-             \x20   RETURN OLD;\n\
-             END;\n\
-             $$ LANGUAGE plpgsql;\n"
-        ),
-        // SQLite triggers take no arguments, so there is nothing shared to emit.
-        autumn_web::config::DatabaseBackend::Sqlite => String::new(),
-    }
+/// Ordering is why. Diesel keys on the version prefix, and the shared table's
+/// version is `{timestamp}2` while a parent scaffolded in the same second is
+/// `{timestamp}` — so the parent migration runs FIRST, and PostgreSQL refuses
+/// `CREATE TRIGGER` when its function does not yet exist. A parent that carries
+/// its own function cannot be ordered wrongly. The body may safely reference
+/// `comments` before that table exists: plpgsql resolves it at execution.
+fn cleanup_function_sql() -> String {
+    format!(
+        "-- Deleting a parent must take its comments with it. TG_ARGV[0] is the\n\
+         -- parent's `commentable_type`, so ONE function serves every model.\n\
+         --\n\
+         -- CREATE OR REPLACE, and emitted by every commentable parent's own\n\
+         -- migration: the shared table's migration sorts AFTER a parent created\n\
+         -- in the same second, so a trigger relying on it there would fail.\n\
+         CREATE OR REPLACE FUNCTION {COMMENTS_TABLE}_delete_for_parent()\n\
+         RETURNS TRIGGER AS $$\n\
+         BEGIN\n\
+         \x20   DELETE FROM {COMMENTS_TABLE}\n\
+         \x20    WHERE commentable_type = TG_ARGV[0]\n\
+         \x20      AND commentable_id = OLD.id;\n\
+         \x20   RETURN OLD;\n\
+         END;\n\
+         $$ LANGUAGE plpgsql;\n"
+    )
 }
 
 /// The `CREATE TRIGGER` that cleans up `parent_table`'s comments on delete.
@@ -465,12 +480,14 @@ pub fn parent_cleanup_sql(
     match backend {
         autumn_web::config::DatabaseBackend::Postgres => format!(
             "\n\
+             {function}\n\
              -- `{commentable_type}`'s comments go when the row does. The polymorphic key\n\
              -- cannot be a foreign key, so this trigger is the cascade.\n\
              CREATE TRIGGER {parent_table}_delete_{COMMENTS_TABLE}\n\
              \x20   AFTER DELETE ON {parent_table}\n\
              \x20   FOR EACH ROW\n\
-             \x20   EXECUTE FUNCTION {COMMENTS_TABLE}_delete_for_parent('{commentable_type}');\n"
+             \x20   EXECUTE FUNCTION {COMMENTS_TABLE}_delete_for_parent('{commentable_type}');\n",
+            function = cleanup_function_sql(),
         ),
         autumn_web::config::DatabaseBackend::Sqlite => format!(
             "\n\
@@ -1743,13 +1760,26 @@ mod tests {
     /// the thread outlives the parent and resurfaces if the id is reused.
     #[test]
     fn each_commentable_parent_gets_a_cleanup_trigger() {
-        // Postgres: one shared function, one trigger per parent.
+        // The function travels WITH the trigger, not in the shared migration.
+        // Diesel orders by version prefix, and the shared table's `{ts}2` sorts
+        // after a parent's `{ts}` — so a trigger depending on the shared
+        // migration would be created before its function existed and
+        // `CREATE TRIGGER` would fail outright.
         let shared = up_sql(DatabaseBackend::Postgres);
         assert!(
-            shared.contains("CREATE OR REPLACE FUNCTION comments_delete_for_parent()"),
-            "the shared function is emitted once:\n{shared}"
+            !shared.contains("comments_delete_for_parent"),
+            "the shared migration must NOT be the trigger's dependency:\n{shared}"
         );
         let trigger = parent_cleanup_sql(DatabaseBackend::Postgres, "posts", "Post");
+        assert!(
+            trigger.contains("CREATE OR REPLACE FUNCTION comments_delete_for_parent()"),
+            "the parent carries its own function, so ordering cannot break it:\n{trigger}"
+        );
+        assert!(
+            trigger.find("CREATE OR REPLACE FUNCTION").unwrap()
+                < trigger.find("CREATE TRIGGER").unwrap(),
+            "and defines it BEFORE the trigger that calls it:\n{trigger}"
+        );
         assert!(trigger.contains("AFTER DELETE ON posts"));
         assert!(
             trigger.contains("EXECUTE FUNCTION comments_delete_for_parent('Post')"),
@@ -1780,6 +1810,45 @@ mod tests {
             !parent_cleanup_down_sql(DatabaseBackend::Sqlite, "posts").contains(" ON "),
             "SQLite must not"
         );
+    }
+
+    /// A `Comment` model scaffolded the ordinary way owns a `comments` table
+    /// with no discriminator columns. That is neither "already migrated" (the
+    /// helpers would query columns that are not there) nor a clean slate — the
+    /// names collide, so the caller must be able to say so.
+    #[test]
+    fn a_plain_comments_table_is_reported_as_conflicting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_create_comments");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL);\n",
+        )
+        .expect("write");
+        assert!(!already_migrated(tmp.path()), "no discriminator columns");
+        assert!(
+            conflicting_comments_table(tmp.path()),
+            "a same-named non-polymorphic table must be reported"
+        );
+
+        // The polymorphic table is NOT a conflict — it is the thing we reuse.
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (commentable_type TEXT NOT NULL, commentable_id BIGINT NOT NULL);\n",
+        )
+        .expect("write");
+        assert!(already_migrated(tmp.path()));
+        assert!(
+            !conflicting_comments_table(tmp.path()),
+            "the shared table is reused, not a collision"
+        );
+
+        // And no comments table at all is neither.
+        let empty = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(empty.path().join("migrations")).expect("mkdir");
+        assert!(!already_migrated(empty.path()));
+        assert!(!conflicting_comments_table(empty.path()));
     }
 
     /// Quoting makes an identifier case-SENSITIVE: PostgreSQL treats
