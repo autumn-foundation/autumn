@@ -236,11 +236,26 @@ fn comments_table_spellings(verb: &str) -> Vec<String> {
         format!("\"public\".{COMMENTS_TABLE}"),
         format!("\"public\".\"{COMMENTS_TABLE}\""),
     ];
-    // `ONLY` is PostgreSQL's "do not recurse to inheritance children" marker
-    // and sits exactly where `IF EXISTS` does, so a converted table spelled
-    // `ALTER TABLE ONLY comments ADD COLUMN commentable_type …` would otherwise
-    // go unrecognised and the generator would emit a duplicate table.
-    let existence = ["", "if exists ", "if not exists ", "only "];
+    // `ONLY` is PostgreSQL's "do not recurse to inheritance children" marker,
+    // and it does NOT sit where `IF EXISTS` does — the grammar is
+    // `ALTER TABLE [ IF EXISTS ] [ ONLY ] name [ * ]`, so the two COMBINE.
+    // Listing them as alternatives missed `ALTER TABLE IF EXISTS ONLY comments`,
+    // a valid spelling whose ALTERs were then ignored: the scan reported an
+    // incomplete schema and the generator emitted a duplicate `CREATE TABLE
+    // comments` that fails on the next `migrate`.
+    //
+    // `if not exists` belongs to CREATE and never combines with `only`; the
+    // pairing is generated anyway because a spelling that cannot occur simply
+    // never matches, and enumerating the grammar beats hand-picking which
+    // halves may meet.
+    let existence = [
+        "",
+        "if exists ",
+        "if not exists ",
+        "only ",
+        "if exists only ",
+        "if not exists only ",
+    ];
     let mut spellings = Vec::with_capacity(names.len() * existence.len());
     for exists in existence {
         for name in &names {
@@ -1984,6 +1999,63 @@ mod tests {
             already_migrated(tmp.path()),
             "renaming a constraint leaves the columns alone"
         );
+    }
+
+    /// `ALTER TABLE [ IF EXISTS ] [ ONLY ] name [ * ]` — the modifiers COMBINE,
+    /// and the `*` that may follow the name is part of the grammar too. Every
+    /// spelling names the same table, so every one must be recognised.
+    #[test]
+    fn every_alter_table_modifier_combination_is_recognised() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_alter");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // A table with everything BUT the discriminator pair, so the ALTER
+        // under test is what completes it.
+        let base = "CREATE TABLE comments (id BIGINT, parent_id BIGINT, \
+                    author_id BIGINT, body TEXT, created_at TIMESTAMP, \
+                    deleted_at TIMESTAMP);\n";
+
+        for alter in [
+            "ALTER TABLE comments",
+            "ALTER TABLE ONLY comments",
+            "ALTER TABLE IF EXISTS comments",
+            "ALTER TABLE IF EXISTS ONLY comments",
+            "ALTER TABLE IF EXISTS ONLY public.comments",
+            // The inheritance marker sits AFTER the name.
+            "ALTER TABLE comments *",
+        ] {
+            std::fs::write(
+                dir.join("up.sql"),
+                format!(
+                    "{base}{alter} ADD COLUMN commentable_type TEXT;\n\
+                     {alter} ADD COLUMN commentable_id BIGINT;\n"
+                ),
+            )
+            .expect("write");
+            assert!(
+                already_migrated(tmp.path()),
+                "`{alter}` names the shared table"
+            );
+        }
+
+        // A DIFFERENT table under the same modifiers must still not count.
+        for alter in [
+            "ALTER TABLE IF EXISTS ONLY comments_archive",
+            "ALTER TABLE ONLY archive.comments",
+        ] {
+            std::fs::write(
+                dir.join("up.sql"),
+                format!(
+                    "{base}{alter} ADD COLUMN commentable_type TEXT;\n\
+                     {alter} ADD COLUMN commentable_id BIGINT;\n"
+                ),
+            )
+            .expect("write");
+            assert!(
+                !already_migrated(tmp.path()),
+                "`{alter}` is a different table"
+            );
+        }
     }
 
     /// The discriminator pair is not the contract. A table carrying it but
