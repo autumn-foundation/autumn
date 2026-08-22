@@ -44,8 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     over, and both of the migration-ordering hazard warnings a scale-up used to
     print are gone because neither state is reachable any more. The one-shot now
     also loads the release's own uploaded `autumn.toml` (`AUTUMN_MANIFEST_DIR`,
-    matching the slot unit), so a config-only database topology is no longer
-    invisible to it; and the fleet summary stops claiming "the migration that
+    matching the slot unit) and runs in the release dir (`--working-directory`,
+    matching the unit's `WorkingDirectory`), so neither a config-only database
+    topology nor a relative database URL is resolved differently by the migration
+    than by the app it gates; and the fleet summary stops claiming "the migration that
     already ran was NOT rolled back" for a rollout that failed *before* reaching its
     migration.
   - The container end-to-end test asserts the first deploy's migration over real

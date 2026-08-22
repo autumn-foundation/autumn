@@ -451,8 +451,13 @@ impl KamalProxyController {
     /// so far that no required flag rendered, both classify as "no binary". Neither is
     /// ours to overwrite — the binary may be shared with another service on the host —
     /// so the invariant is ENFORCED here rather than merely inferred upstream: the op
-    /// refuses outright when anything already exists at the target path. The operator
+    /// refuses outright when anything already occupies the target path. The operator
     /// then gets that message instead of a silently downgraded proxy.
+    ///
+    /// The test is `-e OR -L`, not `-e` alone: `-e` follows symlinks, so a DANGLING
+    /// symlink at the target path — an operator-managed install whose target is
+    /// temporarily absent, or a broken package link — reads as "nothing there" and
+    /// would be replaced by `mv -f`.
     ///
     /// # What it does, in order
     ///
@@ -482,7 +487,7 @@ impl KamalProxyController {
         let bin = KAMAL_PROXY_BIN;
         format!(
             "( set -e; \
-             if [ -e '{bin}' ]; then \
+             if [ -e '{bin}' ] || [ -L '{bin}' ]; then \
              echo 'kamal-proxy is already installed at {bin}; refusing to replace it' >&2; \
              exit 1; \
              fi; \
@@ -1832,9 +1837,12 @@ mod tests {
         // Never clobbers: the invariant is enforced at the point of action, not
         // merely inferred from the probe verdict upstream.
         assert!(
-            shell.contains(&format!("if [ -e '{KAMAL_PROXY_BIN}' ]"))
-                && shell.contains("refusing to replace it"),
-            "the install must refuse to replace an existing binary: {shell}"
+            shell.contains(&format!(
+                "if [ -e '{KAMAL_PROXY_BIN}' ] || [ -L '{KAMAL_PROXY_BIN}' ]"
+            )) && shell.contains("refusing to replace it"),
+            "the install must refuse to replace anything already occupying the \
+             target path — including a DANGLING symlink, which `-e` alone reports \
+             as absent because it follows links: {shell}"
         );
         // Any failure carries the remedy — this is the most likely new failure on a
         // stock host, and the raw apt/docker stderr alone says nothing useful.

@@ -1695,12 +1695,21 @@ pub fn failed_before_migrating(failed_step: &str) -> bool {
 /// migrations with the same locked applier a normal boot uses and exits without
 /// starting the server.
 ///
-/// It also sets `AUTUMN_MANIFEST_DIR` to the release dir, exactly as the slot unit
-/// does ([`super::render_app_unit`]), so the one-shot loads the SAME uploaded
-/// `autumn.toml` the release will boot with (#1952). Without it the migration ran
-/// against built-in defaults plus the env file: a config-only database topology —
-/// `[[database.shards]]`, a `primary_url` that lives in the manifest — was invisible
-/// to it, so it could migrate a different set of targets than the app then uses.
+/// It also mirrors the slot unit ([`super::render_app_unit`]) in two ways, so the
+/// one-shot resolves everything exactly as the release it gates will:
+///
+/// * `AUTUMN_MANIFEST_DIR` = the release dir, so it loads the SAME uploaded
+///   `autumn.toml` the release boots with (#1952). Without it the migration ran
+///   against built-in defaults plus the env file, so a config-only database
+///   topology — `[[database.shards]]`, a `primary_url` that lives only in the
+///   manifest — was invisible to it and it could migrate a different set of targets
+///   than the app then uses.
+/// * `--working-directory` = the release dir, matching the unit's
+///   `WorkingDirectory`. A transient `systemd-run` unit otherwise starts in the
+///   manager's default directory (`/`), so a RELATIVE database URL — a supported
+///   single-host `sqlite://./app.db`, say — resolved to a different file for the
+///   migration than for the app, which would then start against an unmigrated
+///   database.
 fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> RemoteCommand {
     let bin = format!("{release_dir}/{}", cfg.app_name);
     // Scope the transient unit to this release so overlapping deploys (or a prior
@@ -1711,9 +1720,10 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
         "migrate",
         format!(
             "systemd-run --wait --collect --quiet --unit={service}-migrate-{release_id} \
-             --property=EnvironmentFile={env} --setenv=AUTUMN_MIGRATE=1 \
-             --setenv=AUTUMN_MANIFEST_DIR={manifest} {bin}",
+             --working-directory={workdir} --property=EnvironmentFile={env} \
+             --setenv=AUTUMN_MIGRATE=1 --setenv=AUTUMN_MANIFEST_DIR={manifest} {bin}",
             service = cfg.service_name,
+            workdir = shell_quote(release_dir),
             env = shell_quote(&cfg.env_file()),
             manifest = shell_quote(release_dir),
             bin = shell_quote(&bin),
@@ -3766,6 +3776,52 @@ mod tests {
                 && shell.contains("/srv/autumn/myapp/releases/20260714T120000Z/myapp"),
             "the first deploy runs the real migrate one-shot from the release dir: {shell}"
         );
+    }
+
+    /// The migrate one-shot must resolve its configuration and its RELATIVE paths
+    /// exactly as the release it gates will, on both deploy paths.
+    #[test]
+    fn the_migrate_one_shot_matches_the_slot_unit_directory_and_manifest() {
+        let release_dir = "/srv/autumn/myapp/releases/20260714T120000Z";
+        let unit = super::super::render_app_unit(&resolved(), release_dir, 3001, SLOT_BLUE);
+        for (path, ops) in [
+            (
+                "first deploy",
+                sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n")),
+            ),
+            (
+                "redeploy",
+                sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n")),
+            ),
+        ] {
+            let exec = RecordingExecutor::new();
+            run_ops(&ops, &exec).expect("recording executor never fails");
+            let shell = exec.shell_for("migrate").expect("migrate ran");
+            // A transient `systemd-run` unit otherwise starts in the manager's
+            // default directory, so a relative database URL (a supported single-host
+            // `sqlite://./app.db`) would be migrated in one place and read in
+            // another. The unit's own `WorkingDirectory` is the contract to match.
+            assert!(
+                shell.contains(&format!("--working-directory='{release_dir}'")),
+                "{path}: the one-shot must run in the release dir, like the slot \
+                 unit: {shell}"
+            );
+            assert!(
+                unit.contains(&format!("WorkingDirectory={release_dir}")),
+                "{path}: the slot unit's WorkingDirectory is the contract being \
+                 matched: {unit}"
+            );
+            // …and it must load the same manifest the unit points the app at, so a
+            // config-only database topology is not invisible to the migration.
+            assert!(
+                shell.contains(&format!("--setenv=AUTUMN_MANIFEST_DIR='{release_dir}'")),
+                "{path}: the one-shot must load the release's own manifest: {shell}"
+            );
+            assert!(
+                unit.contains(&format!("Environment=AUTUMN_MANIFEST_DIR={release_dir}")),
+                "{path}: the slot unit's manifest dir is the contract being matched"
+            );
+        }
     }
 
     /// The fleet parameterisation of the FIRST-deploy path (#1621's rule, now that a
