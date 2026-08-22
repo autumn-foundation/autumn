@@ -372,10 +372,19 @@ fn comments_table_events(sql: &str) -> Vec<CommentsEvent> {
     // it; the scan is by the destination instead.
     for (at, new_name_at) in rename_targets(sql) {
         if is_comments_table_name(new_name_at) {
-            // Columns unknown: the rename says nothing about what the table
-            // holds, so it is recorded as a create declaring neither. A later
-            // ALTER can still add them, and until one does the scan correctly
-            // reports the table as not yet polymorphic.
+            // Columns recorded as absent, which is right when the renamed
+            // table is new and wrong when it already carried the discriminator
+            // pair (`CREATE TABLE legacy_comments (commentable_type …)` then
+            // `RENAME TO comments`). Knowing the difference means tracking
+            // columns for EVERY table so the rename can carry them across —
+            // a generalisation of this whole scanner, which is deliberately not
+            // bolted on here. See #2282.
+            //
+            // The failure is loud, not silent: the generator emits a second
+            // `CREATE TABLE comments` and `migrate` stops on "already exists".
+            // The conservative direction, since claiming the table IS
+            // polymorphic would instead produce helpers querying columns that
+            // may not be there.
             events.push((
                 at,
                 CommentsEvent::Create {
@@ -577,7 +586,7 @@ fn migration_up_sql(project_root: &Path) -> Vec<String> {
     dirs.sort();
     dirs.into_iter()
         .filter_map(|dir| std::fs::read_to_string(dir.join("up.sql")).ok())
-        .map(|sql| strip_sql_comments(&sql.to_ascii_lowercase()))
+        .map(|sql| strip_sql_comments(&sql))
         .collect()
 }
 
@@ -630,6 +639,12 @@ fn strip_sql_comments(sql: &str) -> String {
             // A double-quoted IDENTIFIER is a name — exactly what the matchers
             // are looking for — so it is copied through intact. `"comments"`
             // and `"commentable_type"` have to stay findable.
+            //
+            // Case is preserved here and folded everywhere else, because
+            // quoting is what makes an identifier case-SENSITIVE: PostgreSQL
+            // treats `"Comments"` and `comments` as different relations, so
+            // lowercasing the whole file would report a table that the runtime
+            // cannot find.
             b'"' => {
                 out.push('"');
                 i += 1;
@@ -668,7 +683,15 @@ fn strip_sql_comments(sql: &str) -> String {
             }
             _ => {
                 let ch = sql[i..].chars().next().unwrap_or(' ');
-                out.push(ch);
+                // Unquoted SQL is case-insensitive, so it folds here — leaving
+                // the quoted branches above as the only case-preserving path.
+                //
+                // ASCII fold specifically: `char::to_lowercase` can expand one
+                // char into several (İ → i̇), which would shift every byte
+                // offset after it — and offsets are load-bearing, since events
+                // are ordered by position and the CREATE body is sliced by
+                // index. SQL keywords are ASCII, so nothing is lost.
+                out.push(ch.to_ascii_lowercase());
                 i += ch.len_utf8();
             }
         }
@@ -1757,6 +1780,44 @@ mod tests {
             !parent_cleanup_down_sql(DatabaseBackend::Sqlite, "posts").contains(" ON "),
             "SQLite must not"
         );
+    }
+
+    /// Quoting makes an identifier case-SENSITIVE: PostgreSQL treats
+    /// `"Comments"` and `comments` as different relations, so folding the whole
+    /// file would report a table the runtime cannot find.
+    #[test]
+    fn a_quoted_case_sensitive_table_is_not_the_shared_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_cased");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE \"Comments\" (commentable_type TEXT, commentable_id BIGINT);\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "\"Comments\" is a different relation from comments"
+        );
+
+        // Unquoted SQL stays case-INsensitive, so keywords in any case match.
+        std::fs::write(
+            dir.join("up.sql"),
+            "CrEaTe TaBlE Comments (CommentAble_Type TEXT, COMMENTABLE_ID BIGINT);\n",
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "unquoted identifiers and keywords fold"
+        );
+
+        // …and the quoted lowercase spelling is still the shared table.
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE \"comments\" (\"commentable_type\" TEXT, \"commentable_id\" BIGINT);\n",
+        )
+        .expect("write");
+        assert!(already_migrated(tmp.path()));
     }
 
     /// The shared migration must survive `destroy scaffold` while any other
