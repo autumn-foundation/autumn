@@ -2297,10 +2297,20 @@ fn apply_locale_prefix_routing(
         router = router.merge(redirect_router);
     }
 
+    // Content resolution (#1384) has to see the URL prefix, and the prefix
+    // extension is only visible INSIDE this nest — an app-wide ambient-locale
+    // layer sits outside it and would negotiate `/es/posts` from
+    // `Accept-Language` alone. Install the layer here too, INNER to the
+    // extension (a later `.layer` call is more outer), so `#[translatable]`
+    // fields resolve to the URL's locale with no handler plumbing.
+    let prefix_chain = i18n.resolved_fallback_chain();
     for locale in valid_locales {
         let nested = content_router
             .clone()
             .fallback(crate::middleware::error_page_filter::fallback_404_handler)
+            .layer(crate::i18n::AmbientLocaleLayer::with_chain(
+                prefix_chain.clone(),
+            ))
             .layer(axum::Extension(crate::i18n::UriPrefixedLocale(
                 locale.clone(),
             )));

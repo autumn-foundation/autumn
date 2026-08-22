@@ -49,6 +49,16 @@
 //! }
 //! ```
 
+mod translatable;
+
+pub use translatable::{
+    LocaleScope, TranslatableColumnDescriptor, Translated, ambient_locale, ambient_locale_scope,
+    default_locale_snapshot, fallback_chain_snapshot, install_locale_defaults,
+    publish_ambient_locale, registered_translatable_columns, translatable_columns_for_table,
+    with_locale, with_locale_chain, with_locale_chain_sync, with_locale_scope,
+    with_locale_scope_sync, with_locale_sync, write_locale,
+};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -141,7 +151,13 @@ impl Default for I18nConfig {
 }
 
 impl I18nConfig {
-    /// Resolved fallback chain. Always ends with [`Self::default_locale`].
+    /// Resolved fallback chain.
+    ///
+    /// The configured chain, with [`Self::default_locale`] **appended when it
+    /// is absent** — an explicit chain that already names the default keeps the
+    /// author's order, so the last link is not necessarily the default locale.
+    /// Anything that needs the default locale must read
+    /// [`Self::default_locale`] directly rather than the chain's tail.
     #[must_use]
     pub fn resolved_fallback_chain(&self) -> Vec<String> {
         if self.fallback_chain.is_empty() {
@@ -778,11 +794,190 @@ where
         }
         let resolved = resolved.unwrap_or(default);
 
+        // #1384: publish this answer onto the ambient scope, if one is in
+        // effect. `AmbientLocaleLayer` runs the same resolution, but on some
+        // paths it sits outside middleware this extractor reads — most visibly
+        // the session on the SSG/ISG lane, where registered layers are applied
+        // outside the static-first middleware and so outside `SessionLayer`.
+        // Refining here keeps a `#[translatable]` field and a hand-taken
+        // `Locale` parameter from ever disagreeing. A no-op outside a scope.
+        publish_ambient_locale(&resolved);
+
         let mut locale = Self::new(resolved);
         if let Some(bundle) = bundle {
             locale = locale.with_bundle(bundle);
         }
         Ok(locale)
+    }
+}
+
+// ── Ambient locale layer (issue #1384) ───────────────────────────────────────
+
+/// Publishes the request's negotiated locale as the **ambient** one.
+///
+/// A tower [`Layer`](tower::Layer) that scopes the whole handler to the
+/// request's locale, so [`Translated`] model fields resolve themselves with no
+/// locale argument anywhere in the signature.
+///
+/// Installed automatically alongside the [`Bundle`] extension when an app
+/// configures i18n, so `#[translatable]` reads "just work". Resolution is the
+/// [`Locale`] extractor's own — the layer runs the extractor — so the ambient
+/// locale and a hand-taken `Locale` parameter can never disagree.
+///
+/// # Cost
+///
+/// Unlike [`HttpInterceptorLayer`](crate::router::HttpInterceptorLayer) this
+/// layer boxes its future: resolving the locale means running an `async`
+/// extractor (the session lookup step is async) before the inner service is
+/// called, so there is a genuine `await` to suspend on either way. It is
+/// installed whenever a translation bundle is configured — not only when the
+/// binary declares `#[translatable]` columns — because [`ambient_locale`] and
+/// [`with_locale`] are public API whose scope must exist predictably. So an
+/// i18n app that uses no translatable field still pays one boxed future and
+/// one negotiation per request; the negotiation itself touches no I/O (the
+/// session read is an in-memory lock) and the fallback chain is snapshotted at
+/// construction, so nothing here takes a process-wide lock per request.
+#[derive(Clone)]
+pub struct AmbientLocaleLayer {
+    /// Fallback chain published into the scope. Snapshotted from the bundle at
+    /// construction so per-request resolution touches no locks.
+    chain: Arc<[String]>,
+}
+
+impl fmt::Debug for AmbientLocaleLayer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AmbientLocaleLayer")
+            .field("chain", &self.chain)
+            .finish()
+    }
+}
+
+impl AmbientLocaleLayer {
+    /// Build the layer from the loaded [`Bundle`], reusing its resolved
+    /// fallback chain — i.e. exactly [`I18nConfig::resolved_fallback_chain`],
+    /// the chain UI strings walk.
+    #[must_use]
+    pub fn new(bundle: &Arc<Bundle>) -> Self {
+        Self {
+            chain: bundle.fallback_chain().to_vec().into(),
+        }
+    }
+
+    /// Build the layer from an explicit chain (tests, embedded runtimes).
+    #[must_use]
+    pub fn with_chain(chain: Vec<String>) -> Self {
+        Self {
+            chain: chain.into(),
+        }
+    }
+}
+
+impl<S> tower::Layer<S> for AmbientLocaleLayer {
+    type Service = AmbientLocaleService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AmbientLocaleService {
+            inner,
+            chain: Arc::clone(&self.chain),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`AmbientLocaleLayer`].
+#[derive(Clone, Debug)]
+pub struct AmbientLocaleService<S> {
+    inner: S,
+    chain: Arc<[String]>,
+}
+
+impl<S, B> tower::Service<axum::http::Request<B>> for AmbientLocaleService<S>
+where
+    S: tower::Service<axum::http::Request<B>, Response = axum::response::Response>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = axum::response::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<B>) -> Self::Future {
+        // `Service::call` may be invoked on a clone that was never `poll_ready`
+        // -ed, so swap in the ready `self.inner` and keep the clone (the
+        // standard tower `Clone` dance).
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let chain = Arc::clone(&self.chain);
+        Box::pin(async move {
+            let (mut parts, body) = req.into_parts();
+            // Infallible rejection: the extractor always yields a locale.
+            let Ok(locale) = Locale::from_request_parts(&mut parts, &()).await;
+            let scope = LocaleScope::new(locale.tag(), chain.to_vec());
+            let req = axum::http::Request::from_parts(parts, body);
+            let response = with_locale_scope(scope.clone(), inner.call(req)).await?;
+            // A deferred or streaming body (SSE, `Body::from_stream`, a chunked
+            // download) is polled AFTER the handler future resolves, outside
+            // the task-local scope — so a `Translated` rendered per frame would
+            // fall back to the default locale mid-response. Re-enter the same
+            // scope on every frame poll, exactly as `CurrentActorBody` and
+            // `TenantPropagatingBody` do for their own request-scoped values.
+            Ok(response.map(|body| axum::body::Body::new(AmbientLocaleBody::new(body, scope))))
+        })
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Response body that re-enters its request's [`LocaleScope`] on every
+    /// frame poll, so content rendered lazily still resolves to the visitor's
+    /// locale. The sibling of
+    /// [`CurrentActorBody`](crate::current::CurrentActorBody) and
+    /// [`TenantPropagatingBody`](crate::tenancy::TenantPropagatingBody).
+    pub struct AmbientLocaleBody<B> {
+        #[pin]
+        inner: B,
+        scope: LocaleScope,
+    }
+}
+
+impl<B> AmbientLocaleBody<B> {
+    pub(crate) const fn new(inner: B, scope: LocaleScope) -> Self {
+        Self { inner, scope }
+    }
+}
+
+impl<B> http_body::Body for AmbientLocaleBody<B>
+where
+    B: http_body::Body,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        let scope = this.scope.clone();
+        with_locale_scope_sync(scope, || this.inner.poll_frame(cx))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 

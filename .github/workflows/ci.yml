@@ -174,6 +174,19 @@ jobs:
         run: |
           cargo test -p autumn-web --features "inbound-mail,inbound-mailgun,inbound-ses,mail" --lib inbound_mail
           cargo test -p autumn-web --features "inbound-mail,inbound-mailgun,inbound-ses,mail,test-support" --test integration_tests inbound_mail
+      - name: Run i18n-gated tests (translatable model fields)
+        # `i18n` is not a default feature, so the `cargo test --workspace` above
+        # compiles neither `i18n::translatable`'s in-module suite nor the two
+        # `#![cfg(feature = "i18n")]` integration modules. Those are the whole
+        # behavioural proof for #1384 — per-locale persistence, the fallback
+        # walk, the documented sentinel, and the ambient-locale request path —
+        # so they have to run in a lane that blocks merge rather than only in
+        # the (non-blocking, Codecov-driven) coverage job. The Docker-gated
+        # round-trip tests in `translatable_model` are swept separately by the
+        # "Run Docker-dependent tests" step below.
+        run: |
+          cargo test -p autumn-web --features i18n --lib i18n::
+          cargo test -p autumn-web --features "i18n,test-support" --test integration_tests translatable
       - name: Run system-test harness (non-browser) tests
         # `system-tests` is not a default feature. The `cargo test --workspace`
         # above happens to compile it today only because `example-e2e` depends
@@ -272,8 +285,14 @@ jobs:
           # never swept. All are Postgres/Redis testcontainer-managed, so no CI
           # `services:` block is needed. Chromium/browser tests stay OUT — they
           # live behind `system-tests` and require a browser this runner lacks.
-          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis" --test integration_tests offline_sync
-          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis" --test integration_tests -- \
+          #
+          # `i18n` joined the set in #1384 so the `#[translatable]` per-locale
+          # column round-trip suite (`translatable_model`, Postgres
+          # testcontainer) compiles into this binary and is swept. `i18n` is a
+          # pure request-path/codegen feature — it pulls in no extra runner
+          # service and cannot flip a backend.
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --test integration_tests offline_sync
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --test integration_tests -- \
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \

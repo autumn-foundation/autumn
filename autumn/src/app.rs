@@ -8299,15 +8299,31 @@ fn install_i18n_bundle_layer(
         default = bundle.default_locale(),
         "i18n bundle loaded"
     );
+    // #1384: content resolution outside a request (a job worker, a scheduled
+    // task, a CLI command) has no locale scope to read a chain from. Publish
+    // the bundle's resolved chain — the same one UI strings walk — as the
+    // process default so `Translated::resolve` behaves identically there.
+    crate::i18n::install_locale_defaults(bundle.default_locale(), bundle.fallback_chain().to_vec());
     state.insert_extension::<Arc<crate::i18n::Bundle>>(bundle.clone());
     // Use the existing IntoAppLayer plumbing so the Extension is visible to
     // every request. axum::Extension<T> is itself a tower::Layer when T:
     // Clone + Send + Sync + 'static.
+    let ambient_layer = crate::i18n::AmbientLocaleLayer::new(&bundle);
     let ext_layer = axum::Extension(bundle);
     custom_layers.push(CustomLayerRegistration {
         type_id: TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
         type_name: std::any::type_name::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
         layer: tower::util::BoxCloneSyncServiceLayer::new(ext_layer),
+    });
+    // #1384: publish the negotiated locale as the ambient one for the whole
+    // handler, so a `#[translatable]` field resolves itself with no locale
+    // argument in the signature. Registered AFTER the bundle Extension —
+    // registration order is outermost-first, so this layer runs INSIDE it and
+    // its `Locale` extraction can see the bundle it needs to negotiate against.
+    custom_layers.push(CustomLayerRegistration {
+        type_id: TypeId::of::<crate::i18n::AmbientLocaleLayer>(),
+        type_name: std::any::type_name::<crate::i18n::AmbientLocaleLayer>(),
+        layer: tower::util::BoxCloneSyncServiceLayer::new(ambient_layer),
     });
     custom_layers
 }
@@ -12641,6 +12657,103 @@ mod tests {
             .expect("bundle loaded from configured dir");
 
         assert_eq!(bundle.translate("en", "nav.home", &[]), "Loader Home");
+    }
+
+    /// #1384: drive the REAL wiring — `install_i18n_bundle_layer` +
+    /// `try_build_router_inner` — and assert both the ambient locale and a
+    /// `Translated` field resolve for a handler that takes NO locale argument.
+    ///
+    /// This pins the layer-ORDERING invariant the feature rests on: the bundle
+    /// `Extension` must be registered first (outermost) so the ambient layer,
+    /// registered second, can read it while negotiating. Swap the two pushes
+    /// and the layer negotiates against an empty supported-list, pins every
+    /// request to the default locale, and this test goes red — where a
+    /// hand-built router stack would not notice.
+    #[cfg(feature = "i18n")]
+    #[tokio::test]
+    async fn ambient_locale_layer_resolves_translatable_content_through_the_real_stack() {
+        use tower::ServiceExt as _;
+
+        async fn show() -> String {
+            let title =
+                crate::i18n::Translated::from_pairs([("en", "Hello world"), ("es", "Hola mundo")]);
+            // No `Locale` parameter anywhere in this signature.
+            format!(
+                "{}|{}",
+                title,
+                crate::i18n::ambient_locale().unwrap_or_default()
+            )
+        }
+
+        let mut config = AutumnConfig::default();
+        config.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
+        let bundle = Arc::new(crate::i18n::Bundle::from_messages(
+            std::collections::HashMap::new(),
+            &config.i18n,
+        ));
+        let state = AppState::for_test();
+        let custom_layers = install_i18n_bundle_layer(Vec::new(), &state, Some(bundle));
+
+        let router = crate::router::try_build_router_inner(
+            vec![Route {
+                method: http::Method::GET,
+                path: "/show",
+                handler: axum::routing::get(show),
+                name: "show",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/show",
+                    operation_id: "show",
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }],
+            &config,
+            state,
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                custom_layers,
+                static_gate_layers: Vec::new(),
+                #[cfg(feature = "maud")]
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
+            },
+        )
+        .expect("router builds");
+
+        for (accept_language, expected) in [
+            ("es", "Hola mundo|es"),
+            // Untranslated: falls back through the configured chain to `en`.
+            ("fr", "Hello world|en"),
+        ] {
+            let request = axum::http::Request::builder()
+                .uri("/show")
+                .header(http::header::ACCEPT_LANGUAGE, accept_language)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let response = router.clone().oneshot(request).await.expect("response");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .expect("body");
+            assert_eq!(
+                String::from_utf8(bytes.to_vec()).expect("utf-8"),
+                expected,
+                "Accept-Language: {accept_language}"
+            );
+        }
     }
 
     #[cfg(feature = "i18n")]

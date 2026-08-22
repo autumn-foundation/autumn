@@ -8,12 +8,13 @@ use super::dsl::{
     EncryptedMode, Field, FieldConstraints, FieldKind, IdType, parse_fields,
     randomized_equality_lookup_reason,
 };
-use super::emit::Plan;
+use super::emit::{Action, Plan};
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, add_search_down_sql_for, add_search_up_sql_for,
     append_schema_table_with_id_for, create_table_sql_with_metadata_and_id_for, drop_table_sql,
-    link_models_into_seed_bin, position_triggers_down_sql_for, position_triggers_up_sql_for,
+    ensure_autumn_web_feature, link_models_into_seed_bin, position_triggers_down_sql_for,
+    position_triggers_up_sql_for,
 };
 use super::{GenerateError, detect_backend, ensure_project_root, read_or_empty};
 
@@ -203,6 +204,11 @@ fn plan_model_with_options_impl(
     // see the function's contract for why `destroy` must skip it.
     if !for_revert {
         validate_encrypted_fields(&fields, options)?;
+        // Issue #1384: same reasoning as `validate_encrypted_fields` above —
+        // `--unique`/`--index`/`--searchable`/`--shard-key` are flag spellings
+        // of constraints the `{translatable}` parse-time cross-checks cannot
+        // see, because they are folded in after `parse_fields`.
+        validate_translatable_fields(&fields, options)?;
     }
     let pascal_name = pascal(name);
     validate_enum_field_collisions(&pascal_name, &fields)?;
@@ -564,7 +570,40 @@ fn plan_model_with_options_impl(
     // planner, so it inherits the same wiring.
     plan_seed_bin_linking(&mut plan, project_root);
 
+    // (f) Issue #1384: a `{translatable}` column lowers to
+    // `autumn_web::i18n::Translated`, and `autumn_web::i18n` is behind the
+    // NON-DEFAULT `i18n` feature. Without this the generated model would fail
+    // to compile with `E0433: could not find 'i18n' in 'autumn_web'` across
+    // code the author did not write. `{encrypted}` — the closest precedent —
+    // needs no such wiring because `autumn_web::encryption` is ungated; this is
+    // the first field-DSL modifier that lowers to a gated module. Mirrors what
+    // `generate scaffold --i18n` already does for the view lane.
+    if schema_fields.iter().any(Field::is_translatable) {
+        plan_autumn_web_feature(&mut plan, project_root, "i18n");
+    }
+
     Ok(plan)
+}
+
+/// Ensure `autumn-web`'s `features = [...]` list in the project `Cargo.toml`
+/// contains `feature`, folding into any `Modify` action already staged for that
+/// file so two planners cannot clobber each other's edit.
+fn plan_autumn_web_feature(plan: &mut Plan, project_root: &Path, feature: &str) {
+    let cargo_path = project_root.join("Cargo.toml");
+    let base = plan
+        .actions
+        .iter()
+        .rev()
+        .find_map(|a| match a {
+            Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| read_or_empty(&cargo_path));
+    let updated = ensure_autumn_web_feature(&base, feature);
+    if updated != base {
+        plan.actions.retain(|a| a.path() != cargo_path);
+        plan.modify(cargo_path, updated);
+    }
 }
 
 /// Add a `Modify` action linking `src/models/` + `src/schema.rs` into
@@ -1976,6 +2015,52 @@ pub fn parse_model_metadata(
     Ok(metadata)
 }
 
+/// Reject every `{translatable}` combination the `#[model]` macro refuses,
+/// expressed through a *flag* rather than a `{…}` modifier (issue #1384).
+///
+/// `parse_field` already rejects the modifier spellings (`:unique`, a nullable
+/// column, `{encrypted}`, `:states(…)`, the `#[validate]` fan-out). The flags
+/// below are folded in **after** parsing — `--unique` by `apply_unique_flags`,
+/// the others straight from `options` — so without this pass they slip through
+/// and produce either a UNIQUE index over a JSON container (silently useless)
+/// or a generated project that does not compile.
+///
+/// Generation-only: `autumn destroy` recomputes the same plan and must not be
+/// blocked by a refusal that only makes sense when emitting.
+///
+/// # Errors
+/// Returns [`GenerateError::Config`] naming the field, the offending flag, and
+/// why the combination cannot work.
+pub fn validate_translatable_fields(
+    fields: &[Field],
+    options: &ModelOptions,
+) -> Result<(), GenerateError> {
+    for field in fields.iter().filter(|f| f.is_translatable()) {
+        let name = &field.name;
+        if field.unique {
+            return Err(GenerateError::Config(format!(
+                "field '{name}' is `{{translatable}}` and cannot be `--unique`: the index would                  compare whole per-locale containers, so identical text translated into                  different locale sets would never collide, and the derived `find_by_{name}`                  lookup could never match. Put the uniqueness on a non-translatable column                  (e.g. a `slug`)."
+            )));
+        }
+        if options.indexes.iter().any(|i| i.trim() == *name) {
+            return Err(GenerateError::Config(format!(
+                "field '{name}' is `{{translatable}}` and cannot be `--index`ed: an equality                  index over a JSON container matches whole containers, never a single locale's                  value (the `#[model]` macro refuses `#[indexed]` + `#[translatable]` for the                  same reason). Drop it from `--index`."
+            )));
+        }
+        if options.searchable.iter().any(|s| s.trim() == *name) {
+            return Err(GenerateError::Config(format!(
+                "field '{name}' is `{{translatable}}` and cannot be `--searchable`: full-text                  search indexes the stored column, which is a JSON container — the index would                  match locale tags and JSON punctuation, not the prose (the `#[model]` macro                  refuses `#[searchable]` + `#[translatable]`). Drop it from `--searchable`, or                  keep a separate non-translatable column to search."
+            )));
+        }
+        if options.shard_key.as_deref().map(str::trim) == Some(name.as_str()) {
+            return Err(GenerateError::Config(format!(
+                "field '{name}' is `{{translatable}}` and cannot be the `--shard-key`: the                  shard is chosen by hashing the column value, and a container whose bytes                  change every time any locale is edited would move the row between shards.                  Shard on a stable column (e.g. `tenant_id`)."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Reject every `{encrypted}` combination the encryption runtime or the
 /// `#[model]` macro cannot honour (issue #1340), after `--unique` flags have
 /// been folded into the fields so both spellings of "make this column
@@ -2806,6 +2891,16 @@ fn render_model_file(
             }
             None => {}
         }
+        // Issue #1384: a `{translatable}` DSL modifier re-emits as the
+        // `#[translatable]` attribute the `#[model]` macro parses. The field's
+        // Rust type (`autumn_web::i18n::Translated`, from `Field::rust_type`)
+        // is what carries the behaviour; the attribute is what registers the
+        // column and emits the `<field>_localized` / `available_locales(..)`
+        // accessors. Absent for a monolingual column — that no-op path is what
+        // keeps non-translatable output byte-identical.
+        if f.is_translatable() {
+            out.push_str("    #[translatable]\n");
+        }
         // Issue #1255: a `richtext` column renders as a bare `String`, exactly
         // like `String`/`Text`, so nothing in the emitted source would otherwise
         // distinguish it. Emit a marker doc comment that (a) tells a human
@@ -2860,6 +2955,19 @@ mod tests {
     fn project() -> TempDir {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        tmp
+    }
+
+    /// A project whose `Cargo.toml` actually declares `autumn-web`, so the
+    /// feature-wiring pass has a dependency line to edit (the bare `project()`
+    /// fixture has none, which no real `autumn new` project ever does).
+    fn project_with_autumn_web_dep() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { version = \"0.6\" }\n",
+        )
+        .unwrap();
         tmp
     }
 
@@ -3232,6 +3340,166 @@ mod tests {
             "got:\n{model}"
         );
         assert!(model.contains("pub status: String,"), "got:\n{model}");
+    }
+
+    // ── `{translatable}` per-locale content (issue #1384) ───────────────────
+
+    /// AC7 (negative half): a model with no `{translatable}` field renders
+    /// exactly as before — the attribute never leaks into the ordinary path.
+    #[test]
+    fn model_file_without_translatable_field_emits_no_attribute() {
+        let fields =
+            crate::generate::dsl::parse_fields(&["title:String".into(), "body:Text".into()])
+                .unwrap();
+        let model = render_model_file_for_test("Post", "posts", &fields);
+        assert!(
+            !model.contains("#[translatable"),
+            "nothing declared translatable, so no attribute should render; got:\n{model}"
+        );
+        assert!(!model.contains("Translated"), "got:\n{model}");
+    }
+
+    /// AC1: the DSL token re-emits as `#[translatable]` on a field typed as the
+    /// per-locale container, and a plain column in the same model is untouched.
+    #[test]
+    fn model_file_emits_translatable_attribute_and_container_type() {
+        let fields = crate::generate::dsl::parse_fields(&[
+            "title:String{translatable}".into(),
+            "body:Text{translatable}".into(),
+            "slug:String".into(),
+        ])
+        .unwrap();
+        let model = render_model_file_for_test("Post", "posts", &fields);
+        assert!(
+            model.contains("    #[translatable]\n    pub title: autumn_web::i18n::Translated,"),
+            "got:\n{model}"
+        );
+        assert!(
+            model.contains("    #[translatable]\n    pub body: autumn_web::i18n::Translated,"),
+            "got:\n{model}"
+        );
+        assert!(model.contains("    pub slug: String,"), "got:\n{model}");
+        assert!(
+            !model.contains("#[translatable]\n    pub slug"),
+            "plain column must not pick up the attribute; got:\n{model}"
+        );
+    }
+
+    /// AC1 + AC6 end to end through the real planner: the emitted model,
+    /// `schema.rs` entry, migration DDL and `Cargo.toml` feature all land
+    /// together, so a `generate model` with a translatable column produces a
+    /// project that actually builds.
+    #[test]
+    fn translatable_model_plan_emits_model_schema_migration_and_feature() {
+        let tmp = project_with_autumn_web_dep();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String{translatable}".into(), "slug:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            model.contains("    #[translatable]\n    pub title: autumn_web::i18n::Translated,"),
+            "model: {model}"
+        );
+
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(schema.contains("title -> Text,"), "schema: {schema}");
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("title TEXT NOT NULL DEFAULT '{}'"),
+            "up.sql: {up}"
+        );
+        // AC6: what the generator actually wrote classifies as safe.
+        assert!(
+            crate::migrate::safety::is_safe(&crate::migrate::safety::classify_sql(&up)),
+            "generated migration must classify safe: {up}"
+        );
+
+        // The container type lives behind the non-default `i18n` feature.
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("i18n"),
+            "generate model must enable autumn-web's `i18n` feature: {cargo}"
+        );
+    }
+
+    /// A model with no translatable column must not gain the `i18n` feature.
+    #[test]
+    fn a_plain_model_plan_does_not_enable_the_i18n_feature() {
+        let tmp = project_with_autumn_web_dep();
+        let before = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap_or_default();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let after = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap_or_default();
+        assert_eq!(before.contains("i18n"), after.contains("i18n"));
+    }
+
+    /// The flag spellings bypass `parse_field`'s cross-checks (they are folded
+    /// in afterwards), so they need their own refusal — otherwise `--unique`
+    /// ships a UNIQUE index over a JSON container and `--index`/`--searchable`
+    /// emit a model the `#[model]` macro rejects.
+    #[test]
+    fn translatable_columns_refuse_the_flag_spellings_of_their_restrictions() {
+        let cases: [(&str, ModelOptions); 4] = [
+            (
+                "--unique",
+                ModelOptions {
+                    uniques: vec!["title".into()],
+                    ..ModelOptions::default()
+                },
+            ),
+            (
+                "--index",
+                ModelOptions {
+                    indexes: vec!["title".into()],
+                    ..ModelOptions::default()
+                },
+            ),
+            (
+                "--searchable",
+                ModelOptions {
+                    searchable: vec!["title".into()],
+                    ..ModelOptions::default()
+                },
+            ),
+            (
+                "--shard-key",
+                ModelOptions {
+                    shard_key: Some("title".into()),
+                    ..ModelOptions::default()
+                },
+            ),
+        ];
+        for (flag, options) in cases {
+            let tmp = project();
+            let err = plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String{translatable}".into()],
+                "20260427000000",
+                &options,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("translatable"), "{flag}: {err}");
+            assert!(err.contains("title"), "{flag}: {err}");
+        }
     }
 
     // ── `{encrypted}` at-rest column encryption (issue #1340) ───────────────
