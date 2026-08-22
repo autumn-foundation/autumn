@@ -535,21 +535,51 @@ impl Translated {
     }
 }
 
-/// Whether `key` has the shape of a BCP-47 locale tag (`en`, `es-MX`,
-/// `zh-Hant-TW`): a 2-3 letter primary subtag, then `-`-joined alphanumeric
-/// subtags of 1-8 characters.
+/// Whether `key` has the shape of a BCP-47 language tag, in either of the two
+/// forms that can appear as a locale: a **langtag** (`en`, `es-MX`,
+/// `zh-Hant-TW`) — a 2-3 letter primary subtag followed by `-`-joined
+/// alphanumeric subtags of 1-8 characters — or a **singleton-led** tag, which
+/// covers private use (`x-private`) and the grandfathered irregular forms
+/// (`i-klingon`).
 ///
 /// Deliberately a shape test, not a registry lookup: a private-use or
-/// not-yet-registered tag must still round-trip.
+/// not-yet-registered tag must still round-trip. The rule this function exists
+/// to uphold is that **whatever [`Translated::set`] accepts,
+/// [`Translated::decode_column`] must recognise on the way back** — a key the
+/// writer stores and the reader rejects makes the whole container decode as
+/// legacy text, hiding every translation and letting the next save escape the
+/// JSON into the column permanently.
+///
+/// # Known limits
+///
+/// BCP-47 also permits 4-8 letter primary subtags (reserved and registered
+/// ranges, essentially unused in practice). They are **not** accepted here:
+/// admitting them would also admit ordinary English words like `host` or
+/// `name`, and this test's other job is to keep a column that already held an
+/// unrelated JSON string-map from being mistaken for translations. Two-letter
+/// keys are inherently ambiguous (`{"db": "primary"}` reads as a translation
+/// map) — the test cannot be airtight, which is why `#[translatable]` belongs
+/// only on columns that hold human-readable text.
 fn looks_like_locale_tag(key: &str) -> bool {
     let mut parts = key.split('-');
     let Some(primary) = parts.next() else {
         return false;
     };
-    if !(2..=3).contains(&primary.len()) || !primary.bytes().all(|b| b.is_ascii_alphabetic()) {
+    let mut rest = parts.peekable();
+    if primary.len() == 1 {
+        // Singleton-led: `x-…` (private use) and `i-…` (grandfathered
+        // irregular). A bare singleton with no subtag is not a tag.
+        let Some(byte) = primary.bytes().next() else {
+            return false;
+        };
+        if !matches!(byte.to_ascii_lowercase(), b'x' | b'i') || rest.peek().is_none() {
+            return false;
+        }
+    } else if !(2..=3).contains(&primary.len()) || !primary.bytes().all(|b| b.is_ascii_alphabetic())
+    {
         return false;
     }
-    parts.all(|p| (1..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
+    rest.all(|p| (1..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// Renders the active locale's value, or the empty string when the fallback
@@ -910,17 +940,67 @@ mod tests {
 
     #[test]
     fn locale_tag_shape_gates_the_translation_map_decoding() {
-        assert!(looks_like_locale_tag("en"));
-        assert!(looks_like_locale_tag("es-MX"));
-        assert!(looks_like_locale_tag("zh-Hant-TW"));
-        assert!(!looks_like_locale_tag("host"));
-        assert!(!looks_like_locale_tag("a"));
-        assert!(!looks_like_locale_tag(""));
-        assert!(!looks_like_locale_tag("en_US"));
+        for tag in [
+            "en",
+            "es-MX",
+            "zh-Hant-TW",
+            // BCP-47 private use and the grandfathered irregular forms are
+            // singleton-led. `set` accepts them, so decoding must too.
+            "x-private",
+            "i-klingon",
+            "X-Private",
+        ] {
+            assert!(looks_like_locale_tag(tag), "{tag} should be tag-shaped");
+        }
+        for not_a_tag in [
+            "host",
+            "a",
+            "",
+            "en_US",
+            "x",
+            "i",
+            "q-",
+            "-en",
+            "en-toolongsubtag",
+        ] {
+            assert!(
+                !looks_like_locale_tag(not_a_tag),
+                "{not_a_tag} should not be tag-shaped"
+            );
+        }
         // An unrelated JSON string-map in a column that predates the attribute
         // is read as text, not mistaken for translations.
         let t = Translated::decode_column("{\"host\":\"db1\"}", "en");
         assert_eq!(t.get("en"), Some("{\"host\":\"db1\"}"));
+    }
+
+    /// The invariant behind `looks_like_locale_tag`: anything `set` accepts has
+    /// to survive `encode_column` -> `decode_column`. A key the writer stores
+    /// and the reader rejects makes the WHOLE container decode as legacy text —
+    /// every translation goes unreachable, and the next save escapes the JSON
+    /// into the column permanently.
+    #[test]
+    fn every_writable_locale_tag_survives_a_column_round_trip() {
+        for tag in [
+            "en",
+            "es",
+            "es-MX",
+            "zh-Hant-TW",
+            "pt-BR",
+            "sgn-BE-FR",
+            "x-private",
+            "i-klingon",
+        ] {
+            let mut written = Translated::new();
+            written.set(tag, "value");
+            let decoded = Translated::decode_column(&written.encode_column(), "en");
+            assert_eq!(
+                decoded.get(tag),
+                Some("value"),
+                "`{tag}` was writable but did not decode back"
+            );
+            assert_eq!(decoded, written, "round trip must be lossless for `{tag}`");
+        }
     }
 
     /// Reads and writes must agree with no configuration installed: an app
