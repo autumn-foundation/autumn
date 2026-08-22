@@ -450,6 +450,32 @@ fn plan_model_with_options_impl(
     } else {
         format!("{position_down}{down_sql}")
     };
+    // Issue #1367: the cascade a polymorphic foreign key cannot express. The
+    // shared `comments` table is created once and cannot know which models will
+    // later attach to it, so each commentable parent carries its own cleanup
+    // trigger. Without it a deleted parent leaves its thread behind —
+    // unreachable, and worse than unreachable if the id is ever reused, since
+    // the old comments would surface under the new record.
+    let commentable_up = if fields.iter().any(|f| f.kind.is_commentable()) {
+        super::commentable::parent_cleanup_sql(backend, &table, &pascal_name)
+    } else {
+        String::new()
+    };
+    let (up_sql, down_sql) = if commentable_up.is_empty() {
+        (up_sql, down_sql)
+    } else {
+        (
+            format!("{up_sql}{commentable_up}"),
+            // Dropped before the table so the trigger never outlives its
+            // target. The statement is backend-split: SQLite's DROP TRIGGER
+            // takes no `ON <table>`.
+            format!(
+                "{}{down_sql}",
+                super::commentable::parent_cleanup_down_sql(backend, &table)
+            ),
+        )
+    };
+
     plan.create(migration_dir.join("up.sql"), up_sql);
     plan.create(migration_dir.join("down.sql"), down_sql);
 

@@ -502,6 +502,25 @@ pub fn commentable_spec_for(type_name: &str) -> Option<&'static CommentableSpec>
         .map(|descriptor| descriptor.spec)
 }
 
+/// The model type name registered for `spec`, matched by IDENTITY.
+///
+/// Not by discriminator: two models sharing a `commentable_type` while pointing
+/// at different comment tables is a supported helper-only shape (the router
+/// still refuses it), so a name lookup could return the other model's identity
+/// — and with it the other model's repository facts, applying one model's
+/// soft-delete rule to the other's table.
+///
+/// The registered specs are `&'static`, so address equality is exactly the
+/// question being asked. A hand-built spec matches nothing and the caller falls
+/// back to what the spec itself declares.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn commentable_model_for_spec(spec: &CommentableSpec) -> Option<&'static str> {
+    inventory::iter::<CommentableDescriptor>()
+        .find(|descriptor| std::ptr::eq(descriptor.spec, spec))
+        .map(|descriptor| (descriptor.model)())
+}
+
 /// The model type name registered for `type_name`, or `None` when no
 /// `#[commentable]` model claims it.
 ///
@@ -684,7 +703,7 @@ pub async fn add_comment(
 
     scoped_immediate_transaction::<Comment, AutumnError, _>(conn, |conn| {
         async move {
-            lock_parent(conn, &spec, &parent_type, parent_id, tenant.as_deref()).await?;
+            lock_parent(conn, &spec, parent_id, tenant.as_deref()).await?;
 
             if let Some(reply_to) = reply_to {
                 let parent_depth =
@@ -788,14 +807,7 @@ pub async fn delete_comment(
                 return Err(AutumnError::not_found_msg("Comment not found"));
             };
 
-            lock_parent(
-                conn,
-                &spec,
-                &parent_type,
-                target.commentable_id,
-                tenant.as_deref(),
-            )
-            .await?;
+            lock_parent(conn, &spec, target.commentable_id, tenant.as_deref()).await?;
 
             let removed = delete_subtree(conn, &spec, &parent_type, parent_id, comment_id).await?;
 
@@ -852,7 +864,7 @@ pub async fn recompute_comment_count(
     assert_unique_discriminators();
     spec.validate()?;
     let Some(counter_column) = spec.counter_column else {
-        probe_parent(conn, spec, parent_type, parent_id, tenant, false).await?;
+        probe_parent(conn, spec, parent_id, tenant, false).await?;
         return Ok(0);
     };
 
@@ -862,7 +874,7 @@ pub async fn recompute_comment_count(
 
     scoped_immediate_transaction::<i64, AutumnError, _>(conn, |conn| {
         async move {
-            lock_parent(conn, &spec, &parent_type, parent_id, tenant.as_deref()).await?;
+            lock_parent(conn, &spec, parent_id, tenant.as_deref()).await?;
 
             let comments = quote_ident(spec.comments_table);
             let type_column = quote_ident(spec.type_column);
@@ -926,7 +938,7 @@ pub async fn comment_thread(
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
-    probe_parent(conn, spec, parent_type, parent_id, tenant, false).await?;
+    probe_parent(conn, spec, parent_id, tenant, false).await?;
 
     let comments = quote_ident(spec.comments_table);
     let pk = quote_ident(spec.comment_pk);
@@ -1108,7 +1120,6 @@ fn build_nodes(
 async fn probe_parent(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
-    parent_type: &str,
     parent_id: i64,
     tenant: Option<&str>,
     lock: bool,
@@ -1120,7 +1131,7 @@ async fn probe_parent(
     // ordinary audit data, and filtering on it would 404 rows the app still
     // serves deliberately. Only when no repository is registered does the
     // column get to decide.
-    let soft_deletes = commentable_model_for(parent_type)
+    let soft_deletes = commentable_model_for_spec(spec)
         .and_then(model_soft_deletes)
         .unwrap_or(spec.parent_soft_delete);
     let live = if soft_deletes {
@@ -1180,11 +1191,10 @@ async fn probe_parent(
 async fn lock_parent(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
-    parent_type: &str,
     parent_id: i64,
     tenant: Option<&str>,
 ) -> AutumnResult<()> {
-    probe_parent(conn, spec, parent_type, parent_id, tenant, true).await
+    probe_parent(conn, spec, parent_id, tenant, true).await
 }
 
 /// The depth of `comment_id` within `(parent_type, parent_id)`'s thread, where
@@ -2038,12 +2048,12 @@ struct CommentSubmission {
 /// and no tenant is in scope: that is a middleware wiring mistake, not
 /// something the caller can fix.
 #[cfg(all(feature = "db", feature = "maud"))]
-fn request_tenant(commentable_type: &str, spec: &CommentableSpec) -> AutumnResult<Option<String>> {
+fn request_tenant(spec: &CommentableSpec) -> AutumnResult<Option<String>> {
     // A model with no tenant column emits no tenant predicate at all, so
     // reading the task-local would only ever produce a value nothing uses —
     // and neither does one whose repository deliberately opted out of
     // `tenant_scoped` while the model happens to carry a `tenant_id` column.
-    let model = commentable_model_for(commentable_type).unwrap_or("");
+    let model = commentable_model_for_spec(spec).unwrap_or("");
     if !model_requires_tenant(model, spec.parent_tenant_column.is_some()) {
         return Ok(None);
     }
@@ -2169,7 +2179,7 @@ async fn show_thread(
     mut db: crate::db::Db,
 ) -> AutumnResult<maud::Markup> {
     let spec = resolve_spec(&commentable_type)?;
-    let tenant = request_tenant(&commentable_type, spec)?;
+    let tenant = request_tenant(spec)?;
     let thread = comment_thread(
         &mut db,
         spec,
@@ -2241,7 +2251,7 @@ async fn post_comment(
                 .map_err(|_| AutumnError::bad_request_msg("Invalid reply target"))?,
         ),
     };
-    let tenant = request_tenant(&commentable_type, spec)?;
+    let tenant = request_tenant(spec)?;
     // Only a relative, single-slash path is ever honoured, so a crafted
     // `return_to` cannot become an open redirect — and the same validated value
     // is echoed back into the re-rendered forms, so the NEXT no-JS submit still

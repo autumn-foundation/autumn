@@ -86,6 +86,7 @@ pub fn up_sql(backend: autumn_web::config::DatabaseBackend) -> String {
         ts,
         ts_not_null_default_now,
     } = CommentsDdl::for_backend(backend);
+    let cleanup = shared_cleanup_sql(backend);
     format!(
         "-- Threaded, polymorphic comments (issue #1367).\n\
          --\n\
@@ -116,7 +117,8 @@ pub fn up_sql(backend: autumn_web::config::DatabaseBackend) -> String {
          \n\
          -- The delete cascade walks children by parent_id.\n\
          CREATE INDEX IF NOT EXISTS idx_{COMMENTS_TABLE}_parent_id\n\
-         \x20   ON {COMMENTS_TABLE} (parent_id);\n"
+         \x20   ON {COMMENTS_TABLE} (parent_id);\n\
+         {cleanup}"
     )
 }
 
@@ -406,6 +408,94 @@ fn comments_creations(sql: &str) -> Vec<(usize, &str)> {
         }
     }
     found
+}
+
+/// The cascade a polymorphic foreign key cannot express.
+///
+/// `commentable_id` carries no `REFERENCES`, so deleting a parent leaves its
+/// comments behind — unreachable, because the framework's parent probe 404s,
+/// and worse than unreachable if the parent's id is ever reused, since the old
+/// thread would reappear under the new record.
+///
+/// PostgreSQL gets one shared trigger function, parameterised by discriminator,
+/// so each commentable parent costs a single `CREATE TRIGGER`. SQLite has no
+/// parameterised trigger functions, so its cleanup is emitted per parent
+/// instead (see [`parent_cleanup_sql`]).
+fn shared_cleanup_sql(backend: autumn_web::config::DatabaseBackend) -> String {
+    match backend {
+        autumn_web::config::DatabaseBackend::Postgres => format!(
+            "\n\
+             -- Deleting a parent must take its comments with it. TG_ARGV[0] is the\n\
+             -- parent's `commentable_type`, so ONE function serves every model and each\n\
+             -- new commentable parent costs a single CREATE TRIGGER.\n\
+             CREATE OR REPLACE FUNCTION {COMMENTS_TABLE}_delete_for_parent()\n\
+             RETURNS TRIGGER AS $$\n\
+             BEGIN\n\
+             \x20   DELETE FROM {COMMENTS_TABLE}\n\
+             \x20    WHERE commentable_type = TG_ARGV[0]\n\
+             \x20      AND commentable_id = OLD.id;\n\
+             \x20   RETURN OLD;\n\
+             END;\n\
+             $$ LANGUAGE plpgsql;\n"
+        ),
+        // SQLite triggers take no arguments, so there is nothing shared to emit.
+        autumn_web::config::DatabaseBackend::Sqlite => String::new(),
+    }
+}
+
+/// The `CREATE TRIGGER` that cleans up `parent_table`'s comments on delete.
+///
+/// Emitted into the parent's own migration, because the shared table is created
+/// once and cannot know which models will later attach to it.
+#[must_use]
+pub fn parent_cleanup_sql(
+    backend: autumn_web::config::DatabaseBackend,
+    parent_table: &str,
+    commentable_type: &str,
+) -> String {
+    match backend {
+        autumn_web::config::DatabaseBackend::Postgres => format!(
+            "\n\
+             -- `{commentable_type}`'s comments go when the row does. The polymorphic key\n\
+             -- cannot be a foreign key, so this trigger is the cascade.\n\
+             CREATE TRIGGER {parent_table}_delete_{COMMENTS_TABLE}\n\
+             \x20   AFTER DELETE ON {parent_table}\n\
+             \x20   FOR EACH ROW\n\
+             \x20   EXECUTE FUNCTION {COMMENTS_TABLE}_delete_for_parent('{commentable_type}');\n"
+        ),
+        autumn_web::config::DatabaseBackend::Sqlite => format!(
+            "\n\
+             -- `{commentable_type}`'s comments go when the row does. SQLite triggers take\n\
+             -- no arguments, so the discriminator is inlined here rather than shared.\n\
+             CREATE TRIGGER IF NOT EXISTS {parent_table}_delete_{COMMENTS_TABLE}\n\
+             \x20   AFTER DELETE ON {parent_table}\n\
+             \x20   FOR EACH ROW\n\
+             BEGIN\n\
+             \x20   DELETE FROM {COMMENTS_TABLE}\n\
+             \x20    WHERE commentable_type = '{commentable_type}'\n\
+             \x20      AND commentable_id = OLD.id;\n\
+             END;\n"
+        ),
+    }
+}
+
+/// The `DROP TRIGGER` undoing [`parent_cleanup_sql`].
+///
+/// Backend-split because the syntax differs: PostgreSQL names the table
+/// (`DROP TRIGGER … ON <table>`), SQLite does not — triggers are global there.
+#[must_use]
+pub fn parent_cleanup_down_sql(
+    backend: autumn_web::config::DatabaseBackend,
+    parent_table: &str,
+) -> String {
+    match backend {
+        autumn_web::config::DatabaseBackend::Postgres => format!(
+            "DROP TRIGGER IF EXISTS {parent_table}_delete_{COMMENTS_TABLE} ON {parent_table};\n"
+        ),
+        autumn_web::config::DatabaseBackend::Sqlite => {
+            format!("DROP TRIGGER IF EXISTS {parent_table}_delete_{COMMENTS_TABLE};\n")
+        }
+    }
 }
 
 /// Whether `name` is one of the accepted spellings of the shared comments
@@ -1623,6 +1713,50 @@ mod tests {
         )
         .expect("write");
         assert!(!already_migrated(other.path()));
+    }
+
+    /// A deleted parent must take its comments with it. The polymorphic key
+    /// cannot be a foreign key, so a trigger is the cascade — and without one
+    /// the thread outlives the parent and resurfaces if the id is reused.
+    #[test]
+    fn each_commentable_parent_gets_a_cleanup_trigger() {
+        // Postgres: one shared function, one trigger per parent.
+        let shared = up_sql(DatabaseBackend::Postgres);
+        assert!(
+            shared.contains("CREATE OR REPLACE FUNCTION comments_delete_for_parent()"),
+            "the shared function is emitted once:\n{shared}"
+        );
+        let trigger = parent_cleanup_sql(DatabaseBackend::Postgres, "posts", "Post");
+        assert!(trigger.contains("AFTER DELETE ON posts"));
+        assert!(
+            trigger.contains("EXECUTE FUNCTION comments_delete_for_parent('Post')"),
+            "the discriminator is passed, so one function serves every model:\n{trigger}"
+        );
+
+        // SQLite has no parameterised trigger functions, so it inlines instead
+        // — and must NOT reference the Postgres-only shared function.
+        let sqlite_shared = up_sql(DatabaseBackend::Sqlite);
+        assert!(
+            !sqlite_shared.contains("plpgsql"),
+            "no plpgsql on SQLite:\n{sqlite_shared}"
+        );
+        let sqlite = parent_cleanup_sql(DatabaseBackend::Sqlite, "posts", "Post");
+        assert!(sqlite.contains("AFTER DELETE ON posts"));
+        assert!(sqlite.contains("commentable_type = 'Post'"));
+        assert!(
+            !sqlite.contains("EXECUTE FUNCTION"),
+            "SQLite has no EXECUTE FUNCTION:\n{sqlite}"
+        );
+
+        // The down side is backend-split: SQLite's DROP TRIGGER takes no ON.
+        assert!(
+            parent_cleanup_down_sql(DatabaseBackend::Postgres, "posts").contains(" ON posts;"),
+            "Postgres names the table"
+        );
+        assert!(
+            !parent_cleanup_down_sql(DatabaseBackend::Sqlite, "posts").contains(" ON "),
+            "SQLite must not"
+        );
     }
 
     /// The shared migration must survive `destroy scaffold` while any other
