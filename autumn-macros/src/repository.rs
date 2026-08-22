@@ -11765,7 +11765,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // to be published from here or the router's guard misses the shape
     // entirely and serves the model from the control pool.
     let facts_model_name = &config.model_name;
-    let (facts_sharded, facts_tenant_scoped) = (config.sharded, config.tenant_scoped);
+    let (facts_sharded, facts_tenant_scoped, facts_soft_delete) =
+        (config.sharded, config.tenant_scoped, config.soft_delete);
     // Registered for EVERY repository, not only the opted-in ones: the router
     // has to distinguish "this repository opted out" from "no repository said
     // anything", and only an unconditional entry can tell those apart.
@@ -11775,6 +11776,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 model: || ::core::any::type_name::<#facts_model_name>(),
                 sharded: #facts_sharded,
                 tenant_scoped: #facts_tenant_scoped,
+                soft_delete: #facts_soft_delete,
             }
         }
     };

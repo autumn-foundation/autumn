@@ -696,21 +696,23 @@ pub fn push_commentable_migration(
 ///
 /// Recursive: model layout below `src/models/` is the app's business, not the
 /// generator's, and a missed declaration here costs a surviving model its table.
-fn commentable_declared_below(dir: &Path, destroying_file: &str) -> bool {
+fn commentable_declared_below(dir: &Path, destroying_path: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.is_dir() {
-            if commentable_declared_below(&path, destroying_file) {
+            if commentable_declared_below(&path, destroying_path) {
                 return true;
             }
             continue;
         }
-        // Only the file being destroyed is skipped, and only by name: a
-        // same-named model in another module is a different model.
-        if path.file_name().and_then(|name| name.to_str()) == Some(destroying_file) {
+        // Compared as a PATH, not a basename. `src/models/admin/post.rs` is a
+        // different model from `src/models/post.rs` and must still count as a
+        // survivor when the flat one is destroyed — skipping it by shared
+        // filename would delete the shared migration out from under it.
+        if path == destroying_path {
             continue;
         }
         if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
@@ -759,7 +761,7 @@ pub fn another_model_is_still_commentable(project_root: &Path, destroying_model:
     // file simply fails, so a flat scan would conclude nobody else needs the
     // shared table and delete the migration out from under a model that does.
     // The cost of the mistake is a deployment with no storage for a live model.
-    if commentable_declared_below(&models_dir, &destroying_file) {
+    if commentable_declared_below(&models_dir, &models_dir.join(&destroying_file)) {
         return true;
     }
 
@@ -1423,18 +1425,17 @@ mod tests {
         std::fs::remove_file(nested.join("announcement.rs")).expect("rm");
         assert!(!another_model_is_still_commentable(tmp.path(), "post"));
 
-        // A same-named model in another module is a DIFFERENT model, so
-        // destroying the flat `post` must not skip it.
+        // A same-named model in another module is a DIFFERENT model, and it
+        // still needs the table. Matching by bare filename skipped it too.
         std::fs::write(
             nested.join("post.rs"),
             "#[autumn_web::model]\n#[commentable(by = User)]\npub struct Post {}\n",
         )
         .expect("write");
         assert!(
-            !another_model_is_still_commentable(tmp.path(), "post"),
-            "matching by bare filename, `admin/post.rs` is skipped like the target — \
-             a known limit of name-based matching, pinned so it is a decision and \
-             not a surprise"
+            another_model_is_still_commentable(tmp.path(), "post"),
+            "`admin/post.rs` is a different file from `models/post.rs`, so destroying \
+             the flat one must not take the shared migration with it"
         );
     }
 

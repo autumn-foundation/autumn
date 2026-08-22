@@ -403,6 +403,8 @@ pub struct RepositoryFacts {
     pub sharded: bool,
     /// `#[repository(..., tenant_scoped)]` — queries carry a tenant predicate.
     pub tenant_scoped: bool,
+    /// `#[repository(..., soft_delete)]` — reads filter `deleted_at IS NULL`.
+    pub soft_delete: bool,
 }
 
 #[cfg(feature = "db")]
@@ -412,14 +414,22 @@ inventory::collect!(RepositoryFacts);
 #[cfg(feature = "db")]
 #[must_use]
 pub fn model_has_sharded_repository(model: &str) -> bool {
-    repository_facts_for(model).is_some_and(|facts| facts.sharded)
+    // ANY sharded registration counts. The conservative answer here is the
+    // opposite of tenancy's — refusing to mount a router that would read the
+    // wrong database — but it is the same rule underneath: when registrations
+    // disagree, take the one whose failure mode is a visible refusal.
+    repository_facts_for(model).any(|facts| facts.sharded)
 }
 
-/// The repository opt-ins registered for `model`, if a repository was declared.
+/// Every repository registration for `model`.
+///
+/// A model may have MORE than one repository trait — `repository_sharded.rs`
+/// declares two for `Post`, and an app with a scoped application repository
+/// beside an unscoped admin one is an ordinary shape. Returning only the first
+/// would make link order decide, which is not a decision anyone made.
 #[cfg(feature = "db")]
-#[must_use]
-pub fn repository_facts_for(model: &str) -> Option<&'static RepositoryFacts> {
-    inventory::iter::<RepositoryFacts>().find(|facts| (facts.model)() == model)
+fn repository_facts_for(model: &str) -> impl Iterator<Item = &'static RepositoryFacts> {
+    inventory::iter::<RepositoryFacts>().filter(move |facts| (facts.model)() == model)
 }
 
 /// Whether `model`'s comment routes must resolve a tenant.
@@ -428,16 +438,59 @@ pub fn repository_facts_for(model: &str) -> Option<&'static RepositoryFacts> {
 /// is enabled by `#[repository(..., tenant_scoped)]`, and a model can carry the
 /// column while its repository deliberately does not scope on it.
 ///
-/// The two conditions are NOT symmetric, and the default matters. A missing
-/// registration downgrades nothing: absent positive evidence that the
-/// repository opted OUT, a model with a tenant column stays scoped. Getting
-/// this backwards would fail open — serving one tenant's comments to another —
-/// whereas the conservative direction's worst case is the 500 this exists to
-/// stop being spurious.
+/// Aggregated across EVERY registration, and deliberately asymmetric in two
+/// ways. A model with a tenant column stays scoped when nothing is registered,
+/// and stays scoped when *any* registration is scoped — an unscoped admin
+/// repository sitting beside a scoped application one must not be able to
+/// unscope the routes. Both defaults point the same way on purpose: the cost of
+/// being too strict is a 500 telling the operator to mount the middleware,
+/// while the cost of being too lax is serving one tenant's comments to another.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn model_requires_tenant(model: &str, has_tenant_column: bool) -> bool {
-    has_tenant_column && repository_facts_for(model).is_none_or(|facts| facts.tenant_scoped)
+    requires_tenant_from(repository_facts_for(model), has_tenant_column)
+}
+
+/// The aggregation behind [`model_requires_tenant`], over an arbitrary set of
+/// registrations so the order-independence can be tested directly.
+#[cfg(feature = "db")]
+fn requires_tenant_from<'a>(
+    facts: impl Iterator<Item = &'a RepositoryFacts>,
+    has_tenant_column: bool,
+) -> bool {
+    if !has_tenant_column {
+        return false;
+    }
+    let mut registered = false;
+    for entry in facts {
+        if entry.tenant_scoped {
+            return true;
+        }
+        registered = true;
+    }
+    // No registration at all: keep scoping rather than guess it away.
+    !registered
+}
+
+/// Whether `model` has a soft-deleting repository.
+///
+/// Like tenancy, taken from the repository rather than the presence of a
+/// `deleted_at` column: an audit-style timestamp on a model whose repository
+/// does not opt into `soft_delete` is ordinary data, and filtering on it would
+/// 404 rows the app deliberately still serves.
+///
+/// `None` when no repository is registered, so the caller can fall back to what
+/// the column implies rather than this function inventing an answer.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn model_soft_deletes(model: &str) -> Option<bool> {
+    let mut any = false;
+    let mut registered = false;
+    for facts in repository_facts_for(model) {
+        any |= facts.soft_delete;
+        registered = true;
+    }
+    registered.then_some(any)
 }
 
 /// The spec registered for `type_name`, or `None` when no `#[commentable]`
@@ -631,7 +684,7 @@ pub async fn add_comment(
 
     scoped_immediate_transaction::<Comment, AutumnError, _>(conn, |conn| {
         async move {
-            lock_parent(conn, &spec, parent_id, tenant.as_deref()).await?;
+            lock_parent(conn, &spec, &parent_type, parent_id, tenant.as_deref()).await?;
 
             if let Some(reply_to) = reply_to {
                 let parent_depth =
@@ -735,7 +788,14 @@ pub async fn delete_comment(
                 return Err(AutumnError::not_found_msg("Comment not found"));
             };
 
-            lock_parent(conn, &spec, target.commentable_id, tenant.as_deref()).await?;
+            lock_parent(
+                conn,
+                &spec,
+                &parent_type,
+                target.commentable_id,
+                tenant.as_deref(),
+            )
+            .await?;
 
             let removed = delete_subtree(conn, &spec, &parent_type, parent_id, comment_id).await?;
 
@@ -792,7 +852,7 @@ pub async fn recompute_comment_count(
     assert_unique_discriminators();
     spec.validate()?;
     let Some(counter_column) = spec.counter_column else {
-        probe_parent(conn, spec, parent_id, tenant, false).await?;
+        probe_parent(conn, spec, parent_type, parent_id, tenant, false).await?;
         return Ok(0);
     };
 
@@ -802,7 +862,7 @@ pub async fn recompute_comment_count(
 
     scoped_immediate_transaction::<i64, AutumnError, _>(conn, |conn| {
         async move {
-            lock_parent(conn, &spec, parent_id, tenant.as_deref()).await?;
+            lock_parent(conn, &spec, &parent_type, parent_id, tenant.as_deref()).await?;
 
             let comments = quote_ident(spec.comments_table);
             let type_column = quote_ident(spec.type_column);
@@ -866,7 +926,7 @@ pub async fn comment_thread(
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
-    probe_parent(conn, spec, parent_id, tenant, false).await?;
+    probe_parent(conn, spec, parent_type, parent_id, tenant, false).await?;
 
     let comments = quote_ident(spec.comments_table);
     let pk = quote_ident(spec.comment_pk);
@@ -1048,13 +1108,22 @@ fn build_nodes(
 async fn probe_parent(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
+    parent_type: &str,
     parent_id: i64,
     tenant: Option<&str>,
     lock: bool,
 ) -> AutumnResult<()> {
     let parent_table = quote_ident(spec.parent_table);
     let parent_pk = quote_ident(spec.parent_pk);
-    let live = if spec.parent_soft_delete {
+    // The column's presence is the fallback, not the answer. A `deleted_at`
+    // timestamp on a model whose repository does not opt into `soft_delete` is
+    // ordinary audit data, and filtering on it would 404 rows the app still
+    // serves deliberately. Only when no repository is registered does the
+    // column get to decide.
+    let soft_deletes = commentable_model_for(parent_type)
+        .and_then(model_soft_deletes)
+        .unwrap_or(spec.parent_soft_delete);
+    let live = if soft_deletes {
         format!(" AND {parent_table}.{} IS NULL", quote_ident(DELETED_AT))
     } else {
         String::new()
@@ -1111,10 +1180,11 @@ async fn probe_parent(
 async fn lock_parent(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
+    parent_type: &str,
     parent_id: i64,
     tenant: Option<&str>,
 ) -> AutumnResult<()> {
-    probe_parent(conn, spec, parent_id, tenant, true).await
+    probe_parent(conn, spec, parent_type, parent_id, tenant, true).await
 }
 
 /// The depth of `comment_id` within `(parent_type, parent_id)`'s thread, where
@@ -1582,6 +1652,43 @@ mod tests {
     /// A spec built by hand — the one way past the macro's guarantee — is
     /// refused by `validate`, in release builds too. A `debug_assert` here
     /// would be erased in exactly the build where it matters.
+    /// A model may have more than one repository. Taking the FIRST registration
+    /// would let link order decide whether the tenant predicate is applied —
+    /// and an unscoped admin repository beside a scoped application one would
+    /// then be able to unscope the routes, reading another tenant's thread.
+    #[test]
+    fn any_scoped_repository_keeps_the_routes_scoped() {
+        let scoped = RepositoryFacts {
+            model: || "app::Post",
+            sharded: false,
+            tenant_scoped: true,
+            soft_delete: false,
+        };
+        let unscoped = RepositoryFacts {
+            model: || "app::Post",
+            sharded: false,
+            tenant_scoped: false,
+            soft_delete: false,
+        };
+
+        // Both visitation orders, because inventory order is link order.
+        assert!(
+            requires_tenant_from([&scoped, &unscoped].into_iter(), true),
+            "scoped first"
+        );
+        assert!(
+            requires_tenant_from([&unscoped, &scoped].into_iter(), true),
+            "unscoped first — the answer must not change"
+        );
+
+        // Every registration unscoped IS positive evidence of opting out.
+        assert!(!requires_tenant_from([&unscoped].into_iter(), true));
+        // No registration at all keeps scoping.
+        assert!(requires_tenant_from(std::iter::empty(), true));
+        // …and no tenant column is never scoped, whatever is registered.
+        assert!(!requires_tenant_from([&scoped].into_iter(), false));
+    }
+
     /// Tenancy is the one place where "no information" must not mean "no
     /// scoping". A model with a tenant column stays scoped unless a repository
     /// positively says it opted out — guessing the other way would serve one
