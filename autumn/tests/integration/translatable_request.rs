@@ -7,12 +7,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use autumn_web::i18n::{AmbientLocaleLayer, Bundle, I18nConfig, Translated, ambient_locale};
+use autumn_web::i18n::{
+    AmbientLocaleLayer, Bundle, I18nConfig, LocalePrefixScopeLayer, Translated, ambient_locale,
+};
 use axum::Extension;
 use axum::body::Body;
 use axum::http::{Request, header};
 use axum::routing::get;
 use tower::ServiceExt;
+
+fn chain(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| (*s).to_owned()).collect()
+}
 
 fn config() -> I18nConfig {
     I18nConfig {
@@ -128,7 +134,7 @@ async fn locale_prefixed_urls_set_the_ambient_locale() {
     let inner = axum::Router::new()
         .route("/title", get(show_title))
         .route("/ambient", get(show_ambient))
-        .layer(AmbientLocaleLayer::new(&bundle()))
+        .layer(LocalePrefixScopeLayer::new("es", chain(&["en"])))
         .layer(Extension(UriPrefixedLocale("es".to_owned())));
     let app = axum::Router::new()
         .nest("/es", inner)
@@ -256,5 +262,70 @@ async fn the_ambient_layer_sees_a_session_persisted_locale() {
         String::from_utf8(bytes.to_vec()).unwrap(),
         "Hola mundo",
         "the session-persisted locale must reach a handler that takes no Locale"
+    );
+}
+
+/// #1384 (Codex round 3): the per-nest prefix layer must **refine** the
+/// app-wide scope, not replace it with a chain rebuilt from router config.
+///
+/// An app can supply `.i18n(bundle)` whose fallback chain differs from
+/// `AutumnConfig.i18n` — here the bundle falls back `fr -> en` while the
+/// router config would fall back to `en` only. If the nest rebuilt the chain,
+/// `/es/...` would resolve `#[translatable]` content down the router's chain
+/// while `Locale::t` walked the bundle's, breaking the "one mental model"
+/// promise. Refining keeps one chain for both.
+#[tokio::test]
+async fn a_locale_prefixed_nest_inherits_the_bundles_fallback_chain() {
+    use autumn_web::i18n::UriPrefixedLocale;
+
+    // Only `fr` is translated. Under `/es/...` (untranslated) resolution must
+    // walk the BUNDLE's chain, whose first link is `fr`.
+    async fn show_fr_only() -> String {
+        Translated::from_pairs([("fr", "Bonjour le monde"), ("en", "Hello world")]).to_string()
+    }
+
+    let bundle_config = I18nConfig {
+        default_locale: "en".to_owned(),
+        supported_locales: vec!["en".to_owned(), "es".to_owned(), "fr".to_owned()],
+        // The bundle's chain: `fr` before `en`.
+        fallback_chain: vec!["fr".to_owned(), "en".to_owned()],
+        dir: "i18n".to_owned(),
+        locale_prefix_enabled: true,
+        locale_prefix_exclude: vec![],
+        locale_prefix_exclude_exact: vec![],
+    };
+    let rich = std::sync::Arc::new(Bundle::from_messages(HashMap::new(), &bundle_config));
+    assert_eq!(
+        rich.fallback_chain(),
+        ["fr", "en"],
+        "bundle chain precondition"
+    );
+
+    let inner = axum::Router::new()
+        .route("/title", get(show_fr_only))
+        // The nest carries the ROUTER's chain (`en` only) as its no-outer-scope
+        // fallback — which must not be what wins here.
+        .layer(LocalePrefixScopeLayer::new("es", chain(&["en"])))
+        .layer(Extension(UriPrefixedLocale("es".to_owned())));
+    let app = axum::Router::new()
+        .nest("/es", inner)
+        // App-wide layer built from the bundle, outside the nest.
+        .layer(AmbientLocaleLayer::new(&rich))
+        .layer(Extension(rich));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/es/title")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        String::from_utf8(bytes.to_vec()).unwrap(),
+        "Bonjour le monde",
+        "the nest must inherit the bundle's chain, not rebuild the router's"
     );
 }

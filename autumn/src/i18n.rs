@@ -926,7 +926,12 @@ where
             let Ok(locale) = Locale::from_request_parts(&mut parts, &()).await;
             let scope = LocaleScope::new(locale.tag(), chain.to_vec());
             let req = axum::http::Request::from_parts(parts, body);
-            let response = with_locale_scope(scope.clone(), inner.call(req)).await?;
+            // Build the inner future INSIDE the scope as well as polling it
+            // there (the `HttpInterceptorService` pattern), so a nested layer
+            // that refines this scope from its own `call` — see
+            // [`LocalePrefixScopeLayer`] — finds it already established.
+            let inner_future = with_locale_scope_sync(scope.clone(), || inner.call(req));
+            let response = with_locale_scope(scope.clone(), inner_future).await?;
             // A deferred or streaming body (SSE, `Body::from_stream`, a chunked
             // download) is polled AFTER the handler future resolves, outside
             // the task-local scope — so a `Translated` rendered per frame would
@@ -979,6 +984,110 @@ where
 
     fn size_hint(&self) -> http_body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+/// Overrides the ambient locale for one `/{locale}/…` nest (issue #1251 +
+/// #1384).
+///
+/// The URL prefix is the highest-priority locale source — it is step 1 of
+/// [`Locale`]'s documented resolution order — and it is only visible *inside*
+/// the router's per-locale nest, where [`UriPrefixedLocale`] is installed. An
+/// app-wide [`AmbientLocaleLayer`] sits outside that nest and would negotiate
+/// `/es/posts` from `Accept-Language` alone.
+///
+/// It **refines the scope already in effect** rather than establishing a new
+/// one, so the fallback chain stays whatever the app-wide layer published — the
+/// loaded [`Bundle`]'s chain, which an app may have supplied via
+/// `.i18n(bundle)` built from a different [`I18nConfig`] than the router's.
+/// Rebuilding the chain here would shadow it, and `#[translatable]` content
+/// could then resolve down one chain while [`Locale::t`] on the same request
+/// walked another.
+///
+/// The configured chain is used only when there is no scope to refine: the
+/// supported shape where `locale_prefix_enabled` is on but the app never called
+/// `.i18n()`/`.i18n_auto()`, so no bundle — and no app-wide layer — exists.
+#[derive(Clone, Debug)]
+pub struct LocalePrefixScopeLayer {
+    locale: Arc<str>,
+    chain: Arc<[String]>,
+}
+
+impl LocalePrefixScopeLayer {
+    /// Build the layer for one nest's locale segment, with the chain to use
+    /// only when no outer scope exists.
+    #[must_use]
+    pub fn new(locale: impl AsRef<str>, chain: Vec<String>) -> Self {
+        Self {
+            locale: Arc::from(locale.as_ref()),
+            chain: chain.into(),
+        }
+    }
+}
+
+impl<S> tower::Layer<S> for LocalePrefixScopeLayer {
+    type Service = LocalePrefixScopeService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        LocalePrefixScopeService {
+            inner,
+            locale: Arc::clone(&self.locale),
+            chain: Arc::clone(&self.chain),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`LocalePrefixScopeLayer`].
+#[derive(Clone, Debug)]
+pub struct LocalePrefixScopeService<S> {
+    inner: S,
+    locale: Arc<str>,
+    chain: Arc<[String]>,
+}
+
+impl<S, B> tower::Service<axum::http::Request<B>> for LocalePrefixScopeService<S>
+where
+    S: tower::Service<axum::http::Request<B>, Response = axum::response::Response>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = axum::response::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<B>) -> Self::Future {
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let locale = Arc::clone(&self.locale);
+        let chain = Arc::clone(&self.chain);
+        Box::pin(async move {
+            if let Some(scope) = ambient_locale_scope() {
+                // Refine in place: the app-wide layer's chain is authoritative,
+                // and the prefix outranks whatever it negotiated.
+                scope.set_tag(&*locale);
+                let response = inner.call(req).await?;
+                return Ok(
+                    response.map(|body| axum::body::Body::new(AmbientLocaleBody::new(body, scope)))
+                );
+            }
+            // No app-wide layer: locale-prefix routing without a bundle.
+            let scope = LocaleScope::new(&*locale, chain.to_vec());
+            let inner_future = with_locale_scope_sync(scope.clone(), || inner.call(req));
+            let response = with_locale_scope(scope.clone(), inner_future).await?;
+            Ok(response.map(|body| axum::body::Body::new(AmbientLocaleBody::new(body, scope))))
+        })
     }
 }
 
