@@ -218,8 +218,8 @@ pub struct Changeset<T> {
 )]
 impl<T: std::fmt::Debug> std::fmt::Debug for Changeset<T> {
     /// Mirrors the pre-cache derived output exactly (`data` and `errors`
-    /// only): see [`Self::field_value_cache`] for why the cache itself must
-    /// never appear here.
+    /// only): the cache field's own doc comment explains why it must never
+    /// appear here.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Changeset")
             .field("data", &self.data)
