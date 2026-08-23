@@ -314,7 +314,8 @@ async fn export_csv_list_count_profile() {
         reset_stats(&mut conn);
         let (exported, truncated, last_page) = run_export_loop(&repo, &query).await;
         assert_eq!(
-            exported, expected_rows as usize,
+            exported,
+            usize::try_from(expected_rows).expect("tier row count fits in usize"),
             "tier {status} must export exactly its seeded row count"
         );
         assert!(!truncated, "tier {status} must not hit MAX_EXPORT_ROWS");
@@ -382,6 +383,10 @@ async fn export_csv_list_count_profile() {
         total_select_buffers += select_buffers;
     }
     let total_buffers = total_count_buffers + total_select_buffers;
+    // Buffer counts here top out in the low hundred-thousands, nowhere near
+    // f64's 52-bit mantissa limit — this is a display percentage, not a
+    // counter compared against anything, so the lossy cast is harmless.
+    #[allow(clippy::cast_precision_loss)]
     let wasted_share = if total_buffers > 0 {
         (total_count_buffers as f64 / total_buffers as f64) * 100.0
     } else {
