@@ -63,31 +63,43 @@ while IFS= read -r entry; do
   [[ $skip -eq 1 ]] && continue
 
   # `|| true`: a non-matching grep exits 1, which `set -e` would treat as fatal.
-  marker=""
+  # Collect EVERY release token and EVERY issue on the line, not just the
+  # first of each. A line can annotate more than one feature — e.g.
+  # "autumn deploy (0.6.0; fleets 0.7.0, issues #1607/#1621)" — and stopping at
+  # the first pair would leave the later annotation unchecked forever.
+  markers=()
   for cand in $(grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' <<<"$text" || true); do
-    if is_release "$cand"; then marker="$cand"; break; fi
+    is_release "$cand" && markers+=("$cand")
   done
-  [[ -z "$marker" ]] && continue
-  issue="$(grep -o '#[0-9]\{3,4\}' <<<"$text" | head -1 || true)"
+  [[ ${#markers[@]} -eq 0 ]] && continue
 
-  if [[ -z "$issue" ]]; then
+  issues=()
+  for i in $(grep -o '#[0-9]\{3,4\}' <<<"$text" || true); do issues+=("$i"); done
+  if [[ ${#issues[@]} -eq 0 ]]; then
     unverifiable=$((unverifiable + 1))
     continue
   fi
 
-  # Oldest mention == introducing release (CHANGELOG is newest-first).
-  oldest="$(grep -n -- "$issue" "$CHANGELOG" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
-  [[ -z "$oldest" ]] && { unverifiable=$((unverifiable + 1)); continue; }
+  # Rule: every issue on the line must be accounted for by SOME release token
+  # on that line. Positional pairing would be wrong (a line can cite an issue
+  # for tooling rather than for the feature it marks), but an issue whose
+  # introducing release appears nowhere on its line is drift.
+  for issue in "${issues[@]}"; do
+    oldest="$(grep -n -- "$issue" "$CHANGELOG" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
+    [[ -z "$oldest" ]] && continue
+    truth="$(section_for_line "$oldest" || true)"
+    [[ -z "$truth" ]] && continue
 
-  truth="$(section_for_line "$oldest" || true)"
-  [[ -z "$truth" ]] && continue
-
-  if [[ "$marker" != "$truth" ]]; then
-    echo "MISMATCH $file:$lineno" >&2
-    echo "         marker says $marker but $issue was introduced in $truth" >&2
-    echo "         ${text:0:100}" >&2
-    fail=$((fail + 1))
-  fi
+    matched=0
+    for m in "${markers[@]}"; do [[ "$m" == "$truth" ]] && matched=1 && break; done
+    if [[ $matched -eq 0 ]]; then
+      echo "MISMATCH $file:$lineno" >&2
+      echo "         $issue was introduced in $truth, which appears nowhere on this line" >&2
+      echo "         line carries: ${markers[*]}" >&2
+      echo "         ${text:0:100}" >&2
+      fail=$((fail + 1))
+    fi
+  done
 done < <(
   grep -rn '0\.[0-9]\+\.0' "$SKILL_DIR" \
     | grep -v 'migrations/0\.[0-9]\+\.0\.md\|v0\.[0-9]\+\.0\|--version 0\.[0-9]\+\.0\|"0\.[0-9]\+\.0"\|autumn-web = \|autumn-cli = \|MSRV' \

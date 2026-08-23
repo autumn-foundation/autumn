@@ -622,13 +622,22 @@ mod tests {
 
     #[test]
     fn excludes_migrations_the_app_is_already_past() {
-        let ids: Vec<_> = migrations_between(&v(0, 6, 0), &v(0, 7, 0))
-            .iter()
-            .map(|m| m.id)
-            .collect();
+        // An app already on 0.6.0 needs none of 0.6.0's migrations — but it
+        // does need everything 0.7.0 introduced. This asserted an EMPTY result
+        // while 0.7.0 had no entries yet, which quietly conflated "excludes
+        // what the app is past" with "the target release adds nothing"; the
+        // moment 0.7.0 registered its first migration the assertion was wrong
+        // about the thing it is named for. Assert the boundary itself.
+        let selected = migrations_between(&v(0, 6, 0), &v(0, 7, 0));
+        let ids: Vec<_> = selected.iter().map(|m| m.id).collect();
         assert!(
-            ids.is_empty(),
-            "an app already on 0.6.0 needs no 0.6.0 migration, got {ids:?}"
+            selected.iter().all(|m| m.version == "0.7.0"),
+            "0.6.0 -> 0.7.0 must select only 0.7.0 migrations, got {ids:?}"
+        );
+        assert!(
+            !ids.is_empty(),
+            "0.7.0 registers migrations, so this range is not empty — if it is, \
+             the range filter dropped them"
         );
     }
 
