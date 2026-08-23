@@ -683,6 +683,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`Changeset::field_value` no longer re-serializes the whole record per
+  field:** every scaffolded form-rendering helper that populates a value
+  (`text_input`, `textarea_input`, `number_input`, `date_input`, and their
+  `required_*`/`*_htmx` variants) calls `Changeset::field_value` once to read
+  a single field back out of the changeset's data. `field_value` ran
+  `serde_json::to_value(&self.data)` — serializing every field of the record
+  — on **every** call, so a form with N value-bearing fields paid a full
+  record serialization N times over on each render. `Changeset<T>` now caches
+  the serialization in a private `OnceLock<Box<serde_json::Value>>`, computed
+  once on the first `field_value` call and reused by every later call on the
+  same changeset. No public API change: `field_value`'s signature and
+  behaviour are unchanged, including returning `None` on a serialization
+  error (cached as `Value::Null`, whose `.get()` returns `None` exactly as
+  the old early-return did).
+
+  Measured with a new benchmark (`autumn/benches/form_render.rs`, a realistic
+  12-field scaffolded form with two fields carrying validation errors, 2,000
+  iterations = 2,050 renders), `valgrind --tool=callgrind` and `--tool=dhat`,
+  before and after on the same machine:
+
+  | | before | after | delta |
+  | --- | ---: | ---: | ---: |
+  | Instructions (5,000-iteration run) | 932,490,618 | 280,583,825 | **-69.9%** |
+  | Allocation bytes/render (marginal) | 45,003 | 18,460 | **-59.0%** |
+  | Allocation blocks/render (marginal) | 364 | 78 | **-78.6%** |
+
+  `serde_json::SerializeMap::serialize_field` (13.18% of instructions) and the
+  `BTreeMap` machinery backing `serde_json::Map` (~12.7% combined) disappear
+  from the profile entirely; `maud::escape_to_string`'s absolute instruction
+  count is unchanged (109,276,950 both before and after), confirming the win
+  is isolated to the redundant serialization and doesn't touch the genuinely
+  inherent HTML-escaping cost.
+
 - **ingress middleware no longer boxes a future per layer per request:** every
   `axum::middleware::from_fn` on the framework's always-on request path is now a
   hand-rolled `tower::Service` with a **named** future. `from_fn` cannot avoid
