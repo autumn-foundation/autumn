@@ -8,7 +8,7 @@ use super::dsl::{
     EncryptedMode, Field, FieldConstraints, FieldKind, IdType, parse_fields,
     randomized_equality_lookup_reason,
 };
-use super::emit::{Action, Plan};
+use super::emit::{Action, Plan, Revert};
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, add_search_down_sql_for, add_search_up_sql_for,
@@ -604,6 +604,18 @@ fn plan_autumn_web_feature(plan: &mut Plan, project_root: &Path, feature: &str) 
         plan.actions.retain(|a| a.path() != cargo_path);
         plan.modify(cargo_path, updated);
     }
+    // Register the revert UNCONDITIONALLY, not only when the edit changed
+    // something. `autumn destroy model` recomputes this same plan, and by then
+    // the feature is already present — so a revert pushed inside the `if` above
+    // would never be registered on the path that needs it, and `destroy` would
+    // leave the non-default feature enabled forever. `owner_dir` is
+    // `src/models`, so the feature survives until the LAST model is destroyed
+    // (the same ownership rule the scaffold and channel generators use).
+    plan.push_revert(Revert::CargoAutumnWebFeature {
+        path: project_root.join("Cargo.toml"),
+        feature: feature.to_owned(),
+        owner_dir: Some(project_root.join("src/models")),
+    });
 }
 
 /// Add a `Modify` action linking `src/models/` + `src/schema.rs` into
@@ -3430,6 +3442,55 @@ mod tests {
         assert!(
             cargo.contains("i18n"),
             "generate model must enable autumn-web's `i18n` feature: {cargo}"
+        );
+    }
+
+    /// #1384 (Codex round 5): `autumn destroy model` must be able to take the
+    /// non-default `i18n` feature back out. The revert has to be registered
+    /// unconditionally — on the destroy path the feature is already present, so
+    /// the Cargo.toml edit is a no-op and a revert pushed only when the edit
+    /// changed something would never exist where it is needed.
+    #[test]
+    fn a_translatable_model_registers_a_revert_for_the_i18n_feature() {
+        let tmp = project_with_autumn_web_dep();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String{translatable}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let has_feature_revert = plan.reverts.iter().any(|r| {
+            matches!(
+                r,
+                crate::generate::emit::Revert::CargoAutumnWebFeature { feature, owner_dir, .. }
+                    if feature == "i18n"
+                        && owner_dir.as_deref() == Some(&tmp.path().join("src/models"))
+            )
+        });
+        assert!(
+            has_feature_revert,
+            "expected a CargoAutumnWebFeature revert owned by src/models, got {:?}",
+            plan.reverts
+        );
+
+        // Recomputing the plan against a project that ALREADY has the feature
+        // (the destroy path) still registers it.
+        plan.execute(Flags::default()).unwrap();
+        let replanned = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String{translatable}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            replanned.reverts.iter().any(|r| matches!(
+                r,
+                crate::generate::emit::Revert::CargoAutumnWebFeature { feature, .. }
+                    if feature == "i18n"
+            )),
+            "the revert must survive a replan where the feature is already present"
         );
     }
 

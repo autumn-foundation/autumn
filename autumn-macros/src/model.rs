@@ -4440,6 +4440,31 @@ fn emit_form_model_impl(
     }
 }
 
+/// Emit the JSON-Schema `TokenStream` for one model field.
+///
+/// Identical to [`emit_json_schema_tokens`] except that a `#[translatable]`
+/// field (issue #1384) is described inline as a locale-tag→string map, which is
+/// exactly what its lossless `Serialize` emits. Without that, the field would
+/// fall through to the `$ref` branch and `autumn openapi` would ship a spec
+/// referencing a component nothing registers.
+///
+/// Keyed on the **attribute**, never on the type's name: an application type
+/// that merely happens to be called `Translated` (`domain::Translated`) keeps
+/// its ordinary `$ref`, so the advertised contract cannot silently disagree
+/// with what that type actually serializes to.
+fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
+    if field_is_translatable(field) {
+        return quote! {
+            ::autumn_web::reexports::serde_json::json!({
+                "type": "object",
+                "description": "Per-locale content, keyed by locale tag (issue #1384).",
+                "additionalProperties": { "type": "string" }
+            })
+        };
+    }
+    emit_json_schema_tokens(&field.ty)
+}
+
 /// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
 /// representing the JSON Schema for the given Rust type.
 ///
@@ -4465,20 +4490,6 @@ fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     }
 
     let name = type_name_str(ty);
-    // #1384: a `#[translatable]` column's wire shape is known — the lossless
-    // `Serialize` emits a string→string map keyed by locale tag — so describe
-    // it inline. Falling through to the `$ref` branch would emit a reference to
-    // a component nothing registers, and `autumn openapi` would ship a spec
-    // with an unresolvable `$ref`.
-    if name == "Translated" {
-        return quote! {
-            ::autumn_web::reexports::serde_json::json!({
-                "type": "object",
-                "description": "Per-locale content, keyed by locale tag (issue #1384).",
-                "additionalProperties": { "type": "string" }
-            })
-        };
-    }
     crate::api_doc::primitive_json_type(&name).map_or_else(
         || {
             // Emit the `$ref` against the field type's FULL `type_name` identity
@@ -4529,7 +4540,7 @@ fn emit_schema_fn_body_ext(
         .map(|f| {
             let field_name = schema_property_name(f, rename_all_rule)
                 .unwrap_or_else(|| f.ident.as_ref().unwrap().to_string());
-            let schema_expr = emit_json_schema_tokens(&f.ty);
+            let schema_expr = emit_json_schema_tokens_for_field(f);
             quote! {
                 __props.insert(#field_name.to_owned(), #schema_expr);
             }
@@ -10573,6 +10584,62 @@ mod tests {
     }
 
     // ── #1384: `#[translatable]` field attribute ────────────────────────────
+
+    /// #1384 (Codex round 5): the locale-map schema is keyed on the
+    /// `#[translatable]` MARKER, not on the type's leaf name. An application
+    /// type that merely happens to be called `Translated` must keep its
+    /// ordinary `$ref`, or the advertised OpenAPI contract would silently
+    /// disagree with what that type actually serializes to.
+    #[test]
+    fn translatable_schema_is_keyed_on_the_attribute_not_the_type_name() {
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    #[translatable]
+                    pub title: ::autumn_web::i18n::Translated,
+                    // A user's OWN type with the same leaf name, unmarked.
+                    pub note: domain::Translated,
+                }
+            },
+        )
+        .to_string();
+
+        // The marked field is described inline as a locale-tag -> string map,
+        // so `autumn openapi` emits no reference to a component nothing
+        // registers.
+        assert!(
+            generated.contains("additionalProperties"),
+            "translatable field should carry an inline map schema"
+        );
+        // The unmarked look-alike still gets the ordinary `$ref` branch.
+        assert!(
+            generated.contains("components/schemas"),
+            "an unmarked `Translated` look-alike must keep its $ref"
+        );
+    }
+
+    /// A model with NO translatable field emits no inline map schema at all.
+    #[test]
+    fn an_unmarked_translated_lookalike_alone_emits_no_map_schema() {
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub note: domain::Translated,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("additionalProperties"),
+            "no `#[translatable]` field means no locale-map schema"
+        );
+    }
 
     #[test]
     fn translatable_field_is_accepted_on_a_translated_column() {
