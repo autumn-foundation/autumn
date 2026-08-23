@@ -94,9 +94,38 @@ done < <(
     | sed "s|^$SKILL_DIR/||"
 )
 
+# --- Second check: prose that asserts an availability boundary --------------
+#
+# Markers were not the only thing that went stale across the 0.6.0 -> 0.7.0 cut.
+# The skill also carried sentences meaning "not shipped yet" — "trunk-dev only",
+# "NOT in the published X", "do not suggest them to users on the published
+# release". Every one of those became false the moment the release was cut, and
+# a version-number substitution does not fix them: it leaves prose that
+# contradicts its own marker, or actively tells an agent to withhold a shipped
+# command. They are phrased too freely to verify mechanically, so this check
+# bans the specific phrasings rather than trying to interpret them. Say when a
+# feature ARRIVED ("since 0.6.0", "(0.6.0)"), never where it has not yet landed.
+STALE_PHRASES=(
+  'trunk-dev only'
+  'trunk-dev-only'
+  'not in the published'
+  'do not suggest them to users on the published release'
+  'On trunk-dev'
+  'on trunk-dev'
+)
+for phrase in "${STALE_PHRASES[@]}"; do
+  while IFS= read -r hit; do
+    [[ -z "$hit" ]] && continue
+    echo "STALE-PROSE $hit" >&2
+    echo "            \"$phrase\" dates the skill to an unreleased branch." >&2
+    echo "            State the release the feature ARRIVED in instead." >&2
+    fail=$((fail + 1))
+  done < <(grep -rn -F -- "$phrase" "$SKILL_DIR" | sed "s|^$SKILL_DIR/||" | cut -c1-120 || true)
+done
+
 if [[ $fail -gt 0 ]]; then
   echo "" >&2
-  echo "$fail skill version marker(s) disagree with CHANGELOG.md." >&2
+  echo "$fail skill version problem(s) found." >&2
   echo "A marker names the release an API ARRIVED in. Resolve it from the" >&2
   echo "CHANGELOG section containing the issue's oldest mention." >&2
   exit 1

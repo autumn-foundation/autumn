@@ -246,7 +246,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
 
 ## Repository-generated methods (`#[repository]`)
 
-Published 0.7.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
+Published 0.5.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
 `update`, `delete_by_id`, derived `find_by_*`/`count_by_*`/`exists_by_*`,
 `page(&PageRequest)`, `cursor_page(&CursorRequest)` (with `cursor_key =` /
 `cursor_key_type =` attr keys), bulk `save_many` / `save_many_skip_invalid` /
@@ -495,7 +495,7 @@ delete actions remain last-write-wins.
 
 Free functions rendering changeset-aware, accessible inputs:
 
-- Published 0.7.0: `form_tag`, `method_input`, `text_input`,
+- Published 0.5.0: `form_tag`, `method_input`, `text_input`,
   `text_input_htmx`; `Changeset`-bound methods (`form.form_tag(...)`,
   `form.text_input(...)`).
 - **(0.6.0)**: `checkbox_input`, `number_input`, `date_input`,
@@ -844,7 +844,7 @@ to a downloadable PDF `IntoResponse` built on `Download`.
 
 ## Jobs additions
 
-- Published 0.7.0 `#[job]` keys: `name`, `max_attempts`, `backoff_ms`,
+- Published 0.5.0 `#[job]` keys: `name`, `max_attempts`, `backoff_ms`,
   `unique`, `unique_by`, `unique_window`, `unique_for_ms`, `concurrency`,
   `concurrency_key`.
 - **(0.6.0)**: `queue = "name"` + `[jobs] queues` strict-priority list or
@@ -897,7 +897,7 @@ to a downloadable PDF `IntoResponse` built on `Download`.
 
 ## Auth additions
 
-- Published 0.7.0: `autumn generate auth` session management (`{user}_sessions`
+- Published 0.5.0: `autumn generate auth` session management (`{user}_sessions`
   table, `sessions()` / `revoke_session` / `revoke_other_sessions` /
   `revoke_all_sessions`, `/account/sessions` page, `[auth.sessions]` config).
 - **(0.6.0)**: scoped service tokens — `IssueTokenSpec`,

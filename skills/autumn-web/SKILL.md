@@ -50,7 +50,7 @@ when their details matter:
   `.aria_required()`, `.aria_invalid()`, `.described_by()`, per-type
   min/max/length) plus a `.hx(name, value)` escape hatch for arbitrary `hx-*`
   attributes. Treat `autumn a11y verify` as an advisory/best-effort CI net, not
-  a guarantee — the typed primitives are the compile-time proof (trunk-dev,
+  a guarantee — the typed primitives are the compile-time proof (0.6.0,
   #1706). See `skills/autumn-web/references/api-reference.md` for the full
   setter surface.
 
@@ -644,8 +644,8 @@ child cleanup **(0.6.0)**:
 pub trait PostRepository {}
 ```
 
-`on_delete` = `destroy` (soft-delete-aware, fires each child's hooks; on
-trunk-dev this **now recurses** into each child's own `dependent`, cascading
+`on_delete` = `destroy` (soft-delete-aware, fires each child's hooks; since
+0.6.0 this **recurses** into each child's own `dependent`, cascading
 into grandchildren — see the recursive/bulk/model-side note below) |
 `delete_all` (bulk delete, no child hooks) | `nullify` (set the FK null) |
 `restrict` (probe for referencing rows *before* mutating; errors `cannot delete:
@@ -653,7 +653,7 @@ dependent N row(s) …` if any still exist). The generated `delete_by_id` loads 
 locks the parent, applies every declared action, then deletes the parent — all in
 a single transaction (Part of #1369). See `docs/guide/repositories.md`.
 
-On trunk-dev the cascade is recursive and bulk-aware, and can be declared on
+Since 0.6.0 the cascade is recursive and bulk-aware, and can be declared on
 the model instead of the repository **(0.6.0, issues #1738,
 #1739, #1740)**:
 
@@ -818,8 +818,8 @@ validators (follow-up: issue #1801). The `Patch<T>` per-field impls and the
 
 ### Transactions
 
-`Db::tx(f)` runs a READ COMMITTED transaction. On trunk-dev
-**(0.6.0)**, `Db::tx_with(opts, f)` adds isolation levels and automatic
+`Db::tx(f)` runs a READ COMMITTED transaction. Since
+**0.6.0**, `Db::tx_with(opts, f)` adds isolation levels and automatic
 retry of serialization failures (SQLSTATE 40001) with capped exponential
 backoff:
 
@@ -870,15 +870,15 @@ async fn update_post(Path(id): Path<i64>, mut db: Db, session: Session) -> Autum
 }
 ```
 
-**(0.6.0)** Scoped service tokens (trunk-dev only): mint named,
+**(0.6.0)** Scoped service tokens: mint named,
 optionally-expiring API tokens carrying flat scopes via `IssueTokenSpec` +
 `issue_scoped_api_token`; gate handlers with
 `#[secured(scopes = ["posts:write"])]` (no session required — default-deny,
 403 when missing) or `#[secured("admin", scopes = [...])]` for both; check in
 policies with `PolicyContext::has_scope/has_any_scope/has_all_scopes`; manage
 with `autumn token issue <principal> --name ... --scope ...` / `list` /
-`rotate`. The
-published 0.7.0 `autumn token` has only `issue <principal>` / `revoke`.
+`rotate` / `revoke` — all four ship in 0.7.0. `list` and `rotate` arrived in
+0.6.0; a 0.5.x CLI has only `issue` / `revoke`.
 
 Active session management ships with `autumn generate auth` (0.6.0):
 a `{user}_sessions` row per login, generated `sessions()`,
@@ -1187,7 +1187,7 @@ Job attributes beyond `name`/`max_attempts`/`backoff_ms` (0.6.0):
 `concurrency = N` + `concurrency_key = "field"` caps simultaneous runs. A
 coalesced enqueue is a no-op `Ok(())`.
 
-**(0.6.0)** trunk-dev jobs additions:
+**(0.6.0)** jobs additions:
 
 - **Named queues**: `#[job(queue = "critical")]`; drain order via
   `[jobs] queues = ["critical", "default", "low"]` (strict priority) or a
@@ -1425,7 +1425,7 @@ as one transaction.
 ## Resumable SSE streams (0.6.0, issue #1356)
 
 Don't hand-roll `Last-Event-ID` bookkeeping or a manual replay buffer for
-server-sent events. On trunk-dev the `ws`-gated channels backend keeps a
+server-sent events. Since 0.6.0 the `ws`-gated channels backend keeps a
 **bounded per-topic replay ring buffer** and assigns every event an
 **epoch-tagged per-topic `id` automatically** (wire format `epoch.seq`, opaque
 to clients) — no manual `.id(...)` in handler code.
@@ -1658,7 +1658,7 @@ discord_severities = "all"
 
 ## Observability defaults
 
-Published 0.7.0 behavior:
+Published 0.5.0 behavior:
 
 - Structured per-request access log is **on by default**; disable with
   `log.access_log = false`, tune exclusions with `log.access_log_exclude`
@@ -1729,7 +1729,7 @@ and using `#[autumn_web::main]`.
 **Known limitation:** apps built from the scaffolded Dockerfile currently report
 null git provenance because the Docker build context excludes `.git` (tracked in
 #1676).
-0.7.0 — `Server-Timing` response header:
+0.6.0 — `Server-Timing` response header:
 
 - Opt-in via `[observability] server_timing = true` (or
   `AUTUMN_OBSERVABILITY__SERVER_TIMING=true`). Defaults **on in `dev` /
@@ -1928,8 +1928,9 @@ autumn dev-loop-bench --dry-run
 autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
 ```
 
-**(0.6.0)** CLI additions — NOT in 0.6.x or earlier
-`autumn-cli`; do not suggest them to users on the published release:
+**(0.6.0)** CLI additions — absent from a 0.5.x `autumn-cli`, but present in
+every published release since 0.6.0, so they are safe to suggest unless the
+user pins 0.5.x:
 
 ```bash
 autumn serve --daemon            # non-watch local daemon; also: serve stop|status|restart
