@@ -189,6 +189,17 @@ pub struct Changeset<T> {
     /// Boxed rather than a bare `OnceLock<serde_json::Value>`: an inline
     /// `Value` pushes `Changeset` (and therefore `Result<T, Changeset<T>>` in
     /// [`Self::into_valid`]) over clippy's `result_large_err` threshold.
+    ///
+    /// A snapshot, not a live view: if `T` holds interior-mutable fields
+    /// (`RefCell`, `Mutex`, `Atomic*`, …) mutated through the shared
+    /// reference [`Self::data`] hands out, a `field_value` call made before
+    /// that mutation poisons every later call on the same `Changeset` with
+    /// the pre-mutation value — `serde_json::to_value(&self.data)` used to
+    /// re-run, and would have observed it, on every call. `Changeset` is
+    /// documented and universally used as build-once-render-once submitted
+    /// form data (see every call site of `field_value`/`data`), which has no
+    /// interior mutability and no reason to mutate between renders, so this
+    /// is a real but currently theoretical caveat rather than an active bug.
     field_value_cache: OnceLock<Box<serde_json::Value>>,
 }
 
@@ -266,6 +277,13 @@ impl<T: Serialize> Changeset<T> {
     ///
     /// Used by rendering helpers to re-populate `<input value="…">` after a
     /// failed submission.  Returns `None` for missing or non-scalar fields.
+    ///
+    /// The serialization is cached on first call and reused by later calls on
+    /// the same `Changeset`, rather than re-run per call. This is a snapshot:
+    /// if `T` holds interior-mutable fields mutated through the shared
+    /// reference [`Self::data`] hands out, a call made before that mutation
+    /// makes every later call on this `Changeset` observe the pre-mutation
+    /// value instead of the current one.
     pub fn field_value(&self, field: &str) -> Option<String> {
         let json = self.field_value_cache.get_or_init(|| {
             Box::new(serde_json::to_value(&self.data).unwrap_or(serde_json::Value::Null))
