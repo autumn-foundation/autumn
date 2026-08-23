@@ -6,10 +6,16 @@
 //! create/edit view calls, over a 12-field changeset shaped like a typical
 //! scaffolded model (title, slug, description, price, quantity, ... with a
 //! couple of fields carrying validation errors, as on a re-rendered failed
-//! submission). Each helper builds two small `id`/`-field`/`-error` strings
-//! via `format!` purely to hand them to two attribute positions apiece —
-//! this benchmark exists to measure what fraction of a real form render that
-//! accounts for.
+//! submission).
+//!
+//! Profiling this surfaced a bigger cost than the id-string `format!` calls
+//! each helper does: every helper that renders a value
+//! (`text_input`/`textarea_input`/`number_input`/`date_input`) calls
+//! `Changeset::field_value`, which used to run `serde_json::to_value(&self.data)`
+//! — serializing the *entire* record — on every call, just to read one field
+//! out of it. A 12-field form re-serialized the whole record up to 9 times
+//! per render. See `Changeset::field_value` in `autumn/src/form.rs` for the
+//! fix (caches the serialization on the changeset).
 //!
 //! Like the other benches in this crate it is `harness = false` and asserts
 //! nothing: it is a workload to point a profiler at.
@@ -31,8 +37,7 @@ use std::collections::HashMap;
 use std::hint::black_box;
 
 use autumn_web::form::{
-    Changeset, checkbox_input, date_input, number_input, password_input, text_input,
-    textarea_input,
+    Changeset, checkbox_input, date_input, number_input, password_input, text_input, textarea_input,
 };
 use serde::Serialize;
 
