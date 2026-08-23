@@ -9,7 +9,7 @@ are gates rather than prose:
   enforced by `scripts/check-migration-guides.sh`.
 
 A walkthrough is neither. It is the document you send someone who asks "what's
-new in this one?" and does not want 144 changelog entries.
+new in this one?" and does not want 145 changelog entries.
 
 ## Index
 
