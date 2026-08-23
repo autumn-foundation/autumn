@@ -94,6 +94,18 @@ while IFS= read -r entry; do
   # on that line. Positional pairing would be wrong (a line can cite an issue
   # for tooling rather than for the feature it marks), but an issue whose
   # introducing release appears nowhere on its line is drift.
+  # When the line carries as many releases as issues, they are almost certainly
+  # written as pairs — "(0.6.0; fleets 0.7.0, issues #1607/#1621)" — so pair
+  # them POSITIONALLY. The set rule ("some release on the line matches") cannot
+  # see a swap: transpose those two versions and both releases are still
+  # present, so both issues still find a match and the drift the gate exists to
+  # catch sails through. Positional pairing catches it. When the counts differ,
+  # the line is not written as pairs (a codemod id can repeat a version, an
+  # issue can be cited for tooling), so fall back to the set rule.
+  paired=0
+  [[ ${#markers[@]} -eq ${#issues[@]} ]] && paired=1
+
+  idx=0
   for issue in "${issues[@]}"; do
     oldest="$(grep -n -- "$issue" "$CHANGELOG" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
     if [[ -z "$oldest" ]]; then
@@ -110,24 +122,36 @@ while IFS= read -r entry; do
         echo "            UNTRACEABLE_ISSUES with a reason." >&2
         fail=$((fail + 1))
       fi
+      idx=$((idx + 1))
       continue
     fi
     truth="$(section_for_line "$oldest" || true)"
-    [[ -z "$truth" ]] && continue
+    if [[ -z "$truth" ]]; then idx=$((idx + 1)); continue; fi
 
-    matched=0
-    for m in "${markers[@]}"; do [[ "$m" == "$truth" ]] && matched=1 && break; done
-    if [[ $matched -eq 0 ]]; then
-      echo "MISMATCH $file:$lineno" >&2
-      echo "         $issue was introduced in $truth, which appears nowhere on this line" >&2
-      echo "         line carries: ${markers[*]}" >&2
-      echo "         ${text:0:100}" >&2
-      fail=$((fail + 1))
+    if [[ $paired -eq 1 ]]; then
+      if [[ "${markers[$idx]}" != "$truth" ]]; then
+        echo "MISMATCH $file:$lineno" >&2
+        echo "         $issue was introduced in $truth, but the marker paired with it" >&2
+        echo "         on this line is ${markers[$idx]} (markers: ${markers[*]}; issues: ${issues[*]})" >&2
+        echo "         ${text:0:100}" >&2
+        fail=$((fail + 1))
+      fi
+    else
+      matched=0
+      for m in "${markers[@]}"; do [[ "$m" == "$truth" ]] && matched=1 && break; done
+      if [[ $matched -eq 0 ]]; then
+        echo "MISMATCH $file:$lineno" >&2
+        echo "         $issue was introduced in $truth, which appears nowhere on this line" >&2
+        echo "         line carries: ${markers[*]}" >&2
+        echo "         ${text:0:100}" >&2
+        fail=$((fail + 1))
+      fi
     fi
+    idx=$((idx + 1))
   done
 done < <(
-  grep -rn '0\.[0-9]\+\.0' "$SKILL_DIR" \
-    | grep -v 'migrations/0\.[0-9]\+\.0\.md\|v0\.[0-9]\+\.0\|--version 0\.[0-9]\+\.0\|"0\.[0-9]\+\.0"\|autumn-web = \|autumn-cli = \|MSRV' \
+  grep -rn '[0-9]\+\.[0-9]\+\.[0-9]\+' "$SKILL_DIR" \
+    | grep -v 'migrations/[0-9]\+\.[0-9]\+\.[0-9]\+\.md\|v[0-9]\+\.[0-9]\+\.[0-9]\+\|--version [0-9]\+\.[0-9]\+\.[0-9]\+\|"[0-9]\+\.[0-9]\+\.[0-9]\+"\|autumn-web = \|autumn-cli = \|MSRV' \
     | sed "s|^$SKILL_DIR/||"
 )
 
