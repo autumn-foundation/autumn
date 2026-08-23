@@ -213,7 +213,8 @@ guide** — the guide is a gate, not a courtesy (issue #1588). See
 
 ### Automated
 
-- [ ] `./scripts/check-skill-version-markers.sh` is green. The `autumn-web`
+- [ ] `./scripts/check-skill-version-markers.sh` is green (it also runs in CI,
+  in the docs-only `migration-guides` job). The `autumn-web`
   agent skill annotates each API with the release it arrived in; those markers
   are hand-maintained and drift silently across a version cut, in several
   punctuation shapes (`(0.7.0)`, `**(0.7.0)**`, `(0.7.0, #1182)`, `(feature
@@ -355,6 +356,7 @@ Before pushing the release tag:
    ./scripts/check-crate-metadata.sh
    ./scripts/check-release-notes.sh
    ./scripts/check-migration-guides.sh
+   ./scripts/check-skill-version-markers.sh
    ./scripts/check-docs.sh
    ./scripts/check-semver.sh   # requires network; skip offline
    ```
