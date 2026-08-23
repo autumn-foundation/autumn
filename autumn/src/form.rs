@@ -176,7 +176,6 @@ use serde::Serialize;
 /// - [`Changeset::new`] for a blank/valid changeset
 /// - [`IntoChangeset::into_changeset`] after manual construction
 /// - The [`ChangesetForm`] axum extractor (preferred)
-#[derive(Debug)]
 pub struct Changeset<T> {
     data: T,
     errors: HashMap<String, Vec<String>>,
@@ -200,7 +199,33 @@ pub struct Changeset<T> {
     /// form data (see every call site of `field_value`/`data`), which has no
     /// interior mutability and no reason to mutate between renders, so this
     /// is a real but currently theoretical caveat rather than an active bug.
+    ///
+    /// Deliberately excluded from [`Debug`](std::fmt::Debug) (see the manual
+    /// impl below): it holds a raw `serde_json` snapshot of every
+    /// serializable field, which would bypass any redaction a caller's own
+    /// `Debug` impl on `T` applies to a field `Serialize` still includes
+    /// (e.g. a password field masked in `Debug` output but still submitted
+    /// and therefore serialized) — deriving `Debug` here would print that
+    /// unredacted snapshot alongside `T`'s redacted one, and would only start
+    /// doing so once some `field_value` call happened to fill the cache,
+    /// making the leak initialization-order-dependent as well.
     field_value_cache: OnceLock<Box<serde_json::Value>>,
+}
+
+#[allow(
+    clippy::missing_fields_in_debug,
+    reason = "field_value_cache is deliberately omitted — see its doc comment"
+)]
+impl<T: std::fmt::Debug> std::fmt::Debug for Changeset<T> {
+    /// Mirrors the pre-cache derived output exactly (`data` and `errors`
+    /// only): see [`Self::field_value_cache`] for why the cache itself must
+    /// never appear here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Changeset")
+            .field("data", &self.data)
+            .field("errors", &self.errors)
+            .finish()
+    }
 }
 
 impl<T> Changeset<T> {
