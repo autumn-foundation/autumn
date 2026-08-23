@@ -338,7 +338,7 @@ the lower-level `localized_path(path, locale)`) from
 default_locale, supported_locales))` to emit `hreflang` `<link>` tags for the
 current page's localized variants.
 
-**Duplicate-route preflight (issue #1012, 0.7.0):** two
+**Duplicate-route preflight (issue #1012, 0.6.0):** two
 handlers that resolve to the same `(method, path)` after `.scoped(...)` prefix
 resolution — including `#[repository]`-generated API routes — fail app build
 with `RouterBuildError::DuplicateUserRoute { method, path, existing, incoming }`

@@ -129,8 +129,8 @@ copy of the publish order.
 | `#[feature_flag]` | Feature-flag definition |
 | `#[inbound_mail]` | Inbound mail handler |
 | `#[step_up]` | Step-up authentication guard |
-| `#[throttle]` | Per-route rate limit — inline (`limit`/`per`/`key`) or named (`#[throttle("login")]`) (**0.7.0**) |
-| `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**0.7.0**) — publish via the `Events` extractor, register with `.listeners(...)` |
+| `#[throttle]` | Per-route rate limit — inline (`limit`/`per`/`key`) or named (`#[throttle("login")]`) (**0.6.0**) |
+| `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**0.6.0**) — publish via the `Events` extractor, register with `.listeners(...)` |
 
 Route macros accept a `seo(...)` argument declaring per-page meta tag defaults
 (0.7.0, #1182):
@@ -482,7 +482,7 @@ delete actions remain last-write-wins.
 
 - `Db::tx(f)` — READ COMMITTED, one attempt (0.6.0).
 - `Db::tx_with(opts: TxOptions, f) -> Result<T, AutumnError>`
-  (**0.7.0**) — closure gets `&mut AsyncPgConnection`; auto-retries
+  (**0.6.0**) — closure gets `&mut AsyncPgConnection`; auto-retries
   SQLSTATE 40001 with capped exponential backoff.
 - `autumn_web::db::IsolationLevel` {`ReadCommitted` (default),
   `RepeatableRead`, `Serializable`}; `TxOptions` builders
@@ -529,7 +529,7 @@ Free functions rendering changeset-aware, accessible inputs:
   values decode; RFC 3339 still accepted). `DateTime` columns with a zone
   other than `Utc`/`Local` render as `Text` (RFC 3339 string), not a picker.
 
-## Typed accessible primitives (`autumn_web::a11y`, feature `maud`, 0.7.0, #1706)
+## Typed accessible primitives (`autumn_web::a11y`, feature `maud`, 0.6.0, #1706)
 
 Render-implementing structs that make the accessible name a **type-level
 obligation** — the inaccessible form does not compile (the missing name is a
@@ -589,7 +589,7 @@ Per-primitive setters (in addition to the shared set):
 - **`FileField::new(name)`** — `.accept(s)` (MIME/extension filter),
   `.multiple()` (sets the `multiple` attribute).
 
-## View widgets and UI (all 0.7.0)
+## View widgets and UI (all 0.6.0)
 
 - `autumn_web::widgets`: `card(&body, &CardConfig)`,
   `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
@@ -933,7 +933,7 @@ double-submits and replays.
   **Note**: `#[model]` and `#[repository]` are NOT in the prelude — use
   `#[autumn_web::model]` and `#[autumn_web::repository]` (qualified paths).
 - Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
-- Accessibility primitives (`maud` feature, 0.7.0):
+- Accessibility primitives (`maud` feature, 0.6.0):
   `Button`, `ButtonType`, `Img`, `Link`, `MenuItem`, `TextField`.
 - Extractors: `Db`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
@@ -980,9 +980,9 @@ double-submits and replays.
 | `with_audit_sink(sink)` | Structured audit sink |
 | `policy::<R, P>(policy)`, `scope::<R, S>(scope)` | Repository authorization |
 | `plugin(plugin)`, `plugins(tuple)` | Plugin install |
-| `listeners(listeners![...])` | Event listeners (**0.7.0**) |
-| `static_gate(layer)`, `has_static_gate::<L>()`, `get_static_gate_types()` | Static pre-render gating middleware (**0.7.0**) |
-| `with_shard_router(router)` | Sharding router (**0.7.0**) |
+| `listeners(listeners![...])` | Event listeners (**0.6.0**) |
+| `static_gate(layer)`, `has_static_gate::<L>()`, `get_static_gate_types()` | Static pre-render gating middleware (**0.6.0**) |
+| `with_shard_router(router)` | Sharding router (**0.6.0**) |
 | `run()` | Start server |
 
 ## Deterministic time and entropy (`autumn_web::time`, `autumn_web::entropy`)
@@ -1352,7 +1352,7 @@ max_capsules = 50         # oldest-first prune (capsule-named files only), befor
   are not maskable; treat the directory like a database dump and read
   `docs/guide/failure-capsules.md` (security section leads) before enabling.
 
-### `[server.tls]` (feature `tls`, 0.7.0, #1603)
+### `[server.tls]` (feature `tls`, 0.6.0, #1603)
 
 In-process HTTPS termination on the same host:port (off by default).
 
@@ -1362,7 +1362,7 @@ In-process HTTPS termination on the same host:port (off by default).
 - `handshake_timeout_secs` (default `10`).
 - Fail-fast at startup on bad / missing / mismatched / expired PEM.
 
-### `[server.tls.acme]` (feature `acme`, 0.7.0, #1608)
+### `[server.tls.acme]` (feature `acme`, 0.6.0, #1608)
 
 Automatic ACME certificate provisioning + renewal; builds on `tls`, off by
 default. Mutually exclusive with static `cert_path` / `key_path`.

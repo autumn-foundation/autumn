@@ -213,6 +213,15 @@ guide** — the guide is a gate, not a courtesy (issue #1588). See
 
 ### Automated
 
+- [ ] `./scripts/check-skill-version-markers.sh` is green. The `autumn-web`
+  agent skill annotates each API with the release it arrived in; those markers
+  are hand-maintained and drift silently across a version cut, in several
+  punctuation shapes (`(0.7.0)`, `**(0.7.0)**`, `(0.7.0, #1182)`, `(feature
+  `tls`, 0.6.0, #1603)`). A marker naming too NEW a release is the damaging
+  direction — it tells a reader an API is out of reach when it already shipped.
+  The script resolves every issue-referenced marker against the CHANGELOG
+  section that introduced it. Markers with no issue reference are counted and
+  reported, not checked: skim those by hand when a release adds them.
 - [ ] `./scripts/check-migration-guides.sh` is green. It fails on an unmarked
   breaking changelog entry, a breaking section with no guide, a breaking entry
   that does not link its guide, and a guide missing a required section or an
