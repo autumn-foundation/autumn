@@ -262,6 +262,20 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
     // last-value-wins, or see `Vec<(String, String)>` come back key-sorted,
     // with nothing in the build to warn it. `GuideOnly` is precisely the slot
     // for a client-dependent change no source-level rewrite can decide.
+    // The highest-consequence item in the release, and invisible in Rust: an
+    // `autumn.toml` that already sets `auto_migrate_in_production = true` under
+    // a CUSTOM profile did nothing on 0.6.x and applies migrations at startup
+    // on 0.7.0. The key did not change; the profile name-gate around it was
+    // removed. An operator who reads only the compile breaks would meet this
+    // for the first time against a live database.
+    AppMigration {
+        id: "0.7.0-migrate-profile-agnostic",
+        version: "0.7.0",
+        title: "`auto_migrate_in_production` is honoured on any non-`dev` profile",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.7.0.md#startup-migrations-are-now-profile-agnostic-1903",
+        rewrite: Rewrite::GuideOnly,
+    },
     AppMigration {
         id: "0.7.0-query-decoding",
         version: "0.7.0",
