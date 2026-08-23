@@ -56,6 +56,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     proves `autumn deploy up` installs a working one — its manual bootstrap step is
     gone, which is what makes the "≤ 3 commands from `autumn new`" metric honest.
 
+- **Translatable model fields — `#[translatable]` (#1384):** declare a `#[model]`
+  column translatable and it stores an **independent value per locale tag**,
+  resolving on read against the request's active locale with **no locale
+  argument in the handler**. The field's type becomes
+  `autumn_web::i18n::Translated`, a per-locale container persisted as a JSON
+  object in the column's own `TEXT` storage (portable across Postgres and
+  SQLite); `Display` renders the active locale, so `html! { h1 { (post.title) } }`
+  serves Spanish under `Accept-Language: es` and — untranslated under `fr` —
+  falls back through **`I18nConfig::resolved_fallback_chain`, the same chain UI
+  strings walk**. Resolution is `Bundle`'s own algorithm (exact active locale,
+  then each chain link in order); once the chain is exhausted the field returns
+  a single documented sentinel — `None` from `resolve()`, the empty string from
+  `Display` — never a panic or a 500. The active locale is published by an
+  `AmbientLocaleLayer` that Autumn installs alongside the translation bundle
+  (and inside each `/{locale}/…` nest, so locale-prefixed routing composes);
+  reads outside a request — a job worker, a scheduled task, a test — fall back
+  to the process-wide chain rather than panicking, and `i18n::with_locale(tag,
+  fut)` scopes one explicitly. Because the value **is** the whole map, an
+  ordinary `find` → `set_title("es", …)` → `update` round trip changes one
+  locale and leaves every other byte-for-byte intact, and `Serialize` stays
+  lossless so record version history and durable commit-hook payloads can't
+  destroy the other locales on replay. `Deserialize` is its exact inverse — a
+  map, and only a map: a **bare string is refused**, because assignment replaces
+  the whole container, so `PUT /api/posts/1 {"title": "Hola"}` would otherwise
+  delete every other language from a body that reads like it sets one field.
+  `Translated::merge_from` is the non-destructive path for a partial update.
+  Resolution survives a **streaming** response (the layer wraps the response
+  body, so an SSE or chunked render still resolves per frame), and a deeper
+  `Locale` extraction refines the ambient locale in place, so the two can never
+  disagree on paths where the layer sits outside the session. The macro emits
+  `post.title_localized()` / `title_in(locale)` / `set_title(locale, value)` /
+  `title_locales()` / `title_is_translated(locale)` per field, plus the
+  field-name-keyed `available_locales("title")` / `is_translated("title", "fr")`
+  / `Post::translatable_fields()` an app renders a "needs translation"
+  affordance from, and registers each column for surfaces with no compile-time
+  view of the model. The field DSL gains a `{translatable}` modifier
+  (`autumn generate model Post 'title:String{translatable}'`) which emits the
+  attribute, the `Text` `schema.rs` entry, and a migration that is a plain
+  `ADD COLUMN … TEXT NOT NULL DEFAULT '{}'` — `autumn migrate check` classifies
+  it as **safe**, with no new operation type and no backfill job. A stored value
+  that is not a JSON object of strings reads as the default locale's
+  translation, so an existing plain-text column can be declared `#[translatable]`
+  with **no data migration** (an object is read as translations when every value
+  is a string; keys are not inspected, so every key an app can write is
+  guaranteed to round-trip). Purely
+  additive and opt-in per field: a model without the attribute is unchanged
+  apart from an empty `__AUTUMN_TRANSLATABLE_COLUMNS` constant, and the UI `t!`
+  path is untouched. `autumn generate model` enables autumn-web's non-default
+  `i18n` feature when any field is translatable, so the emitted project builds.
+  `generate scaffold` deliberately **refuses** a `{translatable}` column (its
+  single-input CRUD form would replace the whole container on save) and names
+  `generate model` instead; the macro and the DSL likewise refuse combinations
+  whose halves disagree about the column's contents — `#[encrypted]`,
+  `#[searchable]`, `unique`/`indexed`, `#[normalize]`, `#[state_machine]`,
+  `#[id]`, `#[lock_version]`, `#[position]`, the `{min}`/`{max}`/`{email}`/
+  `{url}` validation fan-out, `#[serde(rename)]` and `#[diesel(column_name)]` —
+  each naming the reason and the alternative, and the `--unique`/`--index`/
+  `--searchable`/`--shard-key` flag spellings are refused alongside the `{…}`
+  ones. See [i18n](docs/guide/i18n.md#translatable-model-fields).
 - **Multi-server fleet deploys — `[deploy] hosts` (#1621):** list several
   SSH-reachable servers under `[deploy] hosts` (mutually exclusive with the
   single-server `[deploy] host`; also `AUTUMN_DEPLOY__HOSTS` as CSV) and the same

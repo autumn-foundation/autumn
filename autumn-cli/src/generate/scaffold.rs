@@ -434,6 +434,33 @@ fn plan_scaffold_with_options_impl(
     }
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, &options.model.uniques)?;
+    // Gate (issue #1384): a `{translatable}` column holds a per-locale
+    // container, and the scaffold's CRUD form is a single plain text input
+    // bound to the whole column. Submitting it would REPLACE the container
+    // with one locale's value — silently destroying every other translation on
+    // the first edit — and the index/CSV/filter/sort paths would operate on
+    // the raw JSON. Editing translated content needs a per-locale form, which
+    // is translation-workflow UI and deliberately out of scope here. Refuse up
+    // front rather than emit a CRUD screen that eats data.
+    // `!for_revert`, like every other generation-only gate here: `autumn destroy
+    // scaffold` recomputes this plan before reverting it, and a refusal on that
+    // path would strand the very files the user asked to remove.
+    if let Some(f) = fields
+        .iter()
+        .filter(|_| !for_revert)
+        .find(|f| f.is_translatable())
+    {
+        return Err(GenerateError::Config(format!(
+            "a `{{translatable}}` field (`{}`) is not supported by `generate scaffold`: the \
+             generated CRUD form binds one plain text input to the whole per-locale container, \
+             so saving the form would replace every other locale's value. Use `generate model \
+             {name} {}:...{{translatable}} ...` (which emits the model, schema and migration) \
+             and write the per-locale edit view yourself — `post.title_localized()`, \
+             `post.available_locales(\"title\")` and `post.set_title(locale, value)` are \
+             generated for you.",
+            f.name, f.name
+        )));
+    }
     if !options.api {
         validate_enum_field_names_against_routes_imports(&fields, &pascal(name))?;
     }
@@ -13487,6 +13514,41 @@ async fn main() {
         .await;
 }
 "#
+    }
+
+    /// Issue #1384: `generate scaffold` refuses a `{translatable}` column
+    /// rather than emit a CRUD form whose single text input would replace the
+    /// whole per-locale container on first save.
+    #[test]
+    fn plan_rejects_a_translatable_field_and_points_at_generate_model() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String{translatable}".into(), "body:Text".into()],
+            "20260427000000",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("translatable"), "{err}");
+        assert!(err.contains("generate model"), "{err}");
+        assert!(err.contains("title"), "{err}");
+    }
+
+    /// The refusal is narrow: a scaffold with no translatable column is
+    /// unaffected (issue #1384 AC7).
+    #[test]
+    fn plan_still_accepts_a_scaffold_without_translatable_fields() {
+        let tmp = project_with_main(default_main());
+        assert!(
+            plan_scaffold(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), "body:Text".into()],
+                "20260427000000",
+            )
+            .is_ok()
+        );
     }
 
     #[test]

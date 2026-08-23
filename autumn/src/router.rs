@@ -2297,10 +2297,30 @@ fn apply_locale_prefix_routing(
         router = router.merge(redirect_router);
     }
 
+    // Content resolution (#1384) has to see the URL prefix, and the prefix
+    // extension is only visible INSIDE this nest — an app-wide ambient-locale
+    // layer sits outside it and would negotiate `/es/posts` from
+    // `Accept-Language` alone. So the nest gets its own scope layer.
+    //
+    // It REFINES the app-wide scope rather than building a fresh one: that
+    // layer's chain comes from the loaded `Bundle`, which an app may have
+    // supplied via `.i18n(bundle)` built from a different `I18nConfig` than the
+    // router's. Rebuilding the chain from `i18n` here would shadow it, so
+    // `/es/...` could resolve `#[translatable]` content down one chain while
+    // `Locale::t` on the same request walked another — the exact "one mental
+    // model" this feature promises. The config chain is used only as the
+    // fallback for the shape with no app-wide layer at all: locale-prefix
+    // routing enabled WITHOUT `.i18n()`/`.i18n_auto()`, where no bundle exists.
+    let prefix_chain = i18n.resolved_fallback_chain();
     for locale in valid_locales {
         let nested = content_router
             .clone()
             .fallback(crate::middleware::error_page_filter::fallback_404_handler)
+            .layer(crate::i18n::LocalePrefixScopeLayer::new(
+                locale.clone(),
+                prefix_chain.clone(),
+                &i18n.default_locale,
+            ))
             .layer(axum::Extension(crate::i18n::UriPrefixedLocale(
                 locale.clone(),
             )));
@@ -5001,6 +5021,36 @@ pub fn try_build_router_with_static_inner(
             || custom_layers_require_fail_closed_idempotency(&ctx.static_gate_layers),
     );
     let custom_layers = std::mem::take(&mut ctx.custom_layers);
+
+    // #1384: the ambient-locale layer must NOT drain out with the rest. It runs
+    // `Locale::from_request_parts`, whose session step reads the signed session
+    // — and everything drained here is applied OUTSIDE the static-first
+    // middleware, i.e. outside `SessionLayer`. Out there the session extension
+    // does not exist yet, so a locale persisted by the documented
+    // `set_locale_in_session` switcher would be invisible and content would
+    // silently resolve from `Accept-Language` instead, disagreeing with the UI
+    // chrome on the same page. A handler that deliberately takes no `Locale`
+    // argument — the whole point of the feature — never runs an extractor later
+    // to correct it either.
+    //
+    // Putting it back on the inner router's context lands it in
+    // `apply_middleware`'s merged tuple, which is INSIDE `session_layer` on
+    // both this path and the fully-dynamic one. The bundle `Extension` still
+    // drains out and is therefore still outer, so the layer can read it.
+    //
+    // Shadowed rather than mutated in place: with the `i18n` feature off this
+    // block vanishes, and a `let mut` the remaining code never reassigns is a
+    // `-D warnings` failure in every non-unified build (`-p autumn-web`, the
+    // sqlite lane). A `--workspace` build hides that, because another member
+    // turns `i18n` on and Cargo unifies it.
+    #[cfg(feature = "i18n")]
+    let custom_layers = {
+        let (session_scoped, outside): (Vec<_>, Vec<_>) = custom_layers
+            .into_iter()
+            .partition(|r| r.type_id == std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>());
+        ctx.custom_layers = session_scoped;
+        outside
+    };
 
     // Pre-static gate layers (AppBuilder::static_gate) are likewise extracted
     // and applied OUTSIDE the static-first middleware (the outermost layer of

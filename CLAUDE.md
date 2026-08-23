@@ -60,14 +60,16 @@ house-pattern testcontainer DB test — `#[ignore = "requires Docker (testcontai
 **no workflow edit**. Do not add a per-test allowlist line.
 
 This sweep compiles the consolidated binary with `--features
-"test-support,offline-sync,ws,mail,redis"` (db + maud are already defaults), so
+"test-support,offline-sync,ws,mail,redis,i18n"` (db + maud are already defaults), so
 a new Postgres/DB testcontainer test — and now also the previously-unreachable
 `ws`/`mail`/`redis` testcontainer Docker tests — runs automatically. As of
 #1945 the feature set folds in the `ws` `live_broadcast` OOB-fragment suite, the
 `redis` suites (`process_role_worker_gating`, `queue_dedicated_capacity`,
 `rate_limit_redis_integration`), and the `mail` newsletter-unsubscribe test:
 each is testcontainer-managed (Postgres/Redis in-process), so no CI `services:`
-block is required.
+block is required. As of #1384 the set also folds in `i18n`, so the
+`#[translatable]` per-locale column round-trip suite (`translatable_model`) is
+swept too.
 
 Only **`system-tests`-gated** (browser/Chromium) Docker tests remain excluded —
 they need a Chromium binary this runner does not provide. Consequently, a new
