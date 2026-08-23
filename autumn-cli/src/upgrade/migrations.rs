@@ -225,12 +225,12 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
             }),
         },
     },
-    // 0.7.0 ships no codemod: each of its three breaks needs a value, a wire
-    // change in a client this tool never sees, or a change of impl *shape* —
-    // none of them rename-level. They are registered as `GuideOnly` so the
-    // upgrade summary names them and links the guide section, rather than a
-    // 0.6.x app being told "nothing to change" about a release that broke
-    // three seams.
+    // 0.7.0 ships no codemod: each of its breaks needs a value, a wire change
+    // in a client this tool never sees, or a change of impl *shape* — none of
+    // them rename-level. They are registered as `GuideOnly` so the upgrade
+    // summary names them and links the guide section, rather than a 0.6.x app
+    // being told "nothing to change" about a release that broke three seams
+    // and rewrote query decoding.
     AppMigration {
         id: "0.7.0-routing-route-seo-field",
         version: "0.7.0",
@@ -253,6 +253,21 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         title: "app-wide layers are registered against the erased ingress service",
         confidence: Confidence::Manual,
         guide: "docs/migrations/0.7.0.md#app-wide-layers-are-now-erased",
+        rewrite: Rewrite::GuideOnly,
+    },
+    // Not a compile break — this one still builds, which is exactly why it
+    // needs surfacing: `Query<T>` was rewritten, and four of its runtime
+    // behaviours changed. A 0.6.x app that uses `Query<T>` beyond unique
+    // scalar keys can start returning 400s, stop resolving map duplicates
+    // last-value-wins, or see `Vec<(String, String)>` come back key-sorted,
+    // with nothing in the build to warn it. `GuideOnly` is precisely the slot
+    // for a client-dependent change no source-level rewrite can decide.
+    AppMigration {
+        id: "0.7.0-query-decoding",
+        version: "0.7.0",
+        title: "`Query<T>` decodes structure, rejects duplicate scalar keys, and sorts pair vectors",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.7.0.md#queryt-decoding-1972",
         rewrite: Rewrite::GuideOnly,
     },
 ];

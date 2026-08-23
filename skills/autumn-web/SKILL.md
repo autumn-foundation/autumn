@@ -16,10 +16,11 @@ description: >
 
 **Version identity trip wire**: the workspace on `trunk-dev` is versioned
 0.7.0, and `v0.7.0` is the current release line — `autumn-web = "0.7"`,
-`cargo install autumn-cli --version 0.7.0`. Features below marked **(0.7.0)**
-arrived in this release and are **absent from 0.6.x and earlier**: if an app
-pins an older line, check [`CHANGELOG.md`](../../CHANGELOG.md) before using
-them. Unmarked features predate 0.7.0. An app moving up from 0.6.x follows
+`cargo install autumn-cli --version 0.7.0`. Features below carry the release
+they arrived in — **(0.7.0)** is **absent from 0.6.x and earlier**, and
+**(0.6.0)** is absent from 0.5.x: if an app pins an older line, check
+[`CHANGELOG.md`](../../CHANGELOG.md) before using them. Unmarked features
+predate 0.6.0. An app moving up from 0.6.x follows
 [`docs/migrations/0.7.0.md`](../../docs/migrations/0.7.0.md); run
 `autumn upgrade` first.
 
@@ -65,23 +66,23 @@ the framework almost certainly already generates or ships it:
 | Status-transition validation written by hand in `before_create`/`before_update` hooks or handlers (`if old == "draft" && new == "published"` match blocks) | `#[state_machine(transitions(...))]` on the model field — generated `can_transition_{field}_to` / `transition_{field}_to` enforce the graph. See "Model state machines" below and `docs/guide/state-machines.md` |
 | Raw `axum::Router` routes and handlers, manual `.route("/x", get(...))` | `#[get]`/`#[post]`/`#[put]`/`#[patch]`/`#[delete]` + `routes![...]`, `.scoped(prefix, layer, routes)` for groups. `.merge()`/`.nest()` exist for the rare escape hatch only |
 | Raw Diesel queries for CRUD, lookups, pagination, or bulk writes | `#[repository]`-generated methods: `find_by_id`, `find_all`, `save`, `update`, `delete_by_id`, derived `find_by_*`, `page(&PageRequest)`, `cursor_page(&CursorRequest)`, bulk `save_many`/`update_many`/`delete_many`/`upsert_many`. See `docs/guide/repositories.md`, `docs/guide/pagination.md` |
-| Manual per-item queries in a loop (N+1) or hand-written JOINs to fetch associations | `#[belongs_to]`/`#[has_many]`/`#[has_one]` + `repo.preload(records, Model::preload()...)` (0.7.0) |
-| Hand-rolled auth, session, or token checks in handler bodies | `#[secured]` / `#[secured("role")]`, `#[authorize]`, repository `policy =`/`scope =`; `#[secured(scopes = [...])]` for service tokens (0.7.0) |
+| Manual per-item queries in a loop (N+1) or hand-written JOINs to fetch associations | `#[belongs_to]`/`#[has_many]`/`#[has_one]` + `repo.preload(records, Model::preload()...)` (0.6.0) |
+| Hand-rolled auth, session, or token checks in handler bodies | `#[secured]` / `#[secured("role")]`, `#[authorize]`, repository `policy =`/`scope =`; `#[secured(scopes = [...])]` for service tokens (0.6.0) |
 | A punishingly low global rate limit to protect one abuse-prone endpoint (login, search, export) | `#[throttle(limit = 5, per = "1m", key = "ip")]` sits alongside `#[get]`/`#[post]`; `#[throttle("login")]` reads `[security.rate_limit.named.login]` from config (0.7.0, issue #1350, see `docs/guide/rate-limiting.md`) |
-| Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form::form_for(&changeset, action, method)` + the `#[model]`-derived `FormModel` (0.7.0) renders the whole form — CSRF, `_method` override, one pre-filled control per column, inline errors, submit — in one call; see "Whole-form rendering" below. Compose the per-field helpers only when its escape hatches don't fit: `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (0.7.0) |
-| `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (0.7.0) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
+| Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form::form_for(&changeset, action, method)` + the `#[model]`-derived `FormModel` (0.6.0) renders the whole form — CSRF, `_method` override, one pre-filled control per column, inline errors, submit — in one call; see "Whole-form rendering" below. Compose the per-field helpers only when its escape hatches don't fit: `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (0.6.0) |
+| `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (0.6.0) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
-| Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.7.0) |
-| Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.7.0) |
+| Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0) |
+| Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
 | Hand-rolled HMAC verification for Stripe/GitHub/Slack callbacks | `SignedWebhook` extractor + `[webhooks.<name>]` config |
-| Hand-rolled pager markup (page-number windows, prev/next links) | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` (0.7.0) |
-| Hand-rolled cross-module notifications (calling every reaction inline) | `#[event]` + `#[listener]` typed event bus, `.listeners(listeners![...])` (0.7.0) |
-| Hand-rolled cards, tabs, modals, delete-confirm dialogs, method-override links | `autumn_web::widgets`: `card`/`stat_card`, `tabs`, `modal`/`confirm_action`, `link_to`/`button_to` + `ui::WIDGETS_CSS_PATH` stylesheet (0.7.0) |
-| Hand-built file-download responses (manual `Content-Disposition`/`Content-Type`/`Content-Length` headers, byte-buffered blob reads) | `autumn_web::download::Download` — `from_bytes` / `from_stream` / `from_async_read` / `from_blob(&store, key).await?` + `.filename(...)` / `.content_type(...)` / `.inline()`; RFC 5987 filenames, injection-safe, streams blobs without buffering (0.7.0) |
-| Hand-parsed `Range` headers / manual `206 Partial Content` / `Content-Range` / `416` for seekable media or resumable downloads | `autumn_web::range` (`resolve` + `partial_bytes_response`) and `Download::into_response_ranged(&headers).await` — RFC 7233 single-range parsing, multi-range single-range collapse, `If-Range` via `.etag(..)`/`.last_modified(..)`, blob slices via `BlobStore::get_range` (no whole-object buffering) (0.7.0) |
+| Hand-rolled pager markup (page-number windows, prev/next links) | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` (0.6.0) |
+| Hand-rolled cross-module notifications (calling every reaction inline) | `#[event]` + `#[listener]` typed event bus, `.listeners(listeners![...])` (0.6.0) |
+| Hand-rolled cards, tabs, modals, delete-confirm dialogs, method-override links | `autumn_web::widgets`: `card`/`stat_card`, `tabs`, `modal`/`confirm_action`, `link_to`/`button_to` + `ui::WIDGETS_CSS_PATH` stylesheet (0.6.0) |
+| Hand-built file-download responses (manual `Content-Disposition`/`Content-Type`/`Content-Length` headers, byte-buffered blob reads) | `autumn_web::download::Download` — `from_bytes` / `from_stream` / `from_async_read` / `from_blob(&store, key).await?` + `.filename(...)` / `.content_type(...)` / `.inline()`; RFC 5987 filenames, injection-safe, streams blobs without buffering (0.6.0) |
+| Hand-parsed `Range` headers / manual `206 Partial Content` / `Content-Range` / `416` for seekable media or resumable downloads | `autumn_web::range` (`resolve` + `partial_bytes_response`) and `Download::into_response_ranged(&headers).await` — RFC 7233 single-range parsing, multi-range single-range collapse, `If-Range` via `.etag(..)`/`.last_modified(..)`, blob slices via `BlobStore::get_range` (no whole-object buffering) (0.6.0) |
 | Shelling out to `wkhtmltopdf`/headless Chrome, or hand-rolling a PDF library, to turn a view into a downloadable invoice/receipt/report | `autumn_web::pdf::Pdf` (`pdf` Cargo feature) — `Pdf::from_markup(markup)` / `Pdf::from_html(html)` + `.filename(...)` / `.inline()`; renders headings/paragraphs/tables/lists/bold/italic with the PDF base-14 fonts, no system browser or embedded fonts required. Test with `TestResponse::assert_pdf_contains(&self, &str)`. See `docs/guide/pdf-downloads.md` (0.7.0) |
-| Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (0.7.0). See `docs/guide/conditional-get.md` |
+| Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (0.6.0). See `docs/guide/conditional-get.md` |
 | A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument) instead of leaking series (0.7.0, issue #1378). `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
 | Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + PostgreSQL wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598) |
 | Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.7.0, issue #1344). See `docs/guide/conditional-get.md` |
@@ -244,9 +245,9 @@ Use `.one_off_tasks(one_off_tasks![...])` for `#[task]` handlers invoked by
 | `.with_mail_delivery_queue(queue)` | Install durable deferred mail |
 | `.with_mail_suppression_store(store)` | Install a durable bounce/complaint suppression backend (0.7.0; in-memory default auto-wired otherwise) |
 | `.with_audit_sink(sink)` | Install structured audit sink |
-| `.listeners(listeners![...])` | Register `#[listener]` event listeners (0.7.0) |
+| `.listeners(listeners![...])` | Register `#[listener]` event listeners (0.6.0) |
 | `.static_gate(layer)` | Middleware that also guards `#[static_get]` pre-render (0.7.0; `has_static_gate::<L>()`, `get_static_gate_types()`, `TestApp::static_gate` mirror it) |
-| `.with_shard_router(router)` | Install a shard router for `[[database.shards]]` (0.7.0) |
+| `.with_shard_router(router)` | Install a shard router for `[[database.shards]]` (0.6.0) |
 | `.run()` | Launch the server |
 
 ## Route macros
@@ -419,7 +420,7 @@ pub trait PostRepository {}
 allow_unauthorized_repository_api = true # only when intentional
 ```
 
-### Associations and preloading (0.7.0)
+### Associations and preloading (0.6.0)
 
 Declare `#[belongs_to]` / `#[has_many]` / `#[has_one]` on a `#[model]` for
 batched eager loading — no N+1, no lazy loading (un-preloaded access returns
@@ -635,7 +636,7 @@ paths are **not** yet maintained: a derived `delete_by_<field>` and
 
 Deleting a parent can cascade to its children in one transaction — declare
 `dependent(...)` on the parent's `#[repository]` instead of hand-writing the
-child cleanup **(0.7.0)**:
+child cleanup **(0.6.0)**:
 
 ```rust
 #[autumn_web::repository(Post,
@@ -766,16 +767,16 @@ raw Diesel:
 | `primary_reads` (attr) / `on_primary()` | Pin reads to primary; read-your-writes after a save |
 | `soft_delete`, `tenant_scoped` (attrs), `across_tenants()` | Soft deletion and tenant scoping |
 | `hooks = MyHooks` (attr) | `before_/after_create/update/delete` + `after_*_commit` lifecycle hooks with `MutationContext` |
-| `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(0.7.0)** shard-scoped construction. `with_pool_untracked` is the 0.6.0 rename of `with_pool`; 0.5.x repositories had **no** pool constructor at all. An app carrying the older `with_pool` name is migrated by `autumn upgrade --apply` (codemod `0.6.0-repository-with-pool-untracked`, issue #1629) rather than by hand |
-| `find_in_batches(batch_size)`, `find_each(batch_size)` | **(0.7.0)** Bounded-memory whole-table iteration via a primary-key keyset cursor (`WHERE id > last ORDER BY id ASC LIMIT batch_size` — never `LIMIT`/`OFFSET`), generated on every repository. `find_in_batches` returns a `FindInBatches` handle — drive with `while let Some(chunk) = b.next_batch().await?`; `find_each` returns `FindEach` yielding one model per `next().await?`. Inherits soft-delete filtering, tenant scoping, and read routing like `find_all`; errors are retryable (cursor advances only on success; `Ok(None)` always means completion); `batch_size == 0` errors instead of spinning; `batch_size` is **not** clamped to `MAX_PAGE_SIZE`; sharded repos reject cross-shard `across_tenants()` iteration (iterate per shard via `from_shard`). Handle types: `autumn_web::batches::{FindInBatches, FindEach, BatchSource}` (not in the prelude). See "Batched iteration" in `docs/guide/pagination.md` |
-| `find_or_create_by_<field>[_and_<field>...](<field>, &new)` | **(0.7.0)** Race-safe get-or-insert; declare `fn find_or_create_by_slug(slug: String);` (lookup fields only) to generate an inherent `find_or_create_by_slug(&self, slug: String, new: &NewModel) -> AutumnResult<(Model, bool)>`. Reads on the read path first (tenant/soft-delete aware), else inserts on the primary with `ON CONFLICT DO NOTHING` — under concurrency exactly one row is created, exactly one caller sees `created == true`, and no `23505` escapes. `before_/after_create` + commit hooks fire only on the created path; works on hooked repos (unlike `upsert_many`). **Requires a unique constraint on the lookup column(s)** (`_or_` is rejected). See "Race-safe get-or-insert" in `docs/guide/repositories.md` |
+| `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(0.6.0)** shard-scoped construction. `with_pool_untracked` is the 0.6.0 rename of `with_pool`; 0.5.x repositories had **no** pool constructor at all. An app carrying the older `with_pool` name is migrated by `autumn upgrade --apply` (codemod `0.6.0-repository-with-pool-untracked`, issue #1629) rather than by hand |
+| `find_in_batches(batch_size)`, `find_each(batch_size)` | **(0.6.0)** Bounded-memory whole-table iteration via a primary-key keyset cursor (`WHERE id > last ORDER BY id ASC LIMIT batch_size` — never `LIMIT`/`OFFSET`), generated on every repository. `find_in_batches` returns a `FindInBatches` handle — drive with `while let Some(chunk) = b.next_batch().await?`; `find_each` returns `FindEach` yielding one model per `next().await?`. Inherits soft-delete filtering, tenant scoping, and read routing like `find_all`; errors are retryable (cursor advances only on success; `Ok(None)` always means completion); `batch_size == 0` errors instead of spinning; `batch_size` is **not** clamped to `MAX_PAGE_SIZE`; sharded repos reject cross-shard `across_tenants()` iteration (iterate per shard via `from_shard`). Handle types: `autumn_web::batches::{FindInBatches, FindEach, BatchSource}` (not in the prelude). See "Batched iteration" in `docs/guide/pagination.md` |
+| `find_or_create_by_<field>[_and_<field>...](<field>, &new)` | **(0.6.0)** Race-safe get-or-insert; declare `fn find_or_create_by_slug(slug: String);` (lookup fields only) to generate an inherent `find_or_create_by_slug(&self, slug: String, new: &NewModel) -> AutumnResult<(Model, bool)>`. Reads on the read path first (tenant/soft-delete aware), else inserts on the primary with `ON CONFLICT DO NOTHING` — under concurrency exactly one row is created, exactly one caller sees `created == true`, and no `23505` escapes. `before_/after_create` + commit hooks fire only on the created path; works on hooked repos (unlike `upsert_many`). **Requires a unique constraint on the lookup column(s)** (`_or_` is rejected). See "Race-safe get-or-insert" in `docs/guide/repositories.md` |
 | `retention(after = "30d", basis = created_at)` / `retention(purge_deleted_after = "90d")` (attr) | **(0.7.0)** Declarative data-retention: reach for this instead of hand-writing a `#[scheduled]` cleanup fn for expiring sessions, drafts, one-time codes, or other transient rows. Compiles to a batched (`batch_size`, default 500), cursor-paginated sweep auto-registered with fleet coordination — no `tasks![...]` entry needed. On a `soft_delete` repository, `after` soft-deletes (never re-touching an already-deleted row) and `purge_deleted_after` hard-purges (re-checking `deleted_at` at delete time so a concurrent `restore()` survives); without `soft_delete`, `after` hard-deletes. Sweeps run across **all** tenants on a `tenant_scoped` repository (no per-tenant opt-out) and are not supported on `sharded` repositories (compile error). `autumn retention --dry-run [--model NAME]` reports rows-that-would-be-swept without deleting. Emits `retention_sweep_rows_total` / `retention_sweep_duration_seconds` metrics + a structured log line per run. See `docs/guide/retention-sweeps.md` |
 
 Read routing: with `database.replica_url` set, all generated reads use the
 replica automatically; writes always hit the primary. See
 `docs/guide/repositories.md` and `docs/guide/pagination.md`.
 
-### JSON API endpoints — page envelope + write validation (0.7.0)
+### JSON API endpoints — page envelope + write validation (0.6.0)
 
 A `#[repository(api = "/api/posts")]` list endpoint returns a page envelope, and
 create/update handlers validate the decoded payload before touching the DB:
@@ -818,7 +819,7 @@ validators (follow-up: issue #1801). The `Patch<T>` per-field impls and the
 ### Transactions
 
 `Db::tx(f)` runs a READ COMMITTED transaction. On trunk-dev
-**(0.7.0)**, `Db::tx_with(opts, f)` adds isolation levels and automatic
+**(0.6.0)**, `Db::tx_with(opts, f)` adds isolation levels and automatic
 retry of serialization failures (SQLSTATE 40001) with capped exponential
 backoff:
 
@@ -869,7 +870,7 @@ async fn update_post(Path(id): Path<i64>, mut db: Db, session: Session) -> Autum
 }
 ```
 
-**(0.7.0)** Scoped service tokens (trunk-dev only): mint named,
+**(0.6.0)** Scoped service tokens (trunk-dev only): mint named,
 optionally-expiring API tokens carrying flat scopes via `IssueTokenSpec` +
 `issue_scoped_api_token`; gate handlers with
 `#[secured(scopes = ["posts:write"])]` (no session required — default-deny,
@@ -879,7 +880,7 @@ with `autumn token issue <principal> --name ... --scope ...` / `list` /
 `rotate`. The
 published 0.7.0 `autumn token` has only `issue <principal>` / `revoke`.
 
-Active session management ships with `autumn generate auth` (0.7.0):
+Active session management ships with `autumn generate auth` (0.6.0):
 a `{user}_sessions` row per login, generated `sessions()`,
 `revoke_session(id)`, `revoke_other_sessions(...)`, `revoke_all_sessions()`
 methods, an `/account/sessions` Maud + htmx page, and `[auth.sessions]`
@@ -917,7 +918,7 @@ the banner into the static file written to `dist/`. Bump the scaffolded
 banner. Strictly-necessary cookies (session, CSRF) are never routed through
 the gate.
 
-### Audit actor attribution (0.7.0)
+### Audit actor attribution (0.6.0)
 
 Version/audit writes are auto-attributed to the current actor — no per-call
 plumbing. The log-context middleware opens an empty actor scope per request; set
@@ -1002,7 +1003,7 @@ deliveries. Presets: `stripe`, `github`, `slack`, `generic`.
 
 Read `docs/guide/signed-webhooks.md` and `examples/signed-webhooks/`.
 
-## Mail CSS inlining — render styled in Gmail/Outlook (0.7.0)
+## Mail CSS inlining — render styled in Gmail/Outlook (0.6.0)
 
 Gmail strips `<style>` in many contexts and Outlook (Word engine) ignores
 `<head>`/`<style>` and most external CSS, so email authored with a stylesheet
@@ -1037,7 +1038,7 @@ time. Autumn does this for you (issue #1254).
 - `autumn generate mailer` scaffolds this end to end (a `<style>` template + a
   mailer that calls `.inline_css(true)`).
 
-## Mail suppression — stop emailing bounced addresses (0.7.0)
+## Mail suppression — stop emailing bounced addresses (0.6.0)
 
 Autumn *detects* delivery failure (inbound bounce/complaint webhooks) **and**
 acts on it: `Mailer::send()` consults a bounce/complaint suppression list
@@ -1180,13 +1181,13 @@ Use built-in jobs and tasks before reaching for a workflow engine:
 discarding, and canceling framework jobs. `GET /actuator/jobs` exposes
 lower-level counters.
 
-Job attributes beyond `name`/`max_attempts`/`backoff_ms` (0.7.0):
+Job attributes beyond `name`/`max_attempts`/`backoff_ms` (0.6.0):
 `#[job(unique)]` dedupes on an args hash, `unique_by = "field"`,
 `unique_window = "running"|"pending"`, `unique_for_ms = N` (debounce),
 `concurrency = N` + `concurrency_key = "field"` caps simultaneous runs. A
 coalesced enqueue is a no-op `Ok(())`.
 
-**(0.7.0)** trunk-dev jobs additions:
+**(0.6.0)** trunk-dev jobs additions:
 
 - **Named queues**: `#[job(queue = "critical")]`; drain order via
   `[jobs] queues = ["critical", "default", "low"]` (strict priority) or a
@@ -1208,7 +1209,7 @@ coalesced enqueue is a no-op `Ok(())`.
   `autumn_web::payload_version::{split_version, wrap}` (Closes #1205). See
   `docs/guide/jobs.md`.
 
-**(0.7.0)** Events & listeners — a typed domain event bus so one action
+**(0.6.0)** Events & listeners — a typed domain event bus so one action
 can fan out without inline coupling: `#[event]` on a struct, publish via the
 `Events` extractor (`events.publish(UserSignedUp { .. }).await?`), react with
 `#[listener(UserSignedUp)]` (sync, in-request) or
@@ -1216,7 +1217,7 @@ can fan out without inline coupling: `#[event]` on a struct, publish via the
 register with `.listeners(listeners![...])`. Do not also list durable
 listeners in `jobs![...]`. See `docs/guide/events.md`.
 
-## Distributed locks (0.7.0)
+## Distributed locks (0.6.0)
 
 For "run this exactly once across replicas right now" work (nightly cleanup,
 cache warming, one-shot backfills, "send the daily digest once"), use
@@ -1318,7 +1319,7 @@ autumn_web::app()
     .await;
 ```
 
-**(0.7.0)** Cache stampede protection — do not hand-roll cache-aside
+**(0.6.0)** Cache stampede protection — do not hand-roll cache-aside
 fills: `cache::get_or_compute(cache, key, Some(ttl), fill)` runs `fill` once
 per process for concurrent callers; `get_or_compute_with` +
 `GetOrComputeOptions::new().distributed_fill_lock(true)` (Redis lock) and
@@ -1327,7 +1328,7 @@ serve-stale; `cache::jittered_ttl(base, fraction)` de-synchronizes mass
 expiry. A failed fill never poisons the key. See
 `docs/guide/cache-stampede.md`.
 
-**(0.7.0)** Upload content-type validation — multipart uploads are
+**(0.6.0)** Upload content-type validation — multipart uploads are
 validated by **magic bytes**, not the spoofable client `Content-Type`. The
 `Multipart` extractor sniffs the real type (`sniff_content_type`) whenever an
 `allowed_content_types` allow-list is configured or strict mode is on. Reject
@@ -1341,7 +1342,7 @@ reject_on_content_type_mismatch = true  # declared-vs-sniffed mismatch (or an
 
 (env `AUTUMN_SECURITY__UPLOAD__REJECT_ON_CONTENT_TYPE_MISMATCH`) (#1354).
 
-## View helpers and widgets (0.7.0)
+## View helpers and widgets (0.6.0)
 
 Trunk-dev ships framework view widgets — prefer these over hand-rolled Maud
 for the common cases:
@@ -1365,7 +1366,7 @@ for the common cases:
 | `comment_thread(&cfg, &CommentView::from_thread(&nodes))` / `CommentThread::new(dom_id, action)` | The view half of `#[commentable]` (#1367): nested `<ol>` comment thread with a `<details>`-disclosed inline reply form on every node. Ordinary `<form method="post">` (works with scripting off) that also carries `hx-post`/`hx-target`/`hx-swap="outerHTML"` to swap the thread in place. Thread `.csrf_token(...)` and `.return_to(path)` for the no-JS round trip, `.max_depth(n)` so the UI never offers a reply the write path would `422`, `.read_only(Some(prompt))` for a signed-out visitor |
 | `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
 
-### Whole-form rendering — `form_for` (0.7.0)
+### Whole-form rendering — `form_for` (0.6.0)
 
 `#[model]` derives `autumn_web::form::FormModel` (one `FormField` per
 `NewX`-editable column: humanized label, type-appropriate `FieldControl`,
@@ -1524,7 +1525,7 @@ Use `AUTUMN_SECTION__FIELD` for env overrides, for example
 `AUTUMN_SECURITY__SIGNING_SECRET`, and
 `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND`.
 
-### Process roles — web/worker split (0.7.0)
+### Process roles — web/worker split (0.6.0)
 
 Scale HTTP and background work independently by giving a process a **role** (no
 app-code change) via `role = "web"|"worker"|"combined"` in config or the
@@ -1543,7 +1544,7 @@ app-code change) via `role = "web"|"worker"|"combined"` in config or the
   generated **docker-compose** output and sets the web-tier role on the `app`
   service (#1613). See `docs/guide/cloud-native.md`.
 
-### Per-queue worker pools, pinning & `ProcessRole` on `AppState` (0.7.0)
+### Per-queue worker pools, pinning & `ProcessRole` on `AppState` (0.6.0)
 
 Carve the per-process worker pool up per queue and dedicate a worker tier to a
 subset of queues — all config-only, no app-code change:
@@ -1668,7 +1669,7 @@ Published 0.7.0 behavior:
 - `actuator.prometheus` exposes the Prometheus scrape endpoint independently
   of sensitive actuator mode.
 
-### Runtime log levels (0.7.0)
+### Runtime log levels (0.6.0)
 
 `PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,
 not just an in-memory map — raise/lower verbosity in production without a
@@ -1691,7 +1692,7 @@ Overrides stay ephemeral — a restart resets to the configured `log.level`.
 Invalid levels still return `400`. `GET /actuator/loggers` keeps reporting
 `current_level` + overrides, now matching real emission.
 
-### Build & git provenance on `/actuator/info` (0.7.0)
+### Build & git provenance on `/actuator/info` (0.6.0)
 
 `GET /actuator/info` now reports which commit/build is running, for
 deploy/rollback verification. Apps scaffolded by `autumn new` get this with
@@ -1748,7 +1749,7 @@ null git provenance because the Docker build context excludes `.git` (tracked in
 - Doc + browser DevTools walk-through:
   `docs/guide/observability/server-timing.md`.
 
-## Resilience: load shedding (0.7.0)
+## Resilience: load shedding (0.6.0)
 
 Admission control caps concurrent in-flight requests; excess is shed
 immediately with `503` + `Retry-After` before the handler runs. Disabled by
@@ -1763,7 +1764,7 @@ Probes (`/health`, `/live`, `/ready`, `/startup`, actuator) are never shed;
 sheds increment `autumn_requests_shed_total`. See `docs/guide/resilience.md`
 and `docs/adr/0009-adopt-overload-protection-load-shedding.md`.
 
-## Sharding (0.7.0)
+## Sharding (0.6.0)
 
 Framework-native horizontal sharding: declare `[[database.shards]]` (each a
 full primary/replica topology), route by key → logical slot → shard. Prelude
@@ -1927,7 +1928,7 @@ autumn dev-loop-bench --dry-run
 autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
 ```
 
-**(0.7.0)** CLI additions — NOT in 0.6.x or earlier
+**(0.6.0)** CLI additions — NOT in 0.6.x or earlier
 `autumn-cli`; do not suggest them to users on the published release:
 
 ```bash
@@ -1943,7 +1944,7 @@ autumn i18n check                # compare t!/t(...) keys vs i18n/*.ftl; --stric
 autumn test                      # provision/target an isolated *_test DB, migrate, then cargo test
 autumn test --reset -- --nocapture   # drop+recreate the test DB; forward args to the harness
 autumn db backup --keep 7        # dump control DB + shards to ./backups/<profile>/<ts>/; db restore <artifact> reverses it
-autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (0.7.0)
+autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (0.6.0)
 autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
 autumn serve --role worker       # run only workers + scheduler (web/worker split); also --role web|combined
 autumn console                   # data playground: scaffolds src/bin/playground.rs (pre-wired config+pool), then builds and runs it; alias `autumn c`

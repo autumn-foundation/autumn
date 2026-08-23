@@ -109,6 +109,78 @@ CRATES=(
 breaking_failures=0
 tool_failures=0
 
+# Classify ONE cargo-semver-checks invocation and record its verdict.
+#
+# autumn-web runs two independent passes (Postgres and SQLite surfaces), and
+# each must be classified on its OWN output. Concatenating them and running this
+# chain once lets a skip-worthy signal from one pass mask a real break in the
+# other — e.g. the SQLite pass hitting the handled upstream `time` E0119 while
+# the Postgres pass reports "checks failed" would match the E0119 SKIP branch
+# first and wave the break through. The branches below are ordered by
+# specificity, not severity, so that precedence bug is structural: the fix is to
+# never hand this function more than one pass's output.
+#
+# Args: $1 crate, $2 pass label (empty for single-pass crates), $3 exit code,
+# $4 captured output. Increments the global `breaking_failures` /
+# `tool_failures` counters.
+classify_semver_pass() {
+  local crate="$1" pass_label="$2" pass_exit_code="$3" pass_output="$4"
+  echo "$pass_output"
+
+  if [[ $pass_exit_code -eq 0 ]]; then
+    echo "  PASS: $crate$pass_label API is semver-compatible with crates.io baseline"
+  elif echo "$pass_output" | grep -q "no crates with library targets selected"; then
+    # Proc-macro or binary-only crate — no public API surface to semver-check.
+    echo "  SKIP: $crate$pass_label has no library targets (proc-macro or binary)"
+  elif echo "$pass_output" | grep -q "not found in registry"; then
+    # Crate has never been published on crates.io; nothing to compare against.
+    echo "  SKIP: $crate$pass_label not yet published on crates.io"
+  elif echo "$pass_output" | grep -qE "error\[E0282\]" && echo "$pass_output" | grep -q "aws-runtime"; then
+    # aws-runtime has a type-inference regression (E0282) on Rust 1.92.x that
+    # affects every published version of the crate.  This is an upstream bug
+    # unrelated to our public API surface; skip rather than hard-fail so the
+    # gate remains actionable for real semver breaks.
+    echo "  SKIP: $crate$pass_label — aws-runtime E0282 upstream regression on Rust $semver_toolchain (not a semver issue)"
+  elif echo "$pass_output" | grep -qE "error\[E0119\]" && echo "$pass_output" | grep -qE 'HourBase|conflicting implementation in crate `time`'; then
+    # time 0.3.48 added a blanket From<HourBase> impl that breaks trait
+    # coherence (E0119) in downstream crates with their own blanket From
+    # impls — bollard 0.20.x, aws-smithy-types 1.4.x, and ratatui-widgets
+    # are all affected. The isolated workspace used by cargo-semver-checks
+    # resolves time fresh, so it picks up the broken release even though
+    # the workspace pins time below it (<0.3.48). Upstream breakage, not a
+    # semver issue; remove once time yanks/fixes 0.3.48 or the affected
+    # crates ship releases compatible with it.
+    echo "  SKIP: $crate$pass_label — time 0.3.48 coherence regression (E0119) breaking downstream crates (not a semver issue)"
+  elif echo "$pass_output" | grep -qE "checks failed|semver requires"; then
+    # Exit 1 with semver-violation output → actual breaking API changes found.
+    # Allow them through only when BOTH conditions hold:
+    #   1. A migration guide exists (explicit acknowledgement).
+    #   2. The version bump type permits breaking changes per release policy
+    #      (post-1.0 major bump X.0.0, or pre-1.0 minor bump 0.Y.0).
+    # A patch release or a post-1.0 minor release must never break even if a
+    # migration stub is present, to prevent an accidental regression slipping
+    # through because an old migration document was lying around.
+    if [[ -f "$migration_guide" ]] && is_breaking_release_type; then
+      echo "  ADVISORY: $crate$pass_label has breaking API changes; intentional — migration guide found at $migration_guide"
+    elif [[ -f "$migration_guide" ]]; then
+      echo "  FAIL: $crate$pass_label has breaking API changes but $workspace_version is a patch/minor release." >&2
+      echo "        Breaking changes require a major bump (X.0.0, X≥1) or a pre-1.0 minor bump (0.Y.0)." >&2
+      breaking_failures=$((breaking_failures + 1))
+    else
+      echo "  FAIL: $crate$pass_label has unacknowledged breaking API changes." >&2
+      echo "        Add a migration guide at $migration_guide to acknowledge an intentional break," >&2
+      echo "        or fix the API regression before releasing." >&2
+      breaking_failures=$((breaking_failures + 1))
+    fi
+  else
+    # Exit 1 with unrecognised output → tool/invocation error (compilation
+    # failure, registry timeout, unsupported flag, etc.).  Hard-fail so the
+    # error is investigated rather than silently skipped.
+    echo "  FAIL: $crate$pass_label — cargo-semver-checks failed with an unexpected error (exit $pass_exit_code)." >&2
+    tool_failures=$((tool_failures + 1))
+  fi
+}
+
 for crate in "${CRATES[@]}"; do
   echo ""
   echo "==> semver-checks: $crate"
@@ -251,86 +323,33 @@ for crate in "${CRATES[@]}"; do
     autumn_web_semver_sqlite_features="sqlite"
 
     echo "  pass 1/2: Postgres surface (--features $autumn_web_semver_features)"
-    crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
+    pg_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
       --only-explicit-features \
       --features "$autumn_web_semver_features" 2>&1)"
-    exit_code=$?
+    pg_exit_code=$?
 
-    # Run the SQLite pass regardless, so one report names every break rather
-    # than the maintainer fixing Postgres and rediscovering SQLite on the next
-    # push. Keep the FIRST failing exit code and concatenate both outputs: the
-    # outcome-classifying branches below parse `crate_output`, so a skip-worthy
-    # signal (unpublished crate, upstream E0119/E0282) is still matched from
-    # whichever pass emitted it.
+    # Run the SQLite pass regardless of pass 1's outcome, so one report names
+    # every break rather than the maintainer fixing Postgres and rediscovering
+    # SQLite on the next push.
     echo "  pass 2/2: SQLite surface (--features $autumn_web_semver_sqlite_features)"
     sqlite_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
       --only-explicit-features \
       --features "$autumn_web_semver_sqlite_features" 2>&1)"
     sqlite_exit_code=$?
-    crate_output="${crate_output}"$'\n'"${sqlite_output}"
-    if [[ $exit_code -eq 0 ]]; then
-      exit_code=$sqlite_exit_code
-    fi
-  else
-    crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" 2>&1)"
-    exit_code=$?
+    set -e
+
+    # Classify each pass on its OWN output — never concatenated. See the
+    # comment on classify_semver_pass for why merging them is unsafe.
+    classify_semver_pass "$crate" " (Postgres surface)" "$pg_exit_code" "$pg_output"
+    classify_semver_pass "$crate" " (SQLite surface)" "$sqlite_exit_code" "$sqlite_output"
+    continue
   fi
+
+  crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" 2>&1)"
+  exit_code=$?
   set -e
 
-  echo "$crate_output"
-
-  if [[ $exit_code -eq 0 ]]; then
-    echo "  PASS: $crate API is semver-compatible with crates.io baseline"
-  elif echo "$crate_output" | grep -q "no crates with library targets selected"; then
-    # Proc-macro or binary-only crate — no public API surface to semver-check.
-    echo "  SKIP: $crate has no library targets (proc-macro or binary)"
-  elif echo "$crate_output" | grep -q "not found in registry"; then
-    # Crate has never been published on crates.io; nothing to compare against.
-    echo "  SKIP: $crate not yet published on crates.io"
-  elif echo "$crate_output" | grep -qE "error\[E0282\]" && echo "$crate_output" | grep -q "aws-runtime"; then
-    # aws-runtime has a type-inference regression (E0282) on Rust 1.92.x that
-    # affects every published version of the crate.  This is an upstream bug
-    # unrelated to our public API surface; skip rather than hard-fail so the
-    # gate remains actionable for real semver breaks.
-    echo "  SKIP: $crate — aws-runtime E0282 upstream regression on Rust $semver_toolchain (not a semver issue)"
-  elif echo "$crate_output" | grep -qE "error\[E0119\]" && echo "$crate_output" | grep -qE 'HourBase|conflicting implementation in crate `time`'; then
-    # time 0.3.48 added a blanket From<HourBase> impl that breaks trait
-    # coherence (E0119) in downstream crates with their own blanket From
-    # impls — bollard 0.20.x, aws-smithy-types 1.4.x, and ratatui-widgets
-    # are all affected. The isolated workspace used by cargo-semver-checks
-    # resolves time fresh, so it picks up the broken release even though
-    # the workspace pins time below it (<0.3.48). Upstream breakage, not a
-    # semver issue; remove once time yanks/fixes 0.3.48 or the affected
-    # crates ship releases compatible with it.
-    echo "  SKIP: $crate — time 0.3.48 coherence regression (E0119) breaking downstream crates (not a semver issue)"
-  elif echo "$crate_output" | grep -qE "checks failed|semver requires"; then
-    # Exit 1 with semver-violation output → actual breaking API changes found.
-    # Allow them through only when BOTH conditions hold:
-    #   1. A migration guide exists (explicit acknowledgement).
-    #   2. The version bump type permits breaking changes per release policy
-    #      (post-1.0 major bump X.0.0, or pre-1.0 minor bump 0.Y.0).
-    # A patch release or a post-1.0 minor release must never break even if a
-    # migration stub is present, to prevent an accidental regression slipping
-    # through because an old migration document was lying around.
-    if [[ -f "$migration_guide" ]] && is_breaking_release_type; then
-      echo "  ADVISORY: $crate has breaking API changes; intentional — migration guide found at $migration_guide"
-    elif [[ -f "$migration_guide" ]]; then
-      echo "  FAIL: $crate has breaking API changes but $workspace_version is a patch/minor release." >&2
-      echo "        Breaking changes require a major bump (X.0.0, X≥1) or a pre-1.0 minor bump (0.Y.0)." >&2
-      breaking_failures=$((breaking_failures + 1))
-    else
-      echo "  FAIL: $crate has unacknowledged breaking API changes." >&2
-      echo "        Add a migration guide at $migration_guide to acknowledge an intentional break," >&2
-      echo "        or fix the API regression before releasing." >&2
-      breaking_failures=$((breaking_failures + 1))
-    fi
-  else
-    # Exit 1 with unrecognised output → tool/invocation error (compilation
-    # failure, registry timeout, unsupported flag, etc.).  Hard-fail so the
-    # error is investigated rather than silently skipped.
-    echo "  FAIL: $crate — cargo-semver-checks failed with an unexpected error (exit $exit_code)." >&2
-    tool_failures=$((tool_failures + 1))
-  fi
+  classify_semver_pass "$crate" "" "$exit_code" "$crate_output"
 done
 
 echo ""

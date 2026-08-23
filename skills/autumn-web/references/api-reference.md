@@ -4,8 +4,9 @@ Use this file as a quick map for public names, features, dependency versions,
 and config keys. Verify against current source when exact code matters.
 
 Version identity: this reference tracks **0.7.0**, the current release line,
-which is also the version `trunk-dev` carries. Entries marked **(0.7.0)**
-arrived in this release and are absent from 0.6.x and earlier.
+which is also the version `trunk-dev` carries. Entries carry the release they
+arrived in: **(0.6.0)** is absent from 0.5.x, and **(0.7.0)** is absent from
+0.6.x and earlier. Unmarked entries predate 0.6.0.
 
 ## Published crates
 
@@ -158,7 +159,7 @@ supported_locales)` emit `<link rel="alternate" hreflang="…">` tags (plus
 static route when the flag is on.
 
 `#[model]` also recognizes `#[belongs_to]` / `#[has_many]` / `#[has_one]`
-struct-level attributes (0.7.0)
+struct-level attributes (0.6.0)
 for declarative associations with batched eager
 preloading (`Model::preload()`, `repo.preload(records, spec)`); these are
 consumed by `#[model]` itself, not separately-registered proc macros.
@@ -176,7 +177,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
 `docs/guide/state-machines.md`.
 
 `#[model]` field attributes for column privacy and canonicalization
-(0.7.0):
+(0.6.0):
 
 - `#[private]` (issue #1374) — excludes the column from the model's `Serialize`
   impl so it never appears in `Json` output, the auto-generated `--api`
@@ -190,7 +191,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   *set* it). `autumn doctor` warns (`model_private_columns`) when a
   sensitively-named column (`password`, `token`, `secret`, `*_hash`) is not
   marked `#[private]`.
-- `#[translatable]` (issue #1384, needs the `i18n` feature) — the column stores
+- **(0.7.0)** `#[translatable]` (issue #1384, needs the `i18n` feature) — the column stores
   an **independent value per locale tag** and resolves to the request's active
   locale with no locale argument in the handler. The field type becomes
   `autumn_web::i18n::Translated`, a per-locale container persisted as a JSON
@@ -249,7 +250,7 @@ Published 0.7.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
 `scope =`, `primary_reads`, `soft_delete`, `tenant_scoped`, `hooks =`,
 `mcp` / `mcp = "read"`.
 
-**(0.7.0)**: `preload(records, spec)` (declarative associations);
+**(0.6.0)**: `preload(records, spec)` (declarative associations);
 `from_shard(&ShardedDb)`; `with_pool_untracked` (new on
 the 0.6.0 rename of `with_pool`; 0.5.x repositories had no pool constructor);
 `find_in_batches(batch_size)` / `find_each(batch_size)` — bounded-memory
@@ -265,7 +266,7 @@ clamped to `MAX_PAGE_SIZE`; sharded repositories reject cross-shard
 `across_tenants()` iteration like `cursor_page`. See "Batched iteration" in
 `docs/guide/pagination.md`.
 
-**(0.7.0)** — `find_or_create_by_<field>[_and_<field>...]`: declare
+**(0.6.0)** — `find_or_create_by_<field>[_and_<field>...]`: declare
 `fn find_or_create_by_slug(slug: String);` (lookup fields only) in the
 `#[repository]` trait to generate an inherent
 `find_or_create_by_slug(&self, slug: String, new: &NewModel) ->
@@ -281,7 +282,7 @@ Requires a unique constraint covering the lookup column(s); `_or_` is rejected
 (it would span constraints). See "Race-safe get-or-insert" in
 `docs/guide/repositories.md`.
 
-**(0.7.0)** — typed grouped aggregate queries (#1364): declare
+**(0.6.0)** — typed grouped aggregate queries (#1364): declare
 `fn count_grouped_by_<col>() -> Vec<(K, i64)>` or
 `fn <sum|avg|min|max>_<num_col>_grouped_by_<col>() -> Vec<(K, Option<T>)>`
 (`avg` → `Option<f64>`) in the `#[repository]` trait — the pair return type is
@@ -400,7 +401,7 @@ join an enclosing `Db::tx`** — never hold a `Db` extractor across the call, or
 the handler needs two connections at once and deadlocks once concurrency
 reaches the pool size. See `docs/guide/votable.md`.
 
-**(0.7.0)** — `ListQuery` extractor + `SortDir` (#1126): an `Infallible`
+**(0.6.0)** — `ListQuery` extractor + `SortDir` (#1126): an `Infallible`
 query extractor parsing `?sort=<col>`, `?dir=asc|desc`, and
 `?filter[<col>]=<val>`. It **never rejects** — an empty or unknown `sort` falls
 back to the model's default order, and an invalid `dir` falls back to `asc`
@@ -474,7 +475,7 @@ delete actions remain last-write-wins.
 
 ## Db transactions
 
-- `Db::tx(f)` — READ COMMITTED, one attempt (0.7.0).
+- `Db::tx(f)` — READ COMMITTED, one attempt (0.6.0).
 - `Db::tx_with(opts: TxOptions, f) -> Result<T, AutumnError>`
   (**0.7.0**) — closure gets `&mut AsyncPgConnection`; auto-retries
   SQLSTATE 40001 with capped exponential backoff.
@@ -492,9 +493,9 @@ Free functions rendering changeset-aware, accessible inputs:
 - Published 0.7.0: `form_tag`, `method_input`, `text_input`,
   `text_input_htmx`; `Changeset`-bound methods (`form.form_tag(...)`,
   `form.text_input(...)`).
-- **(0.7.0)**: `checkbox_input`, `number_input`, `date_input`,
+- **(0.6.0)**: `checkbox_input`, `number_input`, `date_input`,
   `datetime_input`, `select_input`.
-- **(0.7.0)**: `form_for(&changeset,
+- **(0.6.0)**: `form_for(&changeset,
   action, method) -> FormFor` whole-form builder. Renders the opening
   `<form>` (audited CSRF injection + hidden `_method` override, as
   `form_tag`), one pre-filled control with inline errors per
@@ -742,13 +743,13 @@ Per-primitive setters (in addition to the shared set):
 `TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` — are documented
 in **Typed accessible primitives** above.)
 
-## Cache read-through (0.7.0)
+## Cache read-through (0.6.0)
 
 `autumn_web::cache::{get_or_compute, get_or_compute_with,
 GetOrComputeOptions, CacheFillError, jittered_ttl}` — single-flight fills,
 optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
 
-## Downloads (0.7.0)
+## Downloads (0.6.0)
 
 `autumn_web::download::Download` — a typed file-download `IntoResponse`.
 
@@ -771,7 +772,7 @@ optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
   object's bytes; `LocalBlobStore` overrides it to stream from disk, other
   backends inherit a buffering default.
 
-### Range / 206 Partial Content (0.7.0)
+### Range / 206 Partial Content (0.6.0)
 
 `autumn_web::range` — reusable HTTP `Range` (RFC 7233) parsing + response
 building, wired into `Download` and the embedded static-asset path.
@@ -841,12 +842,12 @@ to a downloadable PDF `IntoResponse` built on `Download`.
 - Published 0.7.0 `#[job]` keys: `name`, `max_attempts`, `backoff_ms`,
   `unique`, `unique_by`, `unique_window`, `unique_for_ms`, `concurrency`,
   `concurrency_key`.
-- **(0.7.0)**: `queue = "name"` + `[jobs] queues` strict-priority list or
+- **(0.6.0)**: `queue = "name"` + `[jobs] queues` strict-priority list or
   `[jobs.queues]` weight table; tracked jobs (`job::enqueue_tracked`,
   `enqueue_tracked_for`, `TrackedJobHandle`, optional third `JobContext`
   handler arg, `GET /_autumn/jobs/{token}`, `jobs.tracking.*` config).
 
-## Distributed locks (0.7.0)
+## Distributed locks (0.6.0)
 
 - `autumn_web::lock::Lock` (prelude: `Lock`, `LockGuard`, `LockError`; `db`
   feature). Named, cluster-wide Postgres advisory lock for
@@ -894,7 +895,7 @@ to a downloadable PDF `IntoResponse` built on `Download`.
 - Published 0.7.0: `autumn generate auth` session management (`{user}_sessions`
   table, `sessions()` / `revoke_session` / `revoke_other_sessions` /
   `revoke_all_sessions`, `/account/sessions` page, `[auth.sessions]` config).
-- **(0.7.0)**: scoped service tokens — `IssueTokenSpec`,
+- **(0.6.0)**: scoped service tokens — `IssueTokenSpec`,
   `issue_scoped_api_token`, `#[secured(scopes = [...])]`,
   `PolicyContext::has_scope/has_any_scope/has_all_scopes`, `autumn token
   issue --name/--scope/--expires-at | list | rotate`, admin `TokenAdminModel`.
@@ -1251,7 +1252,7 @@ Profile selection precedence:
 3. `--profile <name>`
 4. `AUTUMN_IS_DEBUG` auto-detection from the macro
 
-`.env` auto-loading (0.7.0): a project-root `.env` file is a
+`.env` auto-loading (0.6.0): a project-root `.env` file is a
 local-dev feeder for the env-var layer (6), not a new precedence tier. On
 startup Autumn injects `.env` values into the process environment only for keys
 that are still unset, so a real environment variable of the same name always
@@ -1271,7 +1272,7 @@ Frequently used env keys:
 | `AUTUMN_SESSION__BACKEND` | `session.backend` |
 | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` |
 | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` |
-| `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (0.7.0) |
+| `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (0.6.0) |
 | `AUTUMN_JOBS__BACKEND` | `jobs.backend` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
 | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` |
@@ -1282,7 +1283,7 @@ Frequently used env keys:
 | `AUTUMN_MAIL__ALLOW_IN_PROCESS_DELIVER_LATER_IN_PRODUCTION` | `mail.allow_in_process_deliver_later_in_production` |
 | `AUTUMN_STORAGE__BACKEND` | `storage.backend` |
 | `AUTUMN_CACHE__BACKEND` | `cache.backend` |
-| `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (0.7.0) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
+| `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (0.6.0) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
 
 ### `[cluster]` — embedded clustering (0.7.0, #1762)
 
