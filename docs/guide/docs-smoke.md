@@ -1,14 +1,14 @@
 # Docs Smoke Procedure
 
 This docs-smoke procedure certifies the public first-run path for the published
-Autumn 0.6.x line. It must use Rust 1.88.0+ and the published `autumn-cli` and
+Autumn 0.7.x line. It must use Rust 1.88.0+ and the published `autumn-cli` and
 `autumn-web` crates unless the release is explicitly in a pre-publish rehearsal.
 
 Run it in a clean temporary directory, not inside the Autumn checkout:
 
 ```bash
 rustc --version
-cargo install autumn-cli --version 0.6.0
+cargo install autumn-cli --version 0.7.0
 
 mkdir autumn-docs-smoke
 cd autumn-docs-smoke
@@ -33,7 +33,7 @@ Passing output:
 - `/health` returns:
 
   ```json
-  { "status": "ok", "version": "0.6.0" }
+  { "status": "ok", "version": "0.7.0" }
   ```
 
 Do not add `[patch.crates-io]`, path dependencies, or `cargo install --path`
@@ -47,10 +47,10 @@ commands may be rehearsed against the workspace only if the release notes record
 why the smoke is temporary:
 
 ```text
-docs-smoke: workspace-prepublish rehearsal because autumn-cli/autumn-web 0.6.0
+docs-smoke: workspace-prepublish rehearsal because autumn-cli/autumn-web 0.7.0
 were not yet available on crates.io.
 ```
 
 That rehearsal does not certify the release. The published docs-smoke must be
-rerun with `cargo install autumn-cli --version 0.6.0` and no workspace patches
+rerun with `cargo install autumn-cli --version 0.7.0` and no workspace patches
 before announcing the release.

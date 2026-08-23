@@ -12,7 +12,7 @@ keywords = ["web", "search", "vector", "embeddings", "axum"]
 categories = ["web-programming", "database"]
 
 [dependencies]
-autumn-web = { version = "0.6.0", path = "../autumn" }
+autumn-web = { version = "0.7.0", path = "../autumn" }
 # Diesel is used ONLY by the Postgres `SearchBackend` and the Postgres
 # `DocumentSource`. Backend selection (postgres / sqlite) is inherited from
 # autumn-web's `db` feature via cargo feature unification — this crate never

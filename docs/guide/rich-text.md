@@ -204,7 +204,7 @@ The rendered form appears on the show page.
 All of this lives behind `autumn-web`'s `markdown` feature:
 
 ```toml
-autumn-web = { version = "0.6.0", features = ["markdown"] }
+autumn-web = { version = "0.7.0", features = ["markdown"] }
 ```
 
 A `richtext` scaffold enables it on your project automatically.

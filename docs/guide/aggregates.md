@@ -27,7 +27,7 @@ Postgres/Diesel repository stack — the same setup any Autumn app with a
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.6", features = ["openapi"] }
+autumn-web = { version = "0.7", features = ["openapi"] }
 ```
 
 The `DateBucket` type used for time-series roll-ups is at

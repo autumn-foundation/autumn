@@ -225,6 +225,36 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
             }),
         },
     },
+    // 0.7.0 ships no codemod: each of its three breaks needs a value, a wire
+    // change in a client this tool never sees, or a change of impl *shape* —
+    // none of them rename-level. They are registered as `GuideOnly` so the
+    // upgrade summary names them and links the guide section, rather than a
+    // 0.6.x app being told "nothing to change" about a release that broke
+    // three seams.
+    AppMigration {
+        id: "0.7.0-routing-route-seo-field",
+        version: "0.7.0",
+        title: "`Route` and `StaticRouteMeta` gained an `seo` field",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.7.0.md#routing-route-and-staticroutemeta-gained-an-seo-field",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.7.0-api-lock-version-required",
+        version: "0.7.0",
+        title: "a `lock_version` model requires the version on JSON `PUT`/`PATCH`",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.7.0.md#json-api-a-lock_version-model-now-requires-the-version-on-putpatch",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.7.0-app-layers-erased",
+        version: "0.7.0",
+        title: "app-wide layers are registered against the erased ingress service",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.7.0.md#app-wide-layers-are-now-erased",
+        rewrite: Rewrite::GuideOnly,
+    },
 ];
 
 /// The full registry.

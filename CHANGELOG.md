@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.0] - 2026-08-23
+
+For a narrative tour of this release, see the
+[0.7.0 release walkthrough](docs/releases/0.7.0.md); for the upgrade path from
+0.6.x, see the [migration guide](docs/migrations/0.7.0.md).
+
 ### Added
 
 - **`autumn deploy` prepares the host and migrates on the first deploy (#1607):**
@@ -522,172 +530,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of a demotion, with outbound HTTP worked through as `declared` — is
   now documented in `docs/guide/security-posture-manifest.md` (#1627).
 
-### Changed
-
-- **`Query<T>` treats `[` and `]` in a query key as structure (#1972).** A
-  target that types a parameter as a plain value — `Query<HashMap<String,
-  String>>` is the common one — used to receive `?filter[a]=1` as the literal
-  key `"filter[a]"`; it now sees a nested object and reports a decode error
-  naming the fix. Give such a field a nested type, or accept it as
-  `serde_json::Value`. A key the grammar cannot resolve (one name used as both a
-  scalar and a container, or nesting past the cap) fails only if the target
-  actually claims it, so an unrecognised parameter stays ignorable exactly as
-  before.
-- **`Query<T>` rejects a duplicated key in a single-valued position (#1972).**
-  `?q=a&q=b` against a `String` field is a 400, as it was under
-  `serde_urlencoded` + serde's derive (`duplicate field`). A **map**-typed
-  target previously resolved this silently to the last value; resolving
-  parameter pollution quietly is how the resulting bugs are built, so it is now
-  loud. A sequence field still takes every occurrence.
-- **Query decode errors no longer echo the submitted value (#1972).** A
-  coercion failure names the field path and the expected type
-  (`page: invalid u32 value`) but never the text — the message is returned in
-  the 400 Problem Details body and recorded by every error reporter, and a query
-  parameter can hold a secret. Key text embedded in an error is bounded and
-  stripped of control characters.
-- **`Query<Vec<(String, String)>>` yields key-sorted pairs (#1972)** rather than
-  submission order; occurrences of one key keep their relative order. The
-  `#[edge]` extractor is unaffected — `autumn_edge`'s prelude re-exports axum's
-  `Query`.
-
-### Fixed
-
-- **deploy:** a cutover no longer orphans an active maintenance flag. The
-  maintenance flag path is now resolved through the new
-  `AUTUMN_MAINTENANCE_FLAG_FILE` environment variable (falling back to the
-  historical cwd-relative `tmp/autumn-maintenance.json` when unset, so a
-  non-deploy-managed app is unaffected), and `autumn deploy` stamps it into every
-  slot unit it writes, pointing at the per-app `shared/` directory. A slot unit's
-  `WorkingDirectory` is the *release* directory — new on every deploy — so on the
-  cwd-relative path a cutover silently un-maintained the host, and the blue and
-  green slots could not see each other's flag at all. Both read sites (the boot
-  load and the 500 ms poller) go through the same resolver. See
-  `docs/guide/maintenance-mode.md` (#1621).
-
-- **security:** `#[secured]`'s roles and scopes are no longer lost when another
-  guard wraps the handler body. With `#[secured("admin")]` written above
-  `#[authorize]`, `#[secured]` expands first and `#[authorize]` then buries its
-  role/scope marker consts one level deeper, inside the generated
-  `let __autumn_inner: T = (async move { … }).await;` wrapper — a shape the
-  marker walks did not descend. Extraction fell through
-  to the policy-check fallback, and the route reported `secured: true` with
-  empty `roles`/`scopes`: a *provable* manifest dimension silently understating
-  the posture it exists to prove. Both walks now descend the generated wrapper
-  through the same helper the `#[authorize]` binding walk uses, so the sibling
-  extractors can no longer disagree about depth (#1627).
-
-- **security:** two sibling route-metadata losses found by review of the same
-  extraction ladder: (1) `#[secured]` above the route macro with `#[authorize]`
-  below it dropped the roles/scopes to `&[]` — the live `#[authorize]`
-  attribute short-circuited the marker read, so deleting the `#[secured(...)]`
-  line produced zero manifest diff; the marker read now runs first. (2) The
-  `#[public]` marker walk could not descend a wrapping guard's generated body,
-  so `#[public]` above `#[throttle]` lost `public: true` and false-failed the
-  coverage gate as `unclassified`; the walk now uses the same shared
-  wrapper-descent helper as the other marker extractors (#1627).
-
-- **`generate admin` over an `#[encrypted]` model:** the generated admin adapter
-  did not compile — it bound `&new_row` to `.values(…)` and `&diesel_changeset`
-  to `.set(…)`, and diesel implements `Insertable`/`AsChangeset` only for the
-  owned value once a column uses `#[diesel(serialize_as = …)]`, as every
-  encrypted field does. Both now pass owned records when the model has an
-  encrypted column; plaintext models keep the borrowed form byte-for-byte.
-  Separately, **every admin edit of such a model failed**: the plugin renders an
-  encrypted column's edit control disabled and with no `name` (it is managed
-  outside the admin), so the form submits no key for it, while the handler
-  deserialized the submitted map into `New{Model}`, where the encrypted `String`
-  is required — so `serde_json::from_value` returned a "missing field" error even
-  when only a plaintext column was edited. Encrypted columns are now excluded
-  from the update entirely (matching what the form can actually submit), and the
-  handler back-fills a placeholder purely to satisfy that deserialization. That
-  exclusion also closes a plaintext write: the `lock_version` update path emits a
-  raw `col.eq(value)` tuple that never builds an `Update{Model}` changeset, so it
-  would have bypassed the encrypting wrapper and stored **plaintext** in the
-  encrypted column.
-
-- **`#[repository]` with hooks over an `#[encrypted]` model:** a repository
-  declared `broadcasts = true` (or with an explicit `hooks = …` type) over a
-  model carrying any `#[encrypted]` column failed to compile —
-  `the trait bound `&Model: AsChangeset` is not satisfied`. The hooks-aware
-  bulk-update path bound a *borrowed* proposed row to `.set(…)`, and diesel
-  implements `AsChangeset` only for the owned model once a field uses
-  `#[diesel(serialize_as = …)]`, as every encrypted field does. It now passes
-  the owned record, matching the single-record hooks paths. Reachable from
-  `autumn generate scaffold --live` with an encrypted column.
-
-- **failure capsules:** the resolved client identity now obeys
-  `[log] filter_parameters`. `client_addr`/`client_host`/`client_scheme` are
-  derived from `Forwarded`, `X-Forwarded-*` and `Host`, and were copied into
-  the capsule *after* header redaction ran — so an operator who filtered
-  `x-forwarded-host` saw it masked under `headers` and sitting in cleartext one
-  key away under `client_host`. Each field is now dropped when any header it
-  could have been resolved from is filtered — including `X-Real-IP`, a
-  fallback source for the address. Where a filtered source actually supplied a
-  value the capsule is additionally **refused** by replay: replay pre-inserts
-  the recorded identity whole whenever any field survives, so a suppressed
-  host would reach the handler as `None` rather than not at all, and a handler
-  that branches on it would report a `mismatch` the guide tells operators to
-  read as "the bug is gone".
-- **failure capsules:** the capsule format version is now `2`. The new
-  `db_roles` field changes what a capsule *means* — a reader that skips it
-  rebuilds no database topology and replays a shape the recording never had —
-  and `serde` would otherwise let an older reader ignore it silently, which is
-  exactly what the version gate exists to prevent. Version 1 never appeared in
-  a release, so no capsule anyone holds is affected; a capsule written by an
-  unreleased build off `trunk-dev` is refused with the usual
-  re-record-the-capsule message.
-- **failure capsules:** six fidelity and redaction gaps found in review of
-  #1598 (#2202). A capsule whose request body the handler read only *partly* —
-  or never got to at all — is now marked incomplete and **refused** by replay
-  rather than replayed with a shorter body: the handler would otherwise be
-  judged on input the failing request never carried, and the resulting
-  `mismatch` is exactly what the guide tells operators means "the bug is gone".
-  The client identity is recorded again for capsules written by the real
-  server: `App::run` wraps the finished router in an *outer*
-  `TrustedProxiesLayer` that resolves before the capture scope exists, so the
-  inner instance found the extension already present and skipped recording,
-  leaving `client_addr`/`client_host`/`client_scheme` empty on every
-  production capsule while the test harness (which has no outer layer) recorded
-  them. A second cause sat behind the first: the capture layer passed
-  `inner.call(req)` to `CAPSULE_SCOPE.scope` as an *argument*, which Rust
-  evaluates before the call, so every inner layer's synchronous `call` — where
-  a hand-written Tower middleware does its work — ran before the task-local
-  existed and saw no scope. The inner call is now made from inside the scoped
-  future, which fixes the class rather than the one layer.
-  Replay now rebuilds the database *shape* the recording had even when
-  the request issued no wire traffic at all — "this request ran no queries" and
-  "this application has no database" were the same `None`, so a handler or
-  state initializer that checks `state.pool()` or replica availability before
-  querying took a branch production never took. Redaction reaches two things it
-  used to miss: the credential *inside* a masked header (the token after
-  `Bearer`, what a `Basic` credential decodes to, each value of an auth-param
-  list such as SigV4's `Signature=`, each cookie value — the form
-  a handler actually extracts and may echo into an error message or a SQL bind,
-  where the whole header value never
-  matched), and values shorter than four characters, which are now masked where
-  they stand as a whole token, so a three-digit CVV quoted back by a failure no
-  longer reaches disk while timestamps and identifiers stay readable. Finally,
-  `SET LOCAL ...` is no longer treated as framework housekeeping: `Db::checkout`
-  issues a plain session-level `SET statement_timeout`, so a transaction-scoped
-  setting is application code and belongs on the ordered tape, where changing or
-  removing it shows up as a divergence instead of being synthesized away.
-- **duplicate Markdown heading anchors:** `markdown::render` now hands out
-  document-unique heading `id`s. A page that repeated a heading — and real docs
-  repeat "Example", "Usage", and "Notes" constantly — emitted the same `id`
-  twice, which is invalid HTML and made every table-of-contents entry for the
-  repeated heading jump to the first occurrence. Every heading still keeps the
-  slug its own text produces, so anchors already published in URLs keep
-  resolving; only *repeats* of an already-claimed slug get a `-1`, `-2`, …
-  suffix, the convention GitHub, mdBook, and Hugo share. Because the renderer
-  reserves every heading's natural slug before handing out any suffix, a repeat
-  can never steal a slug another heading owns by name regardless of the order
-  the two appear in: `## Example` / `## Example` / `## Example 1` renders
-  `example`, `example-2`, `example-1`, leaving `#example-1` pointing at
-  "Example 1". Headings with no alphanumeric characters still emit no `id` at
-  all and stay out of the anchor namespace.
-
-### Added
-
 - **`autumn generate scaffold --i18n` emits translatable views** (issue #1349).
   Autumn already shipped the whole Fluent stack — the `t!(locale, "key")` macro
   with compile-time key validation, the `i18n/<tag>.ftl` convention, fallback
@@ -785,171 +627,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `static_params_for("page")`, because a `StaticParams` entry keyed `"slug"`
   leaves `{page}` unsubstituted. `static_params()` is unchanged and now
   delegates to it with `"slug"`.
-
-### Performance
-
-- **ingress middleware no longer boxes a future per layer per request:** every
-  `axum::middleware::from_fn` on the framework's always-on request path is now a
-  hand-rolled `tower::Service` with a **named** future. `from_fn` cannot avoid
-  the cost it was paying: the async block it generates has no nameable type, so
-  `FromFn::call` returns it as `Box::pin(..)` — one heap allocation per call
-  site per request, sized by everything that block captures across its single
-  `.await`, which for an outer layer is the whole downstream continuation. DHAT
-  measured those boxes at **19.57% of every byte** the `request_pipeline`
-  benchmark allocated (5,267,600 of 26,918,238 bytes over 650 requests) while
-  being only 2.14% of the blocks — the largest single allocation cost in the
-  profile (issue #2214).
-
-  Converted: the asset cache-control layer, the event-bus app context, the
-  webhook replay-key cleanup, the method-override rejection filter, the
-  trusted-host gate, the startup barrier, the per-request timeout, the
-  read-your-own-writes pin, and (under `oauth2`) the HTTP-interceptor scope.
-  Each keeps its behaviour and its position in the stack exactly; what goes away
-  is the box and, with it, the `self.inner.clone()` `from_fn` needed to move the
-  inner service into that box — which for an erased `BoxCloneSyncService` was a
-  recursive `clone_box` down the rest of the stack, so each conversion took a
-  whole deep-clone cascade with it too.
-
-  Re-run of the issue's own DHAT recipe on `benches/request_pipeline.rs`
-  (release, 200 iterations = 650 requests), before and after on the same
-  machine — filtering allocation sites whose second stack frame is
-  `FromFn<..>::call` exactly, as the issue specifies:
-
-  | | `FromFn::call` `Box::pin` | share of run bytes | marginal blocks/req | marginal bytes/req |
-  | --- | ---: | ---: | ---: | ---: |
-  | before | 3,250 blocks / 5,215,600 bytes | 19.80% | 168.8 | 36,826 |
-  | after | **0 / 0** (0 sites) | **0%** | 139.2 | 25,943 |
-
-  The before column reproduces the issue's measurement exactly on block count
-  (3,250) and to within 1% on bytes. Overall: **−17.5% allocations** and
-  **−29.6% bytes** per request.
-
-  The same movement is pinned as a regression gate in the debug profile, where
-  it is deterministic run to run: **172 → 140 allocation blocks** and
-  **37,819 → 26,030 bytes** per request under the default feature set. The ingress clone-on-call traversal count drops from 13 to 9 in
-  the same move, on the default set and on a 13-feature build alike. One layer
-  also sheds an allocation of its own: the asset cache-control layer no longer
-  clones the request path into a `String` on every request in the app.
-
-  Two middlewares are deliberately **not** converted, because they `.await`
-  before calling the inner service and their futures therefore cannot be named
-  without `type_alias_impl_trait`: the tenancy middleware (async tenant
-  extraction) and the rate-limit principal shim (async session read). Both are
-  off by default. `webhook_replay_cleanup` keeps one box, taken only on a `5xx`
-  that actually registered replay keys; on every other request its future is
-  unboxed (it still mints the per-request replay cell it always did).
-
-  One public behaviour change: `read_your_writes::middleware` used to
-  `unreachable!()` when handed `ReadYourWrites::Off`. It now debug-asserts and
-  falls back to an inert `Off` pin instead of panicking on the request path.
-  Both call sites gate on `mode != Off`, so the arm stays unreachable in
-  practice. Otherwise nothing public moved: `asset_cache_control`,
-  `method_override_rejection_filter` and `webhook_replay_cleanup_middleware`
-  remain exported `async fn`s with identical behaviour, now sharing their
-  decision logic with the layers so the two forms cannot drift.
-
-  Four gates keep the win from eroding: a per-request allocation **blocks**
-  ceiling tight enough that restoring a single `from_fn` fails it, a companion
-  **bytes** ceiling derived under the wider feature set CI actually gates with,
-  the ingress traversal count pinned to its exact measurement, and a
-  `type_name`-based assertion that none of the converted services ever returns a
-  `Pin<Box<dyn Future>>` again.
-
-- **config reads on the request path:** generated auth handlers, the admin
-  plugin, the `saas` starter, and the `blog`/`saas`/`teams` examples now read
-  configuration through `AppState::config_arc()` instead of
-  `AppState::config()`. `config()` returns an owned `AutumnConfig`, so every
-  call deep-clones **every** config section — 64 allocations and 1,384 bytes
-  against a default config, and more as an app's config grows — even to read a
-  single `bool` or `usize`. On a handler that cost is paid per request, and a
-  handler reading two or three sections paid it two or three times over: a
-  downstream app profiling its request path measured whole-config clones at
-  ~30% of its per-request allocations and ~42% of its per-request bytes.
-  `config_arc()` hands back the shared `Arc<AutumnConfig>` the state already
-  holds, so the same read is a refcount bump and handlers borrow the section
-  they need off the handle (`&config.auth.password`).
-
-  Nothing about the framework's own ingress path changed — that was already
-  allocation-free as of #2199 — and no public signature moved: `config()`
-  remains the per-boot owned-snapshot accessor, and the one generated call site
-  that still uses it is the boot-time `remember_me_startup` hook, which needs an
-  owned `RememberConfig`. Apps calling `state.config()` in their own handlers
-  keep compiling; switching them to `state.config_arc()` is the fix, and
-  `docs/guide/authentication.md` now teaches that as the default. A new
-  generator test pins the emitted handlers to `config_arc()` so the deep clone
-  cannot reappear in scaffolded apps.
-
-- **jobs:** the Postgres job worker's claim query (`SELECT … FOR UPDATE SKIP
-  LOCKED`) no longer scans and sorts the entire ready backlog for a queue
-  before picking one row, for apps that don't configure `[jobs] queues`
-  priority (the common case: a single `"default"` queue). The claim query's
-  `ORDER BY array_position($2::text[], candidate.queue), candidate.run_at`
-  was opaque to the planner — `array_position` depends on the bound queue-
-  order array, so even though it's constant across every candidate row when
-  only one queue is in play, Postgres couldn't prove that and fell back to a
-  `Bitmap Heap Scan` of the whole ready-in-queue backlog followed by a
-  `Sort` and `LockRows` over every one of those rows, before `LIMIT 1`
-  picked the winner. Single-queue workers now send a query that drops
-  `array_position` from `ORDER BY` and uses `queue = $2` (scalar), which
-  lets the planner recognize the existing `idx_autumn_jobs_queue_ready
-  (queue, run_at)` index order and do a plain `Index Scan` + `Limit 1`
-  instead. Measured (`EXPLAIN (ANALYZE, BUFFERS)`, production-shaped
-  fixture): 703→21 buffers at 4.4k ready rows, 3,342→22 at 44.6k, and
-  57,093→22 (eliminating an external-merge sort spill to disk) at 444k;
-  workload-level (`pg_stat_statements`, 50 claims) 166,437→1,410 total
-  buffers, a 99.15% reduction. No index or migration changes — see
-  `docs/reports/2026-08-14-ledger-job-claim-single-queue/`.
-
-- **state:** `AppState::profile` and `AppState::auth_session_key` no longer
-  deep-clone a `String` on every `AppState::clone()`. `AppState` is cloned
-  once per hop of the ingress tower stack (`Route::call` deep-clones the
-  boxed service beneath it, per #2193/#2198), so the two fields still held
-  as an owned `Option<String>`/`String` — rather than shared behind an
-  `Arc` like the rest of the struct — paid a fresh heap allocation on every
-  one of those clones instead of once per request. Both now live behind an
-  `Arc<str>`; `profile()` and `auth_session_key()` are unchanged (`&str`
-  via `Deref`), and `with_profile`/`with_auth_session_key` still take
-  `impl Into<String>`. Measured with the debug-profile allocation-counter
-  gate already used for #2198's `config_arc` work (`autumn/tests/config_alloc_gate.rs`):
-  a `TestClient` request drops from 220 to 172 allocation blocks (-22%),
-  identical across repeated runs.
-- **mail:** list-mail sends (`Mailer::send` with `list_unsubscribe` set) now
-  resolve suppression for the whole recipient batch in one query instead of
-  one `SELECT` per recipient. The `SuppressionStore` trait gained a batched
-  `is_suppressed_many` method (default implementation loops over
-  `is_suppressed`, so existing custom stores keep working unchanged);
-  `DbSuppressionStore` overrides it with a single `WHERE list_id = $1 AND
-  subscriber = ANY($2)` query, chunked at 50,000 recipients on Postgres (a
-  backstop against an unbounded single-statement bind, not a tuning knob for
-  ordinary sends: a tighter chunk size can land statements past a planner
-  cost crossover where `= ANY(...)` stops using the index and falls back to
-  a table scan, then re-pay that scan's fixed cost once per chunk) and at
-  `repository::MAX_BIND_PARAMS - 1` on SQLite, which binds `eq_any` as one
-  parameter per element instead of Postgres's single array parameter.
-  Measured
-  (`pg_stat_statements`, production-shaped `mail_unsubscribes` fixture):
-  statement count per send drops from N to 1 at every batch size tested
-  (200/2,000/20,000 recipients); total buffers 660→604 (200), 6,600→6,004
-  (2,000), and 66,000→8,070 (20,000, −87.8%). No index or migration changes
-  — see `docs/reports/2026-08-15-ledger-mail-suppression-batch/`.
-- **scaffold:** the generated `index` page for a `belongs_to`/`references`
-  field with a resolved display column (#1146) no longer scans the *entire*
-  referenced table to label the ~20 rows on one page. `autumn-cli`'s
-  `render_index_reference_label_loads` reused the create/edit form's
-  `{name}_select_options` loader — a full, unfiltered `SELECT id, col FROM
-  table ORDER BY id` that genuinely needs every row for a `<select>` — to
-  build the index's parent-label map too, so every index page view re-read
-  the whole referenced table regardless of page size. It now scopes the
-  query to `WHERE id = ANY(...)` the page's own FK values
-  (`page_data.content`, already fetched), and the identical fix applies to
-  the `--belongs-to` nested list (`children_section_with`). Measured
-  (`EXPLAIN (ANALYZE, BUFFERS)` + `pg_stat_statements`, production-shaped
-  fixture): rows read at the scan node drop from 500,000→20 (-99.996%) at
-  500k parent rows, with total buffers 7,051→83 (-98.8%); 707→61 (-91.4%)
-  at 50k rows and 72→54 (-25.0%) at 5k rows. No index or migration changes
-  — see `docs/reports/2026-08-16-ledger-scaffold-index-label-scope/`.
-
-### Added
 
 - **cluster:** an embedded, zero-dependency self-clustering substrate (#1762).
   Two instances of the same binary, started with a shared secret and no
@@ -2277,7 +1954,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn_web::Route { .. }` or `autumn_web::static_gen::StaticRouteMeta { .. }`
   literally (plugins building a `Vec<Route>` by hand rather than through
   `routes![]`) must add `seo: autumn_web::seo::SeoRouteDefaults::EMPTY`. See the
-  [migration guide](docs/migrations/next.md).
+  [migration guide](docs/migrations/0.7.0.md).
   `SeoRouteDefaults` is itself `#[non_exhaustive]` and built by chaining its
   `const fn with_*` setters from `EMPTY`, so future SEO keys stay additive.
 - **cli:** `autumn console` (alias `autumn c`) — a one-command, pre-wired data
@@ -2694,7 +2371,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The plugin's `api-reference.md` (*Config layering and env keys*) documents
   when to reach for which accessor.
 
+- **router:** new `health.enabled` config knob (default `true`,
+  `AUTUMN_HEALTH__ENABLED`) — an opt-out that suppresses all built-in probe
+  endpoints (`/health`, `/live`, `/ready`, `/startup`) so an app can own those
+  paths entirely (or expose none). Enabled by default, so behavior is
+  byte-identical to before when unset. Completes the probe-conflict work begun
+  in #1977 (which already lets a hand-written user route at a probe path win),
+  with explicit regression tests for both the user-route-wins and
+  probes-disabled cases (#1971).
+
+- **sim-testing:** `#[sim_test]` macro and public `Sim` skeleton for
+  deterministic simulation tests (seed-driven, replay-on-panic) (#1797). [no-plugin]
+
+- **security:** `autumn routes audit` (#1604) is now wired into every
+  scaffolded app's CI by default — `autumn new` adds a "Route auth coverage
+  (security manifest)" step to `.github/workflows/ci.yml`, right after the
+  a11y-verify step whose prebuilt CLI it reuses, so a route someone forgot to
+  classify fails CI on day one instead of waiting for an app to opt in.
+  Unclassified-route diagnostics now also name the offending handler's
+  `file:line` (from `file!()`/`line!()`, captured by the `#[get]`/`#[post]`/…,
+  `#[ws]`, and static-route macros alongside the existing module path), so a
+  failing gate points straight at the line to fix. A new [Route Auth
+  Coverage](docs/guide/route-auth-coverage.md) guide documents the
+  default-deny posture model and how to classify the three route kinds
+  (`gated`, `public`, `framework`), completing the deferred items from #1604's
+  first slice (#1850).
+
 ### Changed
+
+- **deps:** refreshed the whole dependency floor for the release rather than
+  tagging on a month-old lockfile — `diesel` `2.3.10` -> `2.3.12` (upstream's
+  Postgres (de)serialization panic fixes and the SQLite batch-insert `.load()`
+  fix), `libsqlite3-sys` `0.37` -> `0.38` (bundled SQLite 3.51.x), `redis`
+  `1.4` -> `1.6`, plus every semver-compatible update `cargo update` resolves.
+  The `time` upper bound widens to `<0.3.56` in the three manifests that carry
+  it for the testcontainers/bollard and aws-smithy graphs. This is **not** a
+  breaking change for application code: `libsqlite3-sys` is a build-time
+  transitive of the optional `sqlite` feature and is not re-exported, so it is
+  visible only to an app that already depends on it directly — see the
+  [migration guide](docs/migrations/0.7.0.md#upstream-dependency-updates).
+  Dependency majors that need API work (`rand` 0.10, `sha1` 0.11, `aes-gcm`
+  0.11, `matchit` 0.9, `x509-parser` 0.18, `tokio-tungstenite` 0.30,
+  `tokio-postgres-rustls` 0.14) are deliberately not carried here; each is its
+  own change.
+
+- **`Query<T>` treats `[` and `]` in a query key as structure (#1972).** A
+  target that types a parameter as a plain value — `Query<HashMap<String,
+  String>>` is the common one — used to receive `?filter[a]=1` as the literal
+  key `"filter[a]"`; it now sees a nested object and reports a decode error
+  naming the fix. Give such a field a nested type, or accept it as
+  `serde_json::Value`. A key the grammar cannot resolve (one name used as both a
+  scalar and a container, or nesting past the cap) fails only if the target
+  actually claims it, so an unrecognised parameter stays ignorable exactly as
+  before.
+- **`Query<T>` rejects a duplicated key in a single-valued position (#1972).**
+  `?q=a&q=b` against a `String` field is a 400, as it was under
+  `serde_urlencoded` + serde's derive (`duplicate field`). A **map**-typed
+  target previously resolved this silently to the last value; resolving
+  parameter pollution quietly is how the resulting bugs are built, so it is now
+  loud. A sequence field still takes every occurrence.
+- **Query decode errors no longer echo the submitted value (#1972).** A
+  coercion failure names the field path and the expected type
+  (`page: invalid u32 value`) but never the text — the message is returned in
+  the 400 Problem Details body and recorded by every error reporter, and a query
+  parameter can hold a secret. Key text embedded in an error is bounded and
+  stripped of control characters.
+- **`Query<Vec<(String, String)>>` yields key-sorted pairs (#1972)** rather than
+  submission order; occurrences of one key keep their relative order. The
+  `#[edge]` extractor is unaffected — `autumn_edge`'s prelude re-exports axum's
+  `Query`.
 
 - **docs:** rewrote the getting-started guide (`docs/guide/getting-started.md`)
   against the current scaffold and CLI. The guide had drifted: it announced the
@@ -2785,7 +2530,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both bounds, so the move is invisible in practice; only a layer written
   against `axum::routing::Route` specifically stops compiling, and its fix is
   one line (see
-  [the migration guide](docs/migrations/next.md#app-wide-layers-are-now-erased)).
+  [the migration guide](docs/migrations/0.7.0.md#app-wide-layers-are-now-erased)).
   `docs/guide/middleware.md` describes the new shape.
 
   [no-plugin] — internal router assembly: the registration API, its ordering
@@ -2846,7 +2591,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PUT`/`PATCH` clients must now send the version they read. That is what gives
   the JSON path conflict-checking, but existing clients that omit the field will
   fail deserialization. See the
-  [migration guide](docs/migrations/next.md).
+  [migration guide](docs/migrations/0.7.0.md).
 
 - **generate:** finished the zero-JS file-upload slice (#1236) on the read-back
   side. A scaffold with an `Attachment` column now *shows* what it stored: the
@@ -3002,7 +2747,198 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `db_transient_errors`; an explicit schedule entry always wins. An empty
   schedule / zero rate installs nothing, so a default `Chaos` is unchanged. This
   is W5.a; it stacks on W5.0 and is a sibling of W5.b (item 6). [no-plugin]
+
+- **cli:** the accessibility (a11y) verify step in the generated-app CI template
+  (`autumn new`) is now an **enforcing gate** — its `continue-on-error: true`
+  escape hatch has been removed, so an a11y violation now fails the job. The step
+  was shipped non-blocking in #2018 only until a pinned autumn release published
+  prebuilt CLI binaries; with v0.6.0 now published with prebuilt binaries, the
+  step runs against the release binary and blocks. Checklist item #7 of #2040.
+
+- **panic gate:** the request-path panic gate (#1611) now also denies
+  `clippy::string_slice` and `clippy::arithmetic_side_effects` in every gated
+  module, and the manifest grows to 30 modules (adds `inbound_mail.rs`,
+  `nested_form.rs` — which carried the header but had drifted out of the
+  manifest — and the new crate-private `time_math` saturating-arithmetic
+  helpers). `scripts/check-panic-gate.sh` gains header anchoring, anti-spoof
+  checks for module-wide `allow`s, `reason =` hygiene on per-site allows,
+  reverse-manifest drift detection, a module-count floor, a CI
+  feature-reachability check (with a validated, self-expiring exemption list —
+  `middleware/trace_context.rs` is behind `telemetry-otlp`, which the lint runner
+  cannot enable without `protoc`, and the gate now says so on every run instead
+  of leaving it silently unenforced), and a `--self-test` mode that runs by
+  default;
+  `scripts/pre-push-check.sh` now runs the gate and the gated-features clippy
+  lane. CI lints the `inbound-mail`/`inbound-mailgun`/`inbound-ses`/`storage`
+  features and runs the inbound-mail test suites. [no-plugin]
+- **panic gate:** hardened `scripts/check-panic-gate.sh` against a set of
+  reviewer-confirmed bypasses that had passed both the script and `cargo clippy
+  -- -D warnings` while shipping a production panic (#1611). Header validation is
+  now structural (the block must open *exactly* `#![cfg_attr(not(test), deny(`
+  after comment/whitespace stripping), so a widened `all(not(test), any())`
+  predicate or a `not(test)` living only in a comment no longer passes. A new
+  tree-wide inner-suppression scan rejects any `#![allow(…)]`/`#![expect(…)]`
+  (including the `cfg_attr(…, allow(…))` form) that re-permits a gated lint or a
+  blanket group (`restriction`/`all`/`pedantic`/`nursery`) across **every** `*.rs`
+  under the scan roots — closing the unmarked-submodule hole — while exempting
+  `#[cfg(test)]` scopes; the scan roots now include the sibling framework crates
+  (`autumn-admin-plugin`, `autumn-media-plugin`, `autumn-storage-s3`,
+  `autumn-cache-redis`). Per-site allows must now carry a **non-empty** reason,
+  and the feature-reachability check only counts an *enforcing* CI clippy lane
+  (`-p autumn-web` + `-D warnings`, not commented out), so a stubbed lane can no
+  longer fake coverage. The `--self-test` suite grows to 34 cases, one per bypass.
+  CONTRIBUTING.md documents the enforced-subset scoping (the manifest is an
+  incremental subset of the request path, not the whole of it) and the
+  `macro_rules!` expansion blind spot the gate cannot see. [no-plugin]
+- **inbound_mail:** `compute_mailgun_signature` delegates to
+  `security::config::hmac_sha256_hex` (output byte-identical); removed a dead
+  re-parse in the SNS certificate DER reader (#1611). [no-plugin]
+
+### Deprecated
+
+- **scheduler:** `scheduler::now_unix_secs` and `scheduler::now_unix_duration`
+  read real wall time off the injected-clock seam, so a tick key derived from
+  them is not reproducible under a `#[sim_test]`. Use
+  `time::clock_unix_secs(state.clock())` / `time::clock_unix_duration(state.clock())`
+  instead — which is what the framework's own scheduler already does. Neither
+  function has a remaining production caller inside autumn (#1797). See
+  [the migration guide](docs/migrations/0.7.0.md).
+
 ### Fixed
+
+- **deploy:** a cutover no longer orphans an active maintenance flag. The
+  maintenance flag path is now resolved through the new
+  `AUTUMN_MAINTENANCE_FLAG_FILE` environment variable (falling back to the
+  historical cwd-relative `tmp/autumn-maintenance.json` when unset, so a
+  non-deploy-managed app is unaffected), and `autumn deploy` stamps it into every
+  slot unit it writes, pointing at the per-app `shared/` directory. A slot unit's
+  `WorkingDirectory` is the *release* directory — new on every deploy — so on the
+  cwd-relative path a cutover silently un-maintained the host, and the blue and
+  green slots could not see each other's flag at all. Both read sites (the boot
+  load and the 500 ms poller) go through the same resolver. See
+  `docs/guide/maintenance-mode.md` (#1621).
+
+- **security:** `#[secured]`'s roles and scopes are no longer lost when another
+  guard wraps the handler body. With `#[secured("admin")]` written above
+  `#[authorize]`, `#[secured]` expands first and `#[authorize]` then buries its
+  role/scope marker consts one level deeper, inside the generated
+  `let __autumn_inner: T = (async move { … }).await;` wrapper — a shape the
+  marker walks did not descend. Extraction fell through
+  to the policy-check fallback, and the route reported `secured: true` with
+  empty `roles`/`scopes`: a *provable* manifest dimension silently understating
+  the posture it exists to prove. Both walks now descend the generated wrapper
+  through the same helper the `#[authorize]` binding walk uses, so the sibling
+  extractors can no longer disagree about depth (#1627).
+
+- **security:** two sibling route-metadata losses found by review of the same
+  extraction ladder: (1) `#[secured]` above the route macro with `#[authorize]`
+  below it dropped the roles/scopes to `&[]` — the live `#[authorize]`
+  attribute short-circuited the marker read, so deleting the `#[secured(...)]`
+  line produced zero manifest diff; the marker read now runs first. (2) The
+  `#[public]` marker walk could not descend a wrapping guard's generated body,
+  so `#[public]` above `#[throttle]` lost `public: true` and false-failed the
+  coverage gate as `unclassified`; the walk now uses the same shared
+  wrapper-descent helper as the other marker extractors (#1627).
+
+- **`generate admin` over an `#[encrypted]` model:** the generated admin adapter
+  did not compile — it bound `&new_row` to `.values(…)` and `&diesel_changeset`
+  to `.set(…)`, and diesel implements `Insertable`/`AsChangeset` only for the
+  owned value once a column uses `#[diesel(serialize_as = …)]`, as every
+  encrypted field does. Both now pass owned records when the model has an
+  encrypted column; plaintext models keep the borrowed form byte-for-byte.
+  Separately, **every admin edit of such a model failed**: the plugin renders an
+  encrypted column's edit control disabled and with no `name` (it is managed
+  outside the admin), so the form submits no key for it, while the handler
+  deserialized the submitted map into `New{Model}`, where the encrypted `String`
+  is required — so `serde_json::from_value` returned a "missing field" error even
+  when only a plaintext column was edited. Encrypted columns are now excluded
+  from the update entirely (matching what the form can actually submit), and the
+  handler back-fills a placeholder purely to satisfy that deserialization. That
+  exclusion also closes a plaintext write: the `lock_version` update path emits a
+  raw `col.eq(value)` tuple that never builds an `Update{Model}` changeset, so it
+  would have bypassed the encrypting wrapper and stored **plaintext** in the
+  encrypted column.
+
+- **`#[repository]` with hooks over an `#[encrypted]` model:** a repository
+  declared `broadcasts = true` (or with an explicit `hooks = …` type) over a
+  model carrying any `#[encrypted]` column failed to compile —
+  `the trait bound `&Model: AsChangeset` is not satisfied`. The hooks-aware
+  bulk-update path bound a *borrowed* proposed row to `.set(…)`, and diesel
+  implements `AsChangeset` only for the owned model once a field uses
+  `#[diesel(serialize_as = …)]`, as every encrypted field does. It now passes
+  the owned record, matching the single-record hooks paths. Reachable from
+  `autumn generate scaffold --live` with an encrypted column.
+
+- **failure capsules:** the resolved client identity now obeys
+  `[log] filter_parameters`. `client_addr`/`client_host`/`client_scheme` are
+  derived from `Forwarded`, `X-Forwarded-*` and `Host`, and were copied into
+  the capsule *after* header redaction ran — so an operator who filtered
+  `x-forwarded-host` saw it masked under `headers` and sitting in cleartext one
+  key away under `client_host`. Each field is now dropped when any header it
+  could have been resolved from is filtered — including `X-Real-IP`, a
+  fallback source for the address. Where a filtered source actually supplied a
+  value the capsule is additionally **refused** by replay: replay pre-inserts
+  the recorded identity whole whenever any field survives, so a suppressed
+  host would reach the handler as `None` rather than not at all, and a handler
+  that branches on it would report a `mismatch` the guide tells operators to
+  read as "the bug is gone".
+- **failure capsules:** the capsule format version is now `2`. The new
+  `db_roles` field changes what a capsule *means* — a reader that skips it
+  rebuilds no database topology and replays a shape the recording never had —
+  and `serde` would otherwise let an older reader ignore it silently, which is
+  exactly what the version gate exists to prevent. Version 1 never appeared in
+  a release, so no capsule anyone holds is affected; a capsule written by an
+  unreleased build off `trunk-dev` is refused with the usual
+  re-record-the-capsule message.
+- **failure capsules:** six fidelity and redaction gaps found in review of
+  #1598 (#2202). A capsule whose request body the handler read only *partly* —
+  or never got to at all — is now marked incomplete and **refused** by replay
+  rather than replayed with a shorter body: the handler would otherwise be
+  judged on input the failing request never carried, and the resulting
+  `mismatch` is exactly what the guide tells operators means "the bug is gone".
+  The client identity is recorded again for capsules written by the real
+  server: `App::run` wraps the finished router in an *outer*
+  `TrustedProxiesLayer` that resolves before the capture scope exists, so the
+  inner instance found the extension already present and skipped recording,
+  leaving `client_addr`/`client_host`/`client_scheme` empty on every
+  production capsule while the test harness (which has no outer layer) recorded
+  them. A second cause sat behind the first: the capture layer passed
+  `inner.call(req)` to `CAPSULE_SCOPE.scope` as an *argument*, which Rust
+  evaluates before the call, so every inner layer's synchronous `call` — where
+  a hand-written Tower middleware does its work — ran before the task-local
+  existed and saw no scope. The inner call is now made from inside the scoped
+  future, which fixes the class rather than the one layer.
+  Replay now rebuilds the database *shape* the recording had even when
+  the request issued no wire traffic at all — "this request ran no queries" and
+  "this application has no database" were the same `None`, so a handler or
+  state initializer that checks `state.pool()` or replica availability before
+  querying took a branch production never took. Redaction reaches two things it
+  used to miss: the credential *inside* a masked header (the token after
+  `Bearer`, what a `Basic` credential decodes to, each value of an auth-param
+  list such as SigV4's `Signature=`, each cookie value — the form
+  a handler actually extracts and may echo into an error message or a SQL bind,
+  where the whole header value never
+  matched), and values shorter than four characters, which are now masked where
+  they stand as a whole token, so a three-digit CVV quoted back by a failure no
+  longer reaches disk while timestamps and identifiers stay readable. Finally,
+  `SET LOCAL ...` is no longer treated as framework housekeeping: `Db::checkout`
+  issues a plain session-level `SET statement_timeout`, so a transaction-scoped
+  setting is application code and belongs on the ordered tape, where changing or
+  removing it shows up as a divergence instead of being synthesized away.
+- **duplicate Markdown heading anchors:** `markdown::render` now hands out
+  document-unique heading `id`s. A page that repeated a heading — and real docs
+  repeat "Example", "Usage", and "Notes" constantly — emitted the same `id`
+  twice, which is invalid HTML and made every table-of-contents entry for the
+  repeated heading jump to the first occurrence. Every heading still keeps the
+  slug its own text produces, so anchors already published in URLs keep
+  resolving; only *repeats* of an already-claimed slug get a `-1`, `-2`, …
+  suffix, the convention GitHub, mdBook, and Hugo share. Because the renderer
+  reserves every heading's natural slug before handing out any suffix, a repeat
+  can never steal a slug another heading owns by name regardless of the order
+  the two appear in: `## Example` / `## Example` / `## Example 1` renders
+  `example`, `example-2`, `example-1`, leaving `#example-1` pointing at
+  "Example 1". Headings with no alphanumeric characters still emit no `id` at
+  all and stay out of the anchor namespace.
 
 - **system-tests:** `SystemTest` and `autumn doctor` no longer report
   "no browser" on a Windows host that has Chrome installed (#1456), for three
@@ -3150,17 +3086,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it can never be `--all-features`'d anyway (it keeps its dedicated `-p` test
   lanes). A dedicated `-p autumn-web --features "sqlite,mail"` lane preserves the
   `sqlite` + `mail` union compile in the coverage job. [no-plugin]
-### Added
-
-- **router:** new `health.enabled` config knob (default `true`,
-  `AUTUMN_HEALTH__ENABLED`) — an opt-out that suppresses all built-in probe
-  endpoints (`/health`, `/live`, `/ready`, `/startup`) so an app can own those
-  paths entirely (or expose none). Enabled by default, so behavior is
-  byte-identical to before when unset. Completes the probe-conflict work begun
-  in #1977 (which already lets a hand-written user route at a probe path win),
-  with explicit regression tests for both the user-route-wins and
-  probes-disabled cases (#1971).
-### Fixed
 
 - **deploy:** the one-time kamal-proxy reboot-durability upgrade (#2070/#2071) no
   longer stamps a new/removed `deploy.tls.host` onto the still-live OLD release
@@ -3176,46 +3101,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   self-heals by writing the marker; an unreadable marker fails closed at
   pre-flight (mirroring the #2073 port-change refuse) with two-deploy repair
   guidance. Part of #1607.
-### Added
-
-- **sim-testing:** `#[sim_test]` macro and public `Sim` skeleton for
-  deterministic simulation tests (seed-driven, replay-on-panic) (#1797). [no-plugin]
-### Changed
-
-- **cli:** the accessibility (a11y) verify step in the generated-app CI template
-  (`autumn new`) is now an **enforcing gate** — its `continue-on-error: true`
-  escape hatch has been removed, so an a11y violation now fails the job. The step
-  was shipped non-blocking in #2018 only until a pinned autumn release published
-  prebuilt CLI binaries; with v0.6.0 now published with prebuilt binaries, the
-  step runs against the release binary and blocks. Checklist item #7 of #2040.
-### Added
-
-- **security:** `autumn routes audit` (#1604) is now wired into every
-  scaffolded app's CI by default — `autumn new` adds a "Route auth coverage
-  (security manifest)" step to `.github/workflows/ci.yml`, right after the
-  a11y-verify step whose prebuilt CLI it reuses, so a route someone forgot to
-  classify fails CI on day one instead of waiting for an app to opt in.
-  Unclassified-route diagnostics now also name the offending handler's
-  `file:line` (from `file!()`/`line!()`, captured by the `#[get]`/`#[post]`/…,
-  `#[ws]`, and static-route macros alongside the existing module path), so a
-  failing gate points straight at the line to fix. A new [Route Auth
-  Coverage](docs/guide/route-auth-coverage.md) guide documents the
-  default-deny posture model and how to classify the three route kinds
-  (`gated`, `public`, `framework`), completing the deferred items from #1604's
-  first slice (#1850).
-
-### Security
-
-- **inbound_mail:** cap `multipart/*` nesting at 16 levels (`MAX_MIME_DEPTH`). A
-  deeply nested MIME body on an unauthenticated inbound-mail webhook could
-  previously recurse until the stack overflowed, aborting the process. Past the
-  cap the remaining subtree is kept verbatim as an opaque attachment — never
-  dropped (#1611).
-- **inbound_mail:** reject MIME boundaries RFC 2046 §5.1.1 does not permit —
-  empty, or longer than 70 characters. Such a `Content-Type` now takes the
-  existing single-part fallback instead of driving a boundary scan (#1611).
-
-### Fixed
 
 - **inbound_mail:** quoted MIME parameter values are no longer Latin-1 mangled
   (`filename="café.pdf"` came back as `cafÃ©.pdf`); the parser scans `char`s
@@ -3230,49 +3115,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **jobs:** pathological `#[job(unique_for = ...)]` windows and Redis maintenance
   intervals clamp their deadlines instead of overflowing `Instant + Duration`
   (#1611).
-
-### Changed
-
-- **panic gate:** the request-path panic gate (#1611) now also denies
-  `clippy::string_slice` and `clippy::arithmetic_side_effects` in every gated
-  module, and the manifest grows to 30 modules (adds `inbound_mail.rs`,
-  `nested_form.rs` — which carried the header but had drifted out of the
-  manifest — and the new crate-private `time_math` saturating-arithmetic
-  helpers). `scripts/check-panic-gate.sh` gains header anchoring, anti-spoof
-  checks for module-wide `allow`s, `reason =` hygiene on per-site allows,
-  reverse-manifest drift detection, a module-count floor, a CI
-  feature-reachability check (with a validated, self-expiring exemption list —
-  `middleware/trace_context.rs` is behind `telemetry-otlp`, which the lint runner
-  cannot enable without `protoc`, and the gate now says so on every run instead
-  of leaving it silently unenforced), and a `--self-test` mode that runs by
-  default;
-  `scripts/pre-push-check.sh` now runs the gate and the gated-features clippy
-  lane. CI lints the `inbound-mail`/`inbound-mailgun`/`inbound-ses`/`storage`
-  features and runs the inbound-mail test suites. [no-plugin]
-- **panic gate:** hardened `scripts/check-panic-gate.sh` against a set of
-  reviewer-confirmed bypasses that had passed both the script and `cargo clippy
-  -- -D warnings` while shipping a production panic (#1611). Header validation is
-  now structural (the block must open *exactly* `#![cfg_attr(not(test), deny(`
-  after comment/whitespace stripping), so a widened `all(not(test), any())`
-  predicate or a `not(test)` living only in a comment no longer passes. A new
-  tree-wide inner-suppression scan rejects any `#![allow(…)]`/`#![expect(…)]`
-  (including the `cfg_attr(…, allow(…))` form) that re-permits a gated lint or a
-  blanket group (`restriction`/`all`/`pedantic`/`nursery`) across **every** `*.rs`
-  under the scan roots — closing the unmarked-submodule hole — while exempting
-  `#[cfg(test)]` scopes; the scan roots now include the sibling framework crates
-  (`autumn-admin-plugin`, `autumn-media-plugin`, `autumn-storage-s3`,
-  `autumn-cache-redis`). Per-site allows must now carry a **non-empty** reason,
-  and the feature-reachability check only counts an *enforcing* CI clippy lane
-  (`-p autumn-web` + `-D warnings`, not commented out), so a stubbed lane can no
-  longer fake coverage. The `--self-test` suite grows to 34 cases, one per bypass.
-  CONTRIBUTING.md documents the enforced-subset scoping (the manifest is an
-  incremental subset of the request path, not the whole of it) and the
-  `macro_rules!` expansion blind spot the gate cannot see. [no-plugin]
-- **inbound_mail:** `compute_mailgun_signature` delegates to
-  `security::config::hmac_sha256_hex` (output byte-identical); removed a dead
-  re-parse in the SNS certificate DER reader (#1611). [no-plugin]
-
-### Fixed
 
 - **sim-testing:** `job::enqueue_in` / `enqueue_at`'s delayed enqueues now
   resolve their absolute due instant from the running job runtime's **injected**
@@ -3301,16 +3143,179 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on a fresh clone while passing locally. `scripts/`, `scripts/lib/`, and
   `scripts/self-hosted-runner/` are now negated back in.
 
-### Deprecated
+### Security
 
-- **scheduler:** `scheduler::now_unix_secs` and `scheduler::now_unix_duration`
-  read real wall time off the injected-clock seam, so a tick key derived from
-  them is not reproducible under a `#[sim_test]`. Use
-  `time::clock_unix_secs(state.clock())` / `time::clock_unix_duration(state.clock())`
-  instead — which is what the framework's own scheduler already does. Neither
-  function has a remaining production caller inside autumn (#1797). See
-  [the migration guide](docs/migrations/next.md).
+- **inbound_mail:** cap `multipart/*` nesting at 16 levels (`MAX_MIME_DEPTH`). A
+  deeply nested MIME body on an unauthenticated inbound-mail webhook could
+  previously recurse until the stack overflowed, aborting the process. Past the
+  cap the remaining subtree is kept verbatim as an opaque attachment — never
+  dropped (#1611).
+- **inbound_mail:** reject MIME boundaries RFC 2046 §5.1.1 does not permit —
+  empty, or longer than 70 characters. Such a `Content-Type` now takes the
+  existing single-part fallback instead of driving a boundary scan (#1611).
 
+### Performance
+
+- **ingress middleware no longer boxes a future per layer per request:** every
+  `axum::middleware::from_fn` on the framework's always-on request path is now a
+  hand-rolled `tower::Service` with a **named** future. `from_fn` cannot avoid
+  the cost it was paying: the async block it generates has no nameable type, so
+  `FromFn::call` returns it as `Box::pin(..)` — one heap allocation per call
+  site per request, sized by everything that block captures across its single
+  `.await`, which for an outer layer is the whole downstream continuation. DHAT
+  measured those boxes at **19.57% of every byte** the `request_pipeline`
+  benchmark allocated (5,267,600 of 26,918,238 bytes over 650 requests) while
+  being only 2.14% of the blocks — the largest single allocation cost in the
+  profile (issue #2214).
+
+  Converted: the asset cache-control layer, the event-bus app context, the
+  webhook replay-key cleanup, the method-override rejection filter, the
+  trusted-host gate, the startup barrier, the per-request timeout, the
+  read-your-own-writes pin, and (under `oauth2`) the HTTP-interceptor scope.
+  Each keeps its behaviour and its position in the stack exactly; what goes away
+  is the box and, with it, the `self.inner.clone()` `from_fn` needed to move the
+  inner service into that box — which for an erased `BoxCloneSyncService` was a
+  recursive `clone_box` down the rest of the stack, so each conversion took a
+  whole deep-clone cascade with it too.
+
+  Re-run of the issue's own DHAT recipe on `benches/request_pipeline.rs`
+  (release, 200 iterations = 650 requests), before and after on the same
+  machine — filtering allocation sites whose second stack frame is
+  `FromFn<..>::call` exactly, as the issue specifies:
+
+  | | `FromFn::call` `Box::pin` | share of run bytes | marginal blocks/req | marginal bytes/req |
+  | --- | ---: | ---: | ---: | ---: |
+  | before | 3,250 blocks / 5,215,600 bytes | 19.80% | 168.8 | 36,826 |
+  | after | **0 / 0** (0 sites) | **0%** | 139.2 | 25,943 |
+
+  The before column reproduces the issue's measurement exactly on block count
+  (3,250) and to within 1% on bytes. Overall: **−17.5% allocations** and
+  **−29.6% bytes** per request.
+
+  The same movement is pinned as a regression gate in the debug profile, where
+  it is deterministic run to run: **172 → 140 allocation blocks** and
+  **37,819 → 26,030 bytes** per request under the default feature set. The ingress clone-on-call traversal count drops from 13 to 9 in
+  the same move, on the default set and on a 13-feature build alike. One layer
+  also sheds an allocation of its own: the asset cache-control layer no longer
+  clones the request path into a `String` on every request in the app.
+
+  Two middlewares are deliberately **not** converted, because they `.await`
+  before calling the inner service and their futures therefore cannot be named
+  without `type_alias_impl_trait`: the tenancy middleware (async tenant
+  extraction) and the rate-limit principal shim (async session read). Both are
+  off by default. `webhook_replay_cleanup` keeps one box, taken only on a `5xx`
+  that actually registered replay keys; on every other request its future is
+  unboxed (it still mints the per-request replay cell it always did).
+
+  One public behaviour change: `read_your_writes::middleware` used to
+  `unreachable!()` when handed `ReadYourWrites::Off`. It now debug-asserts and
+  falls back to an inert `Off` pin instead of panicking on the request path.
+  Both call sites gate on `mode != Off`, so the arm stays unreachable in
+  practice. Otherwise nothing public moved: `asset_cache_control`,
+  `method_override_rejection_filter` and `webhook_replay_cleanup_middleware`
+  remain exported `async fn`s with identical behaviour, now sharing their
+  decision logic with the layers so the two forms cannot drift.
+
+  Four gates keep the win from eroding: a per-request allocation **blocks**
+  ceiling tight enough that restoring a single `from_fn` fails it, a companion
+  **bytes** ceiling derived under the wider feature set CI actually gates with,
+  the ingress traversal count pinned to its exact measurement, and a
+  `type_name`-based assertion that none of the converted services ever returns a
+  `Pin<Box<dyn Future>>` again.
+
+- **config reads on the request path:** generated auth handlers, the admin
+  plugin, the `saas` starter, and the `blog`/`saas`/`teams` examples now read
+  configuration through `AppState::config_arc()` instead of
+  `AppState::config()`. `config()` returns an owned `AutumnConfig`, so every
+  call deep-clones **every** config section — 64 allocations and 1,384 bytes
+  against a default config, and more as an app's config grows — even to read a
+  single `bool` or `usize`. On a handler that cost is paid per request, and a
+  handler reading two or three sections paid it two or three times over: a
+  downstream app profiling its request path measured whole-config clones at
+  ~30% of its per-request allocations and ~42% of its per-request bytes.
+  `config_arc()` hands back the shared `Arc<AutumnConfig>` the state already
+  holds, so the same read is a refcount bump and handlers borrow the section
+  they need off the handle (`&config.auth.password`).
+
+  Nothing about the framework's own ingress path changed — that was already
+  allocation-free as of #2199 — and no public signature moved: `config()`
+  remains the per-boot owned-snapshot accessor, and the one generated call site
+  that still uses it is the boot-time `remember_me_startup` hook, which needs an
+  owned `RememberConfig`. Apps calling `state.config()` in their own handlers
+  keep compiling; switching them to `state.config_arc()` is the fix, and
+  `docs/guide/authentication.md` now teaches that as the default. A new
+  generator test pins the emitted handlers to `config_arc()` so the deep clone
+  cannot reappear in scaffolded apps.
+
+- **jobs:** the Postgres job worker's claim query (`SELECT … FOR UPDATE SKIP
+  LOCKED`) no longer scans and sorts the entire ready backlog for a queue
+  before picking one row, for apps that don't configure `[jobs] queues`
+  priority (the common case: a single `"default"` queue). The claim query's
+  `ORDER BY array_position($2::text[], candidate.queue), candidate.run_at`
+  was opaque to the planner — `array_position` depends on the bound queue-
+  order array, so even though it's constant across every candidate row when
+  only one queue is in play, Postgres couldn't prove that and fell back to a
+  `Bitmap Heap Scan` of the whole ready-in-queue backlog followed by a
+  `Sort` and `LockRows` over every one of those rows, before `LIMIT 1`
+  picked the winner. Single-queue workers now send a query that drops
+  `array_position` from `ORDER BY` and uses `queue = $2` (scalar), which
+  lets the planner recognize the existing `idx_autumn_jobs_queue_ready
+  (queue, run_at)` index order and do a plain `Index Scan` + `Limit 1`
+  instead. Measured (`EXPLAIN (ANALYZE, BUFFERS)`, production-shaped
+  fixture): 703→21 buffers at 4.4k ready rows, 3,342→22 at 44.6k, and
+  57,093→22 (eliminating an external-merge sort spill to disk) at 444k;
+  workload-level (`pg_stat_statements`, 50 claims) 166,437→1,410 total
+  buffers, a 99.15% reduction. No index or migration changes — see
+  `docs/reports/2026-08-14-ledger-job-claim-single-queue/`.
+
+- **state:** `AppState::profile` and `AppState::auth_session_key` no longer
+  deep-clone a `String` on every `AppState::clone()`. `AppState` is cloned
+  once per hop of the ingress tower stack (`Route::call` deep-clones the
+  boxed service beneath it, per #2193/#2198), so the two fields still held
+  as an owned `Option<String>`/`String` — rather than shared behind an
+  `Arc` like the rest of the struct — paid a fresh heap allocation on every
+  one of those clones instead of once per request. Both now live behind an
+  `Arc<str>`; `profile()` and `auth_session_key()` are unchanged (`&str`
+  via `Deref`), and `with_profile`/`with_auth_session_key` still take
+  `impl Into<String>`. Measured with the debug-profile allocation-counter
+  gate already used for #2198's `config_arc` work (`autumn/tests/config_alloc_gate.rs`):
+  a `TestClient` request drops from 220 to 172 allocation blocks (-22%),
+  identical across repeated runs.
+- **mail:** list-mail sends (`Mailer::send` with `list_unsubscribe` set) now
+  resolve suppression for the whole recipient batch in one query instead of
+  one `SELECT` per recipient. The `SuppressionStore` trait gained a batched
+  `is_suppressed_many` method (default implementation loops over
+  `is_suppressed`, so existing custom stores keep working unchanged);
+  `DbSuppressionStore` overrides it with a single `WHERE list_id = $1 AND
+  subscriber = ANY($2)` query, chunked at 50,000 recipients on Postgres (a
+  backstop against an unbounded single-statement bind, not a tuning knob for
+  ordinary sends: a tighter chunk size can land statements past a planner
+  cost crossover where `= ANY(...)` stops using the index and falls back to
+  a table scan, then re-pay that scan's fixed cost once per chunk) and at
+  `repository::MAX_BIND_PARAMS - 1` on SQLite, which binds `eq_any` as one
+  parameter per element instead of Postgres's single array parameter.
+  Measured
+  (`pg_stat_statements`, production-shaped `mail_unsubscribes` fixture):
+  statement count per send drops from N to 1 at every batch size tested
+  (200/2,000/20,000 recipients); total buffers 660→604 (200), 6,600→6,004
+  (2,000), and 66,000→8,070 (20,000, −87.8%). No index or migration changes
+  — see `docs/reports/2026-08-15-ledger-mail-suppression-batch/`.
+- **scaffold:** the generated `index` page for a `belongs_to`/`references`
+  field with a resolved display column (#1146) no longer scans the *entire*
+  referenced table to label the ~20 rows on one page. `autumn-cli`'s
+  `render_index_reference_label_loads` reused the create/edit form's
+  `{name}_select_options` loader — a full, unfiltered `SELECT id, col FROM
+  table ORDER BY id` that genuinely needs every row for a `<select>` — to
+  build the index's parent-label map too, so every index page view re-read
+  the whole referenced table regardless of page size. It now scopes the
+  query to `WHERE id = ANY(...)` the page's own FK values
+  (`page_data.content`, already fetched), and the identical fix applies to
+  the `--belongs-to` nested list (`children_section_with`). Measured
+  (`EXPLAIN (ANALYZE, BUFFERS)` + `pg_stat_statements`, production-shaped
+  fixture): rows read at the scan node drop from 500,000→20 (-99.996%) at
+  500k parent rows, with total buffers 7,051→83 (-98.8%); 707→61 (-91.4%)
+  at 50k rows and 72→54 (-25.0%) at 5k rows. No index or migration changes
+  — see `docs/reports/2026-08-16-ledger-scaffold-index-label-scope/`.
 
 ## [0.6.0] - 2026-07-18
 

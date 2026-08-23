@@ -169,7 +169,7 @@ are actually there. It is therefore a **post-publish, pre-announce** gate:
 - [ ] After `cargo publish` completes for the release candidate, trigger the
   `Quickstart Gate` workflow manually (Actions → Quickstart Gate → *Run
   workflow*) with the `cli-version` input set to the candidate version
-  (e.g. `0.6.0`), or via the CLI:
+  (e.g. `0.7.0`), or via the CLI:
 
   ```bash
   gh workflow run quickstart-gate.yml -f cli-version=X.Y.Z
@@ -318,7 +318,17 @@ Before pushing the release tag:
 4. **Complete the [Migration Guide Gate](#migration-guide-gate)** — rename
    `docs/migrations/next.md`, repoint the changelog links, and perform and
    record the codemod-first upgrade walk-through.
-5. **Run all gate scripts locally** to catch problems before CI sees the tag:
+5. **Refresh the dependency floor.** Review the open Dependabot PRs and fold
+   the semver-compatible ones into the release rather than tagging on top of a
+   month-old lockfile: `cargo update`, plus any manifest bound a grouped PR
+   widens. Majors that need API work are a separate change — decide
+   deliberately whether each rides this release, and say so in the changelog.
+6. **Write the [release walkthrough](releases/README.md)** —
+   `docs/releases/X.Y.Z.md`, cut after the CHANGELOG section is final. It is
+   the narrative counterpart to the changelog: what shipped, why, and what it
+   looks like in an app. Link it from the CHANGELOG section header, from the
+   README's *Documentation* list, and from the migration guide's header.
+7. **Run all gate scripts locally** to catch problems before CI sees the tag:
    ```bash
    ./scripts/check-crate-metadata.sh
    ./scripts/check-release-notes.sh
@@ -326,14 +336,14 @@ Before pushing the release tag:
    ./scripts/check-docs.sh
    ./scripts/check-semver.sh   # requires network; skip offline
    ```
-6. **Tag and push:**
+8. **Tag and push:**
    ```bash
-   git tag v0.5.0
-   git push origin v0.5.0
+   git tag v0.7.0
+   git push origin v0.7.0
    ```
    The `publish-gate` workflow runs automatically. The `release` workflow runs
    only after `publish-gate` succeeds.
-7. **Publish to crates.io** (in dependency order, after the gate passes):
+9. **Publish to crates.io** (in dependency order, after the gate passes):
    ```bash
    cargo publish -p autumn-macros
    cargo publish -p autumn-web
@@ -343,7 +353,7 @@ Before pushing the release tag:
    cargo publish -p autumn-cache-redis
    cargo publish -p autumn-search
    ```
-8. **Gate the published quickstart** (see
+10. **Gate the published quickstart** (see
    [Published Quickstart Gate](#7--published-quickstart-gate-quickstart-gate-workflow-post-publish)):
    ```bash
    gh workflow run quickstart-gate.yml -f cli-version=X.Y.Z

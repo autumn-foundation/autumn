@@ -25,8 +25,8 @@ For a runnable end-to-end demo, see [`examples/media-room`](../../examples/media
 
 ```toml
 [dependencies]
-autumn-web = "0.6"
-autumn-media-plugin = "0.6"
+autumn-web = "0.7"
+autumn-media-plugin = "0.7"
 ```
 
 ## Mounting the plugin

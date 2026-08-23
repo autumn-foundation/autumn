@@ -33,7 +33,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 
 ```bash
 # Install the published CLI
-cargo install autumn-cli --version 0.6.0
+cargo install autumn-cli --version 0.7.0
 
 # Local development only, from an Autumn checkout:
 # cargo install --path autumn-cli
@@ -81,7 +81,7 @@ Prefer a manual download? Grab the tarball plus its `.sha256`:
 - Latest: `https://github.com/autumn-foundation/autumn/releases/latest/download/autumn-<target>.tar.gz`
 - Pinned: `https://github.com/autumn-foundation/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
 
-where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.6.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
+where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.7.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
 
 ### Install a prebuilt binary (Windows)
 
@@ -232,6 +232,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 
 ## Documentation
 
+- [**What's new in 0.7.0**](docs/releases/0.7.0.md) — a walkthrough of the release: host-preparing deploys and fleets, deterministic simulation testing, the new model attributes, failure-capsule replay, and a request path that allocates ~59% less
 - [Getting Started Guide](docs/guide/getting-started.md)
 - [Authentication](docs/guide/authentication.md) — sessions, password policy, login/logout, `#[secured]`, lockout, and remember-me; the hub that links OAuth, step-up, and MFA
 - [Dev-Loop Latency Budget](docs/guide/dev-loop-latency.md) — p50/p95/max budgets per change class, measurement methodology, and CI gates for `autumn dev`

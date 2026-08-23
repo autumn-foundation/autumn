@@ -11,7 +11,7 @@ endpoints, profile-aware configuration, and a project CLI behind a Spring
 Boot-style developer experience.
 
 > **Version note:** This guide tracks the published `autumn-web` and
-> `autumn-cli` **0.6.x** release line. If you are working from a source
+> `autumn-cli` **0.7.x** release line. If you are working from a source
 > checkout of the Autumn repository, the workspace may be ahead of the
 > published crates — see [local development](#local-development) below.
 
@@ -85,7 +85,7 @@ directory.
 To build it from crates.io instead:
 
 ```bash
-cargo install autumn-cli --version 0.6.0
+cargo install autumn-cli --version 0.7.0
 ```
 
 ### Local development
@@ -195,7 +195,7 @@ On a fresh project, before `autumn setup`, you will see something like:
 🍂 autumn doctor
 
 ✅ rust_toolchain — rustc 1.88.0 ≥ MSRV 1.88.0
-✅ version_compat — autumn-cli 0.6.0 matches autumn-web 0.6.0
+✅ version_compat — autumn-cli 0.7.0 matches autumn-web 0.7.0
 ✅ autumn_toml — autumn.toml and profile configurations are valid
 ✅ database_topology — database not configured
 ✅ port_bindable — port 3000 is available
@@ -277,7 +277,7 @@ routes are live immediately:
 `/health` responds with:
 
 ```json
-{ "status": "ok", "version": "0.6.0" }
+{ "status": "ok", "version": "0.7.0" }
 ```
 
 Press **Ctrl+C** to stop the server. Shutdown is graceful, draining in-flight
@@ -729,7 +729,7 @@ your code referred to Diesel's traits:
 
 ```toml
 [dependencies]
-autumn-web = "0.6"
+autumn-web = "0.7"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.9", features = ["postgres"] }
