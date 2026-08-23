@@ -118,13 +118,21 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(5_000);
 
-    let changeset = sample_changeset();
-
+    // A fresh Changeset per render, not one reused across the whole run: a
+    // real request builds a new Changeset (from a freshly-fetched or
+    // freshly-submitted record) and renders it once, so field_value's
+    // internal cache fills on the render's first field access and is reused
+    // only for the rest of *that* render — never across renders. Reusing one
+    // Changeset for every iteration would let the very first render fill the
+    // cache and every following iteration skip serialization entirely,
+    // overstating the win (issue caught in PR review).
     for _ in 0..50 {
+        let changeset = sample_changeset();
         black_box(render_form(&changeset).into_string());
     }
 
     for _ in 0..iterations {
+        let changeset = sample_changeset();
         black_box(render_form(&changeset).into_string());
     }
 

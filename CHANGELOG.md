@@ -699,21 +699,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the old early-return did).
 
   Measured with a new benchmark (`autumn/benches/form_render.rs`, a realistic
-  12-field scaffolded form with two fields carrying validation errors, 2,000
-  iterations = 2,050 renders), `valgrind --tool=callgrind` and `--tool=dhat`,
-  before and after on the same machine:
+  12-field scaffolded form with two fields carrying validation errors, a
+  fresh `Changeset` built per render so the cache is never pre-warmed across
+  iterations — a real request builds one `Changeset` and renders it once —
+  2,000 iterations = 2,050 renders), `valgrind --tool=callgrind` and
+  `--tool=dhat`, before and after on the same machine:
 
   | | before | after | delta |
   | --- | ---: | ---: | ---: |
-  | Instructions (5,000-iteration run) | 932,490,618 | 280,583,825 | **-69.9%** |
-  | Allocation bytes/render (marginal) | 45,003 | 18,460 | **-59.0%** |
-  | Allocation blocks/render (marginal) | 364 | 78 | **-78.6%** |
+  | Instructions (5,000-iteration run) | 932,490,618 | 364,082,814 | **-61.0%** |
+  | Allocation bytes/render (marginal) | 45,003 | 21,579 | **-52.0%** |
+  | Allocation blocks/render (marginal) | 364 | 124 | **-65.9%** |
 
-  `serde_json::SerializeMap::serialize_field` (13.18% of instructions) and the
-  `BTreeMap` machinery backing `serde_json::Map` (~12.7% combined) disappear
-  from the profile entirely; `maud::escape_to_string`'s absolute instruction
-  count is unchanged (109,276,950 both before and after), confirming the win
-  is isolated to the redundant serialization and doesn't touch the genuinely
+  `serde_json::SerializeMap::serialize_field` drops from 13.18% of
+  instructions to 3.07% — consistent with the 11 value-reading fields on the
+  benchmark's form collapsing to one real serialization per render instead of
+  11 — and the `BTreeMap` machinery backing `serde_json::Map` mostly drops out
+  of the top-90%-of-instructions list; `maud::escape_to_string`'s absolute
+  instruction count is unchanged (109,276,950 both before and after),
+  confirming the win is isolated to the redundant serialization and doesn't
+  touch the genuinely
   inherent HTML-escaping cost.
 
 - **ingress middleware no longer boxes a future per layer per request:** every
