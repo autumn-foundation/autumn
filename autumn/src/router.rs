@@ -2319,6 +2319,7 @@ fn apply_locale_prefix_routing(
             .layer(crate::i18n::LocalePrefixScopeLayer::new(
                 locale.clone(),
                 prefix_chain.clone(),
+                &i18n.default_locale,
             ))
             .layer(axum::Extension(crate::i18n::UriPrefixedLocale(
                 locale.clone(),

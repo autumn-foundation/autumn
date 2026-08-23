@@ -79,6 +79,17 @@ pub struct LocaleScope {
     /// disagreeing on those paths.
     tag: Arc<RwLock<String>>,
     chain: Arc<[String]>,
+    /// The locale a legacy plain-text column value is attributed to while this
+    /// scope is in effect.
+    ///
+    /// Carried on the scope rather than read from the process-wide defaults so
+    /// that column decoding is fully request-local: two apps in one process
+    /// (a consolidated test binary, an embedded second app) have different
+    /// default locales, and the last to boot wins the global. Without this a
+    /// legacy row loaded by the *other* app would be attributed to its
+    /// neighbour's default — rendering empty under its own chain, and
+    /// persisting under the wrong tag on the next save.
+    default_locale: Arc<str>,
 }
 
 impl LocaleScope {
@@ -95,6 +106,21 @@ impl LocaleScope {
             } else {
                 chain.into()
             },
+            default_locale: default_locale_snapshot(),
+        }
+    }
+
+    /// Build a scope for `tag` with an explicit default locale for column
+    /// decoding — the app-scoped equivalent of [`default_locale_snapshot`].
+    #[must_use]
+    pub fn with_default_locale(
+        tag: impl Into<String>,
+        chain: Vec<String>,
+        default_locale: &str,
+    ) -> Self {
+        Self {
+            default_locale: Arc::from(default_locale),
+            ..Self::new(tag, chain)
         }
     }
 
@@ -104,7 +130,14 @@ impl LocaleScope {
         Self {
             tag: Arc::new(RwLock::new(tag.into())),
             chain: effective_chain(),
+            default_locale: default_locale_snapshot(),
         }
+    }
+
+    /// The locale this scope attributes a legacy plain-text column value to.
+    #[must_use]
+    pub fn default_locale(&self) -> &str {
+        &self.default_locale
     }
 
     /// The active locale tag.
@@ -171,8 +204,9 @@ static DEFAULTS: RwLock<Option<LocaleDefaults>> = RwLock::new(None);
 /// Process-wide, like the attribute-encryption key ring and the default actor
 /// token: two apps built in one process (a consolidated test binary, an
 /// embedded second app) share these defaults, and the last one to boot wins.
-/// It is only consulted **outside** a request scope — inside one, the scope
-/// carries its own chain — so a served request is never affected.
+/// That is why a [`LocaleScope`] captures both the chain **and** the default
+/// locale at request time: everything a served request resolves or decodes
+/// comes from the scope, so the global is only consulted outside one.
 pub fn install_locale_defaults(default_locale: &str, chain: Vec<String>) {
     let mut guard = DEFAULTS
         .write()
@@ -199,8 +233,9 @@ pub fn fallback_chain_snapshot() -> Vec<String> {
 
 /// The process-wide default locale, or `"en"` when none was installed.
 ///
-/// The locale a write with no ambient scope lands in, and the one a legacy
-/// plain-text column is attributed to.
+/// The last-resort source for the locale a write lands in and the one a legacy
+/// plain-text column is attributed to. A request scope carries its own
+/// (see [`LocaleScope::default_locale`]) and is preferred while in effect.
 #[must_use]
 pub fn default_locale_snapshot() -> Arc<str> {
     DEFAULTS
@@ -307,7 +342,19 @@ pub fn write_locale() -> String {
     if let Some(tag) = ambient_locale() {
         return tag;
     }
-    default_locale_snapshot().to_string()
+    scoped_or_global_default_locale()
+}
+
+/// The default locale in effect: the request scope's when one is established,
+/// else the process-wide install.
+///
+/// The scope is preferred so a served request never depends on which app in the
+/// process booted last — the property [`install_locale_defaults`] documents.
+#[must_use]
+pub fn scoped_or_global_default_locale() -> String {
+    ACTIVE_LOCALE
+        .try_with(|scope| scope.default_locale.to_string())
+        .unwrap_or_else(|_| default_locale_snapshot().to_string())
 }
 
 // ── The translatable value ───────────────────────────────────────────────────
@@ -644,7 +691,7 @@ mod db {
     use diesel::serialize::{self, IsNull, Output, ToSql};
     use diesel::sql_types::Text;
 
-    use super::{Translated, default_locale_snapshot};
+    use super::{Translated, scoped_or_global_default_locale};
 
     impl ToSql<Text, diesel::sqlite::Sqlite> for Translated {
         fn to_sql<'b>(
@@ -671,9 +718,13 @@ mod db {
     {
         fn from_sql(bytes: DB::RawValue<'_>) -> deserialize::Result<Self> {
             let raw = String::from_sql(bytes)?;
-            // One `Arc` refcount bump per decoded value, not a chain clone:
-            // a list page decodes this once per translatable column per row.
-            Ok(Self::decode_column(&raw, &default_locale_snapshot()))
+            // Request-scoped when a scope is in effect, so a row decoded during
+            // a request never depends on which app in the process booted last;
+            // the process-wide install is the out-of-request fallback.
+            Ok(Self::decode_column(
+                &raw,
+                &scoped_or_global_default_locale(),
+            ))
         }
     }
 }
@@ -1047,6 +1098,42 @@ mod tests {
     }
 
     // ── Default chain plumbing ───────────────────────────────────────────────
+
+    /// #1384 (Codex round 4): column decoding must read the REQUEST scope's
+    /// default locale, not the process-wide global.
+    ///
+    /// Two apps in one process (a consolidated test binary, an embedded second
+    /// app) share the global and the last to boot wins it. A legacy plain-text
+    /// row loaded by the other app would otherwise be attributed to its
+    /// neighbour's default — rendering empty under its own chain, and
+    /// persisting under the wrong tag on the next save.
+    #[test]
+    fn column_decoding_prefers_the_scopes_default_locale_over_the_global() {
+        with_defaults_guard(|| {
+            // The "other app" booted last and owns the global.
+            install_locale_defaults("de", chain(&["de"]));
+
+            // This request belongs to an app whose default is `fr`.
+            let scope = super::LocaleScope::with_default_locale("fr", chain(&["fr"]), "fr");
+            let decoded = super::with_locale_scope_sync(scope, || {
+                let default = super::scoped_or_global_default_locale();
+                let t = Translated::decode_column("Bonjour le monde", &default);
+                (default, t.resolve().map(str::to_owned))
+            });
+
+            assert_eq!(decoded.0, "fr", "the scope's default wins inside a request");
+            assert_eq!(
+                decoded.1.as_deref(),
+                Some("Bonjour le monde"),
+                "so the legacy value resolves instead of rendering empty"
+            );
+
+            // Outside any scope the global is still the source.
+            assert_eq!(super::scoped_or_global_default_locale(), "de");
+
+            install_locale_defaults("en", chain(&["en"]));
+        });
+    }
 
     /// The default locale is stored EXPLICITLY, not inferred from the chain's
     /// tail: `resolved_fallback_chain` appends the default only when absent, so

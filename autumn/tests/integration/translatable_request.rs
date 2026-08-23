@@ -134,7 +134,7 @@ async fn locale_prefixed_urls_set_the_ambient_locale() {
     let inner = axum::Router::new()
         .route("/title", get(show_title))
         .route("/ambient", get(show_ambient))
-        .layer(LocalePrefixScopeLayer::new("es", chain(&["en"])))
+        .layer(LocalePrefixScopeLayer::new("es", chain(&["en"]), "en"))
         .layer(Extension(UriPrefixedLocale("es".to_owned())));
     let app = axum::Router::new()
         .nest("/es", inner)
@@ -305,7 +305,7 @@ async fn a_locale_prefixed_nest_inherits_the_bundles_fallback_chain() {
         .route("/title", get(show_fr_only))
         // The nest carries the ROUTER's chain (`en` only) as its no-outer-scope
         // fallback — which must not be what wins here.
-        .layer(LocalePrefixScopeLayer::new("es", chain(&["en"])))
+        .layer(LocalePrefixScopeLayer::new("es", chain(&["en"]), "en"))
         .layer(Extension(UriPrefixedLocale("es".to_owned())));
     let app = axum::Router::new()
         .nest("/es", inner)

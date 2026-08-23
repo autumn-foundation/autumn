@@ -227,6 +227,7 @@ pub fn plan_admin_with_options(
     options.encrypted_deterministic.extend(det_deterministic);
 
     let fields = parse_fields(field_tokens)?;
+    reject_translatable_fields(&fields)?;
     // Issue #1340: the MODEL is the only source of truth for whether a column is
     // encrypted at rest — `#[encrypted]` is what puts the `serialize_as` wrapper
     // on the insert/update path. A `{encrypted}` DSL token here declares the same
@@ -327,6 +328,31 @@ pub fn plan_admin_with_options(
 /// # Errors
 /// Returns [`GenerateError`] when `project_root` isn't a valid project, or
 /// `name` fails validation.
+/// Refuse a `{translatable}` column (issue #1384), for the same reason
+/// `generate scaffold` does.
+///
+/// The admin emits a plain text control bound to the whole column and hands its
+/// string straight to `serde_json::from_value::<New{Model}>`. `Translated`
+/// deliberately refuses a bare string — accepting one would let a single-locale
+/// value replace the whole container — so every generated create and update
+/// would fail validation on a required field, and a value that *did* decode
+/// would wipe every other language. Editing translated content needs a
+/// per-locale editor, which is translation-workflow UI and out of scope here.
+fn reject_translatable_fields(fields: &[Field]) -> Result<(), GenerateError> {
+    let Some(field) = fields.iter().find(|f| f.is_translatable()) else {
+        return Ok(());
+    };
+    Err(GenerateError::Config(format!(
+        "a `{{translatable}}` field (`{}`) is not supported by `generate admin`: the generated \
+         admin binds one plain text control to the whole per-locale container, and `Translated` \
+         refuses a bare string — so create and update would fail validation, and a value that \
+         did decode would replace every other locale. Leave the column out of the admin field \
+         list, or write a per-locale editor: `record.available_locales(\"{}\")` and \
+         `record.set_{}(locale, value)` are generated for you.",
+        field.name, field.name, field.name
+    )))
+}
+
 pub fn plan_admin_destroy_fallback(project_root: &Path, name: &str) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     // Unlike `plan_admin_with_options`, this path has no model-file-exists
@@ -1454,6 +1480,27 @@ mod tests {
     }
 
     // ── RED phase ──────────────────────────────────────────────────────────
+
+    /// #1384 (Codex round 4): the admin binds one plain text control to the
+    /// whole per-locale container and hands its string to
+    /// `serde_json::from_value::<New{Model}>`. `Translated` refuses a bare
+    /// string, so every generated create/update would fail validation — and a
+    /// value that did decode would replace every other locale.
+    #[test]
+    fn plan_admin_rejects_a_translatable_field() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   pub title: String,\n\
+            }\n";
+        let tmp = project_with_model_source("post", model_source);
+        let err = plan_admin(tmp.path(), "Post", &["title:String{translatable}".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+        assert!(err.contains("title"), "{err}");
+    }
 
     #[test]
     fn plan_admin_fails_when_not_in_project() {

@@ -54,9 +54,9 @@ mod translatable;
 pub use translatable::{
     LocaleScope, TranslatableColumnDescriptor, Translated, ambient_locale, ambient_locale_scope,
     default_locale_snapshot, fallback_chain_snapshot, install_locale_defaults,
-    publish_ambient_locale, registered_translatable_columns, translatable_columns_for_table,
-    with_locale, with_locale_chain, with_locale_chain_sync, with_locale_scope,
-    with_locale_scope_sync, with_locale_sync, write_locale,
+    publish_ambient_locale, registered_translatable_columns, scoped_or_global_default_locale,
+    translatable_columns_for_table, with_locale, with_locale_chain, with_locale_chain_sync,
+    with_locale_scope, with_locale_scope_sync, with_locale_sync, write_locale,
 };
 
 use std::collections::HashMap;
@@ -838,19 +838,15 @@ where
 /// one negotiation per request; the negotiation itself touches no I/O (the
 /// session read is an in-memory lock) and the fallback chain is snapshotted at
 /// construction, so nothing here takes a process-wide lock per request.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AmbientLocaleLayer {
     /// Fallback chain published into the scope. Snapshotted from the bundle at
     /// construction so per-request resolution touches no locks.
     chain: Arc<[String]>,
-}
-
-impl fmt::Debug for AmbientLocaleLayer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AmbientLocaleLayer")
-            .field("chain", &self.chain)
-            .finish()
-    }
+    /// The app's default locale, published into the scope so column decoding
+    /// of a legacy plain-text value is request-local rather than reading a
+    /// process-wide global two apps in one process would share.
+    default_locale: Arc<str>,
 }
 
 impl AmbientLocaleLayer {
@@ -861,14 +857,17 @@ impl AmbientLocaleLayer {
     pub fn new(bundle: &Arc<Bundle>) -> Self {
         Self {
             chain: bundle.fallback_chain().to_vec().into(),
+            default_locale: Arc::from(bundle.default_locale()),
         }
     }
 
-    /// Build the layer from an explicit chain (tests, embedded runtimes).
+    /// Build the layer from an explicit chain and default locale (tests,
+    /// embedded runtimes).
     #[must_use]
-    pub fn with_chain(chain: Vec<String>) -> Self {
+    pub fn with_chain(chain: Vec<String>, default_locale: &str) -> Self {
         Self {
             chain: chain.into(),
+            default_locale: Arc::from(default_locale),
         }
     }
 }
@@ -880,6 +879,7 @@ impl<S> tower::Layer<S> for AmbientLocaleLayer {
         AmbientLocaleService {
             inner,
             chain: Arc::clone(&self.chain),
+            default_locale: Arc::clone(&self.default_locale),
         }
     }
 }
@@ -889,6 +889,7 @@ impl<S> tower::Layer<S> for AmbientLocaleLayer {
 pub struct AmbientLocaleService<S> {
     inner: S,
     chain: Arc<[String]>,
+    default_locale: Arc<str>,
 }
 
 impl<S, B> tower::Service<axum::http::Request<B>> for AmbientLocaleService<S>
@@ -920,11 +921,13 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let chain = Arc::clone(&self.chain);
+        let default_locale = Arc::clone(&self.default_locale);
         Box::pin(async move {
             let (mut parts, body) = req.into_parts();
             // Infallible rejection: the extractor always yields a locale.
             let Ok(locale) = Locale::from_request_parts(&mut parts, &()).await;
-            let scope = LocaleScope::new(locale.tag(), chain.to_vec());
+            let scope =
+                LocaleScope::with_default_locale(locale.tag(), chain.to_vec(), &default_locale);
             let req = axum::http::Request::from_parts(parts, body);
             // Build the inner future INSIDE the scope as well as polling it
             // there (the `HttpInterceptorService` pattern), so a nested layer
@@ -1011,16 +1014,18 @@ where
 pub struct LocalePrefixScopeLayer {
     locale: Arc<str>,
     chain: Arc<[String]>,
+    default_locale: Arc<str>,
 }
 
 impl LocalePrefixScopeLayer {
     /// Build the layer for one nest's locale segment, with the chain to use
     /// only when no outer scope exists.
     #[must_use]
-    pub fn new(locale: impl AsRef<str>, chain: Vec<String>) -> Self {
+    pub fn new(locale: impl AsRef<str>, chain: Vec<String>, default_locale: &str) -> Self {
         Self {
             locale: Arc::from(locale.as_ref()),
             chain: chain.into(),
+            default_locale: Arc::from(default_locale),
         }
     }
 }
@@ -1033,6 +1038,7 @@ impl<S> tower::Layer<S> for LocalePrefixScopeLayer {
             inner,
             locale: Arc::clone(&self.locale),
             chain: Arc::clone(&self.chain),
+            default_locale: Arc::clone(&self.default_locale),
         }
     }
 }
@@ -1043,6 +1049,7 @@ pub struct LocalePrefixScopeService<S> {
     inner: S,
     locale: Arc<str>,
     chain: Arc<[String]>,
+    default_locale: Arc<str>,
 }
 
 impl<S, B> tower::Service<axum::http::Request<B>> for LocalePrefixScopeService<S>
@@ -1072,6 +1079,7 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let locale = Arc::clone(&self.locale);
         let chain = Arc::clone(&self.chain);
+        let default_locale = Arc::clone(&self.default_locale);
         Box::pin(async move {
             if let Some(scope) = ambient_locale_scope() {
                 // Refine in place: the app-wide layer's chain is authoritative,
@@ -1083,7 +1091,7 @@ where
                 );
             }
             // No app-wide layer: locale-prefix routing without a bundle.
-            let scope = LocaleScope::new(&*locale, chain.to_vec());
+            let scope = LocaleScope::with_default_locale(&*locale, chain.to_vec(), &default_locale);
             let inner_future = with_locale_scope_sync(scope.clone(), || inner.call(req));
             let response = with_locale_scope(scope.clone(), inner_future).await?;
             Ok(response.map(|body| axum::body::Body::new(AmbientLocaleBody::new(body, scope))))
