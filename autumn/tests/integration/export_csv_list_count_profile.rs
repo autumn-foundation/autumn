@@ -165,9 +165,16 @@ fn seed_fixture(conn: &mut PgConnection) {
     .expect("seed ledger_export_orders");
 
     // Real dead tuples: touch a slice of rows post-insert, same technique
-    // the offline-sync Ledger harnesses use.
-    conn.batch_execute("UPDATE ledger_export_orders SET notes = 'reconciled' WHERE id % 7 = 0")
-        .expect("create dead tuples");
+    // the offline-sync Ledger harnesses use. Restricted to already-non-NULL
+    // `notes` so this can't turn a NULL row non-NULL and quietly drift the
+    // fixture's advertised 70% NULL density (caught in review: an
+    // unrestricted `UPDATE` here overwrote ~1,050 NULL rows too, landing at
+    // 60% NULL instead of 70%).
+    conn.batch_execute(
+        "UPDATE ledger_export_orders SET notes = 'reconciled' \
+         WHERE id % 7 = 0 AND notes IS NOT NULL",
+    )
+    .expect("create dead tuples");
     conn.batch_execute("ANALYZE ledger_export_orders")
         .expect("analyze");
 }
