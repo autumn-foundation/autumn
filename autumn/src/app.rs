@@ -3515,7 +3515,8 @@ impl AppBuilder {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
         #[cfg(feature = "i18n")]
-        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+        let custom_layers =
+            install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
         // Install the preflighted blob store on the freshly-built
         // AppState, and remember the serving router so it gets merged
@@ -4939,7 +4940,8 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "i18n")]
-        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+        let custom_layers =
+            install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
         // Install the preflighted storage and remember the serving
         // router so static generation hits the same `/_blobs/...`
@@ -5842,7 +5844,8 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "i18n")]
-        let _custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+        let _custom_layers =
+            install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
         #[cfg(feature = "storage")]
         let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
@@ -6220,7 +6223,8 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "i18n")]
-        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+        let custom_layers =
+            install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
@@ -8289,7 +8293,21 @@ fn install_i18n_bundle_layer(
     mut custom_layers: Vec<CustomLayerRegistration>,
     state: &AppState,
     bundle: Option<Arc<crate::i18n::Bundle>>,
+    i18n: &crate::i18n::I18nConfig,
 ) -> Vec<CustomLayerRegistration> {
+    // #1384: install the resolution defaults from CONFIG first, before the
+    // no-bundle early return. `locale_prefix_enabled` is supported without
+    // `.i18n()`/`.i18n_auto()` (the router builds its nests straight from
+    // `I18nConfig`), and in that shape no `Bundle` exists — but column decoding
+    // still needs the app's default locale. Without this a `default_locale =
+    // "fr"` app attributed every legacy plain-text value to the last-resort
+    // "en", so a `/fr/...` request rendered upgraded content as empty and a
+    // later write could persist it under the wrong locale.
+    //
+    // A bundle, when present, re-installs the identical values below: a
+    // `Bundle` derives both from this same `I18nConfig`.
+    crate::i18n::install_locale_defaults(&i18n.default_locale, i18n.resolved_fallback_chain());
+
     let Some(bundle) = bundle else {
         return custom_layers;
     };
@@ -12659,6 +12677,44 @@ mod tests {
         assert_eq!(bundle.translate("en", "nav.home", &[]), "Loader Home");
     }
 
+    /// #1384: `locale_prefix_enabled` is supported WITHOUT `.i18n()` /
+    /// `.i18n_auto()` — the router builds its `/{locale}` nests straight from
+    /// `I18nConfig` — so no `Bundle` exists in that shape. Column decoding
+    /// still needs the app's default locale: without it a `default_locale =
+    /// "fr"` app attributes every legacy plain-text value to the last-resort
+    /// `"en"`, so a `/fr/...` request renders upgraded content as empty and a
+    /// later write can persist it under the wrong locale.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn locale_defaults_are_installed_even_with_no_bundle() {
+        let mut config = AutumnConfig::default();
+        config.i18n.default_locale = "fr".to_owned();
+        config.i18n.supported_locales = vec!["fr".to_owned(), "en".to_owned()];
+        let state = AppState::for_test();
+
+        let layers = install_i18n_bundle_layer(Vec::new(), &state, None, &config.i18n);
+
+        assert!(
+            layers.is_empty(),
+            "no bundle means no Extension and no ambient layer registration"
+        );
+        assert_eq!(
+            &*crate::i18n::default_locale_snapshot(),
+            "fr",
+            "the configured default must reach column decoding without a bundle"
+        );
+        // A legacy plain-text column is now attributed to `fr`, so a `/fr/...`
+        // request resolves it instead of rendering empty.
+        let legacy = crate::i18n::Translated::decode_column(
+            "Bonjour le monde",
+            &crate::i18n::default_locale_snapshot(),
+        );
+        assert_eq!(legacy.get("fr"), Some("Bonjour le monde"));
+
+        // Restore the framework default for the rest of this binary.
+        crate::i18n::install_locale_defaults("en", vec!["en".to_owned()]);
+    }
+
     /// #1384: drive the REAL wiring — `install_i18n_bundle_layer` +
     /// `try_build_router_inner` — and assert both the ambient locale and a
     /// `Translated` field resolve for a handler that takes NO locale argument.
@@ -12692,7 +12748,8 @@ mod tests {
             &config.i18n,
         ));
         let state = AppState::for_test();
-        let custom_layers = install_i18n_bundle_layer(Vec::new(), &state, Some(bundle));
+        let custom_layers =
+            install_i18n_bundle_layer(Vec::new(), &state, Some(bundle), &config.i18n);
 
         let router = crate::router::try_build_router_inner(
             vec![Route {
@@ -12769,6 +12826,7 @@ mod tests {
             Vec::new(),
             &state,
             Some(test_i18n_bundle("nav.home", "Home")),
+            &config.i18n,
         );
         let router = crate::router::try_build_router_inner(
             vec![Route {
