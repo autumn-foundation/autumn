@@ -315,12 +315,26 @@ for crate in "${CRATES[@]}"; do
     fi
 
     autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp,offline-sync,embed-assets,tls,acme"
-    # The SQLite backend surface. Deliberately MINIMAL: `sqlite` already pulls
-    # `db` transitively, and every feature added alongside it is one more
-    # chance to co-enable something type-incompatible with the SQLite
-    # `RuntimeConnection` — the exact class of rustdoc failure that hard-blocks
-    # a tag push. Widen it only against a demonstrated compile.
-    autumn_web_semver_sqlite_features="sqlite"
+    # The SQLite backend surface: the SAME list plus `sqlite`.
+    #
+    # It was `sqlite` alone at first, on the theory that a minimal set is the
+    # safe one. That left a hole: an item gated on `sqlite` AND another stable
+    # feature was compiled by NEITHER pass, so a break in it would sail through
+    # this gate. `repository_commit_hooks.rs` is the concrete case — four
+    # `start_repository_commit_hook_worker` variants across the ws x sqlite
+    # matrix, of which `cfg(all(feature = "ws", feature = "sqlite"))` was
+    # invisible: the Postgres pass has `ws` but no `sqlite`, the minimal SQLite
+    # pass had `sqlite` but no `ws`.
+    #
+    # Reusing the Postgres list is safe precisely because that list already
+    # excludes `managed-pg`/`managed-pg-bundled` — the features that hard-code
+    # `AsyncPgConnection` and are therefore the ones `sqlite` cannot co-exist
+    # with. Verified by compiling it before wiring it in:
+    #   cargo check -p autumn-web --no-default-features \
+    #     --features "<this list>,sqlite"      # Finished, exit 0
+    # Keep the two lists in step: a feature added to the Postgres list belongs
+    # here too, against the same demonstrated compile.
+    autumn_web_semver_sqlite_features="${autumn_web_semver_features},sqlite"
 
     echo "  pass 1/2: Postgres surface (--features $autumn_web_semver_features)"
     pg_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \

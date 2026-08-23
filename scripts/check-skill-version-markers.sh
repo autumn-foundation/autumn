@@ -25,6 +25,16 @@ SKILL_DIR="skills/autumn-web"
 # Lines whose issue reference is NOT the marked feature's own issue, verified by
 # hand. Keyed on line content, since line numbers move. Keep this list tiny and
 # justify every entry.
+# Issue references that legitimately do not appear in CHANGELOG.md. Each needs a
+# reason: the marker is still verified by hand, just not by this script.
+UNTRACEABLE_ISSUES=(
+  # `MarkdownRegistry::static_params_for` is recorded in the 0.7.0 section
+  # (CHANGELOG "**`MarkdownRegistry::static_params_for(param)`:**") but that
+  # entry cites no issue number, so #743 itself is unfindable. Marker verified
+  # against the API entry instead.
+  '#743'
+)
+
 ALLOW=(
   # Marks `from_shard`/`with_pool_untracked` (0.6.0); cites #1629 only for the
   # `autumn upgrade` tooling that applies its codemod, which is 0.7.0.
@@ -86,7 +96,22 @@ while IFS= read -r entry; do
   # introducing release appears nowhere on its line is drift.
   for issue in "${issues[@]}"; do
     oldest="$(grep -n -- "$issue" "$CHANGELOG" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
-    [[ -z "$oldest" ]] && continue
+    if [[ -z "$oldest" ]]; then
+      # An issue the CHANGELOG has never heard of. Skipping it silently is how
+      # a typo'd or untraceable reference slips past this gate entirely, so it
+      # is reported. Legitimate cases (an API recorded without its issue
+      # number) go in UNTRACEABLE_ISSUES with a justification.
+      known=0
+      for u in "${UNTRACEABLE_ISSUES[@]}"; do [[ "$issue" == "$u" ]] && known=1 && break; done
+      if [[ $known -eq 0 ]]; then
+        echo "UNTRACEABLE $file:$lineno" >&2
+        echo "            $issue appears nowhere in $CHANGELOG — typo, or an" >&2
+        echo "            issue that predates it. Fix the reference, or add it to" >&2
+        echo "            UNTRACEABLE_ISSUES with a reason." >&2
+        fail=$((fail + 1))
+      fi
+      continue
+    fi
     truth="$(section_for_line "$oldest" || true)"
     [[ -z "$truth" ]] && continue
 

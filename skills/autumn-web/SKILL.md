@@ -880,7 +880,7 @@ with `autumn token issue <principal> --name ... --scope ...` / `list` /
 `rotate` / `revoke` — all four ship in 0.7.0. `list` and `rotate` arrived in
 0.6.0; a 0.5.x CLI has only `issue` / `revoke`.
 
-Active session management ships with `autumn generate auth` (0.6.0):
+Active session management ships with `autumn generate auth` (0.5.0):
 a `{user}_sessions` row per login, generated `sessions()`,
 `revoke_session(id)`, `revoke_other_sessions(...)`, `revoke_all_sessions()`
 methods, an `/account/sessions` Maud + htmx page, and `[auth.sessions]`
@@ -1181,7 +1181,7 @@ Use built-in jobs and tasks before reaching for a workflow engine:
 discarding, and canceling framework jobs. `GET /actuator/jobs` exposes
 lower-level counters.
 
-Job attributes beyond `name`/`max_attempts`/`backoff_ms` (0.6.0):
+Job attributes beyond `name`/`max_attempts`/`backoff_ms` (0.5.0):
 `#[job(unique)]` dedupes on an args hash, `unique_by = "field"`,
 `unique_window = "running"|"pending"`, `unique_for_ms = N` (debounce),
 `concurrency = N` + `concurrency_key = "field"` caps simultaneous runs. A

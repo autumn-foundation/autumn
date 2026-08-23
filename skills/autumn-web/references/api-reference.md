@@ -480,7 +480,7 @@ delete actions remain last-write-wins.
 
 ## Db transactions
 
-- `Db::tx(f)` — READ COMMITTED, one attempt (0.6.0).
+- `Db::tx(f)` — READ COMMITTED, one attempt (0.5.0).
 - `Db::tx_with(opts: TxOptions, f) -> Result<T, AutumnError>`
   (**0.6.0**) — closure gets `&mut AsyncPgConnection`; auto-retries
   SQLSTATE 40001 with capped exponential backoff.
