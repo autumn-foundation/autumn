@@ -68,7 +68,7 @@ the framework almost certainly already generates or ships it:
 | Raw Diesel queries for CRUD, lookups, pagination, or bulk writes | `#[repository]`-generated methods: `find_by_id`, `find_all`, `save`, `update`, `delete_by_id`, derived `find_by_*`, `page(&PageRequest)`, `cursor_page(&CursorRequest)`, bulk `save_many`/`update_many`/`delete_many`/`upsert_many`. See `docs/guide/repositories.md`, `docs/guide/pagination.md` |
 | Manual per-item queries in a loop (N+1) or hand-written JOINs to fetch associations | `#[belongs_to]`/`#[has_many]`/`#[has_one]` + `repo.preload(records, Model::preload()...)` (0.6.0) |
 | Hand-rolled auth, session, or token checks in handler bodies | `#[secured]` / `#[secured("role")]`, `#[authorize]`, repository `policy =`/`scope =`; `#[secured(scopes = [...])]` for service tokens (0.6.0) |
-| A punishingly low global rate limit to protect one abuse-prone endpoint (login, search, export) | `#[throttle(limit = 5, per = "1m", key = "ip")]` sits alongside `#[get]`/`#[post]`; `#[throttle("login")]` reads `[security.rate_limit.named.login]` from config (0.7.0, issue #1350, see `docs/guide/rate-limiting.md`) |
+| A punishingly low global rate limit to protect one abuse-prone endpoint (login, search, export) | `#[throttle(limit = 5, per = "1m", key = "ip")]` sits alongside `#[get]`/`#[post]`; `#[throttle("login")]` reads `[security.rate_limit.named.login]` from config (0.6.0, issue #1350, see `docs/guide/rate-limiting.md`) |
 | Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form::form_for(&changeset, action, method)` + the `#[model]`-derived `FormModel` (0.6.0) renders the whole form — CSRF, `_method` override, one pre-filled control per column, inline errors, submit — in one call; see "Whole-form rendering" below. Compose the per-field helpers only when its escape hatches don't fit: `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (0.6.0) |
 | `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (0.6.0) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
@@ -85,7 +85,7 @@ the framework almost certainly already generates or ships it:
 | Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (0.6.0). See `docs/guide/conditional-get.md` |
 | A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument) instead of leaking series (0.7.0, issue #1378). `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
 | Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + PostgreSQL wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598) |
-| Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.7.0, issue #1344). See `docs/guide/conditional-get.md` |
+| Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.6.0, issue #1344). See `docs/guide/conditional-get.md` |
 
 When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
 or raw Diesel (`&mut *db` with `diesel_async`) is supported and fine — but only
@@ -243,10 +243,10 @@ Use `.one_off_tasks(one_off_tasks![...])` for `#[task]` handlers invoked by
 | `.with_blob_store(store)` | Install a file storage backend |
 | `.with_cache_backend(cache)` | Install a cache backend |
 | `.with_mail_delivery_queue(queue)` | Install durable deferred mail |
-| `.with_mail_suppression_store(store)` | Install a durable bounce/complaint suppression backend (0.7.0; in-memory default auto-wired otherwise) |
+| `.with_mail_suppression_store(store)` | Install a durable bounce/complaint suppression backend (0.6.0; in-memory default auto-wired otherwise) |
 | `.with_audit_sink(sink)` | Install structured audit sink |
 | `.listeners(listeners![...])` | Register `#[listener]` event listeners (0.6.0) |
-| `.static_gate(layer)` | Middleware that also guards `#[static_get]` pre-render (0.7.0; `has_static_gate::<L>()`, `get_static_gate_types()`, `TestApp::static_gate` mirror it) |
+| `.static_gate(layer)` | Middleware that also guards `#[static_get]` pre-render (0.6.0; `has_static_gate::<L>()`, `get_static_gate_types()`, `TestApp::static_gate` mirror it) |
 | `.with_shard_router(router)` | Install a shard router for `[[database.shards]]` (0.6.0) |
 | `.run()` | Launch the server |
 
@@ -654,7 +654,7 @@ locks the parent, applies every declared action, then deletes the parent — all
 a single transaction (Part of #1369). See `docs/guide/repositories.md`.
 
 On trunk-dev the cascade is recursive and bulk-aware, and can be declared on
-the model instead of the repository **(0.7.0, issues #1738,
+the model instead of the repository **(0.6.0, issues #1738,
 #1739, #1740)**:
 
 - **Grandchildren cascade.** `destroy` now recurses — each destroyed child runs
@@ -793,7 +793,7 @@ create/update handlers validate the decoded payload before touching the DB:
   specialization (no migration burden), and this applies to plain and
   policy-backed handlers (#1237, #1253). See `docs/guide/pagination.md`.
 
-### Partial-update validation — the effective merged model (0.7.0, issue #1778)
+### Partial-update validation — the effective merged model (0.6.0, issue #1778)
 
 On a repository with `hooks = ...`, a `PATCH`/`PUT` update now validates the
 **effective merged model** — the existing row ∪ the patch, after normalization —
@@ -1414,7 +1414,7 @@ RFC 3339 JSON bodies). Serde-renamed columns pre-fill correctly via
 keeps per-field htmx emission).
 
 For **master-detail** (has-many) forms saved atomically — an order plus its
-line items in one submit — use `autumn_web::nested_form` (0.7.0, #1915) instead of hand-wiring indexed field names: implement
+line items in one submit — use `autumn_web::nested_form` (0.6.0, #1915) instead of hand-wiring indexed field names: implement
 `NestedChild` on the child new-model, render the child rows with
 `inputs_for(&nested, &InputsForOptions, |row| …)` (add/remove rows + a
 `destroy_checkbox` for deletes) off a `NestedChangesetForm<Parent, Child>`, and
@@ -1422,7 +1422,7 @@ decode the flat submission back into parent + children with
 `decode_nested_urlencoded`, so the parent and its children validate and persist
 as one transaction.
 
-## Resumable SSE streams (0.7.0, issue #1356)
+## Resumable SSE streams (0.6.0, issue #1356)
 
 Don't hand-roll `Last-Event-ID` bookkeeping or a manual replay buffer for
 server-sent events. On trunk-dev the `ws`-gated channels backend keeps a
@@ -1564,7 +1564,7 @@ subset of queues — all config-only, no app-code change:
 - **Per-queue actuator gauges** — `<actuator-prefix>/jobs` adds a `queues` key
   with per-queue `depth` and `oldest_waiting_age_ms` alongside the existing
   per-job-type gauges (per-process approximations on multi-process backends).
-- **Backend-derived queue gauges (0.7.0, issue #1752)** — on
+- **Backend-derived queue gauges (0.6.0, issue #1752)** — on
   the durable backends (Postgres/Redis) those `queues` gauges and the
   per-job-type `queued` counter are no longer per-process approximations: a
   periodic survey of the durable store (Redis every 2s, the interval doubling as
@@ -1579,7 +1579,7 @@ subset of queues — all config-only, no app-code change:
   self-gate to the right tier instead of re-reading `AUTUMN_ROLE` (issue #1726).
   See `docs/guide/jobs.md`.
 
-## Operator alerts (0.7.0, issue #1610)
+## Operator alerts (0.6.0, issue #1610)
 
 Connect Autumn's built-in failure signals to email + a signed webhook with **no
 app code** — configure a destination under `[alerts]` and every built-in
@@ -1605,7 +1605,7 @@ to look" actuator pointer:
 - **Scheduled-task failure** — a `#[scheduled]`/framework task returns an error.
   A failed `autumn db backup` offsite upload also raises this condition,
   delivered via the outbound-HTTP alert channels only (not email)
-  **(0.7.0, issue #1743)**.
+  **(0.6.0, issue #1743)**.
 
 Delivery is best-effort and off the request path (background tick every
 `eval_interval_secs`, default 30), reuses your existing mailer + outbound-webhook
@@ -1617,7 +1617,7 @@ Slack, …) by implementing `AlertChannel` and registering it with
 missing or unusable destination — see the `doctor` skill. See
 `docs/guide/operator-alerts.md`.
 
-### Native transports (0.7.0, issue #1630)
+### Native transports (0.6.0, issue #1630)
 
 PagerDuty, Slack, and Discord now ship as built-in `AlertChannel`s — no code,
 just `[alerts]` keys (each with an `AUTUMN_ALERTS__*` env override):
@@ -1778,7 +1778,7 @@ bounded `each_shard` fan-out); install custom routing with
 There are no cross-shard queries or transactions by design. See
 `docs/guide/sharding.md` and `examples/bookmarks-sharded`.
 
-## Per-tenant memory cells (0.7.0, issue #1766)
+## Per-tenant memory cells (0.6.0, issue #1766)
 
 Row-level tenancy scopes a tenant's *rows*; per-tenant memory cells bound a
 tenant's *in-process memory*. Each resolved tenant gets a `TenantCell` — a
@@ -2073,7 +2073,7 @@ legacy migrations applied before the checksum feature existed; use
 `autumn migrate baseline --force <version>` only when a deliberate edit
 is intended and the fork risk is accepted.
 
-### `autumn test` — isolated test DB (0.7.0, issue #1056)
+### `autumn test` — isolated test DB (0.6.0, issue #1056)
 
 `autumn test` resolves the test DB URL with the same precedence as
 `autumn migrate` (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL` →
@@ -2084,7 +2084,7 @@ migrations, exports `AUTUMN_ENV=test` + the resolved `DATABASE_URL`, then runs
 first; trailing `-- <args>` forward to the harness. It refuses to run against a
 non-`_test` database.
 
-### `autumn db backup` / `db restore` (0.7.0, issue #1595)
+### `autumn db backup` / `db restore` (0.6.0, issue #1595)
 
 `autumn db backup [--dir DIR] [--format custom|plain] [--keep N] [--shard NAME]
 [--control-only]` dumps the control DB and every shard to
@@ -2096,7 +2096,7 @@ prunes to the newest N runs. `autumn db restore <ARTIFACT> [--shard NAME]
 same production guard as `db drop` (refuses non-dev/test without `--force`). See
 `docs/guide/deployment.md`.
 
-### Offsite S3 backups (0.7.0, issue #1619)
+### Offsite S3 backups (0.6.0, issue #1619)
 
 `autumn db backup --upload` (or `[backup.offsite] auto_upload = true`) uploads
 each completed local run to an S3-compatible offsite destination (AWS S3,
@@ -2148,7 +2148,7 @@ Pointing the offsite bucket at the app's
 own `[storage.s3]` bucket at the same endpoint needs `allow_shared_bucket = true`. See
 `docs/guide/daemon.md`.
 
-### VPS deploys and fleets — `autumn deploy` (0.7.0, issues #1607/#1621)
+### VPS deploys and fleets — `autumn deploy` (0.6.0; fleets 0.7.0, issues #1607/#1621)
 
 `autumn deploy {check | plan | up | rollback | status | maintenance on|off}`
 takes a project to a live, zero-downtime service on Linux servers the user owns

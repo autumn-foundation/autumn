@@ -13,15 +13,20 @@ arrived in: **(0.6.0)** is absent from 0.5.x, and **(0.7.0)** is absent from
 | Crate | Directory | Notes |
 |---|---|---|
 | `autumn-macros` | `autumn-macros/` | Proc macros; publish first |
+| `autumn-schema-core` | `autumn-schema-core/` | Schema primitives shared by the CLI; no Autumn runtime deps |
+| `autumn-edge` | `autumn-edge/` | Edge/WASM capsule runtime; `autumn-web` pins it (optionally) so it publishes before `autumn-web` |
 | `autumn-web` | `autumn/` | Main framework crate; import path `autumn_web` |
 | `autumn-cli` | `autumn-cli/` | Binary crate; binary name `autumn` |
 | `autumn-admin-plugin` | `autumn-admin-plugin/` | First-party admin UI plugin |
+| `autumn-media-plugin` | `autumn-media-plugin/` | Live-streaming media plugin (broadcast + rooms) |
 | `autumn-storage-s3` | `autumn-storage-s3/` | S3-compatible `BlobStore` plugin |
 | `autumn-cache-redis` | `autumn-cache-redis/` | Redis cache plugin |
 | `autumn-search` | `autumn-search/` | Keyword + vector search plugin |
 
 All publishable crates share the `[workspace.package]` version and release
-together at `0.7.0`.
+together at `0.7.0`. This table lists the same crates, in the same order, as
+`CRATES` in `scripts/check-publish-dry-run.sh` — that script is the executable
+copy of the publish order.
 
 ## Top-level exports
 
@@ -57,7 +62,7 @@ together at `0.7.0`.
   `broadcasts_on(topic)` / `assert_broadcast(topic, predicate)` /
   `assert_broadcast_count(topic, n)` / `assert_no_broadcasts(topic)`
   (`RecordedBroadcast` exposes `.topic()` / `.payload()`)
-- Resumable SSE **(0.7.0, issue #1356)**:
+- Resumable SSE **(0.6.0, issue #1356)**:
   `sse::stream_resumable(&state, topic, last_event_id: Option<u64>)` — automatic
   monotonic per-topic event ids + `Last-Event-ID` replay from a bounded
   per-topic ring buffer, with a `gap` sentinel (`event: gap`,
@@ -110,7 +115,7 @@ together at `0.7.0`.
 | `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools |
 | `#[service]` | Service implementation scaffolding (`db`) |
 | `#[secured]` | Session auth and role guard |
-| `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.7.0, #1604) |
+| `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.6.0, #1604) |
 | `#[authorize]` | Record-level policy guard |
 | `#[api_doc]` | Route OpenAPI metadata |
 | `#[oauth2_callback]` | OAuth2/OIDC callback route |
@@ -900,7 +905,7 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `PolicyContext::has_scope/has_any_scope/has_all_scopes`, `autumn token
   issue --name/--scope/--expires-at | list | rotate`, admin `TokenAdminModel`.
 
-## Submit tokens (0.7.0, #1360)
+## Submit tokens (0.6.0, #1360)
 
 One-time, at-most-once form submission with no JS — defends against
 double-submits and replays.
@@ -1197,7 +1202,7 @@ Endpoint builders:
 
 ## Cache-Control freshness (`etag::cache_for` / `CacheControl`)
 
-Declarative per-handler `Cache-Control` header (0.7.0, issue #1344).
+Declarative per-handler `Cache-Control` header (0.6.0, issue #1344).
 While `fresh_when` handles *revalidation* (is a cached copy still valid?),
 `cache_for` handles *freshness* (how long may a copy be reused before
 revalidating?). Both are re-exported from the prelude.
