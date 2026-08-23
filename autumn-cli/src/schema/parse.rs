@@ -753,7 +753,7 @@ mod tests {
     /// carry the column's empty-container default. Without the `#[translatable]`
     /// marker recorded here, a declarative `ADD COLUMN` would emit
     /// `TEXT NOT NULL` with no DEFAULT — potentially blocking on Postgres and
-    /// refused outright on SQLite.
+    /// refused outright on `SQLite`.
     #[test]
     fn translatable_column_carries_the_empty_container_default() {
         let src = r#"

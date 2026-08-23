@@ -10588,7 +10588,7 @@ mod tests {
     /// #1384 (Codex round 5): the locale-map schema is keyed on the
     /// `#[translatable]` MARKER, not on the type's leaf name. An application
     /// type that merely happens to be called `Translated` must keep its
-    /// ordinary `$ref`, or the advertised OpenAPI contract would silently
+    /// ordinary `$ref`, or the advertised `OpenAPI` contract would silently
     /// disagree with what that type actually serializes to.
     #[test]
     fn translatable_schema_is_keyed_on_the_attribute_not_the_type_name() {
