@@ -15,12 +15,25 @@ SemVer contract.
 | Crate | Directory | Publish Order | Notes |
 |---|---|---|---|
 | `autumn-macros` | `autumn-macros/` | 1 | No Autumn runtime deps; must publish first. |
-| `autumn-web` | `autumn/` | 2 | Depends on `autumn-macros`. |
-| `autumn-cli` | `autumn-cli/` | 3 | Independent of `autumn-web` at crate level. |
-| `autumn-admin-plugin` | `autumn-admin-plugin/` | 4 | Depends on `autumn-web`. |
-| `autumn-storage-s3` | `autumn-storage-s3/` | 4 | Depends on `autumn-web`. |
-| `autumn-cache-redis` | `autumn-cache-redis/` | 4 | Depends on `autumn-web`. |
-| `autumn-search` | `autumn-search/` | 4 | Depends on `autumn-web`. |
+| `autumn-schema-core` | `autumn-schema-core/` | 2 | No Autumn runtime deps. `autumn-cli` pins it. |
+| `autumn-edge` | `autumn-edge/` | 3 | Depends on `autumn-macros`. `autumn-web` pins it — **optionally**, but cargo still requires an optional dependency to resolve on crates.io, so it must precede `autumn-web`. |
+| `autumn-web` | `autumn/` | 4 | Depends on `autumn-macros` and `autumn-edge`. |
+| `autumn-cli` | `autumn-cli/` | 5 | Depends on `autumn-schema-core`. Independent of `autumn-web` at crate level. |
+| `autumn-admin-plugin` | `autumn-admin-plugin/` | 6 | Depends on `autumn-web`. |
+| `autumn-media-plugin` | `autumn-media-plugin/` | 6 | Depends on `autumn-web`. |
+| `autumn-storage-s3` | `autumn-storage-s3/` | 6 | Depends on `autumn-web`. |
+| `autumn-cache-redis` | `autumn-cache-redis/` | 6 | Depends on `autumn-web`. |
+| `autumn-search` | `autumn-search/` | 6 | Depends on `autumn-web`. |
+
+This table is the same set, in the same order, as `CRATES` in
+[`scripts/check-publish-dry-run.sh`](../scripts/check-publish-dry-run.sh) —
+that script is the executable copy, so keep the two in step. Note that two
+other gate scripts currently carry **narrower** lists —
+`scripts/check-crate-metadata.sh` omits `autumn-schema-core` and
+`autumn-media-plugin`, and `scripts/check-semver.sh` omits all three of
+`autumn-schema-core`, `autumn-edge` and `autumn-media-plugin`. Those crates are
+therefore published without a metadata or SemVer check today; widening both
+lists is worth doing, but it does not change the publish order above.
 
 All crates share a single workspace version (`[workspace.package].version` in
 `Cargo.toml`). They are always released together at the same version.
@@ -344,11 +357,18 @@ Before pushing the release tag:
    The `publish-gate` workflow runs automatically. The `release` workflow runs
    only after `publish-gate` succeeds.
 9. **Publish to crates.io** (in dependency order, after the gate passes):
+   Order matters: each crate's Autumn dependencies must already be on
+   crates.io, or `cargo publish` fails to resolve them. In particular
+   `autumn-web` pins `autumn-edge` and `autumn-cli` pins `autumn-schema-core`,
+   so both precede them here.
    ```bash
    cargo publish -p autumn-macros
+   cargo publish -p autumn-schema-core
+   cargo publish -p autumn-edge
    cargo publish -p autumn-web
    cargo publish -p autumn-cli
    cargo publish -p autumn-admin-plugin
+   cargo publish -p autumn-media-plugin
    cargo publish -p autumn-storage-s3
    cargo publish -p autumn-cache-redis
    cargo publish -p autumn-search
