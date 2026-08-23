@@ -1357,6 +1357,7 @@ pub struct DeployTlsConfig {
 /// readiness_timeout_secs = 60 # readiness window before rollback (default: 60)
 /// keep_releases = 3          # releases retained on the host (default: 3)
 /// profile = "prod"           # profile the deployed app runs under (default: "prod")
+/// install_proxy = true       # install the reverse proxy on a bare host (default: true)
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeployConfig {
@@ -1431,6 +1432,28 @@ pub struct DeployConfig {
     /// the historical HTTP-only behavior. See [`DeployTlsConfig`].
     #[serde(default)]
     pub tls: DeployTlsConfig,
+
+    /// Whether `autumn deploy` may PREPARE the target host by installing the
+    /// reverse-proxy binary when the host has none. Default: `true` (issue #1607,
+    /// AC-1 — the documented target-host precondition is at most a stock Ubuntu
+    /// LTS with SSH access, so the command performs the remaining host preparation
+    /// itself).
+    ///
+    /// Probe-gated and idempotent: a host that already has a working proxy binary
+    /// is never touched, and a binary that responds but whose CLI surface has
+    /// drifted is never replaced (that stays a hard, actionable refusal).
+    ///
+    /// Set to `false` when you provision the proxy yourself — a pinned internal
+    /// build, your own package, or a host you do not want a container runtime
+    /// installed on. A missing binary is then an actionable deploy failure instead
+    /// of something the deploy fixes.
+    #[serde(default = "default_deploy_install_proxy")]
+    pub install_proxy: bool,
+}
+
+/// Default for [`DeployConfig::install_proxy`]: prepare the host (issue #1607).
+const fn default_deploy_install_proxy() -> bool {
+    true
 }
 
 impl Default for DeployConfig {
@@ -1449,6 +1472,7 @@ impl Default for DeployConfig {
             keep_releases: default_deploy_keep_releases(),
             profile: default_deploy_profile(),
             tls: DeployTlsConfig::default(),
+            install_proxy: default_deploy_install_proxy(),
         }
     }
 }
@@ -7595,7 +7619,7 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     // only that key produces no deploy section at all — a silent skip, not an
     // error, in both `AutumnConfig::load` and `autumn doctor`. Every key parsed
     // below MUST appear here.
-    const KEYS: [&str; 12] = [
+    const KEYS: [&str; 13] = [
         "AUTUMN_DEPLOY__HOST",
         "AUTUMN_DEPLOY__HOSTS",
         "AUTUMN_DEPLOY__USER",
@@ -7608,6 +7632,7 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         "AUTUMN_DEPLOY__PROFILE",
         "AUTUMN_DEPLOY__TLS__ENABLED",
         "AUTUMN_DEPLOY__TLS__HOST",
+        "AUTUMN_DEPLOY__INSTALL_PROXY",
     ];
     if !KEYS.iter().any(|key| env.var(key).is_ok()) {
         return;
@@ -7678,6 +7703,14 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     // every other deploy override above.
     parse_env_bool(env, "AUTUMN_DEPLOY__TLS__ENABLED", &mut deploy.tls.enabled);
     parse_env_option_string(env, "AUTUMN_DEPLOY__TLS__HOST", &mut deploy.tls.host);
+    // Host preparation opt-out (#1607). Env wins over TOML, like every other deploy
+    // override above, so a CI pipeline deploying to pre-provisioned hosts can
+    // decline it without editing `autumn.toml`.
+    parse_env_bool(
+        env,
+        "AUTUMN_DEPLOY__INSTALL_PROXY",
+        &mut deploy.install_proxy,
+    );
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
@@ -12701,6 +12734,11 @@ path = "/healthz"
         assert_eq!(deploy.service_name, None);
         assert_eq!(deploy.readiness_timeout_secs, 60);
         assert_eq!(deploy.keep_releases, 3);
+        // #1607: host preparation is ON by default, so the documented "target host
+        // precondition is at most a stock Ubuntu LTS" holds for a bare table. A
+        // plain `#[serde(default)]` here would silently deserialize `false` for
+        // every real user while `DeployConfig::default()` stayed `true`.
+        assert!(deploy.install_proxy);
     }
 
     #[test]
@@ -12716,6 +12754,7 @@ path = "/healthz"
             service_name = "myapp-web"
             readiness_timeout_secs = 90
             keep_releases = 5
+            install_proxy = false
             "#,
         )
         .expect("full [deploy] table should parse");
@@ -12728,6 +12767,10 @@ path = "/healthz"
         assert_eq!(deploy.service_name.as_deref(), Some("myapp-web"));
         assert_eq!(deploy.readiness_timeout_secs, 90);
         assert_eq!(deploy.keep_releases, 5);
+        assert!(
+            !deploy.install_proxy,
+            "the host-prep opt-out parses (#1607)"
+        );
         assert!(deploy.validate().is_ok());
     }
 
@@ -12786,6 +12829,26 @@ path = "/healthz"
         assert_eq!(deploy.keep_releases, 5);
         assert_eq!(deploy.profile, "staging");
         assert!(deploy.validate().is_ok());
+    }
+
+    #[test]
+    fn env_override_declines_deploy_host_preparation() {
+        // #1607: a CI pipeline deploying to pre-provisioned hosts must be able to
+        // decline host preparation without editing `autumn.toml`. The key is also in
+        // the presence probe, so setting only it materializes `[deploy]` — otherwise
+        // the override would be silently skipped for an env-only config.
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__INSTALL_PROXY", "false");
+        let mut config = AutumnConfig::default();
+        assert!(config.deploy.is_none());
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("env should materialize deploy");
+        assert!(!deploy.install_proxy);
+
+        // …and it wins over TOML, like every other deploy override.
+        let mut from_toml: AutumnConfig =
+            toml::from_str("[deploy]\nhost = \"203.0.113.10\"\ninstall_proxy = true\n").unwrap();
+        from_toml.apply_env_overrides_with_env(&env);
+        assert!(!from_toml.deploy.expect("deploy configured").install_proxy);
     }
 
     #[test]

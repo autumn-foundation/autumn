@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`autumn deploy` prepares the host and migrates on the first deploy (#1607):**
+  the two remaining gaps between `autumn deploy` and its acceptance criteria are
+  closed, so the documented target-host precondition is now genuinely "a stock
+  Ubuntu LTS with SSH access" and the first deploy of a database-backed app needs
+  no out-of-band migrate step.
+  - **Host preparation.** `autumn deploy up` no longer requires you to install
+    `kamal-proxy` yourself. It probes the target read-only for a working proxy and,
+    on a host that has none, installs the pinned build at
+    `/usr/local/bin/kamal-proxy` (plus `curl`, which the readiness gate uses **on
+    the host**, and a container runtime — kamal-proxy publishes no release binaries,
+    so the pinned `basecamp/kamal-proxy` image is the source). Only genuinely
+    missing packages are installed, the image is pinned **by digest** (a Docker Hub
+    tag is mutable, and the binary is executed as root), the binary is staged and
+    moved into place so the supervised path is never half-written, the install
+    refuses outright if anything already exists at that path, and it verifies the
+    binary it landed before the deploy continues. Host preparation is
+    Debian/Ubuntu-only and needs outbound HTTPS; a failure names exactly that, plus
+    the opt-out. A host that already has a working proxy is **untouched**;
+    a proxy that responds but whose CLI surface has **drifted** is still never
+    replaced — that stays the actionable, fail-closed refusal it has been. In a
+    fleet the install is the first op of that host's own turn, not part of the
+    all-hosts probe phase, so "no host is touched until every host is graded" still
+    holds and a failed install halts and compensates like any other pre-cutover
+    failure. Decline it with `[deploy] install_proxy = false` (default `true`, env
+    override `AUTUMN_DEPLOY__INSTALL_PROXY`) if you provision the proxy yourself.
+  - **Migrations on the first deploy.** `first_deploy_ops` now runs the same
+    blocking `AUTUMN_MIGRATE=1` one-shot the redeploy path does — **before** the
+    initial release is started, so the app never boots against a schema that was
+    never applied, and a failed migration aborts the deploy with nothing started and
+    nothing routed. Consequently the fleet's single migration moves to the **first
+    host in rollout order** whatever its mode: an all-first-deploy fleet migrates on
+    host 1 instead of migrating nowhere, the schema always moves before any host cuts
+    over, and both of the migration-ordering hazard warnings a scale-up used to
+    print are gone because neither state is reachable any more. The one-shot now
+    also loads the release's own uploaded `autumn.toml` (`AUTUMN_MANIFEST_DIR`,
+    matching the slot unit) and runs in the release dir (`--working-directory`,
+    matching the unit's `WorkingDirectory`), so neither a config-only database
+    topology nor a relative database URL is resolved differently by the migration
+    than by the app it gates; and the fleet summary stops claiming "the migration that
+    already ran was NOT rolled back" for a rollout that failed *before* reaching its
+    migration.
+  - The container end-to-end test asserts the first deploy's migration over real
+    ssh (a marker written by the one-shot itself), and the nightly real-VPS
+    workflow now provisions a **stock** image, asserts it has no kamal-proxy, and
+    proves `autumn deploy up` installs a working one — its manual bootstrap step is
+    gone, which is what makes the "≤ 3 commands from `autumn new`" metric honest.
+
 - **Translatable model fields — `#[translatable]` (#1384):** declare a `#[model]`
   column translatable and it stores an **independent value per locale tag**,
   resolving on read against the request's active locale with **no locale
@@ -82,14 +129,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   running the unchanged per-host blue/green cutover against its own kamal-proxy
   and finishing before the next is started, so the rest of the fleet keeps
   serving throughout. One release id per run, and **migrations run exactly
-  once** — on the first host still on a previous release, before its cutover;
-  every other host skips them, and an all-first-deploy fleet migrates nowhere and
-  says so, naming `autumn migrate`. **List already-deployed hosts first when you
-  scale up**: the migration lands on the first host still on a previous release,
-  so a *new* host listed ahead of it cuts over with no migrate step and serves the
-  new release against the old schema until the rollout reaches the migrating host
-  — the rollout names that hazard and the hosts it affects up front rather than
-  silently resequencing a list whose order is the documented contract. A failure
+  once** — on the first host in rollout order, before its cutover; every other
+  host skips them. (Superseded within this release: the placement was originally
+  the first host still on a *previous release*, which left an all-first-deploy
+  fleet migrating nowhere and made scale-up host order load-bearing. Now that a
+  first deploy migrates too — see the `autumn deploy` entry below — the migration
+  simply lands on host 1, so the schema always moves before any host in the fleet
+  cuts over and neither hazard warning exists any more.) A failure
   **halts** the rollout (the
   remaining hosts are never touched) and, by default, compensates the hosts that
   already cut over in reverse rollout order — rolling each back to its previous
@@ -114,8 +160,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compensate, because the migrating host itself failed after `migrate` but before
   its cutover and tore its own candidate down — now gets its own `no host is
   serving the new release, but the migration that already ran was NOT rolled back
-  …` note. An all-first-deploy fleet schedules no migration and stays silent, so
-  the summary never contradicts the prologue's "run `autumn migrate` yourself".
+  …` note. Every non-empty rollout schedules a migration, so the gate on all three
+  is simply whether host 1 was reached at all.
   (A failed *single-host* deploy still renders no summary and so still says
   nothing about a migration that already ran — tracked as #2276.)
   `--only <HOST>` (repeatable) narrows `up` or
