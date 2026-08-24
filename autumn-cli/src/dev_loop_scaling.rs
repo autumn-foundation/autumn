@@ -126,11 +126,13 @@ pub struct ScalingReport {
 /// The generated app:
 /// - Is a **standalone workspace root** (contains `[workspace]`) so that the
 ///   `[patch.crates-io]` section appended by the live driver is valid.
-/// - Depends only on `autumn-web` at default features (which include `db`,
-///   bringing in diesel and diesel-async).
-/// - Uses `autumn_web::reexports::diesel::table!` (no separate diesel dep)
-///   and `#[autumn_web::model]` / `#[autumn_web::repository]`, exactly
-///   mirroring `autumn/tests/compile-pass/repository_no_hooks.rs`.
+/// - Depends on `autumn-web` at default features (which include `db`,
+///   bringing in diesel and diesel-async), plus direct `diesel`/`serde`/
+///   `serde_json` dependencies the generated macro expansions need at the
+///   bare crate path (see the comment on `cargo_toml` below).
+/// - Declares schema through `autumn_web::reexports::diesel::table!` and uses
+///   `#[autumn_web::model]` / `#[autumn_web::repository]`, mirroring
+///   `autumn/tests/compile-pass/repository_no_hooks.rs`.
 /// - Is **compile-only** — no Postgres is required because we never boot the
 ///   binary, only `cargo build` it.
 ///
@@ -143,6 +145,18 @@ pub fn generate_synthetic_app(n: usize) -> GeneratedApp {
     // the resolved version is whatever the repo currently is. A wildcard avoids
     // a hardcoded version that would silently break `[patch]` resolution after a
     // workspace version bump; `publish = false` makes the wildcard valid.
+    //
+    // `diesel`, `serde`, and `serde_json` are also DIRECT dependencies here even
+    // though `autumn-web` re-exports all three (`autumn_web::reexports::diesel`
+    // etc.) and pulls them in transitively: `diesel::table!` and the
+    // `#[autumn_web::model]`/`#[autumn_web::repository]` derives expand to code
+    // that references the bare `diesel`/`serde`/`serde_json` crate paths (not
+    // `$crate`-hygienic re-export paths), which only resolve when those crates
+    // are direct dependencies of the compiling crate — a transitive dependency
+    // is invisible at that path. Omitting them fails every generated model and
+    // repository with "no external crate `diesel`" / "could not find `serde`"
+    // before a single size point can even compile, mirroring the same class of
+    // gap `benchmarks/runtime/autumn` had (issue: diesel-async version skew).
     let cargo_toml = "[package]\n\
          name = \"scaling_bench_app\"\n\
          version = \"0.1.0\"\n\
@@ -152,7 +166,10 @@ pub fn generate_synthetic_app(n: usize) -> GeneratedApp {
          [workspace]\n\
          \n\
          [dependencies]\n\
-         autumn-web = \"*\"\n"
+         autumn-web = \"*\"\n\
+         diesel = { version = \"2\", features = [\"postgres\"] }\n\
+         serde = { version = \"1\", features = [\"derive\"] }\n\
+         serde_json = \"1\"\n"
         .to_string();
 
     let files = vec![
@@ -206,7 +223,7 @@ fn generate_repositories(n: usize) -> String {
     for k in 0..n {
         writeln!(
             out,
-            "#[autumn_web::repository(Entity{k})]\npub trait Entity{k}Repository {{\n\
+            "#[autumn_web::repository(Entity{k}, table = \"entity_{k}\")]\npub trait Entity{k}Repository {{\n\
              \tfn find_by_content(content: String) -> Vec<Entity{k}>;\n\
              }}\n"
         )
@@ -753,15 +770,65 @@ mod tests {
 
     #[test]
     fn generate_app_schema_uses_reexport_path() {
-        // The generated app only depends on autumn-web, not a separate diesel
-        // dep. It must use autumn_web::reexports::diesel::table! to declare
-        // schema, mirroring the compile-pass test pattern.
+        // Schema declarations go through autumn_web::reexports::diesel::table!
+        // (mirroring the compile-pass test pattern) even though the generated
+        // Cargo.toml also carries a *direct* diesel dependency — diesel's own
+        // table! macro expands to code that references the bare `diesel` path,
+        // which only resolves when diesel is a direct dependency of the
+        // compiling crate (see generate_app_cargo_toml_has_direct_macro_deps).
         let app = generate_synthetic_app(1);
         let schema = file_content(&app, "src/schema.rs");
         assert!(
             schema.contains("autumn_web::reexports::diesel::table!"),
-            "schema must use autumn_web::reexports::diesel::table! (no direct diesel dep)"
+            "schema must use autumn_web::reexports::diesel::table!"
         );
+    }
+
+    #[test]
+    fn generate_app_cargo_toml_has_direct_macro_deps() {
+        // Regression: `diesel::table!` and the `#[model]`/`#[repository]`
+        // derives expand to code referencing the bare `diesel`/`serde`/
+        // `serde_json` crate paths, not `autumn_web::reexports::...` — these
+        // only resolve when the crates are DIRECT dependencies of the
+        // compiling crate, since a transitive dependency (pulled in only via
+        // autumn-web) is invisible at that path. Omitting them fails the
+        // scaffolded app with "no external crate `diesel`" / "could not find
+        // `serde`" before a single size point can compile.
+        let app = generate_synthetic_app(1);
+        assert!(
+            app.cargo_toml.contains("diesel"),
+            "Cargo.toml must declare a direct diesel dependency"
+        );
+        assert!(
+            app.cargo_toml.contains("serde_json"),
+            "Cargo.toml must declare a direct serde_json dependency"
+        );
+        assert!(
+            app.cargo_toml.contains("serde"),
+            "Cargo.toml must declare a direct serde dependency"
+        );
+    }
+
+    #[test]
+    fn generate_app_repository_table_attr_matches_model_table_attr() {
+        // Regression: the repository macro has no way to see the model's own
+        // #[model(table = "...")] override — each macro independently infers
+        // (or is told) its table name. Since these generated models use an
+        // explicit non-default table name (entity_{k}, not the default
+        // pluralized entity{k}s), the repository attribute must carry the
+        // SAME explicit table = "entity_{k}" override, or diesel resolves it
+        // against a schema module that was never declared.
+        let n = 3;
+        let app = generate_synthetic_app(n);
+        let repos = file_content(&app, "src/repositories.rs");
+        for k in 0..n {
+            assert!(
+                repos.contains(&format!("Entity{k}, table = \"entity_{k}\"")),
+                "repository(Entity{k}) must carry the same table override as \
+                 #[model(table = \"entity_{k}\")], or it falls back to \
+                 inferring `entity{k}s`, which the schema never declares"
+            );
+        }
     }
 
     // ── apply_handler_edit ────────────────────────────────────────────────
