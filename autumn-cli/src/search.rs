@@ -80,6 +80,75 @@ pub fn is_started_marker(line: &str) -> bool {
     line.starts_with(BACKFILL_STARTED_MARKER)
 }
 
+/// Clear the internal one-shot mode env vars `AppBuilder::run` dispatches
+/// *before* it falls through to normal server startup, where `SearchPlugin`
+/// consumes [`BACKFILL_ENV`].
+///
+/// `Command` inherits the parent process's environment by default, so any of
+/// these left over in the CLI's own environment (e.g. from a wrapping script,
+/// or a previous `autumn migrate`/`autumn task run ...`/`autumn replay ...`
+/// invocation in the same shell) would silently hijack `autumn search
+/// reindex` into a completely different — and potentially mutating — mode,
+/// since every one of them is dispatched earlier than server startup in
+/// `AppBuilder::run`.
+fn clear_competing_one_shot_env(command: &mut Command) {
+    for var in [
+        "AUTUMN_BUILD_STATIC",
+        "AUTUMN_DUMP_ROUTES",
+        "AUTUMN_DUMP_JOBS",
+        "AUTUMN_LIST_TASKS",
+        "AUTUMN_RUN_TASK",
+        "AUTUMN_MIGRATE",
+        "AUTUMN_RETENTION_DRY_RUN",
+        "AUTUMN_REPLAY_CAPSULE",
+    ] {
+        command.env_remove(var);
+    }
+}
+
+/// Set or clear [`BACKFILL_PURGE_ENV`] on `command` from `purge`.
+///
+/// `Command` inherits the parent process's environment by default, so
+/// without an explicit removal when `purge` is `false`, an
+/// `AUTUMN_SEARCH_BACKFILL_PURGE=1` the CLI's own environment already
+/// happens to carry (e.g. exported by a wrapping script, or left over from a
+/// previous `--purge` invocation) would silently leak into a purge-less
+/// reindex, clearing every selected index before rebuilding it — the exact
+/// search outage `--purge` being opt-in is meant to guard against.
+///
+/// A free function (rather than inlined into [`run`]) so this is
+/// unit-testable via [`Command::get_envs`] without actually spawning a
+/// process.
+fn apply_purge_env(command: &mut Command, purge: bool) {
+    if purge {
+        command.env(BACKFILL_PURGE_ENV, "1");
+    } else {
+        command.env_remove(BACKFILL_PURGE_ENV);
+    }
+}
+
+/// Set or clear the profile selector on `command` from `profile`.
+///
+/// `Command` inherits the parent process's environment by default, so
+/// without an explicit removal when `profile` is `None`, an inherited
+/// `AUTUMN_ENV`/`AUTUMN_PROFILE` would outrank the debug-build inference
+/// this CLI just announced (`AUTUMN_ENV` is the configuration resolver's
+/// highest-priority selector), silently reindexing — and, with `--purge`,
+/// temporarily emptying — that other profile's index while claiming to
+/// operate on `dev`.
+///
+/// A free function (rather than inlined into [`run`]) so this is
+/// unit-testable via [`Command::get_envs`] without actually spawning a
+/// process.
+fn apply_profile_env(command: &mut Command, profile: Option<&str>) {
+    if let Some(profile) = profile {
+        command.env("AUTUMN_ENV", profile);
+    } else {
+        command.env_remove("AUTUMN_ENV");
+        command.env_remove("AUTUMN_PROFILE");
+    }
+}
+
 /// Run `autumn search reindex`.
 pub fn run(opts: &ReindexOptions<'_>) {
     eprintln!("\u{1F342} autumn search reindex\n");
@@ -103,16 +172,10 @@ pub fn run(opts: &ReindexOptions<'_>) {
     let binary = find_binary(opts.package, opts.bin);
 
     let mut command = Command::new(&binary);
+    clear_competing_one_shot_env(&mut command);
     command.env(BACKFILL_ENV, backfill_target(opts.index));
-    if opts.purge {
-        command.env(BACKFILL_PURGE_ENV, "1");
-    }
-    // Forwarded as `AUTUMN_ENV`, the highest-priority selector, so the child
-    // resolves `[profile.<name>.search]` for the profile the operator meant
-    // rather than the one implied by this CLI's debug build.
-    if let Some(profile) = opts.profile {
-        command.env("AUTUMN_ENV", profile);
-    }
+    apply_purge_env(&mut command, opts.purge);
+    apply_profile_env(&mut command, opts.profile);
 
     // stdout is piped so the CLI can watch for the plugin's start marker; it is
     // forwarded line by line so the app's own output still reaches the user.
@@ -207,6 +270,92 @@ mod tests {
             Some("prod"),
             "the forwarded value must be one core recognizes"
         );
+    }
+
+    fn set_envs(command: &mut Command, keys: impl IntoIterator<Item = &'static str>) {
+        for key in keys {
+            command.env(key, "1");
+        }
+    }
+
+    /// Vars still explicitly set (present with a value, i.e. not
+    /// `env_remove`d) on `command`, restricted to `keys`.
+    fn still_set(command: &Command, keys: &[&str]) -> Vec<String> {
+        command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|_| key))
+            .filter_map(|key| key.to_str().map(str::to_owned))
+            .filter(|key| keys.contains(&key.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn clear_competing_one_shot_env_removes_every_var_checked_before_server_startup() {
+        // AppBuilder::run dispatches build, route/job dumps, tasks, migration,
+        // retention dry-run, and capsule replay *before* falling through to
+        // normal server startup, where SearchPlugin consumes
+        // AUTUMN_SEARCH_BACKFILL — any of them left over in the CLI's own
+        // environment would hijack `autumn search reindex` into a completely
+        // different (potentially mutating) mode via Command's default
+        // environment inheritance.
+        let competing_vars = [
+            "AUTUMN_BUILD_STATIC",
+            "AUTUMN_DUMP_ROUTES",
+            "AUTUMN_DUMP_JOBS",
+            "AUTUMN_LIST_TASKS",
+            "AUTUMN_RUN_TASK",
+            "AUTUMN_MIGRATE",
+            "AUTUMN_RETENTION_DRY_RUN",
+            "AUTUMN_REPLAY_CAPSULE",
+        ];
+        let mut command = Command::new("true");
+        set_envs(&mut command, competing_vars);
+        clear_competing_one_shot_env(&mut command);
+        let remaining = still_set(&command, &competing_vars);
+        assert!(
+            remaining.is_empty(),
+            "these competing one-shot vars survived: {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn apply_purge_env_clears_an_inherited_purge_flag_when_purge_is_not_requested() {
+        let mut command = Command::new("true");
+        command.env(BACKFILL_PURGE_ENV, "1");
+        apply_purge_env(&mut command, false);
+        assert!(
+            still_set(&command, &[BACKFILL_PURGE_ENV]).is_empty(),
+            "an inherited purge flag must not survive a purge-less reindex"
+        );
+    }
+
+    #[test]
+    fn apply_purge_env_sets_the_flag_when_purge_is_requested() {
+        let mut command = Command::new("true");
+        apply_purge_env(&mut command, true);
+        assert_eq!(
+            still_set(&command, &[BACKFILL_PURGE_ENV]),
+            [BACKFILL_PURGE_ENV]
+        );
+    }
+
+    #[test]
+    fn apply_profile_env_clears_inherited_profile_selectors_for_default_reindex() {
+        let mut command = Command::new("true");
+        command.env("AUTUMN_ENV", "prod");
+        command.env("AUTUMN_PROFILE", "prod");
+        apply_profile_env(&mut command, None);
+        assert!(
+            still_set(&command, &["AUTUMN_ENV", "AUTUMN_PROFILE"]).is_empty(),
+            "an inherited profile selector must not survive an unset --profile"
+        );
+    }
+
+    #[test]
+    fn apply_profile_env_forwards_an_explicit_profile_as_autumn_env() {
+        let mut command = Command::new("true");
+        apply_profile_env(&mut command, Some("prod"));
+        assert_eq!(still_set(&command, &["AUTUMN_ENV"]), ["AUTUMN_ENV"]);
     }
 
     #[test]
