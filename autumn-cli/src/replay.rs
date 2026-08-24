@@ -9,6 +9,29 @@ pub const REPLAY_CAPSULE_ENV: &str = "AUTUMN_REPLAY_CAPSULE";
 /// Exit code used for a capsule that is never replayed at all.
 const EXIT_REFUSED: i32 = 2;
 
+/// Clear the other internal one-shot mode env vars `AppBuilder::run` checks
+/// *before* `AUTUMN_REPLAY_CAPSULE` in its dispatch chain.
+///
+/// `Command` inherits the parent process's environment by default, so any of
+/// these left over in the CLI's own environment (e.g. from a wrapping script,
+/// or a previous `autumn migrate`/`autumn task run ...` invocation in the same
+/// shell) would silently hijack a replay into a completely different — and
+/// potentially mutating — mode, since every one of them is dispatched earlier
+/// than `AUTUMN_REPLAY_CAPSULE` in `AppBuilder::run`.
+fn clear_competing_one_shot_env(command: &mut Command) {
+    for var in [
+        "AUTUMN_BUILD_STATIC",
+        "AUTUMN_DUMP_ROUTES",
+        "AUTUMN_DUMP_JOBS",
+        "AUTUMN_LIST_TASKS",
+        "AUTUMN_RUN_TASK",
+        "AUTUMN_MIGRATE",
+        "AUTUMN_RETENTION_DRY_RUN",
+    ] {
+        command.env_remove(var);
+    }
+}
+
 /// Options controlling `autumn replay`.
 pub struct ReplayOptions<'a> {
     pub capsule: &'a str,
@@ -60,6 +83,7 @@ pub fn run(opts: &ReplayOptions<'_>) {
     }
 
     let mut command = Command::new(&binary);
+    clear_competing_one_shot_env(&mut command);
     command
         .env(REPLAY_CAPSULE_ENV, &capsule)
         .env("AUTUMN_ENV", &profile)
@@ -330,6 +354,41 @@ mod tests {
         assert!(
             error.contains("directory"),
             "the error must say what is wrong: {error}"
+        );
+    }
+
+    #[test]
+    fn clear_competing_one_shot_env_removes_every_var_checked_before_replay() {
+        // AppBuilder::run checks build, route/job dumps, tasks, migration, and
+        // retention dry-run modes *before* AUTUMN_REPLAY_CAPSULE in its
+        // dispatch chain — any of them left over in the CLI's own environment
+        // would hijack a replay into a completely different (potentially
+        // mutating) mode via Command's default environment inheritance.
+        let competing_vars = [
+            "AUTUMN_BUILD_STATIC",
+            "AUTUMN_DUMP_ROUTES",
+            "AUTUMN_DUMP_JOBS",
+            "AUTUMN_LIST_TASKS",
+            "AUTUMN_RUN_TASK",
+            "AUTUMN_MIGRATE",
+            "AUTUMN_RETENTION_DRY_RUN",
+        ];
+        let mut command = Command::new("true");
+        for var in competing_vars {
+            command.env(var, "1");
+        }
+        clear_competing_one_shot_env(&mut command);
+        let remaining: Vec<&str> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value
+                    .and(key.to_str())
+                    .filter(|k| competing_vars.contains(k))
+            })
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "these competing one-shot vars survived: {remaining:?}"
         );
     }
 
