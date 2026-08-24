@@ -336,7 +336,7 @@ serde_yaml = { version = "0.9", optional = true }
 pulldown-cmark = { workspace = true, optional = true }
 ammonia = { workspace = true, optional = true }
 subtle = "2.6.1"
-base64 = "0.22"
+base64 = "0.23"
 url = "2.5.8"
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
