@@ -9,6 +9,12 @@ use autumn_web::config::DatabaseBackend;
 use super::GenerateError;
 use super::naming;
 
+/// Rust type a `{translatable}` column lowers to (issue #1384).
+const TRANSLATED_RUST_TYPE: &str = "autumn_web::i18n::Translated";
+
+/// SQL literal a translatable column defaults to: the empty JSON container.
+const EMPTY_TRANSLATION_CONTAINER: &str = "'{}'";
+
 /// The constraint modifiers a field carried in a trailing `{…}` block
 /// (`title:String{min=3,max=120}`, `contact:String{email}`,
 /// `age:i32{min=0,max=130}`, `post:references{label:title}`).
@@ -44,9 +50,28 @@ pub struct FieldConstraints {
     /// generated model field. `String`/`Text` only, and never nullable — see
     /// [`EncryptedMode`]. `None` for an ordinary plaintext column.
     pub encrypted: Option<EncryptedMode>,
+    /// `scope:col` — the parent foreign-key column a `position` field's
+    /// contiguous ordering is scoped to (issue #1358), e.g.
+    /// `rank:position{scope:board_id}`. `position` only; `None` means the
+    /// position is a single sequence over the whole table. Never a
+    /// `#[validate]`/HTML5 constraint.
+    pub scope: Option<String>,
+    /// `translatable` — per-locale content storage (issue #1384), re-emitted
+    /// as a `#[translatable]` attribute on the generated model field and an
+    /// `autumn_web::i18n::Translated` Rust type. `String`/`Text` only, never
+    /// nullable, and never combined with `{encrypted}`, `:unique`, or a state
+    /// machine. `false` for an ordinary monolingual column.
+    pub translatable: bool,
 }
 
 impl FieldConstraints {
+    /// True when no modifier that fans out to a `#[validate(...)]` rule was
+    /// declared (issue #1388's `min`/`max`/`email`/`url`).
+    #[must_use]
+    pub const fn validation_attrs_are_empty(&self) -> bool {
+        self.min.is_none() && self.max.is_none() && !self.email && !self.url
+    }
+
     /// True when no constraint modifier was declared.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
@@ -57,6 +82,8 @@ impl FieldConstraints {
             && self.label.is_none()
             && self.from.is_none()
             && self.encrypted.is_none()
+            && self.scope.is_none()
+            && !self.translatable
     }
 }
 
@@ -168,6 +195,12 @@ impl Field {
     /// `String` storage-representation fallback.
     #[must_use]
     pub fn rust_type(&self) -> String {
+        // #1384: a `{translatable}` column is a per-locale container in Rust,
+        // not a `String`. The SQL type is unchanged (`TEXT`) — the container
+        // is stored as a JSON object — so only the Rust type moves.
+        if self.constraints.translatable {
+            return TRANSLATED_RUST_TYPE.to_owned();
+        }
         let inner = self
             .enum_type_name()
             .unwrap_or_else(|| self.kind.rust_type().to_owned());
@@ -175,6 +208,30 @@ impl Field {
             format!("Option<{inner}>")
         } else {
             inner
+        }
+    }
+
+    /// Whether this column stores per-locale content (issue #1384) — declared
+    /// with a `{translatable}` modifier, re-emitted as `#[translatable]`.
+    #[must_use]
+    pub const fn is_translatable(&self) -> bool {
+        self.constraints.translatable
+    }
+
+    /// The SQL `DEFAULT` clause this field's storage needs, without the
+    /// `DEFAULT` keyword, or `None` for a column with no default.
+    ///
+    /// Only `{translatable}` uses it today: the container column is `NOT NULL`
+    /// and defaults to the empty JSON object, which is what makes the
+    /// `ADD COLUMN` an ordinary *safe* migration (`autumn migrate check`
+    /// classifies `ADD COLUMN … NOT NULL DEFAULT <constant>` as safe) rather
+    /// than a table-rewriting backfill.
+    #[must_use]
+    pub const fn sql_default(&self) -> Option<&'static str> {
+        if self.constraints.translatable {
+            Some(EMPTY_TRANSLATION_CONTAINER)
+        } else {
+            None
         }
     }
 
@@ -471,6 +528,40 @@ pub enum FieldKind {
     /// `update`/`delete` routes resolve the record by this field instead of
     /// `id`.
     Slug,
+    /// `position` (optionally `position{scope:col}`) — a server-managed
+    /// contiguous ordering column (issue #1358), e.g. `rank:position` or,
+    /// scoped to a parent, `rank:position{scope:board_id}`. Storage-wise a
+    /// plain `i64`/`BIGINT` column (matching the default `i64` primary-key
+    /// convention), but never nullable — every row belongs somewhere in its
+    /// ordering — and never hand-assigned: the generated repository assigns
+    /// the next contiguous value on insert, compacts on delete, and exposes
+    /// `move_to`/`move_before`/`move_after`/`move_up`/`move_down` helpers, so
+    /// the field is excluded from the generated `New*`/`Update*` structs the
+    /// same way `id`/timestamps are. The optional [`FieldConstraints::scope`]
+    /// keeps a separate contiguous `0..len-1` sequence per distinct value of
+    /// the named column (typically a `references` foreign key). At most one
+    /// `position` field is allowed per model.
+    Position,
+    /// `commentable` (e.g. `comments:commentable`) — threaded, **polymorphic**
+    /// comments on this model (issue #1367).
+    ///
+    /// Storage-wise this is the counter-cache *source* column: a plain
+    /// `i64`/`BIGINT`, never nullable (the maintenance is `c = c + 1`, and
+    /// `NULL + 1` is `NULL`), never hand-assigned, and — like
+    /// [`Position`](Self::Position) — excluded from the generated
+    /// `New*`/`Update*` structs and the create/edit form, because the
+    /// framework maintains it inside each comment's own transaction. The
+    /// declared field name is normalised to `{singular}_count`
+    /// (`comments:commentable` → `comment_count`), matching `#[model]`'s
+    /// `{snake(child)}_count` convention.
+    ///
+    /// The rest of the feature is not a column at all: the token additionally
+    /// emits the shared `comments(commentable_type, commentable_id, parent_id,
+    /// …)` migration — once per project, since the table is shared — and
+    /// `#[commentable(...)]` on the generated `#[model]`, which is what brings
+    /// the repository's `add_comment`/`comment_thread`/`delete_comment`
+    /// helpers into existence. At most one `commentable` field per model.
+    Commentable,
 }
 
 impl FieldKind {
@@ -486,8 +577,9 @@ impl FieldKind {
             // enum's real type name.
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "String",
             Self::I32 => "i32",
-            // `References` is always `i64`, matching the default `i64` PK convention.
-            Self::I64 | Self::References => "i64",
+            // `References` and `Position` are always `i64`, matching the
+            // default `i64` PK convention.
+            Self::I64 | Self::References | Self::Position | Self::Commentable => "i64",
             Self::Bool => "bool",
             Self::F32 => "f32",
             Self::F64 => "f64",
@@ -507,7 +599,7 @@ impl FieldKind {
         match self {
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "Text",
             Self::I32 => "Int4",
-            Self::I64 | Self::References => "Int8",
+            Self::I64 | Self::References | Self::Position | Self::Commentable => "Int8",
             Self::Bool => "Bool",
             Self::F32 => "Float4",
             Self::F64 => "Float8",
@@ -526,7 +618,7 @@ impl FieldKind {
         match self {
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "TEXT",
             Self::I32 => "INTEGER",
-            Self::I64 | Self::References => "BIGINT",
+            Self::I64 | Self::References | Self::Position | Self::Commentable => "BIGINT",
             Self::Bool => "BOOLEAN",
             Self::F32 => "REAL",
             Self::F64 => "DOUBLE PRECISION",
@@ -569,7 +661,12 @@ impl FieldKind {
     pub const fn sqlite_sql_type(self) -> &'static str {
         match self {
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "TEXT",
-            Self::I32 | Self::I64 | Self::References | Self::Bool => "INTEGER",
+            Self::I32
+            | Self::I64
+            | Self::References
+            | Self::Position
+            | Self::Commentable
+            | Self::Bool => "INTEGER",
             Self::F32 | Self::F64 => "REAL",
             Self::Uuid => "TEXT",
             Self::NaiveDateTime | Self::DateTime => "TEXT",
@@ -643,7 +740,7 @@ impl FieldKind {
         match self {
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "Text",
             Self::I32 => "Int4",
-            Self::I64 | Self::References => "Int8",
+            Self::I64 | Self::References | Self::Position | Self::Commentable => "Int8",
             Self::Bool => "Bool",
             Self::F32 => "Float4",
             Self::F64 => "Float8",
@@ -740,6 +837,8 @@ impl FieldKind {
             Self::Enum => "enum{…}",
             Self::Decimal { .. } => "decimal{…}",
             Self::Slug => "slug{…}",
+            Self::Position => "position",
+            Self::Commentable => "commentable",
         }
     }
 
@@ -792,6 +891,42 @@ impl FieldKind {
     #[must_use]
     pub const fn is_decimal(self) -> bool {
         matches!(self, Self::Decimal { .. })
+    }
+
+    /// Returns `true` for a server-managed `position` ordering field (issue
+    /// #1358).
+    ///
+    /// Used by the model/migration/repository/scaffold generators to: exclude
+    /// the column from `New*`/`Update*` structs, emit its `NOT NULL BIGINT`
+    /// column plus auto-index, wire `position(column = "...", scope = "...")`
+    /// into the generated `#[repository(...)]` attribute, and order the
+    /// scaffold index view by it with Move up/down buttons.
+    #[must_use]
+    pub const fn is_position(self) -> bool {
+        matches!(self, Self::Position)
+    }
+
+    /// Returns `true` for a `commentable` polymorphic-comments field (issue
+    /// #1367).
+    ///
+    /// Used by the model/migration/scaffold generators to: keep the counter
+    /// column out of `New*`/`Update*` structs and the create/edit form, write
+    /// `#[commentable(...)]` onto the generated model, and emit the shared
+    /// `comments` table migration.
+    #[must_use]
+    pub const fn is_commentable(self) -> bool {
+        matches!(self, Self::Commentable)
+    }
+
+    /// Returns `true` for a column the *framework* assigns and maintains, so
+    /// no generated form, `New*` struct or `Update*` struct may offer it.
+    ///
+    /// One predicate rather than a growing `is_position() || is_commentable()
+    /// || …` chain at every call site — a new server-managed kind is then a
+    /// one-line change here instead of a hunt through the generators.
+    #[must_use]
+    pub const fn is_server_managed(self) -> bool {
+        matches!(self, Self::Position | Self::Commentable)
     }
 }
 
@@ -916,8 +1051,9 @@ impl IdType {
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
-    enum{a,b,…}, decimal{precision,scale}, slug{from:col}, Option<…>, :unique, \
-    String{encrypted}, String{encrypted:deterministic}";
+    enum{a,b,…}, decimal{precision,scale}, slug{from:col}, position (optionally \
+    position{scope:col}), commentable, Option<…>, :unique, String{encrypted}, \
+    String{encrypted:deterministic}, String{translatable}";
 
 /// The DSL field kinds that map to a working diesel `SQLite` conversion
 /// (issue #1614 AC #4; #1924) — the complement of the kinds
@@ -926,7 +1062,7 @@ pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, 
 /// field kinds a `SQLite` app supports today.
 pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
     NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
-    slug{from:col}, Option<…>, :unique";
+    slug{from:col}, position (optionally position{scope:col}), commentable, Option<…>, :unique";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -945,6 +1081,14 @@ pub const SQL_SUPPORTED_TYPES: &str = "text, varchar, bpchar (-> String), int4 (
 ///
 /// Returns `None` for types outside the documented surface so the caller can
 /// fail loudly with a column-named error rather than silently dropping it.
+///
+/// Like `jsonb` (which round-trips as a plain `FieldKind::Json`, losing the
+/// distinction from a hand-written `json` column), a `position` column has
+/// no distinguishing catalog type of its own — it's a plain `int4`/`int8`
+/// NOT NULL column plus an index and a pair of triggers. `db pull` therefore
+/// introspects it back as an ordinary [`FieldKind::I32`]/[`FieldKind::I64`],
+/// not [`FieldKind::Position`]; this is expected, not a bug — there is no
+/// SQL-level marker to recover the `position`-ness from.
 #[must_use]
 pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
     match udt_name {
@@ -1167,9 +1311,53 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     // rather than doubling the suffix.
     let name = if kind == FieldKind::References && !name.ends_with("_id") {
         format!("{name}_id")
+    } else if kind == FieldKind::Commentable {
+        // `comments:commentable` names the *feature*, not the column. The
+        // column it actually adds is the counter-cache source, whose name
+        // follows `#[model]`'s `{snake(child)}_count` convention — so the
+        // declared name is singularised and suffixed, and an already-suffixed
+        // name is left alone rather than doubled.
+        if name.ends_with("_count") {
+            name.to_owned()
+        } else {
+            format!("{}_count", naming::singularize(name))
+        }
     } else {
         name.to_owned()
     };
+
+    // `commentable` is a whole feature behind one token, not a value the caller
+    // supplies: the counter it adds is maintained by the framework inside each
+    // comment's transaction, so it can be neither nullable (`NULL + 1` is
+    // `NULL`) nor `:unique` (every model starts at 0), and it takes no `{…}`
+    // modifiers at all.
+    if kind == FieldKind::Commentable {
+        if nullable {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `commentable` field cannot be nullable — it is the \
+                         framework-maintained comment counter, and `NULL + 1` is `NULL`"
+                    .into(),
+            });
+        }
+        if unique {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `commentable` field cannot be `:unique` — it is a comment \
+                         counter, and every model starts at 0"
+                    .into(),
+            });
+        }
+        if !constraints.is_empty() {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `commentable` field takes no `{…}` modifiers — configure the \
+                         association on the generated model's `#[commentable(...)]` \
+                         attribute instead"
+                    .into(),
+            });
+        }
+    }
 
     // A `slug` field (issue #1260) is always the record's routing key: it
     // can never be nullable (every record needs a URL) and always needs a
@@ -1197,6 +1385,29 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     // existing `unique`-field `UNIQUE INDEX` and `find_by_slug` repository
     // machinery (issue #1032) for free, whether or not `:unique` was typed.
     let unique = unique || kind == FieldKind::Slug;
+
+    // A `position` field (issue #1358) can never be nullable — every row has
+    // a place in its ordering — and can never be `:unique` — the whole point
+    // is a dense, repository-maintained `0..len-1` sequence per scope, not a
+    // one-off distinct value.
+    if kind == FieldKind::Position {
+        if nullable {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `position` field cannot be nullable — every row has a place in its \
+                         ordering"
+                    .into(),
+            });
+        }
+        if unique {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `position` field cannot be `:unique` — the repository maintains a \
+                         dense `0..len-1` sequence per scope, not a one-off distinct value"
+                    .into(),
+            });
+        }
+    }
 
     // ── `{encrypted}` cross-checks (issue #1340) ────────────────────────────
     // The kind allowlist already ran in `set_encrypted_constraint`; what's left
@@ -1245,6 +1456,81 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
             return Err(GenerateError::InvalidField {
                 token: token.to_owned(),
                 reason: randomized_equality_lookup_reason(&name, "is `unique`"),
+            });
+        }
+    }
+
+    // ── `{translatable}` cross-checks (issue #1384) ─────────────────────────
+    // The kind allowlist already ran while parsing the modifier; these need the
+    // whole parsed field.
+    if constraints.translatable {
+        // The container itself models "no translation" as an empty map, so a
+        // nullable column would give two spellings for one state — and the
+        // `#[model]` macro refuses `Option<Translated>` for the same reason.
+        if nullable {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `translatable` field cannot be nullable — the per-locale container \
+                         already represents \"no translation\" as an empty map. Drop the \
+                         `Option<…>`."
+                    .into(),
+            });
+        }
+        // The column holds one opaque ciphertext envelope under `{encrypted}`,
+        // which has no per-locale structure to resolve against.
+        if constraints.encrypted.is_some() {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `translatable` field cannot also be `encrypted`: an encrypted column \
+                         stores one opaque envelope, with no per-locale structure to resolve. \
+                         Keep a separate encrypted column for the secret."
+                    .into(),
+            });
+        }
+        // A UNIQUE index (and the free `find_by_<col>` the generators derive
+        // from it) would compare whole JSON containers, so two records with
+        // identical text translated into different locale sets never collide.
+        if unique {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `translatable` field cannot be `:unique`: the index would compare \
+                         whole per-locale containers, so identical text translated into \
+                         different locale sets would never collide, and the derived \
+                         `find_by_<col>` lookup could never match. Put the uniqueness on a \
+                         non-translatable column (e.g. a `slug`)."
+                    .into(),
+            });
+        }
+        // The `{min}/{max}/{email}/{url}` fan-out emits `#[validate(length(..))]`
+        // / `#[validate(email)]` on the field, and `validator` implements those
+        // rules for `String`-shaped types only — there is no impl for a
+        // per-locale container, so the generated model would not compile. (And
+        // even with one, "which locale is this rule about?" has no single
+        // answer.) Refuse here, where the fix is one token away.
+        let validation_modifiers = !constraints.validation_attrs_are_empty();
+        if validation_modifiers {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `translatable` field cannot carry `min`/`max`/`email`/`url` \
+                         constraints: those emit a `#[validate(...)]` rule that `validator` \
+                         implements for strings only, and a per-locale container has one \
+                         value per locale rather than one string to measure. Validate the \
+                         individual translations in your own edit handler."
+                    .into(),
+            });
+        }
+        // The scaffold's transition handler writes the state with a raw
+        // `UPDATE … SET col = 'state'`, which would replace the whole container
+        // with a bare state name. A state is also locale-invariant by
+        // definition.
+        if state_machine.is_some() {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `translatable` field cannot also declare a `states(…)` state \
+                         machine: a state name is locale-invariant, and the generated \
+                         transition handler's raw `UPDATE … SET col = 'state'` would replace \
+                         the whole per-locale container."
+                    .into(),
             });
         }
     }
@@ -1477,6 +1763,7 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
             match key.trim() {
                 "label" => set_label_constraint(&mut c, value.trim(), is_reference)?,
                 "from" => set_from_constraint(&mut c, value.trim(), is_slug)?,
+                "scope" => set_scope_constraint(&mut c, value.trim(), kind.is_position())?,
                 // The kind check runs FIRST: on `count:i64{encrypted:bogus}` the
                 // useful diagnosis is that `encrypted` doesn't apply to an
                 // `i64` at all, not that `bogus` isn't a mode.
@@ -1507,6 +1794,20 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
                     reject_encrypted_on_kind(kind)?;
                     reject_repeated_encrypted(&c)?;
                     c.encrypted = Some(EncryptedMode::Randomized);
+                }
+                // #1384: per-locale content storage. Bare token only — the
+                // storage strategy is the framework's to choose, so unlike
+                // `{encrypted}` there is no mode to spell.
+                "translatable" => {
+                    reject_translatable_on_kind(kind)?;
+                    if c.translatable {
+                        return Err(
+                            "the `translatable` modifier is declared more than once — remove \
+                             the duplicate"
+                                .to_owned(),
+                        );
+                    }
+                    c.translatable = true;
                 }
                 _ => return Err(unknown_constraint_message(tok, kind)),
             }
@@ -1697,6 +1998,26 @@ fn set_from_constraint(c: &mut FieldConstraints, value: &str, is_slug: bool) -> 
     Ok(())
 }
 
+/// Set the `position` scope column (issue #1358), rejecting `scope` on a
+/// non-`position` field and a value that isn't a valid `snake_case`
+/// identifier.
+fn set_scope_constraint(
+    c: &mut FieldConstraints,
+    value: &str,
+    is_position: bool,
+) -> Result<(), String> {
+    if !is_position {
+        return Err("the `scope` constraint only applies to `position` fields".to_owned());
+    }
+    if !is_valid_ident(value) {
+        return Err(format!(
+            "position scope column '{value}' is not a valid snake_case identifier"
+        ));
+    }
+    c.scope = Some(value.to_owned());
+    Ok(())
+}
+
 /// Reject a `{encrypted}` modifier on any field kind the `#[encrypted]`
 /// attribute macro does not support (issue #1340).
 ///
@@ -1746,12 +2067,30 @@ fn reject_encrypted_on_kind(kind: FieldKind) -> Result<(), String> {
     ))
 }
 
+/// `{translatable}` stores a JSON container of per-locale values in the
+/// column, so the column has to be free-form text. Every other kind either has
+/// no text to translate (numbers, timestamps, foreign keys) or is a machine
+/// identifier whose value must stay stable across locales (`slug`, `enum`).
+fn reject_translatable_on_kind(kind: FieldKind) -> Result<(), String> {
+    if matches!(kind, FieldKind::String | FieldKind::Text) {
+        return Ok(());
+    }
+    // Name the DSL token, not `rust_type()` — `richtext`, `enum{…}` and `slug`
+    // all render as `String` in Rust (see `reject_encrypted_on_kind`).
+    Err(format!(
+        "the `translatable` modifier only applies to `String`/`Text` fields; it stores a \
+         per-locale JSON container in the column, which needs free-form text. Got a `{}` \
+         field.",
+        kind.dsl_token()
+    ))
+}
+
 /// A per-kind "unknown constraint" message that names the offending token and
 /// lists what the kind *does* accept (issue #1388 AC5).
 fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
     let accepted = match kind {
         FieldKind::String | FieldKind::Text => {
-            "min=N, max=N, email, url, encrypted, encrypted:deterministic"
+            "min=N, max=N, email, url, encrypted, encrypted:deterministic, translatable"
         }
         // `RichText` shares the numeric arm's accepted set, not `String`'s: it
         // takes the `min`/`max` length bounds but NOT the `email`/`url` format
@@ -1761,11 +2100,15 @@ fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
         }
         FieldKind::References => "label:col",
         FieldKind::Slug => "from:col",
+        FieldKind::Position => "scope:col",
         _ => "(none — this field type takes no constraint modifiers)",
     };
+    // Reported by the DSL token the author actually typed (`commentable`),
+    // not by the Rust type it happens to lower to (`i64`) — the latter reads
+    // like a different field entirely.
     format!(
-        "unknown constraint '{token}' for {} fields; supported: {accepted}",
-        kind.rust_type()
+        "unknown constraint '{token}' for `{}` fields; supported: {accepted}",
+        kind.dsl_token()
     )
 }
 
@@ -1988,7 +2331,108 @@ pub fn parse_fields(tokens: &[String]) -> Result<Vec<Field>, GenerateError> {
         fields.push(field);
     }
     validate_slug_fields(tokens, &fields)?;
+    validate_position_fields(tokens, &fields)?;
+    validate_commentable_fields(tokens, &fields)?;
     Ok(fields)
+}
+
+/// Cross-field validation for every `position`/`position{scope:...}` field in
+/// `fields` (issue #1358) — see [`parse_fields`]. Runs after every token has
+/// parsed individually, since `scope`'s target may be declared earlier OR
+/// later in the token list.
+fn validate_position_fields(tokens: &[String], fields: &[Field]) -> Result<(), GenerateError> {
+    let position_fields: Vec<(usize, &Field)> = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.kind.is_position())
+        .collect();
+    if let [(_, first), (second_idx, second), ..] = position_fields[..] {
+        return Err(GenerateError::InvalidField {
+            token: tokens[second_idx].clone(),
+            reason: format!(
+                "only one `position` field is supported per model — found both '{}' and '{}'",
+                first.name, second.name
+            ),
+        });
+    }
+    for (idx, position_field) in &position_fields {
+        let Some(scope) = position_field.constraints.scope.as_deref() else {
+            continue;
+        };
+        let token = tokens[*idx].clone();
+        let Some(source) = fields.iter().find(|f| f.name == scope) else {
+            return Err(GenerateError::InvalidField {
+                token,
+                reason: format!(
+                    "position field '{}' is scoped `scope:{scope}`, but no field named \
+                     '{scope}' is declared",
+                    position_field.name
+                ),
+            });
+        };
+        if !source.kind.is_reference() {
+            return Err(GenerateError::InvalidField {
+                token,
+                reason: format!(
+                    "position field '{}' is scoped `scope:{scope}`, but '{scope}' is a {} \
+                     field — position can only be scoped to a `references` foreign key",
+                    position_field.name,
+                    source.rust_type()
+                ),
+            });
+        }
+        // A nullable scope FK renders as `Option<i64>` at the Rust level,
+        // but the generated triggers/`move_to` compare the scope column via
+        // Postgres `hashtext(NEW."{scope}"::text)` / `"{scope}" = $1`
+        // equality, both of which are SQL-NULL-strict: a NULL scope value
+        // hashes to NULL (taking no advisory lock at all) and never equals
+        // itself in a `WHERE` filter, so every NULL-scoped row would
+        // silently get position 0 with no working compaction. Reject the
+        // combination outright rather than emit ordering that quietly
+        // breaks the moment a scope value is unset.
+        if source.nullable {
+            return Err(GenerateError::InvalidField {
+                token,
+                reason: format!(
+                    "position field '{}' is scoped `scope:{scope}`, but '{scope}' is nullable \
+                     (`Option<…>`) — a NULL scope value can't be locked or matched by the \
+                     generated triggers/`move_to`. Make '{scope}' non-nullable, or drop the \
+                     `references` field's `:null`.",
+                    position_field.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Cross-field validation for `commentable` fields (issue #1367) — see
+/// [`parse_fields`].
+///
+/// At most one per model: a second token would mean a second counter column
+/// *and* a second `#[commentable]` attribute, and `#[model]` rejects the
+/// latter outright (both would generate the same `{Model}Comments` trait). The
+/// DSL refuses first so the error names the token rather than surfacing as a
+/// macro error in generated code the author did not write.
+fn validate_commentable_fields(tokens: &[String], fields: &[Field]) -> Result<(), GenerateError> {
+    let commentable: Vec<(usize, &Field)> = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.kind.is_commentable())
+        .collect();
+    if let [(_, first), (second_idx, second), ..] = commentable[..] {
+        return Err(GenerateError::InvalidField {
+            token: tokens[second_idx].clone(),
+            reason: format!(
+                "only one `commentable` field is supported per model — found both '{}' and \
+                 '{}'. One shared comments table already attaches to every model; a second \
+                 token would add a second counter column and a second `#[commentable]` \
+                 attribute, which `#[model]` rejects.",
+                first.name, second.name
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Cross-field validation for every `slug{from:...}` field in `fields`
@@ -2146,6 +2590,10 @@ fn atomic_type(ty: &str) -> Option<FieldKind> {
         // kind; there is no separate non-binary "json" storage distinction on
         // the Postgres side (the column is always `JSONB`).
         "json" | "Json" | "jsonb" | "Jsonb" => Some(FieldKind::Json),
+        // position (issue #1358): a server-managed contiguous ordering
+        // column, e.g. `rank:position` or `rank:position{scope:board_id}`.
+        "position" | "Position" => Some(FieldKind::Position),
+        "commentable" | "Commentable" => Some(FieldKind::Commentable),
         _ => {
             // Allow `Vec<u8>` as a synonym for `Bytea`.
             strip_wrapper(ty, "Vec").and_then(|inner| {
@@ -2206,6 +2654,94 @@ pub(super) fn is_rust_keyword(s: &str) -> bool {
 #[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
+
+    // ── #1384: `{translatable}` modifier ────────────────────────────────────
+
+    #[test]
+    fn translatable_modifier_parses_on_string_and_text() {
+        for token in ["title:String{translatable}", "body:Text{translatable}"] {
+            let f = parse_field(token).unwrap_or_else(|e| panic!("{token}: {e}"));
+            assert!(f.is_translatable(), "{token}");
+            // The Rust type becomes the per-locale container...
+            assert_eq!(f.rust_type(), "autumn_web::i18n::Translated");
+            // ...while the column stays a portable TEXT holding a JSON object.
+            assert_eq!(f.sql_column_type(), "TEXT");
+            assert_eq!(f.schema_type(), "Text");
+            assert_eq!(f.sql_nullability(), "NOT NULL");
+            assert_eq!(f.sql_default(), Some("'{}'"));
+        }
+    }
+
+    #[test]
+    fn translatable_modifier_is_rejected_on_non_text_kinds() {
+        for token in [
+            "count:i64{translatable}",
+            "at:NaiveDateTime{translatable}",
+            "post:references{translatable}",
+        ] {
+            let err = parse_field(token).unwrap_err().to_string();
+            assert!(
+                err.contains("translatable"),
+                "{token} should name the modifier: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn translatable_is_rejected_on_a_nullable_column() {
+        // The container already models "no translation" as an empty map.
+        let err = parse_field("title:Option<String>{translatable}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+    }
+
+    #[test]
+    fn translatable_and_encrypted_are_mutually_exclusive() {
+        let err = parse_field("title:String{translatable,encrypted}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("encrypted"), "{err}");
+    }
+
+    #[test]
+    fn translatable_is_rejected_with_unique() {
+        // A UNIQUE index over a JSON container compares whole containers.
+        let err = parse_field("title:String:unique{translatable}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+    }
+
+    #[test]
+    fn translatable_is_rejected_with_a_state_machine() {
+        let err = parse_field("status:String{translatable}:states(draft -> live)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+    }
+
+    #[test]
+    fn a_repeated_translatable_modifier_is_rejected() {
+        let err = parse_field("title:String{translatable,translatable}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+    }
+
+    #[test]
+    fn non_translatable_fields_keep_their_type_and_have_no_default() {
+        let f = parse_field("title:String").unwrap();
+        assert!(!f.is_translatable());
+        assert_eq!(f.rust_type(), "String");
+        assert_eq!(f.sql_default(), None);
+    }
+
+    #[test]
+    fn unknown_constraint_message_advertises_translatable() {
+        let err = parse_field("title:String{bogus}").unwrap_err().to_string();
+        assert!(err.contains("translatable"), "{err}");
+    }
 
     #[test]
     fn parse_string_field() {
@@ -2630,6 +3166,74 @@ mod tests {
         let err = parse_fields(&tokens).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("slug"), "unexpected error: {msg}");
+    }
+
+    // ── position cross-field validation (issue #1358) ───────────────────────
+
+    #[test]
+    fn parse_fields_accepts_position_scoped_to_earlier_reference_field() {
+        let tokens = vec![
+            "board:references".into(),
+            "rank:position{scope:board_id}".into(),
+        ];
+        let fs = parse_fields(&tokens).unwrap();
+        assert_eq!(fs[1].constraints.scope.as_deref(), Some("board_id"));
+    }
+
+    #[test]
+    fn parse_fields_accepts_position_scoped_to_later_reference_field() {
+        // Declaration order shouldn't matter for the `scope` reference.
+        let tokens = vec![
+            "rank:position{scope:board_id}".into(),
+            "board:references".into(),
+        ];
+        assert!(parse_fields(&tokens).is_ok());
+    }
+
+    #[test]
+    fn parse_fields_rejects_position_scope_unknown_field() {
+        let tokens = vec!["rank:position{scope:board_id}".into()];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("board_id"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn parse_fields_rejects_position_scope_non_reference_field() {
+        let tokens = vec![
+            "board_id:i64".into(),
+            "rank:position{scope:board_id}".into(),
+        ];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("board_id"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn parse_fields_rejects_position_scope_nullable_reference_field() {
+        let tokens = vec![
+            "board:references?".into(),
+            "rank:position{scope:board_id}".into(),
+        ];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("board_id"), "unexpected error: {msg}");
+        assert!(msg.contains("nullable"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn parse_fields_rejects_more_than_one_position_field() {
+        let tokens = vec!["rank:position".into(), "rank2:position".into()];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("position"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn parse_fields_accepts_unscoped_position_field() {
+        let tokens = vec!["rank:position".into()];
+        let fs = parse_fields(&tokens).unwrap();
+        assert_eq!(fs[0].constraints.scope, None);
     }
 
     // ── RED: Attachment field kind ──────────────────────────────────────────
@@ -3472,6 +4076,88 @@ mod tests {
         let f = parse_field("email:String:unique").unwrap();
         assert!(f.unique);
         assert!(f.constraints.is_empty());
+    }
+
+    // ── `position` ordering field (issue #1358) ─────────────────────────────
+
+    #[test]
+    fn parse_position_field() {
+        let f = parse_field("rank:position").unwrap();
+        assert_eq!(f.name, "rank");
+        assert_eq!(f.kind, FieldKind::Position);
+        assert!(!f.nullable);
+        assert!(!f.unique);
+        assert_eq!(f.constraints.scope, None);
+        assert_eq!(f.rust_type(), "i64");
+        assert_eq!(f.sql_type(), "BIGINT");
+        assert_eq!(f.kind.sqlite_sql_type(), "INTEGER");
+    }
+
+    #[test]
+    fn parse_position_field_with_scope() {
+        let f = parse_field("rank:position{scope:board_id}").unwrap();
+        assert_eq!(f.kind, FieldKind::Position);
+        assert_eq!(f.constraints.scope.as_deref(), Some("board_id"));
+    }
+
+    #[test]
+    fn position_field_is_never_nullable() {
+        let err = parse_field("rank:Option<position>").unwrap_err();
+        assert!(
+            err.to_string().contains("position") && err.to_string().contains("nullable"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn position_field_rejects_unique_modifier() {
+        let err = parse_field("rank:position:unique").unwrap_err();
+        assert!(
+            err.to_string().contains("unique"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn scope_constraint_only_applies_to_position_fields() {
+        let err = parse_field("title:String{scope:board_id}").unwrap_err();
+        assert!(err.to_string().contains("scope"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn position_field_rejects_non_ident_scope_value() {
+        let err = parse_field("rank:position{scope:not a field}").unwrap_err();
+        assert!(err.to_string().contains("scope"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn position_field_rejects_empty_constraint_block() {
+        let err = parse_field("rank:position{}").unwrap_err();
+        assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn position_field_rejects_min_max_constraints() {
+        let err = parse_field("rank:position{min=0}").unwrap_err();
+        assert!(err.to_string().contains("min"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn position_field_accepts_pascal_case_token() {
+        let f = parse_field("rank:Position").unwrap();
+        assert_eq!(f.kind, FieldKind::Position);
+    }
+
+    #[test]
+    fn supported_types_documents_position() {
+        assert!(
+            SUPPORTED_TYPES.contains("position"),
+            "SUPPORTED_TYPES must list position"
+        );
+        assert!(
+            SQLITE_SUPPORTED_KINDS.contains("position"),
+            "SQLITE_SUPPORTED_KINDS must list position — it is a plain INTEGER column"
+        );
     }
 
     // ── `{encrypted}` at-rest column encryption (issue #1340) ───────────────

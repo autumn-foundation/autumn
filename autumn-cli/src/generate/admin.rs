@@ -227,6 +227,7 @@ pub fn plan_admin_with_options(
     options.encrypted_deterministic.extend(det_deterministic);
 
     let fields = parse_fields(field_tokens)?;
+    reject_translatable_fields(&fields)?;
     // Issue #1340: the MODEL is the only source of truth for whether a column is
     // encrypted at rest — `#[encrypted]` is what puts the `serialize_as` wrapper
     // on the insert/update path. A `{encrypted}` DSL token here declares the same
@@ -327,6 +328,31 @@ pub fn plan_admin_with_options(
 /// # Errors
 /// Returns [`GenerateError`] when `project_root` isn't a valid project, or
 /// `name` fails validation.
+/// Refuse a `{translatable}` column (issue #1384), for the same reason
+/// `generate scaffold` does.
+///
+/// The admin emits a plain text control bound to the whole column and hands its
+/// string straight to `serde_json::from_value::<New{Model}>`. `Translated`
+/// deliberately refuses a bare string — accepting one would let a single-locale
+/// value replace the whole container — so every generated create and update
+/// would fail validation on a required field, and a value that *did* decode
+/// would wipe every other language. Editing translated content needs a
+/// per-locale editor, which is translation-workflow UI and out of scope here.
+fn reject_translatable_fields(fields: &[Field]) -> Result<(), GenerateError> {
+    let Some(field) = fields.iter().find(|f| f.is_translatable()) else {
+        return Ok(());
+    };
+    Err(GenerateError::Config(format!(
+        "a `{{translatable}}` field (`{}`) is not supported by `generate admin`: the generated \
+         admin binds one plain text control to the whole per-locale container, and `Translated` \
+         refuses a bare string — so create and update would fail validation, and a value that \
+         did decode would replace every other locale. Leave the column out of the admin field \
+         list, or write a per-locale editor: `record.available_locales(\"{}\")` and \
+         `record.set_{}(locale, value)` are generated for you.",
+        field.name, field.name, field.name
+    )))
+}
+
 pub fn plan_admin_destroy_fallback(project_root: &Path, name: &str) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     // Unlike `plan_admin_with_options`, this path has no model-file-exists
@@ -511,8 +537,19 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         FieldKind::F32 | FieldKind::F64 => "AdminFieldKind::Float",
         FieldKind::NaiveDateTime | FieldKind::DateTime => "AdminFieldKind::DateTime",
         // Bytea and Attachment both render as hidden in the admin panel —
-        // binary blobs and file metadata aren't suitable for direct inline editing.
-        FieldKind::Bytea | FieldKind::Attachment => "AdminFieldKind::Hidden",
+        // binary blobs and file metadata aren't suitable for direct inline
+        // editing. `position` (issue #1358) is hidden for a different
+        // reason: it is server-managed (the repository assigns and
+        // maintains it on insert/delete/move) and excluded from the
+        // generated `New*`/`Update*` structs entirely, so it is not
+        // directly editable either way.
+        // `commentable` (issue #1367) is hidden for the same reason as
+        // `position`: the framework maintains the comment counter inside each
+        // comment's own transaction, so an editable admin field would only
+        // ever let an operator desynchronise it from the comments table.
+        FieldKind::Bytea | FieldKind::Attachment | FieldKind::Position | FieldKind::Commentable => {
+            "AdminFieldKind::Hidden"
+        }
         // `json`/`jsonb` (issue #1341) uses the admin panel's existing
         // `AdminFieldKind::Json`: a monospace textarea whose submission is
         // coerced back to a real JSON value by `coerce_form_value` before the
@@ -585,6 +622,17 @@ fn is_update_writable(
         && !options.readonly.contains(&field.name)
         && !is_lock_version_field(field, lock_version_field)
         && !is_default_readonly(field)
+        // Issue #1358: `#[position]` excludes the column from both
+        // `New{Model}` and `Update{Model}` entirely (like `#[lock_version]`
+        // excludes its own column) — referencing `new_row.<position_field>`
+        // here would fail to compile.
+        && !field.kind.is_position()
+        // Issue #1367: the same reasoning, one field kind over. The
+        // `#[commentable]` counter is emitted `#[default]`, so it is absent from
+        // `New{Model}`/`Update{Model}` too, and `Patch::Set(new_row.comment_count)`
+        // would not compile. Hiding the control (see the `FieldKind` arm above)
+        // was only half of it: the control and the write path have to agree.
+        && !field.kind.is_commentable()
         && !matches!(field.kind, FieldKind::Bytea)
         // Issue #1340: an at-rest encrypted column is not updatable through the
         // admin. The plugin renders its edit control disabled and WITHOUT a
@@ -1433,6 +1481,27 @@ mod tests {
 
     // ── RED phase ──────────────────────────────────────────────────────────
 
+    /// #1384 (Codex round 4): the admin binds one plain text control to the
+    /// whole per-locale container and hands its string to
+    /// `serde_json::from_value::<New{Model}>`. `Translated` refuses a bare
+    /// string, so every generated create/update would fail validation — and a
+    /// value that did decode would replace every other locale.
+    #[test]
+    fn plan_admin_rejects_a_translatable_field() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   pub title: String,\n\
+            }\n";
+        let tmp = project_with_model_source("post", model_source);
+        let err = plan_admin(tmp.path(), "Post", &["title:String{translatable}".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+        assert!(err.contains("title"), "{err}");
+    }
+
     #[test]
     fn plan_admin_fails_when_not_in_project() {
         let tmp = TempDir::new().unwrap();
@@ -1703,6 +1772,62 @@ mod tests {
         assert!(admin.contains("..Default::default()"));
         assert!(admin.contains("let diesel_changeset = changes.__to_changeset()"));
         assert!(admin.contains(".set(&diesel_changeset)"));
+    }
+
+    #[test]
+    fn position_field_excluded_from_admin_update_body() {
+        // Issue #1358: `#[position]` excludes the column from `New{Model}`/
+        // `Update{Model}` entirely, the same way `#[lock_version]` does — a
+        // generated `new_row.rank`/`UpdatePost { rank: ... }` reference would
+        // fail to compile ("no field `rank` on type `NewTask`").
+        let tmp = project_with_model("task");
+        let plan = plan_admin(
+            tmp.path(),
+            "Task",
+            &["title:String".into(), "rank:position".into()],
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/task.rs")).unwrap();
+        assert!(
+            !admin.contains("new_row.rank") && !admin.contains("rank: Patch::Set"),
+            "a position field must never be referenced in the New/Update struct \
+             construction, both of which exclude it:\n{admin}"
+        );
+        assert!(
+            admin.contains("title: Patch::Set(new_row.title)"),
+            "the ordinary field must still be writable:\n{admin}"
+        );
+    }
+
+    #[test]
+    fn commentable_counter_excluded_from_admin_update_body() {
+        // Issue #1367: the `comments:commentable` counter is emitted
+        // `#[default]`, so it is absent from `New{Model}`/`Update{Model}` just
+        // like `#[position]` — and `Patch::Set(new_row.comment_count)` would
+        // fail to compile. Hiding the edit control was only half the fix; the
+        // control and the write path have to agree.
+        let tmp = project_with_model("post");
+        let plan = plan_admin(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "comments:commentable".into()],
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
+        assert!(
+            !admin.contains("new_row.comment_count")
+                && !admin.contains("comment_count: Patch::Set"),
+            "the commentable counter must never be referenced in the New/Update \
+             struct construction:\n{admin}"
+        );
+        assert!(
+            admin.contains("title: Patch::Set(new_row.title)"),
+            "the ordinary field must still be writable:\n{admin}"
+        );
     }
 
     #[test]

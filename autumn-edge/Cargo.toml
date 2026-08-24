@@ -1,0 +1,54 @@
+[package]
+name = "autumn-edge"
+description = "Edge WASM capsule runtime for autumn-web read-path routes"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/autumn-foundation/autumn"
+readme = "README.md"
+keywords = ["web", "wasm", "edge", "wasi", "axum"]
+categories = ["web-programming", "wasm"]
+
+[dependencies]
+# axum is pinned DIRECTLY rather than with `workspace = true`. The workspace pin
+# (`axum = { version = "0.8", features = ["macros", "ws"] }`) leaves axum's
+# default features on, which drags in hyper/tokio/http1 — none of which compile
+# for `wasm32-wasip1`. A `workspace = true` inherit is feature-ADDITIVE and
+# cannot turn a workspace dependency's default features back off, so the edge
+# crate declares the same 0.8 release line on its own with
+# `default-features = false`. Cargo still resolves both to one `axum 0.8.x` in
+# `Cargo.lock`; only the per-target feature set differs.
+autumn-macros = { version = "0.7.0", path = "../autumn-macros" }
+axum = { version = "0.8", default-features = false, features = ["json", "query"] }
+# Not pinned in `[workspace.dependencies]`; matches the `base64 = "0.22"` line
+# already used by `autumn`, `autumn-cli`, and `examples/todo-app`.
+base64 = "0.22"
+futures = { workspace = true }
+http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+# Pure-Rust WASM interpreter for the reference host behind the `host` feature.
+# Not pinned in `[workspace.dependencies]` because nothing else in the workspace
+# links it and the dependency is native-only (never compiled for wasm). MSRV
+# verified: wasmi 0.40 declares `rust-version = "1.86"`, below this workspace's
+# 1.88 floor. Licensed MIT OR Apache-2.0, matching the workspace policy.
+wasmi = { version = "0.40", optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default = []
+# Native-only reference host. NEVER enable this for a `wasm32-*` target: it is
+# the harness that *runs* capsules, not part of a capsule.
+host = ["dep:wasmi"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

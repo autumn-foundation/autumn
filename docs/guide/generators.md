@@ -10,6 +10,7 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate task`               | A one-off operational `#[task]` skeleton under `tasks/`                         |
 | `autumn generate job`                | A `#[job]` background-job handler with args struct, `registered_jobs()` aggregator, and `.jobs(…)` wiring in `src/main.rs` |
 | `autumn generate channel`            | A real-time broadcast channel over the `Channels` API — an htmx SSE live view by default, or a raw `#[ws]` handler with `--ws` |
+| `autumn generate webhook`            | A signature-verified, replay-protected inbound provider webhook (Stripe/GitHub/Slack/generic) — handler, event dispatch, `autumn.toml` endpoint config, and tests |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
 | `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |
 | `autumn generate admin`              | An `AdminModel` adapter for an existing model, wired to `autumn-admin-plugin`   |
@@ -80,6 +81,8 @@ set.
 | `post:references` | `i64`                           | `Int8`             | `BIGINT`            |
 | `slug:slug{from:title}` | `String`                  | `Text`              | `TEXT`              |
 | `config:json` *(or `jsonb`)* | `serde_json::Value`    | `Jsonb`             | `JSONB`              |
+| `rank:position` *(or `position{scope:col}`)* | `i64` (server-managed) | `Int8`  | `BIGINT`            |
+| `comments:commentable` | `i64` (server-managed `comment_count`) | `Int8` | `BIGINT`            |
 
 Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
@@ -851,6 +854,154 @@ transports), and assert `cargo check --tests` passes with no hand-editing —
 plus one gate that actually runs the generated smoke test with `cargo test`
 to confirm it passes on first run.
 
+## `autumn generate webhook`
+
+For inbound provider callbacks — Stripe payment events, GitHub push/CI events,
+Slack Events API, or any provider that signs its body with HMAC-SHA256. The
+generator wires up the shipped `SignedWebhook` extractor; it never hand-rolls
+signature verification.
+
+```bash
+autumn generate webhook stripe Payments
+```
+
+Produces:
+
+```
+src/webhooks/payments.rs   # POST /webhooks/stripe: verified handler, event dispatch, tests
+src/webhooks/mod.rs        # pub mod payments; (created or appended)
+src/main.rs                # mod webhooks; + routes![...] entry added in place
+autumn.toml                # [[security.webhooks.endpoints]] + replay backend + path exemptions
+Cargo.toml                 # serde_json + tracing, and the tokio test features
+```
+
+The handler takes the extractor and dispatches on the provider's event type,
+with clearly-marked stub functions to fill in and a default arm that
+acknowledges-and-ignores everything else (a 2xx stops the provider retrying an
+event the app does not handle):
+
+```rust,ignore
+#[post("/webhooks/stripe")]
+pub async fn payments_webhook(webhook: SignedWebhook) -> AutumnResult<Json<serde_json::Value>> {
+    let event: serde_json::Value = webhook.json::<serde_json::Value>().map_err(|error| {
+        AutumnError::bad_request_msg(format!("invalid stripe webhook payload: {error}"))
+    })?;
+    match webhook.event_type().unwrap_or("unknown") {
+        // TODO: fill this in
+        "payment_intent.succeeded" => on_payment_intent_succeeded(&event).await?,
+        // …one arm and one `on_*` stub function per preset event…
+        _ => tracing::debug!(event_type, "unhandled webhook event — acknowledged and ignored"),
+    }
+    Ok(Json(serde_json::json!({ "received": true })))
+}
+```
+
+Provider presets (`stripe`, `github`, `slack`, `generic`) map onto
+`WebhookProvider` and pick the route path, signature/event/delivery headers,
+and the stub event arms. The Slack preset also unwraps the Events API
+`event_callback` envelope — `event_type()` reports the envelope type, not the
+inner event — and answers Slack's `url_verification` handshake by echoing the
+challenge. `generic` covers any other provider: raw-body HMAC-SHA256 with
+`X-Webhook-Signature`/`X-Webhook-Event`/`X-Webhook-Delivery`.
+
+The `autumn.toml` block references the signing secret by environment variable
+(`secret_env`) — a plaintext secret is never written — and turns replay
+protection on:
+
+```toml
+[[security.webhooks.endpoints]]
+name = "payments"
+path = "/webhooks/stripe"
+provider = "stripe"
+secret_env = "STRIPE_WEBHOOK_SECRET"
+previous_secret_envs = []      # add the old variable here during rotation
+replay_protection = true
+```
+
+That block is all the wiring the endpoint needs. Autumn installs the webhook
+registry from `[security.webhooks]` at startup, and derives the endpoint's CSRF,
+submit-token, and CAPTCHA path exemptions from the same block on every boot — a
+provider callback carries no browser session, and its signature is its
+authentication — so the generator deliberately writes **no** `exempt_paths`
+copies that could go stale when the path changes.
+
+`[security.webhooks.replay]` is written explicitly, with guidance to switch to
+Redis: production config validation rejects the process-local `memory` backend
+for replay-protected endpoints, so a deployed app must configure Redis (which
+needs `autumn-web`'s `redis` feature).
+
+The generator then prints the remaining steps: set the secret env var (the app
+refuses to start while a configured endpoint has none), point the provider
+dashboard at the path, fire a test delivery locally with `autumn webhook sim`,
+and fill in the `on_*` stubs.
+
+Useful flags:
+
+```bash
+# A second Stripe endpoint (two endpoints on one path fail config validation):
+autumn generate webhook stripe Billing --path /webhooks/stripe-billing
+
+# A distinct secret variable per endpoint:
+autumn generate webhook generic Partner --secret-env PARTNER_WEBHOOK_SECRET
+
+# Print the plan without writing:
+autumn generate webhook stripe Payments --dry-run
+```
+
+Fire a signed test delivery at the running app without touching the provider —
+same four presets, and a fresh delivery id per call (for Stripe and Slack, whose
+replay key lives in the body, the simulator rewrites that field before signing,
+so repeated runs are new deliveries rather than `409 Conflict` replays):
+
+```bash
+autumn webhook sim stripe http://localhost:3000/webhooks/stripe \
+  --secret "$STRIPE_WEBHOOK_SECRET" \
+  --payload '{"id":"evt_1","type":"payment_intent.succeeded"}'
+
+# GitHub and generic carry the event type in a header, so name it explicitly —
+# the simulator's default (`sim.event`) matches no generated arm:
+autumn webhook sim github http://localhost:3000/webhooks/github \
+  --secret "$GITHUB_WEBHOOK_SECRET" \
+  --payload '{"ref":"refs/heads/main"}' --event push
+```
+
+The printed command targets a generated stub arm, so a filled-in handler
+actually runs rather than falling through to acknowledge-and-ignore. A `409
+Conflict` on a repeat run is replay protection doing its job: for the
+header-signed providers the endpoint also keys on the signature, so a
+byte-identical payload is a duplicate delivery — vary `--payload`, or restart
+the app to clear an in-memory replay store.
+
+The generated `#[cfg(test)]` module is a real assertion, not a stub: it signs a
+fixture delivery the way the provider does and asserts a valid signature is
+accepted (200), a missing signature header is rejected (400 — the request is
+malformed), a well-formed but wrong signature is rejected (401), and a replayed
+delivery id is rejected (409). No Postgres or Docker required, so it runs on
+every `cargo test`.
+
+Re-running with `--force` and a different `--path`/`--secret-env` updates the
+existing endpoint block in place rather than leaving a stale one behind (the
+registry matches paths exactly, so a stale path would 500 every real delivery).
+
+`autumn destroy webhook <provider> <Name>` removes the handler, its route
+registration, and its `autumn.toml` block — including the shared replay block
+once the last endpoint is gone. A `--path`/`--secret-env` used at generation
+time does not have to be repeated: destroy recovers both from the endpoint block
+recorded under the same name (an explicit flag still wins). Config you have since edited by hand (rotation
+variables in `previous_secret_envs`, a tightened `timestamp_tolerance_secs`, a
+Redis replay backend) is left in place rather than deleted.
+
+### Slow live webhook verification
+
+```bash
+cargo test -p autumn-cli --test generate generated_webhook_cargo_checks -- --ignored --exact
+cargo test -p autumn-cli --test generate generated_webhook_tests_pass -- --ignored --exact
+```
+
+These scaffold a fresh project, generate all four presets, and assert `cargo
+check --tests` passes with no hand-editing — plus one gate that actually runs
+the generated tests to confirm they pass on first run.
+
 ## `autumn generate scaffold`
 
 Everything `model` produces, plus:
@@ -1095,6 +1246,138 @@ no routes file, so there is no form to be inconsistent with, and
 editable, reusable slug rather than the primary key, so
 `WHERE slug = … AND lock_version = …` does not identify a stable row.)
 
+### Threaded comments on anything with `commentable`
+
+Declare a field with the `commentable` type and the scaffold wires a threaded,
+**polymorphic** comment system (issue #1367) — one `comments` table that
+attaches to *any* number of models — with **zero hand-written comment routes,
+queries, or threading SQL**:
+
+```bash
+autumn generate scaffold Post title:String comments:commentable
+```
+
+- The token names the *feature*, not the column. The column it adds is the
+  counter-cache source, normalised to `{singular}_count` — `comments:commentable`
+  → `comment_count BIGINT NOT NULL DEFAULT 0`. Like `position`, it is
+  server-managed: excluded from `NewPost`/`UpdatePost` and from the generated
+  create/edit form, because the framework maintains it inside each comment's
+  own transaction.
+- A **second migration** creates the shared
+  `comments(commentable_type, commentable_id, parent_id, author_id, body,
+  created_at, deleted_at)` table, with an index covering the thread read and
+  another for the delete cascade. It is emitted **once per project**: run the
+  same token on a second model and the generator reuses the existing table and
+  says so.
+- The **model** gets `#[commentable(by = User, counter_cache = comment_count)]`
+  — `by` only when the project actually has a `User` model, since naming a
+  missing one would be a compile error in a file you did not write. That
+  attribute is what brings `add_comment` / `comment_thread` / `delete_comment`
+  onto the generated repository and registers the model with the framework's
+  comment router.
+- **No comment routes are generated at all.** Mount the framework's once:
+
+  ```rust
+  .nest("/comments", autumn_web::commentable::router(Default::default()))
+  ```
+
+  and render a thread with `autumn_web::widgets::comment_thread`. Adding a
+  third commentable model needs no change there.
+
+At most one `commentable` field per model, and it takes no `{…}` modifiers —
+everything else is configured on the model's `#[commentable(...)]` attribute.
+See [Threaded Comments on Anything](commentable.md) for the full option list.
+
+### User-orderable lists with `position`
+
+Declare a field with the `position` type and the scaffold wires a
+transaction-safe, race-safe reorderable list (issue #1358) — todo
+priorities, kanban columns, playlist tracks, form-builder fields — with
+**zero hand-written reindexing SQL**:
+
+```bash
+autumn generate scaffold Todo title:String rank:position
+```
+
+- The **column name is yours** (`rank` above) — `position` is the *type*
+  token, parsed the same way `String`/`i64`/`references` are; the field
+  itself is server-managed, like `lock_version`.
+- The **model** gets `#[position]`, so the column is excluded from
+  `NewTodo`/`UpdateTodo` entirely: a create/update payload can never set it
+  directly, which is what keeps the contiguous ordering from being hand-
+  edited into an inconsistent state.
+- The **migration** declares it `BIGINT NOT NULL DEFAULT 0` plus an index,
+  and adds two database triggers (issue #1358's "handle every insert/delete
+  path, not just the generated repository's" requirement):
+  - an insert trigger assigns the next contiguous value (`MAX(position) +
+    1`, or `0` for the first row) — every new row appends to the end of its
+    list;
+  - a delete trigger (and, under `--soft-delete`, a soft-delete trigger)
+    compacts the remaining rows so no gap is left.
+
+  The column's own `DEFAULT 0` is a placeholder only, immediately corrected
+  by the trigger inside the same statement/transaction as the insert — it
+  is never visible to a concurrent reader.
+- The **repository** (`#[repository(Todo, position(column = "rank"))]`)
+  gains five methods, each `O(rows shifted)` and transaction-safe:
+
+  ```rust,ignore
+  repo.move_to(id, 3).await?;        // absolute index, clamped to [0, len-1]
+  repo.move_before(id, other_id).await?;
+  repo.move_after(id, other_id).await?;
+  repo.move_up(id).await?;           // one step toward index 0 (no-op at the start)
+  repo.move_down(id).await?;         // one step away from index 0 (no-op at the end)
+  ```
+
+  `move_to` locks every row in the list (ordered by `id` — a fixed lock
+  order, so two concurrent moves on the same list serialize against each
+  other's first lock rather than deadlock), re-derives the row's current
+  position under that lock (a prior mover may have shifted it), clamps the
+  target, then shifts only the rows strictly between the old and new
+  position before setting this row's — never a full-table rewrite. This is
+  what makes the ordering safe under concurrent reorders: two browser tabs
+  dragging different rows at once still leave a valid, gapless `0..len-1`
+  permutation.
+- The **HTML index** orders by the position column and renders no-JS
+  **Move up / Move down** buttons per row — small `POST` forms, CSRF- and
+  one-time-submit-token-protected like the trash view's Restore button, so
+  a reorderable list works with JavaScript disabled.
+
+Scope the ordering to a parent with `{scope:col}` — a separate contiguous
+`0..len-1` sequence per distinct value of that column, so reordering one
+board's tasks never touches another board's:
+
+```bash
+autumn generate scaffold Task title:String board:references rank:position{scope:board_id}
+```
+
+The scope column must already be a `references` foreign key (the DSL
+rejects any other kind), and the migration's index becomes composite
+— `(board_id, rank)` — since every real query filters by scope first.
+
+**At most one `position` field per model.** `--default rank=<n>` is
+refused — a constant default would give every new row the same value,
+which is exactly the invariant this feature exists to maintain (compare
+`lock_version`, where a constant default is correct).
+
+**Not yet wired:** `tenant_scoped`, `versioned = true`, and `dependent(...)`
+repositories — `position(...)` is refused up front in combination with any
+of them (matching `retention(...)`'s own posture on the same three). A
+`--sharded` scaffold gets the column, migration triggers, and `#[position]`
+attribute, but no `move_*` methods and no HTML buttons — a move only
+reaches the pool/shard it happens to be given, so
+`#[repository(..., sharded)]` rejects `position(...)` outright; the
+generator prints a warning explaining why. `--api`/`--live`/
+`--live-validation`/owner-scoped scaffolds keep the `move_*` methods (and,
+for `--api`, the ordered data) but not the HTML buttons — reordering there
+needs a hand-written endpoint or client-side call against the repository
+method directly.
+
+**Restoring a soft-deleted row** does not renumber it back into the live
+sequence — it keeps the stale position it had when deleted, which can now
+collide with a position a live row has since taken. Out of scope for this
+slice; call `move_to` after restoring if you need it placed precisely.
+
 ### Export CSV from the list view
 
 Every standard HTML scaffold's index also ships a working **Export CSV**
@@ -1223,6 +1506,192 @@ Bulk restore/purge, retention/auto-purge scheduling, and cascading
 restore across associations are deliberately out of scope; compose them
 with the bulk-actions widgets, `#[scheduled]`, and your own policy.
 
+### Translatable views (`--i18n`)
+
+Autumn ships the whole Fluent stack — the `t!(locale, "key")` macro with
+compile-time key validation, `Locale::t()`, the `i18n/<tag>.ftl`
+convention, fallback chains, and an `Accept-Language` `Locale` extractor
+(see [i18n](./i18n.md)). `--i18n` is what wires the scaffold into it
+(issue #1349), so a generated resource is translatable the moment it
+exists instead of needing every English string hand-replaced:
+
+```bash
+autumn generate scaffold Post title:String body:Text published:bool --i18n
+```
+
+- Every user-facing string in the generated views — page titles, `h1`
+  headings, buttons, links, index column headers, show-page property
+  labels, form control labels, enum options and select placeholders,
+  empty-state copy, the delete-confirm prompt, and the one-shot flash
+  notices — is emitted as a `t!(locale, "key")` lookup instead of a
+  literal. That includes the labels the shared widgets supply by default:
+  the pager's Previous/Next, the bulk-delete button, the purge dialog's
+  Cancel. A nullable `bool` is covered too — the form derive fills its
+  tri-state select with a hardcoded `— Unset —`/`Yes`/`No`, and the
+  generated `override_field` replaces those with `common.select.unset` /
+  `common.yes` / `common.no` while keeping the submitted values. An
+  `Attachment` column's meta line beside the download link is one
+  pattern rather than a stray translated word — `common.attachment.meta =
+  ({ $media }, { $size } bytes)` — so the media type and byte count
+  interpolate as arguments and a translator owns the parentheses, the comma
+  and the unit noun.
+- **Two widgets are not covered yet**, both because they build their text
+  inside autumn-web from arguments that carry no label seam. A `richtext`
+  column's field label translates, but `rich_text_area`'s own chrome — the
+  toolbar's group label and per-control names, the "Markdown supported…"
+  hint, and the preview heading — stays English; and a `:states(…)` column's
+  `transition_controls` keeps its `Mark as …` buttons and `… transitions`
+  group label in English. Unlike the pager and bulk-delete widgets, these
+  two are free functions with no label setters to call, so covering them
+  needs new autumn-web API (a label per transition edge, and per toolbar
+  control). Scaffolding either column with `--i18n` warns and names it,
+  rather than leaving you to find it in the browser.
+- **Validation messages stay English.** A field label translates; the
+  inline error under it after a rejected submission does not.
+  `#[validate(...)]` accepts a `message`, but `validator` takes it as a
+  compile-time literal, so a runtime lookup cannot go there — and a rule
+  with no message renders as `validation failed: <code>`. Reaching these
+  means mapping error *codes* to lookups before the changeset is built,
+  and that conversion happens inside autumn-web, so it needs a seam there
+  rather than a generator change. Scaffolding with `--validate` under
+  `--i18n` warns.
+- Each view-rendering handler takes the `Locale` extractor as its **first**
+  parameter (`Locale` is a `FromRequestParts` extractor, and axum requires
+  the one body-consuming argument to stay last).
+- `i18n/en.ftl` is created — or merged into, if it already exists — with
+  every key the views reference and **only** those, valued with the English
+  the plain scaffold renders. So an `en` app looks exactly like a
+  non-`--i18n` one, adding French means translating that file rather than
+  editing Rust, and `autumn i18n check --strict` passes on the result: no
+  key referenced without a definition, and no definition nobody references.
+- The project is wired so those lookups actually resolve: autumn-web's
+  `i18n` feature is enabled, `[i18n] default_locale = "en"` is added to
+  `autumn.toml` if it has no `[i18n]` block, and `.i18n_auto()` goes into
+  the `AppBuilder` chain in `main.rs`.
+
+Keys are split so a translator sees each string exactly once:
+
+| Kind | Examples | Written |
+| ---- | -------- | ------- |
+| Shared chrome | `common.create`, `common.save`, `common.back`, `common.edit`, `common.delete`, `common.show`, plus the widget defaults `common.pagination` / `common.previous` / `common.next` / `common.delete.selected` | Once per project, under one header. A second resource reuses the block rather than duplicating it per model. |
+| This resource's strings | `post.new`, `post.name.plural`, `post.index.title`, `post.index.empty`, `post.show.title`, `post.edit.title`, `post.delete.confirm`, `post.field.<column>`, `post.flash.*` | Once per resource, under a marked comment block. |
+
+**What interpolates and what does not.** A row key or a count travels as a
+Fluent argument, so a translation can *position* it: `post.show.title =
+Post #{ $id }`, `post.flash.bulk_deleted = Deleted { $count } posts`.
+Positioning is all it can do — see the pluralization limit below. The
+model's **name** never does. `New { $resource }` would look like tidy
+reuse, but it hands the translator a sentence whose article and adjective
+must agree with a noun they cannot see — French *Nouveau*/*Nouvelle*,
+German *Neuer*/*Neue*/*Neues*, case inflection in Slavic languages. So
+"New Post" is a per-resource key (`post.new`), which costs one line in the
+bundle and is actually translatable.
+
+Notes and limits:
+
+- **One key per field, three surfaces.** `post.field.title` labels the
+  index column header, the show-page property row, and the form control
+  alike, so one translation serves all three. The English value is the
+  Title Case the form derive already uses, which means a **multi-word**
+  column's show-page label normalizes from "Author name" to "Author Name"
+  under `--i18n`. Single-word columns are unaffected.
+- **`{ $count }` positions a number; it does not pluralize.** The bundle
+  loader substitutes `{ $name }` placeables and nothing else — Fluent
+  selectors (`{ $count -> [one] … *[other] … }`), terms and `NUMBER()` are
+  carried through as literal text, not evaluated (`autumn/src/i18n.rs`).
+  So `post.flash.bulk_deleted` can put the count wherever a language needs
+  it, but a translator cannot vary the noun with it, and a language with
+  more than two plural categories — Russian, Polish, Arabic — has no form
+  that is right for every value. Write the value so it reads acceptably for
+  any count ("Deleted: { $count }"), or handle the plural in application
+  code and pass the finished string. Lifting this needs selector support in
+  the loader, which is framework work rather than something the generator
+  can emit around.
+- **Re-running never clobbers a translation.** An existing value is left
+  exactly as edited, and a new key from a later run lands inside its
+  resource's block rather than at the end of the file. A `--force`
+  regeneration that *drops* a field or a flag also prunes the keys for
+  those surfaces — nothing references them any more, so `autumn i18n check
+  --strict` would fail on them — while carrying over the values, comments,
+  and blank lines of the keys that remain. The shared chrome is never
+  pruned this way: another resource may still be using it.
+- **The bundle `t!` validates against is kept in step.** `t!`'s
+  compile-time key check does not read `autumn.toml`. It opens
+  `AUTUMN_I18N_FILE`, or else `i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl` with
+  the locale defaulting to `en`, and degrades to a runtime lookup only when
+  that file is absent. So if your project has such a bundle *and* a
+  different default locale, the generator writes the same English into both;
+  otherwise `cargo check` would fail with a `compile_error!` per lookup. The
+  path is resolved the way the macro resolves it, including an `[env]` table
+  in the project's own `.cargo/config.toml` — which is where a setting every
+  build needs usually lives.
+- **Keys go to the bundle the app actually reads.** A project whose
+  `autumn.toml` says `default_locale = "fr"` and `dir = "translations"`
+  gets `translations/fr.ftl`, because that is what its lookups resolve
+  through — in any of TOML's spellings (`[i18n]`, `i18n = { … }`, or
+  `i18n.default_locale = …`). Only a project that configures no i18n at all
+  gets a block written for it (`default_locale = "en"`, `i18n/`).
+- **Profile overlays are reported, not guessed at.** `[profile.prod.i18n]`
+  can repoint `dir`/`default_locale`, and the app resolves the layered
+  config at startup — so the generator writes the *base* bundle and warns
+  which other path a deploy will actually read. Writing English into a
+  profile that exists precisely because it serves another locale would be
+  its own bug.
+- **An app that installs its own bundle keeps it.** A `main.rs` calling
+  `.i18n(my_bundle())` — embedded files, a translation-management service,
+  memory — is left alone, and the generator warns that the keys it just
+  wrote to disk will not reach that bundle.
+- **`--embed` builds get the bundle too.** `.i18n_auto()` loads from disk,
+  so an `autumn build --embed` binary would not be self-contained without
+  it: the generator adds the same `EMBEDDED_LOCALES` static and
+  `.embedded_locales(...)` call (behind `embed-assets`) that `autumn new
+  --with-i18n` emits.
+- **The Docker image gets the bundle.** `.i18n_auto()` reads the default
+  locale's file at startup and *panics* if it is missing, so the generator
+  adds a `COPY` for the configured bundle directory to both stages of a
+  generated `Dockerfile`.
+- **`autumn destroy scaffold … --i18n`** removes that resource's marked key
+  block — the header, everything down to its `# — end <Model> —` marker
+  (so a blank line or a note you leave among the keys does not move the
+  boundary), and nothing outside it, so a hand-authored
+  `post.email.subject` of your own survives —
+  and leaves the file, the `i18n` feature, `[i18n]`, and `.i18n_auto()` in
+  place, since those are project-level and shared. The `common.*` chrome
+  survives as long as another `--i18n` resource still references it; when
+  the last one goes, so does the chrome, keeping `autumn i18n check
+  --strict` green.
+- **Composes with** `--searchable`, `--soft-delete`, `--sharded`, and the
+  CSV export — the strings those surfaces add (search box and its
+  placeholder, Trash/Restore/Purge, "Export CSV", empty-state copy, the
+  bulk-delete button) are translated too. `--api` renders no labels, so the
+  flag is a no-op there: the output is byte-identical and no `.ftl` is
+  written.
+- **Refused with** `--live`, `--live-validation`, and `--belongs-to`. The
+  first two render list rows and inline-validation fragments outside any
+  request (so there is no `Locale` in scope), and the third splices markup
+  into the *parent* resource's already-generated `show` handler, whose
+  signature this generator does not own. Half-translated views under a flag
+  that promises translatable output are worse than a refusal, so the
+  generator says so and writes nothing. The nesting refusal follows the
+  *relationship*, not the flag: `--belongs-to` is typed once, so a later
+  `generate … --force --i18n` that omits it is still refused, naming the
+  parent routes file the nesting was recovered from. `autumn destroy
+  scaffold` that child first (it removes the parent-side section) to
+  scaffold it flat with `--i18n`. A resource named `Common` is refused too —
+  its keys would collide with the shared chrome namespace.
+- **Without `--i18n`, output is byte-for-byte unchanged.** The default
+  scaffold stays zero-i18n-config.
+
+One thing is deliberately **not** translated: the `UNIQUE_CONSTRAINTS`
+table's `"has already been taken"`. It is a `const`, so it cannot hold a
+runtime lookup, and it is a validation message — which the issue scopes
+out alongside the framework's own error pages.
+
+Translating the framework's own strings (error pages, validation
+messages), locale-prefixed routing ([#1251](./i18n.md)), missing/unused
+key linting (`autumn i18n check`), and machine-translating non-English
+`.ftl` files are all out of scope here.
+
 Metadata flags let you keep common model and repository polish in the
 generation step:
 
@@ -1244,6 +1713,7 @@ autumn generate scaffold Bookmark url:String title:String tag:String alive:bool 
 | `--default FIELD=VALUE` | Adds `#[default]` and a SQL `DEFAULT` for bool, string/text, integer, and float fields. `i32` defaults must fit PostgreSQL's `INTEGER` range. Defaulted fields are omitted from generated HTML forms and update columns because the model macro keeps them out of `NewX`. |
 | `--query METHOD:FIELD` | Adds a derived repository method such as `find_by_tag(tag: String) -> Vec<Model>`. The `find_by_` suffix must match `FIELD`. |
 | `--api` | Generates a JSON API-only scaffold (skips HTML routes/templates, registers 5 REST JSON routes, and generates a JSON-based smoke test). |
+| `--i18n` | Emits translatable views: every view string becomes a `t!(locale, "key")` lookup, view handlers take the `Locale` extractor, and `i18n/en.ftl` is back-filled with the English. See [Translatable views](#translatable-views---i18n). |
 
 | Generated file                        | Existing concept it maps to                                                                |
 | ------------------------------------- | ------------------------------------------------------------------------------------------ |

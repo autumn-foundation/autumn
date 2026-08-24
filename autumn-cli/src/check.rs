@@ -601,7 +601,7 @@ fn attr_value(tag: &str, attr: &str) -> Option<String> {
     None
 }
 
-fn attr_boundary_before(bytes: &[u8], pos: usize) -> bool {
+const fn attr_boundary_before(bytes: &[u8], pos: usize) -> bool {
     pos == 0 || bytes[pos - 1].is_ascii_whitespace() || matches!(bytes[pos - 1], b'<' | b'/')
 }
 

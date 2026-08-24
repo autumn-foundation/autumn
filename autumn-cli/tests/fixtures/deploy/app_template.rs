@@ -25,6 +25,12 @@ fn main() {
         // DB-free app: migrations are a no-op. Exit 0 so `systemd-run --wait`
         // sees success and the deploy proceeds to the readiness gate.
         println!("migrate: no-op (version {VERSION})");
+        // Drop a marker NEXT TO the release binary so the harness can prove over
+        // real ssh that the pre-cutover migrate one-shot really ran for THIS
+        // release — including on the very first deploy (issue #1607, AC-3).
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::fs::write(exe.with_extension("migrated"), VERSION);
+        }
         return;
     }
     let host = std::env::var("AUTUMN_SERVER__HOST").unwrap_or_else(|_| "127.0.0.1".to_string());

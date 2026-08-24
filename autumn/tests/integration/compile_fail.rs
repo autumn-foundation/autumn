@@ -25,6 +25,19 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/static_get_params_no_placeholders.rs");
     t.compile_fail("tests/compile-fail/static_get_seo_unknown_key.rs");
 
+    // Edge-lane refusals (#1790). Always available: `#[edge]` is re-exported
+    // unconditionally (a route can be *marked* without the `edge` feature), and
+    // each of these is rejected inside the route macro before any code is
+    // emitted, so the fixtures never name `autumn_edge` and compile the same way
+    // with or without the feature. The edge lane is read-path only, carries no
+    // session or auth state, and adds nothing to a page that is already
+    // pre-rendered CDN-side.
+    t.compile_fail("tests/compile-fail/edge_on_post.rs");
+    t.compile_fail("tests/compile-fail/edge_with_secured.rs");
+    t.compile_fail("tests/compile-fail/edge_with_intercept.rs");
+    t.compile_fail("tests/compile-fail/edge_with_extension.rs");
+    t.compile_fail("tests/compile-fail/edge_on_static_get.rs");
+
     // Lifecycle macro failures (always available — the `lifecycle` macro is not
     // feature-gated). Firing an undeclared transition, leaving a terminal
     // state, starting from a non-initial state, or naming an unknown initial
@@ -45,6 +58,26 @@ fn compile_fail_tests() {
     // override collide on their target-derived mutation helpers (#1785).
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_m2m_helper_collision.rs");
+
+    // `#[commentable]` compile-time guards (#1367). The counter is maintained
+    // with `SET c = c + 1` and read back as `i64`, `commentable_id` is one
+    // column, the emitted `{Model}Comments` trait can only exist once, and the
+    // depth cap has to stay measurable by the runtime's recursive probe — each
+    // is a directed error rather than a runtime surprise.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_missing_counter_column.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_counter_not_i64.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_duplicate.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_composite_key.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_max_depth_too_large.rs");
+    // `author_id` is `i64` everywhere in the comments API, so a non-integer
+    // author key is a compile error rather than a 401 from every POST.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_author_key_not_integer.rs");
 
     // Declarative reactions (#1362): every `#[votable(...)]` misuse is a
     // directed compile error rather than a runtime surprise on the first vote.

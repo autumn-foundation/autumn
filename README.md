@@ -33,7 +33,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 
 ```bash
 # Install the published CLI
-cargo install autumn-cli --version 0.6.0
+cargo install autumn-cli --version 0.7.0
 
 # Local development only, from an Autumn checkout:
 # cargo install --path autumn-cli
@@ -81,7 +81,7 @@ Prefer a manual download? Grab the tarball plus its `.sha256`:
 - Latest: `https://github.com/autumn-foundation/autumn/releases/latest/download/autumn-<target>.tar.gz`
 - Pinned: `https://github.com/autumn-foundation/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
 
-where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.6.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
+where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.7.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
 
 ### Install a prebuilt binary (Windows)
 
@@ -232,6 +232,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 
 ## Documentation
 
+- [**What's new in 0.7.0**](docs/releases/0.7.0.md) — a walkthrough of the release: host-preparing deploys and fleets, deterministic simulation testing, the new model attributes, failure-capsule replay, and a request path that allocates ~59% less
 - [Getting Started Guide](docs/guide/getting-started.md)
 - [Authentication](docs/guide/authentication.md) — sessions, password policy, login/logout, `#[secured]`, lockout, and remember-me; the hub that links OAuth, step-up, and MFA
 - [Dev-Loop Latency Budget](docs/guide/dev-loop-latency.md) — p50/p95/max budgets per change class, measurement methodology, and CI gates for `autumn dev`
@@ -243,6 +244,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [One-Off Tasks](docs/guide/tasks.md) - `#[task]`, `one_off_tasks![]`, and `autumn task`
 - [Embedded Clustering](docs/guide/clustering.md) — zero-dependency two-node clustering: `[cluster]` config, authenticated gossip membership, the cluster-wide CRDT counter via `ClusterHandle`, and the `cluster:membership` health indicator
 - [Multi-Replica Scheduled Tasks](docs/guide/scheduled-multi-replica.md) - `#[scheduled]` with Postgres advisory-lock coordination
+- [Fleet Deploys](docs/guide/fleet-deploys.md) — `[deploy] hosts`: `autumn deploy up` rolls a release across several VPS hosts one at a time (per-host blue/green, migrations exactly once, halt-and-roll-back on failure), plus `deploy status` drift detection, fleet maintenance, and the load-balancer contract
 - [Data-Retention Sweeps](docs/guide/retention-sweeps.md) — `retention(...)` on `#[repository(...)]`: batched, soft-delete-aware, fleet-coordinated auto-purge, plus `autumn retention --dry-run`
 - [Horizontal Sharding](docs/guide/sharding.md) — `[[database.shards]]`, slot-based routing, `ShardedDb`/`Shards` extractors, per-shard health and migrations
 - [Per-Tenant Memory Cells](docs/guide/tenant-cells.md) — `TenantCell` byte accounting with the `tenancy.quota_bytes` soft quota and deterministic per-tenant eviction
@@ -255,14 +257,17 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Logging & PII](docs/guide/logging-pii.md)
 - [Failure Capsules](docs/guide/failure-capsules.md) — `[failure_capture]` records a failing request, its database traffic and its clock reads as one replayable file; `autumn replay` re-runs it offline
+- [Edge Capsules](docs/guide/edge.md) — `#[edge]` compiles read-path routes into a portable `wasm32-wasip1` artifact a CDN can run, byte-identical to the origin and falling back to it for anything the edge cannot serve (experimental)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
 - [Autumn Harvest Architecture Notes](docs/autumn-workflow-architecture.md)
 - [API Reference](https://docs.rs/autumn-web)
 - [Pre-rendering Design Notes](docs/design/hybrid-rendering.md)
 - [Stability Policy](STABILITY.md) — SemVer, MSRV, and migration commitments
+- [Upgrading](docs/guide/upgrading.md) — `autumn upgrade` applies each release's mechanical API migrations to your own code after showing you the diff; everything it cannot safely rewrite is listed with `file:line` and a guide link
 - [Transition effects](docs/guide/transition-effects.md) — per-edge `on` / `on_commit` side effects on `#[state_machine]` transitions.
 - [Counter Caches](docs/guide/counter-cache.md) — `#[belongs_to(Post, counter_cache)]` keeps `posts.comment_count` current atomically, in the same transaction, with an idempotent `recompute` for drift
 - [Votes, Likes and Reactions](docs/guide/votable.md) — `#[votable(by = ..., aggregate = sum|count)]`, the race-safe `react()` / `reaction_of()` helpers, and the no-JS `reaction_controls` widget
+- [Threaded Comments on Anything](docs/guide/commentable.md) — `#[commentable]`, the polymorphic `(commentable_type, commentable_id)` association, `add_comment()` / `comment_thread()` / `delete_comment()`, the registry-driven comment router, and the no-JS `comment_thread` widget
 
 ## Stability
 

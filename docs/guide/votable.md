@@ -42,7 +42,7 @@ already has. Nothing extra to enable:
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.6", features = ["maud"] }
+autumn-web = { version = "0.7", features = ["maud"] }
 ```
 
 The `maud` feature is only needed for the widget half; the `react()` /

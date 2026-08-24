@@ -18,6 +18,7 @@ mod dev;
 mod dev_loop_bench;
 mod dev_loop_scaling;
 mod doctor;
+mod edge_scan;
 mod experiments;
 mod export;
 mod flags;
@@ -52,6 +53,7 @@ mod task;
 mod test_cmd;
 mod text_width;
 mod token;
+mod upgrade;
 mod webhook;
 /// Subcommands for `autumn check`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
@@ -256,6 +258,38 @@ struct Cli {
     command: Commands,
 }
 
+/// Arguments for [`Commands::Upgrade`].
+///
+/// A separate `Args` struct rather than inline variant fields, deliberately.
+/// clap's derive builds every inline field of every variant inside one
+/// `Commands::augment_subcommands` frame, and with this many subcommands that
+/// frame is within a kilobyte of libtest's 2 MiB thread stack — close enough
+/// that a codegen difference between two rustc builds decides whether the
+/// argument-parsing tests overflow. An `Args` struct moves this command's share
+/// into `UpgradeArgs::augment_args`, which gets its own frame and pops.
+#[derive(clap::Args, Debug)]
+struct UpgradeArgs {
+    /// Project directory to migrate (defaults to the current directory).
+    #[arg(value_name = "PATH", default_value = ".")]
+    path: String,
+    /// Release this app is upgrading from. Defaults to the `autumn-web`
+    /// requirement recorded in the project's `Cargo.toml`.
+    #[arg(long, value_name = "VERSION")]
+    from: Option<String>,
+    /// Release to upgrade to. Defaults to this CLI's own version.
+    #[arg(long, value_name = "VERSION")]
+    to: Option<String>,
+    /// Write the rewrites. Without it the command only previews them.
+    #[arg(long)]
+    apply: bool,
+    /// Emit the machine-readable report instead of the human one.
+    #[arg(long)]
+    json: bool,
+    /// List the shipped app-code migrations and exit without scanning.
+    #[arg(long = "list-migrations")]
+    list_migrations: bool,
+}
+
 /// Available subcommands.
 #[derive(Subcommand)]
 enum Commands {
@@ -324,6 +358,13 @@ enum Commands {
         /// `autumn-web/managed-pg-bundled` are active throughout all build steps.
         #[arg(long, value_name = "FEATURES")]
         features: Option<String>,
+        /// Also compile the `#[edge]` routes into a `wasm32-wasip1` edge
+        /// capsule. Release builds do this automatically when the project has
+        /// `#[edge]` routes; pass `--edge` to build it from a `--debug` build
+        /// too (the capsule itself is always compiled in release profile).
+        /// Errors when the project has no `#[edge]` routes.
+        #[arg(long)]
+        edge: bool,
     },
     /// Start the dev server with hot reload (watch mode)
     Dev {
@@ -373,6 +414,28 @@ enum Commands {
         #[command(subcommand)]
         action: AssetsCommands,
     },
+    /// Apply a release's mechanical app-code migrations to your own source.
+    ///
+    /// For each release between the `autumn-web` version this app records and
+    /// the target, `autumn upgrade` applies that release's machine-applyable
+    /// migrations -- today, API renames -- to the app's own Rust code.
+    ///
+    /// It writes nothing by default: a bare `autumn upgrade` prints a per-file
+    /// diff plus a count of affected sites, and `--apply` is the explicit write
+    /// step. Anything it cannot safely rewrite (a call site inside a macro
+    /// invocation, or a change with no mechanical form) is listed with its
+    /// location and a link to the guide section, never guessed at.
+    ///
+    /// Run it BEFORE bumping the `autumn-web` dependency: the release it
+    /// migrates *from* is the one the project manifest records. If the bump
+    /// already happened, pass `--from <previous-version>`.
+    ///
+    ///   autumn upgrade                     # preview
+    ///   autumn upgrade --apply             # write the rewrites
+    ///   autumn upgrade --list-migrations   # what ships today
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Upgrade(UpgradeArgs),
     /// Run or inspect database migrations
     Migrate {
         #[command(subcommand)]
@@ -778,19 +841,42 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Release(ReleaseCommands),
 
-    /// Push-button, zero-downtime deploys to a VPS (issue #1607).
+    /// Push-button, zero-downtime deploys to a VPS or a fleet (issues #1607, #1621).
     ///
-    /// Run from the project root. `check` runs a local preflight, `plan` and
-    /// `rollback` print dry-run plans, and `up` performs a real first deploy over
-    /// SSH (cutover/rollback land in follow-ups). Configure the target under
-    /// `[deploy]` in autumn.toml.
+    /// Run from the project root. `check` runs a preflight against every configured
+    /// host, `plan` prints the dry-run plan, `up` performs a real rolling deploy over
+    /// SSH, and `rollback` returns the fleet to its previous release. Configure the
+    /// target under `[deploy] host` (one server) or `[deploy] hosts` (a fleet, in
+    /// rollout order) in autumn.toml.
+    ///
+    /// Fleet flags:
+    ///   --only <HOST>   repeatable; restrict `up`/`rollback` to these hosts. A
+    ///                   REPAIR LEVER: it leaves the skipped hosts on their current
+    ///                   release, so the fleet may end up mixed.
+    ///   --no-rollback   on `up`, halt and FREEZE a failed rollout for inspection
+    ///                   instead of automatically rolling the cut-over hosts back.
+    ///
+    /// Fleet visibility and control (issue #1621):
+    ///   status          read-only per-host state (release, readiness, maintenance,
+    ///                   proxy) plus version/state drift; `--json` for machines,
+    ///                   `--strict` exits non-zero on drift (cron-alertable).
+    ///   maintenance     turn maintenance mode on|off on EVERY configured host over
+    ///                   SSH (the local `autumn maintenance` only writes this
+    ///                   machine's working directory). NOTE: maintenance does not
+    ///                   drain a host from your load balancer — /ready stays 200.
     ///
     /// # Examples
     ///
     ///   autumn deploy check
     ///   autumn deploy plan
     ///   autumn deploy rollback
+    ///   autumn deploy rollback --only web-2.example.com
     ///   autumn deploy up
+    ///   autumn deploy up --only web-2.example.com
+    ///   autumn deploy up --no-rollback
+    ///   autumn deploy status --json --strict
+    ///   autumn deploy maintenance on --message "Upgrading database schema"
+    ///   autumn deploy maintenance off
     #[command(subcommand, verbatim_doc_comment)]
     Deploy(DeployCommands),
 
@@ -1043,6 +1129,11 @@ enum Commands {
     /// Writes (or removes) a JSON flag file that the running app polls every
     /// 500 ms. Within one second every replica responds 503 to non-bypassed
     /// HTTP traffic while health-check routes stay green.
+    ///
+    /// LOCAL only: the flag lands in THIS working directory. For servers
+    /// managed by `autumn deploy` (`[deploy] host`/`hosts`), use
+    /// `autumn deploy maintenance on|off`, which fans the same flag out to
+    /// every host over SSH (issue #1621).
     ///
     /// # Examples
     ///
@@ -1881,6 +1972,15 @@ enum WebhookCommands {
         /// The payload to send in the request body.
         #[arg(long)]
         payload: String,
+        /// Event type to announce, for the providers that carry it in a header
+        /// (github: `X-GitHub-Event`, generic: `X-Webhook-Event`).
+        ///
+        /// Defaults to `sim.event`, which no real handler dispatches on — pass
+        /// the event your handler expects (e.g. `--event push`) to exercise it.
+        /// Stripe and Slack read their event type from the payload's `type`
+        /// field instead, so this is ignored for those two.
+        #[arg(long, value_name = "TYPE")]
+        event: Option<String>,
     },
 }
 
@@ -2168,7 +2268,18 @@ enum DeployCommands {
     /// Resolves the previous release on the target, brings its slot back up,
     /// flips the proxy back to it, repoints `current`, and re-probes `/ready`.
     /// Fails loudly (non-zero) when there is no previous release to roll back to.
-    Rollback,
+    ///
+    /// With `[deploy] hosts` this rolls back EVERY host, newest first, continuing
+    /// past a host that fails (each is reported) and exiting non-zero if any host
+    /// did not come back.
+    Rollback {
+        /// Roll back only this host; repeat the flag for several (issue #1621).
+        ///
+        /// Each value must appear in `[deploy] hosts`. The hosts left out keep
+        /// running whatever they are running now, so the fleet may end up mixed.
+        #[arg(long, value_name = "HOST")]
+        only: Vec<String>,
+    },
 
     /// Run the preflight, then perform a REAL deploy over SSH.
     ///
@@ -2178,7 +2289,100 @@ enum DeployCommands {
     /// installs the proxy and stands the release up behind it; a redeploy runs a
     /// zero-downtime cutover and auto-rolls-back the candidate on a pre-cutover
     /// failure.
-    Up,
+    ///
+    /// With `[deploy] hosts` the hosts are replaced ONE AT A TIME in declaration
+    /// order, migrations run exactly once, and a mid-rollout failure halts the
+    /// rollout and rolls the hosts that already cut over back.
+    Up {
+        /// Deploy only this host; repeat the flag for several (issue #1621).
+        ///
+        /// Each value must appear in `[deploy] hosts`. A REPAIR LEVER, not a faster
+        /// deploy: the skipped hosts keep their current release, so finish with a
+        /// full `autumn deploy up` to converge the fleet.
+        #[arg(long, value_name = "HOST")]
+        only: Vec<String>,
+
+        /// Halt and FREEZE a failed rollout instead of rolling the cut-over hosts
+        /// back (issue #1621).
+        ///
+        /// Every host is left exactly as it is — including the ones already on the
+        /// new release — and named in the final state table, so the failure can be
+        /// inspected before anything else moves.
+        #[arg(long)]
+        no_rollback: bool,
+    },
+
+    /// Report every configured host's deploy state, read-only (issue #1621).
+    ///
+    /// One row per `[deploy] hosts` entry: mode, deployed release (from the
+    /// `current` symlink), live slot, /ready status, maintenance flag, and proxy
+    /// port — plus version drift (hosts on different releases) and state drift
+    /// (per-host marker damage that will fail the NEXT deploy closed). Touches
+    /// nothing; safe mid-incident.
+    Status {
+        /// Emit the stable JSON report on stdout instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero when ANY drift is detected, so drift is alertable from
+        /// cron. The default exits 0 — status is a report, not a judgement.
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Fleet-wide maintenance mode over SSH (issue #1621).
+    ///
+    /// Applies to the DEPLOY-CONFIGURED host(s) — `[deploy] host` or `[deploy]
+    /// hosts` — unlike the top-level `autumn maintenance`, which only writes this
+    /// machine's own working directory. Best-effort: every host is attempted, the
+    /// per-host table names what changed, and the command exits non-zero if any
+    /// host failed (the changed hosts are NOT reversed).
+    ///
+    /// Maintenance mode does NOT drain a host from your load balancer: /ready
+    /// stays 200 by design, so a maintained host keeps taking traffic and answers
+    /// it with 503. Drain at the load balancer if you need a host out of rotation.
+    #[command(subcommand)]
+    Maintenance(DeployMaintenanceCommands),
+}
+
+/// Subcommands for `autumn deploy maintenance` (issue #1621).
+#[derive(Subcommand)]
+enum DeployMaintenanceCommands {
+    /// Enable maintenance mode on every configured deploy host.
+    ///
+    /// Writes the same flag file the local `autumn maintenance on` writes, to the
+    /// per-app shared dir on each host (and, for hosts still running pre-#1621
+    /// units, to the current release's tmp/ dir), so running apps react within
+    /// 500 ms without a restart.
+    ///
+    /// # Examples
+    ///
+    ///   autumn deploy maintenance on
+    ///   autumn deploy maintenance on --message "Upgrading database schema"
+    ///   autumn deploy maintenance on --readonly
+    ///   autumn deploy maintenance on --allow-ips 10.0.0.0/8 --bypass-header X-Dev-Bypass:mytoken
+    #[command(verbatim_doc_comment)]
+    On {
+        /// Human-readable message shown to users in the 503 response body.
+        #[arg(long, value_name = "MSG")]
+        message: Option<String>,
+        /// CIDR block or IP address whose requests bypass maintenance.
+        /// Repeatable: `--allow-ips 10.0.0.0/8 --allow-ips 172.16.0.1`
+        #[arg(long, value_name = "CIDR")]
+        allow_ips: Vec<String>,
+        /// Allow GET, HEAD, OPTIONS through while blocking writes.
+        #[arg(long)]
+        readonly: bool,
+        /// Bypass header in NAME:VALUE format.
+        /// Requests carrying this header+value bypass the 503.
+        /// Example: `--bypass-header X-Autumn-Maintenance-Bypass:mytoken`
+        #[arg(long, value_name = "NAME:VALUE")]
+        bypass_header: Option<String>,
+    },
+    /// Disable maintenance mode on every configured deploy host.
+    ///
+    /// Removes the flag file(s); a host where maintenance was already off is a
+    /// success, not an error.
+    Off,
 }
 
 /// Subcommands for `autumn generate`.
@@ -2625,6 +2829,45 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate a signed, replay-protected inbound webhook endpoint for a
+    /// third-party provider (Stripe, GitHub, Slack, or a generic HMAC source).
+    ///
+    /// The handler takes the shipped `SignedWebhook` extractor — signature
+    /// verification, raw-body capture, timestamp tolerance, replay rejection,
+    /// and secret rotation are the framework's, never hand-rolled.
+    ///
+    /// Creates:
+    ///   - `src/webhooks/<snake>.rs` — `#[post]` handler, event dispatch, and tests
+    ///   - `src/webhooks/mod.rs`     — created/updated with `pub mod`
+    ///   - `src/main.rs`             — `mod webhooks;` + the route in `routes![...]`
+    ///   - `autumn.toml`             — endpoint stub, replay backend, exemptions
+    ///   - `Cargo.toml`              — `serde_json` + tokio test features
+    ///
+    /// Example:
+    ///
+    ///   autumn generate webhook stripe Payments
+    ///   autumn generate webhook github Repo --path /hooks/github
+    ///   autumn generate webhook stripe Payments --dry-run
+    #[command(verbatim_doc_comment)]
+    Webhook {
+        /// Provider preset: `stripe`, `github`, `slack`, or `generic`.
+        provider: String,
+        /// Endpoint name (`PascalCase` or `snake_case`, e.g. `Payments`).
+        name: String,
+        /// Route path for the endpoint (default: `/webhooks/<provider>`).
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// Environment variable holding the signing secret
+        /// (default: `<PROVIDER>_WEBHOOK_SECRET`).
+        #[arg(long, value_name = "VAR")]
+        secret_env: Option<String>,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate a system-test skeleton under `tests/system/`.
     ///
     /// The generated test is gated behind `#[cfg(feature = "system-tests")]` and
@@ -2947,6 +3190,19 @@ enum GenerateCommands {
         /// `search_vector` migration, and a wired search box in the index view.
         #[arg(long, value_name = "FIELD,FIELD", value_delimiter = ',')]
         searchable: Vec<String>,
+        /// Emit i18n-ready views (issue #1349): every page title, heading,
+        /// button, link, and field label in the generated HTML views becomes a
+        /// `t!(locale, "key")` lookup, each view handler takes the `Locale`
+        /// extractor, and the referenced keys are written to `i18n/en.ftl` with
+        /// their English values — so an `en` app renders identically and adding
+        /// a locale means translating a `.ftl`, not editing Rust. Also enables
+        /// autumn-web's `i18n` feature, adds `[i18n]` to `autumn.toml`, and
+        /// wires `.i18n_auto()` into `main.rs`. Composes with `--searchable`,
+        /// `--soft-delete`, and `--sharded`; `--api` scaffolds render no labels,
+        /// so the flag is a no-op there. Not supported with `--live`,
+        /// `--live-validation`, or `--belongs-to`.
+        #[arg(long)]
+        i18n: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -2996,9 +3252,11 @@ fn run_command(command: Commands) {
             bin,
             embed,
             features,
+            edge,
         } => build::run(
             debug,
             embed,
+            edge,
             package.as_deref(),
             bin.as_deref(),
             features.as_deref(),
@@ -3304,7 +3562,8 @@ fn run_command(command: Commands) {
             url,
             secret,
             payload,
-        }) => webhook::run_sim(&provider, &url, &secret, &payload),
+            event,
+        }) => webhook::run_sim(&provider, &url, &secret, &payload, event.as_deref()),
         Commands::Alert(AlertCommands::Test { channel }) => alert::run_test(channel.as_deref()),
         Commands::Console {
             profile,
@@ -3488,6 +3747,26 @@ fn run_command(command: Commands) {
                 );
                 std::process::exit(1);
             }
+        }
+        Commands::Upgrade(UpgradeArgs {
+            path,
+            from,
+            to,
+            apply,
+            json,
+            list_migrations,
+        }) => {
+            let code = upgrade::run_in(
+                std::path::Path::new(&path),
+                &upgrade::UpgradeOptions {
+                    from,
+                    to,
+                    apply,
+                    json,
+                    list: list_migrations,
+                },
+            );
+            std::process::exit(code);
         }
         Commands::Doctor {
             json,
@@ -3979,14 +4258,81 @@ fn run_release_command(cmd: ReleaseCommands) {
     }
 }
 
+/// Map a `deploy` subcommand onto the (action, options) pair `deploy::run` takes.
+///
+/// [`deploy::DeployAction`] stays a fieldless `Copy` enum and the flags travel
+/// beside it in [`deploy::DeployOptions`] (issue #1621, §3.1), so adding a flag
+/// never ripples through the action enum or its call sites. Every construction here
+/// spreads `..Default::default()` for the same reason.
 fn run_deploy_command(cmd: &DeployCommands) {
-    let action = match cmd {
-        DeployCommands::Check => deploy::DeployAction::Check,
-        DeployCommands::Plan => deploy::DeployAction::Plan,
-        DeployCommands::Rollback => deploy::DeployAction::Rollback,
-        DeployCommands::Up => deploy::DeployAction::Up,
+    let (action, options) = match cmd {
+        DeployCommands::Check => (
+            deploy::DeployAction::Check,
+            deploy::DeployOptions::default(),
+        ),
+        DeployCommands::Plan => (deploy::DeployAction::Plan, deploy::DeployOptions::default()),
+        DeployCommands::Rollback { only } => (
+            deploy::DeployAction::Rollback,
+            deploy::DeployOptions {
+                only: only.clone(),
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Up { only, no_rollback } => (
+            deploy::DeployAction::Up,
+            deploy::DeployOptions {
+                only: only.clone(),
+                no_rollback: *no_rollback,
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Status { json, strict } => (
+            deploy::DeployAction::Status,
+            deploy::DeployOptions {
+                json: *json,
+                strict: *strict,
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Maintenance(cmd) => match cmd {
+            DeployMaintenanceCommands::On {
+                message,
+                allow_ips,
+                readonly,
+                bypass_header,
+            } => {
+                // Same parse (and same failure behavior) as the local
+                // `autumn maintenance on`, so the two surfaces reject a malformed
+                // NAME:VALUE identically.
+                let parsed_bypass = bypass_header.as_deref().map(|s| {
+                    maintenance::parse_bypass_header(s).map_or_else(
+                        |e| {
+                            eprintln!("autumn deploy maintenance on: {e}");
+                            std::process::exit(1);
+                        },
+                        |(name, value)| (name.to_owned(), value.to_owned()),
+                    )
+                });
+                (
+                    deploy::DeployAction::MaintenanceOn,
+                    deploy::DeployOptions {
+                        maintenance: Some(deploy::MaintenanceOnArgs {
+                            message: message.clone(),
+                            allow_ips: allow_ips.clone(),
+                            readonly: *readonly,
+                            bypass_header: parsed_bypass,
+                        }),
+                        ..deploy::DeployOptions::default()
+                    },
+                )
+            }
+            DeployMaintenanceCommands::Off => (
+                deploy::DeployAction::MaintenanceOff,
+                deploy::DeployOptions::default(),
+            ),
+        },
     };
-    if let Err(e) = deploy::run(action) {
+    if let Err(e) = deploy::run(action, &options) {
         eprintln!("autumn deploy: {e}");
         std::process::exit(1);
     }
@@ -4233,6 +4579,41 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             let plan = generate::inbound_mail::plan_inbound_mail(&resolve_cwd(), &name);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
+        GenerateCommands::Webhook {
+            provider,
+            name,
+            path,
+            secret_env,
+            dry_run,
+            force,
+        } => {
+            let options = generate::webhook::WebhookOptions { path, secret_env };
+            let project_root = resolve_cwd();
+            // `destroy` recovers a `--path`/`--secret-env` it was not given from
+            // the endpoint block `generate` recorded, so cleanup does not depend
+            // on the user repeating flags (issue #1366, Codex review).
+            let plan = match mode {
+                ApplyMode::Generate => {
+                    generate::webhook::plan_webhook(&project_root, &provider, &name, &options)
+                }
+                ApplyMode::Destroy => generate::webhook::plan_webhook_for_revert(
+                    &project_root,
+                    &provider,
+                    &name,
+                    &options,
+                ),
+            };
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+            // Printed after the file list, and only for a real generate run:
+            // `apply_plan` exits on failure, and neither a dry run nor a
+            // destroy has next steps to take (issue #1366 AC #5).
+            if mode == ApplyMode::Generate
+                && !dry_run
+                && let Some(steps) = generate::webhook::next_steps(&provider, &name, &options)
+            {
+                println!("{steps}");
+            }
+        }
         GenerateCommands::SystemTest {
             name,
             dry_run,
@@ -4472,6 +4853,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             belongs_to,
             counter_cache,
             searchable,
+            i18n,
             dry_run,
             force,
         } => {
@@ -4532,6 +4914,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 belongs_to.as_deref(),
                 counter_cache,
                 &searchable,
+                i18n,
             ) {
                 Ok(result) => result,
                 Err(e) => {
@@ -4858,6 +5241,7 @@ mod tests {
                 bin: None,
                 embed: false,
                 features: None,
+                edge: false,
             }
         ));
     }
@@ -4873,6 +5257,21 @@ mod tests {
                 bin: None,
                 embed: false,
                 features: None,
+                edge: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_build_edge_flag() {
+        let cli = Cli::try_parse_from(["autumn", "build", "--edge"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Build {
+                debug: false,
+                embed: false,
+                edge: true,
+                ..
             }
         ));
     }
@@ -7243,6 +7642,87 @@ mod tests {
     }
 
     // ── autumn generate channel tests ──────────────────────────────────────
+
+    #[test]
+    fn parse_generate_webhook_defaults() {
+        let cli =
+            Cli::try_parse_from(["autumn", "generate", "webhook", "stripe", "Payments"]).unwrap();
+        let Commands::Generate(GenerateCommands::Webhook {
+            provider,
+            name,
+            path,
+            secret_env,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate webhook");
+        };
+        assert_eq!(provider, "stripe");
+        assert_eq!(name, "Payments");
+        assert!(path.is_none(), "--path defaults to /webhooks/<provider>");
+        assert!(
+            secret_env.is_none(),
+            "--secret-env defaults to <PROVIDER>_WEBHOOK_SECRET"
+        );
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_webhook_with_path_and_secret_env() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "webhook",
+            "generic",
+            "Partner",
+            "--path",
+            "/hooks/partner",
+            "--secret-env",
+            "PARTNER_WEBHOOK_SECRET",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Webhook {
+            provider,
+            path,
+            secret_env,
+            dry_run,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected generate webhook");
+        };
+        assert_eq!(provider, "generic");
+        assert_eq!(path.as_deref(), Some("/hooks/partner"));
+        assert_eq!(secret_env.as_deref(), Some("PARTNER_WEBHOOK_SECRET"));
+        assert!(dry_run);
+    }
+
+    #[test]
+    fn parse_generate_webhook_requires_both_provider_and_name() {
+        assert!(
+            Cli::try_parse_from(["autumn", "generate", "webhook", "stripe"]).is_err(),
+            "the endpoint name is required"
+        );
+        assert!(
+            Cli::try_parse_from(["autumn", "generate", "webhook"]).is_err(),
+            "the provider preset is required"
+        );
+    }
+
+    #[test]
+    fn parse_destroy_webhook() {
+        let cli =
+            Cli::try_parse_from(["autumn", "destroy", "webhook", "stripe", "Payments"]).unwrap();
+        let Commands::Destroy(GenerateCommands::Webhook { provider, name, .. }) = cli.command
+        else {
+            panic!("expected destroy webhook");
+        };
+        assert_eq!(provider, "stripe");
+        assert_eq!(name, "Payments");
+    }
 
     #[test]
     fn parse_generate_channel_with_pascal_name() {

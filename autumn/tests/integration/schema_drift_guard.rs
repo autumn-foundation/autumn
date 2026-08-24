@@ -304,6 +304,10 @@ fn deploy_child_keys_are_strictly_validated() {
         "deploy.service_name",
         "deploy.readiness_timeout_secs",
         "deploy.keep_releases",
+        // #1621: the fleet host list. Without this leaf a typo like
+        // `[deploy] hots = [...]` is silently ignored and the operator deploys to
+        // nothing (or, worse, to the stale single `host`).
+        "deploy.hosts",
     ] {
         assert!(
             leaves.contains(key),
@@ -318,6 +322,23 @@ fn deploy_child_keys_are_strictly_validated() {
     assert!(
         errors.iter().any(|(path, _)| path == "deploy.app_dr"),
         "a bogus [deploy] child key must be rejected by strict validation, got: {errors:?}"
+    );
+
+    // #1621: a near-miss of the new fleet key is flagged too — adding a list-typed
+    // leaf must not open a hole in the strict walk.
+    let hosts_typo =
+        AutumnConfig::validate_toml("[deploy]\nhots = [\"web-1.example.com\"]\n", &schema);
+    assert!(
+        hosts_typo.iter().any(|(path, _)| path == "deploy.hots"),
+        "a typo of the [deploy] hosts key must be rejected by strict validation, \
+         got: {hosts_typo:?}"
+    );
+    // ...while the correctly-spelled fleet list is accepted.
+    let hosts_ok =
+        AutumnConfig::validate_toml("[deploy]\nhosts = [\"web-1.example.com\"]\n", &schema);
+    assert!(
+        hosts_ok.is_empty(),
+        "[deploy] hosts must be accepted by strict validation, got: {hosts_ok:?}"
     );
 }
 

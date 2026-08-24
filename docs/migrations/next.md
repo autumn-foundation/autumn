@@ -8,255 +8,217 @@
 > the index in [`README.md`](README.md) is updated — see
 > [`docs/release-checklist.md`](../release-checklist.md), *Migration Guide
 > Gate*.
+>
+> The `{X.Y.Z}` placeholders below are deliberate: the gate treats `next.md` as
+> a draft and accepts them (and empty sections) here, so nothing has to be
+> invented for a release that has no changes yet.
 
 ## At a glance
 
-- **Old version:** `autumn-web 0.6.x`
-- **New version:** the next release (unreleased)
-- **Expected upgrade effort:** none for application code, beyond two new
-  deprecation warnings if you call `scheduler::now_unix_secs` /
-  `now_unix_duration` (see *Deprecations* below). Small for **plugins
-  and libraries** that build `autumn_web::Route` values by hand, for **JSON
-  API clients** of a scaffolded model that declares a `lock_version` column,
-  and for the (rare) **layer author** who implemented
-  `tower::Layer<axum::routing::Route>` for a concrete type instead of
-  generically.
-- **MSRV delta:** `1.88.0` -> `1.88.0` (unchanged so far)
-- **Carried dependency majors:** none so far
+- **Old version:** `autumn-web {X.Y.Z}`
+- **New version:** `autumn-web {X.Z.0}`
+- **Expected upgrade effort:** {S / M / L — one paragraph of context}
+- **MSRV delta:** `{old MSRV}` → `{new MSRV}` ({reason, or "unchanged"})
+- **Carried dependency majors:** {e.g. `axum 0.8 → 0.9`, `diesel 2 → 3`,
+  or "none"}
 
 ## Summary
 
-Nothing in the unreleased line changes how an application written against
-0.6.x compiles or behaves. There are three breaks, all narrow. The first is at
-the *route-construction* seam: `Route` and `StaticRouteMeta` gained a field, so
-code that builds those structs with a literal — which in practice means plugins
-assembling a `Vec<Route>` rather than using `routes![]` — has to name it. The
-second is on the wire, not in Rust: a model declaring a `lock_version` column
-now requires JSON `PUT`/`PATCH` clients to send that version. The third is at
-the *layer-registration* seam: `AppBuilder::layer` accepts layers via a bound
-on Autumn's erased ingress service rather than `axum::routing::Route`, which
-only a layer implemented non-generically against `Route` itself can notice.
+One paragraph describing *why* this release is major. Prefer "we want
+these properties, and they required breaking change `X`" over a list of
+unrelated removals.
+
+Link to the [CHANGELOG entry](../../CHANGELOG.md) for the release for the
+full commit-level picture.
 
 ## Before you start
 
-1. Pin your current dependency (`autumn-web = "=0.6.0"`) and commit.
-2. Make sure your tests are green on 0.6.x.
-3. If you maintain a plugin, have its conformance check to hand
-   (`autumn plugin-check --plugin-name <your-plugin>`).
+- Pin your existing version (`autumn-web = "={X.Y.Z}"`) and commit.
+- Run `cargo update` *before* the upgrade so the subsequent diff is just
+  the major bump.
+- Make sure your test suite is green on the old version. You will want
+  the safety net.
 
 ## Step-by-step
 
-1. **Bump the dependency.**
-2. **Run `cargo check`.** Application code should be clean; a plugin that
-   constructs routes literally gets `error[E0063]` (see below).
-3. **Add the missing field** to each literal.
-4. **Run the test suite** and the [verification list](#how-to-verify).
+1. **Run `autumn upgrade`** — *before* the dependency bump. The release it
+   migrates from is the one your `Cargo.toml` still records, so bumping first
+   leaves nothing in range. It previews every mechanical change this release
+   can apply to your own source — a per-file diff plus a count of affected
+   sites — and writes nothing; re-run with `--apply` to take them. Anything it
+   cannot safely rewrite is listed with `file:line` and a link to the guide
+   section that explains it.
+
+   ```bash
+   cargo install autumn-cli --version {X.Z.0}
+   autumn upgrade            # preview
+   autumn upgrade --apply    # take it
+   ```
+
+2. **Bump the dependency.**
+   ```toml
+   # Cargo.toml
+   [dependencies]
+   autumn-web = "{(X+1).0}"
+   ```
+
+3. **Run `cargo check`.** Work through the compiler errors section by
+   section using the cheat sheet below. Only the changes labelled `review` or
+   `manual` above should still need you.
+
+4. **Apply configuration changes** (see
+   [Configuration changes](#configuration-changes)).
+
+5. **Run the test suite.**
+
+6. **Run the application locally** and exercise each feature at least
+   once. Pay attention to the [Behavior changes](#behavior-changes)
+   section.
 
 ## Breaking changes
 
-### Routing: `Route` and `StaticRouteMeta` gained an `seo` field
+Repeat the block below for each breaking change. Keep changes grouped by
+area (routing / config / database / …) so readers can skip to what they
+care about.
 
-**Why:** route-level SEO defaults (`#[get("/about", seo(title = "..."))]`) are
-recorded on the route itself, so the router can install the request extension
-only for routes that declared something and routes without `seo(...)` pay
-nothing (#1182).
+### {Area}: {Short description}
 
-`routes![]` and the route attribute macros fill the field in for you. Only a
-**literal** struct construction has to change.
+**Why:** One or two sentences on the motivation.
 
-**Before (`0.6`):**
-
-```rust,ignore
-let route = autumn_web::Route {
-    method: Method::GET,
-    path: "/health",
-    handler,
-    // ...
-};
-```
-
-**After:**
-
-```rust,ignore
-let route = autumn_web::Route {
-    method: Method::GET,
-    path: "/health",
-    handler,
-    seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
-    // ...
-};
-```
-
-The same applies to `autumn_web::static_gen::StaticRouteMeta`.
-
-`SeoRouteDefaults` is `#[non_exhaustive]` and built by chaining its `const fn
-with_*` setters from `EMPTY`, so future SEO keys are additive — this is the
-last time this particular field costs you an edit.
-
-**If you are automating the upgrade:**
-
-```bash
-rg -n 'Route \{|StaticRouteMeta \{' src/
-```
-
-### JSON API: a `lock_version` model now requires the version on `PUT`/`PATCH`
-
-**Why:** declaring a column literally named `lock_version` opts a model into
-optimistic locking (#1318). `#[lock_version]` carries the column on
-`Update{Model}` as the *expected* version, which is what lets the repository
-reject a stale write with `RepositoryError::Conflict` instead of silently
-letting the last writer win.
-
-This affects you only if **both** are true: your model declares a non-nullable
-`i32`/`i64` column named `lock_version`, and you have JSON clients writing
-through the generated `PUT`/`PATCH /api/<plural>/{id}` endpoints. Browser
-forms on an HTML scaffold are unaffected — the generated edit form carries the
-version in a hidden field for you.
-
-**Before (`0.6`):** the field was ignored on the wire, so a client could omit
-it.
-
-```jsonc
-{ "title": "Hello" }
-```
-
-**After:** the field is required, and its value must be the version the client
-read. Omitting it fails deserialization (HTTP 422); sending a stale one is
-answered with a conflict rather than an overwrite.
-
-```jsonc
-{ "title": "Hello", "lock_version": 7 }
-```
-
-Read the current version from the same record's `GET` response (it is a plain
-column) and echo it back on the next write.
-
-**If you did not want optimistic locking**, the column name is the entire
-opt-in: rename it (e.g. to `revision`) and the behaviour goes away. `autumn
-generate` prints a warning naming this escape hatch whenever it detects the
-name.
-
-### App-wide layers are now erased
-
-**Why:** `AppBuilder::layer` / `static_gate` registrations (including plugin
-layers) are type-erased at registration time and composed into a single
-`Router::layer` application, so registering app-wide middleware no longer
-deepens the framework's per-request clone cascade (#2198).
-
-`IntoAppLayer`'s sealed blanket impl is therefore bound on
-`tower::Layer<autumn_web::app::ErasedAppService>` (the new public alias for
-the composed ingress service) instead of `tower::Layer<axum::routing::Route>`.
-
-This affects you only if you wrote a layer against **one concrete inner
-service type** rather than generically. Every layer that is generic over the
-service it wraps — the shape of every tower / tower-http layer, every layer in
-this repo and its plugins, and every example in the docs — satisfies both
-bounds and compiles unchanged.
-
-**Before (`0.6`):**
-
-```rust,ignore
-impl tower::Layer<axum::routing::Route> for MyLayer { /* … */ }
-```
-
-**After** — either make it generic (preferred):
-
-```rust,ignore
-impl<S> tower::Layer<S> for MyLayer { /* … */ }
-```
-
-or retarget the one concrete impl:
-
-```rust,ignore
-impl tower::Layer<autumn_web::app::ErasedAppService> for MyLayer { /* … */ }
-```
-
-**If you are automating the upgrade:**
-
-```bash
-rg -n 'Layer<axum::routing::Route>|Layer<Route>' src/
-```
-
-## Deprecations (non-breaking)
-
-### `scheduler::now_unix_secs` / `scheduler::now_unix_duration`
-
-Both read the real system clock directly, off the framework's injected-clock
-seam, so anything derived from them — a scheduled-task tick key, an expiry
-computation — is not reproducible under a `#[sim_test]` and is exposed to a
-wall-clock jump. They still work exactly as before; they now emit a
-deprecation warning.
+**Before (`{X.Y}`):**
 
 ```rust
-// Before
-let secs = autumn_web::scheduler::now_unix_secs();
-let dur  = autumn_web::scheduler::now_unix_duration();
-
-// After — read the app's injected clock
-let secs = autumn_web::time::clock_unix_secs(state.clock());
-let dur  = autumn_web::time::clock_unix_duration(state.clock());
+// paste a minimal, compiling example from the old version
 ```
 
-`state` is any `AppState` (handlers, `#[job]`/`#[scheduled]` bodies, startup
-hooks). If you hold an `Arc<dyn ClockSource>` rather than an `AppState`, pass
-`clock.as_ref()`. If you genuinely have neither in scope and cannot thread one
-in yet, `#[allow(deprecated)]` at the call site is a fine interim step — the
-functions are not scheduled for removal before the next major release (see
-[STABILITY.md](../../STABILITY.md), *Deprecation process*).
+**After (`{(X+1).0}`):**
 
-The framework's own scheduler already reads the injected clock; neither function
-has a remaining caller inside `autumn`.
+```rust
+// paste the equivalent on the new version
+```
+
+**Automation:** `manual` — {why no codemod applies: it needs new arguments, it
+is a configuration or behaviour change, it is only reachable inside a macro, ….
+For a change `autumn upgrade` *does* rewrite, use `auto` (safe by construction:
+renames and import moves) or `review` (rewritten, every site flagged for a
+human) instead, and name the shipped codemod id from
+`autumn-cli/src/upgrade/migrations.rs` in this paragraph.}
+
+Every breaking change carries this label — `scripts/check-migration-guides.sh`
+fails without it, and fails an `auto`/`review` label that names no shipped
+codemod, or a rename-level change left `manual` with no reason (issue #1629).
+
+---
 
 ## Compiler error cheat sheet
 
+Paste the most common errors a user will hit and the fix. This is the
+single most valuable section of the guide — keep it factual and short.
+
 | Error message (truncated) | Where you see it | Fix |
-|---|---|---|
-| ``error[E0063]: missing field `seo` in initializer of `Route` `` | a literal `Route { .. }` | add `seo: autumn_web::seo::SeoRouteDefaults::EMPTY` |
-| ``error[E0063]: missing field `seo` in initializer of `StaticRouteMeta` `` | a literal `StaticRouteMeta { .. }` | same |
+|---------------------------|------------------|-----|
+| `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::bar;` |
+| `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
 
 ## Configuration changes
 
-None so far.
+- `autumn.toml` keys that were renamed, removed, or have new defaults.
+- New `AUTUMN_*` environment variables.
+- Default profile changes.
+
+If nothing changed, delete this section.
 
 ## Behavior changes
 
-- A `#[static_get]` route declaring `robots = "noindex"` is now left out of the
-  generated `sitemap.xml`. Entries supplied by a `SitemapSource` you register
-  are still passed through unfiltered.
-- On a model with a `lock_version` column, a concurrent write no longer wins
-  silently: the HTML scaffold's edit form comes back at **409** with your input
-  intact and the record's current version, and the JSON path answers with a
-  conflict.
+Changes that still compile but behave differently at runtime. Examples:
+
+- Error responses adopted a new JSON shape.
+- A default middleware is now ordered differently.
+- A scheduled task now runs on a different worker.
+
+If nothing changed, delete this section.
+
+## Deprecations retained from `{X.Y}`
+
+Items that were deprecated during the `{X.Y}` line and have now been
+removed. Link each to the release where the deprecation notice first
+appeared so users can see how much warning they had.
+
+### Config-key removals
+
+Config keys removed in this major release were registered in
+`DEPRECATED_CONFIG_KEYS` (`autumn/src/config.rs`) with `remove_in = "{X+1}.0.0"`.
+Startup issued a `WARN` log entry for each deprecated key detected in the config
+(via `since = "{X.Y}"`), and `autumn doctor` surfaced them in the
+`deprecated_keys` check.
+
+For each removed config key, fill in the table below:
+
+| Removed key (TOML / env var) | Replacement | Deprecated since | References |
+|------------------------------|-------------|------------------|------------|
+| `section.old_key` / `AUTUMN_SECTION__OLD_KEY` | `section.new_key` | `{X.Y}.0` | (link to changelog) |
+
+If no config keys were removed, delete this subsection.
+
+## Upstream dependency updates
+
+For each major dependency bump carried with this release:
+
+- Link to that project's upstream migration notes.
+- Call out any of their changes that leak through Autumn's public API.
+
+If no majors were carried, delete this section.
 
 ## How to verify
 
-1. `cargo check` — clean, with no `missing field `seo`` error.
-2. `cargo test` — your suite is green.
-3. Plugins: `autumn plugin-check --plugin-name <your-plugin>` passes
-   (`--plugin-name` is required).
-4. If you have a `lock_version` model with JSON clients: `PUT` a record without
-   `lock_version` and confirm it is rejected, then `PUT` it with the version
-   from the record's `GET` and confirm it succeeds.
-5. Serve the app (`cargo run`, default `http://127.0.0.1:3000`) and view-source
-   a page whose route declares `seo(...)` — the declared `<title>` / `<meta>`
-   values render.
-6. `curl http://127.0.0.1:3000/sitemap.xml` — no `robots = "noindex"` static
-   route is listed. Substitute your own address if you changed `[server] host`
-   or `[server] port`.
+The reader's proof the upgrade landed. Keep it to concrete, checkable steps —
+commands with expected output, not "make sure everything works". Required by
+`scripts/check-migration-guides.sh`.
+
+1. `cargo check` — clean, with none of the errors in the cheat sheet above.
+2. `cargo test` — the suite is green on the new version.
+3. `autumn doctor --strict` — no findings.
+4. {one step per breaking change: the observable behaviour that proves the fix
+   was applied, e.g. "hit `/x` and confirm the response carries `Y`"}
 
 ### Guide-only upgrade walkthrough
 
-The release checklist requires upgrading an app scaffolded with `autumn new` on
-the previous release using **only** this guide — no changelog, no source
-reading. See [`docs/release-checklist.md`](../release-checklist.md), *Migration
-Guide Gate*.
+(The heading keeps its historical name; the walk-through itself is
+codemod-first.) Upgrade an app scaffolded with `autumn new` on the **previous** release
+**codemod-first** — `autumn upgrade` before any manual step — using only this
+guide for what remains, and record the result here before publishing to
+crates.io. See [`docs/release-checklist.md`](../release-checklist.md),
+*Migration Guide Gate*.
 
-- **Status:** pending — performed and recorded during the release that ships
-  this guide, before publishing to crates.io.
+- **Codemod:** {the `autumn upgrade` invocation the walk-through ran first, and
+  what it covered. Required once this release ships any `auto`/`review`
+  codemod; the remaining manual steps below must be only the `review`/`manual`
+  changes.}
+- **Status:** pending
+  {the value must *begin* with `performed YYYY-MM-DD` once the walk-through is
+  done, or `backfilled` for a guide written after its release shipped;
+  `pending` is accepted only while this file is still `next.md`}
+- **From → to:** `autumn-cli {X.Y.Z}` app upgraded to `autumn-web {X.Z.0}`
+- **Elapsed:** {minutes — the budget is under 30 for a guide-only
+  walk-through, and under 10 once `autumn upgrade` covers this release's
+  rename-level changes (issue #1629)}
+- **Gaps found and fixed in this guide:** {none, or what the walk-through
+  exposed}
+
+## Troubleshooting
+
+Known rough edges, workarounds, and known-good version combinations
+(e.g. "use `diesel 2.2.5+` — earlier `2.2.x` releases have a known
+`pq-sys` linkage issue on macOS").
 
 ## Reporting problems
 
-If you hit something this guide does not cover, that is a bug in the guide.
-Open an issue at <https://github.com/autumn-foundation/autumn/issues> with the
-error or unexpected behaviour, the version you upgraded from, and a minimal
-reproduction if you have one.
+If you hit something not covered here, please open an issue at
+<https://github.com/autumn-foundation/autumn/issues> with:
+
+- The error message or unexpected behavior.
+- The old version you upgraded from.
+- A minimal reproduction if possible.
+
+Migration guides are living documents — we update them based on user
+reports for the first few months after a major release.

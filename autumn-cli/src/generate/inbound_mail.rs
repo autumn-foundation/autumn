@@ -407,7 +407,7 @@ pub(super) fn remove_inbound_mail_handler(existing: &str, handler_module_path: &
 /// `(`, i.e. depth 1) for the matching closing paren, returning the index
 /// just past it. `None` if the parens never balance (malformed/truncated
 /// input — destroy never guesses).
-fn find_balanced_close_paren(src: &str, start: usize) -> Option<usize> {
+const fn find_balanced_close_paren(src: &str, start: usize) -> Option<usize> {
     let bytes = src.as_bytes();
     let mut depth = 1usize;
     let mut i = start;

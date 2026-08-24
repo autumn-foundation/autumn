@@ -754,6 +754,12 @@ where
 const BASE64URL_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+// `clippy::chunks_exact_to_as_chunks` (armed by rustc 1.98) suggests
+// `as_chunks::<3>()`. That API stabilized in 1.88, which is this workspace's
+// exact MSRV — CI builds a `1.88.0` lane, so adopting it leaves zero margin for
+// an MSRV the project may want to hold. Not a trade worth making for an
+// incidental cleanup; revisit when the MSRV moves past 1.88.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn base64url_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut chunks = input.chunks_exact(3);

@@ -1943,6 +1943,60 @@ impl AppBuilder {
         self
     }
 
+    /// Provide the key/value seam an `#[edge]` handler reads at the origin
+    /// (issue #1790).
+    ///
+    /// An `#[edge(needs(kv))]` handler takes an
+    /// [`EdgeCache`](autumn_edge::EdgeCache) extractor. At the edge the capsule
+    /// runtime injects that handle per request; at the origin this method does,
+    /// installing it as an app-wide extension layer so the *same handler
+    /// source* serves from both substrates. Without it the extractor declines
+    /// with an actionable `500` naming this call.
+    ///
+    /// Most apps pass [`CacheEdgeKv`](crate::CacheEdgeKv) over the cache they
+    /// already run, so anything the origin publishes with
+    /// [`cache::insert_cached`](crate::cache::insert_cached) is visible to the
+    /// edge lane; any other [`EdgeKv`](autumn_edge::EdgeKv) works just as well.
+    ///
+    /// # Not a database
+    ///
+    /// The seam is a non-authoritative, read-only replica (ADR-0004 category
+    /// 2): a miss is always a legal answer and staleness is expected. Routes
+    /// whose correctness depends on a fresh, authoritative read belong on the
+    /// origin — see [`edge_support`](crate::edge_support).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    ///
+    /// use autumn_web::CacheEdgeKv;
+    /// use autumn_web::cache::{Cache, MokaCache};
+    /// use autumn_web::edge::EdgeKv;
+    /// use autumn_web::prelude::*;
+    ///
+    /// # #[get("/health")] async fn health() -> &'static str { "ok" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// let cache = Arc::new(MokaCache::new(1_024, None)) as Arc<dyn Cache>;
+    ///
+    /// autumn_web::app()
+    ///     .routes(routes![health])
+    ///     .with_edge_kv(Arc::new(CacheEdgeKv::new(cache)) as Arc<dyn EdgeKv>)
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[cfg(feature = "edge")]
+    #[must_use]
+    pub fn with_edge_kv(self, kv: Arc<dyn autumn_edge::EdgeKv>) -> Self {
+        // `EdgeCache::layer` hands back a ready-made `axum::Extension`, which is
+        // itself a `tower::Layer` and therefore an `IntoAppLayer` — the same
+        // plumbing `install_i18n_bundle_layer` uses. No adapter needed, and the
+        // injection type stays an implementation detail of `autumn-edge`.
+        self.layer(autumn_edge::EdgeCache::layer(kv))
+    }
+
     /// Register an [`ErrorReporter`](crate::reporting::ErrorReporter) for
     /// unhandled panics and 5xx responses.
     ///
@@ -3238,20 +3292,31 @@ impl AppBuilder {
         }
 
         // Instantiate MaintenanceState, load flag synchronously at startup, insert as extension, and start background poller task
+        //
+        // #1621: the flag path comes from `maintenance::resolve_flag_file_path()`,
+        // NOT the bare cwd-relative const. A deploy-managed slot unit runs with
+        // `WorkingDirectory={release_dir}` — a fresh dir every release — so the
+        // legacy path made a cutover ORPHAN the flag and silently un-maintain the
+        // host. The resolver honours `AUTUMN_MAINTENANCE_FLAG_FILE` (stamped by
+        // `autumn deploy` at the per-app `shared/` dir, which survives cutovers) and
+        // falls back to the legacy path when unset, so a non-deploy-managed app is
+        // unaffected. Both read sites — this boot load and the 500 ms poller below —
+        // go through the SAME resolver so they can never disagree.
         let maintenance_state = crate::maintenance::MaintenanceState::new();
-        let flag_path = std::path::Path::new(crate::maintenance::MAINTENANCE_FLAG_FILE);
-        if let Ok(Some(cfg)) = crate::maintenance::MaintenanceState::load_from_file(flag_path) {
+        let flag_path = crate::maintenance::resolve_flag_file_path();
+        if let Ok(Some(cfg)) = crate::maintenance::MaintenanceState::load_from_file(&flag_path) {
             maintenance_state.enable(cfg);
         }
         state.insert_extension(maintenance_state.clone());
 
         let poller_state = maintenance_state.clone();
         tokio::spawn(async move {
-            let path = std::path::Path::new(crate::maintenance::MAINTENANCE_FLAG_FILE);
+            let path = crate::maintenance::resolve_flag_file_path();
             let interval = std::time::Duration::from_millis(500);
             loop {
+                let poll_path = path.clone();
                 let load_res = tokio::task::spawn_blocking(move || {
-                    crate::maintenance::MaintenanceState::load_from_file(path)
+                    crate::maintenance::MaintenanceState::load_from_file(&poll_path)
                 })
                 .await;
 
@@ -3450,7 +3515,8 @@ impl AppBuilder {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
         #[cfg(feature = "i18n")]
-        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+        let custom_layers =
+            install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
         // Install the preflighted blob store on the freshly-built
         // AppState, and remember the serving router so it gets merged
@@ -4874,7 +4940,8 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "i18n")]
-        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+        let custom_layers =
+            install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
         // Install the preflighted storage and remember the serving
         // router so static generation hits the same `/_blobs/...`
@@ -5854,7 +5921,8 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "i18n")]
-        let _custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+        let _custom_layers =
+            install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
         #[cfg(feature = "storage")]
         let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
@@ -6232,7 +6300,8 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "i18n")]
-        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+        let custom_layers =
+            install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
@@ -8301,7 +8370,21 @@ fn install_i18n_bundle_layer(
     mut custom_layers: Vec<CustomLayerRegistration>,
     state: &AppState,
     bundle: Option<Arc<crate::i18n::Bundle>>,
+    i18n: &crate::i18n::I18nConfig,
 ) -> Vec<CustomLayerRegistration> {
+    // #1384: install the resolution defaults from CONFIG first, before the
+    // no-bundle early return. `locale_prefix_enabled` is supported without
+    // `.i18n()`/`.i18n_auto()` (the router builds its nests straight from
+    // `I18nConfig`), and in that shape no `Bundle` exists — but column decoding
+    // still needs the app's default locale. Without this a `default_locale =
+    // "fr"` app attributed every legacy plain-text value to the last-resort
+    // "en", so a `/fr/...` request rendered upgraded content as empty and a
+    // later write could persist it under the wrong locale.
+    //
+    // A bundle, when present, re-installs the identical values below: a
+    // `Bundle` derives both from this same `I18nConfig`.
+    crate::i18n::install_locale_defaults(&i18n.default_locale, i18n.resolved_fallback_chain());
+
     let Some(bundle) = bundle else {
         return custom_layers;
     };
@@ -8311,15 +8394,31 @@ fn install_i18n_bundle_layer(
         default = bundle.default_locale(),
         "i18n bundle loaded"
     );
+    // #1384: content resolution outside a request (a job worker, a scheduled
+    // task, a CLI command) has no locale scope to read a chain from. Publish
+    // the bundle's resolved chain — the same one UI strings walk — as the
+    // process default so `Translated::resolve` behaves identically there.
+    crate::i18n::install_locale_defaults(bundle.default_locale(), bundle.fallback_chain().to_vec());
     state.insert_extension::<Arc<crate::i18n::Bundle>>(bundle.clone());
     // Use the existing IntoAppLayer plumbing so the Extension is visible to
     // every request. axum::Extension<T> is itself a tower::Layer when T:
     // Clone + Send + Sync + 'static.
+    let ambient_layer = crate::i18n::AmbientLocaleLayer::new(&bundle);
     let ext_layer = axum::Extension(bundle);
     custom_layers.push(CustomLayerRegistration {
         type_id: TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
         type_name: std::any::type_name::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
         layer: tower::util::BoxCloneSyncServiceLayer::new(ext_layer),
+    });
+    // #1384: publish the negotiated locale as the ambient one for the whole
+    // handler, so a `#[translatable]` field resolves itself with no locale
+    // argument in the signature. Registered AFTER the bundle Extension —
+    // registration order is outermost-first, so this layer runs INSIDE it and
+    // its `Locale` extraction can see the bundle it needs to negotiate against.
+    custom_layers.push(CustomLayerRegistration {
+        type_id: TypeId::of::<crate::i18n::AmbientLocaleLayer>(),
+        type_name: std::any::type_name::<crate::i18n::AmbientLocaleLayer>(),
+        layer: tower::util::BoxCloneSyncServiceLayer::new(ambient_layer),
     });
     custom_layers
 }
@@ -12879,6 +12978,142 @@ mod tests {
         assert_eq!(bundle.translate("en", "nav.home", &[]), "Loader Home");
     }
 
+    /// #1384: `locale_prefix_enabled` is supported WITHOUT `.i18n()` /
+    /// `.i18n_auto()` — the router builds its `/{locale}` nests straight from
+    /// `I18nConfig` — so no `Bundle` exists in that shape. Column decoding
+    /// still needs the app's default locale: without it a `default_locale =
+    /// "fr"` app attributes every legacy plain-text value to the last-resort
+    /// `"en"`, so a `/fr/...` request renders upgraded content as empty and a
+    /// later write can persist it under the wrong locale.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn locale_defaults_are_installed_even_with_no_bundle() {
+        let mut config = AutumnConfig::default();
+        config.i18n.default_locale = "fr".to_owned();
+        config.i18n.supported_locales = vec!["fr".to_owned(), "en".to_owned()];
+        let state = AppState::for_test();
+
+        let layers = install_i18n_bundle_layer(Vec::new(), &state, None, &config.i18n);
+
+        assert!(
+            layers.is_empty(),
+            "no bundle means no Extension and no ambient layer registration"
+        );
+        assert_eq!(
+            &*crate::i18n::default_locale_snapshot(),
+            "fr",
+            "the configured default must reach column decoding without a bundle"
+        );
+        // A legacy plain-text column is now attributed to `fr`, so a `/fr/...`
+        // request resolves it instead of rendering empty.
+        let legacy = crate::i18n::Translated::decode_column(
+            "Bonjour le monde",
+            &crate::i18n::default_locale_snapshot(),
+        );
+        assert_eq!(legacy.get("fr"), Some("Bonjour le monde"));
+
+        // Restore the framework default for the rest of this binary.
+        crate::i18n::install_locale_defaults("en", vec!["en".to_owned()]);
+    }
+
+    /// #1384: drive the REAL wiring — `install_i18n_bundle_layer` +
+    /// `try_build_router_inner` — and assert both the ambient locale and a
+    /// `Translated` field resolve for a handler that takes NO locale argument.
+    ///
+    /// This pins the layer-ORDERING invariant the feature rests on: the bundle
+    /// `Extension` must be registered first (outermost) so the ambient layer,
+    /// registered second, can read it while negotiating. Swap the two pushes
+    /// and the layer negotiates against an empty supported-list, pins every
+    /// request to the default locale, and this test goes red — where a
+    /// hand-built router stack would not notice.
+    #[cfg(feature = "i18n")]
+    #[tokio::test]
+    async fn ambient_locale_layer_resolves_translatable_content_through_the_real_stack() {
+        use tower::ServiceExt as _;
+
+        async fn show() -> String {
+            let title =
+                crate::i18n::Translated::from_pairs([("en", "Hello world"), ("es", "Hola mundo")]);
+            // No `Locale` parameter anywhere in this signature.
+            format!(
+                "{}|{}",
+                title,
+                crate::i18n::ambient_locale().unwrap_or_default()
+            )
+        }
+
+        let mut config = AutumnConfig::default();
+        config.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
+        let bundle = Arc::new(crate::i18n::Bundle::from_messages(
+            std::collections::HashMap::new(),
+            &config.i18n,
+        ));
+        let state = AppState::for_test();
+        let custom_layers =
+            install_i18n_bundle_layer(Vec::new(), &state, Some(bundle), &config.i18n);
+
+        let router = crate::router::try_build_router_inner(
+            vec![Route {
+                method: http::Method::GET,
+                path: "/show",
+                handler: axum::routing::get(show),
+                name: "show",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/show",
+                    operation_id: "show",
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }],
+            &config,
+            state,
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                custom_layers,
+                static_gate_layers: Vec::new(),
+                #[cfg(feature = "maud")]
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
+            },
+        )
+        .expect("router builds");
+
+        for (accept_language, expected) in [
+            ("es", "Hola mundo|es"),
+            // Untranslated: falls back through the configured chain to `en`.
+            ("fr", "Hello world|en"),
+        ] {
+            let request = axum::http::Request::builder()
+                .uri("/show")
+                .header(http::header::ACCEPT_LANGUAGE, accept_language)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let response = router.clone().oneshot(request).await.expect("response");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .expect("body");
+            assert_eq!(
+                String::from_utf8(bytes.to_vec()).expect("utf-8"),
+                expected,
+                "Accept-Language: {accept_language}"
+            );
+        }
+    }
+
     #[cfg(feature = "i18n")]
     #[tokio::test]
     async fn i18n_bundle_layer_is_applied_to_static_route_rendering() {
@@ -12892,6 +13127,7 @@ mod tests {
             Vec::new(),
             &state,
             Some(test_i18n_bundle("nav.home", "Home")),
+            &config.i18n,
         );
         let router = crate::router::try_build_router_inner(
             vec![Route {

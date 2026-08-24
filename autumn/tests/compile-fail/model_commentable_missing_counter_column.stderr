@@ -1,0 +1,5 @@
+error: commentable counter column `comment_count` not found on model `Post`; add the field (e.g. `#[default] pub comment_count: i64`), point the attribute at an existing one with `#[commentable(..., counter_cache = <field>)]`, or opt out with `#[commentable(..., counter_cache = false)]`
+  --> tests/compile-fail/model_commentable_missing_counter_column.rs:14:3
+   |
+14 | #[commentable(by = User)]
+   |   ^^^^^^^^^^^

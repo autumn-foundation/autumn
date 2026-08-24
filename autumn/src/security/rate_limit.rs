@@ -1511,6 +1511,13 @@ fn build_rate_limited_response(
 /// build their own `RateLimitLayer` instead.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
+// `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
+// 128 bytes — that is `axum::response::Response`'s own size, not something this
+// crate chose. Returning a ready-made rejection response IS the idiom here, and
+// boxing it would add an allocation to every rejection path to satisfy a size
+// heuristic. Allowed at the site rather than workspace-wide so the lint stays
+// armed for error types we do control.
+#[allow(clippy::result_large_err)]
 pub async fn __check_throttle(
     state: &crate::AppState,
     route_id: &'static str,

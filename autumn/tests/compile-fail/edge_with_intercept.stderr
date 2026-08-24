@@ -1,0 +1,5 @@
+error: `#[edge]` cannot be combined with `#[intercept(...)]` — interceptor layers are origin-only tower middleware and are not carried into the edge capsule, so the two lanes would serve different bytes; serve this route from the origin
+  --> tests/compile-fail/edge_with_intercept.rs:16:3
+   |
+16 | #[edge]
+   |   ^^^^

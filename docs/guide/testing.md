@@ -329,7 +329,7 @@ no one-container-per-test overhead.
 ```toml
 # Cargo.toml  — use the same version as your [dependencies] entry
 [dev-dependencies]
-autumn-web = { version = "0.5", features = ["test-support"] }
+autumn-web = { version = "0.7", features = ["test-support"] }
 serde_json = "1"
 ```
 

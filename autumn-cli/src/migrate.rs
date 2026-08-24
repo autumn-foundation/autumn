@@ -1603,8 +1603,7 @@ fn is_production_profile(explicit: Option<&str>) -> bool {
 fn has_revertable_down_sql(m: &AppliedUserMigration) -> bool {
     m.dir.as_ref().is_some_and(|d| {
         std::fs::read_to_string(d.join("down.sql"))
-            .ok()
-            .is_some_and(|sql| safety::has_executable_sql(&sql))
+            .is_ok_and(|sql| safety::has_executable_sql(&sql))
     })
 }
 
@@ -1621,8 +1620,7 @@ fn has_revertable_down_sql(m: &AppliedUserMigration) -> bool {
 fn down_sql_concurrent_without_opt_out(m: &AppliedUserMigration) -> bool {
     m.dir.as_ref().is_some_and(|d| {
         std::fs::read_to_string(d.join("down.sql"))
-            .ok()
-            .is_some_and(|sql| safety::contains_concurrent_index(&sql))
+            .is_ok_and(|sql| safety::contains_concurrent_index(&sql))
             && !migration_opts_out_of_transaction(d)
     })
 }

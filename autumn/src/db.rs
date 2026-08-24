@@ -2007,7 +2007,7 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// as `Unknown`. Worse: the wrapper type diesel-async uses to carry Postgres's
 /// error fields for an `Unknown`-kind error (`PostgresDbErrorWrapper`, private
 /// to diesel-async) implements only `DatabaseErrorInformation`, not
-/// `std::error::Error` — so [`source_chain_has_sqlstate`]'s downcast walk can
+/// `std::error::Error` — so `source_chain_has_sqlstate`'s downcast walk can
 /// **never** reach the real SQLSTATE for it; there is no structural path to a
 /// deadlock's code at all through this crate boundary. The only signal
 /// available is the message, so this checks it — but with an **exact**
@@ -2026,7 +2026,7 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// domain/validation error as a transient conflict, silently re-running a
 /// non-idempotent closure and delaying the response.
 #[cfg_attr(feature = "sqlite", allow(dead_code))]
-fn is_retryable_txn_error(err: &AutumnError) -> bool {
+pub fn is_retryable_txn_error(err: &AutumnError) -> bool {
     use tokio_postgres::error::SqlState;
 
     fn is_retryable_sqlstate(state: &SqlState) -> bool {
@@ -3110,6 +3110,81 @@ impl RequestDbContext {
             interceptors: state.db_interceptors(),
             clock: state.clock(),
         }
+    }
+}
+
+/// A database checkout that has been *prepared* but not *taken*.
+///
+/// [`Db`] is a `FromRequestParts` extractor, so axum runs it before the final
+/// `FromRequest` extractor reads the request body. A handler taking both
+/// therefore holds a pooled connection for as long as the client takes to send
+/// its body — and the client controls that. A handful of slow-body requests can
+/// pin `pool_size` connections and starve unrelated database work, with no
+/// request timeout configured by default to stop them.
+///
+/// This captures what the checkout needs from the request parts — statement
+/// timeout, route key, metrics, interceptors, clock — and takes the connection
+/// only when [`DeferredDb::checkout`] is awaited, which the handler does after
+/// the body is in hand.
+///
+/// `pub(crate)` deliberately: the general answer is a lazy `Db` for every
+/// handler (#2264), and shipping a second public extractor would make that
+/// harder to land rather than easier.
+pub(crate) struct DeferredDb {
+    pool: Pool<RuntimeConnection>,
+    ctx: RequestDbContext,
+    #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+    capture_gap: Option<std::sync::Arc<str>>,
+}
+
+impl DeferredDb {
+    /// Take the connection. Called once the request body has been read.
+    pub(crate) async fn checkout(self) -> Result<Db, AutumnError> {
+        let result = Db::checkout(DbCheckoutParams {
+            pool: &self.pool,
+            pool_name: "primary",
+            shard: None,
+            statement_timeout: self.ctx.statement_timeout,
+            route_key: self.ctx.route_key,
+            metrics: self.ctx.metrics,
+            slow_query_threshold: self.ctx.slow_query_threshold,
+            interceptors: self.ctx.interceptors,
+            #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+            capture_gap: self.capture_gap,
+            clock: self.ctx.clock,
+        })
+        .await;
+        // The same read-your-writes bookkeeping the eager extractor does, at
+        // the moment the connection is actually taken.
+        if result.is_ok() {
+            crate::read_your_writes::mark_write();
+        }
+        result
+    }
+}
+
+impl<S> FromRequestParts<S> for DeferredDb
+where
+    S: DbState + Send + Sync,
+{
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // The pool is resolved here, so a misconfigured app still fails at
+        // extraction exactly as it does with `Db`. Only the checkout moves.
+        let pool = state
+            .pool()
+            .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?
+            .clone();
+        Ok(Self {
+            pool,
+            ctx: RequestDbContext::from_parts(parts, state),
+            #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+            capture_gap: state.db_capture_gap(),
+        })
     }
 }
 

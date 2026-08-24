@@ -625,7 +625,25 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream, Token
         }
     }
 
-    // Case 1b — #[authorize] or #[autumn_web::authorize] visible as a remaining attribute.
+    // Case 2 — #[secured] was above the route macro and already expanded;
+    // read the markers emitted into the guarded function body. This runs
+    // BEFORE the live-#[authorize] fallback below: `#[secured]` above the
+    // route macro with `#[authorize]` below it leaves both an expanded marker
+    // and a live attribute, and letting the attribute win would drop the
+    // roles/scopes to `&[]` while `secured` stayed true — deleting the
+    // `#[secured(...)]` line would then produce zero manifest diff on a
+    // `provable` dimension.
+    if let Some(roles) = extract_secured_roles_marker(input_fn) {
+        let scopes = extract_secured_scopes_marker(input_fn).unwrap_or_default();
+        return (
+            true,
+            emit_static_str_slice(&roles),
+            emit_static_str_slice(&scopes),
+        );
+    }
+
+    // Case 1b — #[authorize] or #[autumn_web::authorize] visible as a remaining
+    // attribute (and no secured markers anywhere in the body).
     for attr in &input_fn.attrs {
         if attr.path().is_ident("authorize")
             || attr
@@ -636,17 +654,6 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream, Token
         {
             return (true, quote! { &[] }, quote! { &[] });
         }
-    }
-
-    // Case 2 — #[secured] was above the route macro and already expanded;
-    // read the markers emitted into the guarded function body.
-    if let Some(roles) = extract_secured_roles_marker(input_fn) {
-        let scopes = extract_secured_scopes_marker(input_fn).unwrap_or_default();
-        return (
-            true,
-            emit_static_str_slice(&roles),
-            emit_static_str_slice(&scopes),
-        );
     }
 
     // Case 2b — #[authorize] was above the route macro and already expanded;
@@ -714,9 +721,13 @@ fn has_public_marker_in_stmt(stmt: &syn::Stmt) -> bool {
 fn has_public_marker_in_expr(expr: &syn::Expr) -> bool {
     match expr {
         syn::Expr::Block(block) => has_public_marker_in_stmts(&block.block.stmts),
-        syn::Expr::Async(block) => has_public_marker_in_stmts(&block.block.stmts),
         syn::Expr::Unsafe(block) => has_public_marker_in_stmts(&block.block.stmts),
-        _ => false,
+        // Same generated-wrapper descent as the secured/authorize marker walks:
+        // a body guard expanding after `#[public]` (e.g. `#[throttle]`) buries
+        // the marker inside `(async move { … }).await`, and losing it here
+        // flips the route to `unclassified` and false-fails the coverage gate.
+        _ => crate::idempotency_guard::expr_nested_async_body(expr)
+            .is_some_and(|block| has_public_marker_in_stmts(&block.stmts)),
     }
 }
 
@@ -749,9 +760,13 @@ fn extract_secured_roles_marker_from_stmt(stmt: &syn::Stmt) -> Option<Vec<String
 fn extract_secured_roles_marker_from_expr(expr: &syn::Expr) -> Option<Vec<String>> {
     match expr {
         syn::Expr::Block(block) => extract_secured_roles_marker_from_stmts(&block.block.stmts),
-        syn::Expr::Async(block) => extract_secured_roles_marker_from_stmts(&block.block.stmts),
         syn::Expr::Unsafe(block) => extract_secured_roles_marker_from_stmts(&block.block.stmts),
-        _ => None,
+        // A guard that expands after `#[secured]` (e.g. `#[authorize]`) buries
+        // the marker inside `let __autumn_inner: T = (async move { … }).await;`
+        // — descend that generated wrapper or the roles silently vanish from
+        // the route metadata while `secured` stays `true` via the fallbacks.
+        _ => crate::idempotency_guard::expr_nested_async_body(expr)
+            .and_then(|block| extract_secured_roles_marker_from_stmts(&block.stmts)),
     }
 }
 
@@ -870,10 +885,174 @@ fn extract_secured_scopes_marker_from_stmt(stmt: &syn::Stmt) -> Option<Vec<Strin
 fn extract_secured_scopes_marker_from_expr(expr: &syn::Expr) -> Option<Vec<String>> {
     match expr {
         syn::Expr::Block(block) => extract_secured_scopes_marker_from_stmts(&block.block.stmts),
-        syn::Expr::Async(block) => extract_secured_scopes_marker_from_stmts(&block.block.stmts),
         syn::Expr::Unsafe(block) => extract_secured_scopes_marker_from_stmts(&block.block.stmts),
+        // Same generated-wrapper descent as the roles walk above: the scopes
+        // marker sits wherever the roles marker sits.
+        _ => crate::idempotency_guard::expr_nested_async_body(expr)
+            .and_then(|block| extract_secured_scopes_marker_from_stmts(&block.stmts)),
+    }
+}
+
+/// Name of the marker const `#[authorize]` prepends to a guarded body so the
+/// binding survives the attribute's own removal.
+const AUTHORIZE_BINDINGS_MARKER: &str = "__AUTUMN_AUTHORIZE_BINDINGS";
+
+/// Extract the `#[authorize]` bindings declared on a handler, as
+/// `(action, resource)` pairs in source order.
+///
+/// Mirrors [`extract_secured_info`]'s attribute/marker duality, but takes the
+/// **union** of the two rather than the first that matches: a mixed stack
+/// (`#[authorize(A)]` above the route macro, `#[authorize(B)]` below it) leaves
+/// one already-expanded marker *and* one live attribute, and both are real
+/// bindings.
+///
+/// 1. Marker consts in the body — `#[authorize]` expanded first and deleted its
+///    own attribute. The walk descends the generated `(async move { … }).await`
+///    wrappers, because each guard that expands afterwards buries the marker one
+///    level deeper, and collects every level instead of stopping at the first.
+/// 2. Attributes still present — the route macro is outermost, so `#[authorize]`
+///    has not expanded yet. Parsed with the `#[authorize]` grammar itself
+///    ([`crate::authorize::parse_with_leading_literal`]) so the two sites cannot
+///    drift apart. Every matching attribute contributes, since nothing stops a
+///    handler from stacking several.
+///
+/// The result is source-ordered. Markers precede live attributes because a
+/// marker only ever comes from an attribute *above* the route macro, and live
+/// attributes sit *below* it; within the markers, deeper nesting means an
+/// earlier expansion — i.e. higher in the source stack — so the walk records
+/// nested markers before the level that wraps them.
+///
+/// Markers are decoded structurally (`&[( "action", "Resource" ), …]`), never by
+/// scanning stringified tokens, so handler *text* that merely spells the marker
+/// cannot forge a binding. A same-named const of any other shape is not ours to
+/// interpret and contributes nothing rather than erroring.
+pub fn extract_authorize_bindings(input_fn: &syn::ItemFn) -> Vec<(String, String)> {
+    let mut bindings = Vec::new();
+
+    collect_authorize_markers_in_stmts(&input_fn.block.stmts, &mut bindings);
+
+    for attr in &input_fn.attrs {
+        if attr.path().is_ident("authorize")
+            || attr
+                .path()
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "authorize")
+        {
+            bindings.extend(authorize_binding_from_attr(attr));
+        }
+    }
+
+    bindings
+}
+
+/// Read one still-unexpanded `#[authorize(...)]` attribute.
+///
+/// Returns `None` for an attribute the `#[authorize]` macro will itself reject
+/// (a bare `#[authorize]` with no arguments, a missing action or resource): the
+/// macro reports the diagnostic, and metadata extraction stays silent rather
+/// than emitting a second error or a half-formed binding.
+fn authorize_binding_from_attr(attr: &syn::Attribute) -> Option<(String, String)> {
+    let syn::Meta::List(list) = &attr.meta else {
+        return None;
+    };
+    let args = crate::authorize::parse_with_leading_literal(list.tokens.clone()).ok()?;
+    Some((args.action?, args.resource?.to_string()))
+}
+
+fn collect_authorize_markers_in_stmts(stmts: &[syn::Stmt], out: &mut Vec<(String, String)>) {
+    // Nested wrappers first: a deeper marker was expanded earlier, i.e. its
+    // attribute sat higher in the source stack, so it must be recorded before
+    // this level's own marker for the result to stay source-ordered.
+    for stmt in stmts {
+        match stmt {
+            syn::Stmt::Expr(expr, _) => collect_authorize_markers_in_expr(expr, out),
+            syn::Stmt::Local(local) => {
+                if let Some(init) = &local.init {
+                    collect_authorize_markers_in_expr(&init.expr, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in stmts {
+        if let syn::Stmt::Item(syn::Item::Const(item_const)) = stmt
+            && item_const.ident == AUTHORIZE_BINDINGS_MARKER
+        {
+            collect_authorize_bindings_from_marker_expr(&item_const.expr, out);
+        }
+    }
+}
+
+fn collect_authorize_markers_in_expr(expr: &syn::Expr, out: &mut Vec<(String, String)>) {
+    match expr {
+        syn::Expr::Block(block) => collect_authorize_markers_in_stmts(&block.block.stmts, out),
+        syn::Expr::Unsafe(block) => collect_authorize_markers_in_stmts(&block.block.stmts, out),
+        // Everything the body guards generate — `(async move { … }).await`,
+        // optionally inside `IntoResponse::into_response(…)`, parens or
+        // invisible groups — is unwrapped by the shared helper, so a marker
+        // stays reachable however many guards expanded around it.
+        _ => {
+            if let Some(block) = crate::idempotency_guard::expr_nested_async_body(expr) {
+                collect_authorize_markers_in_stmts(&block.stmts, out);
+            }
+        }
+    }
+}
+
+/// Decode a `&[("action", "Resource"), …]` marker initializer.
+///
+/// All-or-nothing per marker: one element of an unexpected shape means the const
+/// is not the one we emit, so none of it is recorded.
+fn collect_authorize_bindings_from_marker_expr(expr: &syn::Expr, out: &mut Vec<(String, String)>) {
+    let syn::Expr::Reference(reference) = expr else {
+        return;
+    };
+    let syn::Expr::Array(array) = reference.expr.as_ref() else {
+        return;
+    };
+
+    let mut decoded = Vec::with_capacity(array.elems.len());
+    for elem in &array.elems {
+        let syn::Expr::Tuple(tuple) = elem else {
+            return;
+        };
+        let [action, resource] = tuple.elems.iter().collect::<Vec<_>>()[..] else {
+            return;
+        };
+        let (Some(action), Some(resource)) =
+            (string_literal_value(action), string_literal_value(resource))
+        else {
+            return;
+        };
+        decoded.push((action, resource));
+    }
+    out.extend(decoded);
+}
+
+fn string_literal_value(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) => Some(s.value()),
         _ => None,
     }
+}
+
+/// Emit the `&'static [AuthorizeBinding]` slice for `ApiDoc::authorize_bindings`.
+pub fn emit_authorize_binding_slice(bindings: &[(String, String)]) -> TokenStream {
+    if bindings.is_empty() {
+        return quote! { &[] };
+    }
+    let entries = bindings.iter().map(|(action, resource)| {
+        let action = LitStr::new(action, Span::call_site());
+        let resource = LitStr::new(resource, Span::call_site());
+        quote! {
+            ::autumn_web::openapi::AuthorizeBinding { action: #action, resource: #resource }
+        }
+    });
+    quote! { &[#(#entries),*] }
 }
 
 fn emit_static_str_slice(items: &[String]) -> TokenStream {
@@ -1100,5 +1279,217 @@ mod tests {
             async fn handler() {}
         };
         assert!(!is_public(&input_fn));
+    }
+
+    // ── #[authorize] binding extraction (#1627) ──────────────────────────────
+
+    #[test]
+    fn extract_authorize_bindings_from_attribute() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[authorize("update", resource = Note)]
+            async fn handler(note: Note) {}
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            vec![("update".to_owned(), "Note".to_owned())]
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_from_marker() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("update", "Note")];
+            }
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            vec![("update".to_owned(), "Note".to_owned())]
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_from_nested_marker() {
+        // A guard that expanded after `#[authorize]` wraps the marker in
+        // `(async move { … }).await`, one level per stacked guard.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                let __autumn_inner: ::autumn_web::reexports::axum::response::Response =
+                    (async move {
+                        const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("update", "Note")];
+                    })
+                    .await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            vec![("update".to_owned(), "Note".to_owned())]
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_is_empty_without_authorize() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {}
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_handles_string_literal_resource() {
+        // `resource = "Note"` is accepted by the #[authorize] grammar and
+        // normalized back to an identifier; reading the attribute through that
+        // same parser keeps both spellings recording the same binding.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[authorize("update", resource = "Note")]
+            async fn handler(note: Note) {}
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            vec![("update".to_owned(), "Note".to_owned())]
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_unions_attr_and_marker() {
+        // A mixed stack (`#[authorize(A)]` above the route macro, `#[authorize(B)]`
+        // below it) leaves one marker and one attribute — both are real bindings,
+        // so neither case may short-circuit the other. The marker comes from the
+        // attribute *above* the route macro, so source order puts it first.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[authorize("publish", resource = Note)]
+            async fn handler(note: Note) {
+                const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("update", "Note")];
+            }
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            vec![
+                ("update".to_owned(), "Note".to_owned()),
+                ("publish".to_owned(), "Note".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_orders_stacked_markers_by_source() {
+        // Two `#[authorize]`s above the route macro expand top-down: the first
+        // (higher in source) is wrapped by the second, so its marker sits one
+        // wrapper level *deeper*. Source order is therefore deepest-first, and
+        // the walk must record nested markers before the level that wraps them.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("second", "Note")];
+                let __autumn_inner: ::autumn_web::reexports::axum::response::Response =
+                    (async move {
+                        const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] =
+                            &[("first", "Note")];
+                    })
+                    .await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            vec![
+                ("first".to_owned(), "Note".to_owned()),
+                ("second".to_owned(), "Note".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn secured_markers_survive_live_authorize_attribute() {
+        // `#[secured]` ABOVE the route macro (already expanded into markers)
+        // with `#[authorize]` BELOW it (still a live attribute): the marker
+        // read must win over the authorize-attribute fallback, or the roles
+        // and scopes silently drop to `&[]` while `secured` stays true.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[authorize("update", resource = Note)]
+            async fn handler(note: Note) {
+                const __AUTUMN_SECURED_ROLES: &[&str] = &["admin"];
+                const __AUTUMN_SECURED_SCOPES: &[&str] = &["notes:write"];
+            }
+        };
+        let (secured, roles, scopes) = extract_secured_info(&input_fn);
+        assert!(secured);
+        assert!(
+            roles.to_string().contains("\"admin\""),
+            "roles from an expanded #[secured] must survive a live #[authorize] attribute: {roles}"
+        );
+        assert!(
+            scopes.to_string().contains("\"notes:write\""),
+            "scopes must survive alongside the roles: {scopes}"
+        );
+    }
+
+    #[test]
+    fn public_marker_survives_generated_wrapper() {
+        // `#[public]` above a wrapping guard (e.g. `#[throttle]`): the guard
+        // buries the `__AUTUMN_PUBLIC` marker inside its generated
+        // `(async move { … }).await` body. The walk must descend that wrapper,
+        // or the route silently loses `public: true` and false-fails the
+        // coverage gate as `unclassified`.
+        let public = crate::public::public_macro(
+            quote::quote! {},
+            quote::quote! { async fn h() -> &'static str { "ok" } },
+        );
+        let throttled =
+            crate::throttle::throttle_macro(quote::quote! { limit = 5, per = "1m" }, public);
+        let parsed: syn::ItemFn =
+            syn::parse2(throttled).expect("#[throttle] over #[public] output must parse");
+        assert!(
+            is_public(&parsed),
+            "the public marker must survive a #[throttle] wrapper"
+        );
+    }
+
+    #[test]
+    fn secured_roles_survive_authorize_wrapper() {
+        // `#[secured]`'s role markers end up under the
+        // `let __autumn_inner: T = (async move { … }).await;` wrapper when a
+        // guard expands after it. The roles walk must descend that shape, like
+        // the authorize-binding walk does, or the roles silently vanish.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("update", "Note")];
+                let __autumn_inner: ::autumn_web::reexports::axum::response::Response =
+                    (async move {
+                        const __AUTUMN_SECURED_ROLES: &[&str] = &["admin"];
+                        const __AUTUMN_SECURED_SCOPES: &[&str] = &["notes:write"];
+                    })
+                    .await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        let (secured, roles, scopes) = extract_secured_info(&input_fn);
+        assert!(secured);
+        assert!(
+            roles.to_string().contains("\"admin\""),
+            "roles buried under a generated wrapper must be recovered: {roles}"
+        );
+        assert!(
+            scopes.to_string().contains("\"notes:write\""),
+            "scopes buried under a generated wrapper must be recovered: {scopes}"
+        );
+    }
+
+    #[test]
+    fn extract_authorize_bindings_ignores_malformed_marker() {
+        // A same-named const of a foreign shape is not ours to interpret: it
+        // contributes nothing rather than panicking on the unexpected AST.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, u32)] = &[("update", 1)];
+            }
+        };
+        assert_eq!(
+            extract_authorize_bindings(&input_fn),
+            Vec::<(String, String)>::new()
+        );
     }
 }

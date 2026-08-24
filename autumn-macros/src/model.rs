@@ -17,6 +17,8 @@ use quote::{ToTokens as _, format_ident, quote};
 use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
 
+use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
+
 /// Parsed `#[model(...)]` attribute arguments.
 ///
 /// `managed` is a declarative-schema opt-in marker (#1975, Decision 4). It is
@@ -94,6 +96,18 @@ fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
                 return Err(syn::Error::new_spanned(
                     attr,
                     "`#[unique]` takes no arguments; write a bare `#[unique]`",
+                ));
+            }
+        } else if attr.path().is_ident("position") {
+            // Bare marker only (issue #1358): the column name and optional
+            // scope live in the generated `#[repository(..., position(column
+            // = "...", scope = "..."))]` attribute, not here — this marker's
+            // only job is excluding the field from `New{Model}`/`Update{Model}`
+            // (see `excluded_from_new`), the same way `#[lock_version]` does.
+            if !matches!(attr.meta, syn::Meta::Path(_)) {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "`#[position]` takes no arguments; write a bare `#[position]`",
                 ));
             }
         } else if attr.path().is_ident("references") {
@@ -2898,8 +2912,8 @@ fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
 }
 
 /// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`,
-/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`, `#[searchable]`,
-/// `#[state_machine]`) that shouldn't be on the query struct
+/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`, `#[position]`,
+/// `#[searchable]`, `#[state_machine]`) that shouldn't be on the query struct
 /// (they'd confuse Diesel derives).
 fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
@@ -2922,6 +2936,11 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // they never leak onto the Diesel derives; codegen is unchanged.
                 && !a.path().is_ident("unique")
                 && !a.path().is_ident("references")
+                && !a.path().is_ident("position")
+                // #1384: `#[translatable]` is a marker the model macro reads;
+                // the behaviour lives in the field's `Translated` type, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("translatable")
         })
         .collect()
 }
@@ -3120,9 +3139,14 @@ fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
     }
     // `#[encrypted]` columns must flow through the `serialize_as` wrapper on
     // insert. Fields excluded from the insert (`#[id]`, `#[default]`,
-    // `#[lock_version]`) would instead get a raw database value, which the
-    // decrypting reader then rejects as a malformed envelope. Reject the combo.
-    if has_attr(field, "default") || has_attr(field, "lock_version") || has_attr(field, "id") {
+    // `#[lock_version]`, `#[position]`) would instead get a raw database
+    // value, which the decrypting reader then rejects as a malformed
+    // envelope. Reject the combo.
+    if has_attr(field, "default")
+        || has_attr(field, "lock_version")
+        || has_attr(field, "id")
+        || has_attr(field, "position")
+    {
         return Err(syn::Error::new_spanned(
             field,
             "`#[encrypted]` cannot be combined with `#[default]`, `#[lock_version]`, \
@@ -3156,6 +3180,275 @@ fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
         ));
     }
     Ok(())
+}
+
+// ── #1384: `#[translatable]` field attribute ─────────────────────────────────
+
+/// Whether a field is declared `#[translatable]` (issue #1384): its column
+/// holds an `autumn_web::i18n::Translated` container — an independent value
+/// per locale tag — instead of a single monolingual string.
+fn field_is_translatable(field: &syn::Field) -> bool {
+    has_attr(field, "translatable")
+}
+
+/// Validate a `#[translatable]` field.
+///
+/// The attribute is a marker: the *type* carries the behaviour, so the type
+/// has to be right. Everything else rejected here is a combination whose two
+/// halves disagree about what the column contains — a JSON container is not a
+/// string to encrypt, index, normalize, or full-text search.
+fn validate_translatable_field(field: &syn::Field) -> syn::Result<()> {
+    if !field_is_translatable(field) {
+        return Ok(());
+    }
+    // The type must be `Translated` (however it is spelled: bare, or fully
+    // qualified through any path). `Option<Translated>` is rejected on
+    // purpose — the container already models "no translation" as an empty
+    // map, and a nullable column would give two spellings for one state.
+    let is_translated = matches!(
+        &field.ty,
+        syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "Translated")
+            && p.path.segments.last().is_some_and(|s| s.arguments.is_empty())
+    );
+    if !is_translated {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[translatable]` requires the field type `autumn_web::i18n::Translated` \
+             (a per-locale container), not a plain string. Change the field to \
+             `pub <name>: autumn_web::i18n::Translated`; it renders the active \
+             locale through `Display` and keeps every other locale intact on write. \
+             The check is syntactic — a type alias for `Translated` is not \
+             recognised, and conversely any type whose last path segment is \
+             `Translated` is accepted, so spell the real type here.",
+        ));
+    }
+    // Combinations whose two halves disagree about the column's contents.
+    for (marker, why) in [
+        (
+            "encrypted",
+            "an encrypted column stores one opaque ciphertext envelope, which has no \
+             per-locale structure to resolve",
+        ),
+        (
+            "searchable",
+            "full-text search indexes the stored column, which for a translatable field \
+             is a JSON container — the index would match locale tags and JSON \
+             punctuation, not the prose",
+        ),
+        (
+            "normalize",
+            "normalizers rewrite a single string; they cannot see inside the per-locale \
+             container",
+        ),
+        (
+            "unique",
+            "uniqueness would compare whole JSON containers, so two records translated \
+             into different locale sets would never collide even with identical text",
+        ),
+        (
+            "indexed",
+            "an equality index over a JSON container matches whole containers, never a \
+             single locale's value",
+        ),
+        ("id", "a primary key must be a single scalar value"),
+        (
+            "lock_version",
+            "the optimistic-lock column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "position",
+            "the position column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "state_machine",
+            "a state column must hold one state name, not a per-locale container",
+        ),
+    ] {
+        if has_attr(field, marker) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "`#[translatable]` cannot be combined with `#[{marker}]`: {why}. \
+                     Keep a separate non-translatable column for that."
+                ),
+            ));
+        }
+    }
+    // The column is registered under its Rust field name, which the registry
+    // and the generated field-name-keyed accessors match against. A
+    // `#[serde(rename)]` would desync them.
+    if field_has_serde_rename(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[translatable]` fields cannot use `#[serde(rename = ...)]`: the column is \
+             registered under its Rust name, which must match the field name passed to \
+             `available_locales(..)` / `is_translated(..)`.",
+        ));
+    }
+    // `#[diesel(column_name = ...)]` is the spelling that actually renames the
+    // *database* column, so it desyncs the registry harder than a serde rename:
+    // `TranslatableColumnDescriptor` would name a column that does not exist on
+    // the table. Refuse it for the same reason, and say which one.
+    if field_has_diesel_column_name(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[translatable]` fields cannot use `#[diesel(column_name = ...)]`: the column \
+             is registered for framework surfaces under its Rust name, so a renamed database \
+             column would be advertised under a name that does not exist on the table. Name \
+             the Rust field after the column instead.",
+        ));
+    }
+    Ok(())
+}
+
+/// An identifier's name with any raw-identifier prefix removed (`r#type` ->
+/// `type`), matching the DB column and the key callers pass to the
+/// field-name-driven accessors.
+fn unraw_ident(ident: &syn::Ident) -> String {
+    let raw = ident.to_string();
+    raw.strip_prefix("r#").unwrap_or(&raw).to_owned()
+}
+
+/// Whether a field carries `#[diesel(column_name = ...)]`, which renames the
+/// database column out from under the Rust field name.
+fn field_has_diesel_column_name(field: &syn::Field) -> bool {
+    let mut found = false;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("diesel")) {
+        // Swallow any parse error: this is a detector, not a validator —
+        // diesel's own derive reports malformed input with a better message.
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("column_name") {
+                found = true;
+            }
+            let _ = meta
+                .value()
+                .and_then(syn::parse::ParseBuffer::parse::<syn::Expr>);
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Build the `impl` block a model's `#[translatable]` fields contribute:
+/// per-field accessors plus the field-name-keyed surface an app renders a
+/// "needs translation" affordance from (issue #1384 AC5).
+///
+/// Returns an empty token stream when the model has no translatable field, so
+/// a model that never opts in expands byte-for-byte as before.
+fn emit_translatable_items(model: &syn::Ident, fields: &[&syn::Ident]) -> TokenStream {
+    if fields.is_empty() {
+        return quote! {};
+    }
+    // Strip the raw-identifier prefix (the house idiom, see `pascal_case`):
+    // `Ident`'s `Display` keeps `r#`, so a `#[translatable] pub r#type:
+    // Translated` field would be keyed as `"r#type"` — a name no `SELECT`
+    // resolves and no caller of `available_locales("type")` would ever pass.
+    let names: Vec<String> = fields.iter().map(|f| unraw_ident(f)).collect();
+    let per_field = fields.iter().map(|ident| {
+        let name = ident.to_string();
+        let localized = format_ident!("{}_localized", ident);
+        let in_locale = format_ident!("{}_in", ident);
+        let setter = format_ident!("set_{}", ident);
+        let locales = format_ident!("{}_locales", ident);
+        let is_translated = format_ident!("{}_is_translated", ident);
+        let doc_localized = format!(
+            "`{name}` resolved against the request's active locale, walking the \
+             configured fallback chain on miss. `None` once the chain is exhausted."
+        );
+        let doc_in =
+            format!("`{name}` resolved against an explicit locale, then the fallback chain.");
+        let doc_set = format!(
+            "Store `value` as `{name}`'s translation for `locale`, leaving every other \
+             locale untouched."
+        );
+        let doc_locales = format!("Every locale `{name}` has been translated into, in tag order.");
+        let doc_is_translated = format!("Whether `{name}` has its own translation for `locale`.");
+        quote! {
+            #[doc = #doc_localized]
+            #[must_use]
+            pub fn #localized(&self) -> ::core::option::Option<&str> {
+                self.#ident.resolve()
+            }
+
+            #[doc = #doc_in]
+            #[must_use]
+            pub fn #in_locale(&self, locale: &str) -> ::core::option::Option<&str> {
+                self.#ident.resolve_in(locale)
+            }
+
+            #[doc = #doc_set]
+            pub fn #setter(
+                &mut self,
+                locale: impl ::core::convert::Into<::std::string::String>,
+                value: impl ::core::convert::Into<::std::string::String>,
+            ) -> &mut Self {
+                self.#ident.set(locale, value);
+                self
+            }
+
+            #[doc = #doc_locales]
+            #[must_use]
+            pub fn #locales(&self) -> ::std::vec::Vec<&str> {
+                self.#ident.available_locales()
+            }
+
+            #[doc = #doc_is_translated]
+            #[must_use]
+            pub fn #is_translated(&self, locale: &str) -> bool {
+                self.#ident.is_translated(locale)
+            }
+        }
+    });
+    let match_arms = fields.iter().zip(names.iter()).map(|(ident, name)| {
+        quote! { #name => ::core::option::Option::Some(&self.#ident), }
+    });
+    quote! {
+        impl #model {
+            #(#per_field)*
+
+            /// Field names on this model declared `#[translatable]`.
+            #[must_use]
+            pub const fn translatable_fields() -> &'static [&'static str] {
+                Self::__AUTUMN_TRANSLATABLE_COLUMNS
+            }
+
+            /// The raw per-locale container for `field`, or `None` when the
+            /// model has no translatable field by that name.
+            #[must_use]
+            pub fn translated(
+                &self,
+                field: &str,
+            ) -> ::core::option::Option<&::autumn_web::i18n::Translated> {
+                match field {
+                    #(#match_arms)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+
+            /// Which locales `field` has been translated into — the
+            /// "needs translation" affordance. Empty for an unknown field.
+            #[must_use]
+            pub fn available_locales(&self, field: &str) -> ::std::vec::Vec<&str> {
+                self.translated(field)
+                    .map(::autumn_web::i18n::Translated::available_locales)
+                    .unwrap_or_default()
+            }
+
+            /// Whether `field` has its own translation for `locale`.
+            #[must_use]
+            pub fn is_translated(&self, field: &str, locale: &str) -> bool {
+                self.translated(field)
+                    .is_some_and(|t| t.is_translated(locale))
+            }
+
+            /// `field` resolved against the request's active locale.
+            #[must_use]
+            pub fn localized(&self, field: &str) -> ::core::option::Option<&str> {
+                self.translated(field)
+                    .and_then(::autumn_web::i18n::Translated::resolve)
+            }
+        }
+    }
 }
 
 // ── #1379: `#[normalize(...)]` field normalization ────────────────────────
@@ -3897,14 +4190,23 @@ fn validate_factory_assoc_attrs(fields: &[&Field]) -> Option<TokenStream> {
     None
 }
 
-/// True if a field has `#[id]`, `#[default]`, or `#[lock_version]` — all
-/// three are excluded from the `NewX` insert type.
+/// True if a field has `#[id]`, `#[default]`, `#[lock_version]`, or
+/// `#[position]` — all four are excluded from the `NewX` insert type (and,
+/// via `fields_for_new`, from `UpdateX` too — `#[lock_version]` is the one
+/// exception, re-added to `UpdateX` separately as a plain required field).
 ///
 /// `#[lock_version]` fields are excluded because the DB column must carry a
 /// `DEFAULT 0` constraint; the initial version is always zero and is never
-/// supplied by the caller on insert.
+/// supplied by the caller on insert. `#[position]` fields (issue #1358) are
+/// excluded because the generated repository assigns the next contiguous
+/// value on insert and only ever changes it through `move_to`/`move_before`/
+/// `move_after`/`move_up`/`move_down` — never a direct create/update payload,
+/// which would let a caller silently break the contiguous invariant.
 fn excluded_from_new(field: &Field) -> bool {
-    has_attr(field, "id") || has_attr(field, "default") || has_attr(field, "lock_version")
+    has_attr(field, "id")
+        || has_attr(field, "default")
+        || has_attr(field, "lock_version")
+        || has_attr(field, "position")
 }
 
 /// Convert a `snake_case` identifier to `PascalCase`.
@@ -4138,6 +4440,31 @@ fn emit_form_model_impl(
     }
 }
 
+/// Emit the JSON-Schema `TokenStream` for one model field.
+///
+/// Identical to [`emit_json_schema_tokens`] except that a `#[translatable]`
+/// field (issue #1384) is described inline as a locale-tag→string map, which is
+/// exactly what its lossless `Serialize` emits. Without that, the field would
+/// fall through to the `$ref` branch and `autumn openapi` would ship a spec
+/// referencing a component nothing registers.
+///
+/// Keyed on the **attribute**, never on the type's name: an application type
+/// that merely happens to be called `Translated` (`domain::Translated`) keeps
+/// its ordinary `$ref`, so the advertised contract cannot silently disagree
+/// with what that type actually serializes to.
+fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
+    if field_is_translatable(field) {
+        return quote! {
+            ::autumn_web::reexports::serde_json::json!({
+                "type": "object",
+                "description": "Per-locale content, keyed by locale tag (issue #1384).",
+                "additionalProperties": { "type": "string" }
+            })
+        };
+    }
+    emit_json_schema_tokens(&field.ty)
+}
+
 /// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
 /// representing the JSON Schema for the given Rust type.
 ///
@@ -4213,7 +4540,7 @@ fn emit_schema_fn_body_ext(
         .map(|f| {
             let field_name = schema_property_name(f, rename_all_rule)
                 .unwrap_or_else(|| f.ident.as_ref().unwrap().to_string());
-            let schema_expr = emit_json_schema_tokens(&f.ty);
+            let schema_expr = emit_json_schema_tokens_for_field(f);
             quote! {
                 __props.insert(#field_name.to_owned(), #schema_expr);
             }
@@ -4993,12 +5320,22 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
+    // `#[commentable(by = ..., ...)]` (#1367) — the polymorphic association
+    // kind. Resolved here beside `#[votable]`; emitted below, once `all_fields`
+    // is known (the counter column must name a real `i64` field, and the
+    // parent's soft-delete / tenant columns are projected into the spec).
+    let commentable = match resolve_commentable(name, outer_attrs) {
+        Ok(spec) => spec,
+        Err(err) => return err.to_compile_error(),
+    };
+
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
         .filter(|a| {
             !a.path().is_ident("searchable")
                 && !is_association_attr(a)
                 && !is_votable_attr(a)
+                && !is_commentable_attr(a)
                 && !a.path().is_ident("shard_key")
         })
         .collect();
@@ -5156,6 +5493,112 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 has_deleted_at,
                 has_tenant_id,
                 pk_ident,
+            )
+        }
+    };
+
+    // ── Polymorphic comments (#[commentable], #1367) ────────────────────────
+    // Validated on the same terms as `#[votable]`'s aggregate column: the
+    // maintained counter must name a real `i64` field, or the mistake only
+    // surfaces as a runtime `42703 column "comment_count" does not exist` on
+    // the very first comment.
+    let commentable_items = match commentable {
+        None => TokenStream::new(),
+        Some(ref spec) => {
+            if let Some(counter_column) = spec.counter_column.as_deref() {
+                let counter_field = all_fields
+                    .iter()
+                    .find(|f| f.ident.as_ref().is_some_and(|i| i == counter_column));
+                let Some(counter_field) = counter_field else {
+                    return syn::Error::new(
+                        spec.span,
+                        format!(
+                            "commentable counter column `{counter_column}` not found on \
+                             model `{name}`; add the field (e.g. `#[default] pub \
+                             {counter_column}: i64`), point the attribute at an \
+                             existing one with `#[commentable(..., counter_cache = \
+                             <field>)]`, or opt out with `#[commentable(..., \
+                             counter_cache = false)]`"
+                        ),
+                    )
+                    .to_compile_error();
+                };
+                // Two layers, exactly like `#[votable]`: a directed error for
+                // the spellings that are definitely wrong, and the generated
+                // `const` guard below for everything else — so
+                // `std::primitive::i64` and honest aliases still compile.
+                let counter_ty = counter_field.ty.to_token_stream().to_string();
+                let definitely_not_i64: &[&str] = &[
+                    "i8", "i16", "i32", "i128", "u8", "u16", "u32", "u64", "u128", "usize",
+                    "isize", "f32", "f64", "bool", "String",
+                ];
+                if definitely_not_i64.contains(&counter_ty.as_str())
+                    || counter_ty.starts_with("Option <")
+                {
+                    return syn::Error::new_spanned(
+                        &counter_field.ty,
+                        format!(
+                            "commentable counter column `{counter_column}` on model \
+                             `{name}` must be `i64` (BIGINT), found `{counter_ty}`; the \
+                             counter is maintained with `SET c = c + 1` and read back \
+                             as an `i64` — widen the column and the field"
+                        ),
+                    )
+                    .to_compile_error();
+                }
+            }
+            let cmt_has_deleted_at = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
+            let cmt_has_tenant_id = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "tenant_id"));
+            // A composite key cannot back a polymorphic parent: `commentable_id`
+            // is ONE column, so a two-`#[id]` model has no single value to store
+            // there. Reject rather than silently keying on the first component.
+            let cmt_id_fields: Vec<&syn::Ident> = all_fields
+                .iter()
+                .filter(|f| has_attr(f, "id"))
+                .filter_map(|f| f.ident.as_ref())
+                .collect();
+            if cmt_id_fields.len() > 1 {
+                let listed = cmt_id_fields
+                    .iter()
+                    .map(|i| format!("`{i}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return syn::Error::new(
+                    spec.span,
+                    format!(
+                        "`#[commentable]` requires a single `i64` primary key: model \
+                         `{name}` declares a composite key ({listed}), and \
+                         `commentable_id` is one column — it cannot address a \
+                         composite-keyed row"
+                    ),
+                )
+                .to_compile_error();
+            }
+            let cmt_pk_ident = all_fields
+                .iter()
+                .find(|f| has_attr(f, "id"))
+                .or_else(|| {
+                    all_fields.iter().find(|f| match &f.ty {
+                        syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                        _ => false,
+                    })
+                })
+                .and_then(|f| f.ident.as_ref());
+            emit_commentable_items(
+                name,
+                vis,
+                spec,
+                &table_name,
+                &crate::commentable::ParentShape {
+                    has_deleted_at: cmt_has_deleted_at,
+                    has_tenant_id: cmt_has_tenant_id,
+                    is_sharded: shard_key_field.is_some(),
+                    pk_ident: cmt_pk_ident,
+                },
             )
         }
     };
@@ -5542,6 +5985,43 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             Err(err) => return err.to_compile_error(),
         }
     }
+
+    // Collect `#[translatable]` columns (issue #1384, validated to be
+    // non-null `Translated`). Each entry is the field ident; the column name is
+    // the Rust field name, which is also the key the field-name-driven
+    // `available_locales` / `is_translated` accessors match on.
+    let mut translatable_columns: Vec<&syn::Ident> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_translatable_field(f) {
+            return err.to_compile_error();
+        }
+        if field_is_translatable(f)
+            && let Some(ident) = f.ident.as_ref()
+        {
+            translatable_columns.push(ident);
+        }
+    }
+    // `unraw()` for the same reason as in `emit_translatable_items`: the column
+    // registered here must be the real DB column name.
+    let translatable_column_names: Vec<String> = translatable_columns
+        .iter()
+        .map(|i| unraw_ident(i))
+        .collect();
+    let translatable_inventory: Vec<TokenStream> = translatable_column_names
+        .iter()
+        .map(|col| {
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::i18n::TranslatableColumnDescriptor {
+                        model: stringify!(#name),
+                        table: #table_name,
+                        column: #col,
+                    }
+                }
+            }
+        })
+        .collect();
+    let translatable_items = emit_translatable_items(name, &translatable_columns);
 
     // Collect `#[normalize]` columns (validated to be non-null `String`).
     // Each entry: (field ident, lookup key, normalizer chain).
@@ -7269,9 +7749,21 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub const __AUTUMN_ENCRYPTED_COLUMNS: &'static [&'static str] =
                 &[#(#encrypted_column_names),*];
+
+            /// Column names on this model declared `#[translatable]` (#1384).
+            ///
+            /// Emitted for every model (empty when none are translatable) so
+            /// that surfaces without a compile-time view of the model can ask
+            /// which columns hold a per-locale container.
+            #[doc(hidden)]
+            pub const __AUTUMN_TRANSLATABLE_COLUMNS: &'static [&'static str] =
+                &[#(#translatable_column_names),*];
         }
 
         #(#encrypted_inventory)*
+
+        #translatable_items
+        #(#translatable_inventory)*
 
         impl #update_name {
             #[doc(hidden)]
@@ -7722,6 +8214,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // ── Votable reactions (#[votable], #1362) ───────────────────────────
         #votable_items
+
+        // ── Polymorphic comments (#[commentable], #1367) ────────────────────
+        #commentable_items
     }
 }
 
@@ -9972,6 +10467,101 @@ mod tests {
     }
 
     #[test]
+    fn position_attr_detected_by_has_attr() {
+        let field: syn::Field = syn::parse_quote! {
+            #[position]
+            pub rank: i64
+        };
+        assert!(has_attr(&field, "position"));
+    }
+
+    #[test]
+    fn position_field_is_excluded_from_new() {
+        let field: syn::Field = syn::parse_quote! {
+            #[position]
+            pub rank: i64
+        };
+        // A #[position] field must be absent from NewModel/UpdateModel — the
+        // generated repository assigns and maintains it entirely (#1358).
+        assert!(excluded_from_new(&field));
+    }
+
+    #[test]
+    fn position_bare_attribute_with_args_is_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[position(scope = "board_id")]
+            pub rank: i64
+        };
+        let err = validate_field_schema_markers(&field).unwrap_err();
+        assert!(
+            err.to_string().contains("position"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn position_attribute_is_stripped_from_the_diesel_struct() {
+        // `#[position]` is consumed by `#[model]`; re-emitting it onto the
+        // generated Diesel struct would fail with "cannot find attribute
+        // `position` in this scope".
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Task {
+                    #[id]
+                    pub id: i64,
+                    #[position]
+                    pub rank: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("# [position]"),
+            "the position attribute must not leak onto the emitted struct, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn position_field_excluded_from_new_and_update_structs() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Task {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    #[position]
+                    pub rank: i64,
+                }
+            },
+        )
+        .to_string();
+
+        let new_struct = generated
+            .split("struct NewTask")
+            .nth(1)
+            .expect("NewTask struct should be emitted");
+        let new_struct_body = &new_struct[..new_struct.find('}').unwrap_or(new_struct.len())];
+        assert!(
+            !new_struct_body.contains("rank"),
+            "NewTask must not contain the server-managed position field, got: {new_struct_body}"
+        );
+
+        let update_struct = generated
+            .split("struct UpdateTask")
+            .nth(1)
+            .expect("UpdateTask struct should be emitted");
+        let update_struct_body =
+            &update_struct[..update_struct.find('}').unwrap_or(update_struct.len())];
+        assert!(
+            !update_struct_body.contains("rank"),
+            "UpdateTask must not contain the server-managed position field, got: {update_struct_body}"
+        );
+    }
+
+    #[test]
     fn encrypted_string_field_is_accepted() {
         let field: syn::Field = syn::parse_quote! {
             #[encrypted]
@@ -9991,6 +10581,220 @@ mod tests {
         };
         let err = validate_encrypted_field(&field).unwrap_err();
         assert!(err.to_string().contains("searchable"));
+    }
+
+    // ── #1384: `#[translatable]` field attribute ────────────────────────────
+
+    /// #1384 (Codex round 5): the locale-map schema is keyed on the
+    /// `#[translatable]` MARKER, not on the type's leaf name. An application
+    /// type that merely happens to be called `Translated` must keep its
+    /// ordinary `$ref`, or the advertised `OpenAPI` contract would silently
+    /// disagree with what that type actually serializes to.
+    #[test]
+    fn translatable_schema_is_keyed_on_the_attribute_not_the_type_name() {
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    #[translatable]
+                    pub title: ::autumn_web::i18n::Translated,
+                    // A user's OWN type with the same leaf name, unmarked.
+                    pub note: domain::Translated,
+                }
+            },
+        )
+        .to_string();
+
+        // The marked field is described inline as a locale-tag -> string map,
+        // so `autumn openapi` emits no reference to a component nothing
+        // registers.
+        assert!(
+            generated.contains("additionalProperties"),
+            "translatable field should carry an inline map schema"
+        );
+        // The unmarked look-alike still gets the ordinary `$ref` branch.
+        assert!(
+            generated.contains("components/schemas"),
+            "an unmarked `Translated` look-alike must keep its $ref"
+        );
+    }
+
+    /// A model with NO translatable field emits no inline map schema at all.
+    #[test]
+    fn an_unmarked_translated_lookalike_alone_emits_no_map_schema() {
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub note: domain::Translated,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("additionalProperties"),
+            "no `#[translatable]` field means no locale-map schema"
+        );
+    }
+
+    #[test]
+    fn translatable_field_is_accepted_on_a_translated_column() {
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            pub title: Translated
+        };
+        assert!(validate_translatable_field(&field).is_ok());
+        let qualified: syn::Field = syn::parse_quote! {
+            #[translatable]
+            pub title: ::autumn_web::i18n::Translated
+        };
+        assert!(validate_translatable_field(&qualified).is_ok());
+    }
+
+    #[test]
+    fn translatable_on_a_plain_string_is_rejected_with_the_fix() {
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            pub title: String
+        };
+        let err = validate_translatable_field(&field).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Translated"), "{msg}");
+    }
+
+    #[test]
+    fn translatable_option_is_rejected() {
+        // The container itself models "no translation" (an empty map), so a
+        // nullable column would give two ways to say the same thing.
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            pub title: Option<Translated>
+        };
+        assert!(validate_translatable_field(&field).is_err());
+    }
+
+    #[test]
+    fn translatable_plus_encrypted_is_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            #[encrypted]
+            pub title: Translated
+        };
+        let err = validate_translatable_field(&field).unwrap_err();
+        assert!(err.to_string().contains("encrypted"), "{err}");
+    }
+
+    #[test]
+    fn translatable_plus_searchable_is_rejected() {
+        // The stored column is a JSON container; a tsvector built from it
+        // would index JSON punctuation and locale tags, not the prose.
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            #[searchable]
+            pub title: Translated
+        };
+        let err = validate_translatable_field(&field).unwrap_err();
+        assert!(err.to_string().contains("searchable"), "{err}");
+    }
+
+    #[test]
+    fn translatable_plus_equality_markers_are_rejected() {
+        for marker in [
+            "unique",
+            "indexed",
+            "normalize",
+            "id",
+            "lock_version",
+            "position",
+        ] {
+            let marker_ident = syn::Ident::new(marker, proc_macro2::Span::call_site());
+            let field: syn::Field = syn::parse_quote! {
+                #[translatable]
+                #[#marker_ident]
+                pub title: Translated
+            };
+            assert!(
+                validate_translatable_field(&field).is_err(),
+                "`#[{marker}]` must not combine with `#[translatable]`"
+            );
+        }
+    }
+
+    #[test]
+    fn translatable_model_emits_accessors_and_registry() {
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    #[translatable]
+                    pub title: ::autumn_web::i18n::Translated,
+                    pub body: String,
+                }
+            },
+        )
+        .to_string();
+
+        // The attribute is stripped from the emitted struct (rustc has no
+        // `#[translatable]` attribute of its own).
+        let query_struct = generated
+            .split("pub struct Post")
+            .nth(1)
+            .expect("Post struct emitted");
+        let body = &query_struct[..query_struct.find('}').unwrap_or(query_struct.len())];
+        assert!(
+            !body.contains("translatable"),
+            "attr must be stripped: {body}"
+        );
+
+        // Per-field accessors (AC2 / AC5).
+        for expected in [
+            "fn title_localized",
+            "fn title_in",
+            "fn set_title",
+            "fn title_locales",
+            "fn title_is_translated",
+        ] {
+            assert!(generated.contains(expected), "missing {expected}");
+        }
+        // Model-level, field-name-keyed surface (AC5 wording).
+        for expected in [
+            "fn translatable_fields",
+            "fn available_locales",
+            "fn is_translated",
+            "fn localized",
+            "__AUTUMN_TRANSLATABLE_COLUMNS",
+        ] {
+            assert!(generated.contains(expected), "missing {expected}");
+        }
+        // Registry submission (AC5 observability from outside the model).
+        assert!(generated.contains("TranslatableColumnDescriptor"));
+    }
+
+    #[test]
+    fn model_without_translatable_fields_emits_no_translatable_accessors() {
+        // AC7: purely additive — a model that opts out is untouched apart from
+        // the always-emitted (empty) column constant.
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(!generated.contains("TranslatableColumnDescriptor"));
+        assert!(!generated.contains("fn translatable_fields"));
+        assert!(!generated.contains("fn available_locales"));
+        assert!(generated.contains("__AUTUMN_TRANSLATABLE_COLUMNS"));
     }
 
     // ── #1191: `#[searchable(embed)]` parsing ───────────────────────────────

@@ -57,6 +57,11 @@ pub trait PostRepository {
     fn find_by_author_id(author_id: i64) -> Vec<Post>;
 }
 
+// #2260 declared a `CommentRepository` here to serve `Post`'s `dependent =
+// destroy` leg. Both are gone with the `Comment` model (#1367): comments live in
+// the polymorphic table now, and a `posts_delete_comments` trigger removes a
+// parent's rows -- for every commentable model, not just this one.
+
 // Typed grouped aggregate (#1364): `sum_value_grouped_by_post_id` rolls the
 // votes table up to `SUM(value) GROUP BY post_id`, returning one
 // `(post_id, Option<sum>)` pair per post. The front-page "Top posts by votes"

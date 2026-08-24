@@ -3,7 +3,7 @@
 Autumn relies on procedural macros to eliminate boilerplate. This guide shows
 you exactly what those macros generate so there are no surprises at runtime.
 
-Examples in this guide track the Autumn 0.6.x line and Rust 1.88.0+ as of
+Examples in this guide track the Autumn 0.7.x line and Rust 1.88.0+ as of
 2026-07-10.
 
 The code snippets are **illustrative**, not compiled doctests: the "what it
@@ -38,7 +38,7 @@ When your application starts, Autumn logs every decision it makes. A typical
 startup sequence looks like this:
 
 ```
-  INFO autumn: Autumn starting version="0.6.0" profile="dev"
+  INFO autumn: Autumn starting version="0.7.0" profile="dev"
   INFO autumn: Database pool configured max_connections=10
   INFO autumn: Registered task name="db_cleanup" schedule="every 5m"
   INFO autumn: Listening addr=127.0.0.1:3000
@@ -47,7 +47,7 @@ startup sequence looks like this:
 If you omit the database:
 
 ```
-  INFO autumn: Autumn starting version="0.6.0" profile="dev"
+  INFO autumn: Autumn starting version="0.7.0" profile="dev"
   INFO autumn: Database not configured
   INFO autumn: Listening addr=127.0.0.1:3000
 ```
@@ -74,7 +74,7 @@ AUTUMN_SHOW_CONFIG=1 cargo run
 This produces output like:
 
 ```
-  INFO autumn: Autumn starting version="0.6.0" profile="dev"
+  INFO autumn: Autumn starting version="0.7.0" profile="dev"
   INFO autumn: Registered routes:
     /            GET      -> index
     /todos       GET      -> list_todos
@@ -1187,8 +1187,9 @@ async fn admin_panel(__autumn_session: Session) -> AutumnResult<&'static str> {
 
 ### `#[authorize("action", resource = Type)]`
 
-Injects hidden `Session` and `State<AppState>` extractors and a
-record-level [`Policy`](./authorization.md) check at the top of your
+Injects hidden extractors (`Session`, `State<AppState>`, the granted
+API-token scopes, and the route-version/idempotency-replay extensions) and
+a record-level [`Policy`](./authorization.md) check at the top of your
 handler. Mirrors `#[secured]` but answers "are you allowed to act on
 *this* record?" instead of "are you allowed to call this *route*?"
 
@@ -1207,17 +1208,31 @@ async fn edit_post(post: Post) -> AutumnResult<Markup> {
 ```rust
 #[get("/posts/{id}/edit")]
 async fn edit_post(
+    __autumn_token_scopes: Option<Extension<ApiTokenScopes>>,
     __autumn_session: Session,
     State(__autumn_state): State<AppState>,
+    // … plus hidden route-version and idempotency-replay extractors
     post: Post,
-) -> AutumnResult<Markup> {
-    ::autumn_web::authorization::__check_policy::<Post>(
+) -> Response {
+    // Inert build-time marker — nothing reads it at runtime. It lets the
+    // route macro recover the binding when `#[authorize]` expands *before*
+    // `#[get]` (attribute order decides which macro sees the other's output).
+    const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("update", "Post")];
+
+    if let Err(__autumn_error) = ::autumn_web::authorization::__check_policy_scoped::<Post>(
         &__autumn_state,
         &__autumn_session,
+        __autumn_token_scopes.as_ref().map(|__e| &__e.0),
         "update",
         &post,
-    ).await?;
-    Ok(html! { h1 { (post.title) } })
+    ).await {
+        return __autumn_error.into_response();
+    }
+    // … sunset check and idempotency-replay short-circuit …
+    let __autumn_inner: AutumnResult<Markup> = (async move {
+        Ok(html! { h1 { (post.title) } })
+    }).await;
+    __autumn_inner.into_response()
 }
 ```
 
@@ -1226,8 +1241,21 @@ async fn edit_post(
 - The check returns the configured deny status — `404` by default to
   avoid leaking record existence, configurable via
   `[security] forbidden_response = "403"`.
+- The scope-aware `__check_policy_scoped` takes the request's granted API-token
+  scopes as its third argument, so a policy can decide on `ctx.has_scope(...)`
+  for token-authenticated principals as well as session ones.
+- The handler is rewritten to return `Response`, and the original body is
+  wrapped in `(async move { … }).await` so the deny path can return early
+  before it runs.
+- `__AUTUMN_AUTHORIZE_BINDINGS` records the resource *identifier as written*,
+  never the `Policy` impl that serves the check — that is resolved from the
+  registry at boot. It is what puts the route's `(action, resource)` pair into
+  the `authorization_policies` dimension of the build-time security manifest;
+  see [Security Posture Manifest](./security-posture-manifest.md).
 - Coexists with `#[secured]`: stack both attributes when a route should
-  require both authentication/role gating and a record-level check.
+  require both authentication/role gating and a record-level check. Each
+  attribute leaves its own marker, so both the roles and the binding survive
+  however the two expand around each other.
 
 ### `#[step_up]` / `#[step_up(max_age = "5m")]`
 

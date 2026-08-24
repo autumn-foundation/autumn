@@ -21,6 +21,7 @@ use super::model::{
     plan_cargo_deps, plan_model_with_options,
 };
 use super::naming::{humanize_label, pascal, pluralize, snake};
+use super::scaffold_i18n;
 use super::schema_edit::{
     add_mod_declaration, create_table_sql_with_metadata_and_id, ensure_autumn_web_feature,
     ensure_dependency_feature, ensure_dev_dependency_test_support,
@@ -76,6 +77,18 @@ pub struct ScaffoldOptions {
     /// the generated child model's `#[belongs_to(...)]` and a migration adding
     /// `{child}_count BIGINT NOT NULL DEFAULT 0` to the parent's table.
     pub counter_cache: bool,
+    /// Emit translatable views (issue #1349) — `--i18n`. Every user-facing
+    /// string in the generated HTML views (page titles, headings, buttons,
+    /// links, per-field labels) becomes a `t!(locale, "key")` lookup, each
+    /// view-rendering handler takes the `Locale` extractor, and the keys are
+    /// back-filled into `i18n/en.ftl` with their English values — so a
+    /// default-locale app renders exactly as it does without the flag, and
+    /// adding a locale is a `.ftl` file rather than a Rust edit.
+    ///
+    /// `false` (the default) keeps the scaffold's output byte-for-byte
+    /// unchanged: [`super::scaffold_i18n::ViewLabels`] is an identity function
+    /// over the literal expressions the plain path emits.
+    pub i18n: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,7 +200,7 @@ fn layout_param_counts(main_src: &str) -> Vec<usize> {
 }
 
 /// Whether a raw string literal begins at `start` (`r"`, `r#"`, `br"`, …).
-fn is_raw_string_start(bytes: &[u8], start: usize) -> bool {
+pub(super) fn is_raw_string_start(bytes: &[u8], start: usize) -> bool {
     let mut i = start;
     if bytes.get(i) == Some(&b'b') {
         i += 1;
@@ -205,7 +218,7 @@ fn is_raw_string_start(bytes: &[u8], start: usize) -> bool {
 /// Advance past a raw string literal beginning at `start`, matching the opening
 /// hash count. Returns the index just past the closing delimiter (or the end of
 /// input if the literal is unterminated).
-fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
+pub(super) fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
     if bytes.get(i) == Some(&b'b') {
         i += 1;
@@ -236,7 +249,7 @@ fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
 
 /// Whether the byte before `i` is an identifier-continuation char, used to
 /// avoid mistaking a trailing `r`/`b` inside an identifier for a raw string.
-fn prev_is_ident_char(bytes: &[u8], i: usize) -> bool {
+const fn prev_is_ident_char(bytes: &[u8], i: usize) -> bool {
     i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')
 }
 
@@ -421,6 +434,33 @@ fn plan_scaffold_with_options_impl(
     }
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, &options.model.uniques)?;
+    // Gate (issue #1384): a `{translatable}` column holds a per-locale
+    // container, and the scaffold's CRUD form is a single plain text input
+    // bound to the whole column. Submitting it would REPLACE the container
+    // with one locale's value — silently destroying every other translation on
+    // the first edit — and the index/CSV/filter/sort paths would operate on
+    // the raw JSON. Editing translated content needs a per-locale form, which
+    // is translation-workflow UI and deliberately out of scope here. Refuse up
+    // front rather than emit a CRUD screen that eats data.
+    // `!for_revert`, like every other generation-only gate here: `autumn destroy
+    // scaffold` recomputes this plan before reverting it, and a refusal on that
+    // path would strand the very files the user asked to remove.
+    if let Some(f) = fields
+        .iter()
+        .filter(|_| !for_revert)
+        .find(|f| f.is_translatable())
+    {
+        return Err(GenerateError::Config(format!(
+            "a `{{translatable}}` field (`{}`) is not supported by `generate scaffold`: the \
+             generated CRUD form binds one plain text input to the whole per-locale container, \
+             so saving the form would replace every other locale's value. Use `generate model \
+             {name} {}:...{{translatable}} ...` (which emits the model, schema and migration) \
+             and write the per-locale edit view yourself — `post.title_localized()`, \
+             `post.available_locales(\"title\")` and `post.set_title(locale, value)` are \
+             generated for you.",
+            f.name, f.name
+        )));
+    }
     if !options.api {
         validate_enum_field_names_against_routes_imports(&fields, &pascal(name))?;
     }
@@ -458,6 +498,75 @@ fn plan_scaffold_with_options_impl(
             return Err(GenerateError::Config(
                 "a `slug` field is not yet supported alongside a `:states(...)` field: the \
                  transition handler still keys its route off `id`."
+                    .to_owned(),
+            ));
+        }
+    }
+    // Gate (issue #1349): `--i18n` rewrites the standard HTML views' strings
+    // into `t!(locale, "key")` lookups, which need a `Locale` extractor in scope
+    // at the render site. Two families of view code have no such scope:
+    //
+    //   * `--live`/`--live-validation` render list rows from a `LiveFragment`
+    //     impl driven by an SSE broadcast — there is no request, so no locale;
+    //   * `--belongs-to` renders the child list and inline create form through
+    //     the nested renderer, which splices markup into the PARENT resource's
+    //     already-generated `show` handler (whose signature this generator does
+    //     not own).
+    //
+    // Emitting half-translated views under a flag that promises translatable
+    // output is worse than refusing: the untranslated half only surfaces once
+    // someone adds a second locale. Same posture as the `slug` gates above.
+    //
+    // `for_revert` skips the gate so `autumn destroy scaffold` can still clean
+    // up a resource generated before a refusal existed (issue #1834).
+    // `--api` renders no labels, so `--i18n` is documented as a pure no-op
+    // there — which has to include these refusals. Otherwise
+    // `generate scaffold Common --api --i18n` fails while the identical
+    // `--api` scaffold succeeds, and a flag that changes nothing about the
+    // output would still change whether it is allowed to exist.
+    if !for_revert && options.i18n && !options.api {
+        let unsupported = if options.live {
+            Some((
+                "--live",
+                "the SSE live list renders its rows from a `LiveFragment` impl outside any \
+                 request, so no `Locale` extractor is in scope",
+            ))
+        } else if options.live_validation {
+            Some((
+                "--live-validation",
+                "the inline-validation fragments re-render single form controls outside the \
+                 handlers that carry the `Locale` extractor",
+            ))
+        } else if options.belongs_to.is_some() {
+            Some((
+                "--belongs-to",
+                "the nested child list and inline create form are spliced into the parent \
+                 resource's already-generated `show` handler, whose signature this scaffold \
+                 does not own",
+            ))
+        } else {
+            None
+        };
+        if let Some((variant, why)) = unsupported {
+            return Err(GenerateError::Config(format!(
+                "`--i18n` is not yet supported together with `{variant}`: {why}. Drop \
+                 `{variant}` to get translatable views, or drop `--i18n` to keep the \
+                 English-only scaffold."
+            )));
+        }
+        // A resource named `Common` would key its labels under `common.*` — the
+        // same namespace the shared chrome block owns. Its keys would be written
+        // into both blocks, and `destroy`ing it would strip the chrome every
+        // OTHER resource is still referencing, so those resources stop
+        // compiling (`t!` validates key existence at compile time). Refuse the
+        // name rather than emit a bundle that breaks its neighbours.
+        if snake(name) == "common" {
+            return Err(GenerateError::Config(
+                "`--i18n` cannot scaffold a resource named `Common`: its translation keys would \
+                 land under `common.*`, the namespace reserved for the shared chrome every \
+                 scaffolded resource reuses — destroying it later would take that chrome down \
+                 with it and break every other `--i18n` resource. Rename the resource (e.g. \
+                 `CommonSetting`), or drop `--i18n`."
                     .to_owned(),
             ));
         }
@@ -557,6 +666,7 @@ fn plan_scaffold_with_options_impl(
         no_policy: options.no_policy,
         belongs_to: options.belongs_to.clone(),
         counter_cache: options.counter_cache,
+        i18n: options.i18n,
     };
     let mut plan = if for_revert {
         super::model::plan_model_with_options_for_revert(
@@ -575,7 +685,10 @@ fn plan_scaffold_with_options_impl(
             &options_with_key.model,
         )?
     };
-    let metadata = parse_model_metadata(&fields, &options_with_key.model)?;
+    let mut metadata = parse_model_metadata(&fields, &options_with_key.model)?;
+    // Issue #1367: see `model::plan_model` — `by` is emitted only when the
+    // author model it names is really there.
+    metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
     // A `--default field=value` column is dropped from `form_fields` (see
     // below) and therefore from the generated `New{Pascal}` insert struct
     // entirely (it's set at the SQL `DEFAULT` level instead) — a slug can't
@@ -619,6 +732,42 @@ fn plan_scaffold_with_options_impl(
         &options_with_key,
         for_revert,
     )?;
+
+    // Issue #1349: the `--belongs-to` refusal above reads the command line, and
+    // the command line is not where a nesting necessarily comes from. `resolve`
+    // deliberately recovers the relationship from the markers in the parent's
+    // routes file when the flag is not repeated — which is the ordinary "I
+    // changed a field, re-scaffold it" run. Without this second gate,
+    // `generate … --force --i18n` on an existing child is accepted and emits
+    // nested views whose heading, empty state, add button, and parent backlink
+    // are still hardcoded English: a half-translated module, which is precisely
+    // what the refusal exists to prevent.
+    //
+    // Two gates rather than one moved gate: the early one needs no disk reads
+    // and fires on the typed flag even in a project where `resolve` would fail
+    // first for an unrelated reason (an unscaffolded parent, say), so the user
+    // hears about the combination they asked for rather than about a
+    // precondition they would then have to satisfy only to be refused anyway.
+    // This one is reachable only for a recovered nesting, and says so.
+    if !for_revert
+        && options_with_key.i18n
+        && !options_with_key.api
+        && let Some(n) = nesting.as_ref()
+    {
+        return Err(GenerateError::Config(format!(
+            "`--i18n` is not yet supported for a nested resource, and {plural} is still nested \
+             under {parent}: src/routes/{parent}.rs renders their children section, which is \
+             where this run recovered the relationship from (`--belongs-to` is typed once, so \
+             a later `--force` rarely repeats it). The nested child list and inline create form \
+             are spliced into {parent}.rs's already-generated `show` handler, whose signature \
+             this scaffold does not own — so those views would stay hardcoded English while the \
+             rest of the module was translated. Drop `--i18n` to regenerate the nested scaffold \
+             as it is, or `autumn destroy scaffold {name} …` first (that removes the \
+             parent-side section from src/routes/{parent}.rs) and scaffold it flat with \
+             `--i18n`. Nothing has been written.",
+            parent = n.parent_plural,
+        )));
+    }
 
     // ── Counter cache (issue #1325) ────────────────────────────────────────
     // `--counter-cache` maintains `{parent}.{child}_count`. The maintenance is
@@ -669,6 +818,84 @@ fn plan_scaffold_with_options_impl(
                     &n.parent_pascal,
                 );
             }
+        }
+    }
+
+    // ── Polymorphic comments (issue #1367) ─────────────────────────────────
+    // A `comments:commentable` token is already a column on this model (the
+    // counter-cache source) and an attribute on the generated `#[model]`; what
+    // is left is the shared `comments` table. It is emitted at most once per
+    // project — that is what makes adding comments to a SECOND model the DSL
+    // token and nothing else.
+    // On the destroy path the field tokens are not repeated, so the
+    // declaration is recovered from the model file instead.
+    if fields.iter().any(|f| f.kind.is_commentable())
+        || (for_revert && super::commentable::model_declares_commentable(project_root, &snake_name))
+    {
+        // On a revert, the shared table stays as long as ANY other model still
+        // declares `#[commentable]` — it is one table for all of them, so
+        // taking it out with this model would break every other one.
+        let backend = super::detect_backend(project_root);
+        let revert_would_orphan_another_model = for_revert
+            && super::commentable::another_model_is_still_commentable(project_root, &snake_name);
+        let emitted = !revert_would_orphan_another_model
+            && super::commentable::push_commentable_migration(
+                &mut plan,
+                project_root,
+                timestamp,
+                backend,
+                for_revert,
+            );
+        if !for_revert {
+            if emitted {
+                if super::commentable::conflicting_comments_table(project_root) {
+                    plan.warn(format!(
+                        "This project already has a `{table}` table that is NOT the \
+                         polymorphic one — a `Comment` model scaffolded the ordinary \
+                         way creates exactly that, and the shared table takes the same \
+                         name. Both `CREATE TABLE {table}` statements will be applied \
+                         and `migrate` will stop on \"already exists\". Rename or drop \
+                         the existing table, or add `commentable_type TEXT NOT NULL` \
+                         and `commentable_id BIGINT NOT NULL` to it and delete the \
+                         migration just written.",
+                        table = super::commentable::COMMENTS_TABLE,
+                    ));
+                }
+                plan.warn(format!(
+                    "Added the shared `{table}` table. Every `#[commentable]` model \
+                     attaches to it, so later models need no migration of their own. \
+                     Mount the framework's comment routes once, e.g. \
+                     `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))`, \
+                     and render a thread with \
+                     `autumn_web::widgets::comment_thread`.",
+                    table = super::commentable::COMMENTS_TABLE,
+                ));
+            } else {
+                plan.warn(format!(
+                    "Reusing the existing `{table}` table — the polymorphic comments table \
+                     is shared across every `#[commentable]` model, so no migration was \
+                     added for {pascal_name}.",
+                    table = super::commentable::COMMENTS_TABLE,
+                ));
+            }
+            plan.warn(
+                super::commentable::detect_author_model(project_root).map_or_else(
+                    || {
+                        "This project has no `User` model, so the generated \
+                         `#[commentable]` names no author model. Add `by = <AuthorModel>` \
+                         (and `author_name = <column>`) once you have one — until then \
+                         threads render authors as `user #id`."
+                            .to_owned()
+                    },
+                    |author| {
+                        format!(
+                            "`#[commentable(by = {author}, ...)]` on the generated model \
+                             names this app's author model. Add `author_name = <column>` \
+                             to render display names instead of `user #id`."
+                        )
+                    },
+                ),
+            );
         }
     }
 
@@ -865,6 +1092,15 @@ fn plan_scaffold_with_options_impl(
             authorize_wiring
                 .then(|| owner_column.as_ref().map(|o| o.name.as_str()))
                 .flatten(),
+            // Issue #1358: `position(...)` is rejected outright by
+            // `#[repository(..., sharded)]` at macro-expansion time (a move
+            // only reaches the pool/shard it happens to be given — see
+            // autumn-macros' `parse_repo_args`), so a `--sharded` scaffold
+            // must never emit it, or the generated project fails to compile
+            // with a macro error instead of a clear generate-time one.
+            (!options_with_key.model.sharded)
+                .then(|| fields.iter().find(|f| f.kind.is_position()))
+                .flatten(),
         ),
     );
     let repo_mod_path = repos_dir.join("mod.rs");
@@ -999,6 +1235,13 @@ fn plan_scaffold_with_options_impl(
         } else {
             read_or_empty(&own_routes_path)
         };
+        // Issue #1349: the one seam every user-facing string in the generated
+        // views passes through. With `--i18n` off it returns each caller's
+        // literal expression verbatim, so the rendered file is byte-for-byte
+        // what it was before this feature existed; with it on, each string
+        // becomes a `t!(locale, "key")` lookup and the key/English pair is
+        // recorded for the `i18n/en.ftl` back-fill below.
+        let labels = scaffold_i18n::ViewLabels::new(options_with_key.i18n);
         let fresh_own_routes = render_routes_file(
             project_root,
             &pascal_name,
@@ -1017,6 +1260,7 @@ fn plan_scaffold_with_options_impl(
             owner_column.as_ref().map(|o| o.name.as_str()),
             &options_with_key.model.searchable,
             nesting.as_ref(),
+            &labels,
         );
         let own_routes = super::nested::reapply_children(&previous_own_routes, &fresh_own_routes)
             .map_err(|refused| {
@@ -1036,6 +1280,413 @@ fn plan_scaffold_with_options_impl(
             ))
         })?;
         plan.create(own_routes_path, own_routes);
+
+        // Issue #1349: back-fill `i18n/en.ftl` with every key the views just
+        // referenced, and wire the three project-level bits that make those
+        // lookups resolve with no further config (AC4).
+        //
+        // Order matters for the *file*, not the plan: `t!` validates key
+        // existence at COMPILE time against the default locale's bundle, so a
+        // referenced key missing from `en.ftl` is a `compile_error!` in the
+        // user's app rather than a runtime miss. `labels.used_keys()` is the
+        // exact set the render emitted — no more (which `autumn i18n check`
+        // would flag as unused) and no fewer.
+        let autumn_toml_path_for_i18n = project_root.join("autumn.toml");
+        let referenced_keys = labels.used_keys();
+        if labels.enabled() && !referenced_keys.is_empty() {
+            // Write to the bundle the app actually resolves through, not a
+            // hardcoded `i18n/en.ftl`. A project configured with
+            // `default_locale = "fr"` — or `dir = "translations"` — looks its
+            // keys up somewhere else entirely, so keys parked at the default
+            // path would render as visible `{$post.index.title}` placeholders
+            // and read as "missing from the default locale" to `autumn i18n
+            // check`, while `t!`'s compile-time validation (which looks under
+            // `i18n/` for `en`) passed and hid it until runtime.
+            let (configured_locale, configured_dir) =
+                scaffold_i18n::configured_i18n(&read_or_empty(&autumn_toml_path_for_i18n));
+            let default_locale = configured_locale.unwrap_or_else(|| "en".to_owned());
+            let i18n_dir = configured_dir.unwrap_or_else(|| "i18n".to_owned());
+            let ftl_path = project_root
+                .join(&i18n_dir)
+                .join(format!("{default_locale}.ftl"));
+            // NOT `read_or_empty`: that maps an unreadable or non-UTF-8 file to
+            // `""`, and the merge would then write a fresh English file straight
+            // over somebody's translations. An existing bundle we cannot read is
+            // a hard error, not an empty one.
+            let existing_ftl = match std::fs::read_to_string(&ftl_path) {
+                Ok(contents) => contents,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    return Err(GenerateError::Config(format!(
+                        "cannot read the existing i18n bundle at {}: {e}. Refusing to continue \
+                         — merging would replace it with a freshly generated file and lose \
+                         whatever translations it holds. Fix the file (it must be UTF-8 and \
+                         readable) and re-run.",
+                        ftl_path.display()
+                    )));
+                }
+            };
+            // A `--force` regeneration reconciles the block against the keys
+            // the NEW render emits, which is what stops a dropped field
+            // leaving orphans behind — but a key this render no longer emits
+            // can still be called from hand-written code elsewhere, and `t!`
+            // rejects a missing key at COMPILE time. Same project scan
+            // `destroy` uses, reading the plan's PENDING contents so this
+            // resource's own freshly rendered routes are what count for it,
+            // not the superseded file still on disk.
+            let pending = super::emit::pending_contents(&plan);
+            let surviving_scan = super::emit::scan_surviving_sources(project_root, &[], &pending);
+            let still_referenced =
+                super::emit::keys_still_referenced_in(&surviving_scan, &existing_ftl);
+            let merged = scaffold_i18n::merge_en_ftl_keeping(
+                &existing_ftl,
+                &pascal_name,
+                &snake_name,
+                &referenced_keys,
+                &still_referenced,
+            );
+            if merged != existing_ftl {
+                // `create` rather than `modify` when the file is new: the plan's
+                // collision check should treat a first-time `i18n/en.ftl` like
+                // any other generated file.
+                if existing_ftl.is_empty() && !ftl_path.exists() {
+                    plan.create(ftl_path.clone(), merged);
+                } else {
+                    plan.modify(ftl_path.clone(), merged);
+                }
+            }
+            // `t!`'s COMPILE-TIME key check does not read `autumn.toml`. It
+            // resolves its own bundle from `AUTUMN_I18N_FILE`, else
+            // `$CARGO_MANIFEST_DIR/i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl` with
+            // the locale defaulting to `en`, and degrades to a runtime lookup
+            // only when that file is ABSENT. So a project on
+            // `default_locale = "fr"` that still keeps the validator's bundle
+            // around gets the worst case: the validator finds it, it lacks
+            // every key just written to `fr.ftl`, and `cargo check` fails with a
+            // `compile_error!` per lookup.
+            //
+            // Keep it in step — the bundle the MACRO would pick, resolved the
+            // way the macro resolves it, not a hardcoded `i18n/en.ftl`. Only
+            // when it already exists: an absent one means there is no
+            // compile-time check to satisfy, and writing it would invent a
+            // locale the project deliberately does not have.
+            let mut extra_revert_paths: Vec<std::path::PathBuf> = Vec::new();
+            let macro_env = scaffold_i18n::MacroEnv::resolve(project_root);
+            if let Some(validator_path) =
+                scaffold_i18n::validator_bundle_path(project_root, &macro_env)
+                && validator_path != ftl_path
+            {
+                // Same fallible read as the runtime bundle above, for the same
+                // reason: `read_or_empty` would turn an unreadable or non-UTF-8
+                // file into `""`, and the `Modify` below would then write a
+                // fresh English bundle straight over whatever it holds.
+                let base = match std::fs::read_to_string(&validator_path) {
+                    Ok(contents) => contents,
+                    Err(e) => {
+                        return Err(GenerateError::Config(format!(
+                            "cannot read the i18n bundle at {}: {e}. Refusing to continue — it \
+                             is the file `t!`'s compile-time key check reads, so it has to be \
+                             kept in step, and merging would replace it with a freshly \
+                             generated file and lose whatever translations it holds. Fix the \
+                             file (it must be UTF-8 and readable) and re-run.",
+                            validator_path.display()
+                        )));
+                    }
+                };
+                // The SAME preserving merge the runtime bundle gets, against
+                // this file's own definitions. Reconciling the validator block
+                // against only the newly generated keys undoes the protection:
+                // a key held back from the runtime prune because hand-written
+                // code still calls it would be dropped from the very bundle
+                // that call is validated against, so the build fails anyway —
+                // just from the other file.
+                let still_referenced_here =
+                    super::emit::keys_still_referenced_in(&surviving_scan, &base);
+                let merged = scaffold_i18n::merge_en_ftl_keeping(
+                    &base,
+                    &pascal_name,
+                    &snake_name,
+                    &referenced_keys,
+                    &still_referenced_here,
+                );
+                if merged != base {
+                    plan.modify(validator_path.clone(), merged);
+                }
+                extra_revert_paths.push(validator_path);
+            }
+
+            // Destroy takes back this resource's keys only. The shared
+            // `common.*` block and the file itself always survive: sibling
+            // resources reuse the chrome, and `.i18n_auto()` panics at startup
+            // if the default locale's file is missing.
+            //
+            // EVERY locale bundle, not just the default one. A translator
+            // starts a locale by copying the default bundle and translating in
+            // place, so `fr.ftl` carries this resource's block — and its
+            // markers — too. Reverting only the default leaves those copies
+            // behind with nothing referencing them, which `autumn i18n check
+            // --strict` fails on as unused. The revert is marker-bounded and
+            // recomputed per file, so a hand-authored key outside the block is
+            // as safe here as it is in the default bundle.
+            let mut revert_paths: std::collections::BTreeSet<std::path::PathBuf> =
+                scaffold_i18n::locale_bundles(project_root, &i18n_dir)
+                    .into_iter()
+                    .collect();
+            // The default bundle even when this run is what creates it — the
+            // directory scan above only sees what is already on disk.
+            revert_paths.insert(ftl_path.clone());
+            revert_paths.extend(extra_revert_paths);
+            for path in revert_paths {
+                plan.push_revert(Revert::I18nFtlKeys {
+                    path,
+                    pascal: pascal_name.clone(),
+                    snake: snake_name.clone(),
+                });
+            }
+
+            // A project that already ships another locale gets those keys as
+            // UNTRANSLATED until someone writes them, and `--strict` exits
+            // non-zero on that. Say so by name rather than letting the next CI
+            // run be the messenger.
+            //
+            // Deliberately NOT written for them: filling `es.ftl` with English
+            // would report as translated and ship English, which is worse than
+            // a warning — it turns a visible gap into a silent one. The bundle
+            // header this generator writes says the same thing to translators.
+            let other_locales: Vec<String> = scaffold_i18n::locale_bundles(project_root, &i18n_dir)
+                .into_iter()
+                .filter(|path| path != &ftl_path)
+                .filter_map(|path| {
+                    path.file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                })
+                .collect();
+            if !other_locales.is_empty() {
+                plan.warn(format!(
+                    "{} new key(s) were written to {}. {} still needs them translated — \
+                     `autumn i18n check --strict` reports them as untranslated until it does.",
+                    referenced_keys.len(),
+                    ftl_path.display(),
+                    other_locales.join(", "),
+                ));
+            }
+
+            // (The `i18n` Cargo feature is enabled further down, alongside
+            // `maud`/`csv`/`htmx` — `plan_cargo_deps` runs between here and
+            // there and rebuilds its Cargo.toml action from DISK, so an edit
+            // made at this point would be silently dropped.)
+
+            // Two shared autumn-web widgets build user-facing text INSIDE
+            // themselves, from consts and `format!`s with no parameter to route
+            // a `t!` through. The generator translates every label it passes in
+            // and can reach no further:
+            //
+            //   * `form::rich_text_area` — the toolbar's "Markdown formatting"
+            //     group label and per-control names, the "Markdown supported…"
+            //     hint, and the preview pane's "Preview".
+            //   * `widgets::transition_controls` — each button's `Mark as {to}`
+            //     and the group's `{field} transitions` aria-label.
+            //
+            // Both are free functions with positional parameters, so unlike the
+            // pager and bulk-delete widgets there is no label setter to call:
+            // reaching them means new public API on autumn-web (a label PER
+            // transition edge, and per toolbar control), which is a framework
+            // design decision rather than a scaffold change. Refusing these
+            // columns under `--i18n` would cost more than it buys when the rest
+            // of the view does translate — so the flag does what it can and
+            // names what it could not.
+            let untranslated: Vec<(&str, &str, Vec<&Field>)> = vec![
+                (
+                    "Markdown editor",
+                    "the toolbar labels, the \"Markdown supported…\" hint, and the preview \
+                     heading come from `rich_text_area`",
+                    rich_text_fields(&fields),
+                ),
+                (
+                    "state-transition controls",
+                    "the `Mark as …` buttons and the transitions group label come from \
+                     `widgets::transition_controls`",
+                    fields
+                        .iter()
+                        .filter(|f| f.state_machine.is_some())
+                        .collect(),
+                ),
+            ];
+            for (widget, detail, affected) in untranslated {
+                if affected.is_empty() {
+                    continue;
+                }
+                plan.warn(format!(
+                    "`--i18n` translated this view's labels, but the {widget} on {} keeps \
+                     autumn-web's own chrome in English — {detail}, which takes no label \
+                     overrides yet. Everything else in the generated views goes through the \
+                     bundle.",
+                    affected
+                        .iter()
+                        .map(|f| format!("`{}`", f.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+
+            // Validation MESSAGES are a third surface the flag cannot reach.
+            // `#[validate(...)]` carries an optional `message`, but the
+            // `validator` crate takes it as a compile-time literal, so it can
+            // never hold a runtime `t!` lookup; with no message, autumn-web's
+            // `collect_errors` renders `validation failed: <code>`. Either way
+            // the inline error under a rejected field is English while its
+            // label is translated.
+            //
+            // Reaching it means the handler mapping error CODES to lookups
+            // before building the changeset — and `into_changeset` flattens
+            // the codes away inside autumn-web, so that needs a public seam
+            // there (a code-to-message resolver), the same kind of framework
+            // API the two widgets above want. Emitting the mapping into every
+            // generated handler instead would duplicate `collect_errors`'
+            // nested/list recursion in template strings, which is worse than
+            // saying so.
+            if metadata.has_validator_rules() {
+                plan.warn(
+                    "`--i18n` translated this view's labels, but the inline messages from \
+                     `#[validate(...)]` stay English — the `validator` attribute takes a \
+                     compile-time literal, so a runtime lookup cannot go there, and an \
+                     unmessaged rule renders as `validation failed: <code>`. Translating them \
+                     needs a code-to-message seam in autumn-web's changeset conversion."
+                        .to_owned(),
+                );
+            }
+
+            // A profile overlay can repoint i18n somewhere else entirely, and
+            // the runtime resolves the fully layered config — so the base
+            // bundle this generator just wrote (and the `COPY` it is about to
+            // add) can be the wrong one for the deploy that matters. Writing
+            // English into a `fr` production bundle would be a worse answer, so
+            // name the paths and let the author decide.
+            for (profile, path) in scaffold_i18n::profile_i18n_overrides(
+                &read_or_empty(&autumn_toml_path_for_i18n),
+                &i18n_dir,
+                &default_locale,
+            ) {
+                plan.warn(format!(
+                    "`[profile.{profile}.i18n]` points at `{path}`, not the `{}` this scaffold \
+                     wrote. Add the same keys there (or an `{profile}` fallback chain that \
+                     reaches the base bundle) — the app loads the layered config at startup, and \
+                     `.i18n_auto()` PANICS when the resolved default locale's file is missing.",
+                    ftl_path.display()
+                ));
+            }
+
+            // The same hazard through the OTHER spelling. A standalone
+            // `autumn-<profile>.toml` is merged LAST — after `autumn.toml` and
+            // its inline `[profile.…]` sections — so a project that keeps its
+            // production config in one has no `[profile.prod.i18n]` for the scan
+            // above to find, and the loudest case reports nothing at all.
+            let profile_files: Vec<(String, String)> = std::fs::read_dir(project_root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let name = path.file_name()?.to_str()?;
+                    let profile = name.strip_prefix("autumn-")?.strip_suffix(".toml")?;
+                    Some((profile.to_owned(), read_or_empty(&path)))
+                })
+                .collect();
+            for (profile, path) in scaffold_i18n::profile_file_i18n_overrides(
+                &profile_files,
+                &i18n_dir,
+                &default_locale,
+            ) {
+                plan.warn(format!(
+                    "`autumn-{profile}.toml` points i18n at `{path}`, not the `{}` this scaffold \
+                     wrote — and that file is layered LAST, so it wins over `autumn.toml`. Add \
+                     the same keys there (or a fallback chain that reaches the base bundle) — \
+                     `.i18n_auto()` PANICS at startup when the resolved default locale's file is \
+                     missing.",
+                    ftl_path.display()
+                ));
+            }
+
+            // The image has to carry the bundle: `.i18n_auto()` panics at
+            // startup when the default locale's file is missing, and the plain
+            // `autumn new` Dockerfile copies no `i18n/` directory.
+            let dockerfile_path = project_root.join("Dockerfile");
+            if dockerfile_path.exists() {
+                let base = read_or_empty(&dockerfile_path);
+                // A `dir` that moved since an earlier `--i18n` run leaves the old
+                // pair behind, and the new pair is added beside it. `COPY` fails
+                // the build outright when its source is gone from the context, so
+                // the stale line is the difference between an image that builds
+                // and one that does not.
+                if let Some(stale) = scaffold_i18n::stale_dockerfile_i18n_dir(&base, &i18n_dir) {
+                    plan.warn(format!(
+                        "Dockerfile still copies `{stale}/` — the locale directory an earlier \
+                         scaffold wired in — while `[i18n] dir` now resolves to `{i18n_dir}/`. \
+                         Both stages have been given `{i18n_dir}/`; remove the `{stale}/` lines \
+                         by hand. Left in place they fail the image build outright once \
+                         `{stale}/` is gone from the build context."
+                    ));
+                }
+                match scaffold_i18n::ensure_dockerfile_i18n_copy(&base, &i18n_dir) {
+                    Some(updated) if updated != base => {
+                        plan.modify(dockerfile_path, updated);
+                    }
+                    Some(_) => {}
+                    None => plan.warn(format!(
+                        "Dockerfile has no `COPY migrations` line to anchor on, so the \
+                         `{i18n_dir}/` directory was not added to it. Copy `{i18n_dir}/` into \
+                         both the builder and runtime stages by hand — the app calls \
+                         `.i18n_auto()`, which PANICS at startup if the default locale's \
+                         `.ftl` is missing from the image."
+                    )),
+                }
+            }
+
+            // `[i18n]` in `autumn.toml` names the default locale the bundle
+            // loads. Only touched when the project actually has an
+            // `autumn.toml` to edit and does not already configure i18n — a
+            // project on a non-`en` default must keep it.
+            let autumn_toml_path = autumn_toml_path_for_i18n;
+            if autumn_toml_path.exists() {
+                let base = plan
+                    .actions
+                    .iter()
+                    .rev()
+                    .find_map(|a| match a {
+                        Action::Modify { path, contents } if path == &autumn_toml_path => {
+                            Some(contents.clone())
+                        }
+                        _ => None,
+                    })
+                    .map_or_else(
+                        || {
+                            // Read FALLIBLY. `read_or_empty` turns an unreadable
+                            // file — non-UTF-8, or unreadable under the current
+                            // ACL — into `""`, and the `Modify` planned below
+                            // would then write a fresh `[i18n]` block over
+                            // whatever was really there, destroying the project's
+                            // configuration. The bundle reads above already take
+                            // this care; this one is the same hazard with a worse
+                            // blast radius, since `autumn.toml` configures
+                            // everything. Absence stays absent.
+                            match std::fs::read_to_string(&autumn_toml_path) {
+                                Ok(src) => Ok(src),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    Ok(String::new())
+                                }
+                                Err(e) => Err(GenerateError::Io(e)),
+                            }
+                        },
+                        Ok,
+                    )?;
+                let updated = scaffold_i18n::ensure_i18n_config_block(&base);
+                if updated != base {
+                    plan.actions.retain(|a| a.path() != autumn_toml_path);
+                    plan.modify(autumn_toml_path, updated);
+                }
+            }
+        }
+
         let route_mod_path = routes_dir.join("mod.rs");
         plan.modify(
             route_mod_path.clone(),
@@ -1135,6 +1786,25 @@ fn plan_scaffold_with_options_impl(
         && !options_with_key.live_validation
         && !options_with_key.model.sharded
         && !owner_authorizes;
+    // Issue #1358: the position field's no-JS Move up / Move down index
+    // buttons + their `POST /{plural}/{id}/move_up`|`move_down` handlers.
+    // Must agree exactly with the `reorder_enabled` gate in
+    // `render_routes_file` (plus `--api`, which emits no HTML routes module
+    // at all), or main.rs would mount routes the module never emitted. Same
+    // restriction set as `trash_enabled` — scoped to the plain HTML index for
+    // this slice. `--api`/`--live`/`--live-validation`/owner-scoped scaffolds
+    // still get the repository's `move_*` methods (and, for `--api`, the
+    // ordered data), just not the HTML buttons. `--sharded` is different: the
+    // repository attribute omits `position(...)` entirely there (see the
+    // `render_repository_file` call above) because the macro itself rejects
+    // `position(...)` combined with `sharded` — a move only reaches the
+    // pool/shard it happens to be given.
+    let reorder_enabled = fields.iter().any(|f| f.kind.is_position())
+        && !options_with_key.api
+        && !options_with_key.live
+        && !options_with_key.live_validation
+        && !options_with_key.model.sharded
+        && !owner_authorizes;
     // A `--soft-delete` scaffold that lands on one of the gated-off variants
     // gets the data layer and the delete tunnel but NO way to see or recover
     // what it deleted — exactly the situation #1332 exists to remove. Say so at
@@ -1161,6 +1831,32 @@ fn plan_scaffold_with_options_impl(
              The repository still has restore/purge/only_deleted, so a hand-written \
              trash route can use them; see docs/guide/generators.md."
         ));
+    }
+    // Issue #1358: `position(...)` on `#[repository(..., sharded)]` is
+    // rejected outright by the macro (see `autumn-macros`' `parse_repo_args`)
+    // — a move only reaches the pool/shard it happens to be given — so
+    // `render_repository_file` was previously made to omit `position(...)`
+    // from a sharded scaffold's attribute entirely, generating the column
+    // and its migration triggers (insert-assign, delete-compact) with no
+    // `move_*` methods and only a warning. Codex review: that left a live
+    // gap — `delete_many`'s single-row-chunking fix for the batch-compaction
+    // race (see `autumn-macros`' `delete_chunk_size`) keys off
+    // `config.position`, which the sharded repository attribute no longer
+    // carries, so a sharded model's bulk delete keeps its 1000-row chunks
+    // even though the row-level compaction triggers are still installed and
+    // still vulnerable to the same multi-row-per-statement race. Reject the
+    // combination outright instead: no partial position support (column,
+    // triggers, but no working reorder or safe bulk-delete) is worth the
+    // silent corruption risk.
+    if fields.iter().any(|f| f.kind.is_position()) && options_with_key.model.sharded {
+        return Err(GenerateError::Config(format!(
+            "position field on --sharded {plural}: not supported. \
+             #[repository(..., sharded)] rejects position(...) outright — a move only \
+             reaches the pool/shard it happens to be given — and the migration's \
+             row-level compaction triggers are not safe against a sharded repository's \
+             bulk delete, which keeps its full-size chunks with no `position` metadata \
+             to know it must not. Drop the position field, or drop --sharded."
+        )));
     }
     // Smoke test under `tests/<snake>.rs`. Uses the same soft-delete-augmented
     // field list as the real migration (see `augment_fields_for_soft_delete`)
@@ -1297,6 +1993,11 @@ fn plan_scaffold_with_options_impl(
         // this run emits is decided by `trash_enabled` alone, and the prune below
         // handles a re-run that dropped the flag.
         trash_enabled || for_revert,
+        // Same double-gate reasoning as `trash_enabled || for_revert` above:
+        // the DESTROY/revert path may not repeat the DSL token that turned
+        // `reorder_enabled` on, but a stale routes module still needs its
+        // mounted handlers claimed for cleanup.
+        reorder_enabled || for_revert,
         &validated_field_names,
         &sm_field_names,
         &rich_text_field_names,
@@ -1353,6 +2054,79 @@ fn plan_scaffold_with_options_impl(
             &pascal_name,
             &snake_name,
         )
+    } else {
+        updated
+    };
+    // Issue #1349: `.i18n_auto()` in the builder chain is what makes the
+    // generated `t!` lookups resolve to real translations instead of echoing
+    // their keys — AC4's "zero further config". Folded into the same `Modify`
+    // action as everything else main.rs gains. Idempotent, and a no-op for a
+    // project that already installs a bundle its own way (`.i18n(...)`).
+    //
+    // No matching `Revert`: this is project-level wiring shared by every
+    // `--i18n` resource, and removing it while a sibling still emits `t!` calls
+    // would leave that resource rendering raw keys. Leaving it is inert.
+    let updated = if options_with_key.i18n && !options_with_key.api {
+        // Recomputed rather than threaded down from the bundle-writing block
+        // above: it is one small read, and it keeps this warning's wording
+        // honest about the path the keys actually went to.
+        let (locale, dir) =
+            scaffold_i18n::configured_i18n(&read_or_empty(&project_root.join("autumn.toml")));
+        let i18n_dir_for_embed = dir.unwrap_or_else(|| "i18n".to_owned());
+        let ftl_display_path = format!(
+            "{i18n_dir_for_embed}/{}.ftl",
+            locale.unwrap_or_else(|| "en".to_owned())
+        );
+        match scaffold_i18n::ensure_i18n_auto(&updated) {
+            // Also embed the bundle for `--embed` builds, matching what
+            // `autumn new --with-i18n` wires up. Absent anchors (an `--api` or
+            // hand-rolled `main.rs`) just leave it alone: `.i18n_auto()`'s disk
+            // load still works for an ordinary build.
+            scaffold_i18n::I18nAutoWiring::Wired(wired) => {
+                scaffold_i18n::ensure_embedded_locales(&wired, &i18n_dir_for_embed).unwrap_or_else(
+                    || {
+                        // The builder chain was found and wired, but the
+                        // template's `EMBEDDED_STATIC` anchors are not there to
+                        // hang the locale embedding on. Filesystem loading still
+                        // works for an ordinary build, so this is not a refusal
+                        // — but it is not silent either: `autumn build --embed`
+                        // advertises a self-contained binary, and this one would
+                        // carry no bundle and panic wherever the sidecar
+                        // directory is absent.
+                        plan.warn(format!(
+                            "`main.rs` has no `embed_static!`/`embedded_static` anchors, so the                              `{i18n_dir_for_embed}/` bundle was NOT embedded — `.i18n_auto()`                              loads it from disk instead. That is fine for an ordinary build; an                              `autumn build --embed` binary, though, will carry no locales and                              PANICS at startup wherever `{i18n_dir_for_embed}/` is missing. Add                              `embed_locales!` and `.embedded_locales(&…)` by hand if you ship                              `--embed` builds."
+                        ));
+                        wired
+                    },
+                )
+            }
+            // No real `.routes(` call to anchor on. Writing the call anywhere
+            // else risks landing it in a comment, where it would silently never
+            // run and the app would render raw keys forever — so say so instead
+            // and leave `main.rs` alone.
+            // The app installs its own bundle. Leave it be — swapping somebody's
+            // embedded or TMS-backed `Bundle` for a filesystem load would be a
+            // far bigger change than this generator is entitled to make — but
+            // say so, because the keys just written to disk will not reach it.
+            scaffold_i18n::I18nAutoWiring::CustomBundle => {
+                plan.warn(format!(
+                    "src/main.rs installs its own translation bundle with `.i18n(...)`, which \
+                     takes precedence over loading `{ftl_display_path}` from disk. The keys this scaffold just \
+                     wrote there will NOT reach that bundle — add them to whatever source it is \
+                     built from, or switch to `.i18n_auto()` to load from the filesystem."
+                ));
+                updated
+            }
+            scaffold_i18n::I18nAutoWiring::NoAnchor => {
+                plan.warn(
+                    "src/main.rs has no `.routes(...)` call to anchor on, so `.i18n_auto()` was \
+                     not wired in. Add it to your `autumn_web::app()` builder chain by hand — \
+                     without it the generated `t!(locale, ...)` lookups render their KEYS \
+                     instead of the English in i18n/en.ftl.",
+                );
+                updated
+            }
+        }
     } else {
         updated
     };
@@ -1441,6 +2215,34 @@ fn plan_scaffold_with_options_impl(
             feature: "maud".to_owned(),
             owner_dir: Some(project_root.join("src").join("routes")),
         });
+    }
+
+    // Issue #1349: the generated views' `t!(locale, …)` lookups and the `Locale`
+    // extractor they read live behind autumn-web's `i18n` feature, and the
+    // `.i18n_auto()` call folded into `main.rs` above is gated on it too.
+    // Without this the generated app would not compile.
+    //
+    // Deliberately NO matching `Revert`, unlike `maud`/`csv`/`htmx`: that
+    // `.i18n_auto()` call is project-level wiring this generator does not take
+    // back out (a sibling `--i18n` resource would stop resolving its keys), so
+    // removing the feature under it would break the build. Leaving a feature
+    // enabled is inert; removing one that is still called is not.
+    if options_with_key.i18n && !options_with_key.api {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, "i18n");
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path, updated);
+        }
     }
 
     // Issue #1315: the emitted `CsvSchema` impl and `export.csv` handler call
@@ -2038,6 +2840,7 @@ fn render_repository_file(
     live: bool,
     searchable: bool,
     owner_column: Option<&str>,
+    position: Option<&Field>,
 ) -> String {
     let plural = pluralize(snake_name);
     let query_body = render_repository_queries(pascal_name, queries);
@@ -2066,6 +2869,17 @@ fn render_repository_file(
     // (no owner column, `--no-policy`, `--live`, `--sharded`) passes `None` and
     // the attr — and the scoped methods — are omitted.
     let owner_attr = owner_column.map_or(String::new(), |col| format!(", owner = {col}"));
+    // Issue #1358: a `position`/`position{{scope:col}}` DSL field wires
+    // `position(column = "...", scope = "...")` into the generated
+    // `#[repository(...)]` attribute, which is what actually generates the
+    // `move_to`/`move_before`/`move_after`/`move_up`/`move_down` methods —
+    // the DSL field alone only shapes the model struct and migration.
+    let position_attr = position.map_or(String::new(), |f| {
+        f.constraints.scope.as_deref().map_or_else(
+            || format!(", position(column = \"{}\")", f.name),
+            |scope| format!(", position(column = \"{}\", scope = \"{scope}\")", f.name),
+        )
+    });
     let sharded_note = if sharded {
         format!(
             "//!\n\
@@ -2172,7 +2986,7 @@ fn render_repository_file(
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{draft_ext_import}}};\n\
          use crate::schema::{plural};\n\
          \n\
-         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr}{owner_attr})]\n\
+         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr}{owner_attr}{position_attr})]\n\
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
          }}\n\
@@ -2601,8 +3415,169 @@ fn render_routes_file(
     // `show` view renders. `None` keeps every emission below byte-identical to
     // the pre-#1323 flat scaffold.
     nesting: Option<&super::nested::Nesting>,
+    // Issue #1349: the seam every user-facing view string passes through.
+    // Disabled (`--i18n` off) it returns each caller's literal expression
+    // verbatim, so this whole template renders byte-for-byte as before.
+    labels: &scaffold_i18n::ViewLabels,
 ) -> String {
     let id_rust = id_type.rust_type();
+    // Issue #1349: with `--i18n`, every view-rendering handler takes the
+    // `Locale` extractor so the `t!` calls below have a `locale` in scope. It
+    // goes FIRST in every signature: `Locale` is a `FromRequestParts`
+    // extractor, and axum requires the single body-consuming (`FromRequest`)
+    // argument — `body: Bytes`, `Multipart` — to be last. Empty without the
+    // flag, keeping each signature byte-identical.
+    let locale_param = if labels.enabled() {
+        "locale: Locale,\n    "
+    } else {
+        ""
+    };
+    // Same, for the handlers whose parameter lists are written inline on one
+    // line rather than one-per-line.
+    let locale_param_inline = if labels.enabled() {
+        "locale: Locale, "
+    } else {
+        ""
+    };
+    // (Kept as empty strings so the handler/form templates below can splice a
+    // per-handler label prelude without a second set of conditionals.)
+    // Issue #1349: no `l_resource` binding any more — see `new_link_text`.
+    let resource_bind = String::new();
+    let resource_bind_form = String::new();
+    // The three page-furniture strings every HTML index variant renders, and the
+    // create/edit chrome shared by the form views. Computed once so the six
+    // index templates and both search templates below stay literal-free without
+    // repeating the key/English pair eight times.
+    let index_title = labels.lit_ref(
+        &format!("{snake_name}.index.title"),
+        &format!("{pascal_name} index"),
+    );
+    let index_heading = labels.markup(
+        &format!("{snake_name}.name.plural"),
+        &format!("{pascal_name}s"),
+    );
+    // "New {Model}" is a per-resource key, NOT chrome with the noun passed in as
+    // a Fluent argument. Interpolating a noun into a sentence pattern is the
+    // classic i18n trap: French needs *Nouveau*/*Nouvelle* by gender, German
+    // *Neuer*/*Neue*/*Neues*, and Slavic languages inflect the noun itself — a
+    // translator handed `New { $resource }` cannot get any of that right from
+    // the bundle alone. One key per resource costs one extra line in `en.ftl`
+    // and is translatable. (The same reasoning the sibling `{snake}.delete.confirm`
+    // and `{snake}.trash.heading` keys already follow. `{ $id }` is fine to
+    // interpolate — a number carries no grammatical gender.)
+    let new_link_text = labels.lit(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
+    let new_link_markup =
+        labels.markup(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
+    let back_to_list = labels.lit("common.back", "Back to list");
+    let back_to_list_markup = labels.markup("common.back", "Back to list");
+    let edit_link_text = labels.lit("common.edit", "Edit");
+    // Create/edit form chrome. The `New {Pascal}` title is the SAME
+    // per-resource `{snake}.new` key the index link uses, for the reason given
+    // above: interpolating the model name into a shared pattern hands the
+    // translator a sentence whose article and adjective must agree with a noun
+    // they cannot see.
+    let new_title = labels.lit_ref(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
+    let new_heading = labels.markup(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
+    let create_button = labels.lit("common.create", "Create");
+    let create_button_ref = labels.lit_ref("common.create", "Create");
+    let save_button = labels.lit("common.save", "Save");
+    let save_button_ref = labels.lit_ref("common.save", "Save");
+    let delete_button = labels.markup("common.delete", "Delete");
+    // The shared `{snake}_form_for` helper renders every labeled control, so it
+    // needs the locale too. By reference — it only forwards it into `t!`-built
+    // `override_label` values, so there is nothing to own.
+    let form_for_locale_arg = if labels.enabled() {
+        "locale.clone(), "
+    } else {
+        ""
+    };
+    // The generated routes module imports explicitly (no `prelude::*`), so the
+    // extractor and the macro both need naming. Both live behind autumn-web's
+    // `i18n` feature, which the plan enables on the project's Cargo.toml.
+    let i18n_imports = if labels.enabled() {
+        "use autumn_web::i18n::Locale;\nuse autumn_web::t;\n"
+    } else {
+        ""
+    };
+    // Empty-state copy. `DataTableConfig::new` takes `&str`, and the config is a
+    // temporary borrowed only for the `data_table(...)` call, so an inline
+    // `&t!(…)` is fine here — no binding needed.
+    let index_empty = labels.lit_ref(
+        &format!("{snake_name}.index.empty"),
+        &format!("No {plural} yet."),
+    );
+    // The strings only the flag-gated surfaces render. Registered lazily so a
+    // scaffold without the flag never defines a key nothing references — which
+    // is exactly what `autumn i18n check` reports as unused.
+    let (search_empty, search_box_placeholder) = if searchable.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (
+            labels.lit_ref(
+                &format!("{snake_name}.search.empty"),
+                &format!("No {plural} found."),
+            ),
+            labels.lit_ref(
+                &format!("{snake_name}.search.placeholder"),
+                &format!("Search {pascal_name}s…"),
+            ),
+        )
+    };
+    // The destructive button keeps its `window.confirm` guard, so the prompt has
+    // to travel through a JavaScript string literal — and a translation is not
+    // trusted input: it can come from a translator, a TMS, or a crowdsourced
+    // `.ftl`. Maud escapes the attribute value for HTML, but nothing escapes it
+    // for JS, so the encoding has to be exact.
+    //
+    // `serde_json::to_string` is that encoder: JSON string syntax is a subset of
+    // JavaScript's, and it escapes the quote, the BACKSLASH, and every control
+    // character. Hand-rolling `.replace('\'', "\\'")` is not enough — it leaves
+    // backslashes alone, so `C:\temp` smuggles in a tab and a trailing `\` before
+    // an apostrophe escapes the generator's own escape and closes the string
+    // early, turning the rest of the translation into executable code. The
+    // emitted double quotes are HTML-escaped by Maud and un-escaped by the
+    // parser before JS ever sees them. (`serde_json` is already imported by the
+    // generated module.)
+    let delete_confirm_key = format!("{snake_name}.delete.confirm");
+    let delete_confirm_ftl = format!("Delete this {pascal_name}?");
+    let (delete_confirm_bind, delete_confirm_attr) = if labels.enabled() {
+        (
+            format!(
+                r#"@let delete_confirm_js = format!("return confirm({{}})", serde_json::to_string(&{}).unwrap_or_else(|_| "\"\"".into()));
+            "#,
+                labels.lit(&delete_confirm_key, &delete_confirm_ftl)
+            ),
+            "(delete_confirm_js)".to_owned(),
+        )
+    } else {
+        (
+            String::new(),
+            format!("\"return confirm('Delete this {pascal_name}?')\""),
+        )
+    };
+    // `--searchable` only. Registered lazily so a non-searchable scaffold never
+    // writes these keys into `en.ftl` (an unreferenced key is exactly what
+    // `autumn i18n check` reports as unused). `{snake}.search.title` serves the
+    // page `<h1>`, the `<title>`, and the search input's visible label — they
+    // are the same words naming the same thing, so one key keeps them in step.
+    let (search_title, search_heading, search_box_label) = if searchable.is_empty() {
+        (String::new(), String::new(), String::new())
+    } else {
+        (
+            labels.lit_ref(
+                &format!("{snake_name}.search.title"),
+                &format!("Search {pascal_name}s"),
+            ),
+            labels.markup(
+                &format!("{snake_name}.search.title"),
+                &format!("Search {pascal_name}s"),
+            ),
+            labels.lit_ref(
+                &format!("{snake_name}.search.title"),
+                &format!("Search {pascal_name}s"),
+            ),
+        )
+    };
     // Issue #1260: a `slug` field reroutes `show`/`edit`/`update`/`delete` (and
     // their generated links) to key off the slug instead of `id`. The
     // `plan_scaffold_with_options_impl` gate above ensures a slug never
@@ -2645,6 +3620,86 @@ fn render_routes_file(
     // last use of `row` in the surrounding handler.
     let route_key_display_expr: String =
         route_key_field.map_or_else(|| "row.id".to_owned(), |f| format!("&row.{f}"));
+    // Issue #1349: the detail page's title and heading both render
+    // "{Model} #{key}". The Fluent value interpolates the key rather than
+    // concatenating around it, so a translation can place it wherever its
+    // language puts it.
+    let show_title_key = format!("{snake_name}.show.title");
+    let show_title_ftl = format!("{pascal_name} #{{ $id }}");
+    let show_id_arg = format!("&({route_key_display_expr}).to_string()");
+    let show_title = labels.expr_ref(
+        &show_title_key,
+        &show_title_ftl,
+        &format!("&format!(\"{pascal_name} #{{}}\", {route_key_display_expr})"),
+        &[("id", &show_id_arg)],
+    );
+    let show_heading = labels.markup_expr(
+        &show_title_key,
+        &show_title_ftl,
+        &format!("\"{pascal_name} #\" ({route_key_display_expr})"),
+        &[("id", &show_id_arg)],
+    );
+    // The `:states(...)` variant renders the same page from a shared `show_view`
+    // helper, which is always `id`-keyed (a slug column and a state-machine
+    // column are refused together upstream).
+    let show_view_title = labels.expr_ref(
+        &show_title_key,
+        &show_title_ftl,
+        &format!("&format!(\"{pascal_name} #{{}}\", row.id)"),
+        &[("id", "&row.id.to_string()")],
+    );
+    let show_view_heading = labels.markup_expr(
+        &show_title_key,
+        &show_title_ftl,
+        &format!("\"{pascal_name} #\" (row.id)"),
+        &[("id", "&row.id.to_string()")],
+    );
+    // The edit form's title/heading. Keyed per-resource because the English
+    // carries the model's own name; the row key is a Fluent argument so a
+    // translation can position it. Two shapes: the standard form keys off
+    // `{id_value_expr}` (a slug column reroutes it), the live-validation form
+    // always off `*id`.
+    let edit_title_key = format!("{snake_name}.edit.title");
+    let edit_title_ftl = format!("Edit {pascal_name} #{{ $id }}");
+    let edit_id_arg = format!("&({id_value_expr}).to_string()");
+    let edit_title = labels.expr_ref(
+        &edit_title_key,
+        &edit_title_ftl,
+        &format!("&format!(\"Edit {pascal_name} #{{}}\", {id_value_expr})"),
+        &[("id", &edit_id_arg)],
+    );
+    let edit_heading = labels.markup_expr(
+        &edit_title_key,
+        &edit_title_ftl,
+        &format!("\"Edit {pascal_name} #\" ({id_value_expr})"),
+        &[("id", &edit_id_arg)],
+    );
+    let edit_title_live = labels.expr_ref(
+        &edit_title_key,
+        &edit_title_ftl,
+        &format!("&format!(\"Edit {pascal_name} #{{}}\", *id)"),
+        &[("id", "&(*id).to_string()")],
+    );
+    let edit_heading_live = labels.markup_expr(
+        &edit_title_key,
+        &edit_title_ftl,
+        &format!("\"Edit {pascal_name} #\" (*id)"),
+        &[("id", "&(*id).to_string()")],
+    );
+    // `show_view` is a plain helper, not a handler, so it takes the locale as an
+    // ordinary argument — BY VALUE. `t!` expands to `Locale::t(&locale, …)`, and
+    // a `&Locale` binding would make that a `&&Locale` the signature rejects.
+    // `Locale` is a cheap clone: a tag string plus an `Arc` to the shared bundle.
+    let (show_view_locale_param, show_view_locale_arg, show_view_locale_arg_multiline) =
+        if labels.enabled() {
+            (
+                "locale: Locale,\n    ",
+                "locale.clone(), ",
+                "locale.clone(), ",
+            )
+        } else {
+            ("", "", "")
+        };
     // The value the `update` handler's SUCCESS redirect resolves the row
     // by — unlike `id_value_expr` (the path extractor's PRE-update value,
     // still correct for the not-found message above it), this must read the
@@ -2736,6 +3791,45 @@ fn render_routes_file(
     // emits no HTML routes module at all), or `main.rs` would mount a route this
     // module never emitted.
     let export_enabled = owner_scoped_standard || (!owner_scoped_index && !live && !sharded);
+    // Issue #1349: the export link's text, registered only where the export is
+    // actually emitted so a non-exporting scaffold defines no unused key.
+    // Issue #1349: strings the shared widgets supply by DEFAULT rather than the
+    // templates above — the pager's `aria-label`/Previous/Next, the bulk-delete
+    // submit button and its per-row checkbox `aria-label`. They render in the
+    // generated views like any other button or link, so a scaffold that leaves
+    // them at their English defaults is only partly translated. Each widget
+    // already exposes a setter; the generator just never called them.
+    //
+    // The pager's are inline: `PagerOptions` is built and consumed inside one
+    // statement, so a `&t!(…)` temporary lives long enough. `BulkActionsConfig`
+    // is bound to a `let` that outlives its statement, so its two take bindings.
+    let pager_labels = if labels.enabled() {
+        format!(
+            ".aria_label(&{}).prev_label(&{}).next_label(&{})",
+            labels.lit("common.pagination", "Pagination"),
+            labels.lit("common.previous", "Previous"),
+            labels.lit("common.next", "Next"),
+        )
+    } else {
+        String::new()
+    };
+    let (bulk_label_binds, bulk_labels) = if labels.enabled() && bulk_delete_enabled {
+        (
+            format!(
+                "let l_bulk_submit = {};\n    let l_bulk_select = {};\n    ",
+                labels.lit("common.delete.selected", "Delete selected"),
+                labels.lit("common.select.row", "Select row"),
+            ),
+            ".submit_label(&l_bulk_submit).select_label(&l_bulk_select)".to_owned(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    let export_csv_text = if export_enabled {
+        labels.lit("common.export.csv", "Export CSV")
+    } else {
+        String::new()
+    };
     // Issue #1332: the `GET /{plural}/trash` recycle bin plus its per-row
     // `POST /{plural}/{id}/restore` and `POST /{plural}/{id}/purge` controls,
     // finishing #689's AC6. Emitted ONLY for a `--soft-delete` resource — there
@@ -2763,6 +3857,61 @@ fn render_routes_file(
     // routes module at all), or `main.rs` would mount routes this module never
     // emitted.
     let trash_enabled = soft_delete && !live && !live_validation && !sharded && !owner_scoped_index;
+    // Issue #1358: must agree exactly with the matching gate in
+    // `plan_scaffold_with_options_impl` (plus `--api`, which emits no HTML
+    // routes module at all), or `main.rs` would mount routes this module
+    // never emitted. See that gate's comment for the full scope rationale.
+    // `fields` here is actually the caller's `form_fields` (params are named
+    // `fields`/`all_fields` but the call site passes `&form_fields,
+    // &fields`) — a `position` field is always excluded from it (it's
+    // DB-managed, so it's dropped from `metadata.defaults`-filtered form
+    // fields the same way `lock_version` is), so it must be looked up in
+    // `all_fields`, the actual full field list.
+    let position_field = all_fields.iter().find(|f| f.kind.is_position());
+    let reorder_enabled =
+        position_field.is_some() && !live && !live_validation && !sharded && !owner_scoped_index;
+    // Issue #1358: the `position` field's no-JS Move up/down buttons and
+    // their flash message. `move_up`/`move_down` are shared chrome (same
+    // English on every resource, like `common.delete`); the flash bakes in
+    // the resource's own name, so it gets a per-resource key like
+    // `flash_created`/`flash_updated` below. Registered lazily, like
+    // `search_empty`/`search_box_placeholder` above: a scaffold with no
+    // position field never references these, so they must not be defined
+    // in `en.ftl` either, or `autumn i18n check` would flag them unused.
+    let (move_up_button, move_down_button, flash_moved) = if reorder_enabled {
+        (
+            labels.lit("common.move_up", "Move up"),
+            labels.lit("common.move_down", "Move down"),
+            labels.lit(
+                &format!("{snake_name}.flash.moved"),
+                &format!("{pascal_name} moved"),
+            ),
+        )
+    } else {
+        (String::new(), String::new(), String::new())
+    };
+    // Issue #1358: the plain index (and, for the same reason, the CSV
+    // export below) defaults `?sort=` to the position column when the
+    // caller requested none, so a reorderable list renders — and exports —
+    // in its maintained order out of the box rather than primary-key
+    // order — `move_*` would otherwise silently have no visible effect on
+    // load, and a Codex review round caught the export side specifically:
+    // without this, "Export CSV" from a no-`?sort=` position-ordered index
+    // silently downloaded a different row order than what was on screen,
+    // since `export_csv` parses its OWN `ListQuery` from the request
+    // rather than inheriting the index handler's default. Applied only in
+    // the branch `reorder_enabled` targets (the same restriction set); the
+    // sharded/live/owner-scoped index branches keep their existing
+    // (unsorted) queries unchanged.
+    let default_sort_let = position_field.map_or_else(String::new, |pf| {
+        format!(
+            "    let list_query = if list_query.sort().is_none() {{\n        \
+             let __autumn_filters: Vec<(&str, &str)> = list_query.filters().collect();\n        \
+             ListQuery::new(Some(\"{}\"), list_query.direction(), &__autumn_filters)\n    \
+             }} else {{\n        list_query\n    }};\n",
+            pf.name
+        )
+    });
     // Issue #1332: once a Trash page exists, "{pascal_name} deleted" is no longer
     // what happened — the row moved somewhere the user can go and get it back,
     // and the flash is the only place that says so. Every scaffold that emits no
@@ -2773,6 +3922,88 @@ fn render_routes_file(
     } else {
         format!("{pascal_name} deleted")
     };
+    // Issue #1349: the one-shot notices. They are rendered by the layout's
+    // `flash_messages(...)` on the very next page, so a French app that still
+    // toasts "Post created" is not translated — the whole promise of the flag is
+    // that adding a locale means editing a `.ftl`, not Rust.
+    //
+    // Per-resource keys, like the other strings that carry the model's name: a
+    // shared `common.created = { $resource } created` would hand the translator
+    // a sentence whose verb has to agree with a noun they cannot see (French
+    // "créé"/"créée", German word order), which is the same trap `{snake}.new`
+    // avoids. `Flash::success` takes `impl Into<String>`, so a `t!` `String`
+    // drops straight in where the literal was.
+    let flash_created = labels.lit(
+        &format!("{snake_name}.flash.created"),
+        &format!("{pascal_name} created"),
+    );
+    let flash_updated = labels.lit(
+        &format!("{snake_name}.flash.updated"),
+        &format!("{pascal_name} updated"),
+    );
+    let flash_destroyed = labels.lit(&format!("{snake_name}.flash.deleted"), &destroy_flash);
+    // The bulk-delete pair. `Deleted {n} posts` interpolates a COUNT, which is
+    // safe to pass as a Fluent argument (a number carries no gender), unlike the
+    // model noun. A translator wanting real plural rules can turn the value into
+    // a Fluent selector on `$count` without touching Rust.
+    let flash_bulk_cap = if bulk_delete_enabled {
+        labels.expr(
+            &format!("{snake_name}.flash.bulk_cap"),
+            &format!("Select at most {{ $max }} {plural} at once"),
+            &format!("format!(\"Select at most {{MAX_BULK_IDS}} {plural} at once\")"),
+            &[("max", "&MAX_BULK_IDS.to_string()")],
+        )
+    } else {
+        String::new()
+    };
+    let (flash_none_selected, flash_bulk_deleted) = if bulk_delete_enabled {
+        (
+            labels.lit(
+                &format!("{snake_name}.flash.none_selected"),
+                &format!("No {plural} selected"),
+            ),
+            labels.expr(
+                &format!("{snake_name}.flash.bulk_deleted"),
+                &format!("Deleted {{ $count }} {plural}"),
+                &format!("format!(\"Deleted {{}} {plural}\", allowed.len())"),
+                &[("count", "&allowed.len().to_string()")],
+            ),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    let (flash_restored, flash_purged) = if trash_enabled {
+        (
+            labels.lit(
+                &format!("{snake_name}.flash.restored"),
+                &format!("{pascal_name} restored — it is back in the list"),
+            ),
+            labels.lit(
+                &format!("{snake_name}.flash.purged"),
+                &format!("{pascal_name} permanently deleted"),
+            ),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    // Registered only where the surface using it is actually emitted: a key
+    // nothing references is exactly what `autumn i18n check --strict` fails on.
+    // The stale-write notice lives in the state-machine transition handler's
+    // 409 branch only, so it needs BOTH a lock column and a `:states(...)`
+    // column — a plain `lock_version` scaffold re-renders the edit form with an
+    // inline banner instead and never flashes.
+    let flash_stale =
+        if lock_version.is_some() && all_fields.iter().any(|f| f.state_machine.is_some()) {
+            labels.lit(
+                &format!("{snake_name}.flash.stale"),
+                &format!(
+                    "This {snake_name} was changed by someone else since this page was loaded. \
+                 Reload and try again."
+                ),
+            )
+        } else {
+            String::new()
+        };
     // The full extractor pair the authorize wiring needs on handlers that do not
     // already carry a `state:` wrapper. No trailing comma — each insertion site
     // supplies its own delimiter.
@@ -3065,6 +4296,19 @@ fn render_routes_file(
         1,
     );
 
+    // Issue #1349: `create`/`update` re-render the form on a rejected submission,
+    // so they render labels and need the locale. Prepended, keeping `body: Bytes`
+    // last for the same reason the CSRF pair is inserted rather than appended:
+    // axum allows exactly one body-consuming extractor and it must come last.
+    let (create_signature, update_signature) = if labels.enabled() {
+        (
+            format!("locale: Locale, {create_signature}"),
+            format!("locale: Locale,\n    {update_signature}"),
+        )
+    } else {
+        (create_signature, update_signature)
+    };
+
     // Issue #1135: reference selects need a DB handle to load their options
     // in every handler that renders the form. `create`/`update` already carry
     // `mut db` except on the live non-sharded path (which uses the repository
@@ -3158,6 +4402,41 @@ fn render_routes_file(
     // presigned GET. An app with no `[storage]` backend (or a backend that
     // refuses to sign) degrades to the stored file's name without a link rather
     // than failing the whole page.
+    // Issue #1349: the meta span beside the link — `(image/png, 17 bytes)` — is
+    // user-facing text like every other string this flag claims, so the WHOLE
+    // parenthesised pattern comes from the bundle rather than just the word
+    // "bytes": a translator has to reorder it, repunctuate it, and choose the
+    // unit noun (and whether it agrees with the number). The media type and the
+    // count interpolate as Fluent arguments — they are data, not language.
+    //
+    // That means `attachment_link` needs a `Locale`, which is why it takes one
+    // under `--i18n` and not otherwise: both call sites are view handlers that
+    // already hold it, and the non-i18n helper must stay byte-for-byte as it
+    // was. `media`, not `type`, because the argument name becomes a Rust
+    // identifier in the `t!` expansion and `type` is a keyword.
+    let attachment_locale_param = if labels.enabled() {
+        "locale: &autumn_web::i18n::Locale,\n    "
+    } else {
+        ""
+    };
+    let attachment_locale_arg = if labels.enabled() { "&locale, " } else { "" };
+    // Recorded only when the helper is actually emitted: `markup_expr` adds the
+    // key to `used_keys`, and a key written to `en.ftl` that no generated view
+    // references is exactly what `autumn i18n check --strict` fails on. A
+    // scaffold with no attachment column must not carry this key.
+    let attachment_meta_markup = if has_attachments {
+        labels.markup_expr(
+            "common.attachment.meta",
+            "({ $media }, { $size } bytes)",
+            "\"(\" (blob.content_type) \", \" (blob.byte_size) \" bytes)\"",
+            &[
+                ("media", "&blob.content_type"),
+                ("size", "&blob.byte_size.to_string()"),
+            ],
+        )
+    } else {
+        String::new()
+    };
     let attachment_read_back_helpers = if has_attachments {
         format!(
             "\n/// The dot-extension to give a stored blob, derived from the browser-supplied\n\
@@ -3309,7 +4588,7 @@ fn render_routes_file(
              /// Emitted as a raw `<a>` rather than `autumn_web::a11y::Link` because that\n\
              /// primitive has no `download` builder.\n\
              fn attachment_link(\n    \
-             blob: Option<&autumn_web::storage::Blob>,\n    \
+             {attachment_locale_param}blob: Option<&autumn_web::storage::Blob>,\n    \
              url: Option<&str>,\n    \
              label: &str,\n\
              ) -> Markup {{\n    \
@@ -3327,7 +4606,7 @@ fn render_routes_file(
              span {{ (file_name) }}\n        \
              }}\n        \
              \" \"\n        \
-             span class=\"autumn-attachment__meta\" {{ \"(\" (blob.content_type) \", \" (blob.byte_size) \" bytes)\" }}\n    \
+             span class=\"autumn-attachment__meta\" {{ {attachment_meta_markup} }}\n    \
              }}\n\
              }}\n"
         )
@@ -3447,6 +4726,16 @@ fn render_routes_file(
     for f in &attachment_fields {
         let name = &f.name;
         let label = humanize_label(name);
+        // Issue #1349: "Current Cover:" names the file already stored, so it is
+        // a view label like any other. Per FIELD, not a shared pattern with the
+        // column name interpolated — same grammatical-agreement reasoning as
+        // `{snake}.new`. The `attachment_link` argument beside it stays the raw
+        // column name on purpose: it is the DOWNLOAD FILENAME stem, not a label,
+        // and localizing a filename is a bug, not a feature.
+        let current_label = labels.markup(
+            &format!("{snake_name}.attachment.{name}.current"),
+            &format!("Current {label}: "),
+        );
         let _ = writeln!(
             edit_attachment_url_binds,
             "        let {name}_url = attachment_url(&state, current.{name}.as_ref()).await;"
@@ -3454,7 +4743,7 @@ fn render_routes_file(
         let _ = write!(
             edit_current_attachment_markup,
             "@if let Some(blob) = current.{name}.as_ref() {{\n            \
-             p class=\"autumn-field__current\" {{ \"Current {label}: \" (attachment_link(Some(blob), {name}_url.as_deref(), \"{name}\")) }}\n        \
+             p class=\"autumn-field__current\" {{ {current_label} (attachment_link({attachment_locale_arg}Some(blob), {name}_url.as_deref(), \"{name}\")) }}\n        \
              }}\n        "
         );
     }
@@ -3465,46 +4754,72 @@ fn render_routes_file(
     // key-sanitizing rules, rather than leaving them proven only by the
     // generator's own string assertions. They live INSIDE the routes module
     // because a `tests/` integration binary cannot import a project's bin crate.
+    // Under `--i18n` the helper takes a `Locale`, so the tests build one. It
+    // carries a real one-key bundle rather than the bare `Locale::new` (whose
+    // lookups fall back to the key itself): that keeps these assertions about
+    // the RENDERED meta — the media type and byte count still have to reach the
+    // string — instead of degrading them to "some key was looked up".
+    let (attachment_test_locale_helper, attachment_test_locale_arg) = if labels.enabled() {
+        (
+            r#"
+    fn locale() -> autumn_web::i18n::Locale {
+        let mut en = std::collections::HashMap::new();
+        en.insert(
+            "common.attachment.meta".to_owned(),
+            "({ $media }, { $size } bytes)".to_owned(),
+        );
+        let mut messages = std::collections::HashMap::new();
+        messages.insert("en".to_owned(), en);
+        let config = autumn_web::i18n::I18nConfig::default();
+        let bundle = autumn_web::i18n::Bundle::from_messages(messages, &config);
+        autumn_web::i18n::Locale::new("en").with_bundle(std::sync::Arc::new(bundle))
+    }
+"#,
+            "&locale(), ",
+        )
+    } else {
+        ("", "")
+    };
     let attachment_read_back_unit_tests = if has_attachments {
-        String::from(
+        format!(
             r#"
 
 #[cfg(test)]
-mod attachment_read_back_tests {
-    use super::{LINKABLE_CONTENT_TYPES, attachment_link, upload_extension};
+mod attachment_read_back_tests {{
+    use super::{{LINKABLE_CONTENT_TYPES, attachment_link, upload_extension}};
     use autumn_web::storage::Blob;
 
-    fn blob(key: &str) -> Blob {
+    fn blob(key: &str) -> Blob {{
         Blob::new("test", key, "image/png", 17)
-    }
+    }}
+{attachment_test_locale_helper}
+    #[test]
+    fn renders_an_em_dash_when_the_column_is_null() {{
+        assert_eq!(attachment_link({attachment_test_locale_arg}None, None, "cover").into_string(), "\u{{2014}}");
+    }}
 
     #[test]
-    fn renders_an_em_dash_when_the_column_is_null() {
-        assert_eq!(attachment_link(None, None, "cover").into_string(), "\u{2014}");
-    }
-
-    #[test]
-    fn labels_the_link_from_the_column_and_the_stored_extension() {
+    fn labels_the_link_from_the_column_and_the_stored_extension() {{
         let stored = blob("posts/cover/1700000000_abc.png");
-        let html = attachment_link(Some(&stored), Some("/_blobs/x?sig=1"), "cover").into_string();
-        assert!(html.contains("href=\"/_blobs/x?sig=1\""), "{html}");
+        let html = attachment_link({attachment_test_locale_arg}Some(&stored), Some("/_blobs/x?sig=1"), "cover").into_string();
+        assert!(html.contains("href=\"/_blobs/x?sig=1\""), "{{html}}");
         // Not the opaque key: a download has to land with a usable name.
-        assert!(html.contains("download=\"cover.png\""), "{html}");
-        assert!(html.contains(">cover.png<"), "{html}");
-        assert!(html.contains("image/png"), "{html}");
-        assert!(html.contains("17 bytes"), "{html}");
-    }
+        assert!(html.contains("download=\"cover.png\""), "{{html}}");
+        assert!(html.contains(">cover.png<"), "{{html}}");
+        assert!(html.contains("image/png"), "{{html}}");
+        assert!(html.contains("17 bytes"), "{{html}}");
+    }}
 
     #[test]
-    fn drops_the_anchor_when_no_url_could_be_signed() {
+    fn drops_the_anchor_when_no_url_could_be_signed() {{
         let stored = blob("posts/cover/1700000000_abc.png");
-        let html = attachment_link(Some(&stored), None, "cover").into_string();
-        assert!(!html.contains("<a "), "{html}");
-        assert!(html.contains("cover.png"), "{html}");
-    }
+        let html = attachment_link({attachment_test_locale_arg}Some(&stored), None, "cover").into_string();
+        assert!(!html.contains("<a "), "{{html}}");
+        assert!(html.contains("cover.png"), "{{html}}");
+    }}
 
     #[test]
-    fn refuses_to_link_content_types_that_execute_as_same_origin_script() {
+    fn refuses_to_link_content_types_that_execute_as_same_origin_script() {{
         // The local backend replays the stored content type from THIS origin with
         // no `Content-Disposition`, and the default CSP allows `script-src 'self'`,
         // so navigating to a stored `.html`/`.svg` would run it as same-origin
@@ -3517,20 +4832,20 @@ mod attachment_read_back_tests {
             "application/xml",
             "text/javascript",
             "application/javascript",
-        ] {
+        ] {{
             assert!(
                 !LINKABLE_CONTENT_TYPES.contains(&dangerous),
-                "{dangerous} must never be linkable"
+                "{{dangerous}} must never be linkable"
             );
-        }
+        }}
         // The ordinary upload types a scaffold is actually used for stay linkable.
-        for safe in ["image/png", "image/jpeg", "application/pdf", "text/plain"] {
-            assert!(LINKABLE_CONTENT_TYPES.contains(&safe), "{safe} should link");
-        }
-    }
+        for safe in ["image/png", "image/jpeg", "application/pdf", "text/plain"] {{
+            assert!(LINKABLE_CONTENT_TYPES.contains(&safe), "{{safe}} should link");
+        }}
+    }}
 
     #[test]
-    fn keeps_only_a_short_safe_lowercase_extension() {
+    fn keeps_only_a_short_safe_lowercase_extension() {{
         assert_eq!(upload_extension(Some("holiday.PNG")), ".png");
         assert_eq!(upload_extension(Some("archive.tar.gz")), ".gz");
         // No extension to take, or nothing safe to take.
@@ -3543,8 +4858,8 @@ mod attachment_read_back_tests {
         assert_eq!(upload_extension(Some("sneaky.meta")), "");
         // A traversal attempt keeps nothing but the final extension.
         assert_eq!(upload_extension(Some("../../etc/passwd.png")), ".png");
-    }
-}
+    }}
+}}
 "#,
         )
     } else {
@@ -3888,15 +5203,25 @@ mod attachment_read_back_tests {
     // their own edits with an explanation, never on a dead-end error page. The
     // wording states what happened and what to do, because a bare "409
     // Conflict" tells a non-technical author nothing.
+    // Issue #1349: the banner is the one thing an author reads at the moment
+    // their save is rejected, so it is the LAST place to fall back to English.
+    // Recorded only when the scaffold has a lock column — an `en.ftl` key no
+    // view references fails `autumn i18n check --strict`.
     let lock_conflict_banner = if lock_version.is_some() {
-        "@if lock_conflict {\n            \
-         p class=\"autumn-flash autumn-flash--error\" role=\"alert\" {\n                \
-         \"This record was changed by someone else since you opened it. \
-         Your changes are shown below — review them and save again to apply them.\"\n            \
-         }\n        \
-         }\n        "
+        format!(
+            "@if lock_conflict {{\n            \
+             p class=\"autumn-flash autumn-flash--error\" role=\"alert\" {{\n                \
+             {}\n            \
+             }}\n        \
+             }}\n        ",
+            labels.markup(
+                "common.lock.conflict",
+                "This record was changed by someone else since you opened it. \
+                 Your changes are shown below — review them and save again to apply them.",
+            )
+        )
     } else {
-        ""
+        String::new()
     };
     // The `--live-validation` form is raw markup rather than a `form_for` call,
     // so its hidden version input is spliced straight into the `<form>` body.
@@ -3977,28 +5302,28 @@ mod attachment_read_back_tests {
         // it carries an `onclick` confirm the current `Button` API can't express,
         // and converting would drop the confirmation guard.
         let new_form_layout = format!(
-            "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
-             h1 {{ \"New {pascal_name}\" }}\n        \
+            "{layout_fn}({new_title}, {cp_new}{flash_arg}, html! {{\n        \
+             h1 {{ {new_heading} }}\n        \
              form action=(paths::create()) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{changeset_inputs}            \
-             (autumn_web::a11y::Button::new(\"Create\").submit())\n        \
+             (autumn_web::a11y::Button::new({create_button}).submit())\n        \
              }}\n    \
              }})"
         );
         let edit_form_layout = format!(
-            "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
-             h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
+            "{layout_fn}({edit_title_live}, {cp_edit}{flash_arg}, html! {{\n        \
+             h1 {{ {edit_heading_live} }}\n        \
              {lock_conflict_banner}\
              {edit_current_attachment_markup}\
              form action=(paths::update(*id)) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{lock_version_hidden_input}{changeset_inputs}            \
-             (autumn_web::a11y::Button::new(\"Save\").submit())\n        \
+             (autumn_web::a11y::Button::new({save_button}).submit())\n        \
              }}\n        \
              form action=(paths::delete(*id)) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
-             button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
+             {delete_confirm_bind}button type=\"submit\" onclick={delete_confirm_attr} {{ {delete_button} }}\n        \
              }}\n    \
              }})"
         );
@@ -4007,6 +5332,7 @@ mod attachment_read_back_tests {
             edit_form_layout,
             &option_loads,
             &edit_attachment_url_binds,
+            &resource_bind_form,
         );
         // The referenced-row option loaders are emitted regardless: they
         // populate the in-form `<select>` (issue #1750). The issue #1146 index
@@ -4055,20 +5381,20 @@ mod attachment_read_back_tests {
             ""
         };
         let new_form_layout = format!(
-            "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
-             h1 {{ \"New {pascal_name}\" }}\n        \
-             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_create}{form_lock_create}{form_parent_fk}))\n    \
+            "{layout_fn}({new_title}, {cp_new}{flash_arg}, html! {{\n        \
+             h1 {{ {new_heading} }}\n        \
+             ({snake_name}_form_for({form_for_locale_arg}&changeset, paths::create(), {create_button_ref}, csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_create}{form_lock_create}{form_parent_fk}))\n    \
              }})"
         );
         let edit_form_layout = format!(
-            "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", {id_value_expr}), {cp_edit}{flash_arg}, html! {{\n        \
-             h1 {{ \"Edit {pascal_name} #\" ({id_value_expr}) }}\n        \
+            "{layout_fn}({edit_title}, {cp_edit}{flash_arg}, html! {{\n        \
+             h1 {{ {edit_heading} }}\n        \
              {lock_conflict_banner}\
              {edit_current_attachment_markup}\
-             ({snake_name}_form_for(&changeset, paths::update({id_value_expr}), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}{form_lock_edit}{form_parent_fk}))\n        \
+             ({snake_name}_form_for({form_for_locale_arg}&changeset, paths::update({id_value_expr}), {save_button_ref}, csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}{form_lock_edit}{form_parent_fk}))\n        \
              form action=(paths::delete({id_value_expr})) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
-             button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
+             {delete_confirm_bind}button type=\"submit\" onclick={delete_confirm_attr} {{ {delete_button} }}\n        \
              }}\n    \
              }})"
         );
@@ -4077,6 +5403,7 @@ mod attachment_read_back_tests {
             edit_form_layout,
             &option_loads,
             &edit_attachment_url_binds,
+            &resource_bind_form,
         );
         (
             new_form_body,
@@ -4085,6 +5412,7 @@ mod attachment_read_back_tests {
                 pascal_name,
                 snake_name,
                 fields,
+                labels,
                 missing_reference_targets,
                 lock_version.map(|_| lock_version_ty.as_str()),
                 nesting.map(|n| n.fk.as_str()),
@@ -4103,6 +5431,35 @@ mod attachment_read_back_tests {
         render_unique_constraints_const(plural, &unique_fields, all_fields)
     };
 
+    // Issue #1349: "has already been taken" is shown to whoever submitted the
+    // duplicate, so it is view text like any other. It cannot come from
+    // `UNIQUE_CONSTRAINTS` under `--i18n` — that is a `const`, evaluated before
+    // there is a request to have a locale — so the const keeps its (constraint,
+    // field) mapping and the MESSAGE is looked up where the changeset error is
+    // built, in a handler that holds the extractor. One shared key rather than
+    // one per field: the const's message is the same sentence for every column.
+    //
+    // Recorded only when the scaffold actually has a unique column, for the
+    // same reason as the attachment meta — an `en.ftl` key no view references
+    // fails `autumn i18n check --strict`.
+    let (unique_message_binding, unique_message_expr) = if unique_fields.is_empty() {
+        ("message", "message.to_string()".to_owned())
+    } else {
+        (
+            if labels.enabled() {
+                "_message"
+            } else {
+                "message"
+            },
+            labels.expr(
+                "common.error.taken",
+                "has already been taken",
+                "message.to_string()",
+                &[],
+            ),
+        )
+    };
+
     let create_insert_block = if !unique_fields.is_empty() {
         // Issue #1872: `{blob_cleanup}` (empty unless the scaffold has attachment
         // fields) best-effort deletes the just-saved blob(s) on both the
@@ -4113,15 +5470,15 @@ mod attachment_read_back_tests {
              Ok(())\n    \
              }}.await;\n    \
              if let Err(err) = result {{\n        \
-             if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n            \
+             if let Some((field, {unique_message_binding})) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n            \
              let mut errors = std::collections::HashMap::new();\n            \
-             errors.insert(field.to_string(), vec![message.to_string()]);\n            \
+             errors.insert(field.to_string(), vec![{unique_message_expr}]);\n            \
              let changeset = Changeset::from_errors(changeset.into_inner(), errors);\n            \
              {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {new_form_body}).into_response());\n        \
              }}\n        \
              {blob_cleanup}return Err(err);\n    \
              }}\n    \
-             flash.success(\"{pascal_name} created\").await;\n    \
+             flash.success({flash_created}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     } else if has_attachments {
@@ -4135,13 +5492,13 @@ mod attachment_read_back_tests {
              if let Err(err) = result {{\n        \
              {blob_cleanup}return Err(err);\n    \
              }}\n    \
-             flash.success(\"{pascal_name} created\").await;\n    \
+             flash.success({flash_created}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     } else {
         format!(
             "{create_stmt}\n    \
-             flash.success(\"{pascal_name} created\").await;\n    \
+             flash.success({flash_created}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     };
@@ -4250,9 +5607,9 @@ mod attachment_read_back_tests {
              let updated = match result {{\n        \
              Ok(updated) => updated,\n        \
              Err(err) => {{\n            \
-             if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n                \
+             if let Some((field, {unique_message_binding})) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n                \
              let mut errors = std::collections::HashMap::new();\n                \
-             errors.insert(field.to_string(), vec![message.to_string()]);\n                \
+             errors.insert(field.to_string(), vec![{unique_message_expr}]);\n                \
              let changeset = Changeset::from_errors(changeset.into_inner(), errors);\n                \
              {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {edit_form_body}).into_response());\n            \
              }}\n            \
@@ -4262,7 +5619,7 @@ mod attachment_read_back_tests {
              if updated == 0 {{\n        \
              {zero_rows}\n    \
              }}\n    \
-             flash.success(\"{pascal_name} updated\").await;\n    \
+             flash.success({flash_updated}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::show({update_redirect_expr})).into_response())",
             zero_rows = update_zero_rows_block(blob_cleanup, &id_value_expr),
         )
@@ -4283,7 +5640,7 @@ mod attachment_read_back_tests {
              if updated == 0 {{\n        \
              {zero_rows}\n    \
              }}\n    \
-             flash.success(\"{pascal_name} updated\").await;\n    \
+             flash.success({flash_updated}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())",
             zero_rows = update_zero_rows_block(blob_cleanup, "*id"),
         )
@@ -4293,7 +5650,7 @@ mod attachment_read_back_tests {
              if updated == 0 {{\n        \
              {zero_rows}\n    \
              }}\n    \
-             flash.success(\"{pascal_name} updated\").await;\n    \
+             flash.success({flash_updated}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())",
             zero_rows = update_zero_rows_block("", "*id"),
         )
@@ -4510,14 +5867,14 @@ mod attachment_read_back_tests {
              #[secured]\n\
              #[post(\"/{plural}/bulk_delete\")]\n\
              pub async fn bulk_delete(\n    \
-             flash: Flash,{authz_params}\n    \
+             {locale_param}flash: Flash,{authz_params}\n    \
              repo: Pg{pascal_name}Repository,\n    \
              mut db: {db_ty},\n    \
              body: Bytes,\n\
              ) -> AutumnResult<autumn_web::Redirect> {{\n    \
              let ids = parse_bulk_ids(&body);\n    \
              if ids.is_empty() {{\n        \
-             flash.info(\"No {plural} selected\").await;\n        \
+             flash.info({flash_none_selected}).await;\n        \
              return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
              }}\n    \
              // Refuse an oversized selection outright rather than truncating it: a\n    \
@@ -4525,7 +5882,7 @@ mod attachment_read_back_tests {
              // the empty case this redirects with a flash instead of 400ing.\n    \
              if ids.len() > MAX_BULK_IDS {{\n        \
              flash\n            \
-             .error(format!(\"Select at most {{MAX_BULK_IDS}} {plural} at once\"))\n            \
+             .error({flash_bulk_cap})\n            \
              .await;\n        \
              return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
              }}\n    \
@@ -4558,7 +5915,7 @@ mod attachment_read_back_tests {
              drop(db);\n\
              {allowed_block}    \
              repo.delete_many(&allowed).await?;\n    \
-             flash.success(format!(\"Deleted {{}} {plural}\", allowed.len())).await;\n    \
+             flash.success({flash_bulk_deleted}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::index()))\n\
              }}"
         )
@@ -4752,7 +6109,7 @@ mod attachment_read_back_tests {
              repo: Pg{pascal_name}Repository,\n\
              ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
              use autumn_web::reexports::axum::response::IntoResponse as _;\n\
-             {owner_let}    \
+             {default_sort_let}{owner_let}    \
              let batch_size = autumn_web::pagination::MAX_PAGE_SIZE;\n    \
              let mut rows: Vec<{pascal_name}> = Vec::new();\n    \
              let mut page: u32 = 1;\n    \
@@ -4822,11 +6179,13 @@ mod attachment_read_back_tests {
         // Rebound as `mut` so the two trash-only columns can be pushed after it.
         let trash_columns = render_columns_vec(
             pascal_name,
+            snake_name,
             fields,
             &reference_displays,
             false,
             route_key_field,
             false,
+            labels,
         )
         .replacen("    let columns:", "    let mut columns:", 1);
         // Restore and Purge act on the row the trash page just listed, so they
@@ -4878,6 +6237,69 @@ mod attachment_read_back_tests {
         // other index column header is (`title_case`), so the trash table reads
         // like the list it mirrors.
         let deleted_at_header = title_case("deleted_at");
+        // Issue #1349: the trash view's own strings.
+        //
+        // The two extra `Column`s take `let` bindings, exactly like the
+        // `l_col_*` headers `render_columns_vec` emits: `Column<'a, T>` holds
+        // its header as `&'a str` and both are pushed into a `columns` vec that
+        // outlives the statement, so an inline `&t!(…)` would be a temporary
+        // dropped at the end of the `insert`/`push` (E0716). `confirm_action`'s
+        // per-row title and its config, by contrast, are consumed inside a
+        // single statement and can stay inline. The bindings are spliced BEFORE
+        // the `columns` vec, not after: locals drop in reverse declaration
+        // order, so a label declared after the vec it is borrowed into would be
+        // dropped first (E0597).
+        let (deleted_at_header_expr, actions_header_expr, trash_label_binds) = if labels.enabled() {
+            (
+                "&l_trash_deleted_at".to_owned(),
+                "&l_trash_actions".to_owned(),
+                format!(
+                    "    let l_trash_deleted_at = {};\n    let l_trash_actions = {};\n",
+                    labels.lit("common.field.deleted_at", &deleted_at_header),
+                    labels.lit("common.actions", "Actions"),
+                ),
+            )
+        } else {
+            (
+                format!("\"{deleted_at_header}\""),
+                "\"Actions\"".to_owned(),
+                String::new(),
+            )
+        };
+        let purge_title_expr = labels.expr(
+            &format!("{snake_name}.purge.confirm"),
+            &format!("Permanently delete {snake_name} {{ $id }}?"),
+            &format!(
+                "format!(\"Permanently delete {snake_name} {{}}?\", {route_key_display_expr})"
+            ),
+            &[("id", &format!("&({route_key_display_expr}).to_string()"))],
+        );
+        let purge_warning = labels.markup(
+            "common.purge.warning",
+            "This action cannot be undone. Restore it instead if you might need it later.",
+        );
+        let (purge_cancel_bind, purge_cancel) = if labels.enabled() {
+            (
+                format!(
+                    "let purge_cancel = {};\n        ",
+                    labels.lit("common.cancel", "Cancel")
+                ),
+                "\n            .cancel_label(&purge_cancel)".to_owned(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        let restore_button = labels.lit("common.restore", "Restore");
+        let purge_button = labels.lit_ref("common.purge", "Purge");
+        let trash_title = labels.lit_ref(
+            &format!("{snake_name}.trash.title"),
+            &format!("{pascal_name} trash"),
+        );
+        let trash_heading = labels.markup(
+            &format!("{snake_name}.trash.heading"),
+            &format!("Deleted {pascal_name}s"),
+        );
+        let trash_empty = labels.lit_ref("common.trash.empty", "Trash is empty.");
         format!(
             r#"
 
@@ -4892,7 +6314,7 @@ mod attachment_read_back_tests {
 #[secured]
 #[get("/{plural}/trash")]
 pub async fn trash(
-    page_req: PageRequest,
+    {locale_param}page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
     flash: Flash,
     csrf: Option<CsrfToken>,
@@ -4908,23 +6330,23 @@ pub async fn trash(
     // loads, plus a `<noscript>` fallback so the action stays reachable without
     // JavaScript.
     let purge_csrf = csrf.as_ref().map(|token| token.token()).unwrap_or_default();
-{trash_columns}    // The `{deleted_at_header}` stamp goes BEFORE the trailing "Show" link column that
+{trash_label_binds}{trash_columns}    // The `{deleted_at_header}` stamp goes BEFORE the trailing "Show" link column that
     // `columns` ends with, so the data columns stay together and the two link
     // columns stay at the end of the row.
     columns.insert(
         columns.len() - 1,
-        autumn_web::widgets::Column::new("{deleted_at_header}", |row: &{pascal_name}| maud::html! {{ (row.deleted_at.as_ref().map(ToString::to_string).unwrap_or_default()) }}),
+        autumn_web::widgets::Column::new({deleted_at_header_expr}, |row: &{pascal_name}| maud::html! {{ (row.deleted_at.as_ref().map(ToString::to_string).unwrap_or_default()) }}),
     );
-    columns.push(autumn_web::widgets::Column::new("Actions", |row: &{pascal_name}| {{
+    columns.push(autumn_web::widgets::Column::new({actions_header_expr}, |row: &{pascal_name}| {{
         // Titled per row rather than once for the whole page: a page-sized
         // trash renders one dialog per row, and identical titles would put a
         // run of indistinguishable `<h2>`s in the heading outline — and leave
         // the person confirming an irreversible delete with nothing on screen
         // saying WHICH {snake_name} they are about to destroy.
-        let purge_title = format!("Permanently delete {snake_name} {{}}?", {route_key_display_expr});
-        let purge_confirm = autumn_web::widgets::ConfirmActionConfig::new()
-            .title(&purge_title)
-            .message(maud::html! {{ p {{ "This action cannot be undone. Restore it instead if you might need it later." }} }});
+        let purge_title = {purge_title_expr};
+        {purge_cancel_bind}let purge_confirm = autumn_web::widgets::ConfirmActionConfig::new()
+            .title(&purge_title){purge_cancel}
+            .message(maud::html! {{ p {{ {purge_warning} }} }});
         let purge_confirm = match csrf_field.as_ref() {{
             Some(field) => purge_confirm.csrf_field(field.0.as_str()),
             None => purge_confirm,
@@ -4932,11 +6354,11 @@ pub async fn trash(
         maud::html! {{
             form action=(paths::restore({route_key_display_expr})) method="post" {{
                 (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
-                (autumn_web::a11y::Button::new("Restore").submit())
+                (autumn_web::a11y::Button::new({restore_button}).submit())
             }}
             (autumn_web::widgets::confirm_action(
                 &format!("purge-{{}}", row.id),
-                "Purge",
+                {purge_button},
                 &paths::purge({route_key_display_expr}),
                 autumn_web::reexports::http::Method::POST,
                 purge_csrf,
@@ -4944,11 +6366,11 @@ pub async fn trash(
             ))
         }}
     }}));
-    Ok({layout_fn}("{pascal_name} trash", {cp_trash}{flash_arg}, html! {{
-        h1 {{ "Deleted {pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
-        (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("Trash is empty.").base_path(&paths::trash())))
-        (pagination_nav(&page_data, &PagerOptions::new(&paths::trash())))
+    Ok({layout_fn}({trash_title}, {cp_trash}{flash_arg}, html! {{
+        h1 {{ {trash_heading} }}
+        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
+        (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({trash_empty}).base_path(&paths::trash())))
+        (pagination_nav(&page_data, &PagerOptions::new(&paths::trash()){pager_labels}))
     }}))
 }}
 
@@ -4960,7 +6382,7 @@ pub async fn trash(
 #[secured]
 #[post("/{plural}/{{{id_url_segment}}}/restore")]
 pub async fn restore(
-    {id_param_decl},
+    {locale_param}{id_param_decl},
     mut db: {db_ty},
     repo: Pg{pascal_name}Repository,
     flash: Flash,{trash_authz_params}
@@ -4969,7 +6391,7 @@ pub async fn restore(
     repo.restore(row.id).await?;
     // The redirect lands back on the Trash page (the row is gone from it), so
     // the flash has to say where the {snake_name} actually went.
-    flash.success("{pascal_name} restored — it is back in the list").await;
+    flash.success({flash_restored}).await;
     Ok(autumn_web::Redirect::to(&paths::trash()))
 }}
 
@@ -4995,15 +6417,70 @@ pub async fn restore(
 #[secured]
 #[post("/{plural}/{{{id_url_segment}}}/purge")]
 pub async fn purge(
-    {id_param_decl},
+    {locale_param}{id_param_decl},
     mut db: {db_ty},
     repo: Pg{pascal_name}Repository,
     flash: Flash,{trash_authz_params}
 ) -> AutumnResult<autumn_web::Redirect> {{
 {trash_guard_load}{trash_authz_call}    drop(db);
     repo.purge(row.id).await?;
-    flash.success("{pascal_name} permanently deleted").await;
+    flash.success({flash_purged}).await;
     Ok(autumn_web::Redirect::to(&paths::trash()))
+}}
+"#
+        )
+    } else {
+        String::new()
+    };
+
+    // Issue #1358: the position field's `move_up`/`move_down` no-JS button
+    // targets. Authorized identically to `edit_form`/`update` ("edit" action,
+    // record policy) since moving a row is a content mutation, not a
+    // deletion — reuses `edit_destroy_authz_params`/`authz_edit_call` rather
+    // than inventing a third authorization shape.
+    let reorder_section = if reorder_enabled {
+        format!(
+            r#"
+/// `POST /{plural}/{{{id_url_segment}}}/move_up` — move a {snake_name} one position toward the start of its list.
+#[secured]
+#[post("/{plural}/{{{id_url_segment}}}/move_up")]
+pub async fn move_up(
+    {locale_param}{id_param_decl},
+    mut db: {db_ty},
+    repo: Pg{pascal_name}Repository,
+    flash: Flash,{edit_destroy_authz_params}
+) -> AutumnResult<autumn_web::Redirect> {{
+    let row: {pascal_name} = {plural}::table
+        .{find_expr}
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(AutumnError::not_found)?;
+    {authz_edit_call}drop(db);
+    repo.move_up(row.id).await?;
+    flash.success({flash_moved}).await;
+    Ok(autumn_web::Redirect::to(&paths::index()))
+}}
+
+/// `POST /{plural}/{{{id_url_segment}}}/move_down` — move a {snake_name} one position toward the end of its list.
+#[secured]
+#[post("/{plural}/{{{id_url_segment}}}/move_down")]
+pub async fn move_down(
+    {locale_param}{id_param_decl},
+    mut db: {db_ty},
+    repo: Pg{pascal_name}Repository,
+    flash: Flash,{edit_destroy_authz_params}
+) -> AutumnResult<autumn_web::Redirect> {{
+    let row: {pascal_name} = {plural}::table
+        .{find_expr}
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(AutumnError::not_found)?;
+    {authz_edit_call}drop(db);
+    repo.move_down(row.id).await?;
+    flash.success({flash_moved}).await;
+    Ok(autumn_web::Redirect::to(&paths::index()))
 }}
 "#
         )
@@ -5032,11 +6509,13 @@ pub async fn purge(
     } else {
         render_columns_vec(
             pascal_name,
+            snake_name,
             fields,
             &reference_displays,
             false,
             route_key_field,
             true,
+            labels,
         )
     };
     let index_label_loads = if live {
@@ -5063,11 +6542,13 @@ pub async fn purge(
     } else {
         render_columns_vec(
             pascal_name,
+            snake_name,
             fields,
             &reference_displays,
             true,
             route_key_field,
             true,
+            labels,
         )
     };
     // Issue #1312: the shared columns prelude the index AND the search-results
@@ -5080,9 +6561,36 @@ pub async fn purge(
             index_columns_labeled.replacen("    let columns:", "    let mut columns:", 1);
         format!(
             "    let bulk_action = paths::bulk_delete();\n    \
-             let bulk_cfg = autumn_web::widgets::BulkActionsConfig::new(&bulk_action);\n\
+             {bulk_label_binds}let bulk_cfg = autumn_web::widgets::BulkActionsConfig::new(&bulk_action){bulk_labels};\n\
              {with_mut}    \
              columns.insert(0, autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ (autumn_web::widgets::bulk_select_checkbox(row.id, &bulk_cfg)) }}));\n"
+        )
+    } else {
+        index_columns_labeled
+    };
+    // Issue #1358: the position field's no-JS Move up / Move down buttons —
+    // each a tiny CSRF- and submit-token-protected `POST` form, following the
+    // exact pattern the trash view's Restore button uses (`csrf_input` +
+    // `submit_token_input` inside a bare `form method="post"`). Appended
+    // after the bulk-delete checkbox column (if also present) so both
+    // features compose without either one clobbering the other's insert.
+    let index_columns_labeled = if reorder_enabled {
+        let with_mut =
+            index_columns_labeled.replacen("    let columns:", "    let mut columns:", 1);
+        format!(
+            "{with_mut}    \
+             columns.push(autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{\n\
+             form action=(paths::move_up({route_key_display_expr})) method=\"post\" {{\n\
+             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n\
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n\
+             (autumn_web::a11y::Button::new({move_up_button}).submit())\n\
+             }}\n\
+             form action=(paths::move_down({route_key_display_expr})) method=\"post\" {{\n\
+             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n\
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n\
+             (autumn_web::a11y::Button::new({move_down_button}).submit())\n\
+             }}\n\
+             }}));\n"
         )
     } else {
         index_columns_labeled
@@ -5095,11 +6603,31 @@ pub async fn purge(
     // tokenless request straight through, so without it a double-clicked
     // "Delete selected" runs the whole destructive path — hooks and dependent
     // deletes included — twice instead of replaying the first response.
-    let bulk_csrf_params = if bulk_delete_enabled {
+    // Issue #1349: under `--i18n` the four token extractors collapse into ONE
+    // tuple parameter. axum implements `FromRequestParts` for tuples, and its
+    // `Handler` impls stop at 16 arguments — the owner-scoped `search` handler
+    // already declares 13, and `#[secured]`/`#[get]` inject three more, so
+    // adding `locale: Locale` on top would push it to 17 and fail to compile
+    // with an unreadable elided-tuple trait error. Destructuring in the pattern
+    // keeps every use site in the body spelled exactly as before. Only under
+    // the flag: the plain scaffold's signature stays byte-identical.
+    // Issue #1358: the Move up/down buttons need the same CSRF + one-time
+    // submit-token pair as the bulk-delete form (a double-clicked move is
+    // exactly the double-submit `SubmitTokenLayer` guards against), so this
+    // gate — and the params it emits — are shared between the two features
+    // rather than duplicated. Reusing the identical 4-tuple (rather than a
+    // 2-tuple for reorder-only) means every emitted param is always actually
+    // used by at least one of the two forms, whichever combination is on.
+    let bulk_csrf_params = if !bulk_delete_enabled && !reorder_enabled {
+        String::new()
+    } else if labels.enabled() {
+        "\n    (csrf, csrf_field, submit_token, submit_field): (Option<CsrfToken>, \
+         Option<CsrfFormField>, Option<SubmitToken>, Option<SubmitFormField>),"
+            .to_owned()
+    } else {
         "\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    \
          submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,"
-    } else {
-        ""
+            .to_owned()
     };
     // The `Option<&str>` conversions `bulk_actions_form` takes for its hidden
     // CSRF and submit-token inputs, matching the `csrf_input` /
@@ -5120,11 +6648,11 @@ pub async fn purge(
         // (non-sort/filter) config. Wiring owner-scoped sort/filter there is a
         // follow-up (issue #1841 covers the standard Db path only).
         format!(
-            r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index())))"#
+            r"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({index_empty}).base_path(&paths::index())))"
         )
     } else {
         format!(
-            r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index()).query(raw_query.as_deref().unwrap_or_default()).active_sort(list_query.sort().unwrap_or_default()).active_dir(list_query.direction())))"#
+            r"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({index_empty}).base_path(&paths::index()).query(raw_query.as_deref().unwrap_or_default()).active_sort(list_query.sort().unwrap_or_default()).active_dir(list_query.direction())))"
         )
     };
 
@@ -5147,10 +6675,11 @@ pub async fn purge(
     // handler from the raw query string). The `--live` variants call `repo.page`
     // and extract no `RawQuery`, so they keep the plain pager.
     let pager_line = if live {
-        r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index())))".to_string()
+        format!("(pagination_nav(&page_data, &PagerOptions::new(&paths::index()){pager_labels}))")
     } else {
-        r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index()).query(pager_query)))"
-            .to_string()
+        format!(
+            "(pagination_nav(&page_data, &PagerOptions::new(&paths::index()).query(pager_query){pager_labels}))"
+        )
     };
     // Issue #1315: the index's "Export CSV" link, and the `let` that builds its
     // href. The link carries the index's CURRENT query string, so "filter →
@@ -5192,18 +6721,24 @@ pub async fn purge(
             // nodes, so without it the two anchors render as one glued run
             // ("New PostExport CSV"). Same separator the generated `show` view
             // puts between its "Back to list" and "Edit" links.
-            "\n        \" \"\n        \
-             (autumn_web::a11y::Link::new(export_href, \"Export CSV\"))",
+            format!(
+                "\n        \" \"\n        \
+                 (autumn_web::a11y::Link::new(export_href, {export_csv_text}))"
+            ),
         )
     } else {
-        ("", "")
+        ("", String::new())
     };
     // The furniture slot takes the link only when there is no search box to
     // invalidate it; otherwise `index_list_block` places it inside the container.
     // The two slots differ only in indentation — furniture is a direct child of
     // the `html! {` block (8 spaces), the in-results copy is one level deeper
     // inside the container `div` (12) — so the generated file stays readable.
-    let export_link_furniture = if search_enabled { "" } else { export_link };
+    let export_link_furniture = if search_enabled {
+        ""
+    } else {
+        export_link.as_str()
+    };
     // Issue #1332 AC2: the index's "Trash" link. Page furniture next to "New
     // {pascal_name}" — unlike "Export CSV" it describes no row set, so a search
     // that swaps the results container cannot leave it pointing at stale rows,
@@ -5212,16 +6747,21 @@ pub async fn purge(
     // export link and the show view use: Maud drops template whitespace between
     // nodes, so without it the anchors render as one glued run.
     let trash_link_furniture = if trash_enabled {
-        "\n        \" \"\n        \
-         (autumn_web::a11y::Link::new(paths::trash(), \"Trash\"))"
+        format!(
+            "\n        \" \"\n        \
+             (autumn_web::a11y::Link::new(paths::trash(), {}))",
+            labels.lit("common.trash", "Trash")
+        )
     } else {
-        ""
+        String::new()
     };
     let export_link_in_results = if search_enabled {
-        "\n            \" \"\n            \
-         (autumn_web::a11y::Link::new(export_href, \"Export CSV\"))"
+        format!(
+            "\n            \" \"\n            \
+             (autumn_web::a11y::Link::new(export_href, {export_csv_text}))"
+        )
     } else {
-        ""
+        String::new()
     };
     // Issue #1312: the list itself (data_table + pager) is wrapped in the
     // bulk-actions `<form>` so each row's checkbox submits with the
@@ -5256,9 +6796,9 @@ pub async fn purge(
         };
         format!(
             "script src=(autumn_web::htmx::HTMX_JS_PATH) {{}}\n        \
-             (autumn_web::widgets::active_search_input(\"{snake_name}-search\", \"Search {pascal_name}s\", \
+             (autumn_web::widgets::active_search_input(\"{snake_name}-search\", {search_box_label}, \
              &autumn_web::widgets::ActiveSearchConfig::new(\"/{plural}/search\", \"#{plural}-search-results\")\
-             .placeholder(\"Search {pascal_name}s…\")))\n        \
+             .placeholder({search_box_placeholder})))\n        \
              {inner}"
         )
     } else if bulk_delete_enabled {
@@ -5268,7 +6808,8 @@ pub async fn purge(
     } else {
         format!("{list_render}\n        {pager_line}")
     };
-    let show_rows = render_show_property_rows(all_fields, &reference_displays);
+    let show_rows = render_show_property_rows(all_fields, &reference_displays, labels);
+    let show_prop_binds = render_show_property_label_binds(all_fields, snake_name, labels);
     // The `show` handler pre-loads each displayable reference's parent label
     // (issue #1146) before building its property rows.
     let show_label_loads = render_show_reference_label_loads(all_fields, &reference_displays);
@@ -5307,7 +6848,7 @@ pub async fn purge(
 #[get("/{plural}")]
 #[allow(clippy::too_many_arguments)]
 pub async fn index(
-    list_query: ListQuery,
+    {locale_param}list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
@@ -5319,9 +6860,9 @@ pub async fn index(
     let owner_id = ctx.user_id_i64().unwrap_or(-1);
     let page_data: Page<{pascal_name}> = repo.list_scoped(owner_id, &list_query, &page_req).await?;
     let pager_query = raw_query.as_deref().unwrap_or("");
-{export_href_let}{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        a href=(paths::new()) {{ "New {pascal_name}" }}{export_link_furniture}
+{export_href_let}{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        a href=(paths::new()) {{ {new_link_markup} }}{export_link_furniture}
         {index_list_block}
     }}))
 }}"#
@@ -5347,7 +6888,7 @@ pub async fn index(
 #[get("/{plural}")]
 #[allow(clippy::too_many_arguments)]
 pub async fn index(
-    page_req: PageRequest,
+    {locale_param}page_req: PageRequest,
     autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
     session: autumn_web::session::Session,
     {owner_index_db_param},
@@ -5368,11 +6909,11 @@ pub async fn index(
         .load(&mut *db)
         .await?;
     let page_data: Page<{pascal_name}> = Page::new(items, total, &page_req);
-{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new("/{plural}/new", "New {pascal_name}"))
+{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new("/{plural}/new", {new_link_text}))
         {list_render}
-        (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
+        (pagination_nav(&page_data, &PagerOptions::new("/{plural}"){pager_labels}))
     }}))
 }}"#
         )
@@ -5387,15 +6928,15 @@ pub async fn index(
 #[get("/{plural}")]
 #[allow(clippy::too_many_arguments)]
 pub async fn index(
-    page_req: PageRequest,
+    {locale_param}page_req: PageRequest,
     db: ShardedDb,
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let repo = Pg{pascal_name}Repository::from_shard(&db);
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
+{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text}))
         {index_list_block}
     }}))
 }}"#
@@ -5412,7 +6953,7 @@ pub async fn index(
 #[get("/{plural}")]
 #[allow(clippy::too_many_arguments)]
 pub async fn index(
-    list_query: ListQuery,
+    {locale_param}list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     {sharded_index_db},
@@ -5421,9 +6962,9 @@ pub async fn index(
     let repo = Pg{pascal_name}Repository::from_shard(&db);
     let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
     let pager_query = raw_query.as_deref().unwrap_or("");
-{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
+{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text}))
         {index_list_block}
     }}))
 }}"#
@@ -5439,14 +6980,14 @@ pub async fn index(
 #[get("/{plural}")]
 #[allow(clippy::too_many_arguments)]
 pub async fn index(
-    page_req: PageRequest,
+    {locale_param}page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
+{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text}))
         {index_list_block}
     }}))
 }}"#
@@ -5462,17 +7003,17 @@ pub async fn index(
 #[get("/{plural}")]
 #[allow(clippy::too_many_arguments)]
 pub async fn index(
-    list_query: ListQuery,
+    {locale_param}list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
     {index_db_param}flash: Flash,{bulk_csrf_params}
 ) -> AutumnResult<Markup> {{
-    let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
+{default_sort_let}    let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
     let pager_query = raw_query.as_deref().unwrap_or("");
-{export_href_let}{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}")){export_link_furniture}{trash_link_furniture}
+{export_href_let}{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text})){export_link_furniture}{trash_link_furniture}
         {index_list_block}
     }}))
 }}"#
@@ -5711,6 +7252,14 @@ pub async fn index(
             names.push("restore".to_owned());
             names.push("purge".to_owned());
         }
+        // Issue #1358: `paths::move_up(id)`/`paths::move_down(id)` back the
+        // index's per-row reorder buttons. Gated with the handlers, so a
+        // scaffold without a `position` field keeps its `paths!` block
+        // byte-identical.
+        if reorder_enabled {
+            names.push("move_up".to_owned());
+            names.push("move_down".to_owned());
+        }
         if live {
             names.push("events".to_owned());
         }
@@ -5765,10 +7314,10 @@ pub async fn index(
     // replace the form's innards with checkboxes that have no `<form>` (and no
     // submit button) around them, silently breaking bulk delete after a search.
     let search_results_table = format!(
-        r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} found.").base_path("/{plural}/search")))"#
+        r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({search_empty}).base_path("/{plural}/search")))"#
     );
     let search_results_pager = format!(
-        r#"(pagination_nav(&page_data, &PagerOptions::new("/{plural}/search").query(pager_query)))"#
+        r#"(pagination_nav(&page_data, &PagerOptions::new("/{plural}/search").query(pager_query){pager_labels}))"#
     );
     let search_results_body = if bulk_delete_enabled {
         format!(
@@ -5834,7 +7383,7 @@ pub struct {pascal_name}SearchQuery {{
 #[secured]
 #[get("/{plural}/search")]
 pub async fn search(
-    autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
+    {locale_param}autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
     autumn_web::reexports::axum::extract::RawQuery(raw_query): autumn_web::reexports::axum::extract::RawQuery,
     list_query: ListQuery,
     page_req: PageRequest,
@@ -5862,9 +7411,9 @@ pub async fn search(
     if hx.is_htmx {{
         return Ok(results);
     }}
-    Ok({layout_fn}("Search {pascal_name}s", {cp_index}{flash_arg}, html! {{
-        h1 {{ "Search {pascal_name}s" }}
-        a href="/{plural}" {{ "Back to list" }}
+    Ok({layout_fn}({search_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {search_heading} }}
+        a href="/{plural}" {{ {back_to_list_markup} }}
         div id="{plural}-search-results" {{ (results) }}
     }}))
 }}"#
@@ -5900,7 +7449,7 @@ pub struct {pascal_name}SearchQuery {{
 
 #[get("/{plural}/search")]
 pub async fn search(
-    autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
+    {locale_param}autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
     autumn_web::reexports::axum::extract::RawQuery(raw_query): autumn_web::reexports::axum::extract::RawQuery,
     page_req: PageRequest,
     hx: autumn_web::htmx::HxRequest,
@@ -5922,9 +7471,9 @@ pub async fn search(
     if hx.is_htmx {{
         return Ok(results);
     }}
-    Ok({layout_fn}("Search {pascal_name}s", {cp_index}{flash_arg}, html! {{
-        h1 {{ "Search {pascal_name}s" }}
-        (autumn_web::a11y::Link::new("/{plural}", "Back to list"))
+    Ok({layout_fn}({search_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {search_heading} }}
+        (autumn_web::a11y::Link::new("/{plural}", {back_to_list}))
         div id="{plural}-search-results" {{ (results) }}
     }}))
 }}"#
@@ -5940,7 +7489,7 @@ pub async fn search(
 //! these are ordinary user code.
 {attachment_note}
 use autumn_web::extract::Path;
-use autumn_web::pagination::{{Page, PageRequest}};
+{i18n_imports}use autumn_web::pagination::{{Page, PageRequest}};
 {sort_imports}use autumn_web::reexports::axum::body::Bytes;
 use autumn_web::reexports::serde_json;
 use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
@@ -6078,20 +7627,20 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
 /// each state-machine transition handler's 422 re-render, so the detail-page
 /// markup has a single source of truth (issue #1326).
 async fn show_view(
-    {show_view_db_param},
+    {show_view_locale_param}{show_view_db_param},
     row: &{pascal_name},
     flash: Markup,
     csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,{show_view_state_param}
 ) -> AutumnResult<Markup> {{
-{show_label_loads}{show_view_attachment_url_binds}    let props: Vec<(&str, maud::Markup)> = vec![
+{show_label_loads}{show_view_attachment_url_binds}{show_prop_binds}    let props: Vec<(&str, maud::Markup)> = vec![
 {show_rows}    ];
-    Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}flash, html! {{
-        h1 {{ "{pascal_name} #" (row.id) }}
+    Ok({layout_fn}({show_view_title}, {cp_show}flash, html! {{
+        h1 {{ {show_view_heading} }}
         (autumn_web::widgets::property_list(&props))
-{show_transition_controls}        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
+{show_transition_controls}        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
         " "
-        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit")){show_parent_backlink}
+        (autumn_web::a11y::Link::new(paths::edit(row.id), {edit_link_text})){show_parent_backlink}
     }}))
 }}"#
             );
@@ -6099,7 +7648,7 @@ async fn show_view(
                 r#"/// `GET /{plural}/{{id}}` — show one {snake_name}.
 #[get("/{plural}/{{id}}")]
 pub async fn show(
-    id: Path<{id_rust}>,
+    {locale_param}id: Path<{id_rust}>,
     mut db: {db_ty},
     flash: Flash,
     csrf: Option<CsrfToken>,
@@ -6111,7 +7660,7 @@ pub async fn show(
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-{show_authz_call}    show_view(db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref(){show_view_state_arg_call}).await
+{show_authz_call}    show_view({show_view_locale_arg}db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref(){show_view_state_arg_call}).await
 }}"#
             );
             // Issue #1326 security fix (IDOR): a transition mutates an existing
@@ -6227,12 +7776,12 @@ pub async fn show(
                      )));\n                \
                      }};\n\
                      {transition_conflict_reauthz}                \
-                     flash.error(\"This {snake_name} was changed by someone else since this page was loaded. Reload and try again.\").await;\n                \
+                     flash.error({flash_stale}).await;\n                \
                      // Render the row as it NOW stands, not the snapshot this\n                \
                      // request loaded: the reader is deciding again, and the legal\n                \
                      // transitions may well be different from the ones they saw.\n                \
                      let view = show_view(\n                    \
-                     db,\n                    \
+                     {show_view_locale_arg_multiline}db,\n                    \
                      &current,\n                    \
                      flash_messages(&flash.consume().await),\n                    \
                      csrf.as_ref(),\n                    \
@@ -6246,6 +7795,29 @@ pub async fn show(
             let mut transition_handlers = String::new();
             for f in &sm_fields {
                 let field = &f.name;
+                // Per FIELD as well as per resource: "Post status updated" and
+                // "Post visibility updated" are different sentences, and a
+                // model can carry more than one state-machine column.
+                let flash_transitioned = labels.lit(
+                    &format!("{snake_name}.flash.{field}_updated"),
+                    &format!("{pascal_name} {field} updated"),
+                );
+                // Issue #1349: the REJECTION is user-facing too, and it is the
+                // one an ordinary reader is most likely to hit. `err` here is
+                // the model method's error, whose Display is built in
+                // autumn-macros as a hardcoded English "Cannot transition …" —
+                // a string this generator cannot route a `t!` through. So under
+                // `--i18n` the flash carries a translated message instead of
+                // the error's own text. One shared key: the sentence does not
+                // vary by field, and the specifics it drops (which edge was
+                // refused) are developer detail rather than something an author
+                // clicking a button can act on.
+                let flash_rejected = labels.expr(
+                    "common.transition.rejected",
+                    "That change is not allowed from the current state.",
+                    "err.to_string()",
+                    &[],
+                );
                 let handler = format!(
                     r#"/// `POST /{plural}/{{id}}/transitions/{field}` — apply a `{field}` state
 /// transition (issue #1326). A legal edge persists the new `{field}` value and
@@ -6254,7 +7826,7 @@ pub async fn show(
 #[secured]
 #[post("/{plural}/{{id}}/transitions/{field}")]
 pub async fn transition_{field}(
-    id: Path<{id_rust}>,
+    {locale_param}id: Path<{id_rust}>,
     mut db: {db_ty},
     flash: Flash,
     csrf: Option<CsrfToken>,
@@ -6277,13 +7849,13 @@ pub async fn transition_{field}(
                 .set({transition_set_open}{plural}::{field}.eq(new_state){transition_lock_bump}{transition_set_close})
                 .execute(&mut *db)
                 .await?;
-{transition_conflict_block}            flash.success("{pascal_name} {field} updated").await;
+{transition_conflict_block}            flash.success({flash_transitioned}).await;
             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())
         }}
         Err(err) => {{
-            flash.error(err.to_string()).await;
+            flash.error({flash_rejected}).await;
             let view = show_view(
-                db,
+                {show_view_locale_arg_multiline}db,
                 &row,
                 flash_messages(&flash.consume().await),
                 csrf.as_ref(),
@@ -6307,21 +7879,21 @@ pub async fn transition_{field}(
 
 /// `GET /{plural}/{{{id_url_segment}}}` — show one {snake_name}.
 #[get("/{plural}/{{{id_url_segment}}}")]
-pub async fn show({id_param_decl}, mut db: {db_ty}, flash: Flash{show_state_param}) -> AutumnResult<Markup> {{
+pub async fn show({locale_param_inline}{id_param_decl}, mut db: {db_ty}, flash: Flash{show_state_param}) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
         .{find_expr}
         .select({pascal_name}::as_select())
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-{show_authz_call}{show_label_loads}{show_attachment_url_binds}    let props: Vec<(&str, maud::Markup)> = vec![
+{show_authz_call}{show_label_loads}{show_attachment_url_binds}{show_prop_binds}    let props: Vec<(&str, maud::Markup)> = vec![
 {show_rows}    ];
-    Ok({layout_fn}(&format!("{pascal_name} #{{}}", {route_key_display_expr}), {cp_show}{flash_arg}, html! {{
-        h1 {{ "{pascal_name} #" ({route_key_display_expr}) }}
+    Ok({layout_fn}({show_title}, {cp_show}{flash_arg}, html! {{
+        h1 {{ {show_heading} }}
         (autumn_web::widgets::property_list(&props))
-        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
+        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
         " "
-        (autumn_web::a11y::Link::new(paths::edit({route_key_display_expr}), "Edit")){show_parent_backlink}
+        (autumn_web::a11y::Link::new(paths::edit({route_key_display_expr}), {edit_link_text})){show_parent_backlink}
     }}))
 }}
 "#
@@ -6353,12 +7925,12 @@ fn submit_token_input(submit_token: Option<&SubmitToken>, field: Option<&SubmitF
     }}
 }}
 {bulk_ids_parser}{attachment_read_back_helpers}{private_layout}
-{index_handler}{bulk_delete_fn}{export_csv_fn}{trash_section}{show_section}
+{index_handler}{bulk_delete_fn}{export_csv_fn}{trash_section}{reorder_section}{show_section}
 /// `GET /{plural}/new` — render the new-{snake_name} form.
 #[secured]
 #[get("/{plural}/new", name = "new")]
 pub async fn new_form(
-    {new_form_db_param}flash: Flash,
+    {locale_param}{new_form_db_param}flash: Flash,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
     submit_token: Option<SubmitToken>,
@@ -6376,7 +7948,7 @@ pub async fn new_form(
 #[secured]
 #[get("/{plural}/{{{id_url_segment}}}/edit", name = "edit")]
 pub async fn edit_form(
-    {id_param_decl},
+    {locale_param}{id_param_decl},
     mut db: {db_ty},
     flash: Flash,
     csrf: Option<CsrfToken>,
@@ -6403,7 +7975,7 @@ pub async fn edit_form(
 #[secured]
 #[post("/{plural}/{{{id_url_segment}}}/delete", name = "delete")]
 pub async fn destroy(
-    {id_param_decl},
+    {locale_param}{id_param_decl},
     {destroy_signature_arg},
     flash: Flash,
 ) -> AutumnResult<autumn_web::Redirect> {{
@@ -6413,7 +7985,7 @@ pub async fn destroy(
             "{pascal_name} with id {{}} not found", {id_value_expr}
         )));
     }}
-    flash.success("{destroy_flash}").await;
+    flash.success({flash_destroyed}).await;
     Ok(autumn_web::Redirect::to(&paths::index()))
 }}
 
@@ -6564,11 +8136,17 @@ fn render_nested_section(
     }
     let columns = render_columns_vec(
         pascal_name,
+        snake_name,
         &list_fields,
         reference_displays,
         true,
         route_key_field,
         false,
+        // Issue #1349: `--belongs-to` is refused alongside `--i18n` upstream —
+        // this section splices markup into the PARENT's already-generated `show`
+        // handler, whose signature carries no `Locale` extractor — so the nested
+        // child list always renders the plain English labels.
+        &scaffold_i18n::ViewLabels::disabled(),
     );
 
     // Select options for the inline form's OTHER `references` columns. The
@@ -6927,11 +8505,15 @@ fn wrap_form_bodies(
     edit_form_layout: String,
     option_loads: &str,
     edit_attachment_url_binds: &str,
+    // Issue #1349: bindings only the NEW form needs — the localized resource
+    // display name its "New {Model}" title and heading interpolate. Empty
+    // without `--i18n`, so the wrapping below stays byte-identical.
+    new_form_binds: &str,
 ) -> (String, String) {
-    let new_body = if option_loads.is_empty() {
+    let new_body = if option_loads.is_empty() && new_form_binds.is_empty() {
         new_form_layout
     } else {
-        format!("{{\n{option_loads}        {new_form_layout}\n    }}")
+        format!("{{\n{new_form_binds}{option_loads}        {new_form_layout}\n    }}")
     };
     let edit_body = if option_loads.is_empty() && edit_attachment_url_binds.is_empty() {
         edit_form_layout
@@ -7021,6 +8603,10 @@ fn render_form_for_helper(
     pascal_name: &str,
     snake_name: &str,
     fields: &[Field],
+    // Issue #1349: relabels every control through `{snake}.field.{name}` when
+    // `--i18n` is on, and is an identity function over the derived English
+    // labels when it is off.
+    labels: &scaffold_i18n::ViewLabels,
     missing_reference_targets: &BTreeSet<String>,
     // The Rust type of the model's `lock_version` counter (issue #1318), or
     // `None` when the model declares no optimistic-locking column.
@@ -7064,15 +8650,23 @@ fn render_form_for_helper(
                 );
             }
             FieldKind::Enum => {
-                let placeholder = if f.nullable {
-                    "— Unset —"
+                let (placeholder_key, placeholder) = if f.nullable {
+                    ("common.select.unset", "— Unset —")
                 } else {
-                    "— Select —"
+                    ("common.select.prompt", "— Select —")
                 };
-                let mut options = format!("(\"\".into(), \"{placeholder}\".into())");
+                // `.into()` on a `&str` literal and on the `String` a `t!` call
+                // returns both land on `String`, so the emitted `vec!` element
+                // is well-typed either way.
+                let mut options = format!(
+                    "(\"\".into(), {}.into())",
+                    labels.lit(placeholder_key, placeholder)
+                );
                 for v in &f.variants {
                     let vlabel = humanize_label(v);
-                    let _ = write!(options, ", (\"{v}\".into(), \"{vlabel}\".into())");
+                    let vexpr =
+                        labels.lit(&format!("{snake_name}.field.{name}.option.{v}"), &vlabel);
+                    let _ = write!(options, ", (\"{v}\".into(), {vexpr}.into())");
                 }
                 let _ = write!(
                     builder_calls,
@@ -7094,7 +8688,10 @@ fn render_form_for_helper(
                 // `[security.submit_token].field_name` (issue #1843), not just
                 // the default — the helper already has the `SubmitFormField`
                 // extractor in scope for `submit_token_input`.
-                let label = humanize_label(name);
+                // `rich_text_area_*` takes `&str` (unlike the `a11y` builders'
+                // `impl Into<String>`), so this label site borrows.
+                let label =
+                    labels.lit_ref(&format!("{snake_name}.field.{name}"), &humanize_label(name));
                 // A non-nullable column takes the `required_*` variant, exactly
                 // like every other generated control — `String` and `TEXT NOT
                 // NULL` both accept `""`, so without it an empty editor would
@@ -7108,7 +8705,7 @@ fn render_form_for_helper(
                 let _ = write!(
                     appends,
                     "\n        .append(autumn_web::form::{helper}(\
-                     changeset, \"{name}\", \"{label}\", &paths::preview_{name}(), \
+                     changeset, \"{name}\", {label}, &paths::preview_{name}(), \
                      submit_field.map_or(\"_submit_token\", |f| f.0.as_str())))"
                 );
             }
@@ -7130,7 +8727,8 @@ fn render_form_for_helper(
             // `.append()` escape hatch the other schema-specific overrides
             // use, minus the `required_builders` those emit.
             FieldKind::Slug => {
-                let label = humanize_label(name);
+                let label =
+                    labels.lit(&format!("{snake_name}.field.{name}"), &humanize_label(name));
                 let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
                 let _ = write!(
                     appends,
@@ -7138,7 +8736,7 @@ fn render_form_for_helper(
                      @let errors = changeset.errors_for(\"{name}\");\n            \
                      div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
                      (autumn_web::a11y::TextField::new(\"{name}\")\n                    \
-                     .label(\"{label}\")\n                    \
+                     .label({label})\n                    \
                      .label_class(\"autumn-field__label\")\n                    \
                      .input_type(\"text\")\n                    \
                      .value(changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
@@ -7166,20 +8764,58 @@ fn render_form_for_helper(
                 if missing_reference_targets.contains(name) {
                     continue;
                 }
-                let placeholder = if f.nullable {
-                    "— Unset —"
+                let (placeholder_key, placeholder) = if f.nullable {
+                    ("common.select.unset", "— Unset —")
                 } else {
-                    "— Select —"
+                    ("common.select.prompt", "— Select —")
                 };
+                let placeholder_expr = labels.expr(
+                    placeholder_key,
+                    placeholder,
+                    &format!("\"{placeholder}\".to_string()"),
+                    &[],
+                );
                 let _ = write!(extra_params, ",\n    {name}_options: &[(String, String)]");
                 let _ = write!(
                     preludes,
-                    "    let mut {name}_select = vec![(String::new(), \"{placeholder}\".to_string())];\n    \
+                    "    let mut {name}_select = vec![(String::new(), {placeholder_expr})];\n    \
                      {name}_select.extend({name}_options.iter().cloned());\n"
                 );
                 let _ = write!(
                     builder_calls,
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: {name}_select }})"
+                );
+            }
+            // A nullable `bool` renders as a tri-state `<select>` so `NULL`
+            // stays reachable, and the derive fills it with hardcoded
+            // `— Unset —` / `Yes` / `No` (`autumn-macros/src/model.rs`'s
+            // `form_control_tokens`). Those are user-facing strings this flag
+            // is supposed to have claimed: without the override they survive
+            // untranslated in every create and edit form, next to a field
+            // label that IS translated. The same `override_field` escape hatch
+            // the enum arm uses replaces them, keeping the derive's `""` /
+            // `"true"` / `"false"` values so form parsing is unaffected.
+            //
+            // Only under `--i18n`: with the flag off the derived control is
+            // already right, and emitting an override would change output the
+            // rest of this module keeps byte-identical.
+            FieldKind::Bool if f.nullable && labels.enabled() => {
+                let mut options = format!(
+                    "(\"\".into(), {}.into())",
+                    labels.lit("common.select.unset", "— Unset —")
+                );
+                for (value, key, english) in
+                    [("true", "common.yes", "Yes"), ("false", "common.no", "No")]
+                {
+                    let _ = write!(
+                        options,
+                        ", (\"{value}\".into(), {}.into())",
+                        labels.lit(key, english)
+                    );
+                }
+                let _ = write!(
+                    builder_calls,
+                    "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: vec![{options}] }})"
                 );
             }
             // A `String`/`Text`/numeric field carrying DSL constraint
@@ -7193,7 +8829,8 @@ fn render_form_for_helper(
             // inline-error/ARIA skeleton matches the derived controls.
             _ => {
                 if let Some((input_type, _)) = html5_constraint_spec(f) {
-                    let label = humanize_label(name);
+                    let label =
+                        labels.lit(&format!("{snake_name}.field.{name}"), &humanize_label(name));
                     let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
                     if matches!(f.kind, FieldKind::Text) && input_type == "text" {
                         // A `text` DSL column with a length/plain constraint is a
@@ -7232,7 +8869,7 @@ fn render_form_for_helper(
                              @let errors = changeset.errors_for(\"{name}\");\n            \
                              div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
                              (autumn_web::a11y::TextArea::new(\"{name}\")\n                    \
-                             .label(\"{label}\")\n                    \
+                             .label({label})\n                    \
                              .label_class(\"autumn-field__label\")\n                    \
                              .value(changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
                              {constraint_builders}{required_builders}\n                    \
@@ -7269,7 +8906,7 @@ fn render_form_for_helper(
                              @let errors = changeset.errors_for(\"{name}\");\n            \
                              div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
                              (autumn_web::a11y::TextField::new(\"{name}\")\n                    \
-                             .label(\"{label}\")\n                    \
+                             .label({label})\n                    \
                              .label_class(\"autumn-field__label\")\n                    \
                              .input_type(\"{input_type}\")\n                    \
                              .value(changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
@@ -7349,6 +8986,29 @@ fn render_form_for_helper(
         let _ = write!(extra_params, ",\n    exclude_parent_fk: bool");
         format!("    if exclude_parent_fk {{\n        form = form.exclude(\"{name}\");\n    }}\n")
     });
+    // Issue #1349: the helper renders every labeled control, so with `--i18n` it
+    // takes the request's locale. By value for the same reason `show_view` does:
+    // `t!` expands to `Locale::t(&locale, …)`, which a `&Locale` binding would
+    // turn into a `&&Locale`.
+    let form_for_locale_param = if labels.enabled() {
+        "locale: Locale,\n    "
+    } else {
+        ""
+    };
+    // Relabel every control the `FormModel` derive renders. The derive humanizes
+    // the column name into Title Case; `.override_label` swaps in the `t!`
+    // lookup for the SAME key the index header and show row use, so one
+    // translation serves all three surfaces.
+    if labels.enabled() {
+        for f in fields {
+            let name = &f.name;
+            let _ = write!(
+                builder_calls,
+                "\n        .override_label(\"{name}\", {})",
+                labels.lit(&format!("{snake_name}.field.{name}"), &humanize_label(name))
+            );
+        }
+    }
     format!(
         "/// Render the create/edit form in a single `form_for` call (issue #1135).\n\
          ///\n\
@@ -7359,7 +9019,7 @@ fn render_form_for_helper(
          /// them.\n\
          #[allow(clippy::too_many_arguments)]\n\
          fn {snake_name}_form_for(\n    \
-         changeset: &Changeset<{pascal_name}Form>,\n    \
+         {form_for_locale_param}changeset: &Changeset<{pascal_name}Form>,\n    \
          action: String,\n    \
          submit_label: &str,\n    \
          csrf: Option<&CsrfToken>,\n    \
@@ -8401,8 +10061,15 @@ const fn field_is_sortable(field: &Field) -> bool {
 /// (the sort key is the column's snake name) so the `data_table` renders header
 /// links that the generated `list()` method applies against the model's column
 /// allowlist (#1126). The trailing "Show" action column is never sortable.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one column-vec renderer serving the index, the search fragment, the \
+              trash table, and the nested child list — splitting it would fork the \
+              header/cell emission the four surfaces must agree on"
+)]
 fn render_columns_vec(
     pascal_name: &str,
+    snake_name: &str,
     fields: &[Field],
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
     use_label_maps: bool,
@@ -8414,22 +10081,53 @@ fn render_columns_vec(
     // reloads the identical list and stamps an `aria-sort` that never changes —
     // an accessibility lie, not just a dead control.
     sortable: bool,
+    // Issue #1349: with `--i18n`, each header becomes a `let`-bound `t!` lookup
+    // rather than an inline literal — `Column::new` borrows its header for the
+    // column's lifetime, so a `&t!(…)` temporary inside the `vec![…]` would be
+    // dropped before the table renders.
+    labels: &scaffold_i18n::ViewLabels,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 150 + 300);
+    // Header bindings first: `Column::new` takes `&'a str`, so a translated
+    // header has to outlive the `vec![…]` it is built into.
+    if labels.enabled() {
+        let _ = writeln!(
+            out,
+            "    let l_col_id = {};",
+            labels.lit("common.field.id", "Id")
+        );
+        for f in fields {
+            let name = &f.name;
+            let _ = writeln!(
+                out,
+                "    let l_col_{name} = {};",
+                labels.lit(&format!("{snake_name}.field.{name}"), &title_case(name))
+            );
+        }
+    }
     let _ = writeln!(
         out,
         "    let columns: Vec<autumn_web::widgets::Column<{pascal_name}>> = vec!["
     );
     // ID column — always sortable (the default order is `id DESC`).
     let id_sortable = if sortable { ".sortable(\"id\")" } else { "" };
+    let id_header = if labels.enabled() {
+        "&l_col_id".to_owned()
+    } else {
+        format!("\"{}\"", title_case("id"))
+    };
     let _ = writeln!(
         out,
-        "        autumn_web::widgets::Column::new(\"Id\", |row: &{pascal_name}| maud::html! {{ (row.id) }}){id_sortable},"
+        "        autumn_web::widgets::Column::new({id_header}, |row: &{pascal_name}| maud::html! {{ (row.id) }}){id_sortable},"
     );
     // One column per field
     for f in fields {
-        let header = title_case(&f.name);
+        let header = if labels.enabled() {
+            format!("&l_col_{}", f.name)
+        } else {
+            format!("\"{}\"", title_case(&f.name))
+        };
         let sortable_suffix = if sortable && field_is_sortable(f) {
             format!(".sortable(\"{}\")", f.name)
         } else {
@@ -8473,7 +10171,7 @@ fn render_columns_vec(
         };
         let _ = writeln!(
             out,
-            "        autumn_web::widgets::Column::new(\"{header}\", |{binding}: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
+            "        autumn_web::widgets::Column::new({header}, |{binding}: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
         );
     }
     // Show link column. Keyed off the slug (issue #1260) when the model has
@@ -8483,7 +10181,8 @@ fn render_columns_vec(
         route_key_field.map_or_else(|| "row.id".to_owned(), |field| format!("&row.{field}"));
     let _ = writeln!(
         out,
-        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ (autumn_web::a11y::Link::new(paths::show({show_link_arg}), \"Show\")) }}),"
+        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ (autumn_web::a11y::Link::new(paths::show({show_link_arg}), {})) }}),",
+        labels.lit("common.show", "Show")
     );
     let _ = writeln!(out, "    ];");
     out
@@ -8499,11 +10198,29 @@ fn render_columns_vec(
 fn render_show_property_rows(
     fields: &[Field],
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
+    // Issue #1349: `property_list` takes `&[(&str, Markup)]`, so a translated
+    // label is a `let` binding (see [`render_show_property_label_binds`]) rather
+    // than an inline `t!` call whose `String` would be dropped with the `vec![…]`
+    // temporary.
+    labels: &scaffold_i18n::ViewLabels,
 ) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 100 + 150);
-    out.push_str("        (\"Id\", maud::html! { (row.id) }),\n");
+    let id_label = if labels.enabled() {
+        "&l_prop_id".to_owned()
+    } else {
+        "\"Id\"".to_owned()
+    };
+    let _ = writeln!(out, "        ({id_label}, maud::html! {{ (row.id) }}),");
     for f in fields {
-        let label = humanize(&f.name);
+        // One key per field, shared with the index header and the form control.
+        // The English is the derive's Title Case rather than this view's older
+        // sentence case, so all three surfaces read alike once translated.
+        let label = if labels.enabled() {
+            format!("&l_prop_{}", f.name)
+        } else {
+            format!("\"{}\"", humanize(&f.name))
+        };
         let cell_expr = if f.kind.is_reference() && reference_displays.contains_key(&f.name) {
             format!("{}_label", f.name)
         } else if f.kind.is_attachment() {
@@ -8512,7 +10229,13 @@ fn render_show_property_rows(
             // resolved into `{name}_url` — instead of the index's cheap
             // presence marker. See `attachment_link` in the generated routes.
             let name = &f.name;
-            format!("attachment_link(row.{name}.as_ref(), {name}_url.as_deref(), \"{name}\")")
+            // The locale argument matches `attachment_link`'s `--i18n` signature
+            // (see `render_routes_file`): the meta span it renders is bundle
+            // text, and this handler holds the extractor.
+            let locale_arg = if labels.enabled() { "&locale, " } else { "" };
+            format!(
+                "attachment_link({locale_arg}row.{name}.as_ref(), {name}_url.as_deref(), \"{name}\")"
+            )
         } else if f.kind.is_rich_text() {
             // Issue #1255: the column stores user-submitted Markdown SOURCE, so
             // the show page renders it through `render_user_content` — raw-HTML
@@ -8530,13 +10253,60 @@ fn render_show_property_rows(
         } else {
             cell_value_expr(f)
         };
-        out.push_str("        (\"");
+        out.push_str("        (");
         out.push_str(&label);
-        out.push_str("\", maud::html! { (");
+        out.push_str(", maud::html! { (");
         out.push_str(&cell_expr);
         out.push_str(") }),\n");
     }
-    out.push_str("        (\"Created at\", maud::html! { (row.created_at.to_string()) }),\n");
+    let created_label = if labels.enabled() {
+        "&l_prop_created_at".to_owned()
+    } else {
+        "\"Created at\"".to_owned()
+    };
+    let _ = writeln!(
+        out,
+        "        ({created_label}, maud::html! {{ (row.created_at.to_string()) }}),"
+    );
+    out
+}
+
+/// The `let l_prop_* = t!(…);` bindings the `show` view evaluates before
+/// building its `props` vec (issue #1349).
+///
+/// Separate from [`render_show_property_rows`] because `property_list` borrows
+/// each label for the life of the slice: a `t!` call spliced straight into the
+/// `vec![…]` would produce a `String` temporary dropped at the end of that
+/// statement. Empty without `--i18n`, where the labels are `&'static str`
+/// literals with nothing to bind.
+fn render_show_property_label_binds(
+    fields: &[Field],
+    snake_name: &str,
+    labels: &scaffold_i18n::ViewLabels,
+) -> String {
+    use std::fmt::Write as _;
+    if !labels.enabled() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(fields.len() * 60 + 120);
+    let _ = writeln!(
+        out,
+        "    let l_prop_id = {};",
+        labels.lit("common.field.id", "Id")
+    );
+    for f in fields {
+        let name = &f.name;
+        let _ = writeln!(
+            out,
+            "    let l_prop_{name} = {};",
+            labels.lit(&format!("{snake_name}.field.{name}"), &title_case(name))
+        );
+    }
+    let _ = writeln!(
+        out,
+        "    let l_prop_created_at = {};",
+        labels.lit("common.field.created_at", &title_case("created_at"))
+    );
     out
 }
 
@@ -10823,7 +12593,16 @@ fn sql_sample_literal(kind: FieldKind) -> String {
         // a slug field's own `UNIQUE INDEX` would reject a second `'sample'`
         // row alongside whatever `enum_rejection_insert_sql` inserts.
         FieldKind::Slug => "'sample-slug'".to_owned(),
-        FieldKind::I32 | FieldKind::I64 | FieldKind::References => "1".to_owned(),
+        // `position` (issue #1358) is a plain `BIGINT NOT NULL` column like
+        // any other `i64`-shaped field — "1" satisfies it fine for a smoke
+        // test that isn't exercising the ordering invariant itself.
+        // `commentable` (issue #1367) is likewise a plain `BIGINT NOT NULL`
+        // counter column at the storage level.
+        FieldKind::I32
+        | FieldKind::I64
+        | FieldKind::References
+        | FieldKind::Position
+        | FieldKind::Commentable => "1".to_owned(),
         FieldKind::Bool => "TRUE".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "1.0".to_owned(),
         // Scale-derived rather than a fixed "1.0": a tightly-scaled column
@@ -11089,7 +12868,12 @@ fn unique_sample_literal(kind: FieldKind) -> String {
         | FieldKind::RichText
         | FieldKind::Enum
         | FieldKind::Slug => "'dup_value'".to_owned(),
-        FieldKind::I32 | FieldKind::I64 => "424242".to_owned(),
+        // `position`/`commentable` can never be `:unique` (both rejected in
+        // `parse_field`), so these arms are unreachable in practice — listed
+        // for exhaustiveness with the same literal as `I32`/`I64`.
+        FieldKind::I32 | FieldKind::I64 | FieldKind::Position | FieldKind::Commentable => {
+            "424242".to_owned()
+        }
         // Must be a real seeded row's id, not an arbitrary literal — a
         // `references` target column is FK-constrained against the stub
         // table `render_reference_stub_tables_sql` seeds exactly one row
@@ -11127,7 +12911,12 @@ fn unique_sample_literal_variant(kind: FieldKind) -> String {
         | FieldKind::RichText
         | FieldKind::Enum
         | FieldKind::Slug => "'dup_value_2'".to_owned(),
-        FieldKind::I32 | FieldKind::I64 => "424243".to_owned(),
+        // `position` can never be `:unique` (rejected in `parse_field`), so
+        // this arm is unreachable in practice — listed for exhaustiveness
+        // with the same literal as `I32`/`I64`.
+        FieldKind::I32 | FieldKind::I64 | FieldKind::Position | FieldKind::Commentable => {
+            "424243".to_owned()
+        }
         // The second stub row `render_reference_stub_tables_sql` seeds —
         // distinct from `unique_sample_literal`'s "1" for the same reason
         // that one must be a real seeded row's id, not an arbitrary literal.
@@ -11367,6 +13156,9 @@ fn main_route_entries(
     // Issue #1332: `true` under `--soft-delete` on the standard HTML path,
     // mounting the trash view and its restore/purge controls.
     trash: bool,
+    // Issue #1358: `true` when the model has a `position` field on the
+    // standard HTML path, mounting the two `move_up`/`move_down` controls.
+    reorder: bool,
     validated_field_names: &[String],
     sm_field_names: &[String],
     rich_text_field_names: &[String],
@@ -11418,6 +13210,12 @@ fn main_route_entries(
             entries.push(format!("routes::{plural}::trash"));
             entries.push(format!("routes::{plural}::restore"));
             entries.push(format!("routes::{plural}::purge"));
+        }
+        // Issue #1358: mount the reorder controls next to `destroy`, same
+        // reasoning as `bulk_delete`/`trash` above.
+        if reorder {
+            entries.push(format!("routes::{plural}::move_up"));
+            entries.push(format!("routes::{plural}::move_down"));
         }
         if live {
             entries.push(format!("routes::{plural}::events"));
@@ -11716,6 +13514,41 @@ async fn main() {
         .await;
 }
 "#
+    }
+
+    /// Issue #1384: `generate scaffold` refuses a `{translatable}` column
+    /// rather than emit a CRUD form whose single text input would replace the
+    /// whole per-locale container on first save.
+    #[test]
+    fn plan_rejects_a_translatable_field_and_points_at_generate_model() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String{translatable}".into(), "body:Text".into()],
+            "20260427000000",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("translatable"), "{err}");
+        assert!(err.contains("generate model"), "{err}");
+        assert!(err.contains("title"), "{err}");
+    }
+
+    /// The refusal is narrow: a scaffold with no translatable column is
+    /// unaffected (issue #1384 AC7).
+    #[test]
+    fn plan_still_accepts_a_scaffold_without_translatable_fields() {
+        let tmp = project_with_main(default_main());
+        assert!(
+            plan_scaffold(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), "body:Text".into()],
+                "20260427000000",
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -14314,6 +16147,10 @@ async fn main() {
             !routes.contains("autumn_web::form::select_input(&changeset"),
             "{routes}"
         );
+        // …with the flag off. Under `--i18n` the derive's hardcoded
+        // `— Unset —`/`Yes`/`No` are user-facing English that has to be
+        // claimed, so an override IS emitted — see
+        // `a_nullable_bool_translates_its_own_options`.
         assert!(
             !routes.contains(".override_field(\"archived\""),
             "nullable bool fields need no form_for override: {routes}"
@@ -14948,6 +16785,7 @@ async fn main() {
             false,
             false,
             None,
+            None,
         );
         assert!(
             rendered.contains("shard-aware"),
@@ -14971,6 +16809,7 @@ async fn main() {
             false,
             false,
             None,
+            None,
         );
         assert!(
             rendered.contains("control pool"),
@@ -14980,8 +16819,18 @@ async fn main() {
 
     #[test]
     fn repository_no_sharded_note_when_not_sharded() {
-        let rendered =
-            render_repository_file("Post", "post", &[], false, false, false, false, false, None);
+        let rendered = render_repository_file(
+            "Post",
+            "post",
+            &[],
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+        );
         assert!(
             !rendered.contains("shard-aware"),
             "non-sharded repository must not mention shard-aware: {rendered}"
@@ -21720,6 +23569,1074 @@ exempt_paths = [
                 "Column::new(\"Username\", |row: &Account| maud::html! { (&row.username) })"
             ),
             "routes:\n{routes}"
+        );
+    }
+    // ── Issue #1349: `--i18n` translatable scaffold views ────────────────
+
+    /// Every `t!(locale, "key")` key referenced by `src`, in source order.
+    fn t_macro_keys(src: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut rest = src;
+        while let Some(pos) = rest.find("t!(locale, \"") {
+            let after = &rest[pos + "t!(locale, \"".len()..];
+            let Some(end) = after.find('"') else { break };
+            keys.push(after[..end].to_owned());
+            rest = &after[end..];
+        }
+        keys
+    }
+
+    /// Every top-level key defined in an `.ftl` source.
+    fn ftl_keys(src: &str) -> BTreeSet<String> {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .filter(|l| !l.starts_with(' ') && !l.starts_with('\t'))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, _)| k.trim().to_owned())
+            .collect()
+    }
+
+    fn i18n_options() -> ScaffoldOptions {
+        ScaffoldOptions {
+            i18n: true,
+            ..Default::default()
+        }
+    }
+
+    /// A five-field resource — the shape the issue's success metric measures.
+    fn i18n_fields() -> Vec<String> {
+        vec![
+            "title:String".into(),
+            "body:Text".into(),
+            "published:bool".into(),
+            "views:i64".into(),
+            "author_name:String".into(),
+        ]
+    }
+
+    /// The `html! { … }` view bodies of a generated routes file — every span
+    /// between a `html! {` and the handler's closing `}))`. Used to assert that
+    /// no user-facing English literal survives in the markup itself (AC7).
+    fn view_bodies(routes: &str) -> String {
+        let mut out = String::new();
+        let mut rest = routes;
+        while let Some(pos) = rest.find("html! {") {
+            let after = &rest[pos..];
+            let end = after.find("\n}").unwrap_or(after.len());
+            out.push_str(&after[..end]);
+            out.push('\n');
+            rest = &after[end..];
+        }
+        out
+    }
+
+    /// AC6: without `--i18n`, scaffold output is byte-for-byte unchanged.
+    ///
+    /// What this proves on its own is narrow — both sides run the post-#1349
+    /// generator, so it pins `ScaffoldOptions::default().i18n == false` and the
+    /// absence of any i18n artifact, not equality with the pre-#1349 output.
+    /// The real guard against drift is threefold and lives elsewhere: the
+    /// several hundred existing tests in this module assert the plain path's
+    /// exact strings (`Column::new("Id"`, `("Created at", maud::html!`,
+    /// `confirm('Delete this Post?')`, …) and would fail on any change;
+    /// `integration::scaffold_i18n::views_look_up_every_user_facing_string_through_the_t_macro`
+    /// re-generates without the flag and asserts each of those literals is
+    /// still there; and structurally,
+    /// [`ViewLabels`](super::super::scaffold_i18n::ViewLabels) returns the
+    /// caller's own expression verbatim when the flag is off, so there is no
+    /// second code path that could drift in the first place.
+    /// A nullable `bool` renders a tri-state select whose three options the
+    /// DERIVE fills with hardcoded English (`autumn-macros/src/model.rs`'s
+    /// `form_control_tokens`). Translating the field label and leaving
+    /// `— Unset —`/`Yes`/`No` beside it is exactly the half-done state this
+    /// flag exists to remove, so the scaffold overrides the control.
+    #[test]
+    fn a_nullable_bool_translates_its_own_options() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "archived:Option<bool>".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(".override_field(\"archived\", autumn_web::form::FieldControl::Select"),
+            "the derived control's English options must be replaced:\n{routes}"
+        );
+        for key in ["common.select.unset", "common.yes", "common.no"] {
+            assert!(
+                routes.contains(&format!("t!(locale, \"{key}\")")),
+                "{key} must be looked up:\n{routes}"
+            );
+        }
+        // The derive's own submitted values are kept, so form parsing is
+        // untouched: only the labels beside them change.
+        for value in ["(\"\".into()", "(\"true\".into()", "(\"false\".into()"] {
+            assert!(routes.contains(value), "{value} missing:\n{routes}");
+        }
+        // And no English leaks alongside.
+        assert!(
+            !routes.contains("\"— Unset —\".into()") && !routes.contains("\"Yes\".into()"),
+            "{routes}"
+        );
+
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert!(ftl.contains("common.yes = Yes"), "{ftl}");
+        assert!(ftl.contains("common.no = No"), "{ftl}");
+    }
+
+    #[test]
+    fn i18n_omitted_is_byte_identical_to_default() {
+        let fields = i18n_fields();
+
+        let tmp_default = project_with_main(default_main());
+        plan_scaffold(tmp_default.path(), "Post", &fields, "20260427000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let tmp_explicit = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp_explicit.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions {
+                i18n: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        for rel in [
+            "src/routes/posts.rs",
+            "src/models/post.rs",
+            "src/repositories/post.rs",
+            "migrations/20260427000000_create_posts/up.sql",
+            "src/main.rs",
+            "Cargo.toml",
+        ] {
+            let a = fs::read_to_string(tmp_default.path().join(rel)).unwrap();
+            let b = fs::read_to_string(tmp_explicit.path().join(rel)).unwrap();
+            assert_eq!(a, b, "`i18n: false` must not change `{rel}`");
+            assert!(
+                !b.contains("t!(locale"),
+                "non-i18n `{rel}` must carry no `t!` lookups:\n{b}"
+            );
+        }
+        assert!(
+            !tmp_default.path().join("i18n/en.ftl").exists(),
+            "a non-i18n scaffold must not create an `.ftl` stub"
+        );
+    }
+
+    /// AC2: page titles, buttons, links, and per-field labels are `t!` lookups.
+    #[test]
+    fn i18n_scaffold_emits_t_macro_lookups_for_every_view_string() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        let keys: BTreeSet<String> = t_macro_keys(&routes).into_iter().collect();
+        for expected in [
+            "common.create",
+            "common.save",
+            "common.back",
+            "common.edit",
+            "common.delete",
+            "common.show",
+            "post.new",
+            "post.name.plural",
+            "post.field.title",
+            "post.field.author_name",
+            "post.flash.created",
+        ] {
+            assert!(
+                keys.contains(expected),
+                "missing `t!` key `{expected}`; got {keys:?}"
+            );
+        }
+    }
+
+    /// AC7: no hardcoded English label literal survives in the view body.
+    #[test]
+    fn i18n_view_bodies_carry_no_hardcoded_label_literals() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let bodies = view_bodies(&routes);
+
+        for literal in [
+            "\"New Post\"",
+            "\"Create\"",
+            "\"Save\"",
+            "\"Delete\"",
+            "\"Back to list\"",
+            "\"Edit\"",
+            "\"Show\"",
+            "\"Post index\"",
+            "\"Posts\"",
+            "\"Title\"",
+            "\"Author Name\"",
+            "\"Author name\"",
+        ] {
+            assert!(
+                !bodies.contains(literal),
+                "view body still carries the hardcoded literal {literal}:\n{bodies}"
+            );
+        }
+        // The whole file, not just the markup: labels reach the widgets through
+        // `let` bindings and `override_label` calls outside `html! { … }` too.
+        assert!(
+            !routes.contains("Column::new(\"Title\""),
+            "index column headers must be translated:\n{routes}"
+        );
+        assert!(
+            !routes.contains("(\"Created at\", maud::html!"),
+            "show property labels must be translated:\n{routes}"
+        );
+    }
+
+    /// The Markdown editor's own chrome lives in autumn-web, behind no
+    /// parameter this generator can route a `t!` through, so an `--i18n`
+    /// scaffold with a `richtext` column translates everything EXCEPT that
+    /// widget. Silence would be the bug — the flag promises the whole view.
+    #[test]
+    fn i18n_says_so_when_the_rich_text_editor_keeps_english_chrome() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:richtext".into()],
+            "20260501000000",
+            &i18n_options(),
+        )
+        .unwrap();
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("Markdown editor"))
+            .unwrap_or_else(|| panic!("no rich-text warning in {:?}", plan.warnings));
+        assert!(
+            warning.contains("`body`"),
+            "must name the column: {warning}"
+        );
+
+        // A scaffold without one says nothing.
+        let tmp2 = project_with_main(default_main());
+        let without_rich_text = plan_scaffold_with_options(
+            tmp2.path(),
+            "Post",
+            &["title:String".into()],
+            "20260501000000",
+            &i18n_options(),
+        )
+        .unwrap();
+        assert!(
+            !without_rich_text
+                .warnings
+                .iter()
+                .any(|w| w.contains("Markdown editor")),
+            "{:?}",
+            without_rich_text.warnings
+        );
+        assert!(
+            !without_rich_text
+                .warnings
+                .iter()
+                .any(|w| w.contains("state-transition controls")),
+            "{:?}",
+            without_rich_text.warnings
+        );
+    }
+
+    /// A translated field label with an English error under it is the same
+    /// half-done state the widget gaps are, and it is reached the same way:
+    /// `validator` takes `message` as a compile-time literal, so no runtime
+    /// lookup can go there, and the code-to-message mapping lives inside
+    /// autumn-web's changeset conversion.
+    #[test]
+    fn i18n_says_so_when_validation_messages_stay_english() {
+        let tmp = project_with_main(default_main());
+        let mut options = i18n_options();
+        options.model.validations = vec!["email=email".to_owned()];
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Contact",
+            &["email:String".into()],
+            "20260503000000",
+            &options,
+        )
+        .unwrap();
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("#[validate(...)]"))
+            .unwrap_or_else(|| panic!("no validation warning in {:?}", plan.warnings));
+        assert!(
+            warning.contains("validation failed: <code>"),
+            "must show what the author will actually see: {warning}"
+        );
+
+        // A scaffold with no rules has nothing to warn about.
+        let unvalidated = plan_scaffold_with_options(
+            tmp.path(),
+            "Note",
+            &["body:Text".into()],
+            "20260503000001",
+            &i18n_options(),
+        )
+        .unwrap();
+        assert!(
+            !unvalidated
+                .warnings
+                .iter()
+                .any(|w| w.contains("#[validate(...)]")),
+            "{:?}",
+            unvalidated.warnings
+        );
+    }
+
+    /// `transition_controls` builds `Mark as {to}` and the `{field} transitions`
+    /// group label inside autumn-web, from positional arguments that carry no
+    /// label seam — the same shape as the Markdown editor, and named the same
+    /// way rather than left for the reader to find in the browser.
+    #[test]
+    fn i18n_says_so_when_the_transition_controls_keep_english_chrome() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Order",
+            &[
+                "title:String".into(),
+                "status:String:states(draft -> published, published -> archived)".into(),
+            ],
+            "20260502000000",
+            &i18n_options(),
+        )
+        .unwrap();
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("state-transition controls"))
+            .unwrap_or_else(|| panic!("no transition warning in {:?}", plan.warnings));
+        assert!(
+            warning.contains("`status`"),
+            "must name the column: {warning}"
+        );
+        assert!(
+            warning.contains("transition_controls"),
+            "must name the widget the author has to look at: {warning}"
+        );
+    }
+
+    /// A standalone `autumn-<profile>.toml` is layered LAST, so it wins over
+    /// `autumn.toml` — and a project that keeps production config in one has no
+    /// `[profile.prod.i18n]` for the inline scan to find. Silence there is the
+    /// loudest failure: `.i18n_auto()` panics at startup on the missing bundle.
+    #[test]
+    fn i18n_warns_about_a_standalone_profile_override_file() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn-prod.toml"),
+            "[i18n]\ndir = \"translations\"\ndefault_locale = \"fr\"\n",
+        )
+        .unwrap();
+
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260504000000",
+            &i18n_options(),
+        )
+        .unwrap();
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("autumn-prod.toml"))
+            .unwrap_or_else(|| panic!("no profile-file warning in {:?}", plan.warnings));
+        assert!(
+            warning.contains("translations/fr.ftl"),
+            "must name the bundle the deploy actually loads: {warning}"
+        );
+    }
+
+    /// AC7: a refused transition is user-facing, and the error's own Display is
+    /// built in autumn-macros as hardcoded English — so the flash carries a
+    /// translated message instead of the error text.
+    #[test]
+    fn i18n_translates_the_rejected_transition_flash() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Order",
+            &[
+                "title:String".into(),
+                "status:String:states(draft -> published, published -> archived)".into(),
+            ],
+            "20260506000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/orders.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        assert!(
+            routes.contains("flash.error(t!(locale, \"common.transition.rejected\"))"),
+            "the rejection must come from the bundle:\n{routes}"
+        );
+        assert!(
+            !routes.contains("flash.error(err.to_string())"),
+            "the English error text must not reach the flash:\n{routes}"
+        );
+        assert!(ftl.contains("common.transition.rejected = "), "{ftl}");
+    }
+
+    /// Without the flag the flash is the error's own text, as before.
+    #[test]
+    fn without_i18n_the_rejected_transition_flash_is_the_error() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Order",
+            &[
+                "title:String".into(),
+                "status:String:states(draft -> published, published -> archived)".into(),
+            ],
+            "20260506000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/orders.rs")).unwrap();
+        assert!(routes.contains("flash.error(err.to_string())"), "{routes}");
+    }
+
+    /// AC7: the conflict banner is what an author reads at the moment their
+    /// save is rejected — the last place to fall back to English.
+    #[test]
+    fn i18n_translates_the_lock_conflict_banner() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260505000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        assert!(
+            routes.contains("t!(locale, \"common.lock.conflict\")"),
+            "the banner must come from the bundle:\n{routes}"
+        );
+        assert!(
+            !routes.contains("\"This record was changed by someone else"),
+            "the English literal must be gone:\n{routes}"
+        );
+        assert!(
+            ftl.contains("common.lock.conflict = This record was changed"),
+            "{ftl}"
+        );
+    }
+
+    /// AC7: the duplicate-value error is shown to whoever submitted the form,
+    /// so it is view text too. It cannot ride in `UNIQUE_CONSTRAINTS` — a
+    /// `const` is evaluated before any request has a locale — so the const
+    /// keeps the mapping and the message is resolved in the handler.
+    #[test]
+    fn i18n_translates_the_unique_violation_message() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String:unique".into()],
+            "20260503000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        assert!(
+            routes.contains("vec![t!(locale, \"common.error.taken\")]"),
+            "the message must be resolved per request:\n{routes}"
+        );
+        assert!(
+            ftl.contains("common.error.taken = has already been taken"),
+            "{ftl}"
+        );
+        // The const still carries the constraint -> field mapping; only the
+        // message slot stops being the thing rendered.
+        assert!(routes.contains("const UNIQUE_CONSTRAINTS"), "{routes}");
+    }
+
+    /// Without the flag the whole path is byte-for-byte as it was, including
+    /// the binding name.
+    #[test]
+    fn without_i18n_the_unique_violation_message_is_the_const_text() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String:unique".into()],
+            "20260503000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("vec![message.to_string()]"), "{routes}");
+        assert!(
+            routes.contains("if let Some((field, message)) ="),
+            "{routes}"
+        );
+    }
+
+    /// AC7: the attachment meta span is view text like any other.
+    ///
+    /// `attachment_link` renders `(image/png, 17 bytes)` beside the download
+    /// link on both the show and edit pages. The media type and the count are
+    /// data, but the parentheses, the comma and the unit noun are language — so
+    /// the whole pattern comes from the bundle and the two values interpolate
+    /// as Fluent arguments. Left hardcoded, every non-English scaffold with an
+    /// attachment column renders a stray English "bytes".
+    #[test]
+    fn i18n_translates_the_attachment_size_meta() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "cover:Attachment".into()],
+            "20260430000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        assert!(
+            !routes.contains("\" bytes)\""),
+            "the size suffix must not stay hardcoded English:\n{routes}"
+        );
+        assert!(
+            routes.contains("t!(locale, \"common.attachment.meta\""),
+            "the meta span must come from the bundle:\n{routes}"
+        );
+        assert!(
+            ftl.contains("common.attachment.meta = ({ $media }, { $size } bytes)"),
+            "the pattern a translator reorders must be the whole span:\n{ftl}"
+        );
+        // The helper cannot reach a `Locale` it was not handed, and both call
+        // sites are handlers that hold one.
+        assert!(
+            routes.contains("locale: &autumn_web::i18n::Locale,"),
+            "`attachment_link` must take the locale under `--i18n`:\n{routes}"
+        );
+        assert!(
+            routes.contains("attachment_link(&locale, Some(blob)")
+                && routes.contains("attachment_link(&locale, row.cover.as_ref()"),
+            "both the edit and show call sites must pass it:\n{routes}"
+        );
+    }
+
+    /// The same scaffold WITHOUT the flag keeps the helper exactly as it was —
+    /// the flag's byte-for-byte promise covers this seam too.
+    #[test]
+    fn without_i18n_the_attachment_meta_stays_a_plain_literal() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "cover:Attachment".into()],
+            "20260430000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("\"(\" (blob.content_type) \", \" (blob.byte_size) \" bytes)\""),
+            "the non-i18n meta span must be untouched:\n{routes}"
+        );
+        assert!(
+            !routes.contains("autumn_web::i18n::Locale"),
+            "no locale plumbing without the flag:\n{routes}"
+        );
+        assert!(
+            routes.contains("attachment_link(Some(blob)"),
+            "the call sites must keep their original arity:\n{routes}"
+        );
+    }
+
+    /// AC4/AC7: every referenced key exists in the emitted `en.ftl`, and the
+    /// file carries no key the views never reference (which `autumn i18n check`
+    /// would report as unused).
+    #[test]
+    fn i18n_en_ftl_matches_the_referenced_key_set_exactly() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        let referenced: BTreeSet<String> = t_macro_keys(&routes).into_iter().collect();
+        let defined = ftl_keys(&ftl);
+        assert!(!referenced.is_empty(), "expected `t!` keys in:\n{routes}");
+        let missing: Vec<_> = referenced.difference(&defined).collect();
+        assert!(
+            missing.is_empty(),
+            "keys referenced but not defined in en.ftl: {missing:?}\n{ftl}"
+        );
+        let unused: Vec<_> = defined.difference(&referenced).collect();
+        assert!(
+            unused.is_empty(),
+            "keys defined in en.ftl but never referenced: {unused:?}\n{routes}"
+        );
+        // English values, so an `en` app reads exactly like the plain scaffold.
+        assert!(ftl.contains("common.create = Create"), "{ftl}");
+        assert!(ftl.contains("common.save = Save"), "{ftl}");
+        assert!(ftl.contains("common.back = Back to list"), "{ftl}");
+        assert!(ftl.contains("post.new = New Post"), "{ftl}");
+        assert!(ftl.contains("post.field.title = Title"), "{ftl}");
+        assert!(
+            ftl.contains("post.field.author_name = Author Name"),
+            "{ftl}"
+        );
+    }
+
+    /// AC3: every view-rendering handler takes the `Locale` extractor so the
+    /// macro has a `locale` in scope.
+    #[test]
+    fn i18n_view_handlers_take_the_locale_extractor() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("use autumn_web::i18n::Locale;"),
+            "routes must import the extractor:\n{routes}"
+        );
+        for handler in [
+            "pub async fn index(",
+            "pub async fn show(",
+            "pub async fn new_form(",
+            "pub async fn edit_form(",
+            "pub async fn create(",
+            "pub async fn update(",
+        ] {
+            let start = routes
+                .find(handler)
+                .unwrap_or_else(|| panic!("missing handler `{handler}`:\n{routes}"));
+            let sig_end = routes[start..].find(") ->").unwrap_or_else(|| {
+                panic!("unterminated signature for `{handler}`");
+            });
+            let sig = &routes[start..start + sig_end];
+            assert!(
+                sig.contains("locale: Locale"),
+                "`{handler}` must take the Locale extractor, got:\n{sig}"
+            );
+        }
+        // The extractor must precede any body-consuming extractor — axum only
+        // allows one `FromRequest` argument, and it has to be last.
+        if let Some(start) = routes.find("pub async fn create(") {
+            let sig = &routes[start..start + routes[start..].find(") ->").unwrap()];
+            let locale_at = sig.find("locale: Locale").unwrap();
+            if let Some(body_at) = sig.find("body: Bytes") {
+                assert!(locale_at < body_at, "Locale must precede the body:\n{sig}");
+            }
+        }
+    }
+
+    /// AC3: the `--api` (JSON) path is unaffected — no labels to translate, so
+    /// no `t!` calls, no `Locale` extractor, and no `.ftl` stub.
+    #[test]
+    fn i18n_api_scaffold_output_is_unaffected() {
+        let fields = i18n_fields();
+        let tmp_plain = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp_plain.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let tmp_i18n = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp_i18n.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions {
+                api: true,
+                i18n: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        for rel in [
+            "src/models/post.rs",
+            "src/repositories/post.rs",
+            "Cargo.toml",
+        ] {
+            let a = fs::read_to_string(tmp_plain.path().join(rel)).unwrap();
+            let b = fs::read_to_string(tmp_i18n.path().join(rel)).unwrap();
+            assert_eq!(a, b, "`--api --i18n` must not change `{rel}`");
+        }
+        assert!(
+            !tmp_i18n.path().join("i18n/en.ftl").exists(),
+            "an `--api` scaffold references no labels, so it writes no `.ftl`"
+        );
+    }
+
+    /// AC5: shared chrome keys are emitted once and reused — a second resource
+    /// adds only its own nouns, never a duplicate `common.*` entry.
+    #[test]
+    fn i18n_common_chrome_keys_are_emitted_once_across_resources() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into()],
+            "20260427000001",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert_eq!(
+            ftl.matches("common.create =").count(),
+            1,
+            "shared chrome must be emitted exactly once:\n{ftl}"
+        );
+        assert_eq!(ftl.matches("common.back =").count(), 1, "{ftl}");
+        let keys = ftl_keys(&ftl);
+        assert!(keys.contains("post.field.title"), "{ftl}");
+        assert!(keys.contains("comment.field.body"), "{ftl}");
+        assert!(
+            !keys.iter().any(|k| k.starts_with("comment.create")),
+            "chrome must not be duplicated per model:\n{ftl}"
+        );
+    }
+
+    /// AC4: an `en.ftl` the user has already translated survives regeneration —
+    /// existing values are never rewritten, only missing keys are appended.
+    #[test]
+    fn i18n_merges_into_an_existing_en_ftl_without_clobbering_values() {
+        let tmp = project_with_main(default_main());
+        fs::create_dir_all(tmp.path().join("i18n")).unwrap();
+        fs::write(
+            tmp.path().join("i18n/en.ftl"),
+            "# hand-written\nwelcome.title = Welcome\ncommon.create = Add\n",
+        )
+        .unwrap();
+
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert!(ftl.contains("welcome.title = Welcome"), "{ftl}");
+        assert!(
+            ftl.contains("common.create = Add"),
+            "an existing value must not be rewritten:\n{ftl}"
+        );
+        assert!(!ftl.contains("common.create = Create"), "{ftl}");
+        assert!(ftl.contains("post.field.title = Title"), "{ftl}");
+    }
+
+    /// AC4 ("zero further config"): the generated app actually resolves the
+    /// keys — the `i18n` feature is on, `[i18n]` is configured, and the builder
+    /// loads the bundle.
+    #[test]
+    fn i18n_wires_the_project_so_keys_resolve_with_no_further_config() {
+        let tmp = project_with_main(default_main());
+        fs::write(tmp.path().join("autumn.toml"), "[server]\nport = 3000\n").unwrap();
+        // A real `autumn new` project declares autumn-web; the bare fixture does
+        // not, and a feature cannot be added to a dependency that isn't there.
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n",
+        )
+        .unwrap();
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("\"i18n\""),
+            "the `i18n` feature must be enabled:\n{cargo}"
+        );
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert!(toml.contains("[i18n]"), "{toml}");
+        assert!(toml.contains("default_locale = \"en\""), "{toml}");
+        let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains(".i18n_auto()"),
+            "the builder must load the bundle:\n{main_rs}"
+        );
+    }
+
+    /// AC1: `--i18n` composes with `--searchable` and `--soft-delete`; the
+    /// strings those variants add are translated too.
+    #[test]
+    fn i18n_composes_with_searchable_and_soft_delete() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                i18n: true,
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    soft_delete: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        let referenced: BTreeSet<String> = t_macro_keys(&routes).into_iter().collect();
+        let defined = ftl_keys(&ftl);
+        assert!(
+            referenced.difference(&defined).next().is_none(),
+            "searchable+trash keys must all be defined:\n{ftl}"
+        );
+        assert!(
+            !routes.contains("\"Search Posts\""),
+            "the search page's strings must be translated:\n{routes}"
+        );
+        assert!(
+            !routes.contains("\"Restore\"") && !routes.contains("\"Trash is empty.\""),
+            "the trash view's strings must be translated:\n{routes}"
+        );
+    }
+
+    /// The variants whose views render outside a request handler (`--live`'s
+    /// SSE fragment) or through a separate nested renderer are refused up front
+    /// rather than silently emitting English under an i18n flag.
+    #[test]
+    fn i18n_rejects_the_view_variants_it_cannot_translate() {
+        for (label, options) in [
+            (
+                "--live",
+                ScaffoldOptions {
+                    i18n: true,
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--live-validation",
+                ScaffoldOptions {
+                    i18n: true,
+                    live_validation: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--belongs-to",
+                ScaffoldOptions {
+                    i18n: true,
+                    belongs_to: Some("Post".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let tmp = project_with_main(default_main());
+            let err = plan_scaffold_with_options(
+                tmp.path(),
+                "Comment",
+                &["body:Text".into()],
+                "20260427000000",
+                &options,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "{label}: expected a Config error, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("--i18n") && msg.contains(label),
+                "{label}: the error must name both flags: {msg}"
+            );
+        }
+    }
+
+    /// AC1/AC2: the `--belongs-to` refusal has to hold for nesting this run
+    /// INFERRED as well as nesting it was told about.
+    ///
+    /// `--belongs-to` is typed once, when the relationship is created; the
+    /// ordinary "I changed a field, re-scaffold it" run does not repeat it, and
+    /// [`super::nested::resolve`] deliberately recovers the relationship from
+    /// the markers in the parent's routes file so the two sides cannot drift
+    /// apart. That recovery has to reach the refusal too: otherwise
+    /// `generate … --force --i18n` on an existing child is accepted, and emits
+    /// nested views whose heading, empty state, add button, and parent backlink
+    /// are still hardcoded English — a half-translated module, which is exactly
+    /// what refusing `--belongs-to` outright exists to prevent.
+    #[test]
+    fn i18n_is_refused_for_nesting_recovered_from_the_parents_markers() {
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+
+        // No `belongs_to` here — exactly what a forgetful `--force --i18n`
+        // re-scaffold looks like on the command line.
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260429000000",
+            &ScaffoldOptions {
+                i18n: true,
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected a Config error, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--i18n") && msg.contains("posts.rs"),
+            "the refusal must name the flag and the evidence it was recovered from: {msg}"
+        );
+    }
+
+    /// AC2: per-field labels flow through one key per field, used by the index
+    /// column header, the show property row, and the form control alike.
+    #[test]
+    fn i18n_field_labels_share_one_key_per_field() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "author_name:String".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains(".override_label(\"title\", t!(locale, \"post.field.title\"))"),
+            "form controls must relabel through the field key:\n{routes}"
+        );
+        // One key, three surfaces: index header, show row, form label.
+        assert!(
+            routes.matches("\"post.field.author_name\"").count() >= 3,
+            "the field key must serve index, show, and form:\n{routes}"
         );
     }
 }

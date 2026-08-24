@@ -38,6 +38,7 @@ ok() {
 declare -a CRATES=(
   "autumn-web:autumn/Cargo.toml"
   "autumn-macros:autumn-macros/Cargo.toml"
+  "autumn-edge:autumn-edge/Cargo.toml"
   "autumn-cli:autumn-cli/Cargo.toml"
   "autumn-admin-plugin:autumn-admin-plugin/Cargo.toml"
   "autumn-storage-s3:autumn-storage-s3/Cargo.toml"

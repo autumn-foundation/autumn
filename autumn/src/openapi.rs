@@ -128,6 +128,15 @@ pub struct ApiDoc {
     pub sunset_opt_out: bool,
     /// Whether this route uses dynamic policy authorization.
     pub has_policy: bool,
+    /// Record-level authorization bindings declared by `#[authorize]` on the
+    /// handler, in source order — one entry per attribute, empty when the
+    /// handler declares none.
+    ///
+    /// This is the provable subset of [`Self::has_policy`], never a
+    /// replacement for it: that boolean is also `true` for a hand-written
+    /// `__check_policy` call in the body, which carries no binding a macro can
+    /// recover.
+    pub authorize_bindings: &'static [AuthorizeBinding],
     /// True when the handler is explicitly declared public via `#[public]`.
     ///
     /// Populated by the route macros from the `#[public]` marker. Used by the
@@ -164,6 +173,28 @@ pub struct ApiDoc {
     /// schema, this flag also exempts the tool from the JSON-out eligibility
     /// gate that otherwise excludes schema-less routes.
     pub mcp_stream: bool,
+}
+
+/// A record-level authorization binding declared by `#[authorize]`.
+///
+/// One entry per `#[authorize("action", resource = Type)]` attribute on a
+/// handler, recovered from the macro expansion, so a binding disappears from
+/// the metadata exactly when the attribute disappears from the source.
+///
+/// This is deliberately **not** the `Policy` implementation that serves the
+/// check. `#[authorize]` names only the resource `R`; the concrete
+/// `impl Policy<R>` is resolved from the `PolicyRegistry` at boot
+/// (`AppBuilder::policy::<R, _>(...)`) and is therefore not knowable at build
+/// time. [`Self::resource`] is likewise the identifier as written at the use
+/// site rather than a resolved path, so two same-named types in different
+/// modules are indistinguishable here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizeBinding {
+    /// Action verb passed to the policy check — the first `#[authorize]`
+    /// argument, recorded verbatim.
+    pub action: &'static str,
+    /// Resource type identifier exactly as written in `resource = Type`.
+    pub resource: &'static str,
 }
 
 /// Reference to a schema definition, produced by the route macros.
@@ -618,7 +649,11 @@ pub struct Parameter {
     /// The schema defining the type used for the parameter.
     pub schema: serde_json::Value,
     /// Serialization style. `"form"` with `explode: true` makes each object
-    /// property a separate query key — the correct mapping for `Query<T>`.
+    /// property a separate query key — the accurate mapping for a `Query<T>`
+    /// whose fields are scalars or scalar arrays. A **nested** field decodes
+    /// from the bracketed form (`?filter[status]=open`) that
+    /// [`crate::query_string`] defines, which `form`/`explode` leaves
+    /// undefined; see the "Known gaps" note in `docs/guide/openapi.md`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub style: Option<String>,
     /// When `true` with `style: "form"`, each schema property becomes an
@@ -1170,8 +1205,14 @@ fn operation_for(
 
     // Query parameters from `Query<T>` extractor.
     // Use `style: form, explode: true` so each field of the query struct
-    // is serialized as an independent query key (e.g. `?q=foo&page=2`),
-    // which matches what the server's `Query<T>` deserialization expects.
+    // is serialized as an independent query key (e.g. `?q=foo&page=2`).
+    // That is exact for scalar and scalar-array fields. A nested field
+    // (an object, or an array of objects) is decoded from the bracketed form
+    // `crate::query_string` defines — `?filter[status]=open` — which no OpenAPI
+    // style expresses in full (`deepObject` covers one object level but not an
+    // array of objects, and would also re-introduce the parameter name that
+    // `form`/`explode` correctly drops). Documented in docs/guide/openapi.md
+    // rather than misdescribed here (issue #1972).
     if let Some(query_entry) = &api_doc.query_schema {
         parameters.push(Parameter {
             name: query_entry.name.to_owned(),

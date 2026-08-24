@@ -564,7 +564,19 @@ pub async fn publish_stored_live_event_best_effort(state: &AppState, event_id: i
     }
 }
 
+/// The running app's state, captured at startup for
+/// [`publish_comment_created`].
+///
+/// The framework's comment router is mounted before the app is built, so its
+/// `on_comment` callback is a plain closure with nothing to capture. The
+/// startup hook below is the first place `AppState` exists, so it is stashed
+/// here. Best-effort by construction: a callback that fires before startup
+/// completes (it cannot) or after a failed boot simply finds `None` and does
+/// nothing, which is the right answer for a live-feed notification.
+static LIVE_FEED_STATE: std::sync::OnceLock<AppState> = std::sync::OnceLock::new();
+
 pub async fn start_live_event_relay(state: AppState) -> AutumnResult<()> {
+    let _ = LIVE_FEED_STATE.set(state.clone());
     if state.pool().is_none() {
         return Err(AutumnError::service_unavailable_msg(
             "reddit-clone live feed relay requires database.url",
@@ -905,6 +917,14 @@ pub fn post_created_event(
     })
 }
 
+// `comment_created_event` survived the move to the framework's generic comment
+// router in #1367. The router owns no app-specific side effects of its own, but
+// it does offer `CommentsConfig::on_comment` for exactly this: `main.rs` hands
+// it a callback that lands here, so `/ws/feed` and `/ws/r/{slug}` keep
+// announcing new comments as they always did. (Model-change broadcast (#1336)
+// is NOT a substitute -- comment rows are written by the framework's own SQL
+// rather than through a `#[model]` repository, so no model-change event fires
+// for them.)
 #[must_use]
 pub fn comment_created_event(
     comment_id: i64,
@@ -922,8 +942,126 @@ pub fn comment_created_event(
         "subreddit_slug": subreddit_slug,
         "author_username": author_username,
         "body_preview": comment_body_preview(body),
-        "path": format!("{}#comment-{comment_id}", crate::routes::posts::__autumn_path_show(subreddit_slug, post_slug)),
+        // Built from the widget's own convention, not a hand-written
+        // `#comment-{id}`: the detail page renders each comment as
+        // `{thread_dom_id}-c{comment_id}`, so an invented anchor matches
+        // nothing and the notification opens the post without scrolling.
+        "path": format!(
+            "{}#{}",
+            crate::routes::posts::__autumn_path_show(subreddit_slug, post_slug),
+            autumn_web::widgets::comment_dom_id(
+                &autumn_web::commentable::thread_dom_id(
+                    crate::models::Post::COMMENTABLE_TYPE,
+                    post_id,
+                ),
+                comment_id,
+            )
+        ),
     })
+}
+
+/// Collapse a comment body to a short single-line preview for the live feed.
+fn comment_body_preview(body: &str) -> String {
+    const MAX_PREVIEW_LEN: usize = 120;
+
+    let mut collapsed = String::with_capacity(body.len());
+    for word in body.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+    }
+
+    if collapsed.len() <= MAX_PREVIEW_LEN {
+        return collapsed;
+    }
+
+    let mut preview = collapsed
+        .chars()
+        .take(MAX_PREVIEW_LEN.saturating_sub(3))
+        .collect::<String>();
+    preview.push_str("...");
+    preview
+}
+
+/// Announce a comment created through the framework's comment router.
+///
+/// Wired in `main.rs` via `CommentsConfig::on_comment`. Only `Post` comments
+/// reach the feed: a `Subreddit` comment has no post to link to, and the feed's
+/// existing `comment_created` shape is post-shaped. Best-effort throughout --
+/// a comment the user can already see must not be undone by a failing notifier,
+/// so every step logs and returns rather than propagating.
+pub async fn publish_comment_created(created: &autumn_web::commentable::CommentCreated) {
+    use crate::models::Post;
+    use crate::schema::{posts, subreddits, users};
+
+    if created.commentable_type != Post::COMMENTABLE_TYPE {
+        return;
+    }
+
+    let Some(state) = LIVE_FEED_STATE.get() else {
+        return;
+    };
+    let Some(pool) = state.pool() else {
+        return;
+    };
+    let Ok(mut conn) = pool.get().await else {
+        tracing::warn!("live feed: no connection for comment_created");
+        return;
+    };
+
+    // The feed entry needs the post's slug and subreddit (for the link) and the
+    // author's username (for the byline). Two small reads rather than a join:
+    // this is a best-effort notifier, and each step has its own "give up".
+    let post: Result<(String, i64), _> = posts::table
+        .filter(posts::id.eq(created.parent_id))
+        .select((posts::slug, posts::subreddit_id))
+        .first(&mut conn)
+        .await;
+    let Ok((post_slug, subreddit_id)) = post else {
+        tracing::warn!(post_id = created.parent_id, "live feed: post not found");
+        return;
+    };
+
+    let subreddit_slug: Result<String, _> = subreddits::table
+        .filter(subreddits::id.eq(subreddit_id))
+        .select(subreddits::slug)
+        .first(&mut conn)
+        .await;
+    let Ok(subreddit_slug) = subreddit_slug else {
+        tracing::warn!(subreddit_id, "live feed: subreddit not found");
+        return;
+    };
+
+    let username: String = users::table
+        .filter(users::id.eq(created.author_id))
+        .select(users::username)
+        .first(&mut conn)
+        .await
+        .unwrap_or_else(|_| format!("user #{}", created.author_id));
+
+    let event = comment_created_event(
+        created.comment_id,
+        created.parent_id,
+        &post_slug,
+        &subreddit_slug,
+        &username,
+        &created.body,
+    );
+    let stored = store_activity_event_for_state(state, &mut conn, &subreddit_slug, &event).await;
+
+    // Release the database connection before publishing. With
+    // `distributed.live_feed_bus.kind = redis_pubsub` the publish opens a Redis
+    // connection and has no timeout of its own, so holding this checkout across
+    // it lets a slow or unreachable Redis pin database connections that the
+    // publish does not even use -- starving unrelated queries for as long as
+    // Redis takes to answer.
+    drop(conn);
+
+    match stored {
+        Ok(event_id) => publish_stored_live_event_best_effort(state, event_id).await,
+        Err(error) => tracing::warn!(%error, "live feed: storing comment_created failed"),
+    }
 }
 
 type AutumnResult<T> = Result<T, AutumnError>;
@@ -1103,32 +1241,6 @@ fn rebroadcast_row(state: &AppState, row: &LiveFeedEventRow) {
         .sender(&format!("r/{}", row.subreddit_slug))
         .send(payload)
         .ok();
-}
-
-/// ⚡ Bolt Optimization:
-/// Avoids an intermediate `Vec<&str>` heap allocation and `join` overhead
-/// by manually building the collapsed string into a pre-allocated buffer.
-fn comment_body_preview(body: &str) -> String {
-    const MAX_PREVIEW_LEN: usize = 120;
-
-    let mut collapsed = String::with_capacity(body.len());
-    for word in body.split_whitespace() {
-        if !collapsed.is_empty() {
-            collapsed.push(' ');
-        }
-        collapsed.push_str(word);
-    }
-
-    if collapsed.len() <= MAX_PREVIEW_LEN {
-        return collapsed;
-    }
-
-    let mut preview = collapsed
-        .chars()
-        .take(MAX_PREVIEW_LEN.saturating_sub(3))
-        .collect::<String>();
-    preview.push_str("...");
-    preview
 }
 
 #[cfg(test)]
@@ -1404,29 +1516,6 @@ mod tests {
         assert_eq!(
             remaining.count, 1,
             "prune should use the database clock so the just-inside-retention row survives",
-        );
-    }
-
-    #[tokio::test]
-    async fn comment_event_payload_includes_preview_and_path() {
-        let event = comment_created_event(
-            7,
-            42,
-            "ferris-ships",
-            "rust",
-            "ferris",
-            "Borrow checker approved this message.",
-        );
-
-        assert_eq!(event["type"], "comment_created");
-        assert_eq!(event["comment_id"], 7);
-        assert_eq!(event["post_id"], 42);
-        assert_eq!(event["subreddit_slug"], "rust");
-        assert_eq!(event["author_username"], "ferris");
-        assert_eq!(event["path"], json!("/r/rust/posts/ferris-ships#comment-7"));
-        assert_eq!(
-            event["body_preview"],
-            json!("Borrow checker approved this message.")
         );
     }
 

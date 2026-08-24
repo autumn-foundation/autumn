@@ -72,6 +72,11 @@ fn deploy_plan_prints_unit_and_steps() {
 fn deploy_check_fails_fast_without_host() {
     // A bare [deploy] table has no host; check must fail with an actionable
     // message naming the key to set, and exit non-zero.
+    //
+    // #1621: the fleet spelling (`[deploy] hosts`) EXTENDS this message rather
+    // than replacing it — the literal `[deploy] host` substring is quoted in
+    // operator runbooks, so it must survive verbatim while the message also
+    // offers the fleet alternative.
     let dir = project("");
     let (stdout, stderr) = run_autumn_fail(dir.path(), &["deploy", "check"], &[]);
     let combined = format!("{stdout}{stderr}");
@@ -82,6 +87,65 @@ fn deploy_check_fails_fast_without_host() {
     assert!(
         combined.contains("[deploy] host"),
         "check should name the config key\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("hosts"),
+        "check should also offer the #1621 fleet spelling\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_rejects_host_and_hosts_configured_together() {
+    // #1621 (AC-1): `[deploy] host` and `[deploy] hosts` are mutually exclusive —
+    // with both set there is no unambiguous rollout order, so the CLI refuses
+    // before any remote work, naming BOTH keys so the operator knows which one to
+    // delete.
+    let dir = project("host = \"203.0.113.10\"\nhosts = [\"web-1.example.com\"]\n");
+    let (stdout, stderr) = run_autumn_fail(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("[deploy] host"),
+        "the refusal must name the legacy key\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("[deploy] hosts"),
+        "the refusal must name the fleet key\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_rejects_a_blank_hosts_entry() {
+    // #1621 (AC-1): a blank fleet entry is a typo that would otherwise resolve to
+    // a hostless SSH target mid-rollout. The refusal names the 0-based index so
+    // the operator can find the offending line.
+    let dir = project("hosts = [\"web-1.example.com\", \"  \"]\n");
+    let (stdout, stderr) = run_autumn_fail(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("[deploy] hosts"),
+        "the refusal must name the fleet key\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains('1'),
+        "the refusal must name the 0-based index of the blank entry\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_rejects_duplicate_hosts_entries() {
+    // #1621 (AC-1/AC-3): deploying the same machine twice corrupts its blue/green
+    // previous-release chain, which a fleet rollback depends on. Duplicates are
+    // compared after trimming and the repeated value is named.
+    let dir = project("hosts = [\"web-1.example.com\", \" web-1.example.com \"]\n");
+    let (stdout, stderr) = run_autumn_fail(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("web-1.example.com"),
+        "the refusal must name the repeated host\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("[deploy] hosts"),
+        "the refusal must name the fleet key\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 
@@ -661,6 +725,269 @@ fn deploy_check_respects_explicit_autumn_dotenv_off() {
     );
 }
 
+/// The single fleet-wide migrate-placement sentence `deploy plan` prints for a
+/// multi-host `[deploy] hosts` (issue #1621, AC-4). Kept in sync by hand with
+/// `deploy::fleet::FLEET_MIGRATE_PLACEMENT_NOTE`; the unit-level drift guard is
+/// `fleet_plan_matches_fleet_ops_sequence`.
+const MIGRATE_PLACEMENT_NOTE: &str =
+    "runs once, on the first host in rollout order, before its cutover";
+
+#[test]
+fn deploy_plan_renders_the_fleet_rollout_order_and_one_migrate_note() {
+    // #1621 (AC-4, T2.2): `deploy plan` is offline — it contacts no host, so it
+    // cannot know which hosts are first deploys. It therefore prints the rollout
+    // ORDER (declaration order, the documented contract) plus the migrate
+    // placement as a single fleet-wide RULE, never a per-host line.
+    let dir =
+        project("hosts = [\"web-1.example.com\", \"web-2.example.com\", \"web-3.example.com\"]\n");
+    let (stdout, stderr, code) = run_autumn(dir.path(), &["deploy", "plan"], &[]);
+    assert_eq!(
+        code,
+        Some(0),
+        "deploy plan should succeed for a fleet\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let first = stdout
+        .find("web-1.example.com")
+        .unwrap_or_else(|| panic!("web-1 must be listed\nstdout:\n{stdout}"));
+    let second = stdout
+        .find("web-2.example.com")
+        .unwrap_or_else(|| panic!("web-2 must be listed\nstdout:\n{stdout}"));
+    let third = stdout
+        .find("web-3.example.com")
+        .unwrap_or_else(|| panic!("web-3 must be listed\nstdout:\n{stdout}"));
+    assert!(
+        first < second && second < third,
+        "the fleet plan must list hosts in declaration (rollout) order\nstdout:\n{stdout}"
+    );
+
+    assert_eq!(
+        stdout.matches(MIGRATE_PLACEMENT_NOTE).count(),
+        1,
+        "the fleet plan must carry exactly one migrate-placement note\nstdout:\n{stdout}"
+    );
+}
+
+/// The grader names `deploy check` printed, in order, read off its report lines
+/// (`✅ name: detail`, `❌ name (host): detail`, `⚠️  name: detail`).
+///
+/// Scope suffixes are stripped, so this returns the STABLE identifiers — which is
+/// exactly the set `autumn doctor` must mirror (issue #1621, plan §5.5).
+fn preflight_grader_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let rest = line
+                .strip_prefix("\u{2705} ")
+                .or_else(|| line.strip_prefix("\u{274C} "))
+                .or_else(|| line.strip_prefix("\u{26A0}\u{FE0F}  "))?;
+            let name = rest.split(':').next()?.trim();
+            // Drop the ` (host)` scope suffix a fleet row carries.
+            let name = name.split(" (").next()?.trim();
+            (!name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+                .then(|| name.to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn deploy_check_reports_ssh_reachability_per_fleet_host() {
+    // #1621 (T2.3, AC-7): every host is graded BEFORE anything is touched, and each
+    // per-host row names its host — otherwise "cannot reach the server" in a
+    // three-host fleet does not say which server. The three project-wide graders
+    // (signing secret, database URL, migrate check) grade the PROJECT, so they run
+    // once and stay unscoped.
+    //
+    // `.test` addresses never resolve (RFC 2606), so the ssh grader fails fast per
+    // host with no network dependence.
+    let dir = project(
+        "hosts = [\"web-1.example.test\", \"web-2.example.test\", \"web-3.example.test\"]\n",
+    );
+    let (stdout, stderr) = run_autumn_fail(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+
+    for host in [
+        "web-1.example.test",
+        "web-2.example.test",
+        "web-3.example.test",
+    ] {
+        assert!(
+            combined.contains(&format!("ssh_reachability ({host})")),
+            "every fleet host needs its own scoped ssh_reachability row; missing \
+             {host}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    let names = preflight_grader_names(&combined);
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| *name == "ssh_reachability")
+            .count(),
+        3,
+        "one ssh_reachability row per host\nnames: {names:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    for project_grader in ["signing_secret", "database_url", "migrate_check"] {
+        assert_eq!(
+            names.iter().filter(|name| *name == project_grader).count(),
+            1,
+            "the project-wide grader `{project_grader}` runs ONCE for the whole \
+             fleet\nnames: {names:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !combined.contains(&format!("{project_grader} (")),
+            "`{project_grader}` grades the project, not a host, so it must not be \
+             scoped\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    // Six checks in total (three hosts + three project graders) and the count
+    // includes every failing host, so the operator learns about host 3 before host 1
+    // is touched.
+    assert!(
+        combined.contains("of 6 preflight check(s) failed"),
+        "the report must count every host's grader\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        combined.matches("could not resolve web-").count(),
+        3,
+        "every host must be probed, not just the first\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_and_doctor_grade_the_same_fleet_graders() {
+    // #1621 (T2.5, plan §5.5): `autumn doctor` mirroring the deploy preflight is a
+    // hard invariant that has, until now, been enforced only by comments. Both
+    // surfaces build their names from ONE ordered list
+    // (`deploy::PREFLIGHT_GRADERS` / `deploy::DOCTOR_PREFLIGHT_GRADERS`, whose
+    // `deploy_`-prefix derivation is pinned by a unit test); this asserts the two
+    // really do emit the same grader set for the SAME fleet config.
+    //
+    // Doctor emits one `deploy_ssh_reachability` for the whole fleet (its check
+    // names are `&'static str` `--json` keys and must stay unique) while
+    // `deploy check` emits one row per host — so the comparison is over the SET of
+    // stable identifiers, not the row count.
+    let dir = project("hosts = [\"web-1.example.test\", \"web-2.example.test\"]\n");
+
+    let (check_out, check_err, _) = run_autumn(dir.path(), &["deploy", "check"], &[]);
+    let mut from_check: Vec<String> = preflight_grader_names(&format!("{check_out}{check_err}"))
+        .into_iter()
+        .map(|name| format!("deploy_{name}"))
+        .collect();
+    from_check.sort_unstable();
+    from_check.dedup();
+
+    // `--online` is what enables doctor's TCP reachability probe; without it the
+    // deploy branch deliberately runs only the offline graders.
+    let (doctor_out, doctor_err, _) =
+        run_autumn(dir.path(), &["doctor", "--json", "--online"], &[]);
+    let report: serde_json::Value = serde_json::from_str(&doctor_out).unwrap_or_else(|e| {
+        panic!(
+            "doctor --json must emit valid JSON: {e}\nstdout:\n{doctor_out}\nstderr:\n{doctor_err}"
+        )
+    });
+    let mut from_doctor: Vec<String> = report["checks"]
+        .as_array()
+        .expect("doctor --json carries a checks array")
+        .iter()
+        .filter_map(|check| check["name"].as_str())
+        .filter(|name| name.starts_with("deploy_"))
+        // `deploy_host` (offline host presence) and `deploy_config` (a config-load
+        // guard) are doctor-only by design — `deploy check` folds host presence into
+        // `ssh_reachability`, which reports the identical missing-host detail.
+        .filter(|name| *name != "deploy_host" && *name != "deploy_config")
+        .map(str::to_owned)
+        .collect();
+    from_doctor.sort_unstable();
+    from_doctor.dedup();
+
+    assert_eq!(
+        from_check, from_doctor,
+        "`deploy check` and `doctor` must grade the SAME deploy graders for the same \
+         fleet config\ncheck stdout:\n{check_out}\ncheck stderr:\n{check_err}\ndoctor \
+         stdout:\n{doctor_out}"
+    );
+    assert!(
+        !from_check.is_empty(),
+        "the parity assertion must not pass vacuously\ncheck stderr:\n{check_err}"
+    );
+
+    // …and doctor really did enumerate the fleet rather than reporting "no target
+    // host configured" because the scalar `[deploy] host` is unset.
+    assert!(
+        doctor_out.contains("web-1.example.test") && doctor_out.contains("web-2.example.test"),
+        "doctor must enumerate the configured fleet hosts\nstdout:\n{doctor_out}"
+    );
+}
+
+#[test]
+fn deploy_check_output_is_identical_for_host_and_a_single_entry_hosts_list() {
+    // #1621 (AC-1, the `check` half of T2.1): the same differential proof the `plan`
+    // half makes, over the surface that grades. `deploy check` now runs the FLEET
+    // preflight, so this is what pins "a one-entry `hosts` list is byte-for-byte
+    // today's single-server deploy" against the scope field, the per-host rows and
+    // the failure counting all at once.
+    let scalar = project("host = \"deploy.example.test\"\n");
+    let list = project("hosts = [\"deploy.example.test\"]\n");
+
+    let (scalar_out, scalar_err, scalar_code) =
+        run_autumn(scalar.path(), &["deploy", "check"], &[]);
+    let (list_out, list_err, list_code) = run_autumn(list.path(), &["deploy", "check"], &[]);
+
+    assert_eq!(
+        scalar_code, list_code,
+        "exit codes must match\n`host` stderr:\n{scalar_err}\n`hosts` stderr:\n{list_err}"
+    );
+    assert_eq!(
+        scalar_out, list_out,
+        "`deploy check` stdout must be byte-identical under both spellings"
+    );
+    assert_eq!(
+        scalar_err, list_err,
+        "`deploy check` stderr must be byte-identical under both spellings"
+    );
+    // Non-vacuous: the report really was produced (not two empty strings from an
+    // early config refusal).
+    assert!(
+        scalar_err.contains("ssh_reachability"),
+        "the differential must compare a real preflight report\nstderr:\n{scalar_err}"
+    );
+    // A single-host report carries NO scope suffix — that is what "identical" means
+    // here (AC-1 artifact 4).
+    assert!(
+        !scalar_err.contains("ssh_reachability ("),
+        "a single-host preflight must not print a scope suffix\nstderr:\n{scalar_err}"
+    );
+}
+
+#[test]
+fn deploy_plan_output_is_identical_for_host_and_a_single_entry_hosts_list() {
+    // #1621 (AC-1, differential half of T2.1): a one-entry `hosts` list IS today's
+    // single-server deploy. The two projects differ by exactly the `[deploy]` host
+    // spelling, so any fleet-specific divergence in `deploy plan` — an extra
+    // section, a reordered line, a changed byte — shows up here. Stronger than a
+    // checked-in golden fixture: it can never go stale and depends on nothing
+    // about the machine it runs on.
+    let scalar = project("host = \"203.0.113.10\"\n");
+    let list = project("hosts = [\"203.0.113.10\"]\n");
+
+    let (scalar_out, scalar_err, scalar_code) = run_autumn(scalar.path(), &["deploy", "plan"], &[]);
+    let (list_out, list_err, list_code) = run_autumn(list.path(), &["deploy", "plan"], &[]);
+
+    assert_eq!(
+        scalar_code, list_code,
+        "exit codes must match\n`host` stderr:\n{scalar_err}\n`hosts` stderr:\n{list_err}"
+    );
+    assert_eq!(
+        scalar_out, list_out,
+        "`deploy plan` stdout must be byte-identical under both spellings"
+    );
+    assert_eq!(
+        scalar_err, list_err,
+        "`deploy plan` stderr must be byte-identical under both spellings"
+    );
+}
+
 #[test]
 fn deploy_help_lists_subcommands() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -682,5 +1009,100 @@ fn deploy_help_lists_subcommands() {
     assert!(
         combined.contains("rollback"),
         "help should list rollback\n{combined}"
+    );
+    // #1621 (T2.4): the group doc comment IS the help text (verbatim_doc_comment),
+    // so the fleet flags must be documented there or `autumn deploy --help` starts
+    // lying about what the command can do.
+    assert!(
+        combined.contains("--only"),
+        "help should document the fleet `--only` flag\n{combined}"
+    );
+    assert!(
+        combined.contains("--no-rollback"),
+        "help should document the fleet `--no-rollback` flag\n{combined}"
+    );
+    // #1621 (T2.4): the fleet status + maintenance surfaces must be discoverable
+    // from the group help, flags included.
+    assert!(
+        combined.contains("status"),
+        "help should list the status subcommand\n{combined}"
+    );
+    assert!(
+        combined.contains("maintenance"),
+        "help should list the maintenance subcommand\n{combined}"
+    );
+    assert!(
+        combined.contains("--json"),
+        "help should document status --json\n{combined}"
+    );
+    assert!(
+        combined.contains("--strict"),
+        "help should document status --strict\n{combined}"
+    );
+}
+
+#[test]
+fn maintenance_help_cross_references_the_deploy_fan_out() {
+    // #1621 (plan §3.3): the top-level `autumn maintenance` is LOCAL-only (it
+    // writes the flag in the CLI's own working directory), and the fleet fan-out
+    // lives under `autumn deploy maintenance`. The local command's help must point
+    // at the deploy one, or operators of deploy-managed hosts will run the local
+    // command and wonder why nothing happened.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (stdout, stderr, code) = run_autumn(dir.path(), &["maintenance", "--help"], &[]);
+    assert_eq!(
+        code,
+        Some(0),
+        "maintenance --help should succeed\nstderr:\n{stderr}"
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("deploy maintenance"),
+        "the local maintenance help must cross-reference `autumn deploy maintenance` \
+         for deploy-managed hosts\n{combined}"
+    );
+}
+
+#[test]
+fn deploy_up_rejects_an_only_host_that_is_not_in_the_fleet() {
+    // #1621 (§3.2): `--only` is checked against `[deploy] hosts` before anything
+    // else happens — no preflight, no SSH, no build. A typo names itself and the
+    // configured hosts are listed, because the alternative (guessing, or silently
+    // deploying nothing) can put the wrong machine into production.
+    let dir = project("hosts = [\"web-1.example.com\", \"web-2.example.com\"]\n");
+    let (stdout, stderr) = run_autumn_fail(
+        dir.path(),
+        &["deploy", "up", "--only", "web-9.example.com"],
+        &[],
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("web-9.example.com"),
+        "the error must quote the unmatched host\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("web-1.example.com") && combined.contains("web-2.example.com"),
+        "the error must list the configured hosts\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_up_fails_fast_without_host() {
+    // #2274: forgetting `[deploy] host` is an ordinary first-run mistake, and `up`
+    // must report it the way `check` does — at the preflight boundary, before any
+    // local prerequisite work and long before anything indexes the fleet's first
+    // host. The tier-2 harness runs with an empty `PATH`, so this asserts the
+    // fail-fast boundary itself: the run must end in the missing-host preflight
+    // report, never a panic.
+    let dir = project("");
+    let (stdout, stderr) = run_autumn_fail(dir.path(), &["deploy", "up"], &[]);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !combined.contains("panicked"),
+        "a hostless `up` must fail cleanly, not panic\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("[deploy] host") && combined.contains("hosts"),
+        "the missing-host report must name both spellings\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }

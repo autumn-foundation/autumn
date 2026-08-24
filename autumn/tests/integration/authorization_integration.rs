@@ -746,3 +746,126 @@ async fn reversed_attribute_order_owner_passes_both() {
     let response = post_with_session(&client, "/notes-reversed/1", "sess-owner").await;
     assert_eq!(response.status, StatusCode::OK);
 }
+
+// ── #[authorize] bindings recorded in route metadata (#1627) ──
+//
+// The route macros record every `#[authorize("action", resource = Type)]` on a
+// handler into `ApiDoc::authorize_bindings`, which the routes dump carries as
+// `RouteInfo::authorize_bindings` for the security manifest's
+// `authorization_policies` dimension. These tests assert on the real handlers
+// above — the same functions the behavioural tests exercise — so a binding
+// disappears from the metadata exactly when the attribute disappears from the
+// source.
+
+/// Project a route's compile-time bindings onto comparable pairs.
+fn bindings_of(route: &autumn_web::Route) -> Vec<(&'static str, &'static str)> {
+    route
+        .api_doc
+        .authorize_bindings
+        .iter()
+        .map(|b| (b.action, b.resource))
+        .collect()
+}
+
+/// The same bindings after the routes-dump projection — the owned, sorted form
+/// the security manifest actually consumes.
+fn wire_bindings_of(route: autumn_web::Route) -> Vec<(String, String)> {
+    let infos = autumn_web::route_listing::collect_route_infos(
+        &[route],
+        &[autumn_web::route_listing::RouteSource::User],
+        &[],
+        &[],
+    )
+    .expect("these handlers declare no api_version, so version resolution cannot fail");
+    infos[0]
+        .authorize_bindings
+        .iter()
+        .map(|b| (b.action.clone(), b.resource.clone()))
+        .collect()
+}
+
+/// Shorthand for an expected wire-side binding pair.
+fn wire(action: &str, resource: &str) -> (String, String) {
+    (action.to_owned(), resource.to_owned())
+}
+
+/// `#[post]` outermost, `#[authorize]` still an unexpanded attribute below it:
+/// the route macro reads the arguments straight off the attribute.
+#[test]
+fn authorize_attr_below_route_macro_records_binding() {
+    let route = __autumn_route_info_update_note_attr();
+    assert_eq!(
+        bindings_of(&route),
+        vec![("update", "Note")],
+        "the #[authorize] attribute below #[post] must record its binding"
+    );
+    assert!(
+        route.api_doc.has_policy,
+        "has_policy stays the superset boolean it always was"
+    );
+    assert_eq!(
+        wire_bindings_of(__autumn_route_info_update_note_attr()),
+        vec![wire("update", "Note")],
+        "…and the binding must reach the routes dump the manifest reads"
+    );
+}
+
+/// `#[post]` + `#[secured]` + `#[authorize]`: the `#[secured]` guard between
+/// the two must not swallow the binding.
+#[test]
+fn stacked_secured_and_authorize_records_binding() {
+    let route = __autumn_route_info_update_note_stacked_with_secured();
+    assert_eq!(
+        bindings_of(&route),
+        vec![("update", "Note")],
+        "a binding stacked under #[secured] must survive"
+    );
+    assert_eq!(
+        wire_bindings_of(__autumn_route_info_update_note_stacked_with_secured()),
+        vec![wire("update", "Note")],
+    );
+}
+
+/// The reverse stacking (`#[authorize]` above `#[secured]`, both below
+/// `#[post]`) records the same binding: the metadata describes the handler, not
+/// the order its guards happen to be written in.
+#[test]
+fn authorize_above_secured_records_binding() {
+    let route = __autumn_route_info_update_note_reversed_attribute_order();
+    assert_eq!(
+        bindings_of(&route),
+        vec![("update", "Note")],
+        "attribute order must not change the recorded binding"
+    );
+    assert_eq!(
+        wire_bindings_of(__autumn_route_info_update_note_reversed_attribute_order()),
+        vec![wire("update", "Note")],
+    );
+}
+
+/// The falsifying half (D6): `authorize_bindings` is the *provable subset* of
+/// the `policy` boolean, so a handler that authorizes by hand — or one guarded
+/// only by `#[secured]` — records no binding at all.
+#[test]
+fn handler_without_authorize_has_no_bindings() {
+    let hand_written = __autumn_route_info_update_note_inline();
+    assert!(
+        bindings_of(&hand_written).is_empty(),
+        "a hand-written authorize::<Note>() call carries no recoverable binding"
+    );
+    assert!(
+        wire_bindings_of(__autumn_route_info_update_note_inline()).is_empty(),
+        "and it stays empty on the wire, so the key is elided from the dump"
+    );
+
+    let secured_only = __autumn_route_info_secured_admin_mutation();
+    assert!(
+        bindings_of(&secured_only).is_empty(),
+        "#[secured] is a role check, not a record-level policy binding"
+    );
+    assert_eq!(
+        secured_only.api_doc.required_roles,
+        &["admin"],
+        "…while its role guard is still recorded, unchanged"
+    );
+}

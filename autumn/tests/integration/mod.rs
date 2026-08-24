@@ -40,6 +40,8 @@ mod chaos_state_loom;
 mod circuit_breaker_integration;
 mod clock_integration;
 mod cluster_two_node;
+#[cfg(feature = "db")]
+mod commentable;
 mod commit_hook_drain;
 mod compile_fail;
 mod compression_middleware;
@@ -53,6 +55,12 @@ mod directory_shard_router;
 mod distributed_lock;
 mod download;
 mod duplicate_route_detection;
+// The origin-side half of the edge capsule (#1790). `cache-moka` supplies the
+// concrete `Cache` the `CacheEdgeKv` adapter is proven against; the wasm half
+// of the parity claim lives in the example crate's conformance suite, which
+// needs the `wasm32-wasip1` target and must never be swept in here.
+#[cfg(all(feature = "edge", feature = "cache-moka"))]
+mod edge_native;
 #[cfg(all(feature = "embed-assets", feature = "i18n"))]
 mod embed_assets_integration;
 #[cfg(feature = "db")]
@@ -63,6 +71,8 @@ mod error_reporting;
 mod events_integration;
 #[cfg(feature = "db")]
 mod experiments_pg_integration;
+#[cfg(feature = "db")]
+mod export_csv_list_count_profile;
 mod extractors;
 mod factory_fake;
 mod factory_integration;
@@ -144,6 +154,8 @@ mod mcp_repository;
 mod mcp_schema_derive;
 #[cfg(feature = "mcp")]
 mod mcp_streaming;
+#[cfg(feature = "mcp")]
+mod mcp_structured_query;
 mod middleware_introspection;
 mod middleware_pipeline;
 mod middleware_stack_depth;
@@ -168,6 +180,8 @@ mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_engine;
 #[cfg(feature = "offline-sync")]
+mod offline_sync_gc_tombstones_batching_perf;
+#[cfg(feature = "offline-sync")]
 mod offline_sync_pg;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_push_batching_perf;
@@ -184,11 +198,14 @@ mod pdf;
 #[cfg(feature = "db")]
 mod pg_tls;
 #[cfg(feature = "db")]
+mod position_repository_integration;
+#[cfg(feature = "db")]
 mod preload_scoping;
 mod problem_details;
 #[cfg(feature = "redis")]
 mod process_role_worker_gating;
 mod query_count_asserts;
+mod query_structured;
 #[cfg(feature = "redis")]
 mod queue_dedicated_capacity;
 mod range;
@@ -281,6 +298,10 @@ mod time_zone_integration;
 #[cfg(feature = "tls")]
 mod tls_serving;
 mod transactional_test_integration;
+#[cfg(all(feature = "db", feature = "i18n"))]
+mod translatable_model;
+#[cfg(feature = "i18n")]
+mod translatable_request;
 mod tx_isolation_retry_integration;
 #[cfg(feature = "db")]
 mod validate_merged_model;

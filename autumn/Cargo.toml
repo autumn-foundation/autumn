@@ -206,9 +206,22 @@ tls = ["dep:tokio-rustls", "dep:x509-parser", "dep:rustls", "dep:rustls-pki-type
 # placeholder), both pinned to `ring` so no second crypto backend enters the
 # graph.
 acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
+# Origin-side half of the edge capsule (issue #1790). Adds the `autumn_web::edge`
+# re-export of the `autumn-edge` crate, the `CacheEdgeKv` adapter that projects
+# the app's `Cache` onto the `EdgeKv` seam, and `AppBuilder::with_edge_kv`, which
+# installs the `EdgeCache` extension app-wide so an `#[edge]` handler serves
+# identically from the origin binary and from the wasm capsule.
+#
+# Additive and host-only: autumn-web is never compiled for wasm32 (the capsule
+# links `autumn-edge` alone), so this feature adds no target-conditional
+# dependency and changes nothing about the default build. The `#[edge]` /
+# `edge_routes!` macros are re-exported unconditionally — a route can be *marked*
+# without this feature; the feature is what wires the seam at the origin.
+edge = ["dep:autumn-edge"]
 
 [dependencies]
-autumn-macros = { version = "0.6.0", path = "../autumn-macros" }
+autumn-edge = { version = "0.7.0", path = "../autumn-edge", optional = true }
+autumn-macros = { version = "0.7.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
 # Best-effort ASCII folding for `slug::slugify` (issue #1260, e.g. "café" ->
@@ -403,7 +416,7 @@ features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
-  "reporting", "csv", "embed-assets", "offline-sync", "pdf",
+  "reporting", "csv", "embed-assets", "offline-sync", "pdf", "edge",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
@@ -425,6 +438,10 @@ harness = false
 # the exact commands.
 [[bench]]
 name = "request_pipeline"
+harness = false
+
+[[bench]]
+name = "form_render"
 harness = false
 
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
@@ -450,6 +467,14 @@ path = "tests/integration_tests.rs"
 [[test]]
 name = "config_alloc_gate"
 path = "tests/config_alloc_gate.rs"
+
+# Allocation gate for `auth::validate_password` on a realistic signup-form
+# workload (Bolt follow-up to #2198/#2205/#2214/#2232, looking at the password
+# path). Own binary for the same `allocation-counter` global-allocator reason
+# as `config_alloc_gate` above.
+[[test]]
+name = "password_policy_alloc_gate"
+path = "tests/password_policy_alloc_gate.rs"
 
 # SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
 # `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default

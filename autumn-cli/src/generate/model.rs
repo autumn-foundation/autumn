@@ -8,12 +8,13 @@ use super::dsl::{
     EncryptedMode, Field, FieldConstraints, FieldKind, IdType, parse_fields,
     randomized_equality_lookup_reason,
 };
-use super::emit::Plan;
+use super::emit::{Action, Plan, Revert};
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, add_search_down_sql_for, add_search_up_sql_for,
     append_schema_table_with_id_for, create_table_sql_with_metadata_and_id_for, drop_table_sql,
-    link_models_into_seed_bin,
+    ensure_autumn_web_feature, link_models_into_seed_bin, position_triggers_down_sql_for,
+    position_triggers_up_sql_for,
 };
 use super::{GenerateError, detect_backend, ensure_project_root, read_or_empty};
 
@@ -60,9 +61,20 @@ pub struct ModelMetadata {
     /// field is searchable.
     search_language: Option<String>,
     searchable: Vec<(String, char)>,
+    /// The author model `#[commentable(by = ...)]` should name (issue #1367),
+    /// detected from the project by
+    /// [`super::commentable::detect_author_model`]. `None` emits a bare
+    /// `#[commentable]`, which compiles — naming a model that does not exist
+    /// would not.
+    commentable_author: Option<String>,
 }
 
 impl ModelMetadata {
+    /// Record the author model `#[commentable(by = ...)]` will name.
+    pub fn set_commentable_author(&mut self, author: Option<&str>) {
+        self.commentable_author = author.map(str::to_owned);
+    }
+
     #[must_use]
     pub fn has_validator_rules(&self) -> bool {
         !self.validations.is_empty()
@@ -192,10 +204,19 @@ fn plan_model_with_options_impl(
     // see the function's contract for why `destroy` must skip it.
     if !for_revert {
         validate_encrypted_fields(&fields, options)?;
+        // Issue #1384: same reasoning as `validate_encrypted_fields` above —
+        // `--unique`/`--index`/`--searchable`/`--shard-key` are flag spellings
+        // of constraints the `{translatable}` parse-time cross-checks cannot
+        // see, because they are folded in after `parse_fields`.
+        validate_translatable_fields(&fields, options)?;
     }
     let pascal_name = pascal(name);
     validate_enum_field_collisions(&pascal_name, &fields)?;
-    let metadata = parse_model_metadata(&fields, options)?;
+    let mut metadata = parse_model_metadata(&fields, options)?;
+    // Issue #1367: `#[commentable(by = ...)]` may only name a model that
+    // actually exists in this project — naming a missing one would be a
+    // compile error in a file the author did not write.
+    metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
 
     // Determine the target app's database backend so the emitted DDL / diesel
     // schema is backend-aware (SQLite foundation, issue #1614). Full-text search
@@ -209,6 +230,14 @@ fn plan_model_with_options_impl(
     // `TEXT PRIMARY KEY` column that would accept NULL/omitted ids (AC #4).
     if backend == autumn_web::config::DatabaseBackend::Sqlite && options.id_type == IdType::Uuid {
         return Err(super::sqlite_uuid_pk_unsupported_error());
+    }
+    // `comments:commentable` on a UUID-keyed model would plan every file and
+    // then hand back a project that does not compile: the shared table stores
+    // `commentable_id BIGINT` and the generated helpers take `parent_id: i64`.
+    // Refused here, before anything is written, exactly as the SQLite/UUID
+    // combination above is.
+    if options.id_type == IdType::Uuid && fields.iter().any(|f| f.kind.is_commentable()) {
+        return Err(super::uuid_pk_commentable_unsupported_error());
     }
     // A few DSL field kinds still render to Rust model types with no working
     // diesel SQLite FromSql/ToSql (Uuid, Decimal, Enum). #1924 wired DateTime<Utc>
@@ -307,6 +336,59 @@ fn plan_model_with_options_impl(
         Some(options.id_type),
     )?;
 
+    // ── Polymorphic comments (issue #1367) ─────────────────────────────────
+    // The `comments:commentable` token also has to bring the shared comments
+    // table, or this model's `#[commentable]` compiles and then fails at
+    // runtime with `relation "comments" does not exist`. `generate scaffold`
+    // routes through its own copy of this because it owns the warnings; this is
+    // the `generate model` path, which the scaffold does not reach.
+    // On the destroy path the field tokens are not repeated, so the
+    // declaration is recovered from the model file instead.
+    if fields.iter().any(|f| f.kind.is_commentable())
+        || (for_revert && super::commentable::model_declares_commentable(project_root, &snake_name))
+    {
+        // On a revert the shared table stays as long as ANY other model still
+        // declares `#[commentable]`: it is one table for all of them.
+        let revert_would_orphan_another_model = for_revert
+            && super::commentable::another_model_is_still_commentable(project_root, &snake_name);
+        let emitted = !revert_would_orphan_another_model
+            && super::commentable::push_commentable_migration(
+                &mut plan,
+                project_root,
+                timestamp,
+                backend,
+                for_revert,
+            );
+        if !for_revert {
+            if emitted && super::commentable::conflicting_comments_table(project_root) {
+                plan.warn(format!(
+                    "This project already has a `{table}` table that is NOT the \
+                     polymorphic one — a `Comment` model scaffolded the ordinary way \
+                     creates exactly that, and the shared table takes the same name. \
+                     Both `CREATE TABLE {table}` statements will be applied and \
+                     `migrate` will stop on \"already exists\". Rename or drop the \
+                     existing table, or add `commentable_type TEXT NOT NULL` and \
+                     `commentable_id BIGINT NOT NULL` to it and delete the migration \
+                     just written.",
+                    table = super::commentable::COMMENTS_TABLE,
+                ));
+            }
+            plan.warn(if emitted {
+                format!(
+                    "Added the shared `{table}` table. Every `#[commentable]` model attaches \
+                     to it, so later models need no migration of their own.",
+                    table = super::commentable::COMMENTS_TABLE,
+                )
+            } else {
+                format!(
+                    "Reusing the existing `{table}` table — the polymorphic comments table \
+                     is shared across every `#[commentable]` model.",
+                    table = super::commentable::COMMENTS_TABLE,
+                )
+            });
+        }
+    }
+
     // (a) `src/models/<snake>.rs` + `src/models/mod.rs`
     let models_dir = project_root.join("src").join("models");
     let model_file = models_dir.join(format!("{snake_name}.rs"));
@@ -378,6 +460,49 @@ fn plan_model_with_options_impl(
             format!("{search_down}{}", drop_table_sql(&table)),
         )
     };
+    // Issue #1358: `position`-field maintenance triggers. Appended after the
+    // (optional) search scaffold, same reasoning as that block — these are
+    // independent DDL objects tied to the table, not the model struct/schema.rs
+    // surface. Empty string (byte-identical output) for the overwhelmingly
+    // common case of no `position` field.
+    let position_up = position_triggers_up_sql_for(backend, &table, &schema_fields);
+    let position_down = position_triggers_down_sql_for(backend, &table, &schema_fields);
+    let up_sql = if position_up.is_empty() {
+        up_sql
+    } else {
+        format!("{up_sql}\n{position_up}")
+    };
+    let down_sql = if position_down.is_empty() {
+        down_sql
+    } else {
+        format!("{position_down}{down_sql}")
+    };
+    // Issue #1367: the cascade a polymorphic foreign key cannot express. The
+    // shared `comments` table is created once and cannot know which models will
+    // later attach to it, so each commentable parent carries its own cleanup
+    // trigger. Without it a deleted parent leaves its thread behind —
+    // unreachable, and worse than unreachable if the id is ever reused, since
+    // the old comments would surface under the new record.
+    let commentable_up = if fields.iter().any(|f| f.kind.is_commentable()) {
+        super::commentable::parent_cleanup_sql(backend, &table, &pascal_name)
+    } else {
+        String::new()
+    };
+    let (up_sql, down_sql) = if commentable_up.is_empty() {
+        (up_sql, down_sql)
+    } else {
+        (
+            format!("{up_sql}{commentable_up}"),
+            // Dropped before the table so the trigger never outlives its
+            // target. The statement is backend-split: SQLite's DROP TRIGGER
+            // takes no `ON <table>`.
+            format!(
+                "{}{down_sql}",
+                super::commentable::parent_cleanup_down_sql(backend, &table)
+            ),
+        )
+    };
+
     plan.create(migration_dir.join("up.sql"), up_sql);
     plan.create(migration_dir.join("down.sql"), down_sql);
 
@@ -445,7 +570,52 @@ fn plan_model_with_options_impl(
     // planner, so it inherits the same wiring.
     plan_seed_bin_linking(&mut plan, project_root);
 
+    // (f) Issue #1384: a `{translatable}` column lowers to
+    // `autumn_web::i18n::Translated`, and `autumn_web::i18n` is behind the
+    // NON-DEFAULT `i18n` feature. Without this the generated model would fail
+    // to compile with `E0433: could not find 'i18n' in 'autumn_web'` across
+    // code the author did not write. `{encrypted}` — the closest precedent —
+    // needs no such wiring because `autumn_web::encryption` is ungated; this is
+    // the first field-DSL modifier that lowers to a gated module. Mirrors what
+    // `generate scaffold --i18n` already does for the view lane.
+    if schema_fields.iter().any(Field::is_translatable) {
+        plan_autumn_web_feature(&mut plan, project_root, "i18n");
+    }
+
     Ok(plan)
+}
+
+/// Ensure `autumn-web`'s `features = [...]` list in the project `Cargo.toml`
+/// contains `feature`, folding into any `Modify` action already staged for that
+/// file so two planners cannot clobber each other's edit.
+fn plan_autumn_web_feature(plan: &mut Plan, project_root: &Path, feature: &str) {
+    let cargo_path = project_root.join("Cargo.toml");
+    let base = plan
+        .actions
+        .iter()
+        .rev()
+        .find_map(|a| match a {
+            Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| read_or_empty(&cargo_path));
+    let updated = ensure_autumn_web_feature(&base, feature);
+    if updated != base {
+        plan.actions.retain(|a| a.path() != cargo_path);
+        plan.modify(cargo_path, updated);
+    }
+    // Register the revert UNCONDITIONALLY, not only when the edit changed
+    // something. `autumn destroy model` recomputes this same plan, and by then
+    // the feature is already present — so a revert pushed inside the `if` above
+    // would never be registered on the path that needs it, and `destroy` would
+    // leave the non-default feature enabled forever. `owner_dir` is
+    // `src/models`, so the feature survives until the LAST model is destroyed
+    // (the same ownership rule the scaffold and channel generators use).
+    plan.push_revert(Revert::CargoAutumnWebFeature {
+        path: project_root.join("Cargo.toml"),
+        feature: feature.to_owned(),
+        owner_dir: Some(project_root.join("src/models")),
+    });
 }
 
 /// Add a `Modify` action linking `src/models/` + `src/schema.rs` into
@@ -1755,6 +1925,31 @@ pub fn parse_model_metadata(
             .or_insert_with(|| "0".to_owned());
     }
 
+    // Issue #1358: a `position` column is likewise DB-managed and excluded
+    // from `New{Model}`/`Update{Model}` (`#[position]`), so the SQL column
+    // needs a `DEFAULT` too, or every create would fail the NOT NULL
+    // constraint before the repository's insert hook ever runs. `DEFAULT 0`
+    // is a placeholder only — the generated repository's insert hook
+    // overwrites it with the real next-in-scope value inside the same
+    // transaction as the insert (see `autumn-macros`' `position_after_insert`
+    // splice), the same two-step "DB default, then app-managed overwrite"
+    // shape `lock_version` uses above. Recording it here also drops the
+    // column from the scaffold's generated HTML form, same as `lock_version`.
+    //
+    // Issue #1367: a `commentable` counter column is the same shape — DB
+    // managed, `#[default]` on the model, `DEFAULT 0` in SQL — except that the
+    // overwrite comes from the framework's comment write path rather than an
+    // insert hook. `NOT NULL DEFAULT 0` is load-bearing rather than tidy: the
+    // maintenance is `SET c = c + 1`, and `NULL + 1` is `NULL`.
+    for f in fields {
+        if f.kind.is_server_managed() {
+            metadata
+                .defaults
+                .entry(f.name.clone())
+                .or_insert_with(|| "0".to_owned());
+        }
+    }
+
     // Full-text search's generated `search_page` (in the repository macro)
     // hardcodes an `i64`/`BigInt` primary key: it collects `SearchId { id: i64 }`
     // rows into a `Vec<i64>`, filters with `id.eq_any(&ids)`, and dedups through
@@ -1830,6 +2025,52 @@ pub fn parse_model_metadata(
     }
 
     Ok(metadata)
+}
+
+/// Reject every `{translatable}` combination the `#[model]` macro refuses,
+/// expressed through a *flag* rather than a `{…}` modifier (issue #1384).
+///
+/// `parse_field` already rejects the modifier spellings (`:unique`, a nullable
+/// column, `{encrypted}`, `:states(…)`, the `#[validate]` fan-out). The flags
+/// below are folded in **after** parsing — `--unique` by `apply_unique_flags`,
+/// the others straight from `options` — so without this pass they slip through
+/// and produce either a UNIQUE index over a JSON container (silently useless)
+/// or a generated project that does not compile.
+///
+/// Generation-only: `autumn destroy` recomputes the same plan and must not be
+/// blocked by a refusal that only makes sense when emitting.
+///
+/// # Errors
+/// Returns [`GenerateError::Config`] naming the field, the offending flag, and
+/// why the combination cannot work.
+pub fn validate_translatable_fields(
+    fields: &[Field],
+    options: &ModelOptions,
+) -> Result<(), GenerateError> {
+    for field in fields.iter().filter(|f| f.is_translatable()) {
+        let name = &field.name;
+        if field.unique {
+            return Err(GenerateError::Config(format!(
+                "field '{name}' is `{{translatable}}` and cannot be `--unique`: the index would                  compare whole per-locale containers, so identical text translated into                  different locale sets would never collide, and the derived `find_by_{name}`                  lookup could never match. Put the uniqueness on a non-translatable column                  (e.g. a `slug`)."
+            )));
+        }
+        if options.indexes.iter().any(|i| i.trim() == *name) {
+            return Err(GenerateError::Config(format!(
+                "field '{name}' is `{{translatable}}` and cannot be `--index`ed: an equality                  index over a JSON container matches whole containers, never a single locale's                  value (the `#[model]` macro refuses `#[indexed]` + `#[translatable]` for the                  same reason). Drop it from `--index`."
+            )));
+        }
+        if options.searchable.iter().any(|s| s.trim() == *name) {
+            return Err(GenerateError::Config(format!(
+                "field '{name}' is `{{translatable}}` and cannot be `--searchable`: full-text                  search indexes the stored column, which is a JSON container — the index would                  match locale tags and JSON punctuation, not the prose (the `#[model]` macro                  refuses `#[searchable]` + `#[translatable]`). Drop it from `--searchable`, or                  keep a separate non-translatable column to search."
+            )));
+        }
+        if options.shard_key.as_deref().map(str::trim) == Some(name.as_str()) {
+            return Err(GenerateError::Config(format!(
+                "field '{name}' is `{{translatable}}` and cannot be the `--shard-key`: the                  shard is chosen by hashing the column value, and a container whose bytes                  change every time any locale is edited would move the row between shards.                  Shard on a stable column (e.g. `tenant_id`)."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Reject every `{encrypted}` combination the encryption runtime or the
@@ -2344,7 +2585,14 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
         | FieldKind::References
         // A slug's value is always auto-derived from its `from` field on
         // create (issue #1260), never a static default.
-        | FieldKind::Slug => Err(format!(
+        | FieldKind::Slug
+        // A position's value is always assigned by the repository on insert
+        // (issue #1358), never a static default.
+        | FieldKind::Position
+        // A commentable counter always starts at 0 and is thereafter moved by
+        // the framework (issue #1367); the migration's own `DEFAULT 0` is the
+        // only default it may have.
+        | FieldKind::Commentable => Err(format!(
             "defaults for {} fields are not supported by `autumn generate` yet",
             field.rust_type()
         )),
@@ -2549,7 +2797,35 @@ fn render_model_file(
             out.push('\n');
         }
     }
+    // Struct-level `#[commentable(...)]` (issue #1367) — emitted by the
+    // `comments:commentable` DSL token. It is what brings the repository's
+    // `add_comment`/`comment_thread`/`delete_comment` helpers into existence
+    // and registers this model with the framework's generic comment router.
+    //
+    // `by = User` is the convention `autumn generate auth` produces; a project
+    // whose author model is named differently changes that one word. No
+    // `author_name` is emitted on purpose: the generated `User` carries an
+    // `email`, and defaulting a *public* display name to it would leak
+    // addresses into every rendered thread.
+    if fields.iter().any(|f| f.kind.is_commentable()) {
+        out.push_str(
+            "// Threaded, polymorphic comments (#1367): one shared `comments` table,\n\
+             // keyed on `(commentable_type, commentable_id)`, attaches to any number of\n\
+             // models. Point `by` at this app's author model, and add\n\
+             // `author_name = <column>` to render display names instead of `user #id`.\n",
+        );
+    }
     out.push_str("#[autumn_web::model]\n");
+    // `#[commentable]` is consumed by `#[model]`, so it must sit BELOW it —
+    // attribute macros are applied top-down, and above it the compiler would
+    // report `cannot find attribute commentable in this scope`.
+    if let Some(counter) = fields.iter().find(|f| f.kind.is_commentable()) {
+        let by = metadata
+            .commentable_author
+            .as_deref()
+            .map_or_else(String::new, |author| format!("by = {author}, "));
+        let _ = writeln!(out, "#[commentable({by}counter_cache = {})]", counter.name);
+    }
     // Struct-level `#[searchable(language = "…")]` (issue #1319) opts the model
     // into full-text search; the per-field `#[searchable(weight = "…")]` below
     // declare which columns feed the `search_vector` and at what rank weight.
@@ -2583,6 +2859,13 @@ fn render_model_file(
         // `DEFAULT 0` separately, so the migration still backfills the INSERT.
         if is_lock_version_column(f) {
             out.push_str("    #[lock_version]\n");
+        } else if f.kind.is_position() {
+            // Issue #1358: `#[position]` marks the column DB-managed
+            // (excluded from `New{Model}`/`Update{Model}`, like
+            // `#[lock_version]`) — the generated repository assigns and
+            // maintains its value entirely; see `excluded_from_new` in
+            // `autumn-macros`.
+            out.push_str("    #[position]\n");
         } else if metadata.defaults.contains_key(&f.name) {
             out.push_str("    #[default]\n");
         }
@@ -2619,6 +2902,16 @@ fn render_model_file(
                 out.push_str("    #[encrypted(deterministic)]\n");
             }
             None => {}
+        }
+        // Issue #1384: a `{translatable}` DSL modifier re-emits as the
+        // `#[translatable]` attribute the `#[model]` macro parses. The field's
+        // Rust type (`autumn_web::i18n::Translated`, from `Field::rust_type`)
+        // is what carries the behaviour; the attribute is what registers the
+        // column and emits the `<field>_localized` / `available_locales(..)`
+        // accessors. Absent for a monolingual column — that no-op path is what
+        // keeps non-translatable output byte-identical.
+        if f.is_translatable() {
+            out.push_str("    #[translatable]\n");
         }
         // Issue #1255: a `richtext` column renders as a bare `String`, exactly
         // like `String`/`Text`, so nothing in the emitted source would otherwise
@@ -2674,6 +2967,19 @@ mod tests {
     fn project() -> TempDir {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        tmp
+    }
+
+    /// A project whose `Cargo.toml` actually declares `autumn-web`, so the
+    /// feature-wiring pass has a dependency line to edit (the bare `project()`
+    /// fixture has none, which no real `autumn new` project ever does).
+    fn project_with_autumn_web_dep() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { version = \"0.6\" }\n",
+        )
+        .unwrap();
         tmp
     }
 
@@ -3046,6 +3352,215 @@ mod tests {
             "got:\n{model}"
         );
         assert!(model.contains("pub status: String,"), "got:\n{model}");
+    }
+
+    // ── `{translatable}` per-locale content (issue #1384) ───────────────────
+
+    /// AC7 (negative half): a model with no `{translatable}` field renders
+    /// exactly as before — the attribute never leaks into the ordinary path.
+    #[test]
+    fn model_file_without_translatable_field_emits_no_attribute() {
+        let fields =
+            crate::generate::dsl::parse_fields(&["title:String".into(), "body:Text".into()])
+                .unwrap();
+        let model = render_model_file_for_test("Post", "posts", &fields);
+        assert!(
+            !model.contains("#[translatable"),
+            "nothing declared translatable, so no attribute should render; got:\n{model}"
+        );
+        assert!(!model.contains("Translated"), "got:\n{model}");
+    }
+
+    /// AC1: the DSL token re-emits as `#[translatable]` on a field typed as the
+    /// per-locale container, and a plain column in the same model is untouched.
+    #[test]
+    fn model_file_emits_translatable_attribute_and_container_type() {
+        let fields = crate::generate::dsl::parse_fields(&[
+            "title:String{translatable}".into(),
+            "body:Text{translatable}".into(),
+            "slug:String".into(),
+        ])
+        .unwrap();
+        let model = render_model_file_for_test("Post", "posts", &fields);
+        assert!(
+            model.contains("    #[translatable]\n    pub title: autumn_web::i18n::Translated,"),
+            "got:\n{model}"
+        );
+        assert!(
+            model.contains("    #[translatable]\n    pub body: autumn_web::i18n::Translated,"),
+            "got:\n{model}"
+        );
+        assert!(model.contains("    pub slug: String,"), "got:\n{model}");
+        assert!(
+            !model.contains("#[translatable]\n    pub slug"),
+            "plain column must not pick up the attribute; got:\n{model}"
+        );
+    }
+
+    /// AC1 + AC6 end to end through the real planner: the emitted model,
+    /// `schema.rs` entry, migration DDL and `Cargo.toml` feature all land
+    /// together, so a `generate model` with a translatable column produces a
+    /// project that actually builds.
+    #[test]
+    fn translatable_model_plan_emits_model_schema_migration_and_feature() {
+        let tmp = project_with_autumn_web_dep();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String{translatable}".into(), "slug:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            model.contains("    #[translatable]\n    pub title: autumn_web::i18n::Translated,"),
+            "model: {model}"
+        );
+
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(schema.contains("title -> Text,"), "schema: {schema}");
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("title TEXT NOT NULL DEFAULT '{}'"),
+            "up.sql: {up}"
+        );
+        // AC6: what the generator actually wrote classifies as safe.
+        assert!(
+            crate::migrate::safety::is_safe(&crate::migrate::safety::classify_sql(&up)),
+            "generated migration must classify safe: {up}"
+        );
+
+        // The container type lives behind the non-default `i18n` feature.
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("i18n"),
+            "generate model must enable autumn-web's `i18n` feature: {cargo}"
+        );
+    }
+
+    /// #1384 (Codex round 5): `autumn destroy model` must be able to take the
+    /// non-default `i18n` feature back out. The revert has to be registered
+    /// unconditionally — on the destroy path the feature is already present, so
+    /// the Cargo.toml edit is a no-op and a revert pushed only when the edit
+    /// changed something would never exist where it is needed.
+    #[test]
+    fn a_translatable_model_registers_a_revert_for_the_i18n_feature() {
+        let tmp = project_with_autumn_web_dep();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String{translatable}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let has_feature_revert = plan.reverts.iter().any(|r| {
+            matches!(
+                r,
+                crate::generate::emit::Revert::CargoAutumnWebFeature { feature, owner_dir, .. }
+                    if feature == "i18n"
+                        && owner_dir.as_deref() == Some(&tmp.path().join("src/models"))
+            )
+        });
+        assert!(
+            has_feature_revert,
+            "expected a CargoAutumnWebFeature revert owned by src/models, got {:?}",
+            plan.reverts
+        );
+
+        // Recomputing the plan against a project that ALREADY has the feature
+        // (the destroy path) still registers it.
+        plan.execute(Flags::default()).unwrap();
+        let replanned = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String{translatable}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            replanned.reverts.iter().any(|r| matches!(
+                r,
+                crate::generate::emit::Revert::CargoAutumnWebFeature { feature, .. }
+                    if feature == "i18n"
+            )),
+            "the revert must survive a replan where the feature is already present"
+        );
+    }
+
+    /// A model with no translatable column must not gain the `i18n` feature.
+    #[test]
+    fn a_plain_model_plan_does_not_enable_the_i18n_feature() {
+        let tmp = project_with_autumn_web_dep();
+        let before = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap_or_default();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let after = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap_or_default();
+        assert_eq!(before.contains("i18n"), after.contains("i18n"));
+    }
+
+    /// The flag spellings bypass `parse_field`'s cross-checks (they are folded
+    /// in afterwards), so they need their own refusal — otherwise `--unique`
+    /// ships a UNIQUE index over a JSON container and `--index`/`--searchable`
+    /// emit a model the `#[model]` macro rejects.
+    #[test]
+    fn translatable_columns_refuse_the_flag_spellings_of_their_restrictions() {
+        let cases: [(&str, ModelOptions); 4] = [
+            (
+                "--unique",
+                ModelOptions {
+                    uniques: vec!["title".into()],
+                    ..ModelOptions::default()
+                },
+            ),
+            (
+                "--index",
+                ModelOptions {
+                    indexes: vec!["title".into()],
+                    ..ModelOptions::default()
+                },
+            ),
+            (
+                "--searchable",
+                ModelOptions {
+                    searchable: vec!["title".into()],
+                    ..ModelOptions::default()
+                },
+            ),
+            (
+                "--shard-key",
+                ModelOptions {
+                    shard_key: Some("title".into()),
+                    ..ModelOptions::default()
+                },
+            ),
+        ];
+        for (flag, options) in cases {
+            let tmp = project();
+            let err = plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String{translatable}".into()],
+                "20260427000000",
+                &options,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("translatable"), "{flag}: {err}");
+            assert!(err.contains("title"), "{flag}: {err}");
+        }
     }
 
     // ── `{encrypted}` at-rest column encryption (issue #1340) ───────────────
@@ -6089,6 +6604,50 @@ autumn-web = \"0.3\"\n";
             up.contains("lock_version INTEGER NOT NULL DEFAULT 0"),
             "got:\n{up}"
         );
+    }
+
+    #[test]
+    fn position_field_emits_position_attribute() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Task",
+            &["title:String".into(), "rank:position".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/task.rs")).unwrap();
+        assert!(
+            model.contains("#[position]\n    pub rank: i64,"),
+            "a `position` column must carry the framework's `#[position]` attribute so it is \
+             excluded from New/UpdateTask: {model}"
+        );
+    }
+
+    #[test]
+    fn position_column_gets_sql_default_zero() {
+        // `#[position]` excludes the column from `NewTask`, so the INSERT
+        // omits it — without a SQL DEFAULT every create would fail on the
+        // NOT NULL constraint before the repository's insert hook overwrites
+        // the placeholder with the real next-in-scope value.
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Task",
+            &["title:String".into(), "rank:position".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_tasks/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("rank BIGINT NOT NULL DEFAULT 0"), "got:\n{up}");
     }
 
     #[test]

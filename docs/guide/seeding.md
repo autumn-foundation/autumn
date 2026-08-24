@@ -29,7 +29,7 @@ named `seed`.
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-web = { version = "0.5", features = ["seed"] }
+autumn-web = { version = "0.7", features = ["seed"] }
 
 [[bin]]
 name = "seed"

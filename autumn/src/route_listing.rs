@@ -252,6 +252,25 @@ impl<'de> Deserialize<'de> for RouteSource {
     }
 }
 
+/// One record-level authorization binding declared by `#[authorize]`.
+///
+/// Wire twin of [`AuthorizeBinding`](crate::openapi::AuthorizeBinding): the
+/// same `("action", resource = Type)` pair in owned form, so it round-trips
+/// through the routes-dump JSON. (The `*Info` suffix follows [`RouteInfo`].)
+///
+/// [`Self::resource`] is the identifier exactly as written at the use site,
+/// not a resolved path, and never the `impl Policy<_>` that serves the check:
+/// that binding is established from the `PolicyRegistry` at boot
+/// (`AppBuilder::policy::<R, _>(...)`) and is not knowable at build time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AuthorizeBindingInfo {
+    /// Action verb passed to the policy check — the first `#[authorize]`
+    /// argument, recorded verbatim.
+    pub action: String,
+    /// Resource type identifier exactly as written in `resource = Type`.
+    pub resource: String,
+}
+
 /// Metadata for a single mounted route, suitable for display and JSON export.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteInfo {
@@ -298,6 +317,17 @@ pub struct RouteInfo {
     /// `None` for routes without a known location.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
+    /// Record-level authorization bindings proven from the handler's
+    /// `#[authorize]` attributes — one `(action, resource)` entry per binding,
+    /// sorted and deduplicated. Empty for routes that declare none.
+    ///
+    /// This is the provable *subset* of [`Self::policy`], never a replacement
+    /// for it: that boolean is also `true` for a hand-written `__check_policy`
+    /// call in the body and for a `policy = ...` repository auto-API, neither
+    /// of which carries a binding a macro can recover. A route with
+    /// `policy: true` and no bindings is therefore normal, not a defect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorize_bindings: Vec<AuthorizeBindingInfo>,
 }
 
 /// `skip_serializing_if` helper: elide `false` booleans from JSON output.
@@ -410,6 +440,41 @@ fn source_location_of(api_doc: &crate::openapi::ApiDoc) -> Option<String> {
         .then(|| format!("{}:{}", api_doc.source_file, api_doc.source_line))
 }
 
+/// The route's `#[authorize]` bindings, canonicalized for the wire.
+///
+/// Framework routes are pre-classified and carry no handler metadata, so —
+/// like [`classify`], which short-circuits before it reads the `ApiDoc` at all
+/// — they never report a binding.
+///
+/// The list is sorted by `(action, resource)` and then deduplicated. That
+/// diverges deliberately from `roles`/`scopes`, which preserve `#[secured]`
+/// attribute source order: the audit's falsifiability claim over these
+/// bindings is a *set* claim ("removing an `#[authorize]` removes exactly that
+/// binding"), so a stable set serves it better than a stable sequence, and the
+/// manifest diff stays byte-deterministic — the same contract
+/// [`SecurityDump::from_config`] holds every list it emits to. Sorting must run
+/// *first*: [`Vec::dedup`] only collapses adjacent duplicates, so two equal
+/// bindings written apart in the source would otherwise both survive.
+fn authorize_bindings_of(
+    source: &RouteSource,
+    api_doc: &crate::openapi::ApiDoc,
+) -> Vec<AuthorizeBindingInfo> {
+    if matches!(source, RouteSource::Framework) {
+        return Vec::new();
+    }
+    let mut bindings: Vec<AuthorizeBindingInfo> = api_doc
+        .authorize_bindings
+        .iter()
+        .map(|binding| AuthorizeBindingInfo {
+            action: binding.action.to_owned(),
+            resource: binding.resource.to_owned(),
+        })
+        .collect();
+    bindings.sort();
+    bindings.dedup();
+    bindings
+}
+
 /// Helper type alias representing version name, status string, and sunset opt-out flag.
 type RouteVersionInfo = (Option<String>, Option<String>, Option<bool>);
 
@@ -476,6 +541,7 @@ pub fn collect_route_infos(
             resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
         let (classification, roles, scopes, policy) =
             classify(&source, &route.api_doc, route.repository.as_ref());
+        let authorize_bindings = authorize_bindings_of(&source, &route.api_doc);
         infos.push(RouteInfo {
             method: route.method.to_string(),
             path: route.path.to_owned(),
@@ -491,6 +557,7 @@ pub fn collect_route_infos(
             policy,
             module: module_of(&route.api_doc),
             location: source_location_of(&route.api_doc),
+            authorize_bindings,
         });
     }
 
@@ -516,6 +583,7 @@ pub fn collect_route_infos(
                 policy,
                 module: module_of(&route.api_doc),
                 location: source_location_of(&route.api_doc),
+                authorize_bindings: authorize_bindings_of(&group.source, &route.api_doc),
             });
         }
     }
@@ -756,6 +824,14 @@ mod tests {
 
     fn make_route(method: Method, path: &'static str, name: &'static str) -> Route {
         make_route_with(method, path, name, dummy_api_doc())
+    }
+
+    /// Shorthand for an expected wire-side `#[authorize]` binding.
+    fn binding(action: &str, resource: &str) -> AuthorizeBindingInfo {
+        AuthorizeBindingInfo {
+            action: action.to_owned(),
+            resource: resource.to_owned(),
+        }
     }
 
     /// Build a [`RepositoryApiMeta`](crate::route::RepositoryApiMeta) with the
@@ -1120,6 +1196,173 @@ mod tests {
         let route = make_route_with(Method::GET, "/widgets", "list_widgets", api_doc);
         let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
         assert_eq!(infos[0].module.as_deref(), Some("myapp::widgets"));
+    }
+
+    // ── #[authorize] bindings (#1627) ──────────────────────────────────────
+
+    /// The wire list is a *set* of bindings, not a transcript of the source:
+    /// unlike `roles`/`scopes` (which keep `#[secured]` attribute order), it is
+    /// sorted by `(action, resource)` and deduplicated so the manifest diff is
+    /// byte-deterministic and the audit's "removing an `#[authorize]` removes
+    /// exactly that binding" claim is order-independent.
+    #[test]
+    fn authorize_bindings_are_sorted_and_deduped() {
+        let api_doc = crate::openapi::ApiDoc {
+            has_policy: true,
+            authorize_bindings: &[
+                crate::openapi::AuthorizeBinding {
+                    action: "update",
+                    resource: "Note",
+                },
+                crate::openapi::AuthorizeBinding {
+                    action: "delete",
+                    resource: "Note",
+                },
+                crate::openapi::AuthorizeBinding {
+                    action: "update",
+                    resource: "Note",
+                },
+                crate::openapi::AuthorizeBinding {
+                    action: "update",
+                    resource: "Comment",
+                },
+            ],
+            ..dummy_api_doc()
+        };
+
+        let bindings = authorize_bindings_of(&RouteSource::User, &api_doc);
+
+        assert_eq!(
+            bindings,
+            vec![
+                binding("delete", "Note"),
+                binding("update", "Comment"),
+                binding("update", "Note"),
+            ],
+            "bindings must be sorted by (action, resource) and deduplicated"
+        );
+    }
+
+    /// `Vec::dedup` only collapses *adjacent* equal elements, so a helper that
+    /// deduped before sorting would leave the duplicate pair in place. Pin the
+    /// order of the two operations with duplicates that are separated in the
+    /// source.
+    #[test]
+    fn authorize_bindings_dedup_runs_after_sorting() {
+        let api_doc = crate::openapi::ApiDoc {
+            authorize_bindings: &[
+                crate::openapi::AuthorizeBinding {
+                    action: "show",
+                    resource: "Note",
+                },
+                crate::openapi::AuthorizeBinding {
+                    action: "delete",
+                    resource: "Note",
+                },
+                crate::openapi::AuthorizeBinding {
+                    action: "show",
+                    resource: "Note",
+                },
+            ],
+            ..dummy_api_doc()
+        };
+
+        assert_eq!(
+            authorize_bindings_of(&RouteSource::User, &api_doc),
+            vec![binding("delete", "Note"), binding("show", "Note")],
+        );
+    }
+
+    /// Framework routes are pre-classified and carry no handler metadata, so
+    /// they never report a binding — mirroring `classify`, which short-circuits
+    /// on [`RouteSource::Framework`] before reading the `ApiDoc` at all.
+    #[test]
+    fn framework_routes_carry_no_authorize_bindings() {
+        let api_doc = crate::openapi::ApiDoc {
+            has_policy: true,
+            authorize_bindings: &[crate::openapi::AuthorizeBinding {
+                action: "update",
+                resource: "Note",
+            }],
+            ..dummy_api_doc()
+        };
+
+        assert!(
+            authorize_bindings_of(&RouteSource::Framework, &api_doc).is_empty(),
+            "a framework route must never report an #[authorize] binding"
+        );
+    }
+
+    /// End-to-end through `collect_route_infos`: the bindings recorded by the
+    /// route macros reach the `RouteInfo` the dump serializes.
+    #[test]
+    fn collect_carries_authorize_bindings() {
+        let api_doc = crate::openapi::ApiDoc {
+            has_policy: true,
+            authorize_bindings: &[crate::openapi::AuthorizeBinding {
+                action: "update",
+                resource: "Note",
+            }],
+            ..dummy_api_doc()
+        };
+        let route = make_route_with(Method::POST, "/notes/{id}", "update_note", api_doc);
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+
+        assert_eq!(infos[0].authorize_bindings, vec![binding("update", "Note")]);
+        assert!(infos[0].policy, "a bound route is still policy-guarded");
+    }
+
+    /// Field 15 follows the field 9-14 convention: elided when empty, so the
+    /// first fourteen keys of every existing dump entry stay byte-stable and an
+    /// *old* consumer sees the JSON it already knows.
+    #[test]
+    fn route_info_elides_empty_authorize_bindings() {
+        let info = RouteInfo {
+            method: "GET".to_owned(),
+            path: "/health".to_owned(),
+            handler: "health".to_owned(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert!(
+            value.get("authorize_bindings").is_none(),
+            "an empty binding list must not be serialized: {value}"
+        );
+
+        let bound = RouteInfo {
+            authorize_bindings: vec![binding("update", "Note")],
+            ..info
+        };
+        let value = serde_json::to_value(&bound).unwrap();
+        assert_eq!(
+            value["authorize_bindings"],
+            serde_json::json!([{ "action": "update", "resource": "Note" }]),
+        );
+        let decoded: RouteInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.authorize_bindings, vec![binding("update", "Note")]);
+    }
+
+    /// The other half of the compatibility contract: `#[serde(default)]` lets a
+    /// *new* consumer read a dump produced before the field existed, rather
+    /// than failing the whole parse on a missing key.
+    #[test]
+    fn route_info_deserializes_old_dump_without_bindings() {
+        let old = serde_json::json!({
+            "method": "POST",
+            "path": "/notes/{id}",
+            "handler": "update_note",
+            "source": "user",
+            "middleware": [],
+            "classification": "gated",
+            "policy": true,
+        });
+
+        let decoded: RouteInfo = serde_json::from_value(old).unwrap();
+        assert!(
+            decoded.authorize_bindings.is_empty(),
+            "a dump without the key must decode to an empty list"
+        );
+        assert!(decoded.policy, "the pre-existing keys must still decode");
     }
 
     #[test]

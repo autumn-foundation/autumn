@@ -1,0 +1,5 @@
+error: `#[commentable]` requires a single `i64` primary key: model `Post` declares a composite key (`tenant`, `id`), and `commentable_id` is one column — it cannot address a composite-keyed row
+  --> tests/compile-fail/model_commentable_composite_key.rs:15:3
+   |
+15 | #[commentable(by = User)]
+   |   ^^^^^^^^^^^

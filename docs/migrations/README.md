@@ -15,6 +15,7 @@ request and in the publish gate. See
 - [`0.4.0.md`](0.4.0.md) — `autumn-web 0.3.x → 0.4.0`
 - [`0.5.0.md`](0.5.0.md) — `autumn-web 0.4.x → 0.5.0`
 - [`0.6.0.md`](0.6.0.md) — `autumn-web 0.5.x → 0.6.0`
+- [`0.7.0.md`](0.7.0.md) — `autumn-web 0.6.x → 0.7.0`
 - [`next.md`](next.md) — rolling draft for `## [Unreleased]`, renamed to
   `<version>.md` at release time
 
@@ -70,6 +71,35 @@ tooling, policy docs — append an explicit suppression naming its reason:
 It is greppable and shows up in the diff, so using it on a real break is a
 reviewable act rather than a silent one.
 
+## Classifying a breaking change: the automation label
+
+Every breaking change in a guide carries one line saying how much of it a
+machine can apply, so a reader knows before starting whether the upgrade is a
+command or an afternoon (issue #1629):
+
+```markdown
+**Automation:** `auto` — `autumn upgrade` rewrites every call site; codemod
+`0.6.0-repository-with-pool-untracked`.
+```
+
+| Label | Meaning | What the reader does |
+|-------|---------|----------------------|
+| `auto` | Safe by construction — a rename or an import move. `autumn upgrade` rewrites every reachable call site. | Run `autumn upgrade --apply` and read the diff. |
+| `review` | `autumn upgrade` rewrites it, and flags **every** rewritten site in the summary. | Run it, then read each flagged site. |
+| `manual` | No mechanical rewrite. This guide section is the fix path. | Follow the section. |
+
+An `auto`/`review` entry names the shipped codemod id from the registry in
+[`autumn-cli/src/upgrade/migrations.rs`](../../autumn-cli/src/upgrade/migrations.rs);
+that registry is what `autumn upgrade` actually runs, so the guide cannot
+promise a codemod nobody wrote. A `manual` label on a *rename-level* change —
+the class the tool can apply safely — has to say why it stays manual. Semantic
+and behavioural changes need no justification: the label is the whole answer.
+
+Nothing is silently skipped at either end. A change the codemod cannot reach —
+a call site inside a macro invocation, a generated file — is reported by
+`autumn upgrade` with `file:line` under `manual`, pointing at the guide section
+named in the registry entry.
+
 ## Process for a breaking release
 
 1. **Open the draft with the first breaking change.** The first PR that lands a
@@ -79,10 +109,12 @@ reviewable act rather than a silent one.
    breaking-change PR appends a section with *before* / *after* snippets and the
    compiler error the user will see. For a contributor opening a
    breaking-change PR, that section is part of "done".
-3. **Perform the guide-only walk-through before publishing.** Upgrade an app
-   scaffolded with `autumn new` on the *previous* release using only the guide —
-   no changelog, no source reading — and record the result in the guide's
-   `### Guide-only upgrade walkthrough` section. See
+3. **Perform the walk-through before publishing, codemod-first.** Upgrade an
+   app scaffolded with `autumn new` on the *previous* release: run
+   `autumn upgrade` **before any manual step**, then follow the guide — and
+   only the guide, no changelog, no source reading — for the changes labelled
+   `review` and `manual`. Record both the codemod invocation and the result in
+   the guide's `### Guide-only upgrade walkthrough` section. See
    [`docs/release-checklist.md`](../release-checklist.md).
 4. **Rename at release.** `next.md` becomes `<version>.md`, its version
    placeholders are filled in, the index above is updated, and the changelog
@@ -129,6 +161,25 @@ It fails when:
   empty-section checks — the release checklist recreates it from
   `TEMPLATE.md` after every release, and the template ships placeholders by
   design. Every exemption lapses the moment it is renamed to `<version>.md`.
+- a change in a guide that reads as a rename or an import move carries no
+  `**Automation:**` label; any label whose value is not `auto`/`review`/`manual`
+  (a bare `auto` outside a code span is not a label); an `auto`/`review` label
+  that names no codemod id shipped in
+  `autumn-cli/src/upgrade/migrations.rs` **for that release** (an id from an
+  earlier release does not cover a later one, and an id shown only inside a
+  fenced sample is a sample); or a rename-level change labelled `manual` with no
+  reason given (issue #1629). Entries are read under every `## ` section, not
+  only `## Breaking changes`, and rename detection is textual and errs toward
+  asking: a false positive costs one sentence, a false negative strands users on
+  a hand-edit the tool could have done. A released guide that ships an
+  `auto`/`review` codemod must also record a `- **Codemod:**` line under
+  `### Guide-only upgrade walkthrough`, because the walk-through is performed
+  codemod-first. An entry carrying the `migration-guide-gate` suppression is
+  exempt from all of this, exactly as for the changelog checks above.
+
+  That *every* breaking change carries a label — not only the rename-level ones
+  the shell gate insists on — is asserted over this repository's guides as a set
+  by `autumn-cli`'s `upgrade_codemod` test suite;
 - `next.md` is missing. The rolling draft is permanent, not conditional on
   there being an unreleased break: this file and `STABILITY.md` both link it by
   name, and nothing here checks markdown links;

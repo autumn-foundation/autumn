@@ -313,7 +313,15 @@ pub fn create_table_sql_with_metadata_and_id_for(
         if let Some(target) = f.reference_table() {
             let _ = write!(sql, " REFERENCES {target}(id)");
         }
-        if let Some(default) = defaults.get(&f.name) {
+        // An explicit `--default` wins; otherwise a field kind that carries its
+        // own storage default supplies one. Today that is `{translatable}`
+        // (#1384): the per-locale container column is `NOT NULL` and starts as
+        // the empty JSON object `'{}'`.
+        if let Some(default) = defaults
+            .get(&f.name)
+            .map(String::as_str)
+            .or_else(|| f.sql_default())
+        {
             let _ = write!(sql, " DEFAULT {default}");
         }
         if let Some(check) = enum_check_suffix(f) {
@@ -340,6 +348,14 @@ pub fn create_table_sql_with_metadata_and_id_for(
         .filter(|f| f.unique)
         .map(|f| f.name.as_str())
         .collect();
+    // A `position` field (issue #1358) is never `:unique` (rejected at parse
+    // time) and gets its own composite/plain index below, not the generic
+    // single-column loop — excluded here the same way `unique_fields` is.
+    let position_fields: BTreeSet<&str> = fields
+        .iter()
+        .filter(|f| f.kind.is_position())
+        .map(|f| f.name.as_str())
+        .collect();
     let mut index_fields = indexes.clone();
     for f in fields {
         if f.kind.is_reference() {
@@ -351,7 +367,9 @@ pub fn create_table_sql_with_metadata_and_id_for(
     // field (or an auto-added `references` index, though `unique` +
     // `references` together is an unusual combination) must not also emit a
     // redundant plain index (issue #1032).
-    index_fields.retain(|name| !unique_fields.contains(name.as_str()));
+    index_fields.retain(|name| {
+        !unique_fields.contains(name.as_str()) && !position_fields.contains(name.as_str())
+    });
     for field_name in &index_fields {
         let _ = writeln!(
             sql,
@@ -362,7 +380,447 @@ pub fn create_table_sql_with_metadata_and_id_for(
     for field_name in &unique_fields {
         sql.push_str(&unique_index_sql(table, field_name, fields));
     }
+    // A `position` field gets an index automatically (issue #1358): scans
+    // ordering by it (the scaffold index view, `move_*` neighbor lookups) are
+    // the entire point of the column. When scoped (`{scope:col}`), the index
+    // is composite `(scope, position)` — every real query filters by scope
+    // first — rather than a single-column index on `position` alone.
+    for f in fields {
+        if f.kind.is_position() {
+            match f.constraints.scope.as_deref() {
+                Some(scope) => {
+                    let _ = writeln!(
+                        sql,
+                        "CREATE INDEX idx_{table}_{scope}_{position} ON {table} ({scope}, {position});",
+                        position = f.name
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        sql,
+                        "CREATE INDEX idx_{table}_{position} ON {table} ({position});",
+                        position = f.name
+                    );
+                }
+            }
+        }
+    }
     sql
+}
+
+/// Backend-aware `up.sql` triggers that maintain a `position` field's
+/// contiguous `0..len-1` ordering (issue #1358): assign the next value on
+/// insert, compact the remaining rows' positions on delete — hard delete
+/// always, plus soft-delete (a `deleted_at` transition from `NULL` to
+/// non-`NULL`) when `fields` declares a `deleted_at` column (the `--soft-delete`
+/// virtual field `generate::model` appends — see `append_soft_delete_field`)
+/// — append a RESTORED row (the reverse `deleted_at` transition, reachable
+/// from the scaffold's Trash page) to the end of its live sequence — and,
+/// for a scoped position field, compact the old scope and re-append at the
+/// end of the new one when an ordinary `UPDATE` reassigns the scope FK
+/// (e.g. dragging a Kanban card to a different board).
+///
+/// Implemented as database triggers rather than application-level repository
+/// hooks so the invariant holds for **every** insert/delete path (the
+/// generated repository, raw SQL, an admin panel, a seed script) — not just
+/// the one Rust code path that happens to run it. The column's migration
+/// `DEFAULT 0` (see `generate::model`'s auto-inserted default) is a
+/// placeholder only: `Postgres` corrects it before the row is ever written
+/// (`BEFORE INSERT`, mutating `NEW` directly — cheaper than a follow-up
+/// `UPDATE`); `SQLite` triggers cannot mutate `NEW`, so its `AFTER INSERT`
+/// trigger corrects the just-inserted row with a single `UPDATE ... WHERE
+/// id = new.id`, still inside the same statement/transaction, so the
+/// placeholder is never visible outside it. The `restore` trigger mirrors
+/// this exactly (same advisory lock, same append-at-the-end `MAX + 1`
+/// read), just keyed off the `deleted_at` transition instead of `INSERT`.
+///
+/// Compaction only shifts still-live rows (`deleted_at IS NULL` on the
+/// soft-delete branch) — a restored row does not get its old position
+/// back (some other, still-live row may since have taken it); it is
+/// appended fresh at the end of its scope's live sequence instead, like
+/// any other row re-entering the live set.
+///
+/// Returns an empty string when `fields` has no `position` column (the
+/// common case), so a model without one gets byte-identical migration output.
+///
+/// Known limitation (Codex review, issue #1358): the function/trigger names
+/// this emits (`{table}_{position}_assign`, `_compact`, `_compact_soft`,
+/// `_rescope`, each with a `_trg` trigger-name counterpart) are NOT given
+/// [`unique_index_name`]'s truncate-and-hash treatment for Postgres's
+/// 63-byte (`NAMEDATALEN - 1`) identifier limit — a `table`/`position` pair
+/// long enough to make two of these names collide on truncation would fail
+/// the migration with a duplicate-object error (or, for the two trigger
+/// names, install one that shadows the other on the same table) rather
+/// than a clear "name too long" message. Applying the same treatment here
+/// would need the identical scheme reproduced bit-for-bit in
+/// `autumn-macros`' `position_impl_methods`, whose `move_to` embeds the
+/// SAME `{table}_{position}_assign` string as its `pg_advisory_xact_lock`
+/// key and must keep contending on the identical lock Postgres actually
+/// stored — a cross-crate synchronization this generator does not
+/// currently attempt for any other identifier. In practice this requires a
+/// `table`+`position` combined length in the high 40s of bytes, well past
+/// typical naming; out of scope for this slice.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn position_triggers_up_sql_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+) -> String {
+    let has_soft_delete = fields.iter().any(|f| f.name == "deleted_at");
+    let mut out = String::new();
+    for f in fields {
+        if !f.kind.is_position() {
+            continue;
+        }
+        let position = &f.name;
+        let scope = f.constraints.scope.as_deref();
+        match backend {
+            DatabaseBackend::Postgres => {
+                let scope_cond_new =
+                    scope.map_or_else(|| "TRUE".to_owned(), |s| format!("\"{s}\" = NEW.\"{s}\""));
+                let scope_cond_old =
+                    scope.map_or_else(|| "TRUE".to_owned(), |s| format!("\"{s}\" = OLD.\"{s}\""));
+                // The insert-assign trigger's `MAX(position)` scan must skip
+                // soft-deleted rows: a soft-deleted row's position is stale
+                // (excluded from the live compaction that ran when it was
+                // deleted — see `compact_soft` below), so counting it here
+                // would inflate the next assignment and leave a gap in the
+                // live sequence the very first time a live insert follows a
+                // soft delete.
+                let live_cond_new = if has_soft_delete {
+                    format!("{scope_cond_new} AND deleted_at IS NULL")
+                } else {
+                    scope_cond_new.clone()
+                };
+                // A transaction-scoped advisory lock, keyed by table+scope
+                // (a constant second key when unscoped, so every insert into
+                // the table serializes against every other). Without it,
+                // two concurrent `BEFORE INSERT`s under READ COMMITTED can
+                // both read the same `MAX(position)` before either commits
+                // and be assigned the same value — there is no UNIQUE
+                // constraint on `(scope, position)` to catch it (positions
+                // are only ever *maintained* uniquely, by these triggers and
+                // `move_to`'s own locking; nothing at the schema level
+                // enforces it, matching how `move_to` itself achieves
+                // exclusivity through locking rather than a constraint).
+                // `pg_advisory_xact_lock` auto-releases at commit/rollback,
+                // so it composes with the rest of the inserting transaction
+                // with no separate unlock statement.
+                let lock_key2 = scope.map_or_else(
+                    || "0".to_owned(),
+                    |s| format!("hashtext(NEW.\"{s}\"::text)"),
+                );
+                let _ = writeln!(
+                    out,
+                    "CREATE FUNCTION {table}_{position}_assign() RETURNS TRIGGER AS $$\n\
+                     BEGIN\n  \
+                     PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), {lock_key2});\n  \
+                     NEW.\"{position}\" := COALESCE((SELECT MAX(\"{position}\") + 1 FROM \"{table}\" WHERE {live_cond_new}), 0);\n  \
+                     RETURN NEW;\n\
+                     END;\n\
+                     $$ LANGUAGE plpgsql;"
+                );
+                let _ = writeln!(
+                    out,
+                    "CREATE TRIGGER {table}_{position}_assign_trg BEFORE INSERT ON \"{table}\" \
+                     FOR EACH ROW EXECUTE FUNCTION {table}_{position}_assign();"
+                );
+                // Same advisory lock key as the assign trigger, keyed by
+                // `OLD`'s scope value (unchanged from `NEW`'s for a row that
+                // isn't itself being re-scoped): without it, a concurrent
+                // insert's `SELECT MAX(position)` (a plain read, not
+                // row-locked) can run against a snapshot taken before this
+                // compaction's shift commits, computing a next-position that
+                // leaves a gap where the compacted range used to end. Taking
+                // the same lock here makes insert and delete-compaction on
+                // the same scope fully serialize, closing that window.
+                let lock_key2_old = scope.map_or_else(
+                    || "0".to_owned(),
+                    |s| format!("hashtext(OLD.\"{s}\"::text)"),
+                );
+                // On a `--soft-delete` model this trigger only ever fires
+                // from `purge` — every row it hard-deletes was *already*
+                // soft-deleted (the scaffold's purge handler only reaches
+                // rows filtered to `deleted_at IS NOT NULL`), whose position
+                // was already excluded from the live sequence by
+                // `compact_soft` at the time it was soft-deleted. Running
+                // this compaction unconditionally would shift the live rows
+                // a SECOND time for the same removal, producing a duplicate
+                // live position. Skip entirely when `OLD.deleted_at` is set;
+                // on a non-soft-delete model there is no such column and
+                // this trigger is the only compaction path, so it always runs.
+                let (compact_guard_open, compact_guard_close) = if has_soft_delete {
+                    ("IF OLD.deleted_at IS NULL THEN\n    ", "\n  END IF;")
+                } else {
+                    ("", "")
+                };
+                let _ = writeln!(
+                    out,
+                    "CREATE FUNCTION {table}_{position}_compact() RETURNS TRIGGER AS $$\n\
+                     BEGIN\n  \
+                     {compact_guard_open}PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), {lock_key2_old});\n    \
+                     UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > OLD.\"{position}\";{compact_guard_close}\n  \
+                     RETURN OLD;\n\
+                     END;\n\
+                     $$ LANGUAGE plpgsql;"
+                );
+                let _ = writeln!(
+                    out,
+                    "CREATE TRIGGER {table}_{position}_compact_trg AFTER DELETE ON \"{table}\" \
+                     FOR EACH ROW EXECUTE FUNCTION {table}_{position}_compact();"
+                );
+                if has_soft_delete {
+                    let _ = writeln!(
+                        out,
+                        "CREATE FUNCTION {table}_{position}_compact_soft() RETURNS TRIGGER AS $$\n\
+                         BEGIN\n  \
+                         IF OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL THEN\n    \
+                         PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), {lock_key2_old});\n    \
+                         UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > OLD.\"{position}\" AND deleted_at IS NULL;\n  \
+                         END IF;\n  \
+                         RETURN NEW;\n\
+                         END;\n\
+                         $$ LANGUAGE plpgsql;"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "CREATE TRIGGER {table}_{position}_compact_soft_trg AFTER UPDATE OF deleted_at ON \"{table}\" \
+                         FOR EACH ROW EXECUTE FUNCTION {table}_{position}_compact_soft();"
+                    );
+                    // Codex review: `compact_soft` only ever handles the
+                    // soft-delete transition (`deleted_at` NULL -> non-NULL).
+                    // The generated repository's `restore()` — reachable from
+                    // the scaffold's Trash page — performs the OPPOSITE
+                    // transition, and without a trigger of its own the
+                    // restored row re-enters the live set still carrying
+                    // whatever stale position it had when it was soft-deleted
+                    // — a position some other, still-live row may since have
+                    // taken, producing a duplicate. Mirrors the insert-assign
+                    // trigger exactly (same advisory lock key, same
+                    // append-at-the-end `MAX(position) + 1` read, now keyed
+                    // off `NEW`'s scope since a restore never itself changes
+                    // scope) rather than trying to recreate the row's old
+                    // position, which this slice does not attempt to
+                    // preserve across a soft-delete/restore round trip.
+                    let _ = writeln!(
+                        out,
+                        "CREATE FUNCTION {table}_{position}_restore() RETURNS TRIGGER AS $$\n\
+                         BEGIN\n  \
+                         PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), {lock_key2});\n  \
+                         NEW.\"{position}\" := COALESCE((SELECT MAX(\"{position}\") + 1 FROM \"{table}\" WHERE {live_cond_new}), 0);\n  \
+                         RETURN NEW;\n\
+                         END;\n\
+                         $$ LANGUAGE plpgsql;"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "CREATE TRIGGER {table}_{position}_restore_trg BEFORE UPDATE OF deleted_at ON \"{table}\" \
+                         FOR EACH ROW WHEN (OLD.deleted_at IS NOT NULL AND NEW.deleted_at IS NULL) \
+                         EXECUTE FUNCTION {table}_{position}_restore();"
+                    );
+                }
+                // Issue #1358 review: an ordinary `UPDATE` can reassign a
+                // scoped row's scope FK (e.g. dragging a Kanban card to a
+                // different board via `board_id`) — nothing about `position`
+                // makes that column immutable. Without this trigger the row
+                // keeps its old position, leaving a gap in the old scope and
+                // usually a duplicate in the new one. `BEFORE UPDATE` (not
+                // `AFTER`) because only a `BEFORE` trigger can set `NEW`'s
+                // position; the compaction UPDATE and the append-to-new-scope
+                // assignment both run inside the same function/statement, so
+                // a hard crash mid-trigger can't leave one done without the
+                // other. Locks BOTH the old and new scope's advisory key —
+                // always in ascending-hash order, mirroring `move_to`'s
+                // fixed id-ascending row-lock order — so two rows swapping
+                // scopes concurrently can't deadlock each other; a rescope
+                // racing a plain insert/delete/move_to on either scope is
+                // still safe (same lock key, Postgres's deadlock detector
+                // aborts one side of any residual cycle rather than
+                // corrupting data). Skipped for soft-deleted rows on either
+                // side of the change (`compact_soft`/restore already own
+                // that transition) and for unscoped position fields (no
+                // scope column exists to reassign).
+                if let Some(scope_col) = scope {
+                    let rescope_when = if has_soft_delete {
+                        format!(
+                            "NEW.\"{scope_col}\" IS DISTINCT FROM OLD.\"{scope_col}\" AND \
+                             OLD.deleted_at IS NULL AND NEW.deleted_at IS NULL"
+                        )
+                    } else {
+                        format!("NEW.\"{scope_col}\" IS DISTINCT FROM OLD.\"{scope_col}\"")
+                    };
+                    let _ = writeln!(
+                        out,
+                        "CREATE FUNCTION {table}_{position}_rescope() RETURNS TRIGGER AS $$\n\
+                         BEGIN\n  \
+                         IF hashtext(OLD.\"{scope_col}\"::text) <= hashtext(NEW.\"{scope_col}\"::text) THEN\n    \
+                         PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), hashtext(OLD.\"{scope_col}\"::text));\n    \
+                         PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), hashtext(NEW.\"{scope_col}\"::text));\n  \
+                         ELSE\n    \
+                         PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), hashtext(NEW.\"{scope_col}\"::text));\n    \
+                         PERFORM pg_advisory_xact_lock(hashtext('{table}_{position}_assign'), hashtext(OLD.\"{scope_col}\"::text));\n  \
+                         END IF;\n  \
+                         UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > OLD.\"{position}\";\n  \
+                         NEW.\"{position}\" := COALESCE((SELECT MAX(\"{position}\") + 1 FROM \"{table}\" WHERE {live_cond_new}), 0);\n  \
+                         RETURN NEW;\n\
+                         END;\n\
+                         $$ LANGUAGE plpgsql;"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "CREATE TRIGGER {table}_{position}_rescope_trg BEFORE UPDATE OF \"{scope_col}\" ON \"{table}\" \
+                         FOR EACH ROW WHEN ({rescope_when}) EXECUTE FUNCTION {table}_{position}_rescope();"
+                    );
+                }
+            }
+            DatabaseBackend::Sqlite => {
+                let scope_cond_new =
+                    scope.map_or_else(|| "1=1".to_owned(), |s| format!("\"{s}\" = new.\"{s}\""));
+                let scope_cond_old =
+                    scope.map_or_else(|| "1=1".to_owned(), |s| format!("\"{s}\" = old.\"{s}\""));
+                // Same reasoning as the Postgres arm: skip soft-deleted rows
+                // when computing the next position, or a soft delete
+                // followed by a live insert leaves a gap in the live
+                // sequence.
+                let live_cond_new = if has_soft_delete {
+                    format!("{scope_cond_new} AND deleted_at IS NULL")
+                } else {
+                    scope_cond_new.clone()
+                };
+                let _ = writeln!(
+                    out,
+                    "CREATE TRIGGER \"{table}_{position}_assign\" AFTER INSERT ON \"{table}\" BEGIN\n  \
+                     UPDATE \"{table}\" SET \"{position}\" = (SELECT COALESCE(MAX(\"{position}\"), -1) + 1 FROM \"{table}\" WHERE {live_cond_new} AND id != new.id) WHERE id = new.id;\n\
+                     END;"
+                );
+                // Same reasoning as the Postgres arm: on a `--soft-delete`
+                // model this only ever fires from `purge`, whose target was
+                // already soft-deleted and already compacted out of the live
+                // sequence by `compact_soft` — running this unconditionally
+                // would shift the live rows a second time for the same
+                // removal. SQLite triggers support a `WHEN` clause directly
+                // (unlike Postgres, no `IF`/`END IF` needed inside the body).
+                let compact_when = if has_soft_delete {
+                    " WHEN old.deleted_at IS NULL"
+                } else {
+                    ""
+                };
+                let _ = writeln!(
+                    out,
+                    "CREATE TRIGGER \"{table}_{position}_compact\" AFTER DELETE ON \"{table}\"{compact_when} BEGIN\n  \
+                     UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > old.\"{position}\";\n\
+                     END;"
+                );
+                if has_soft_delete {
+                    let _ = writeln!(
+                        out,
+                        "CREATE TRIGGER \"{table}_{position}_compact_soft\" AFTER UPDATE OF deleted_at ON \"{table}\" \
+                         WHEN old.deleted_at IS NULL AND new.deleted_at IS NOT NULL BEGIN\n  \
+                         UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > old.\"{position}\" AND deleted_at IS NULL;\n\
+                         END;"
+                    );
+                    // Same reasoning as the Postgres `restore` trigger above:
+                    // a restored row must be appended to the end of its
+                    // (unchanged) scope's live sequence, mirroring the
+                    // insert-assign trigger's own AFTER-the-fact correction
+                    // (SQLite can't mutate NEW directly either way).
+                    let _ = writeln!(
+                        out,
+                        "CREATE TRIGGER \"{table}_{position}_restore\" AFTER UPDATE OF deleted_at ON \"{table}\" \
+                         WHEN old.deleted_at IS NOT NULL AND new.deleted_at IS NULL BEGIN\n  \
+                         UPDATE \"{table}\" SET \"{position}\" = (SELECT COALESCE(MAX(\"{position}\"), -1) + 1 FROM \"{table}\" WHERE {live_cond_new} AND id != new.id) WHERE id = new.id;\n\
+                         END;"
+                    );
+                }
+                // Same reasoning as the Postgres `rescope` trigger above: an
+                // ordinary `UPDATE` reassigning a scoped row's scope FK must
+                // compact the old scope's gap and append the row to the end
+                // of the new scope, or the contiguous invariant breaks on a
+                // common "move card to another board" operation. `SQLite`
+                // can't mutate `NEW` in a `BEFORE` trigger, so this runs
+                // `AFTER UPDATE` and corrects the already-written row with a
+                // follow-up `UPDATE ... WHERE id = new.id`, mirroring the
+                // `_assign` trigger's own after-the-fact correction. No
+                // locking needed — `SQLite` has none, and write-write
+                // correctness rests on `scoped_immediate_transaction`'s
+                // `BEGIN IMMEDIATE` the same way every other position
+                // trigger here does.
+                if let Some(scope_col) = scope {
+                    let rescope_when = if has_soft_delete {
+                        format!(
+                            "old.\"{scope_col}\" IS NOT new.\"{scope_col}\" AND \
+                             old.deleted_at IS NULL AND new.deleted_at IS NULL"
+                        )
+                    } else {
+                        format!("old.\"{scope_col}\" IS NOT new.\"{scope_col}\"")
+                    };
+                    let _ = writeln!(
+                        out,
+                        "CREATE TRIGGER \"{table}_{position}_rescope\" AFTER UPDATE OF \"{scope_col}\" ON \"{table}\" \
+                         WHEN {rescope_when} BEGIN\n  \
+                         UPDATE \"{table}\" SET \"{position}\" = \"{position}\" - 1 WHERE {scope_cond_old} AND \"{position}\" > old.\"{position}\";\n  \
+                         UPDATE \"{table}\" SET \"{position}\" = (SELECT COALESCE(MAX(\"{position}\"), -1) + 1 FROM \"{table}\" WHERE {live_cond_new} AND id != new.id) WHERE id = new.id;\n\
+                         END;"
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `down.sql` companion to [`position_triggers_up_sql_for`].
+///
+/// `SQLite` triggers are dropped automatically when their table is dropped,
+/// so this is a no-op there — matching [`sqlite_add_search_down_sql`]'s
+/// analogous table-owned-object handling. `Postgres` triggers are also
+/// dropped automatically with the table, but their backing `FUNCTION`
+/// objects are standalone and must be dropped explicitly — `CASCADE` so
+/// this is safe to run before or after the table drop regardless of
+/// ordering.
+#[must_use]
+pub fn position_triggers_down_sql_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+) -> String {
+    let has_soft_delete = fields.iter().any(|f| f.name == "deleted_at");
+    let mut out = String::new();
+    if backend != DatabaseBackend::Postgres {
+        return out;
+    }
+    for f in fields {
+        if !f.kind.is_position() {
+            continue;
+        }
+        let position = &f.name;
+        let _ = writeln!(
+            out,
+            "DROP FUNCTION IF EXISTS {table}_{position}_assign() CASCADE;"
+        );
+        let _ = writeln!(
+            out,
+            "DROP FUNCTION IF EXISTS {table}_{position}_compact() CASCADE;"
+        );
+        if has_soft_delete {
+            let _ = writeln!(
+                out,
+                "DROP FUNCTION IF EXISTS {table}_{position}_compact_soft() CASCADE;"
+            );
+            let _ = writeln!(
+                out,
+                "DROP FUNCTION IF EXISTS {table}_{position}_restore() CASCADE;"
+            );
+        }
+        if f.constraints.scope.is_some() {
+            let _ = writeln!(
+                out,
+                "DROP FUNCTION IF EXISTS {table}_{position}_rescope() CASCADE;"
+            );
+        }
+    }
+    out
 }
 
 /// A leading comment block naming this table's `{encrypted}` columns (issue
@@ -696,6 +1154,24 @@ pub fn add_columns_up_sql_for(
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields {
+        // A `position` field (issue #1358) can't be retrofit onto an existing
+        // table through this codegen path: `NOT NULL` with no per-field
+        // default (like every other column here) would leave every existing
+        // row sharing the same value, silently violating the contiguous
+        // `0..len-1`-per-scope invariant until the first `move_*` call
+        // happens to fix it up. Reject with a clear message rather than emit
+        // a migration that "succeeds" into a broken ordering.
+        if f.kind.is_position() {
+            return Err(GenerateError::Config(format!(
+                "cannot add `position` column `{}` to table `{table}` via `generate migration \
+                 Add...To...`: an existing table's rows would all need a contiguous `0..len-1` \
+                 backfill, which this codegen path does not generate. Add the `position` field \
+                 when first scaffolding the model (`generate model`/`generate scaffold`), or \
+                 hand-write a migration that adds the column and backfills it with \
+                 `ROW_NUMBER() OVER (...) - 1` before making it NOT NULL.",
+                f.name
+            )));
+        }
         // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a
         // DEFAULT (issue #1614 AC #4). This path carries no per-field default,
         // so any NOT NULL added column is rejected at generate time rather than
@@ -710,13 +1186,22 @@ pub fn add_columns_up_sql_for(
         // column arrives. `DEFAULT 0` also backfills existing rows in one
         // statement, which is why this add needs neither the blocking-safety
         // banner nor the SQLite refusal below.
+        //
+        // Issue #1384: a `{translatable}` column is the same shape of retrofit
+        // — the container column is `NOT NULL` and defaults to the empty JSON
+        // object `'{}'`, a constant that backfills every existing row in one
+        // statement. So, like `lock_version`, it needs neither the blocking
+        // banner nor the SQLite refusal, and `autumn migrate check` classifies
+        // the result as plain `ADD COLUMN NOT NULL DEFAULT <constant>` — safe.
         let lock_version_default = super::model::is_lock_version_column(f);
-        if backend == DatabaseBackend::Sqlite && !f.nullable && !lock_version_default {
+        let inherent_default = f.sql_default();
+        let has_default = lock_version_default || inherent_default.is_some();
+        if backend == DatabaseBackend::Sqlite && !f.nullable && !has_default {
             return Err(super::sqlite_add_not_null_without_default_error(
                 table, &f.name,
             ));
         }
-        if !f.nullable && !lock_version_default {
+        if !f.nullable && !has_default {
             let _ = writeln!(
                 out,
                 "-- autumn-safety: potentially-blocking \
@@ -732,6 +1217,8 @@ pub fn add_columns_up_sql_for(
         );
         if lock_version_default {
             out.push_str(" DEFAULT 0");
+        } else if let Some(default) = inherent_default {
+            let _ = write!(out, " DEFAULT {default}");
         }
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
@@ -1106,7 +1593,10 @@ pub fn remove_columns_down_sql_for(
         // contract. Postgres is unaffected (its output stays byte-for-byte
         // identical), and a NOT NULL column inside CREATE TABLE is likewise
         // fine on SQLite.
-        if backend == DatabaseBackend::Sqlite && !f.nullable {
+        // Issue #1384: a `{translatable}` column carries its own constant
+        // default (`'{}'`), so the rollback's re-add is valid on SQLite too.
+        let inherent_default = f.sql_default();
+        if backend == DatabaseBackend::Sqlite && !f.nullable && inherent_default.is_none() {
             return Err(super::sqlite_add_not_null_without_default_error(
                 table, &f.name,
             ));
@@ -1118,6 +1608,9 @@ pub fn remove_columns_down_sql_for(
             f.sql_column_type_for(backend),
             f.sql_nullability()
         );
+        if let Some(default) = inherent_default {
+            let _ = write!(out, " DEFAULT {default}");
+        }
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
         }
@@ -1896,7 +2389,7 @@ pub fn remove_mail_preview_from_app(existing: &str, mailer_type: &str) -> String
 /// `(`, i.e. depth 1) for the matching closing paren, returning the index
 /// just past it. `None` if the parens never balance (malformed/truncated
 /// input — destroy never guesses).
-fn find_balanced_close_paren(src: &str, start: usize) -> Option<usize> {
+const fn find_balanced_close_paren(src: &str, start: usize) -> Option<usize> {
     let bytes = src.as_bytes();
     let mut depth = 1usize;
     let mut i = start;
@@ -4946,12 +5439,134 @@ pub fn parse_model_search_config_for_table(
 }
 
 #[cfg(test)]
+// Test inputs like `"rank:position{scope:board_id}"` are literal DSL tokens
+// passed to `parse_field`, not format strings — the `{…}` is the scaffold's
+// own constraint-modifier syntax under test.
+#[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
     use crate::generate::dsl::parse_field;
 
     fn fields(tokens: &[&str]) -> Vec<Field> {
         tokens.iter().map(|t| parse_field(t).unwrap()).collect()
+    }
+
+    // ── #1384: `{translatable}` storage migration ───────────────────────────
+
+    #[test]
+    fn create_table_gives_a_translatable_column_the_empty_container_default() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "posts",
+            &fields(&["title:String{translatable}", "views:i64"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("title TEXT NOT NULL DEFAULT '{}'"),
+            "translatable column needs the empty-container default: {sql}"
+        );
+        // A plain column on the same table is untouched (AC7).
+        assert!(sql.contains("views BIGINT NOT NULL"), "{sql}");
+        assert!(!sql.contains("views BIGINT NOT NULL DEFAULT"), "{sql}");
+    }
+
+    #[test]
+    fn schema_block_keeps_a_translatable_column_as_text() {
+        let block = schema_table_block_with_id(
+            "posts",
+            &fields(&["title:String{translatable}"]),
+            IdType::BigSerial,
+        );
+        assert!(block.contains("title -> Text,"), "{block}");
+    }
+
+    #[test]
+    fn add_column_emits_the_default_and_skips_the_blocking_banner() {
+        let sql = add_columns_up_sql("posts", &fields(&["title:String{translatable}"]), "");
+        assert!(
+            sql.contains("ALTER TABLE posts ADD COLUMN title TEXT NOT NULL DEFAULT '{}'"),
+            "{sql}"
+        );
+        assert!(
+            !sql.contains("autumn-safety: potentially-blocking"),
+            "a constant default backfills in one statement — no banner: {sql}"
+        );
+    }
+
+    #[test]
+    fn add_column_is_accepted_on_sqlite() {
+        // SQLite rejects `ADD COLUMN … NOT NULL` without a DEFAULT; the
+        // container default is exactly what makes this portable.
+        let sql = add_columns_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["title:String{translatable}"]),
+            "",
+        )
+        .expect("SQLite ADD COLUMN accepted for a defaulted column");
+        assert!(sql.contains("title TEXT NOT NULL DEFAULT '{}'"), "{sql}");
+    }
+
+    #[test]
+    fn remove_column_rollback_restores_the_default() {
+        let sql = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["title:String{translatable}"]),
+            "",
+        )
+        .expect("SQLite rollback accepted for a defaulted column");
+        assert!(sql.contains("title TEXT NOT NULL DEFAULT '{}'"), "{sql}");
+    }
+
+    /// AC6: `autumn migrate check` classifies the emitted migration — and
+    /// classifies it as **safe**. No new unclassified operation type.
+    #[test]
+    fn migrate_check_classifies_the_translatable_migration_as_safe() {
+        use crate::migrate::safety::{classify_sql, is_safe};
+
+        for sql in [
+            create_table_sql_with_metadata_and_id(
+                "posts",
+                &fields(&["title:String{translatable}"]),
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                IdType::BigSerial,
+            ),
+            add_columns_up_sql("posts", &fields(&["title:String{translatable}"]), ""),
+        ] {
+            let findings = classify_sql(&sql);
+            assert!(
+                is_safe(&findings),
+                "translatable storage must classify as safe, got {findings:?} for:\n{sql}"
+            );
+        }
+    }
+
+    /// The classification test above is only meaningful if the classifier would
+    /// actually *say something* about this DDL when the default is missing —
+    /// otherwise "no findings" would pass for a statement the classifier simply
+    /// does not understand. Pin the discriminating case: drop the container
+    /// default and the very same `ADD COLUMN` becomes a recognised
+    /// `PotentiallyBlocking` finding, not an unclassified one.
+    #[test]
+    fn the_container_default_is_what_makes_the_add_column_safe() {
+        use crate::migrate::safety::{RiskLevel, classify_sql, is_safe};
+
+        let undefaulted = "ALTER TABLE posts ADD COLUMN title TEXT NOT NULL;";
+        let findings = classify_sql(undefaulted);
+        assert!(!is_safe(&findings), "control case must not be safe");
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.risk == RiskLevel::PotentiallyBlocking
+                    && f.operation.contains("ADD COLUMN NOT NULL")),
+            "the classifier must recognise the shape, not merely stay silent: {findings:?}"
+        );
+        // And with the default the same statement is classified clean.
+        let defaulted = add_columns_up_sql("posts", &fields(&["title:String{translatable}"]), "");
+        assert!(is_safe(&classify_sql(&defaulted)));
     }
 
     #[test]
@@ -5127,6 +5742,599 @@ mod tests {
             "the FK index and an explicit --index on the same field must not \
              produce two CREATE INDEX statements:\n{sql}"
         );
+    }
+
+    // ── position field: NOT NULL BIGINT column + auto index (issue #1358) ──
+
+    #[test]
+    fn create_table_sql_emits_position_column_not_null_bigint() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "tasks",
+            &fields(&["title:String", "rank:position"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("rank BIGINT NOT NULL"),
+            "expected a NOT NULL BIGINT position column; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unscoped_position_gets_single_column_index() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "tasks",
+            &fields(&["rank:position"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_tasks_rank ON tasks (rank);"),
+            "expected a plain index on the unscoped position column; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_scoped_position_gets_composite_index() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "tasks",
+            &fields(&["board:references", "rank:position{scope:board_id}"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_tasks_board_id_rank ON tasks (board_id, rank);"),
+            "expected a composite (scope, position) index; got:\n{sql}"
+        );
+        // The composite index replaces a plain single-column one — no
+        // redundant `CREATE INDEX ... (rank)` on top of it.
+        assert!(
+            !sql.contains("CREATE INDEX idx_tasks_rank ON tasks (rank);"),
+            "must not also emit a redundant plain index on the position column alone:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_position_scope_reference_still_gets_its_own_fk_index() {
+        // The scope column is itself a `references` field, so it keeps its
+        // own single-column FK index (issue #1026) in addition to the new
+        // composite (scope, position) index — the two serve different query
+        // shapes (join on the FK alone vs. ordered scan within a scope).
+        let sql = create_table_sql_with_metadata_and_id(
+            "tasks",
+            &fields(&["board:references", "rank:position{scope:board_id}"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_tasks_board_id ON tasks (board_id);"),
+            "expected the scope column's own FK index to survive; got:\n{sql}"
+        );
+    }
+
+    // ── position triggers: insert-assign + delete-compact (issue #1358) ────
+
+    #[test]
+    fn position_triggers_empty_when_no_position_field() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["title:String"]),
+        );
+        assert_eq!(up, "");
+        let down = position_triggers_down_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["title:String"]),
+        );
+        assert_eq!(down, "");
+    }
+
+    #[test]
+    fn position_triggers_postgres_unscoped_assign_and_compact() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["rank:position"]),
+        );
+        assert!(
+            up.contains("CREATE FUNCTION tasks_rank_assign() RETURNS TRIGGER"),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains(
+                "NEW.\"rank\" := COALESCE((SELECT MAX(\"rank\") + 1 FROM \"tasks\" WHERE TRUE), 0);"
+            ),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("BEFORE INSERT ON \"tasks\""),
+            "insert assignment must run BEFORE INSERT on Postgres so it mutates NEW directly: {up}"
+        );
+        assert!(
+            up.contains("CREATE FUNCTION tasks_rank_compact() RETURNS TRIGGER"),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("UPDATE \"tasks\" SET \"rank\" = \"rank\" - 1 WHERE TRUE AND \"rank\" > OLD.\"rank\";"),
+            "got:\n{up}"
+        );
+        assert!(up.contains("AFTER DELETE ON \"tasks\""), "got:\n{up}");
+        assert!(
+            !up.contains("compact_soft"),
+            "no deleted_at column, so no soft-delete trigger: {up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_assign_and_compact_share_an_advisory_lock() {
+        // Regression: without a shared lock, a concurrent insert's `SELECT
+        // MAX(position)` (a plain read) can compute against a snapshot
+        // taken before a concurrent delete's compaction shift commits,
+        // leaving a gap. Both triggers must take the SAME
+        // `pg_advisory_xact_lock` key so insert and delete-compaction on the
+        // same scope fully serialize.
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["rank:position"]),
+        );
+        let assign_fn = up
+            .split("CREATE FUNCTION tasks_rank_assign()")
+            .nth(1)
+            .expect("assign function body");
+        let assign_fn = &assign_fn[..assign_fn.find("$$ LANGUAGE").unwrap_or(assign_fn.len())];
+        assert!(
+            assign_fn.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), 0)"),
+            "the insert-assign trigger must take the advisory lock before reading MAX: {assign_fn}"
+        );
+        let advisory_pos = assign_fn.find("pg_advisory_xact_lock").unwrap();
+        let select_max_pos = assign_fn.find("SELECT MAX").unwrap();
+        assert!(
+            advisory_pos < select_max_pos,
+            "the lock must be acquired BEFORE the MAX(position) read, or a concurrent \
+             insert can still race in between: {assign_fn}"
+        );
+
+        let compact_fn = up
+            .split("CREATE FUNCTION tasks_rank_compact()")
+            .nth(1)
+            .expect("compact function body");
+        let compact_fn = &compact_fn[..compact_fn.find("$$ LANGUAGE").unwrap_or(compact_fn.len())];
+        assert!(
+            compact_fn.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), 0)"),
+            "the delete-compact trigger must take the SAME lock key as the assign \
+             trigger: {compact_fn}"
+        );
+        let advisory_pos = compact_fn.find("pg_advisory_xact_lock").unwrap();
+        let update_pos = compact_fn.find("UPDATE \"tasks\"").unwrap();
+        assert!(
+            advisory_pos < update_pos,
+            "the lock must be acquired BEFORE the compaction UPDATE: {compact_fn}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_soft_delete_compact_also_takes_the_advisory_lock() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["rank:position", "deleted_at:Option<NaiveDateTime>"]),
+        );
+        let compact_soft_fn = up
+            .split("CREATE FUNCTION tasks_rank_compact_soft()")
+            .nth(1)
+            .expect("compact_soft function body");
+        assert!(
+            compact_soft_fn.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), 0)"),
+            "the soft-delete compaction trigger must take the same advisory lock too: \
+             {compact_soft_fn}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_scoped_advisory_lock_keys_on_scope_value() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["board:references", "rank:position{scope:board_id}"]),
+        );
+        assert!(
+            up.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), hashtext(NEW.\"board_id\"::text))"),
+            "the assign trigger's lock must be scoped to board_id, not a table-wide \
+             constant, so unrelated boards never contend: {up}"
+        );
+        assert!(
+            up.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), hashtext(OLD.\"board_id\"::text))"),
+            "the compact trigger's lock must use the same scope key (from OLD, since it \
+             runs after the row is gone): {up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_scoped_uses_scope_column() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["board:references", "rank:position{scope:board_id}"]),
+        );
+        assert!(
+            up.contains("WHERE \"board_id\" = NEW.\"board_id\""),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("\"board_id\" = OLD.\"board_id\" AND \"rank\" > OLD.\"rank\""),
+            "got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_scoped_adds_rescope_trigger() {
+        // Codex review finding (issue #1358): an ordinary UPDATE reassigning
+        // the scope FK (e.g. `board_id`) must compact the old scope's gap
+        // and append the row to the end of the new scope, or the
+        // contiguous invariant breaks on a "move card to another board"
+        // operation.
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["board:references", "rank:position{scope:board_id}"]),
+        );
+        assert!(
+            up.contains("CREATE FUNCTION tasks_rank_rescope() RETURNS TRIGGER"),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains(
+                "CREATE TRIGGER tasks_rank_rescope_trg BEFORE UPDATE OF \"board_id\" ON \"tasks\""
+            ),
+            "must be BEFORE UPDATE so it can mutate NEW.rank directly: {up}"
+        );
+        assert!(
+            up.contains("WHEN (NEW.\"board_id\" IS DISTINCT FROM OLD.\"board_id\")"),
+            "must only fire when the scope actually changes: {up}"
+        );
+        let rescope_fn = up
+            .split("CREATE FUNCTION tasks_rank_rescope()")
+            .nth(1)
+            .expect("rescope function body");
+        let rescope_fn = &rescope_fn[..rescope_fn.find("$$ LANGUAGE").unwrap_or(rescope_fn.len())];
+        assert!(
+            rescope_fn.contains(
+                "UPDATE \"tasks\" SET \"rank\" = \"rank\" - 1 WHERE \"board_id\" = OLD.\"board_id\" AND \"rank\" > OLD.\"rank\";"
+            ),
+            "must compact the old scope: {rescope_fn}"
+        );
+        assert!(
+            rescope_fn.contains(
+                "NEW.\"rank\" := COALESCE((SELECT MAX(\"rank\") + 1 FROM \"tasks\" WHERE \"board_id\" = NEW.\"board_id\"), 0);"
+            ),
+            "must append to the end of the new scope: {rescope_fn}"
+        );
+        // Both scope keys must be locked, in a fixed hash-ascending order
+        // (mirroring move_to's fixed id-ascending row-lock order) so two
+        // rows swapping scopes concurrently can't deadlock each other.
+        assert!(
+            rescope_fn
+                .contains("hashtext(OLD.\"board_id\"::text) <= hashtext(NEW.\"board_id\"::text)"),
+            "must lock old/new scope keys in a fixed order: {rescope_fn}"
+        );
+        assert!(
+            rescope_fn.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), hashtext(OLD.\"board_id\"::text))")
+                && rescope_fn.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), hashtext(NEW.\"board_id\"::text))"),
+            "must lock BOTH the old and new scope's advisory key, same key as \
+             assign/compact so they fully serialize: {rescope_fn}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_unscoped_position_has_no_rescope_trigger() {
+        // No scope column exists to reassign on an unscoped position field.
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["rank:position"]),
+        );
+        assert!(
+            !up.contains("rescope"),
+            "an unscoped position field must not emit a rescope trigger: {up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_rescope_skips_soft_deleted_rows() {
+        // A soft-deleted row's scope is already excluded from both the old
+        // and new scope's live sequence — compact_soft/restore own that
+        // transition, not rescope.
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&[
+                "board:references",
+                "rank:position{scope:board_id}",
+                "deleted_at:Option<NaiveDateTime>",
+            ]),
+        );
+        assert!(
+            up.contains(
+                "WHEN (NEW.\"board_id\" IS DISTINCT FROM OLD.\"board_id\" AND OLD.deleted_at IS NULL AND NEW.deleted_at IS NULL)"
+            ),
+            "got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_soft_delete_adds_compaction_trigger() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["rank:position", "deleted_at:Option<NaiveDateTime>"]),
+        );
+        assert!(
+            up.contains("CREATE FUNCTION tasks_rank_compact_soft() RETURNS TRIGGER"),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL"),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("AFTER UPDATE OF deleted_at ON \"tasks\""),
+            "got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_soft_delete_adds_restore_trigger() {
+        // Codex review (issue #1358): compact_soft only ever handles the
+        // deletion direction; without a restore trigger a restored row
+        // re-enters the live set still carrying its stale pre-delete
+        // position, which some other live row may since have taken.
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["rank:position", "deleted_at:Option<NaiveDateTime>"]),
+        );
+        assert!(
+            up.contains("CREATE FUNCTION tasks_rank_restore() RETURNS TRIGGER"),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains(
+                "CREATE TRIGGER tasks_rank_restore_trg BEFORE UPDATE OF deleted_at ON \"tasks\""
+            ),
+            "must be BEFORE UPDATE so it can mutate NEW.rank directly: {up}"
+        );
+        assert!(
+            up.contains("WHEN (OLD.deleted_at IS NOT NULL AND NEW.deleted_at IS NULL)"),
+            "must only fire on the restore direction (compact_soft owns the other): {up}"
+        );
+        let restore_fn = up
+            .split("CREATE FUNCTION tasks_rank_restore()")
+            .nth(1)
+            .expect("restore function body");
+        let restore_fn = &restore_fn[..restore_fn.find("$$ LANGUAGE").unwrap_or(restore_fn.len())];
+        assert!(
+            restore_fn.contains("pg_advisory_xact_lock(hashtext('tasks_rank_assign'), 0)"),
+            "must take the same advisory lock as assign/compact: {restore_fn}"
+        );
+        assert!(
+            restore_fn.contains(
+                "NEW.\"rank\" := COALESCE((SELECT MAX(\"rank\") + 1 FROM \"tasks\" WHERE TRUE AND deleted_at IS NULL), 0);"
+            ),
+            "must append the restored row to the end of the live sequence: {restore_fn}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_down_drops_functions_with_cascade() {
+        let down = position_triggers_down_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["rank:position", "deleted_at:Option<NaiveDateTime>"]),
+        );
+        assert!(
+            down.contains("DROP FUNCTION IF EXISTS tasks_rank_assign() CASCADE;"),
+            "got:\n{down}"
+        );
+        assert!(
+            down.contains("DROP FUNCTION IF EXISTS tasks_rank_compact() CASCADE;"),
+            "got:\n{down}"
+        );
+        assert!(
+            down.contains("DROP FUNCTION IF EXISTS tasks_rank_compact_soft() CASCADE;"),
+            "got:\n{down}"
+        );
+        assert!(
+            down.contains("DROP FUNCTION IF EXISTS tasks_rank_restore() CASCADE;"),
+            "got:\n{down}"
+        );
+        assert!(
+            !down.contains("rescope"),
+            "unscoped position field must not emit a rescope function to drop: {down}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_postgres_down_drops_rescope_function_when_scoped() {
+        let down = position_triggers_down_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["board:references", "rank:position{scope:board_id}"]),
+        );
+        assert!(
+            down.contains("DROP FUNCTION IF EXISTS tasks_rank_rescope() CASCADE;"),
+            "got:\n{down}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_sqlite_unscoped_assign_and_compact() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "tasks",
+            &fields(&["rank:position"]),
+        );
+        assert!(
+            up.contains("CREATE TRIGGER \"tasks_rank_assign\" AFTER INSERT ON \"tasks\""),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains(
+                "UPDATE \"tasks\" SET \"rank\" = (SELECT COALESCE(MAX(\"rank\"), -1) + 1 FROM \"tasks\" WHERE 1=1 AND id != new.id) WHERE id = new.id;"
+            ),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("CREATE TRIGGER \"tasks_rank_compact\" AFTER DELETE ON \"tasks\""),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("UPDATE \"tasks\" SET \"rank\" = \"rank\" - 1 WHERE 1=1 AND \"rank\" > old.\"rank\";"),
+            "got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_sqlite_scoped_uses_scope_column() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "tasks",
+            &fields(&["board:references", "rank:position{scope:board_id}"]),
+        );
+        assert!(
+            up.contains("WHERE \"board_id\" = new.\"board_id\" AND id != new.id"),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("WHERE \"board_id\" = old.\"board_id\" AND \"rank\" > old.\"rank\";"),
+            "got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_sqlite_scoped_adds_rescope_trigger() {
+        // `SQLite` can't mutate NEW in a BEFORE trigger, so this must be
+        // AFTER UPDATE with a follow-up corrective UPDATE, mirroring the
+        // `_assign` trigger's own AFTER-INSERT correction.
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "tasks",
+            &fields(&["board:references", "rank:position{scope:board_id}"]),
+        );
+        assert!(
+            up.contains(
+                "CREATE TRIGGER \"tasks_rank_rescope\" AFTER UPDATE OF \"board_id\" ON \"tasks\""
+            ),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("WHEN old.\"board_id\" IS NOT new.\"board_id\""),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains(
+                "UPDATE \"tasks\" SET \"rank\" = \"rank\" - 1 WHERE \"board_id\" = old.\"board_id\" AND \"rank\" > old.\"rank\";"
+            ),
+            "must compact the old scope: {up}"
+        );
+        assert!(
+            up.contains(
+                "UPDATE \"tasks\" SET \"rank\" = (SELECT COALESCE(MAX(\"rank\"), -1) + 1 FROM \"tasks\" WHERE \"board_id\" = new.\"board_id\" AND id != new.id) WHERE id = new.id;"
+            ),
+            "must append to the end of the new scope: {up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_sqlite_rescope_skips_soft_deleted_rows() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "tasks",
+            &fields(&[
+                "board:references",
+                "rank:position{scope:board_id}",
+                "deleted_at:Option<NaiveDateTime>",
+            ]),
+        );
+        assert!(
+            up.contains(
+                "WHEN old.\"board_id\" IS NOT new.\"board_id\" AND old.deleted_at IS NULL AND new.deleted_at IS NULL"
+            ),
+            "got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_sqlite_soft_delete_adds_compaction_trigger() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "tasks",
+            &fields(&["rank:position", "deleted_at:Option<NaiveDateTime>"]),
+        );
+        assert!(
+            up.contains(
+                "CREATE TRIGGER \"tasks_rank_compact_soft\" AFTER UPDATE OF deleted_at ON \"tasks\""
+            ),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("WHEN old.deleted_at IS NULL AND new.deleted_at IS NOT NULL"),
+            "got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_sqlite_soft_delete_adds_restore_trigger() {
+        let up = position_triggers_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "tasks",
+            &fields(&["rank:position", "deleted_at:Option<NaiveDateTime>"]),
+        );
+        assert!(
+            up.contains(
+                "CREATE TRIGGER \"tasks_rank_restore\" AFTER UPDATE OF deleted_at ON \"tasks\""
+            ),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains("WHEN old.deleted_at IS NOT NULL AND new.deleted_at IS NULL"),
+            "got:\n{up}"
+        );
+        assert!(
+            up.contains(
+                "UPDATE \"tasks\" SET \"rank\" = (SELECT COALESCE(MAX(\"rank\"), -1) + 1 FROM \"tasks\" WHERE 1=1 AND deleted_at IS NULL AND id != new.id) WHERE id = new.id;"
+            ),
+            "must append the restored row to the end of the live sequence: {up}"
+        );
+    }
+
+    #[test]
+    fn position_triggers_sqlite_down_is_a_noop() {
+        // SQLite triggers are dropped automatically with their table.
+        let down = position_triggers_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "tasks",
+            &fields(&["rank:position"]),
+        );
+        assert_eq!(down, "");
+    }
+
+    #[test]
+    fn add_columns_up_sql_rejects_position_field() {
+        let err = add_columns_up_sql_for(
+            DatabaseBackend::Postgres,
+            "tasks",
+            &fields(&["rank:position"]),
+            "",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("position"), "unexpected error: {msg}");
     }
 
     // ── unique field marker: CREATE UNIQUE INDEX (issue #1032) ──────────────
