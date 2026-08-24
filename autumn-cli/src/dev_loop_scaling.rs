@@ -795,16 +795,20 @@ mod tests {
         // scaffolded app with "no external crate `diesel`" / "could not find
         // `serde`" before a single size point can compile.
         let app = generate_synthetic_app(1);
+        // Match complete manifest keys, not bare substrings: "serde" is a
+        // substring of "serde_json", so a `.contains("serde")` check alone
+        // would still pass even if the direct `serde =` entry were removed
+        // and only `serde_json` remained.
         assert!(
-            app.cargo_toml.contains("diesel"),
+            app.cargo_toml.contains("diesel ="),
             "Cargo.toml must declare a direct diesel dependency"
         );
         assert!(
-            app.cargo_toml.contains("serde_json"),
+            app.cargo_toml.contains("serde_json ="),
             "Cargo.toml must declare a direct serde_json dependency"
         );
         assert!(
-            app.cargo_toml.contains("serde"),
+            app.cargo_toml.contains("serde ="),
             "Cargo.toml must declare a direct serde dependency"
         );
     }
