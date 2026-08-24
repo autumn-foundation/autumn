@@ -468,6 +468,14 @@ path = "tests/integration_tests.rs"
 name = "config_alloc_gate"
 path = "tests/config_alloc_gate.rs"
 
+# Allocation gate for `auth::validate_password` on a realistic signup-form
+# workload (Bolt follow-up to #2198/#2205/#2214/#2232, looking at the password
+# path). Own binary for the same `allocation-counter` global-allocator reason
+# as `config_alloc_gate` above.
+[[test]]
+name = "password_policy_alloc_gate"
+path = "tests/password_policy_alloc_gate.rs"
+
 # SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
 # `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
 # `cargo test` compiles it to an empty (passing) binary. Run explicitly:
