@@ -1703,6 +1703,49 @@ enum MigrateCommands {
         #[arg(long = "force", value_name = "VERSION")]
         force: Option<String>,
     },
+    /// Create `migrations/<version>_<name>/{up,down}.sql` with a version
+    /// that will not collide with any migration this checkout can see.
+    ///
+    /// Diesel records applied migrations BY VERSION (the leading
+    /// `YYYYMMDDHHMMSS` directory prefix). When two directories share one
+    /// version, a fresh database runs exactly one of them and records the
+    /// version as done — the other is skipped forever, with no error
+    /// anywhere. This picks a version free across the working tree, every
+    /// local and remote-tracking git branch, and this CLI's own compiled-in
+    /// framework migrations — never before the latest version already
+    /// claimed anywhere it can see.
+    ///
+    /// Does not touch the database. Prints the created directory's path.
+    ///
+    /// # Example
+    ///
+    ///   autumn migrate new `add_widget_archived_at`
+    #[command(verbatim_doc_comment)]
+    New {
+        /// `snake_case` name for the migration (no leading digit — the CLI
+        /// treats everything up to the first `_` as part of the version).
+        name: String,
+    },
+    /// Fail when a migration version this checkout introduces is already
+    /// claimed by a different directory elsewhere.
+    ///
+    /// The CI-time backstop for `autumn migrate new`: checks the working
+    /// tree's migration versions against the repository's default branch,
+    /// every other pushed branch, and this CLI's own compiled-in framework
+    /// migrations. Reports a collision only when this checkout's working
+    /// tree is one of the colliding directories — a collision between two
+    /// other branches is real but is that branch's own gate to fail on.
+    ///
+    /// Requires the full branch history (`git fetch --all` or
+    /// `actions/checkout` with `fetch-depth: 0`); degrades to a working-tree-
+    /// only check with a loud warning otherwise. Does not require a database
+    /// connection.
+    ///
+    /// # Example
+    ///
+    ///   autumn migrate check-collisions
+    #[command(verbatim_doc_comment, name = "check-collisions")]
+    CheckCollisions,
 }
 
 /// Subcommands for `autumn shard`.
@@ -3261,6 +3304,21 @@ fn run_command(command: Commands) {
             profile,
             wait,
         } => {
+            // `new` and `check-collisions` are pure filesystem/git operations
+            // with no database target — handle them before the DB-target
+            // resolution below, which every other `MigrateCommands` variant
+            // needs.
+            match &action {
+                Some(MigrateCommands::New { name }) => {
+                    migrate::versions::run_new(name);
+                    return;
+                }
+                Some(MigrateCommands::CheckCollisions) => {
+                    migrate::versions::run_check_collisions();
+                    return;
+                }
+                _ => {}
+            }
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
                 Some(MigrateCommands::Check) => migrate::MigrateAction::Check,
@@ -3277,6 +3335,9 @@ fn run_command(command: Commands) {
                     migrate::MigrateAction::Baseline(migrate::BaselineArgs {
                         force_version: force,
                     })
+                }
+                Some(MigrateCommands::New { .. } | MigrateCommands::CheckCollisions) => {
+                    unreachable!("handled above and returned")
                 }
                 None => migrate::MigrateAction::Run,
             };

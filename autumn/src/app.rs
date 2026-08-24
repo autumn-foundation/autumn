@@ -5316,12 +5316,20 @@ impl AppBuilder {
     /// and 1 on the first failure, so a failed migration aborts the deploy before
     /// cutover with the old release still serving (AC-3).
     #[cfg(feature = "db")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a linear apply sequence (fold framework sets, resolve targets, guard \
+                  collisions, apply control then shards) -- splitting it would scatter state \
+                  that is only ever used once, right after it is computed"
+    )]
     async fn run_migrate_only_mode(self) {
         let Self {
             migrations,
             config_loader_factory,
             telemetry_provider,
             plugin_config_roots,
+            shard_router,
+            directory_shard_router,
             ..
         } = self;
 
@@ -5352,6 +5360,75 @@ impl AppBuilder {
             .iter()
             .map(|shard| (format!("shard:{}", shard.name), shard.primary_url.clone()))
             .collect();
+
+        // Same guard `run_startup_migrations` runs on a normal boot -- this path
+        // applies migrations directly (it IS the deploy's migration step, not a
+        // startup side effect of one), so skipping it here would let a collision
+        // reach production before anything ever validated it: the first apply
+        // would record the shared version and silently skip its colliding
+        // partner, and only a subsequent normal boot would notice.
+        //
+        // Includes the directory/shard-map sets in the CHECK whenever they
+        // would actually be required later, even though this path never
+        // APPLIES them (see the doc comment above -- the candidate's own
+        // boot creates those tables): an app/plugin migration colliding with
+        // one of those fixed framework versions would otherwise apply and
+        // record its version here first, silently, with only a later boot's
+        // apply of the real directory/shard-map migration -- not a version
+        // check -- exposing the fallout.
+        //
+        // The two flags are NOT interchangeable: `shard_map_migration_is_required`
+        // depends only on `has_shards`, but `directory_migration_is_required`
+        // ALSO requires directory routing specifically (no explicit
+        // `with_shard_router`, and `directory_shard_router` enabled) -- a
+        // sharded app on the default hash router or a custom router never
+        // creates `_autumn_shard_directory` at all, so unconditionally tying
+        // both flags to "is this app sharded" would itself manufacture a
+        // false positive for that app. Mirrors the exact predicate
+        // `setup_database` computes for `run_startup_migrations`. Neither
+        // set is ever applied by ANY path on an app that doesn't need it, so
+        // omitting them here (rather than checking unconditionally) is what
+        // keeps an unrelated coincidental version match from becoming a
+        // false startup failure -- same reasoning as FRAMEWORK_MIGRATIONS on
+        // a `sqlite://` control target, which is Postgres-only DDL that
+        // SQLite never applies at all.
+        let has_shards = !shard_targets.is_empty();
+        let use_directory_router = shard_router.is_none()
+            && (directory_shard_router || config.database.directory_shard_router);
+        let directory_migration_required = directory_migration_is_required(
+            use_directory_router,
+            has_shards,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let shard_map_migration_required = shard_map_migration_is_required(
+            has_shards,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let control_targets_postgres = control_url
+            .as_deref()
+            .is_some_and(|url| !control_backend_is_sqlite(url));
+        // Same extra gate as `run_startup_migrations`: `directory_migration_
+        // required`/`shard_map_migration_required` only know about routing/
+        // sharding config, not whether a control database is even
+        // configured. `control_url` here comes from the SAME config a
+        // normal boot resolves its own control target from, so when it is
+        // None (or SQLite) here, the candidate's own later boot will find
+        // the identical thing and never apply either set either -- e.g. a
+        // hash-routed sharded app with no control database configured has
+        // `shard_map_migration_required == true` from sharding alone, but
+        // nothing on any path ever applies that migration for it.
+        if log_migration_version_collisions(
+            &migrations,
+            control_targets_postgres,
+            directory_migration_required && control_targets_postgres,
+            shard_map_migration_required && control_targets_postgres,
+        ) {
+            // `process::exit` skips `on_shutdown`/`Drop`; stop any managed
+            // Postgres child first, mirroring the SQLite guard below.
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop();
+            std::process::exit(1);
+        }
 
         if migrations.is_empty() || (control_url.is_none() && shard_targets.is_empty()) {
             eprintln!(
@@ -9023,8 +9100,101 @@ mod sqlite_sharding_unsupported_guard_tests {
     }
 }
 
+/// Whether `url` names a `SQLite` target, by the same predicate
+/// [`sqlite_sharding_unsupported_guard`]/`db::build_pool` use. Always
+/// `false` when the `sqlite` feature isn't compiled in -- the only backend a
+/// non-`sqlite` build can ever target is Postgres, so there is nothing to
+/// detect.
 #[cfg(feature = "db")]
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "the sqlite-feature branch calls DatabaseBackend::detect, which is not const; the \
+              non-sqlite branch alone WOULD be const-fn-able, but clippy only sees whichever \
+              branch is compiled for a given feature set, so a const fn here would silently \
+              stop compiling the moment both features are ever enabled together"
+)]
+fn control_backend_is_sqlite(url: &str) -> bool {
+    #[cfg(feature = "sqlite")]
+    {
+        crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Sqlite)
+    }
+    #[cfg(not(feature = "sqlite"))]
+    {
+        let _ = url;
+        false
+    }
+}
+
+/// Check for, and log, a Diesel migration version claimed by two
+/// differently-named migrations across the combined framework/plugin/app
+/// registrations. Returns `true` when startup must abort.
+///
+/// All of them apply against one shared `__diesel_schema_migrations` table
+/// (keyed by version), so a collision would otherwise mean a fresh database
+/// silently skips one of them — see
+/// [`crate::migrate::check_migration_version_collisions`]. Plugin authors
+/// cannot coordinate versions with every other plugin or app that might
+/// register alongside theirs, so this check, not convention, is what catches
+/// it. Pure static analysis of the embedded migration metadata: it runs even
+/// when the app never auto-applies migrations.
+///
+/// `control_targets_postgres` and the two `_migration_required` flags gate
+/// what actually gets compared, not just what a normal boot happens to
+/// apply: a version that plainly cannot collide (because the set it would
+/// collide with is never going to touch this database) must not fail an
+/// otherwise-clean startup. `FRAMEWORK_MIGRATIONS` and the directory/
+/// shard-map sets are Postgres-only DDL; on a `sqlite://` control target (or
+/// an unsharded one, for the latter two) they are NEVER applied by ANY
+/// path, so a coincidental version match with one of them is not a real
+/// collision at all — including it unconditionally would turn a harmless
+/// coincidence into a startup abort.
+#[cfg(feature = "db")]
+fn log_migration_version_collisions(
+    migrations: &[crate::migrate::EmbeddedMigrations],
+    control_targets_postgres: bool,
+    directory_migration_required: bool,
+    shard_map_migration_required: bool,
+) -> bool {
+    // FRAMEWORK_MIGRATIONS is included whenever it's Postgres-relevant, not
+    // just when the app happens to have registered it: `autumn new`'s
+    // scaffold only calls `.migrations(MIGRATIONS)` (the app's own set),
+    // never `.migrations(FRAMEWORK_MIGRATIONS)`, so for a typical generated
+    // app `migrations` never contains it at all -- `autumn migrate` applies
+    // it separately. Without this, a plugin migration sharing a version with
+    // an actual framework migration would compare against nothing here and
+    // slip through the one guard meant to catch exactly that. Re-registering
+    // the same migration twice (an app that DOES also call
+    // `.migrations(FRAMEWORK_MIGRATIONS)`, e.g. some examples) is harmless --
+    // see `check_migration_version_collisions`'s same-name handling.
+    let collisions = crate::migrate::check_migration_version_collisions(
+        migrations
+            .iter()
+            .chain(control_targets_postgres.then_some(&crate::migrate::FRAMEWORK_MIGRATIONS))
+            .chain(
+                directory_migration_required
+                    .then_some(&crate::sharding::SHARD_DIRECTORY_MIGRATIONS),
+            )
+            .chain(shard_map_migration_required.then_some(&crate::sharding::SHARD_MAP_MIGRATIONS)),
+    );
+    for collision in &collisions {
+        tracing::error!(
+            version = %collision.version,
+            names = ?collision.names,
+            "Migration version claimed by more than one migration; a fresh database would \
+             apply only one and silently skip the rest. Renumber the newer migration so every \
+             registered migration version is unique (`autumn migrate new <name>` picks a free \
+             one)."
+        );
+    }
+    !collisions.is_empty()
+}
+
+#[cfg(feature = "db")]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_lines
+)]
 async fn run_startup_migrations(
     config: &AutumnConfig,
     control_configured: bool,
@@ -9045,6 +9215,38 @@ async fn run_startup_migrations(
     } else {
         None
     };
+
+    // Computed before the collision guard so it can skip FRAMEWORK_MIGRATIONS
+    // for a `sqlite://` control target (or no control target at all) --
+    // that set is Postgres-only DDL never applied to SQLite, so a
+    // coincidental version match there is not a real collision.
+    let control_targets_postgres = control_url
+        .as_deref()
+        .is_some_and(|url| !control_backend_is_sqlite(url));
+    // The directory/shard-map sets are applied ONLY inside the `Some(url) =
+    // control_url` Postgres branch below (never on a `sqlite://` control
+    // target, which returns early, and never with no control target at all).
+    // `directory_migration_is_required`/`shard_map_migration_is_required`
+    // only know about routing/sharding config, not whether a control
+    // database is even configured -- e.g. a hash-routed sharded app with no
+    // control database intentionally set up has `shard_map_migration_required
+    // == true` from sharding alone, but that migration is never applied
+    // anywhere. Without this extra gate, an app migration that happens to
+    // share a version with one of these sets would abort startup over a set
+    // that could never actually collide with it on any real database.
+    if log_migration_version_collisions(
+        &migrations,
+        control_targets_postgres,
+        directory_migration_required && control_targets_postgres,
+        shard_map_migration_required && control_targets_postgres,
+    ) {
+        // Same orphan hazard as a migration failure below: `process::exit`
+        // skips `on_shutdown`, so stop any managed Postgres before bailing.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
+        std::process::exit(1);
+    }
+
     let shard_targets: Vec<(String, String)> = if shards_configured {
         config
             .database
@@ -11695,6 +11897,55 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "db")]
+    #[test]
+    fn control_backend_is_sqlite_detects_sqlite_urls() {
+        #[cfg(feature = "sqlite")]
+        {
+            assert!(control_backend_is_sqlite("sqlite://data.db"));
+            assert!(control_backend_is_sqlite("sqlite::memory:"));
+        }
+        assert!(!control_backend_is_sqlite("postgres://user@host/db"));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn log_migration_version_collisions_gates_framework_migrations_on_postgres() {
+        // This fixture deliberately shares its version with the real
+        // FRAMEWORK_MIGRATIONS entry 20260709000000_create_migration_checksums
+        // (see autumn/test_migrations_framework_collision/), under a
+        // different name -- a genuine collision if FRAMEWORK_MIGRATIONS is in
+        // the comparison, and nothing at all otherwise.
+        use crate::migrate::EmbeddedMigrations;
+
+        const FRAMEWORK_COLLISION_FIXTURE: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("test_migrations_framework_collision");
+
+        // Postgres control target: FRAMEWORK_MIGRATIONS applies here for
+        // real, so the shared version is a genuine collision this must catch
+        // -- the exact bug (a plugin migration silently skipped because a
+        // framework migration recorded its shared version first) this whole
+        // guard exists to prevent.
+        assert!(log_migration_version_collisions(
+            &[FRAMEWORK_COLLISION_FIXTURE],
+            true, // control_targets_postgres
+            false,
+            false,
+        ));
+
+        // SQLite (or no control database at all): FRAMEWORK_MIGRATIONS is
+        // Postgres-only DDL that never applies there, so the same shared
+        // version is a harmless coincidence, not a collision -- flagging it
+        // anyway would abort startup for an app that has nothing wrong with
+        // it (the false-positive a Codex review round on this PR caught).
+        assert!(!log_migration_version_collisions(
+            &[FRAMEWORK_COLLISION_FIXTURE],
+            false, // control_targets_postgres
+            false,
+            false,
+        ));
+    }
+
     #[test]
     fn migrate_only_one_shot_applies_and_exits_without_serving() {
         // The runtime effect (applying against Postgres, exiting without binding a
@@ -11763,6 +12014,56 @@ mod tests {
             guard_call < first_apply,
             "the SQLite guard must run BEFORE the migration loop / apply_pending_or_exit"
         );
+
+        // The migrate one-shot applies migrations directly — it IS the deploy's
+        // migration step, not a side effect of a normal boot — so it must run the
+        // same version-collision guard `run_startup_migrations` runs, and run it
+        // BEFORE the apply loop: otherwise a collision reaches production before
+        // anything ever validated it (a Codex review finding on the PR that added
+        // this guard).
+        let collision_check = handler
+            .find("log_migration_version_collisions(")
+            .expect("migrate handler runs the version-collision guard");
+        assert!(
+            collision_check < first_apply,
+            "the version-collision guard must run BEFORE the migration loop / apply_pending_or_exit"
+        );
+
+        // The collision guard's directory/shard-map flags must use the SAME
+        // predicates `setup_database` computes for `run_startup_migrations`
+        // -- not a naive "is this app sharded" stand-in. A sharded app on
+        // the default hash router (or an explicit `with_shard_router`)
+        // never actually requires the directory migration even though it IS
+        // sharded, so tying that flag to sharding alone would check a
+        // migration set that will never be applied and risk a false-positive
+        // startup abort on nothing more than an unlucky version match (a
+        // Codex review finding on the PR that added this guard).
+        assert!(
+            handler.contains("directory_migration_is_required(")
+                && handler.contains("shard_map_migration_is_required("),
+            "the migrate handler must compute the real directory/shard-map requirement \
+             predicates, not approximate them from whether shards are merely configured"
+        );
+
+        // Neither predicate above knows whether a control database is even
+        // configured -- e.g. a hash-routed sharded app with no control
+        // database has `shard_map_migration_required == true` from sharding
+        // alone, but nothing on any path ever applies that migration for it.
+        // The guard call must additionally gate both flags on
+        // `control_targets_postgres` (a Codex review finding), the same
+        // gate FRAMEWORK_MIGRATIONS already uses.
+        let guard_invocation_start = handler
+            .find("if log_migration_version_collisions(")
+            .expect("migrate handler calls the version-collision guard");
+        let guard_invocation = &handler[guard_invocation_start..guard_invocation_start + 400];
+        assert!(
+            guard_invocation.contains("directory_migration_required && control_targets_postgres")
+                && guard_invocation
+                    .contains("shard_map_migration_required && control_targets_postgres"),
+            "the migrate handler must gate directory/shard-map requirement flags on an actual \
+             Postgres control target, not just on sharding/routing config: {guard_invocation}"
+        );
+
         assert!(
             !handler.contains("initialize_job_runtime")
                 && !handler.contains("try_build_router_inner"),

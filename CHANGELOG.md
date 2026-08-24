@@ -17,6 +17,27 @@ For a narrative tour of this release, see the
 
 ### Added
 
+- **Diesel migration version collision protection:** Diesel records applied
+  migrations *by version* (the leading `YYYYMMDDHHMMSS` directory prefix), so
+  two migrations that happen to share one version silently run only one of
+  them on a fresh database — the other is skipped forever, with no error.
+  This is now caught at three points. `autumn migrate new <name>` creates
+  `migrations/<version>_<name>/{up,down}.sql` with a version guaranteed free
+  across the working tree, every local and remote-tracking git branch, and
+  the framework's own compiled-in migrations. `autumn migrate
+  check-collisions` is the CI-time backstop for a collision that command
+  could not see (a branch pushed after, a teammate's concurrent PR):
+  it fails when a version this checkout introduces is already claimed by a
+  different directory on the default branch, another pushed branch, or the
+  framework's own migrations. Neither can see a *plugin's* migrations, since
+  those live in a compiled crate rather than a directory the checkout's git
+  history contains — an app cannot be expected to coordinate versions with
+  every plugin author who might register alongside it — so the framework
+  itself checks: every registered `EmbeddedMigrations` set (framework,
+  plugin, and app, via `AppBuilder::migrations`) is checked for cross-set
+  version collisions at startup via the new
+  `autumn_web::migrate::check_migration_version_collisions`, and a collision
+  now fails startup loudly instead of silently skipping a migration.
 - **`autumn deploy` prepares the host and migrates on the first deploy (#1607):**
   the two remaining gaps between `autumn deploy` and its acceptance criteria are
   closed, so the documented target-host precondition is now genuinely "a stock
