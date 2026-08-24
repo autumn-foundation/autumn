@@ -18,8 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   embeds a live, per-visitor CSRF token (`consent_banner_markup`). A shared
   cache sitting in front of an otherwise-cacheable handler could therefore
   serve one visitor's token-bearing form to another, leaking the token and
-  breaking that visitor's subsequent submission. The same two headers the
-  injection path already sets are now applied on this path too.
+  causing that visitor's subsequent submission to fail CSRF validation. The
+  same two headers the injection path already sets are now applied on this
+  path too.
 
 ### Performance
 
