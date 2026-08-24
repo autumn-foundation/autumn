@@ -71,6 +71,8 @@ mod error_reporting;
 mod events_integration;
 #[cfg(feature = "db")]
 mod experiments_pg_integration;
+#[cfg(feature = "db")]
+mod export_csv_list_count_profile;
 mod extractors;
 mod factory_fake;
 mod factory_integration;
