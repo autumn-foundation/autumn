@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **consent-banner middleware now guards the already-rendered case against
+  shared-cache CSRF token replay:** when a handler (e.g. a "manage cookie
+  preferences" page) had already rendered the consent banner itself —
+  detected via `RENDERED_BANNER_MARKER` — `splice_into_response` returned
+  that response unchanged without stamping `Cache-Control: private,
+  no-store` / `Vary: Cookie`, even though the handler's own rendering
+  embeds a live, per-visitor CSRF token (`consent_banner_markup`). A shared
+  cache sitting in front of an otherwise-cacheable handler could therefore
+  serve one visitor's token-bearing form to another, leaking the token and
+  breaking that visitor's subsequent submission. The same two headers the
+  injection path already sets are now applied on this path too.
+
 ### Performance
 
 - **scaffolded form helpers no longer re-escape their own constant HTML at
