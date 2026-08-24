@@ -296,6 +296,10 @@ mod time_zone_integration;
 #[cfg(feature = "tls")]
 mod tls_serving;
 mod transactional_test_integration;
+#[cfg(all(feature = "db", feature = "i18n"))]
+mod translatable_model;
+#[cfg(feature = "i18n")]
+mod translatable_request;
 mod tx_isolation_retry_integration;
 #[cfg(feature = "db")]
 mod validate_merged_model;

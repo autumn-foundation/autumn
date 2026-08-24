@@ -27,15 +27,15 @@ internet connection.
 - **Rust 1.88.0+** with `cargo`
 - **Docker** (or Docker Desktop) — `docker --version`
 - **PostgreSQL** accessible at a connection string you control (local or remote)
-- The `autumn` CLI - `cargo install autumn-cli --version 0.6.0`
+- The `autumn` CLI - `cargo install autumn-cli --version 0.7.0`
 
 ---
 
 ## Push-button deploy to your own server (`autumn deploy`)
 
 `autumn deploy` takes a fresh project to a live, zero-downtime service on a
-Linux VPS you control — no Dockerfile, no container registry, no PaaS
-account. It uploads a single embedded binary, supervises it with systemd behind
+Linux VPS you control — no Dockerfile for your app, no registry to publish it
+to, no PaaS account. It uploads a single embedded binary, supervises it with systemd behind
 a reverse proxy, migrates before cutover, health-gates on `/ready`, and flips
 traffic atomically. Re-running it is a zero-downtime redeploy; one command rolls
 back.
@@ -94,7 +94,8 @@ below and are better fits in specific cases:
 
 ### Preconditions
 
-Everything except two host prerequisites is automated by `autumn deploy up`:
+`autumn deploy up` automates everything on the target: the only host prerequisite
+is SSH access, and the only other prerequisite is on your own machine.
 
 - **Key-based SSH access as `root` (or an equivalently privileged account) to a
   stock Ubuntu LTS (or other systemd) host.** The deploy runs non-interactively
@@ -108,15 +109,66 @@ Everything except two host prerequisites is automated by `autumn deploy up`:
   plain non-root SSH login passes preflight (which only checks reachability and
   secrets, not privilege) and then fails once it tries to write the unit or
   invoke `systemctl`.
-- **The `kamal-proxy` binary present at `/usr/local/bin/kamal-proxy`.** The
-  deploy writes and supervises the proxy's systemd unit, but does **not**
-  download the binary itself — install it once as part of host bootstrap. (See
-  [Limitations](#limitations-and-known-gaps).)
 - **A local Rust toolchain** to build the release binary (`autumn build
-  --embed`).
+  --embed`). This one is on *your* machine, not the target.
 
-The reverse proxy, install directories, systemd units, release layout, and the
-secret env file are all created for you.
+The reverse proxy **binary**, the reverse proxy service, install directories,
+systemd units, release layout, and the secret env file are all created for you.
+
+A host that still needs the reverse-proxy binary installed additionally needs
+**apt** (host preparation is Debian/Ubuntu-only — on another systemd distro,
+install `kamal-proxy` yourself and set `install_proxy = false`) and **outbound
+HTTPS** to your distro mirrors and to Docker Hub. Once prepared, neither is
+needed again. See [Host preparation](#host-preparation-install_proxy).
+
+#### Host preparation (`install_proxy`)
+
+`autumn deploy up` prepares the target itself. Before anything else runs it
+probes the host for a working `kamal-proxy`, and:
+
+- **a host that already has one** is left completely untouched — the probe is a
+  read-only `kamal-proxy deploy --help`, and nothing else runs;
+- **a host that has none** gets the pinned build installed at
+  `/usr/local/bin/kamal-proxy`. kamal-proxy publishes no release binaries
+  (upstream ships it as a container image), so the deploy installs the packages a
+  minimal image may lack — `curl` (the readiness gate polls `/ready` *on the
+  host*) and a container runtime — copies the binary out of the
+  `basecamp/kamal-proxy` image **pinned by digest**, and moves it into place. Only
+  genuinely missing packages are installed; the container runtime and the pulled
+  image are left on the host afterwards. The step announces itself before it runs:
+
+  ```
+  host preparation: no kamal-proxy on this host — installing v0.9.2 at
+  /usr/local/bin/kamal-proxy, from the pinned basecamp/kamal-proxy image. This also
+  installs, and leaves behind, any of `curl` and a container runtime the host is
+  missing. Decline with `[deploy] install_proxy = false`.
+  ```
+
+  The install ends by running the binary it just placed, so an install that
+  "succeeded" without producing a working proxy fails the deploy there rather than
+  at the first cutover. It also refuses outright if anything already exists at
+  `/usr/local/bin/kamal-proxy`, so it can never replace a binary the probe merely
+  failed to reach.
+
+- **a host whose kamal-proxy responds but whose CLI surface has drifted** (a
+  renamed or removed subcommand/flag) is *never* replaced — that binary may be
+  shared with something else on the host. The deploy aborts with a message naming
+  exactly what is missing and the version to pin, before touching live traffic.
+
+If the install can't be done — no outbound network, no apt, Docker Hub rate
+limits — the deploy fails fast, before anything is uploaded or cut over, with a
+message naming what the host needs and the `install_proxy = false` opt-out.
+
+To provision the proxy yourself (a pinned internal build, your own package, or a
+host you don't want a container runtime on), decline host preparation:
+
+```toml
+[deploy]
+install_proxy = false
+```
+
+A missing binary is then an actionable deploy failure instead of something the
+deploy fixes.
 
 ### First deploy: from `autumn new` to a live app
 
@@ -140,6 +192,8 @@ host = "203.0.113.10"     # SSH-reachable IP or hostname of your VPS (required)
 # app_dir = "/srv/autumn/myapp"   # remote install dir (default: /srv/autumn/<app_name>)
 # readiness_timeout_secs = 60     # /ready window before rollback (default: 60)
 # keep_releases = 3               # prior releases retained for rollback (default: 3)
+# install_proxy = false           # decline host preparation — you install
+#                                 # kamal-proxy yourself (default: true)
 ```
 
 Every key also has an environment override (`AUTUMN_DEPLOY__HOST`,
@@ -281,10 +335,14 @@ it fails, then on this first run:
 4. writes the signing secret, database URL, and `AUTUMN_ENV` (the profile,
    `prod` by default) to `app_dir/shared/autumn.env` (`0600`, sourced by
    systemd — never printed, never on a command line; rebuilt each deploy),
-5. writes the app's systemd unit (bound to a private `127.0.0.1` port),
-   points `current` at the release, and starts it,
-6. health-gates on `GET /ready` within `readiness_timeout_secs`, then
-7. routes the proxy at the freshly-ready release.
+5. writes the app's systemd unit (bound to a private `127.0.0.1` port) and
+   points `current` at the release,
+6. **runs any pending migrations** (a blocking `AUTUMN_MIGRATE=1` one-shot) —
+   before the release is started, so it never boots against a schema that was
+   never applied,
+7. starts the unit,
+8. health-gates on `GET /ready` within `readiness_timeout_secs`, then
+9. routes the proxy at the freshly-ready release.
 
 On success it prints:
 
@@ -298,6 +356,27 @@ Verify it is serving (the public port is your configured `server.port`):
 curl http://203.0.113.10:3000/health   # -> {"status":"ok", ...}
 curl http://203.0.113.10:3000/ready    # readiness probe used during cutover
 ```
+
+### Migration ordering (first deploy included)
+
+Pending migrations run **before the new version takes traffic**, on both paths:
+
+| | when the migration runs | if it fails |
+| --- | --- | --- |
+| **First deploy** | after the binary, env file and unit are in place, **before the unit is started** | the deploy aborts and the half-written release is torn down — nothing is started, nothing is routed |
+| **Redeploy** | after the candidate slot starts, **before the proxy flip** | the deploy aborts with the **old release still serving** — no flip, no drain, no promote |
+
+A first deploy migrates before it *starts* the app rather than after, because
+there is no live release to keep warm and an app booted against an unapplied
+schema can crash-loop under systemd long before the readiness gate says anything
+useful. Either way the migration is a blocking `systemd-run --wait` one-shot of
+the release binary in `AUTUMN_MIGRATE=1` mode, run from the release directory
+with the same `0600` env file the app uses, so its exit status gates everything
+that follows. An app with no database support reports "nothing to migrate" and
+exits 0, so this step is harmless for a DB-free app.
+
+This is why a `autumn new` → `autumn build --embed` → `autumn deploy up` first
+deploy needs no out-of-band `autumn migrate`.
 
 ### Zero-downtime redeploy
 
@@ -383,45 +462,20 @@ Fleet state:
 #### Migrations run exactly once
 
 The schema is fleet-wide, so the rollout runs the pre-cutover migration on
-**exactly one host**: the first host in rollout order that is still on a previous
-release, immediately before *its* cutover. Every other host builds its cutover
-with the migrate step omitted. A first-deploy host is never chosen — it has no
-live release to keep serving if the migration fails.
+**exactly one host**: the **first host in rollout order**, whatever its mode,
+immediately before *its* cutover. Every other host builds with the migrate step
+omitted. Because host 1 is the earliest point in the rollout, the schema always
+moves before *any* host in the fleet takes traffic on the new release.
 
-If **no** host in the fleet is on a previous release (a brand-new fleet where
-every host is a first deploy), the rollout runs **no migrations at all** and says
-so loudly, because a first deploy has never run migrations (see
-[Limitations](#limitations-and-known-gaps)):
-
-```
-⚠️  no host in this fleet is on a previous release, so this rollout runs NO
-migrations (a first deploy never does) — run `autumn migrate` yourself before
-serving traffic
-```
-
-That warning only appears when a writable database is configured — an app with
-no database has no schema to be behind.
-
-**Put already-deployed hosts first in the list.** Because the migration lands on
-the first host that is still on a previous release, a *first-deploy* host listed
-ahead of it cuts over with no migrate step at all — it goes live on the new
-release while the schema is still the old one, and stays that way until the
-rollout reaches the migrating host. That is the one case where "migrations run
-before the first host cutover" does not hold, and it is exactly the shape of a
-scale-up: `hosts = ["<new>", "<new>", "<existing>"]`. Order the list
-`["<existing>", "<new>", "<new>"]` instead and the migration runs first. The
-rollout will not reorder it for you — declaration order is the contract — but it
-does name the hazard and the hosts it applies to before touching anything:
+That holds for a brand-new fleet too: a first deploy runs its pending migrations
+before it starts the release (see
+[Migration ordering](#migration-ordering-first-deploy-included)), so an
+all-first-deploy rollout migrates on host 1 exactly like an all-redeploy one. The
+rollout header states where the migration lands:
 
 ```
-⚠️  10.0.0.2, 10.0.0.3 go live on the new release BEFORE the migration runs
-(a first deploy never migrates) — if this release needs the new schema they will
-serve against the old one until the migrating host is reached; list an
-already-deployed host first to avoid it
+  → migrate (10.0.0.1 only — the schema is fleet-wide; 10.0.0.2, 10.0.0.3 skip it)
 ```
-
-Like the warning above, it is gated on a writable database being resolvable from
-your config. See the [fleet deploys guide](fleet-deploys.md#list-the-already-deployed-hosts-first).
 
 Once the migrating host cuts over, the rollout says so:
 
@@ -443,10 +497,10 @@ the `Fleet state:` table described [below](#a-failure-halts-the-rollout-and-roll
 The question being answered is never "did the fleet compensate" — it is **the
 schema is at the new release; where are the binaries?** So the gate is the
 migration: the summary says nothing at all unless this run actually scheduled a
-migration *and* reached the host carrying it. (A fleet where every host is a
-first deploy schedules no migration and stays silent — the prologue already told
-you to run `autumn migrate` yourself.) Beyond that gate the fleet's shape only
-picks which sentence is true:
+migration *and* reached the host carrying it. (Every non-empty rollout schedules
+one, so in practice the gate is whether host 1 was reached at all — a rollout that
+failed before touching it moved no schema.) Beyond that gate the fleet's shape
+only picks which sentence is true:
 
 - **Some host is still forward.** At least one host is on the new release —
   deployed, degraded, left alone because its rollback target was in doubt, or one
@@ -708,6 +762,15 @@ and `--no-rollback`; no existing flag changed meaning.
 > it is: after any failed single-host `deploy up`, check `autumn migrate status`
 > before assuming the failure left nothing behind — and write expand/contract
 > migrations so the still-serving release fits the migrated schema either way.
+>
+> Since a **first** deploy migrates too
+> ([Migration ordering](#migration-ordering-first-deploy-included)), this now has a
+> second shape: a single-host *first* deploy that migrates and then fails its
+> readiness gate tears the release down and leaves **nothing serving at all**
+> against a schema that has already moved. The same advice applies, and more
+> sharply — `autumn migrate status` is how you find out, and the fix for the next
+> attempt is usually just re-running `autumn deploy up`, which is idempotent about
+> an already-applied migration.
 
 ### Rollback
 
@@ -1008,7 +1071,7 @@ hosts in rollout order and stating the migrate-placement rule. That section is
 descriptive for the same reason: `plan` contacts no host, so it cannot know which
 hosts are first deploys and which are redeploys. It therefore renders the
 migration as the *rule* `autumn deploy up` applies after probing every host —
-"`[migrate]` runs once, on the first host still on a previous release, before its
+"`[migrate]` runs once, on the first host in rollout order, before its
 cutover — hosts 2..N skip it" — never as a named host. `deploy up` names the
 actual host once it has probed the fleet.
 
@@ -1068,10 +1131,6 @@ or error messages.
 
 ### Limitations and known gaps
 
-- **The `kamal-proxy` binary must be installed on the host** (at
-  `/usr/local/bin/kamal-proxy`) before the first deploy. `autumn deploy up`
-  configures and supervises the proxy but does not download its binary —
-  provision it as part of host bootstrap.
 - **Only the signing secret, database URL, and profile selector are written to
   the host env file.** `autumn deploy` serializes just
   `AUTUMN_SECURITY__SIGNING_SECRET`, (for database-backed apps)
@@ -1096,14 +1155,6 @@ or error messages.
   secrets never go in it — they stay in the `0600` host env file, which overrides
   `autumn.toml` at load time. When no `autumn.toml` is found locally the deploy
   prints a loud warning and the app runs built-in defaults.
-- **Migrations run on redeploys, not on the very first deploy.** The pre-cutover
-  migration one-shot is part of the zero-downtime redeploy path; the initial
-  `deploy up` stands the release up and health-gates it. For a database-backed
-  app, ensure the schema is applied (e.g. a follow-up `autumn deploy up`, or an
-  out-of-band `autumn migrate` against the primary) before relying on DB routes.
-  The same limitation generalises to a fleet: a rollout where **every** host is a
-  first deploy migrates nowhere, and says so loudly, naming `autumn migrate` (see
-  [Migrations run exactly once](#migrations-run-exactly-once)).
 - **One load balancer, many app hosts — but the load balancer is yours.**
   `[deploy] hosts` rolls a release across as many app servers as you list, but
   `autumn deploy` provisions no load balancer and performs no LB membership
@@ -1118,7 +1169,9 @@ or error messages.
   down-migration mid-flip would run exactly the SQL nothing reviews. Use
   expand/contract migrations so a rolled-back binary still fits the migrated
   schema.
-- **A failed *single-host* deploy never warns that the schema moved** (#2276).
+- **A failed *single-host* deploy never warns that the schema moved** (#2276) —
+  including a failed *first* deploy, which since #1607 migrates before it starts
+  the release, and so can leave a moved schema with nothing serving.
   A fleet ends every run with a `Fleet state:` summary that names the
   binaries-versus-schema state; the single-host path returns the per-host error
   directly and renders no summary, so a failure after `migrate` but before the
@@ -1381,7 +1434,7 @@ Visit [http://localhost:3000/health](http://localhost:3000/health) — a healthy
 response looks like:
 
 ```json
-{ "status": "ok", "version": "0.6.0" }
+{ "status": "ok", "version": "0.7.0" }
 ```
 
 > **Migration failure stops the rollout.** If the primary URL is wrong or the

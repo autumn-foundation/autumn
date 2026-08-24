@@ -730,7 +730,7 @@ fn deploy_check_respects_explicit_autumn_dotenv_off() {
 /// `deploy::fleet::FLEET_MIGRATE_PLACEMENT_NOTE`; the unit-level drift guard is
 /// `fleet_plan_matches_fleet_ops_sequence`.
 const MIGRATE_PLACEMENT_NOTE: &str =
-    "runs once, on the first host still on a previous release, before its cutover";
+    "runs once, on the first host in rollout order, before its cutover";
 
 #[test]
 fn deploy_plan_renders_the_fleet_rollout_order_and_one_migrate_note() {

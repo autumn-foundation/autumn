@@ -9,6 +9,12 @@ use autumn_web::config::DatabaseBackend;
 use super::GenerateError;
 use super::naming;
 
+/// Rust type a `{translatable}` column lowers to (issue #1384).
+const TRANSLATED_RUST_TYPE: &str = "autumn_web::i18n::Translated";
+
+/// SQL literal a translatable column defaults to: the empty JSON container.
+const EMPTY_TRANSLATION_CONTAINER: &str = "'{}'";
+
 /// The constraint modifiers a field carried in a trailing `{…}` block
 /// (`title:String{min=3,max=120}`, `contact:String{email}`,
 /// `age:i32{min=0,max=130}`, `post:references{label:title}`).
@@ -50,9 +56,22 @@ pub struct FieldConstraints {
     /// position is a single sequence over the whole table. Never a
     /// `#[validate]`/HTML5 constraint.
     pub scope: Option<String>,
+    /// `translatable` — per-locale content storage (issue #1384), re-emitted
+    /// as a `#[translatable]` attribute on the generated model field and an
+    /// `autumn_web::i18n::Translated` Rust type. `String`/`Text` only, never
+    /// nullable, and never combined with `{encrypted}`, `:unique`, or a state
+    /// machine. `false` for an ordinary monolingual column.
+    pub translatable: bool,
 }
 
 impl FieldConstraints {
+    /// True when no modifier that fans out to a `#[validate(...)]` rule was
+    /// declared (issue #1388's `min`/`max`/`email`/`url`).
+    #[must_use]
+    pub const fn validation_attrs_are_empty(&self) -> bool {
+        self.min.is_none() && self.max.is_none() && !self.email && !self.url
+    }
+
     /// True when no constraint modifier was declared.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
@@ -64,6 +83,7 @@ impl FieldConstraints {
             && self.from.is_none()
             && self.encrypted.is_none()
             && self.scope.is_none()
+            && !self.translatable
     }
 }
 
@@ -175,6 +195,12 @@ impl Field {
     /// `String` storage-representation fallback.
     #[must_use]
     pub fn rust_type(&self) -> String {
+        // #1384: a `{translatable}` column is a per-locale container in Rust,
+        // not a `String`. The SQL type is unchanged (`TEXT`) — the container
+        // is stored as a JSON object — so only the Rust type moves.
+        if self.constraints.translatable {
+            return TRANSLATED_RUST_TYPE.to_owned();
+        }
         let inner = self
             .enum_type_name()
             .unwrap_or_else(|| self.kind.rust_type().to_owned());
@@ -182,6 +208,30 @@ impl Field {
             format!("Option<{inner}>")
         } else {
             inner
+        }
+    }
+
+    /// Whether this column stores per-locale content (issue #1384) — declared
+    /// with a `{translatable}` modifier, re-emitted as `#[translatable]`.
+    #[must_use]
+    pub const fn is_translatable(&self) -> bool {
+        self.constraints.translatable
+    }
+
+    /// The SQL `DEFAULT` clause this field's storage needs, without the
+    /// `DEFAULT` keyword, or `None` for a column with no default.
+    ///
+    /// Only `{translatable}` uses it today: the container column is `NOT NULL`
+    /// and defaults to the empty JSON object, which is what makes the
+    /// `ADD COLUMN` an ordinary *safe* migration (`autumn migrate check`
+    /// classifies `ADD COLUMN … NOT NULL DEFAULT <constant>` as safe) rather
+    /// than a table-rewriting backfill.
+    #[must_use]
+    pub const fn sql_default(&self) -> Option<&'static str> {
+        if self.constraints.translatable {
+            Some(EMPTY_TRANSLATION_CONTAINER)
+        } else {
+            None
         }
     }
 
@@ -1003,7 +1053,7 @@ pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, 
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
     enum{a,b,…}, decimal{precision,scale}, slug{from:col}, position (optionally \
     position{scope:col}), commentable, Option<…>, :unique, String{encrypted}, \
-    String{encrypted:deterministic}";
+    String{encrypted:deterministic}, String{translatable}";
 
 /// The DSL field kinds that map to a working diesel `SQLite` conversion
 /// (issue #1614 AC #4; #1924) — the complement of the kinds
@@ -1410,6 +1460,81 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         }
     }
 
+    // ── `{translatable}` cross-checks (issue #1384) ─────────────────────────
+    // The kind allowlist already ran while parsing the modifier; these need the
+    // whole parsed field.
+    if constraints.translatable {
+        // The container itself models "no translation" as an empty map, so a
+        // nullable column would give two spellings for one state — and the
+        // `#[model]` macro refuses `Option<Translated>` for the same reason.
+        if nullable {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `translatable` field cannot be nullable — the per-locale container \
+                         already represents \"no translation\" as an empty map. Drop the \
+                         `Option<…>`."
+                    .into(),
+            });
+        }
+        // The column holds one opaque ciphertext envelope under `{encrypted}`,
+        // which has no per-locale structure to resolve against.
+        if constraints.encrypted.is_some() {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `translatable` field cannot also be `encrypted`: an encrypted column \
+                         stores one opaque envelope, with no per-locale structure to resolve. \
+                         Keep a separate encrypted column for the secret."
+                    .into(),
+            });
+        }
+        // A UNIQUE index (and the free `find_by_<col>` the generators derive
+        // from it) would compare whole JSON containers, so two records with
+        // identical text translated into different locale sets never collide.
+        if unique {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `translatable` field cannot be `:unique`: the index would compare \
+                         whole per-locale containers, so identical text translated into \
+                         different locale sets would never collide, and the derived \
+                         `find_by_<col>` lookup could never match. Put the uniqueness on a \
+                         non-translatable column (e.g. a `slug`)."
+                    .into(),
+            });
+        }
+        // The `{min}/{max}/{email}/{url}` fan-out emits `#[validate(length(..))]`
+        // / `#[validate(email)]` on the field, and `validator` implements those
+        // rules for `String`-shaped types only — there is no impl for a
+        // per-locale container, so the generated model would not compile. (And
+        // even with one, "which locale is this rule about?" has no single
+        // answer.) Refuse here, where the fix is one token away.
+        let validation_modifiers = !constraints.validation_attrs_are_empty();
+        if validation_modifiers {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `translatable` field cannot carry `min`/`max`/`email`/`url` \
+                         constraints: those emit a `#[validate(...)]` rule that `validator` \
+                         implements for strings only, and a per-locale container has one \
+                         value per locale rather than one string to measure. Validate the \
+                         individual translations in your own edit handler."
+                    .into(),
+            });
+        }
+        // The scaffold's transition handler writes the state with a raw
+        // `UPDATE … SET col = 'state'`, which would replace the whole container
+        // with a bare state name. A state is also locale-invariant by
+        // definition.
+        if state_machine.is_some() {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `translatable` field cannot also declare a `states(…)` state \
+                         machine: a state name is locale-invariant, and the generated \
+                         transition handler's raw `UPDATE … SET col = 'state'` would replace \
+                         the whole per-locale container."
+                    .into(),
+            });
+        }
+    }
+
     Ok(Field {
         name,
         kind,
@@ -1670,6 +1795,20 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
                     reject_repeated_encrypted(&c)?;
                     c.encrypted = Some(EncryptedMode::Randomized);
                 }
+                // #1384: per-locale content storage. Bare token only — the
+                // storage strategy is the framework's to choose, so unlike
+                // `{encrypted}` there is no mode to spell.
+                "translatable" => {
+                    reject_translatable_on_kind(kind)?;
+                    if c.translatable {
+                        return Err(
+                            "the `translatable` modifier is declared more than once — remove \
+                             the duplicate"
+                                .to_owned(),
+                        );
+                    }
+                    c.translatable = true;
+                }
                 _ => return Err(unknown_constraint_message(tok, kind)),
             }
         }
@@ -1928,12 +2067,30 @@ fn reject_encrypted_on_kind(kind: FieldKind) -> Result<(), String> {
     ))
 }
 
+/// `{translatable}` stores a JSON container of per-locale values in the
+/// column, so the column has to be free-form text. Every other kind either has
+/// no text to translate (numbers, timestamps, foreign keys) or is a machine
+/// identifier whose value must stay stable across locales (`slug`, `enum`).
+fn reject_translatable_on_kind(kind: FieldKind) -> Result<(), String> {
+    if matches!(kind, FieldKind::String | FieldKind::Text) {
+        return Ok(());
+    }
+    // Name the DSL token, not `rust_type()` — `richtext`, `enum{…}` and `slug`
+    // all render as `String` in Rust (see `reject_encrypted_on_kind`).
+    Err(format!(
+        "the `translatable` modifier only applies to `String`/`Text` fields; it stores a \
+         per-locale JSON container in the column, which needs free-form text. Got a `{}` \
+         field.",
+        kind.dsl_token()
+    ))
+}
+
 /// A per-kind "unknown constraint" message that names the offending token and
 /// lists what the kind *does* accept (issue #1388 AC5).
 fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
     let accepted = match kind {
         FieldKind::String | FieldKind::Text => {
-            "min=N, max=N, email, url, encrypted, encrypted:deterministic"
+            "min=N, max=N, email, url, encrypted, encrypted:deterministic, translatable"
         }
         // `RichText` shares the numeric arm's accepted set, not `String`'s: it
         // takes the `min`/`max` length bounds but NOT the `email`/`url` format
@@ -2497,6 +2654,94 @@ pub(super) fn is_rust_keyword(s: &str) -> bool {
 #[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
+
+    // ── #1384: `{translatable}` modifier ────────────────────────────────────
+
+    #[test]
+    fn translatable_modifier_parses_on_string_and_text() {
+        for token in ["title:String{translatable}", "body:Text{translatable}"] {
+            let f = parse_field(token).unwrap_or_else(|e| panic!("{token}: {e}"));
+            assert!(f.is_translatable(), "{token}");
+            // The Rust type becomes the per-locale container...
+            assert_eq!(f.rust_type(), "autumn_web::i18n::Translated");
+            // ...while the column stays a portable TEXT holding a JSON object.
+            assert_eq!(f.sql_column_type(), "TEXT");
+            assert_eq!(f.schema_type(), "Text");
+            assert_eq!(f.sql_nullability(), "NOT NULL");
+            assert_eq!(f.sql_default(), Some("'{}'"));
+        }
+    }
+
+    #[test]
+    fn translatable_modifier_is_rejected_on_non_text_kinds() {
+        for token in [
+            "count:i64{translatable}",
+            "at:NaiveDateTime{translatable}",
+            "post:references{translatable}",
+        ] {
+            let err = parse_field(token).unwrap_err().to_string();
+            assert!(
+                err.contains("translatable"),
+                "{token} should name the modifier: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn translatable_is_rejected_on_a_nullable_column() {
+        // The container already models "no translation" as an empty map.
+        let err = parse_field("title:Option<String>{translatable}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+    }
+
+    #[test]
+    fn translatable_and_encrypted_are_mutually_exclusive() {
+        let err = parse_field("title:String{translatable,encrypted}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("encrypted"), "{err}");
+    }
+
+    #[test]
+    fn translatable_is_rejected_with_unique() {
+        // A UNIQUE index over a JSON container compares whole containers.
+        let err = parse_field("title:String:unique{translatable}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+    }
+
+    #[test]
+    fn translatable_is_rejected_with_a_state_machine() {
+        let err = parse_field("status:String{translatable}:states(draft -> live)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+    }
+
+    #[test]
+    fn a_repeated_translatable_modifier_is_rejected() {
+        let err = parse_field("title:String{translatable,translatable}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+    }
+
+    #[test]
+    fn non_translatable_fields_keep_their_type_and_have_no_default() {
+        let f = parse_field("title:String").unwrap();
+        assert!(!f.is_translatable());
+        assert_eq!(f.rust_type(), "String");
+        assert_eq!(f.sql_default(), None);
+    }
+
+    #[test]
+    fn unknown_constraint_message_advertises_translatable() {
+        let err = parse_field("title:String{bogus}").unwrap_err().to_string();
+        assert!(err.contains("translatable"), "{err}");
+    }
 
     #[test]
     fn parse_string_field() {

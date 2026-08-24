@@ -297,6 +297,9 @@ pub struct ResolvedDeployConfig {
     /// when TLS is enabled and a non-blank host was configured; `None` when TLS
     /// is disabled.
     pub tls_host: Option<String>,
+    /// Whether this deploy may install the reverse-proxy binary on a host that has
+    /// none (`[deploy] install_proxy`, default `true`; issue #1607, AC-1).
+    pub install_proxy: bool,
 }
 
 /// Canonicalize a deploy profile string to the value the app's runtime resolver
@@ -415,6 +418,7 @@ impl ResolvedDeployConfig {
             profile: trimmed_deploy_profile(&cfg.profile),
             tls_enabled: cfg.tls.enabled,
             tls_host,
+            install_proxy: cfg.install_proxy,
         })
     }
 
@@ -1343,6 +1347,16 @@ pub fn build_deploy_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
             "build",
             "Build the embedded single-binary release locally (`autumn build --embed`)",
         ),
+        // FIRST, because it is the first thing that mutates the server: the install
+        // ops are spliced at the head of the host's op vector, ahead of the upload.
+        DeployStep::new(
+            "prepare-host",
+            "Ensure the target has a working kamal-proxy — the FIRST thing that touches the \
+             server. A host that already has one is untouched; a host that has none gets the \
+             pinned build installed, which also installs (and leaves behind) any of `curl` \
+             and a container runtime it is missing, and pulls the pinned proxy image from \
+             Docker Hub. Decline with `[deploy] install_proxy = false`",
+        ),
         DeployStep::new(
             "upload",
             format!(
@@ -1352,7 +1366,9 @@ pub fn build_deploy_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
         ),
         DeployStep::new(
             "migrate",
-            "Run pending migrations BEFORE cutover — abort here leaves the current version serving",
+            "Run pending migrations BEFORE the new release takes traffic — on a redeploy an \
+             abort here leaves the current version serving; on a first deploy the release is \
+             never started",
         ),
         DeployStep::new(
             "start-candidate",
@@ -2989,7 +3005,6 @@ fn run_up(
             // Every fact is reduced to a bool HERE so the database URL (credentials
             // and all) never reaches the driver, its errors, or its output.
             db: FleetDatabaseFacts {
-                writable_configured: resolve_writable_db_url(&config.database).is_some(),
                 sqlite: writable_db_is_sqlite(&config.database),
                 auto_migrate: config.database.auto_migrate,
                 auto_migrate_in_production: config.database.auto_migrate_in_production,
@@ -3025,9 +3040,6 @@ fn run_up(
 /// rollout driver, its errors and its output can never quote it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct FleetDatabaseFacts {
-    /// Whether a writable database URL is configured at all — the fleet warns
-    /// loudly when it is and the rollout schedules no migration.
-    writable_configured: bool,
     /// Whether that URL names a `SQLite` backend (the §4.8 refusal).
     sqlite: bool,
     /// `[database] auto_migrate`, verbatim (the §4.8 warning).
@@ -3114,6 +3126,20 @@ struct HostProbeState {
     reregister_options: exec::ProxyServiceOptions,
     /// Operator-facing description of the path this host takes.
     banner: String,
+    /// Whether this host has no usable reverse-proxy binary and this deploy must
+    /// install one as the FIRST op of that host's turn (issue #1607, AC-1).
+    needs_proxy_install: bool,
+}
+
+/// Whether this host's deploy may prepare the target by installing a missing proxy
+/// binary — the `[deploy] install_proxy` knob, projected onto the executor-level
+/// type (issue #1607, AC-1).
+const fn provisioning(cfg: &ResolvedDeployConfig) -> exec::ProxyProvisioning {
+    if cfg.install_proxy {
+        exec::ProxyProvisioning::Auto
+    } else {
+        exec::ProxyProvisioning::Disabled
+    }
 }
 
 /// Probe ONE host read-only and apply every fail-closed refusal to it.
@@ -3151,13 +3177,16 @@ where
         }
     };
 
-    // Fail closed on kamal-proxy CLI-surface drift BEFORE any cutover (#2053): the
-    // controller consumes an UNPINNED kamal-proxy from host bootstrap, so a
-    // renamed/removed subcommand or flag on `kamal-proxy deploy` would otherwise
-    // break a real cutover with no warning. A compatible binary passes silently;
-    // an incompatible one aborts here (read-only `--help` probe, nothing mutated).
-    exec::probe_proxy_compat(input.proxy, executor)
-        .map_err(|e| DeployError::Exec(scoped(e.to_string())))?;
+    // Decide whether the host has a WORKING reverse proxy (#1607 AC-1 host prep,
+    // #2053 CLI-drift guard). READ-ONLY: a compatible binary passes silently, a
+    // drifted one aborts here and is never replaced, and a host with none is merely
+    // MARKED for preparation — the install itself is the first op of that host's own
+    // turn, so this phase still mutates nothing anywhere in the fleet.
+    let needs_proxy_install = matches!(
+        exec::assess_proxy_readiness(input.proxy, executor, provisioning(cfg))
+            .map_err(|e| DeployError::Exec(scoped(e.to_string())))?,
+        exec::ProxyReadiness::NeedsInstall
+    );
 
     // Probe the target to choose first-deploy vs zero-downtime redeploy. The same
     // round-trip also captures `kamal-proxy list` so a drifted live-slot marker
@@ -3206,6 +3235,7 @@ where
             // release whose options could need preserving.
             reregister_options: input.proxy.proxy_service_options(),
             banner: "first deploy".to_owned(),
+            needs_proxy_install,
         }),
         exec::DeployMode::Redeploy { live_slot } => {
             // Pre-flight refuse (#2073): the reboot-durability restart-refresh (#2070)
@@ -3268,6 +3298,7 @@ where
                 repair: reconcile.repair,
                 reregister_options,
                 banner,
+                needs_proxy_install,
             })
         }
     }
@@ -3393,9 +3424,7 @@ where
     let plan = fleet::plan_fleet(fleet, &modes).map_err(|e| DeployError::Config(e.to_string()))?;
 
     if !single {
-        for line in
-            fleet::fleet_rollout_lines(&plan, input.release_id, input.db.writable_configured)
-        {
+        for line in fleet::fleet_rollout_lines(&plan, input.release_id) {
             eprintln!("{line}");
         }
         eprintln!();
@@ -3437,6 +3466,14 @@ where
                 reregister_options: &state.reregister_options,
             },
         );
+        // HOST PREPARATION (#1607, AC-1): this host has no usable reverse-proxy
+        // binary, so install one as the very FIRST op of its turn — ahead of the
+        // proxy unit that supervises it, and ahead of everything else. Running it
+        // here rather than during the read-only probe phase is what keeps "no host
+        // is touched until every host is graded" true, and it means a failed
+        // install is an ordinary PRE-cutover failure: the rollout halts, this host
+        // is compensated like any other, and no host that already cut over is left
+        // behind.
         // Repair the drifted marker as an early op — before the cutover's
         // record-previous-release reads it — so the on-disk marker matches the
         // proxy truth even if the rest of the deploy is later interrupted.
@@ -3445,6 +3482,23 @@ where
                 0,
                 exec::live_slot_marker_repair_op(cfg, state.slots.live_slot, input.public_port),
             );
+        }
+        // Host preparation goes in AFTER the repair insert so it ends up ahead of
+        // it: a host needing both is one with no proxy binary AND a drifted marker,
+        // and installing the proxy is what makes every later op — the marker repair
+        // included — worth attempting at all.
+        if state.needs_proxy_install {
+            eprintln!(
+                "{}host preparation: {}",
+                if single {
+                    String::new()
+                } else {
+                    format!("host {}: ", host_plan.host)
+                },
+                input.proxy.binary_install_note(),
+            );
+            let install = input.proxy.binary_install_ops().unwrap_or_default();
+            ops.splice(0..0, install);
         }
         // First-deploy teardown must also unlink `current` and clear the live-slot
         // marker that first_deploy_ops creates — otherwise a failed first deploy
@@ -4890,6 +4944,32 @@ mod tests {
                 "error should name the section and the missing key, got: {err}",
             );
         }
+    }
+
+    #[test]
+    fn host_preparation_is_on_by_default_and_declinable() {
+        // #1607 (AC-1): the documented target-host precondition is at most a stock
+        // Ubuntu LTS with SSH access, so preparing the host is the DEFAULT. The
+        // opt-out exists for operators who provision the proxy themselves.
+        assert!(
+            resolved_defaults().install_proxy,
+            "a bare `[deploy]` table must prepare the host"
+        );
+        assert_eq!(
+            provisioning(&resolved_defaults()),
+            exec::ProxyProvisioning::Auto
+        );
+
+        let declined = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                install_proxy: false,
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("declining host prep resolves");
+        assert!(!declined.install_proxy);
+        assert_eq!(provisioning(&declined), exec::ProxyProvisioning::Disabled);
     }
 
     // ── fleet host list (#1621) ───────────────────────────────────
@@ -6524,11 +6604,14 @@ mod tests {
         );
 
         // (3) STEP-LABEL SUBSET. Every printed step label either names a real
-        // executed op or is one of the four deliberately MECHANISM-NEUTRAL labels
+        // executed op or is one of the five deliberately MECHANISM-NEUTRAL labels
         // (`build` is local, `upload` executes as `upload-binary`, `cutover` as
-        // `proxy-flip`, `drain` as `drain-old`). Partitioning — rather than a bare
-        // `contains` — means a NEW plan step forces a deliberate decision here
-        // instead of silently drifting away from the ops.
+        // `proxy-flip`, `drain` as `drain-old`, and `prepare-host` executes as the
+        // probe-gated `install-proxy` — which runs ONLY on a host that has no proxy
+        // binary, so it is legitimately absent from this already-equipped fleet's
+        // ops). Partitioning — rather than a bare `contains` — means a NEW plan step
+        // forces a deliberate decision here instead of silently drifting away from
+        // the ops.
         let step_labels: Vec<&str> = build_deploy_plan(&fleet.hosts[0])
             .iter()
             .map(|s| s.label)
@@ -6542,7 +6625,7 @@ mod tests {
         );
         assert_eq!(
             neutral,
-            vec!["build", "upload", "cutover", "drain"],
+            vec!["build", "prepare-host", "upload", "cutover", "drain"],
             "only the documented mechanism-neutral plan labels may be absent from \
              the ops: {step_labels:?} vs {flat:?}"
         );
@@ -7181,6 +7264,210 @@ mod tests {
             .script(host, "probe-release-dir", "absent")
     }
 
+    /// Script one BARE host (issue #1607, AC-1): the compat probe answers nothing,
+    /// which is what a host with no kamal-proxy at `/usr/local/bin` looks like.
+    fn script_bare_first_deploy(
+        recorder: fleet::test_support::FleetRecorder,
+        host: &str,
+    ) -> fleet::test_support::FleetRecorder {
+        recorder
+            .script(host, "proxy-compat-probe", "")
+            .script(host, "detect-current", first_deploy_probe())
+            .script(host, "probe-release-dir", "absent")
+    }
+
+    #[test]
+    fn a_bare_host_installs_the_proxy_as_the_first_op_of_its_own_turn() {
+        // #1607 (AC-1): "the command performs any remaining host preparation
+        // itself". The install must sit at the head of that host's OWN turn, not in
+        // the all-hosts probe phase — otherwise a fleet whose last host is
+        // unreachable would already have modified the earlier hosts before grading
+        // finished, breaking "no host is touched until every host is graded".
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_bare_first_deploy(recorder, "web-a");
+        recorder = script_bare_first_deploy(recorder, "web-b");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect("a bare fleet deploys after preparing each host");
+
+        for host in ["web-a", "web-b"] {
+            let labels = recorder.run_labels_for(host);
+            let install = labels
+                .iter()
+                .position(|l| *l == "install-proxy")
+                .unwrap_or_else(|| panic!("host {host} must be prepared: {labels:?}"));
+            let first_mutating = recorder
+                .first_mutating(host, &READ_ONLY_PROBES)
+                .expect("a deployed host mutates something");
+            assert_eq!(
+                labels[install..install + 2].to_vec(),
+                vec!["install-proxy", "proxy-install"],
+                "the install must precede the proxy unit it supervises on {host}: {labels:?}"
+            );
+            assert!(
+                recorder
+                    .positions_of("install-proxy")
+                    .contains(&first_mutating),
+                "host preparation must be the FIRST thing that touches {host} \
+                 (its first mutating call was at tape position {first_mutating})"
+            );
+        }
+
+        // Both hosts finished being GRADED before either was prepared: every
+        // read-only probe on the fleet tape precedes the first install.
+        let first_install = *recorder
+            .positions_of("install-proxy")
+            .first()
+            .expect("the fleet prepares a host");
+        for label in READ_ONLY_PROBES {
+            let last_probe = *recorder
+                .positions_of(label)
+                .last()
+                .unwrap_or_else(|| panic!("every host runs {label}"));
+            assert!(
+                last_probe < first_install,
+                "the probe phase must finish before anything is installed: {label} at \
+                 {last_probe}, first install at {first_install}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_redeploy_host_is_prepared_before_its_marker_repair() {
+        // A host can need BOTH: no proxy binary and a drifted live-slot marker. Host
+        // preparation must still come first — the marker repair (and everything
+        // after it) is only worth attempting once the proxy the host is supposed to
+        // be running actually exists.
+        let fleet = fleet_of(&["web-a"]);
+        // The marker says blue (3001) but the proxy is serving green (public + 2 =
+        // 3002), so the deploy reconciles onto the proxy's truth and repairs the
+        // marker as an early op.
+        let drifted = "redeploy:blue\t3001\n\
+             ---autumn-kamal-proxy-list---\n\
+             Service   Host          Target            State    TLS\n\
+             myapp     example.com   127.0.0.1:3002   running  no\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 3000\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-a", "proxy-compat-probe", "")
+            .script("web-a", "detect-current", drifted)
+            .script("web-a", "probe-release-dir", "absent");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect("a bare, drifted host deploys after being prepared");
+
+        let labels = recorder.run_labels_for("web-a");
+        let install = labels
+            .iter()
+            .position(|l| *l == "install-proxy")
+            .expect("a bare host is prepared");
+        let repair = labels
+            .iter()
+            .position(|l| *l == "record-live-slot")
+            .expect("a drifted marker is repaired");
+        assert!(
+            install < repair,
+            "host preparation must precede the marker repair: {labels:?}"
+        );
+        let first_mutating = recorder
+            .first_mutating("web-a", &READ_ONLY_PROBES)
+            .expect("a deployed host mutates something");
+        assert!(
+            recorder
+                .positions_of("install-proxy")
+                .contains(&first_mutating),
+            "host preparation is still the FIRST thing that touches the host"
+        );
+    }
+
+    #[test]
+    fn declining_host_preparation_refuses_a_bare_host_without_touching_it() {
+        // #1607: `[deploy] install_proxy = false` is the documented opt-out. It must
+        // reach the assessor through the REAL call site — a hardcoded `Auto` there
+        // would silently ignore the setting — and a declined host must be left
+        // completely alone, not half-prepared.
+        let mut cfg = fleet_cfg(&["web-a"]);
+        cfg.install_proxy = false;
+        let fleet = ResolvedFleet::resolve(&cfg, "myapp").expect("a one-host fleet resolves");
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-a", "proxy-compat-probe", "")
+            .script("web-a", "detect-current", first_deploy_probe())
+            .script("web-a", "probe-release-dir", "absent");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a bare host with host prep declined must refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains("install_proxy"),
+            "the refusal must name the setting in force: {message}"
+        );
+        assert_eq!(
+            recorder.run_labels_for("web-a"),
+            vec!["proxy-compat-probe"],
+            "a declined host must be left untouched"
+        );
+    }
+
+    #[test]
+    fn a_failed_host_preparation_halts_the_rollout_and_touches_no_later_host() {
+        // Host preparation is an ordinary PRE-cutover op, so its failure must behave
+        // like any other: this host is compensated, and the rest of the fleet is
+        // never reached.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_bare_first_deploy(recorder, "web-a");
+        recorder = script_bare_first_deploy(recorder, "web-b");
+        recorder = recorder.fail("web-a", "install-proxy");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a failed host preparation must fail the rollout");
+        assert!(
+            err.to_string().contains("install-proxy"),
+            "the failing step is named: {err}"
+        );
+        // web-a never got past its first op: nothing was uploaded, nothing started,
+        // and the only ops after the failure are the first-deploy teardown that
+        // compensates it.
+        let web_a = recorder.run_labels_for("web-a");
+        let (probes, rest) = web_a.split_at(READ_ONLY_PROBES.len());
+        assert_eq!(probes, READ_ONLY_PROBES);
+        assert_eq!(rest[0], "install-proxy");
+        assert!(
+            rest[1..].iter().all(|l| l.starts_with("teardown-")),
+            "only compensation may follow a failed host preparation: {web_a:?}"
+        );
+        // …and web-b was only ever GRADED, never touched.
+        assert_eq!(
+            recorder.run_labels_for("web-b"),
+            READ_ONLY_PROBES.to_vec(),
+            "a halt must leave every later host untouched"
+        );
+    }
+
+    #[test]
+    fn a_host_that_already_has_the_proxy_is_never_prepared() {
+        // Idempotence, at the driver level: the compat probe answers, so nothing is
+        // installed on either host.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_first_deploy(recorder, "web-a");
+        recorder = script_redeploy(recorder, "web-b");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect("an equipped fleet deploys");
+
+        assert!(
+            recorder.positions_of("install-proxy").is_empty(),
+            "an equipped host must never be re-prepared"
+        );
+    }
+
     /// The release a compensated redeploy host rolls BACK to — the blue release it
     /// was serving before this run flipped it to green.
     const PREVIOUS_RELEASE_DIR: &str = "/srv/autumn/myapp/releases/20260101T000000Z";
@@ -7271,10 +7558,7 @@ mod tests {
                 ffmpeg_bin: "ffmpeg",
                 // No `--only`: the rollout covers everything the config declares.
                 configured_host_count: fleet.hosts.len(),
-                db: FleetDatabaseFacts {
-                    writable_configured: true,
-                    ..FleetDatabaseFacts::default()
-                },
+                db: FleetDatabaseFacts::default(),
                 // Durable by default in the fakes: the AC-8 warning has its own
                 // unit test, and it must not add a line to every driver tape.
                 jobs_backend: "postgres",
@@ -7328,6 +7612,7 @@ mod tests {
                     &self.manifests,
                     FLEET_RELEASE_ID,
                     &slots,
+                    migrate,
                 ),
                 fleet::HostMode::Redeploy => exec::cutover_ops(
                     cfg,
@@ -7465,9 +7750,10 @@ mod tests {
 
     #[test]
     fn fleet_of_one_first_deploy_matches_todays_single_host_sequence() {
-        // #1621 (AC-1, T1.6): the same differential proof on the first-deploy path,
-        // which carries NO migrate op — an all-first-deploy fleet migrates nowhere,
-        // exactly today's documented single-host limitation.
+        // #1621 (AC-1, T1.6): the same differential proof on the first-deploy path.
+        // Since #1607 (AC-3) that path carries the migrate op too, so a one-entry
+        // `hosts` list is byte-identical to the single-host first deploy INCLUDING
+        // its pre-start migration.
         let fleet = fleet_of(&["203.0.113.10"]);
         let recorder = fleet::test_support::FleetRecorder::new()
             .script(
@@ -7490,14 +7776,14 @@ mod tests {
                 .todays_calls(
                     &fleet.hosts[0],
                     fleet::HostMode::First,
-                    exec::MigrateStep::Skip
+                    exec::MigrateStep::Run
                 )
                 .as_slice(),
             "a one-host first deploy must be byte-identical to today's single-host first deploy"
         );
         assert!(
-            !recorder.run_labels_for("203.0.113.10").contains(&"migrate"),
-            "the first-deploy path carries no migrate op"
+            recorder.run_labels_for("203.0.113.10").contains(&"migrate"),
+            "the first-deploy path migrates before the release takes traffic (#1607)"
         );
     }
 

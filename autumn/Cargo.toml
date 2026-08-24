@@ -220,8 +220,8 @@ acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
 edge = ["dep:autumn-edge"]
 
 [dependencies]
-autumn-edge = { version = "0.6.0", path = "../autumn-edge", optional = true }
-autumn-macros = { version = "0.6.0", path = "../autumn-macros" }
+autumn-edge = { version = "0.7.0", path = "../autumn-edge", optional = true }
+autumn-macros = { version = "0.7.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
 # Best-effort ASCII folding for `slug::slugify` (issue #1260, e.g. "café" ->

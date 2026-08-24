@@ -242,8 +242,9 @@ You have a working single-host deploy. Here is the whole change.
 
 Each new host needs exactly what the first one needed
 ([Preconditions](deployment.md#preconditions)): key-based SSH access for
-`[deploy] user`, and the `kamal-proxy` binary at `/usr/local/bin/kamal-proxy`.
-Nothing else — the release layout, units and directories are created for you.
+`[deploy] user`. Nothing else — the reverse-proxy binary, release layout, units
+and directories are all created for you, per host, on its own turn in the rollout
+(see [Host preparation](deployment.md#host-preparation-install_proxy)).
 
 ### 2. Move the shared state off the app host
 
@@ -296,10 +297,9 @@ and the rollout handles that explicitly:
   candidate on the idle slot, migrate, `/ready` gate, atomic flip.
 - `10.0.0.2` and `10.0.0.3` have nothing installed, so they take the **first
   deploy** path: install kamal-proxy, stand the release up, health-gate, route.
-- The migration runs on `10.0.0.1` **only** — the first host in rollout order
-  that is still on a previous release — before its cutover. The two new hosts
-  skip it, because the schema is fleet-wide and running it three times is at best
-  redundant and at worst a race.
+- The migration runs on `10.0.0.1` **only** — the **first host in rollout order**
+  — before its cutover. The other two skip it, because the schema is fleet-wide
+  and running it three times is at best redundant and at worst a race.
 
 ```
 Rolling release 20260821T101500Z across 3 hosts, ONE AT A TIME, in `[deploy] hosts` order:
@@ -309,46 +309,22 @@ Rolling release 20260821T101500Z across 3 hosts, ONE AT A TIME, in `[deploy] hos
   → migrate (10.0.0.1 only — the schema is fleet-wide; 10.0.0.2, 10.0.0.3 skip it)
 ```
 
-> **A fleet where *every* host is a first deploy migrates nowhere.** A first
-> deploy has never run migrations (it stands the release up and health-gates it),
-> so a brand-new fleet with no host on a previous release runs no migration at
-> all — and says so loudly, telling you to run `autumn migrate` yourself before
-> serving traffic. That warning is your cue, not a bug.
+> **A brand-new fleet migrates too.** A first deploy runs its pending migrations
+> before it starts the release, so a fleet where *every* host is a first deploy
+> still migrates exactly once — on host 1, before that host takes traffic. There
+> is no out-of-band `autumn migrate` step for a new fleet.
 
-#### List the already-deployed hosts first
+#### Rollout order and the migration
 
-The example above works because `10.0.0.1` — the host that is already serving —
-is **first** in the list. That ordering is load-bearing, and nothing enforces it.
+The migration is placed on the **first host in rollout order**, whatever state
+that host is in. Host 1 is the earliest point in the rollout, so the schema
+always moves before any host in the fleet serves the new release — including in
+the scale-up shape `hosts = ["<new>", "<new>", "<existing>"]`, where the leading
+new host carries the migration itself.
 
-The migration is placed on the first host in rollout order that is still on a
-previous release. A new host listed *ahead* of that one takes the first-deploy
-path, which carries no migrate step, so it **goes live on the new release before
-the schema moves**. With `hosts = ["10.0.0.2", "10.0.0.3", "10.0.0.1"]` — the two
-new hosts first — `10.0.0.2` and `10.0.0.3` serve the new release against the old
-schema until the rollout reaches `10.0.0.1`. If the release needs the new schema,
-that window is an outage on those hosts.
-
-So when you add hosts to an existing fleet: **put the already-deployed host (or
-hosts) at the front of `hosts` and append the new ones**. The list is never
-reordered for you — declaration order is the rollout contract, and silently
-resequencing it would be worse than the hazard.
-
-The rollout names the hazard when you hit it, in the header, before anything is
-touched:
-
-```
-⚠️  10.0.0.2, 10.0.0.3 go live on the new release BEFORE the migration runs
-(a first deploy never migrates) — if this release needs the new schema they will
-serve against the old one until the migrating host is reached; list an
-already-deployed host first to avoid it
-```
-
-Seeing that means exactly one thing: reorder `hosts` so an already-deployed host
-comes first and re-run, or accept the window knowingly because this release does
-not depend on the new schema. Like the other migration warnings it is only
-printed when the CLI can resolve a writable database URL from your config — an
-app whose database URL exists only in the host's environment gets no warning, so
-order the list correctly regardless.
+Declaration order still matters for *everything else* — it is the rollout order,
+and it is never reordered for you — but it is no longer load-bearing for
+migration safety.
 
 ### 6. Add the new hosts to the load balancer
 
@@ -566,9 +542,9 @@ reading the exact sentence rather than skimming for the ⚠️:
   like a clean no-op and is not: the table is all "previous release still
   serving" rows, and the database has already moved on.
 
-A fleet where *every* host is a first deploy schedules no migration at all, so it
-prints none of these — the prologue already told you to run `autumn migrate`
-yourself.
+Every non-empty rollout schedules a migration, so the gate on all of these is
+simply whether the rollout reached host 1 at all: one that failed before touching
+it moved no schema and prints none of these.
 
 ---
 

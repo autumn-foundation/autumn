@@ -225,6 +225,65 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
             }),
         },
     },
+    // 0.7.0 ships no codemod: each of its breaks needs a value, a wire change
+    // in a client this tool never sees, or a change of impl *shape* — none of
+    // them rename-level. They are registered as `GuideOnly` so the upgrade
+    // summary names them and links the guide section, rather than a 0.6.x app
+    // being told "nothing to change" about a release that broke three seams
+    // and rewrote query decoding.
+    AppMigration {
+        id: "0.7.0-routing-route-seo-field",
+        version: "0.7.0",
+        title: "`Route` and `StaticRouteMeta` gained an `seo` field",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.7.0.md#routing-route-and-staticroutemeta-gained-an-seo-field",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.7.0-api-lock-version-required",
+        version: "0.7.0",
+        title: "a `lock_version` model requires the version on JSON `PUT`/`PATCH`",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.7.0.md#json-api-a-lock_version-model-now-requires-the-version-on-putpatch",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.7.0-app-layers-erased",
+        version: "0.7.0",
+        title: "app-wide layers are registered against the erased ingress service",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.7.0.md#app-wide-layers-are-now-erased",
+        rewrite: Rewrite::GuideOnly,
+    },
+    // Not a compile break — this one still builds, which is exactly why it
+    // needs surfacing: `Query<T>` was rewritten, and four of its runtime
+    // behaviours changed. A 0.6.x app that uses `Query<T>` beyond unique
+    // scalar keys can start returning 400s, stop resolving map duplicates
+    // last-value-wins, or see `Vec<(String, String)>` come back key-sorted,
+    // with nothing in the build to warn it. `GuideOnly` is precisely the slot
+    // for a client-dependent change no source-level rewrite can decide.
+    // The highest-consequence item in the release, and invisible in Rust: an
+    // `autumn.toml` that already sets `auto_migrate_in_production = true` under
+    // a CUSTOM profile did nothing on 0.6.x and applies migrations at startup
+    // on 0.7.0. The key did not change; the profile name-gate around it was
+    // removed. An operator who reads only the compile breaks would meet this
+    // for the first time against a live database.
+    AppMigration {
+        id: "0.7.0-migrate-profile-agnostic",
+        version: "0.7.0",
+        title: "`auto_migrate_in_production` is honoured on any non-`dev` profile",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.7.0.md#startup-migrations-are-now-profile-agnostic-1903",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.7.0-query-decoding",
+        version: "0.7.0",
+        title: "`Query<T>` decodes structure, rejects duplicate scalar keys, and sorts pair vectors",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.7.0.md#queryt-decoding-1972",
+        rewrite: Rewrite::GuideOnly,
+    },
 ];
 
 /// The full registry.
@@ -577,13 +636,22 @@ mod tests {
 
     #[test]
     fn excludes_migrations_the_app_is_already_past() {
-        let ids: Vec<_> = migrations_between(&v(0, 6, 0), &v(0, 7, 0))
-            .iter()
-            .map(|m| m.id)
-            .collect();
+        // An app already on 0.6.0 needs none of 0.6.0's migrations — but it
+        // does need everything 0.7.0 introduced. This asserted an EMPTY result
+        // while 0.7.0 had no entries yet, which quietly conflated "excludes
+        // what the app is past" with "the target release adds nothing"; the
+        // moment 0.7.0 registered its first migration the assertion was wrong
+        // about the thing it is named for. Assert the boundary itself.
+        let selected = migrations_between(&v(0, 6, 0), &v(0, 7, 0));
+        let ids: Vec<_> = selected.iter().map(|m| m.id).collect();
         assert!(
-            ids.is_empty(),
-            "an app already on 0.6.0 needs no 0.6.0 migration, got {ids:?}"
+            selected.iter().all(|m| m.version == "0.7.0"),
+            "0.6.0 -> 0.7.0 must select only 0.7.0 migrations, got {ids:?}"
+        );
+        assert!(
+            !ids.is_empty(),
+            "0.7.0 registers migrations, so this range is not empty — if it is, \
+             the range filter dropped them"
         );
     }
 

@@ -69,7 +69,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::proxy::ProxyController;
+use super::proxy::{ProxyCompatFailure, ProxyController};
 use super::{PreflightCheck, ResolvedDeployConfig};
 
 /// A secret string (e.g. the env-file body carrying the signing secret and
@@ -739,10 +739,10 @@ impl SlotPlan {
 /// yes/no and must not force a second signature break on [`cutover_ops`], the
 /// most exact-vector-asserted builder in the deploy path.
 ///
-/// [`first_deploy_ops`] takes no such parameter: a first deploy has **never** run
-/// migrations (a documented single-host limitation), and keeping it byte-identical
-/// is what lets the one-entry-`hosts` fleet stay indistinguishable from today's
-/// single-server deploy.
+/// [`first_deploy_ops`] takes the SAME parameter (issue #1607, AC-3): a first
+/// deploy migrates too — its pending migrations run before the initial release
+/// ever starts — so a fleet still runs exactly ONE migration whatever mix of
+/// first deploys and redeploys it contains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrateStep {
     /// Run the pending-migration one-shot before the flip — today's behavior, in
@@ -767,14 +767,27 @@ pub enum MigrateStep {
 /// 4. write the secret env file (`0600`, AC-5),
 /// 5. write the blue slot's systemd unit (binds `127.0.0.1:{blue_port}`),
 /// 6. point `current` at the new release,
-/// 7. `systemctl daemon-reload`,
-/// 8. `systemctl enable {service}-blue.service && systemctl restart
+/// 7. `systemctl daemon-reload` (loads the unit; starts nothing),
+/// 8. run pending migrations (`AUTUMN_MIGRATE=1` one-shot) — [`MigrateStep::Run`]
+///    for a single-host first deploy and for the fleet host carrying the
+///    migration, [`MigrateStep::Skip`] for the rest,
+/// 9. `systemctl enable {service}-blue.service && systemctl restart
 ///    {service}-blue.service` (restart, not `enable --now`, so an already-active
 ///    slot always relaunches the freshly written unit — see the op's comment),
-/// 9. record the live slot marker,
-/// 10. clear the previous-release marker (a first deploy has no previous),
-/// 11. bounded `/ready` poll on the blue loopback port,
-/// 12. route the proxy at `127.0.0.1:{blue_port}`.
+/// 10. record the live slot marker,
+/// 11. clear the previous-release marker (a first deploy has no previous),
+/// 12. bounded `/ready` poll on the blue loopback port,
+/// 13. route the proxy at `127.0.0.1:{blue_port}`.
+///
+/// # Why the migration sits EARLIER here than in [`cutover_ops`]
+///
+/// The redeploy path starts the candidate first and migrates while the old
+/// release keeps serving. A first deploy has no old release to protect and no
+/// running process to keep warm, so the migration runs BEFORE the unit is started:
+/// an app booted against a schema that was never applied can crash-loop under
+/// systemd's restart policy long before the readiness gate reports anything
+/// useful. Both positions are pre-cutover, which is what AC-3 requires — nothing
+/// takes traffic until the migration has succeeded.
 #[must_use]
 // One cohesive op-plan builder; each param is a distinct injected input
 // (config, proxy, unit text, secret env, binary path, config manifests, release
@@ -789,6 +802,7 @@ pub fn first_deploy_ops(
     manifests: &[ManifestUpload],
     release_id: &str,
     plan: &SlotPlan,
+    migrate: MigrateStep,
 ) -> Vec<DeployOp> {
     let release_dir = format!("{}/{release_id}", cfg.releases_dir());
     let remote_binary = format!("{release_dir}/{}", cfg.app_name);
@@ -846,6 +860,24 @@ pub fn first_deploy_ops(
             "daemon-reload",
             "systemctl daemon-reload",
         )),
+    ]);
+    // Pending migrations run BEFORE the initial release is even started (issue
+    // #1607, AC-3). `systemd-run --wait` returns the child's exit status, so a
+    // failed migration surfaces a non-zero error that stops `run_ops` here — the
+    // slot never starts, the proxy is never routed at it, and the caller's
+    // first-deploy teardown removes the half-written release.
+    //
+    // It sits AFTER `daemon-reload` (which only reloads unit files and starts
+    // nothing) rather than before it, so `daemon-reload` is unambiguously a
+    // PRE-migrate step on BOTH builders — see [`PRE_MIGRATE_LABELS`], which the
+    // fleet summary uses to tell "died before migrating" from "the schema moved".
+    //
+    // `MigrateStep::Skip` omits ONLY this op (a fleet migrates exactly once); see
+    // [`MigrateStep`].
+    if matches!(migrate, MigrateStep::Run) {
+        ops.push(DeployOp::Run(release_migrate_command(cfg, &release_dir)));
+    }
+    ops.extend([
         // enable = boot-persistence; restart = start-or-relaunch. We deliberately
         // use `restart` (not `enable --now`) because an already-active slot — one
         // left running by drift — must ALWAYS relaunch the freshly written unit:
@@ -1606,6 +1638,52 @@ fn commit_markers_command(
     )
 }
 
+/// Op labels that both per-host builders emit strictly BEFORE their `migrate` op.
+///
+/// A host whose deploy failed at one of these never reached its migration, so the
+/// schema cannot have moved — which is what lets the fleet summary
+/// (`fleet::schema_moved`) stop claiming "the migration that already ran was NOT
+/// rolled back" for a rollout that died while uploading. Any label NOT listed here
+/// is treated as "at or after the migration", so a new step defaults to the
+/// conservative side.
+///
+/// The list is kept honest by `pre_migrate_labels_match_both_builders`, which
+/// derives the true pre-`migrate` prefix from `first_deploy_ops` and `cutover_ops`
+/// and asserts it against this constant — so adding, removing or moving an op
+/// fails that test rather than silently making the summary lie.
+pub const PRE_MIGRATE_LABELS: &[&str] = &[
+    "install-proxy",
+    "proxy-snapshot-unit",
+    "proxy-write-unit",
+    "proxy-install",
+    "proxy-restart-if-changed",
+    "prepare-dirs",
+    "upload-binary",
+    "upload-config",
+    "write-env",
+    "write-unit",
+    "write-candidate-unit",
+    "link-current",
+    "daemon-reload",
+    "start-candidate",
+    // Transport-level attributions for the uploads above (`failed_step_label`
+    // reports a fixed label rather than the remote path): every upload on both
+    // deploy paths precedes `migrate`.
+    "upload",
+    "stage-local-file",
+];
+
+/// Whether a host that failed at `failed_step` had already run its migration.
+///
+/// Conservative by design: only a label this crate KNOWS runs before `migrate`
+/// ([`PRE_MIGRATE_LABELS`]) proves the schema did not move. Anything else — the
+/// `migrate` op itself, everything after it, and any label this list does not
+/// recognise — counts as "it may have".
+#[must_use]
+pub fn failed_before_migrating(failed_step: &str) -> bool {
+    PRE_MIGRATE_LABELS.contains(&failed_step)
+}
+
 /// Command that runs the uploaded release's pending migrations as a one-shot,
 /// BEFORE cutover.
 ///
@@ -1616,6 +1694,22 @@ fn commit_markers_command(
 /// (`AppBuilder::run` → `run_migrate_only_mode`), which applies pending embedded
 /// migrations with the same locked applier a normal boot uses and exits without
 /// starting the server.
+///
+/// It also mirrors the slot unit ([`super::render_app_unit`]) in two ways, so the
+/// one-shot resolves everything exactly as the release it gates will:
+///
+/// * `AUTUMN_MANIFEST_DIR` = the release dir, so it loads the SAME uploaded
+///   `autumn.toml` the release boots with (#1952). Without it the migration ran
+///   against built-in defaults plus the env file, so a config-only database
+///   topology — `[[database.shards]]`, a `primary_url` that lives only in the
+///   manifest — was invisible to it and it could migrate a different set of targets
+///   than the app then uses.
+/// * `--working-directory` = the release dir, matching the unit's
+///   `WorkingDirectory`. A transient `systemd-run` unit otherwise starts in the
+///   manager's default directory (`/`), so a RELATIVE database URL — a supported
+///   single-host `sqlite://./app.db`, say — resolved to a different file for the
+///   migration than for the app, which would then start against an unmigrated
+///   database.
 fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> RemoteCommand {
     let bin = format!("{release_dir}/{}", cfg.app_name);
     // Scope the transient unit to this release so overlapping deploys (or a prior
@@ -1626,9 +1720,12 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
         "migrate",
         format!(
             "systemd-run --wait --collect --quiet --unit={service}-migrate-{release_id} \
-             --property=EnvironmentFile={env} --setenv=AUTUMN_MIGRATE=1 {bin}",
+             --working-directory={workdir} --property=EnvironmentFile={env} \
+             --setenv=AUTUMN_MIGRATE=1 --setenv=AUTUMN_MANIFEST_DIR={manifest} {bin}",
             service = cfg.service_name,
+            workdir = shell_quote(release_dir),
             env = shell_quote(&cfg.env_file()),
+            manifest = shell_quote(release_dir),
             bin = shell_quote(&bin),
         ),
     )
@@ -2445,39 +2542,19 @@ fn probe_dir_state(
     })
 }
 
-/// Fail closed on reverse-proxy CLI-surface drift BEFORE any cutover (issue #2053).
+/// Run the controller's compat probe once and return its raw verdict.
 ///
-/// The proxy controller ([`KamalProxyController`](super::proxy::KamalProxyController))
-/// consumes an UNPINNED kamal-proxy binary from host bootstrap and never checked
-/// its CLI surface, so a renamed/removed subcommand or flag on `kamal-proxy deploy`
-/// (the route/flip command) would break a real cutover with no warning. This runs
-/// the controller's read-only compat probe (a `--help` invocation) and applies its
-/// verdict:
-///
-/// - a controller that declares no probe ([`ProxyController::compat_probe`] →
-///   `None`, e.g. a Caddy controller provisioning its own pinned binary) → `Ok(())`
-///   (nothing to check);
-/// - an installed binary that still supports every subcommand/flag the cutover uses
-///   → `Ok(())` and **silent**, so a host that is already fine is untouched;
-/// - otherwise → [`DeployExecError::ProxyIncompatible`] with a clear, actionable
-///   operator message naming exactly what is missing and the remedy, aborting the
-///   deploy before it touches live traffic.
-///
-/// It runs before the first-vs-redeploy decision, so it gates BOTH deploy paths
-/// (the first deploy's `proxy-route` and the redeploy's `proxy-flip` are the same
-/// `kamal-proxy deploy` command).
-///
-/// # Errors
-///
-/// Returns [`DeployExecError::ProxyIncompatible`] when the installed proxy's CLI
-/// surface is incompatible, or the executor's error if the probe cannot run.
-pub fn probe_proxy_compat(
+/// `Ok(None)` means the controller declares no probe (nothing to check and no
+/// remote command run). The outer `Result` is the TRANSPORT result — an ssh that
+/// could not run at all — kept separate from the verdict so a caller can react to
+/// "no binary" without conflating it with "the host is unreachable".
+fn run_proxy_compat_probe(
     proxy: &impl ProxyController,
     exec: &impl DeployExecutor,
-) -> Result<(), DeployExecError> {
+) -> Result<Option<Result<(), ProxyCompatFailure>>, DeployExecError> {
     let Some(probe) = proxy.compat_probe() else {
         // No declared probe (e.g. a Caddy controller): nothing to guard.
-        return Ok(());
+        return Ok(None);
     };
     let out = exec.run(&probe.command)?;
     // The probe folds stderr into stdout via `2>&1`; assess both defensively so a
@@ -2487,9 +2564,104 @@ pub fn probe_proxy_compat(
     } else {
         format!("{}\n{}", out.stdout, out.stderr)
     };
-    probe
-        .assess(&combined)
-        .map_err(|message| DeployExecError::ProxyIncompatible { message })
+    Ok(Some(probe.assess(&combined)))
+}
+
+/// Whether this deploy may PREPARE the target host by installing a missing proxy
+/// binary (issue #1607, AC-1), or must leave the host untouched.
+///
+/// Resolved from `[deploy] install_proxy` (default `true`). The opt-out exists for
+/// operators who provision the proxy themselves — a pinned corporate build, a
+/// package they maintain, a host they do not want a container runtime on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyProvisioning {
+    /// Install the proxy binary when — and only when — the host has none.
+    Auto,
+    /// Never install anything; a missing binary is an actionable failure.
+    Disabled,
+}
+
+/// What the read-only proxy assessment found on the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyReadiness {
+    /// A working proxy binary is installed (or the controller declares no probe):
+    /// nothing to prepare.
+    Ready,
+    /// The host has no usable proxy binary, and this deploy may install one. The
+    /// caller prepends [`ProxyController::binary_install_ops`] to that host's op
+    /// vector — see [`assess_proxy_readiness`].
+    NeedsInstall,
+}
+
+/// Decide, WITHOUT mutating the target, whether the host already has a working
+/// reverse proxy or needs one installed (issue #1607, AC-1; the CLI-drift guard is
+/// issue #2053).
+///
+/// AC-1 puts the target-host precondition at "at most a stock Ubuntu LTS with SSH
+/// access", so a missing kamal-proxy is something this command fixes rather than
+/// something it demands the operator fix first. This function only *decides*; the
+/// fix itself is an ordinary op at the head of that host's sequence, which is what
+/// keeps the fleet's all-hosts probe phase strictly read-only ("no host is touched
+/// until every host is graded") and lets a failed install ride the same halt +
+/// compensation path as any other pre-cutover failure.
+///
+/// The three cases:
+///
+/// - **Working binary** (or no probe declared) → [`ProxyReadiness::Ready`], silent,
+///   nothing beyond the read-only probe ran. A host that is already fine is
+///   untouched.
+/// - **No usable binary**, host prep allowed and the controller can install one →
+///   [`ProxyReadiness::NeedsInstall`].
+/// - **A binary that responds but has drifted** (renamed/removed subcommand or
+///   flag), or a missing binary this deploy may not or cannot fix → fail closed
+///   with the controller's actionable message. A responding binary is NEVER
+///   replaced: it is somebody's working install, possibly shared with another app
+///   on the host.
+///
+/// # Errors
+///
+/// Returns [`DeployExecError::ProxyIncompatible`] when the installed proxy's CLI
+/// surface has drifted, or when the host has no usable proxy and this deploy may
+/// not install one (`[deploy] install_proxy = false`, or a controller that declares
+/// no installer); or the executor's error if the probe cannot run.
+pub fn assess_proxy_readiness(
+    proxy: &impl ProxyController,
+    exec: &impl DeployExecutor,
+    provisioning: ProxyProvisioning,
+) -> Result<ProxyReadiness, DeployExecError> {
+    let Some(verdict) = run_proxy_compat_probe(proxy, exec)? else {
+        return Ok(ProxyReadiness::Ready);
+    };
+    let Err(failure) = verdict else {
+        return Ok(ProxyReadiness::Ready);
+    };
+
+    // Only an ABSENT binary is host prep's business, and only when this deploy is
+    // allowed to prepare the host and the controller knows how.
+    if !failure.binary_missing {
+        // A responding binary whose CLI surface drifted: never ours to replace.
+        return Err(DeployExecError::ProxyIncompatible {
+            message: failure.message,
+        });
+    }
+    match (provisioning, proxy.binary_install_ops()) {
+        (ProxyProvisioning::Auto, Some(_)) => Ok(ProxyReadiness::NeedsInstall),
+        // The host COULD have been prepared, but the operator declined it. Say which
+        // setting is in force, so the message names the reason this deploy stopped
+        // rather than describing the branch that is not running.
+        (ProxyProvisioning::Disabled, _) => Err(DeployExecError::ProxyIncompatible {
+            message: format!(
+                "{} (`[deploy] install_proxy = false` declines host preparation, so this \
+                 deploy will not install it for you)",
+                failure.message,
+            ),
+        }),
+        // The controller has no installer at all (it expects its binary to arrive
+        // some other way): report the missing binary unchanged.
+        (ProxyProvisioning::Auto, None) => Err(DeployExecError::ProxyIncompatible {
+            message: failure.message,
+        }),
+    }
 }
 
 /// Map a live loopback port back to its slot using the public port: blue binds
@@ -3349,8 +3521,16 @@ mod tests {
     }
 
     /// First-deploy ops: initial release on the blue slot (loopback 3001) behind
-    /// the proxy on the public port 3000.
+    /// the proxy on the public port 3000, carrying the pre-start migration
+    /// ([`MigrateStep::Run`] — what a single-host first deploy always does).
     fn sample_ops(env: Secret) -> Vec<DeployOp> {
+        sample_ops_with(env, MigrateStep::Run)
+    }
+
+    /// [`sample_ops`] with an explicit [`MigrateStep`], so the fleet's
+    /// skip-the-migrate-op parameterisation of the FIRST-deploy path is assertable
+    /// alongside the single-host `Run` sequence.
+    fn sample_ops_with(env: Secret, migrate: MigrateStep) -> Vec<DeployOp> {
         let cfg = resolved();
         let plan = SlotPlan::first(3000);
         let unit = super::super::render_app_unit(
@@ -3368,6 +3548,7 @@ mod tests {
             &sample_manifests(),
             RELEASE_ID,
             &plan,
+            migrate,
         )
     }
 
@@ -3533,6 +3714,147 @@ mod tests {
         assert!(
             route_cmd.contains("--target '127.0.0.1:3001'"),
             "proxy routes at the blue loopback port: {route_cmd}"
+        );
+    }
+
+    /// AC-3 (issue #1607) on the FIRST deploy: pending migrations must run before
+    /// the new version takes traffic. The first deploy used to skip migrations
+    /// entirely, so a database-backed app's very first `deploy up` health-gated and
+    /// routed an app whose schema had never been applied.
+    #[test]
+    fn first_deploy_runs_pending_migrations_before_the_app_starts() {
+        let ops = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=topsecret\n"));
+        let exec = RecordingExecutor::new();
+        run_ops(&ops, &exec).expect("recording executor never fails");
+        let labels = exec.run_labels();
+        let pos = |needle: &str| labels.iter().position(|&l| l == needle);
+
+        let migrate = pos("migrate").expect("the first deploy runs pending migrations");
+        // BEFORE the app starts (stricter than the redeploy path, which starts the
+        // candidate first): a first deploy has no live release to protect, and an
+        // app booted against an unmigrated schema can crash-loop under systemd
+        // before the gate ever runs.
+        assert!(
+            migrate < pos("enable-now").expect("the app starts"),
+            "migrations must run before the first release starts: {labels:?}"
+        );
+        // ... and therefore before it is health-gated and takes traffic.
+        assert!(
+            migrate < pos("readiness-gate").expect("readiness gate")
+                && migrate < pos("proxy-route").expect("proxy is routed"),
+            "migrations must precede the readiness gate and the route: {labels:?}"
+        );
+        // The env file the one-shot reads, and the binary it runs, must be uploaded
+        // BEFORE it — an existence check alone would stay green if either upload
+        // moved after the migration.
+        let calls = exec.calls();
+        let migrate_call = calls
+            .iter()
+            .position(|c| c.run_label() == Some("migrate"))
+            .expect("migrate is recorded");
+        for path in [
+            "/srv/autumn/myapp/shared/autumn.env",
+            "/srv/autumn/myapp/releases/20260714T120000Z/myapp",
+        ] {
+            let uploaded = calls
+                .iter()
+                .position(|c| {
+                    matches!(c, RecordedCall::Upload { remote_path, .. } if remote_path == path)
+                })
+                .unwrap_or_else(|| panic!("{path} is uploaded"));
+            assert!(
+                uploaded < migrate_call,
+                "{path} must be in place before the migrate one-shot runs: {calls:?}"
+            );
+        }
+        // The same real, blocking one-shot the redeploy path uses: `--wait` is what
+        // makes a failed migration stop `run_ops` before anything takes traffic.
+        let shell = exec.shell_for("migrate").expect("migrate ran");
+        assert!(
+            shell.contains("systemd-run --wait")
+                && shell.contains("--setenv=AUTUMN_MIGRATE=1")
+                && shell.contains("/srv/autumn/myapp/releases/20260714T120000Z/myapp"),
+            "the first deploy runs the real migrate one-shot from the release dir: {shell}"
+        );
+    }
+
+    /// The migrate one-shot must resolve its configuration and its RELATIVE paths
+    /// exactly as the release it gates will, on both deploy paths.
+    #[test]
+    fn the_migrate_one_shot_matches_the_slot_unit_directory_and_manifest() {
+        let release_dir = "/srv/autumn/myapp/releases/20260714T120000Z";
+        let unit = super::super::render_app_unit(&resolved(), release_dir, 3001, SLOT_BLUE);
+        for (path, ops) in [
+            (
+                "first deploy",
+                sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n")),
+            ),
+            (
+                "redeploy",
+                sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n")),
+            ),
+        ] {
+            let exec = RecordingExecutor::new();
+            run_ops(&ops, &exec).expect("recording executor never fails");
+            let shell = exec.shell_for("migrate").expect("migrate ran");
+            // A transient `systemd-run` unit otherwise starts in the manager's
+            // default directory, so a relative database URL (a supported single-host
+            // `sqlite://./app.db`) would be migrated in one place and read in
+            // another. The unit's own `WorkingDirectory` is the contract to match.
+            assert!(
+                shell.contains(&format!("--working-directory='{release_dir}'")),
+                "{path}: the one-shot must run in the release dir, like the slot \
+                 unit: {shell}"
+            );
+            assert!(
+                unit.contains(&format!("WorkingDirectory={release_dir}")),
+                "{path}: the slot unit's WorkingDirectory is the contract being \
+                 matched: {unit}"
+            );
+            // …and it must load the same manifest the unit points the app at, so a
+            // config-only database topology is not invisible to the migration.
+            assert!(
+                shell.contains(&format!("--setenv=AUTUMN_MANIFEST_DIR='{release_dir}'")),
+                "{path}: the one-shot must load the release's own manifest: {shell}"
+            );
+            assert!(
+                unit.contains(&format!("Environment=AUTUMN_MANIFEST_DIR={release_dir}")),
+                "{path}: the slot unit's manifest dir is the contract being matched"
+            );
+        }
+    }
+
+    /// The fleet parameterisation of the FIRST-deploy path (#1621's rule, now that a
+    /// first deploy migrates): `Skip` omits ONLY the migrate op and leaves every
+    /// other step's identity and relative position untouched.
+    #[test]
+    fn first_deploy_migrate_skip_omits_only_the_migrate_op() {
+        let run = sample_ops_with(
+            Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=topsecret\n"),
+            MigrateStep::Run,
+        );
+        let skip = sample_ops_with(
+            Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=topsecret\n"),
+            MigrateStep::Skip,
+        );
+        let exec_run = RecordingExecutor::new();
+        run_ops(&run, &exec_run).expect("recording executor never fails");
+        let exec_skip = RecordingExecutor::new();
+        run_ops(&skip, &exec_skip).expect("recording executor never fails");
+
+        let with: Vec<&str> = exec_run
+            .run_labels()
+            .into_iter()
+            .filter(|l| *l != "migrate")
+            .collect();
+        assert_eq!(
+            with,
+            exec_skip.run_labels(),
+            "Skip must remove the migrate op and nothing else"
+        );
+        assert!(
+            !exec_skip.run_labels().contains(&"migrate"),
+            "Skip must not schedule a migration"
         );
     }
 
@@ -6235,25 +6557,42 @@ mod tests {
     }
 
     #[test]
-    fn probe_proxy_compat_passes_silently_on_a_compatible_host() {
-        // A host whose kamal-proxy still has every flag the cutover uses passes the
-        // probe with no error and no cutover impact (#2053 — do not break fine hosts).
-        let exec =
-            RecordingExecutor::new().with_stdout("proxy-compat-probe", compatible_deploy_help());
-        assert!(probe_proxy_compat(&proxy(), &exec).is_ok());
-        // It ran exactly the read-only `deploy --help` probe.
-        assert_eq!(exec.run_labels(), vec!["proxy-compat-probe"]);
-        let shell = exec.shell_for("proxy-compat-probe").expect("probe ran");
-        assert_eq!(shell, "kamal-proxy deploy --help 2>&1 || true");
+    fn a_controller_with_no_compat_probe_is_never_gated_or_probed() {
+        // A controller that declares no compat probe (e.g. a Caddy controller that
+        // provisions its own pinned binary) is never gated — and never even runs a
+        // remote command.
+        struct NoProbeController;
+        impl ProxyController for NoProbeController {
+            fn ensure_installed_ops(&self, _public_port: u16) -> Vec<DeployOp> {
+                Vec::new()
+            }
+            fn route_op(&self, _service: &str, _upstream: &str) -> DeployOp {
+                DeployOp::Run(RemoteCommand::new("noop", "true"))
+            }
+            fn flip_op(&self, _service: &str, _new_upstream: &str) -> DeployOp {
+                DeployOp::Run(RemoteCommand::new("noop", "true"))
+            }
+            // compat_probe() and binary_install_ops() use the trait defaults → None.
+        }
+        let exec = RecordingExecutor::new();
+        assert_eq!(
+            assess_proxy_readiness(&NoProbeController, &exec, ProxyProvisioning::Auto)
+                .expect("a controller with no probe is never gated"),
+            ProxyReadiness::Ready
+        );
+        assert!(
+            exec.run_labels().is_empty(),
+            "no probe declared → no remote command runs"
+        );
     }
 
     #[test]
-    fn probe_proxy_compat_fails_closed_on_a_drifted_cli_surface() {
-        // A future kamal-proxy that renamed --drain-timeout: the probe fails closed
-        // with an actionable message BEFORE any cutover op runs.
+    fn a_drifted_cli_surface_fails_closed_with_the_flag_and_the_pin() {
+        // #2053: a future kamal-proxy that renamed --drain-timeout fails closed with
+        // an actionable message BEFORE any cutover op runs.
         let drifted = compatible_deploy_help().replace("--drain-timeout", "--drain-window");
         let exec = RecordingExecutor::new().with_stdout("proxy-compat-probe", drifted);
-        let err = probe_proxy_compat(&proxy(), &exec)
+        let err = assess_proxy_readiness(&proxy(), &exec, ProxyProvisioning::Auto)
             .expect_err("a drifted CLI surface must fail closed");
         match err {
             DeployExecError::ProxyIncompatible { message } => {
@@ -6272,39 +6611,143 @@ mod tests {
     }
 
     #[test]
-    fn probe_proxy_compat_fails_closed_on_a_missing_binary() {
-        // Empty output (a missing/unusable binary) fails closed rather than being
-        // misread as compatible.
-        let exec = RecordingExecutor::new(); // no scripted stdout → empty capture
-        let err =
-            probe_proxy_compat(&proxy(), &exec).expect_err("an unusable binary must fail closed");
+    fn pre_migrate_labels_match_both_builders() {
+        // `PRE_MIGRATE_LABELS` is what lets the fleet summary stop claiming a
+        // migration ran on a rollout that died while uploading. It is only true if
+        // it actually matches the builders, so derive the real pre-`migrate` prefix
+        // from both and check it — a moved, added or renamed op fails HERE rather
+        // than making the summary lie at 3 a.m.
+        let first = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let redeploy = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        for (path, ops) in [("first deploy", &first), ("redeploy", &redeploy)] {
+            let labels: Vec<&str> = ops.iter().map(DeployOp::label).collect();
+            let migrate = labels
+                .iter()
+                .position(|l| *l == "migrate")
+                .unwrap_or_else(|| panic!("{path} runs a migration: {labels:?}"));
+            for label in &labels[..migrate] {
+                assert!(
+                    PRE_MIGRATE_LABELS.contains(label),
+                    "{path}: `{label}` runs before `migrate` but is missing from \
+                     PRE_MIGRATE_LABELS — a host that failed there would be reported as \
+                     having moved the schema"
+                );
+            }
+            for label in &labels[migrate..] {
+                assert!(
+                    !PRE_MIGRATE_LABELS.contains(label),
+                    "{path}: `{label}` runs at or after `migrate` but is listed as \
+                     PRE-migrate — a host that failed there would be reported as NOT \
+                     having moved the schema, which is the dangerous direction"
+                );
+            }
+        }
+        // The driver splices host preparation ahead of everything (#1607), so it is
+        // pre-migrate too even though no builder emits it.
+        assert!(failed_before_migrating("install-proxy"));
+        // Anything unrecognised errs toward "the schema may have moved".
+        assert!(!failed_before_migrating("readiness-gate"));
+        assert!(!failed_before_migrating("some-future-op"));
+    }
+
+    // ── Host preparation: provisioning the proxy binary (#1607, AC-1) ────────
+
+    #[test]
+    fn a_compatible_host_needs_no_preparation_and_is_never_touched() {
+        // AC-1's host prep is probe-gated and idempotent: a host that already has a
+        // working kamal-proxy runs the read-only probe and NOTHING else — no apt, no
+        // image pull, no binary replaced under a live proxy.
+        let exec =
+            RecordingExecutor::new().with_stdout("proxy-compat-probe", compatible_deploy_help());
+        assert_eq!(
+            assess_proxy_readiness(&proxy(), &exec, ProxyProvisioning::Auto)
+                .expect("a compatible host passes"),
+            ProxyReadiness::Ready
+        );
+        assert_eq!(exec.run_labels(), vec!["proxy-compat-probe"]);
+    }
+
+    #[test]
+    fn a_bare_host_is_assessed_as_needing_preparation_without_being_mutated() {
+        // AC-1: "at most a stock Ubuntu LTS with SSH access — the command performs
+        // any remaining host preparation itself". The ASSESSMENT stays read-only so
+        // the fleet's all-hosts probe phase still touches nothing; the install runs
+        // as an op at the head of that host's own turn.
+        let exec = RecordingExecutor::new(); // empty capture → no binary
+        assert_eq!(
+            assess_proxy_readiness(&proxy(), &exec, ProxyProvisioning::Auto)
+                .expect("a bare host is preparable"),
+            ProxyReadiness::NeedsInstall
+        );
+        assert_eq!(
+            exec.run_labels(),
+            vec!["proxy-compat-probe"],
+            "assessing a host must not mutate it"
+        );
+    }
+
+    #[test]
+    fn host_prep_never_replaces_a_working_but_drifted_binary() {
+        // A binary that RESPONDS but has drifted flags is somebody's working
+        // install — possibly shared with another app on the host. Replacing it
+        // silently is not ours to do, so this stays the fail-closed path it has
+        // always been.
+        let drifted = compatible_deploy_help().replace("--drain-timeout", "--drain-window");
+        let exec = RecordingExecutor::new().with_stdout("proxy-compat-probe", drifted);
+        let err = assess_proxy_readiness(&proxy(), &exec, ProxyProvisioning::Auto)
+            .expect_err("CLI drift must fail closed");
         assert!(matches!(err, DeployExecError::ProxyIncompatible { .. }));
     }
 
     #[test]
-    fn probe_proxy_compat_is_a_noop_when_the_controller_declares_no_probe() {
-        // A controller that declares no compat probe (e.g. a Caddy controller that
-        // provisions its own pinned binary) is never gated — and never even runs a
-        // remote command.
-        struct NoProbeController;
-        impl ProxyController for NoProbeController {
-            fn ensure_installed_ops(&self, _public_port: u16) -> Vec<DeployOp> {
-                Vec::new()
+    fn host_prep_can_be_declined_and_then_says_exactly_what_to_install() {
+        // An operator who provisions kamal-proxy themselves sets
+        // `[deploy] install_proxy = false`; the deploy must then fail with the
+        // manual remedy rather than touching their host.
+        let exec = RecordingExecutor::new(); // empty capture → no binary
+        let err = assess_proxy_readiness(&proxy(), &exec, ProxyProvisioning::Disabled)
+            .expect_err("a missing binary with host prep declined must fail closed");
+        let DeployExecError::ProxyIncompatible { message } = err else {
+            panic!("expected ProxyIncompatible");
+        };
+        assert!(
+            message.contains("install_proxy"),
+            "names the opt-out that is in force: {message}"
+        );
+        assert!(
+            message.contains(super::super::proxy::KAMAL_PROXY_KNOWN_GOOD_VERSION),
+            "names the version to install: {message}"
+        );
+    }
+
+    #[test]
+    fn a_controller_that_cannot_prepare_a_host_reports_the_missing_binary() {
+        // A controller with a compat probe but no installer (it expects its binary
+        // to arrive some other way) must not silently pass a host with none.
+        struct NoInstallerController(super::super::proxy::KamalProxyController);
+        impl ProxyController for NoInstallerController {
+            fn ensure_installed_ops(&self, public_port: u16) -> Vec<DeployOp> {
+                self.0.ensure_installed_ops(public_port)
             }
-            fn route_op(&self, _service: &str, _upstream: &str) -> DeployOp {
-                DeployOp::Run(RemoteCommand::new("noop", "true"))
+            fn route_op(&self, service: &str, upstream: &str) -> DeployOp {
+                self.0.route_op(service, upstream)
             }
-            fn flip_op(&self, _service: &str, _new_upstream: &str) -> DeployOp {
-                DeployOp::Run(RemoteCommand::new("noop", "true"))
+            fn flip_op(&self, service: &str, new_upstream: &str) -> DeployOp {
+                self.0.flip_op(service, new_upstream)
             }
-            // compat_probe() uses the trait default → None.
+            fn compat_probe(&self) -> Option<super::super::proxy::ProxyCompatProbe> {
+                self.0.compat_probe()
+            }
+            // binary_install_ops() uses the trait default → None.
         }
         let exec = RecordingExecutor::new();
-        assert!(probe_proxy_compat(&NoProbeController, &exec).is_ok());
-        assert!(
-            exec.run_labels().is_empty(),
-            "no probe declared → no remote command runs"
-        );
+        let err = assess_proxy_readiness(
+            &NoInstallerController(proxy()),
+            &exec,
+            ProxyProvisioning::Auto,
+        )
+        .expect_err("a controller that cannot prepare a host must fail closed");
+        assert!(matches!(err, DeployExecError::ProxyIncompatible { .. }));
     }
 
     #[test]
@@ -6605,6 +7048,7 @@ mod tests {
             &[],
             RELEASE_ID,
             &plan,
+            MigrateStep::Run,
         );
         assert!(
             !ops.iter().any(|op| op.label() == "upload-config"),
@@ -6717,10 +7161,11 @@ mod tests {
         let exec = RecordingExecutor::new();
         let checks = vec![PreflightCheck::pass("ssh_reachability", "reachable")];
         execute_first_deploy(&checks, &ops, &[], &exec).expect("all checks pass → deploy runs");
-        // 2 proxy ops + 11 first-deploy ops (incl. clear-previous and the #2074
-        // record-proxy-options) + 2 config-manifest uploads (sample_manifests:
-        // autumn.toml + autumn-prod.toml, #1952) + 1 proxy route = 16.
-        assert_eq!(exec.calls().len(), 16, "the full op sequence should run");
+        // 2 proxy ops + 12 first-deploy ops (incl. clear-previous, the #2074
+        // record-proxy-options and the #1607 pre-start migrate) + 2 config-manifest
+        // uploads (sample_manifests: autumn.toml + autumn-prod.toml, #1952) + 1
+        // proxy route = 17.
+        assert_eq!(exec.calls().len(), 17, "the full op sequence should run");
     }
 
     #[test]

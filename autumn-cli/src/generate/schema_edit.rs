@@ -313,7 +313,15 @@ pub fn create_table_sql_with_metadata_and_id_for(
         if let Some(target) = f.reference_table() {
             let _ = write!(sql, " REFERENCES {target}(id)");
         }
-        if let Some(default) = defaults.get(&f.name) {
+        // An explicit `--default` wins; otherwise a field kind that carries its
+        // own storage default supplies one. Today that is `{translatable}`
+        // (#1384): the per-locale container column is `NOT NULL` and starts as
+        // the empty JSON object `'{}'`.
+        if let Some(default) = defaults
+            .get(&f.name)
+            .map(String::as_str)
+            .or_else(|| f.sql_default())
+        {
             let _ = write!(sql, " DEFAULT {default}");
         }
         if let Some(check) = enum_check_suffix(f) {
@@ -1178,13 +1186,22 @@ pub fn add_columns_up_sql_for(
         // column arrives. `DEFAULT 0` also backfills existing rows in one
         // statement, which is why this add needs neither the blocking-safety
         // banner nor the SQLite refusal below.
+        //
+        // Issue #1384: a `{translatable}` column is the same shape of retrofit
+        // — the container column is `NOT NULL` and defaults to the empty JSON
+        // object `'{}'`, a constant that backfills every existing row in one
+        // statement. So, like `lock_version`, it needs neither the blocking
+        // banner nor the SQLite refusal, and `autumn migrate check` classifies
+        // the result as plain `ADD COLUMN NOT NULL DEFAULT <constant>` — safe.
         let lock_version_default = super::model::is_lock_version_column(f);
-        if backend == DatabaseBackend::Sqlite && !f.nullable && !lock_version_default {
+        let inherent_default = f.sql_default();
+        let has_default = lock_version_default || inherent_default.is_some();
+        if backend == DatabaseBackend::Sqlite && !f.nullable && !has_default {
             return Err(super::sqlite_add_not_null_without_default_error(
                 table, &f.name,
             ));
         }
-        if !f.nullable && !lock_version_default {
+        if !f.nullable && !has_default {
             let _ = writeln!(
                 out,
                 "-- autumn-safety: potentially-blocking \
@@ -1200,6 +1217,8 @@ pub fn add_columns_up_sql_for(
         );
         if lock_version_default {
             out.push_str(" DEFAULT 0");
+        } else if let Some(default) = inherent_default {
+            let _ = write!(out, " DEFAULT {default}");
         }
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
@@ -1574,7 +1593,10 @@ pub fn remove_columns_down_sql_for(
         // contract. Postgres is unaffected (its output stays byte-for-byte
         // identical), and a NOT NULL column inside CREATE TABLE is likewise
         // fine on SQLite.
-        if backend == DatabaseBackend::Sqlite && !f.nullable {
+        // Issue #1384: a `{translatable}` column carries its own constant
+        // default (`'{}'`), so the rollback's re-add is valid on SQLite too.
+        let inherent_default = f.sql_default();
+        if backend == DatabaseBackend::Sqlite && !f.nullable && inherent_default.is_none() {
             return Err(super::sqlite_add_not_null_without_default_error(
                 table, &f.name,
             ));
@@ -1586,6 +1608,9 @@ pub fn remove_columns_down_sql_for(
             f.sql_column_type_for(backend),
             f.sql_nullability()
         );
+        if let Some(default) = inherent_default {
+            let _ = write!(out, " DEFAULT {default}");
+        }
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
         }
@@ -5424,6 +5449,124 @@ mod tests {
 
     fn fields(tokens: &[&str]) -> Vec<Field> {
         tokens.iter().map(|t| parse_field(t).unwrap()).collect()
+    }
+
+    // ── #1384: `{translatable}` storage migration ───────────────────────────
+
+    #[test]
+    fn create_table_gives_a_translatable_column_the_empty_container_default() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "posts",
+            &fields(&["title:String{translatable}", "views:i64"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("title TEXT NOT NULL DEFAULT '{}'"),
+            "translatable column needs the empty-container default: {sql}"
+        );
+        // A plain column on the same table is untouched (AC7).
+        assert!(sql.contains("views BIGINT NOT NULL"), "{sql}");
+        assert!(!sql.contains("views BIGINT NOT NULL DEFAULT"), "{sql}");
+    }
+
+    #[test]
+    fn schema_block_keeps_a_translatable_column_as_text() {
+        let block = schema_table_block_with_id(
+            "posts",
+            &fields(&["title:String{translatable}"]),
+            IdType::BigSerial,
+        );
+        assert!(block.contains("title -> Text,"), "{block}");
+    }
+
+    #[test]
+    fn add_column_emits_the_default_and_skips_the_blocking_banner() {
+        let sql = add_columns_up_sql("posts", &fields(&["title:String{translatable}"]), "");
+        assert!(
+            sql.contains("ALTER TABLE posts ADD COLUMN title TEXT NOT NULL DEFAULT '{}'"),
+            "{sql}"
+        );
+        assert!(
+            !sql.contains("autumn-safety: potentially-blocking"),
+            "a constant default backfills in one statement — no banner: {sql}"
+        );
+    }
+
+    #[test]
+    fn add_column_is_accepted_on_sqlite() {
+        // SQLite rejects `ADD COLUMN … NOT NULL` without a DEFAULT; the
+        // container default is exactly what makes this portable.
+        let sql = add_columns_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["title:String{translatable}"]),
+            "",
+        )
+        .expect("SQLite ADD COLUMN accepted for a defaulted column");
+        assert!(sql.contains("title TEXT NOT NULL DEFAULT '{}'"), "{sql}");
+    }
+
+    #[test]
+    fn remove_column_rollback_restores_the_default() {
+        let sql = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["title:String{translatable}"]),
+            "",
+        )
+        .expect("SQLite rollback accepted for a defaulted column");
+        assert!(sql.contains("title TEXT NOT NULL DEFAULT '{}'"), "{sql}");
+    }
+
+    /// AC6: `autumn migrate check` classifies the emitted migration — and
+    /// classifies it as **safe**. No new unclassified operation type.
+    #[test]
+    fn migrate_check_classifies_the_translatable_migration_as_safe() {
+        use crate::migrate::safety::{classify_sql, is_safe};
+
+        for sql in [
+            create_table_sql_with_metadata_and_id(
+                "posts",
+                &fields(&["title:String{translatable}"]),
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                IdType::BigSerial,
+            ),
+            add_columns_up_sql("posts", &fields(&["title:String{translatable}"]), ""),
+        ] {
+            let findings = classify_sql(&sql);
+            assert!(
+                is_safe(&findings),
+                "translatable storage must classify as safe, got {findings:?} for:\n{sql}"
+            );
+        }
+    }
+
+    /// The classification test above is only meaningful if the classifier would
+    /// actually *say something* about this DDL when the default is missing —
+    /// otherwise "no findings" would pass for a statement the classifier simply
+    /// does not understand. Pin the discriminating case: drop the container
+    /// default and the very same `ADD COLUMN` becomes a recognised
+    /// `PotentiallyBlocking` finding, not an unclassified one.
+    #[test]
+    fn the_container_default_is_what_makes_the_add_column_safe() {
+        use crate::migrate::safety::{RiskLevel, classify_sql, is_safe};
+
+        let undefaulted = "ALTER TABLE posts ADD COLUMN title TEXT NOT NULL;";
+        let findings = classify_sql(undefaulted);
+        assert!(!is_safe(&findings), "control case must not be safe");
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.risk == RiskLevel::PotentiallyBlocking
+                    && f.operation.contains("ADD COLUMN NOT NULL")),
+            "the classifier must recognise the shape, not merely stay silent: {findings:?}"
+        );
+        // And with the default the same statement is classified clean.
+        let defaulted = add_columns_up_sql("posts", &fields(&["title:String{translatable}"]), "");
+        assert!(is_safe(&classify_sql(&defaulted)));
     }
 
     #[test]

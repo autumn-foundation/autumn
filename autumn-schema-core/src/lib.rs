@@ -555,7 +555,12 @@ impl ColumnType {
             .next()
             .unwrap_or(normalized.as_str());
         match leaf {
-            "String" => Some(Self::Text),
+            // `Translated` is a `#[translatable]` per-locale container (issue
+            // #1384): its storage is a plain `TEXT` column holding a JSON
+            // object, so the declarative lane manages it exactly like any other
+            // text column. Without it here the parser skips the column and the
+            // diff refuses to emit `CREATE TABLE` for the whole model.
+            "String" | "Translated" => Some(Self::Text),
             "i32" => Some(Self::Int32),
             "i64" => Some(Self::Int64),
             "bool" => Some(Self::Bool),
@@ -1348,6 +1353,15 @@ mod tests {
     fn from_rust_type_happy_and_path_tolerant() {
         // Bare tokens.
         assert_eq!(ColumnType::from_rust_type("String"), Some(ColumnType::Text));
+        // #1384: a translatable container is TEXT storage, path-tolerant.
+        assert_eq!(
+            ColumnType::from_rust_type("Translated"),
+            Some(ColumnType::Text)
+        );
+        assert_eq!(
+            ColumnType::from_rust_type("autumn_web::i18n::Translated"),
+            Some(ColumnType::Text)
+        );
         assert_eq!(ColumnType::from_rust_type("i32"), Some(ColumnType::Int32));
         assert_eq!(ColumnType::from_rust_type("i64"), Some(ColumnType::Int64));
         assert_eq!(ColumnType::from_rust_type("bool"), Some(ColumnType::Bool));

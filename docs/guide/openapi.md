@@ -23,7 +23,7 @@ The spec types and the served endpoints live behind the `openapi` feature:
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-web = { version = "0.6", features = ["openapi"] }
+autumn-web = { version = "0.7", features = ["openapi"] }
 ```
 
 Then hand `AppBuilder` an `OpenApiConfig`:

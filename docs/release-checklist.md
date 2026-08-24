@@ -15,12 +15,25 @@ SemVer contract.
 | Crate | Directory | Publish Order | Notes |
 |---|---|---|---|
 | `autumn-macros` | `autumn-macros/` | 1 | No Autumn runtime deps; must publish first. |
-| `autumn-web` | `autumn/` | 2 | Depends on `autumn-macros`. |
-| `autumn-cli` | `autumn-cli/` | 3 | Independent of `autumn-web` at crate level. |
-| `autumn-admin-plugin` | `autumn-admin-plugin/` | 4 | Depends on `autumn-web`. |
-| `autumn-storage-s3` | `autumn-storage-s3/` | 4 | Depends on `autumn-web`. |
-| `autumn-cache-redis` | `autumn-cache-redis/` | 4 | Depends on `autumn-web`. |
-| `autumn-search` | `autumn-search/` | 4 | Depends on `autumn-web`. |
+| `autumn-schema-core` | `autumn-schema-core/` | 2 | No Autumn runtime deps. `autumn-cli` pins it. |
+| `autumn-edge` | `autumn-edge/` | 3 | Depends on `autumn-macros`. `autumn-web` pins it — **optionally**, but cargo still requires an optional dependency to resolve on crates.io, so it must precede `autumn-web`. |
+| `autumn-web` | `autumn/` | 4 | Depends on `autumn-macros` and `autumn-edge`. |
+| `autumn-cli` | `autumn-cli/` | 5 | Depends on `autumn-schema-core`. Independent of `autumn-web` at crate level. |
+| `autumn-admin-plugin` | `autumn-admin-plugin/` | 6 | Depends on `autumn-web`. |
+| `autumn-media-plugin` | `autumn-media-plugin/` | 6 | Depends on `autumn-web`. |
+| `autumn-storage-s3` | `autumn-storage-s3/` | 6 | Depends on `autumn-web`. |
+| `autumn-cache-redis` | `autumn-cache-redis/` | 6 | Depends on `autumn-web`. |
+| `autumn-search` | `autumn-search/` | 6 | Depends on `autumn-web`. |
+
+This table is the same set, in the same order, as `CRATES` in
+[`scripts/check-publish-dry-run.sh`](../scripts/check-publish-dry-run.sh) —
+that script is the executable copy, so keep the two in step. Note that two
+other gate scripts currently carry **narrower** lists —
+`scripts/check-crate-metadata.sh` omits `autumn-schema-core` and
+`autumn-media-plugin`, and `scripts/check-semver.sh` omits all three of
+`autumn-schema-core`, `autumn-edge` and `autumn-media-plugin`. Those crates are
+therefore published without a metadata or SemVer check today; widening both
+lists is worth doing, but it does not change the publish order above.
 
 All crates share a single workspace version (`[workspace.package].version` in
 `Cargo.toml`). They are always released together at the same version.
@@ -169,7 +182,7 @@ are actually there. It is therefore a **post-publish, pre-announce** gate:
 - [ ] After `cargo publish` completes for the release candidate, trigger the
   `Quickstart Gate` workflow manually (Actions → Quickstart Gate → *Run
   workflow*) with the `cli-version` input set to the candidate version
-  (e.g. `0.6.0`), or via the CLI:
+  (e.g. `0.7.0`), or via the CLI:
 
   ```bash
   gh workflow run quickstart-gate.yml -f cli-version=X.Y.Z
@@ -200,6 +213,16 @@ guide** — the guide is a gate, not a courtesy (issue #1588). See
 
 ### Automated
 
+- [ ] `./scripts/check-skill-version-markers.sh` is green (it also runs in CI,
+  in the docs-only `migration-guides` job). The `autumn-web`
+  agent skill annotates each API with the release it arrived in; those markers
+  are hand-maintained and drift silently across a version cut, in several
+  punctuation shapes (`(0.7.0)`, `**(0.7.0)**`, `(0.7.0, #1182)`, `(feature
+  `tls`, 0.6.0, #1603)`). A marker naming too NEW a release is the damaging
+  direction — it tells a reader an API is out of reach when it already shipped.
+  The script resolves every issue-referenced marker against the CHANGELOG
+  section that introduced it. Markers with no issue reference are counted and
+  reported, not checked: skim those by hand when a release adds them.
 - [ ] `./scripts/check-migration-guides.sh` is green. It fails on an unmarked
   breaking changelog entry, a breaking section with no guide, a breaking entry
   that does not link its guide, and a guide missing a required section or an
@@ -318,32 +341,50 @@ Before pushing the release tag:
 4. **Complete the [Migration Guide Gate](#migration-guide-gate)** — rename
    `docs/migrations/next.md`, repoint the changelog links, and perform and
    record the codemod-first upgrade walk-through.
-5. **Run all gate scripts locally** to catch problems before CI sees the tag:
+5. **Refresh the dependency floor.** Review the open Dependabot PRs and fold
+   the semver-compatible ones into the release rather than tagging on top of a
+   month-old lockfile: `cargo update`, plus any manifest bound a grouped PR
+   widens. Majors that need API work are a separate change — decide
+   deliberately whether each rides this release, and say so in the changelog.
+6. **Write the [release walkthrough](releases/README.md)** —
+   `docs/releases/X.Y.Z.md`, cut after the CHANGELOG section is final. It is
+   the narrative counterpart to the changelog: what shipped, why, and what it
+   looks like in an app. Link it from the CHANGELOG section header, from the
+   README's *Documentation* list, and from the migration guide's header.
+7. **Run all gate scripts locally** to catch problems before CI sees the tag:
    ```bash
    ./scripts/check-crate-metadata.sh
    ./scripts/check-release-notes.sh
    ./scripts/check-migration-guides.sh
+   ./scripts/check-skill-version-markers.sh
    ./scripts/check-docs.sh
    ./scripts/check-semver.sh   # requires network; skip offline
    ```
-6. **Tag and push:**
+8. **Tag and push:**
    ```bash
-   git tag v0.5.0
-   git push origin v0.5.0
+   git tag v0.7.0
+   git push origin v0.7.0
    ```
    The `publish-gate` workflow runs automatically. The `release` workflow runs
    only after `publish-gate` succeeds.
-7. **Publish to crates.io** (in dependency order, after the gate passes):
+9. **Publish to crates.io** (in dependency order, after the gate passes):
+   Order matters: each crate's Autumn dependencies must already be on
+   crates.io, or `cargo publish` fails to resolve them. In particular
+   `autumn-web` pins `autumn-edge` and `autumn-cli` pins `autumn-schema-core`,
+   so both precede them here.
    ```bash
    cargo publish -p autumn-macros
+   cargo publish -p autumn-schema-core
+   cargo publish -p autumn-edge
    cargo publish -p autumn-web
    cargo publish -p autumn-cli
    cargo publish -p autumn-admin-plugin
+   cargo publish -p autumn-media-plugin
    cargo publish -p autumn-storage-s3
    cargo publish -p autumn-cache-redis
    cargo publish -p autumn-search
    ```
-8. **Gate the published quickstart** (see
+10. **Gate the published quickstart** (see
    [Published Quickstart Gate](#7--published-quickstart-gate-quickstart-gate-workflow-post-publish)):
    ```bash
    gh workflow run quickstart-gate.yml -f cli-version=X.Y.Z

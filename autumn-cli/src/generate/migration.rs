@@ -96,6 +96,33 @@ pub fn plan_migration_with_options(
             ),
         });
     }
+    // Issue #1384: same reasoning as `{encrypted}` above, and the same silent
+    // failure. `generate migration` emits SQL only, so the `#[translatable]`
+    // attribute — and the `Translated` field type that carries every bit of the
+    // behaviour — would never reach a model. The column would be added as
+    // `TEXT NOT NULL DEFAULT '{}'` while the model kept reading it as a plain
+    // `String`, so the app would render raw JSON where the author believed they
+    // had declared per-locale content.
+    //
+    // Refusing here also closes the `--unique` hole by construction: the flag is
+    // folded in above by `apply_unique_flags`, after `parse_field`'s own
+    // `:unique` cross-check has already run, so `--unique` on a translatable
+    // column would otherwise have emitted a UNIQUE index over the whole JSON
+    // container — precisely what the inline spelling refuses.
+    if let Some(field) = fields.iter().find(|f| f.is_translatable()) {
+        return Err(GenerateError::InvalidField {
+            token: field.name.clone(),
+            reason: format!(
+                "the `translatable` modifier is not supported by `generate migration`: this \
+                 command emits SQL only, so the `#[translatable]` attribute and the \
+                 `autumn_web::i18n::Translated` field type would never reach a model, and the \
+                 app would read the per-locale JSON container as a plain string. Declare the \
+                 column with `autumn generate model` (`{}:String{{translatable}}`), which emits \
+                 the model, the schema entry, the migration and the `i18n` feature together.",
+                field.name
+            ),
+        });
+    }
     // Determine the target app's database backend so the emitted ALTER TABLE
     // DDL is backend-aware (SQLite foundation, issue #1614).
     let backend = detect_backend(project_root);
@@ -319,6 +346,43 @@ fn pascalish(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1384 (Codex round 4): `generate migration` emits SQL only, so a
+    /// `{translatable}` column would arrive without the `#[translatable]`
+    /// attribute or the `Translated` field type — the app would read the JSON
+    /// container as a plain string. Same silent failure `{encrypted}` refuses.
+    #[test]
+    fn migration_rejects_a_translatable_field() {
+        let tmp = project();
+        let err = plan_migration(
+            tmp.path(),
+            "AddTitleToPosts",
+            &["title:String{translatable}".into()],
+            "20260427000000",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("translatable"), "{err}");
+        assert!(err.contains("generate model"), "{err}");
+    }
+
+    /// The refusal also closes the `--unique` hole: the flag is applied after
+    /// `parse_field`'s own `:unique` cross-check has run, so without it
+    /// `--unique` would emit a UNIQUE index over the whole JSON container.
+    #[test]
+    fn migration_rejects_a_translatable_field_flagged_unique() {
+        let tmp = project();
+        let err = plan_migration_with_options(
+            tmp.path(),
+            "AddTitleToPosts",
+            &["title:String{translatable}".into()],
+            "20260427000000",
+            &["title".to_owned()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("translatable"), "{err}");
+    }
     use crate::generate::Flags;
     use crate::generate::emit::Action;
     use std::fs;
