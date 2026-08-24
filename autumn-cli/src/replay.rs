@@ -382,7 +382,7 @@ mod tests {
             .get_envs()
             .filter_map(|(key, value)| {
                 value
-                    .and(key.to_str())
+                    .and_then(|_| key.to_str())
                     .filter(|k| competing_vars.contains(k))
             })
             .collect();
