@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Performance
+
+- **scaffolded form helpers no longer re-escape their own constant HTML at
+  render time:** `text_input`, `password_input`, `textarea_input`,
+  `number_input`, `checkbox_input`, `date_input`/`datetime_input` (and their
+  `required_*`/`*_htmx` variants) build their `class`/`aria-invalid`
+  attributes from an `if has_errors { A } else { B }` expression where `A`
+  and `B` are always one of a small, fixed set of compile-time string
+  literals (`"autumn-field__input"`, `"true"`/`"false"`, etc.). Passed to
+  `maud::html!`'s `(...)` splice as plain `&str`, each of those literals ran
+  through `maud::escape_to_string`'s byte-by-byte HTML-escaping scan on
+  every render even though the value can never contain a character that
+  needs escaping. Wrapping the literals in `maud::PreEscaped(...)` — the
+  same mechanism the form helpers already use elsewhere for known-safe
+  content — skips the scan entirely; behavior and output are unchanged.
+
+  Measured with the committed `autumn/benches/form_render.rs` harness (a
+  realistic 12-field scaffolded form, two fields carrying validation errors,
+  3,000 iterations = 3,050 renders), `valgrind --tool=callgrind`, before and
+  after on the same machine:
+
+  | | before | after | delta |
+  | --- | ---: | ---: | ---: |
+  | Instructions (3,000-iteration run) | 220,034,852 | 203,355,183 | **-7.58%** |
+  | `maud::escape_to_string` instructions | 65,998,950 (30.0%) | 48,339,450 (23.8%) | **-26.8%** |
+
+  Allocation counts are unchanged (`escape_to_string` writes into an
+  already-allocated buffer; the win is pure CPU, not allocations) — all 203
+  `form`/`nested_form` lib tests pass unchanged.
 
 ## [0.7.0] - 2026-08-23
 

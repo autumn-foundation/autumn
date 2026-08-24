@@ -1015,8 +1015,8 @@ pub fn text_input<T: Serialize>(
                 id=(field)
                 name=(field)
                 value=(value)
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
@@ -1154,8 +1154,8 @@ pub fn text_input_htmx_with_token_field<T: Serialize>(
                 id=(field)
                 name=(field)
                 value=(value)
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" })
                 hx-post=(validate_url)
                 hx-trigger="change"
@@ -1244,8 +1244,8 @@ pub fn required_text_input_htmx_with_token_field<T: Serialize>(
                 value=(value)
                 required
                 aria-required="true"
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" })
                 hx-post=(validate_url)
                 hx-trigger="change"
@@ -1301,8 +1301,8 @@ pub fn password_input<T: Serialize>(
                 type="password"
                 id=(field)
                 name=(field)
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
@@ -1339,8 +1339,8 @@ pub fn textarea_input<T: Serialize>(
             textarea
                 id=(field)
                 name=(field)
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" })
                 { (value) }
             @if has_errors {
@@ -1646,8 +1646,8 @@ fn rich_text_area_inner<T: Serialize>(
                 id=(field)
                 name=(field)
                 rows="12"
-                class=(if has_errors { "autumn-field__input autumn-rich-text__editor autumn-field__input--invalid" } else { "autumn-field__input autumn-rich-text__editor" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-rich-text__editor autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input autumn-rich-text__editor") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(described_by)
                 required[required]
                 aria-required=[required.then_some("true")]
@@ -1735,7 +1735,7 @@ pub fn required_text_input<T: Serialize>(
                 value=(value)
                 required
                 aria-required="true"
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
             @if has_errors {
                 div id=(error_id) role="alert" {
@@ -1803,8 +1803,8 @@ pub fn checkbox_input<T: Serialize>(
                 name=(field)
                 value="true"
                 checked[checked]
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
@@ -1848,8 +1848,8 @@ pub fn number_input<T: Serialize>(
                 name=(field)
                 value=(value)
                 step=[step]
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
@@ -1892,8 +1892,8 @@ pub fn required_number_input<T: Serialize>(
                 step=[step]
                 required
                 aria-required="true"
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
@@ -2276,8 +2276,8 @@ pub fn date_input<T: Serialize>(
                 id=(field)
                 name=(field)
                 value=(value)
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
@@ -2318,8 +2318,8 @@ pub fn required_date_input<T: Serialize>(
                 value=(value)
                 required
                 aria-required="true"
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
@@ -2390,8 +2390,8 @@ pub fn datetime_input<T: Serialize>(
                 name=(field)
                 value=(value)
                 step="any"
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
@@ -2433,8 +2433,8 @@ pub fn required_datetime_input<T: Serialize>(
                 step="any"
                 required
                 aria-required="true"
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
@@ -2480,8 +2480,8 @@ pub fn select_input<T: Serialize>(
             select
                 id=(field)
                 name=(field)
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" }) {
                 @for (option_value, option_label) in options {
                     option value=(option_value) selected[*option_value == current] { (option_label) }
@@ -2527,8 +2527,8 @@ pub fn required_select_input<T: Serialize>(
                 name=(field)
                 required
                 aria-required="true"
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" }) {
                 @for (option_value, option_label) in options {
                     option value=(option_value) selected[*option_value == current] { (option_label) }
