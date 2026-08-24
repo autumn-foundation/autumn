@@ -160,6 +160,7 @@
 )]
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use axum::extract::{FromRequest, Request};
 use axum::response::IntoResponse;
@@ -175,10 +176,56 @@ use serde::Serialize;
 /// - [`Changeset::new`] for a blank/valid changeset
 /// - [`IntoChangeset::into_changeset`] after manual construction
 /// - The [`ChangesetForm`] axum extractor (preferred)
-#[derive(Debug)]
 pub struct Changeset<T> {
     data: T,
     errors: HashMap<String, Vec<String>>,
+    /// Lazily-computed `serde_json::to_value(&data)`, shared across every
+    /// [`Self::field_value`] call on this changeset instead of re-serializing
+    /// the whole record per field. A form with N fields previously paid a
+    /// full-struct serialization N times over — once per rendered input — for
+    /// each render.
+    ///
+    /// Boxed rather than a bare `OnceLock<serde_json::Value>`: an inline
+    /// `Value` pushes `Changeset` (and therefore `Result<T, Changeset<T>>` in
+    /// [`Self::into_valid`]) over clippy's `result_large_err` threshold.
+    ///
+    /// A snapshot, not a live view: if `T` holds interior-mutable fields
+    /// (`RefCell`, `Mutex`, `Atomic*`, …) mutated through the shared
+    /// reference [`Self::data`] hands out, a `field_value` call made before
+    /// that mutation poisons every later call on the same `Changeset` with
+    /// the pre-mutation value — `serde_json::to_value(&self.data)` used to
+    /// re-run, and would have observed it, on every call. `Changeset` is
+    /// documented and universally used as build-once-render-once submitted
+    /// form data (see every call site of `field_value`/`data`), which has no
+    /// interior mutability and no reason to mutate between renders, so this
+    /// is a real but currently theoretical caveat rather than an active bug.
+    ///
+    /// Deliberately excluded from [`Debug`](std::fmt::Debug) (see the manual
+    /// impl below): it holds a raw `serde_json` snapshot of every
+    /// serializable field, which would bypass any redaction a caller's own
+    /// `Debug` impl on `T` applies to a field `Serialize` still includes
+    /// (e.g. a password field masked in `Debug` output but still submitted
+    /// and therefore serialized) — deriving `Debug` here would print that
+    /// unredacted snapshot alongside `T`'s redacted one, and would only start
+    /// doing so once some `field_value` call happened to fill the cache,
+    /// making the leak initialization-order-dependent as well.
+    field_value_cache: OnceLock<Box<serde_json::Value>>,
+}
+
+#[allow(
+    clippy::missing_fields_in_debug,
+    reason = "field_value_cache is deliberately omitted — see its doc comment"
+)]
+impl<T: std::fmt::Debug> std::fmt::Debug for Changeset<T> {
+    /// Mirrors the pre-cache derived output exactly (`data` and `errors`
+    /// only): the cache field's own doc comment explains why it must never
+    /// appear here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Changeset")
+            .field("data", &self.data)
+            .field("errors", &self.errors)
+            .finish()
+    }
 }
 
 impl<T> Changeset<T> {
@@ -187,12 +234,17 @@ impl<T> Changeset<T> {
         Self {
             data,
             errors: HashMap::new(),
+            field_value_cache: OnceLock::new(),
         }
     }
 
     /// Create a changeset pre-loaded with field-level errors.
     pub const fn from_errors(data: T, errors: HashMap<String, Vec<String>>) -> Self {
-        Self { data, errors }
+        Self {
+            data,
+            errors,
+            field_value_cache: OnceLock::new(),
+        }
     }
 
     /// Returns `true` when there are no field-level errors.
@@ -250,8 +302,17 @@ impl<T: Serialize> Changeset<T> {
     ///
     /// Used by rendering helpers to re-populate `<input value="…">` after a
     /// failed submission.  Returns `None` for missing or non-scalar fields.
+    ///
+    /// The serialization is cached on first call and reused by later calls on
+    /// the same `Changeset`, rather than re-run per call. This is a snapshot:
+    /// if `T` holds interior-mutable fields mutated through the shared
+    /// reference [`Self::data`] hands out, a call made before that mutation
+    /// makes every later call on this `Changeset` observe the pre-mutation
+    /// value instead of the current one.
     pub fn field_value(&self, field: &str) -> Option<String> {
-        let json = serde_json::to_value(&self.data).ok()?;
+        let json = self.field_value_cache.get_or_init(|| {
+            Box::new(serde_json::to_value(&self.data).unwrap_or(serde_json::Value::Null))
+        });
         match json.get(field)? {
             serde_json::Value::String(s) => Some(s.clone()),
             serde_json::Value::Number(n) => Some(n.to_string()),

@@ -440,6 +440,10 @@ harness = false
 name = "request_pipeline"
 harness = false
 
+[[bench]]
+name = "form_render"
+harness = false
+
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
 # `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
 # guard, since a `[[bin]]` target — unlike a `[[test]]` — is simply skipped by

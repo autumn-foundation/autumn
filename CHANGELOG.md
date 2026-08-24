@@ -628,6 +628,209 @@ For a narrative tour of this release, see the
   leaves `{page}` unsubstituted. `static_params()` is unchanged and now
   delegates to it with `"slug"`.
 
+### Performance
+
+- **`Changeset::field_value` no longer re-serializes the whole record per
+  field:** every scaffolded form-rendering helper that populates a value
+  (`text_input`, `textarea_input`, `number_input`, `date_input`, and their
+  `required_*`/`*_htmx` variants) calls `Changeset::field_value` once to read
+  a single field back out of the changeset's data. `field_value` ran
+  `serde_json::to_value(&self.data)` — serializing every field of the record
+  — on **every** call, so a form with N value-bearing fields paid a full
+  record serialization N times over on each render. `Changeset<T>` now caches
+  the serialization in a private `OnceLock<Box<serde_json::Value>>`, computed
+  once on the first `field_value` call and reused by every later call on the
+  same changeset. No public API change: `field_value`'s signature and
+  behaviour are unchanged, including returning `None` on a serialization
+  error (cached as `Value::Null`, whose `.get()` returns `None` exactly as
+  the old early-return did).
+
+  Measured with a new benchmark (`autumn/benches/form_render.rs`, a realistic
+  12-field scaffolded form with two fields carrying validation errors, a
+  fresh `Changeset` built per render so the cache is never pre-warmed across
+  iterations — a real request builds one `Changeset` and renders it once —
+  2,000 iterations = 2,050 renders), `valgrind --tool=callgrind` and
+  `--tool=dhat`, before and after on the same machine:
+
+  | | before | after | delta |
+  | --- | ---: | ---: | ---: |
+  | Instructions (5,000-iteration run) | 932,490,618 | 364,082,814 | **-61.0%** |
+  | Allocation bytes/render (marginal) | 45,003 | 21,579 | **-52.0%** |
+  | Allocation blocks/render (marginal) | 364 | 124 | **-65.9%** |
+
+  `serde_json::SerializeMap::serialize_field` drops from 13.18% of
+  instructions to 3.07% — consistent with the 11 value-reading fields on the
+  benchmark's form collapsing to one real serialization per render instead of
+  11 — and the `BTreeMap` machinery backing `serde_json::Map` mostly drops out
+  of the top-90%-of-instructions list; `maud::escape_to_string`'s absolute
+  instruction count is unchanged (109,276,950 both before and after),
+  confirming the win is isolated to the redundant serialization and doesn't
+  touch the genuinely
+  inherent HTML-escaping cost.
+
+- **ingress middleware no longer boxes a future per layer per request:** every
+  `axum::middleware::from_fn` on the framework's always-on request path is now a
+  hand-rolled `tower::Service` with a **named** future. `from_fn` cannot avoid
+  the cost it was paying: the async block it generates has no nameable type, so
+  `FromFn::call` returns it as `Box::pin(..)` — one heap allocation per call
+  site per request, sized by everything that block captures across its single
+  `.await`, which for an outer layer is the whole downstream continuation. DHAT
+  measured those boxes at **19.57% of every byte** the `request_pipeline`
+  benchmark allocated (5,267,600 of 26,918,238 bytes over 650 requests) while
+  being only 2.14% of the blocks — the largest single allocation cost in the
+  profile (issue #2214).
+
+  Converted: the asset cache-control layer, the event-bus app context, the
+  webhook replay-key cleanup, the method-override rejection filter, the
+  trusted-host gate, the startup barrier, the per-request timeout, the
+  read-your-own-writes pin, and (under `oauth2`) the HTTP-interceptor scope.
+  Each keeps its behaviour and its position in the stack exactly; what goes away
+  is the box and, with it, the `self.inner.clone()` `from_fn` needed to move the
+  inner service into that box — which for an erased `BoxCloneSyncService` was a
+  recursive `clone_box` down the rest of the stack, so each conversion took a
+  whole deep-clone cascade with it too.
+
+  Re-run of the issue's own DHAT recipe on `benches/request_pipeline.rs`
+  (release, 200 iterations = 650 requests), before and after on the same
+  machine — filtering allocation sites whose second stack frame is
+  `FromFn<..>::call` exactly, as the issue specifies:
+
+  | | `FromFn::call` `Box::pin` | share of run bytes | marginal blocks/req | marginal bytes/req |
+  | --- | ---: | ---: | ---: | ---: |
+  | before | 3,250 blocks / 5,215,600 bytes | 19.80% | 168.8 | 36,826 |
+  | after | **0 / 0** (0 sites) | **0%** | 139.2 | 25,943 |
+
+  The before column reproduces the issue's measurement exactly on block count
+  (3,250) and to within 1% on bytes. Overall: **−17.5% allocations** and
+  **−29.6% bytes** per request.
+
+  The same movement is pinned as a regression gate in the debug profile, where
+  it is deterministic run to run: **172 → 140 allocation blocks** and
+  **37,819 → 26,030 bytes** per request under the default feature set. The ingress clone-on-call traversal count drops from 13 to 9 in
+  the same move, on the default set and on a 13-feature build alike. One layer
+  also sheds an allocation of its own: the asset cache-control layer no longer
+  clones the request path into a `String` on every request in the app.
+
+  Two middlewares are deliberately **not** converted, because they `.await`
+  before calling the inner service and their futures therefore cannot be named
+  without `type_alias_impl_trait`: the tenancy middleware (async tenant
+  extraction) and the rate-limit principal shim (async session read). Both are
+  off by default. `webhook_replay_cleanup` keeps one box, taken only on a `5xx`
+  that actually registered replay keys; on every other request its future is
+  unboxed (it still mints the per-request replay cell it always did).
+
+  One public behaviour change: `read_your_writes::middleware` used to
+  `unreachable!()` when handed `ReadYourWrites::Off`. It now debug-asserts and
+  falls back to an inert `Off` pin instead of panicking on the request path.
+  Both call sites gate on `mode != Off`, so the arm stays unreachable in
+  practice. Otherwise nothing public moved: `asset_cache_control`,
+  `method_override_rejection_filter` and `webhook_replay_cleanup_middleware`
+  remain exported `async fn`s with identical behaviour, now sharing their
+  decision logic with the layers so the two forms cannot drift.
+
+  Four gates keep the win from eroding: a per-request allocation **blocks**
+  ceiling tight enough that restoring a single `from_fn` fails it, a companion
+  **bytes** ceiling derived under the wider feature set CI actually gates with,
+  the ingress traversal count pinned to its exact measurement, and a
+  `type_name`-based assertion that none of the converted services ever returns a
+  `Pin<Box<dyn Future>>` again.
+
+- **config reads on the request path:** generated auth handlers, the admin
+  plugin, the `saas` starter, and the `blog`/`saas`/`teams` examples now read
+  configuration through `AppState::config_arc()` instead of
+  `AppState::config()`. `config()` returns an owned `AutumnConfig`, so every
+  call deep-clones **every** config section — 64 allocations and 1,384 bytes
+  against a default config, and more as an app's config grows — even to read a
+  single `bool` or `usize`. On a handler that cost is paid per request, and a
+  handler reading two or three sections paid it two or three times over: a
+  downstream app profiling its request path measured whole-config clones at
+  ~30% of its per-request allocations and ~42% of its per-request bytes.
+  `config_arc()` hands back the shared `Arc<AutumnConfig>` the state already
+  holds, so the same read is a refcount bump and handlers borrow the section
+  they need off the handle (`&config.auth.password`).
+
+  Nothing about the framework's own ingress path changed — that was already
+  allocation-free as of #2199 — and no public signature moved: `config()`
+  remains the per-boot owned-snapshot accessor, and the one generated call site
+  that still uses it is the boot-time `remember_me_startup` hook, which needs an
+  owned `RememberConfig`. Apps calling `state.config()` in their own handlers
+  keep compiling; switching them to `state.config_arc()` is the fix, and
+  `docs/guide/authentication.md` now teaches that as the default. A new
+  generator test pins the emitted handlers to `config_arc()` so the deep clone
+  cannot reappear in scaffolded apps.
+
+- **jobs:** the Postgres job worker's claim query (`SELECT … FOR UPDATE SKIP
+  LOCKED`) no longer scans and sorts the entire ready backlog for a queue
+  before picking one row, for apps that don't configure `[jobs] queues`
+  priority (the common case: a single `"default"` queue). The claim query's
+  `ORDER BY array_position($2::text[], candidate.queue), candidate.run_at`
+  was opaque to the planner — `array_position` depends on the bound queue-
+  order array, so even though it's constant across every candidate row when
+  only one queue is in play, Postgres couldn't prove that and fell back to a
+  `Bitmap Heap Scan` of the whole ready-in-queue backlog followed by a
+  `Sort` and `LockRows` over every one of those rows, before `LIMIT 1`
+  picked the winner. Single-queue workers now send a query that drops
+  `array_position` from `ORDER BY` and uses `queue = $2` (scalar), which
+  lets the planner recognize the existing `idx_autumn_jobs_queue_ready
+  (queue, run_at)` index order and do a plain `Index Scan` + `Limit 1`
+  instead. Measured (`EXPLAIN (ANALYZE, BUFFERS)`, production-shaped
+  fixture): 703→21 buffers at 4.4k ready rows, 3,342→22 at 44.6k, and
+  57,093→22 (eliminating an external-merge sort spill to disk) at 444k;
+  workload-level (`pg_stat_statements`, 50 claims) 166,437→1,410 total
+  buffers, a 99.15% reduction. No index or migration changes — see
+  `docs/reports/2026-08-14-ledger-job-claim-single-queue/`.
+
+- **state:** `AppState::profile` and `AppState::auth_session_key` no longer
+  deep-clone a `String` on every `AppState::clone()`. `AppState` is cloned
+  once per hop of the ingress tower stack (`Route::call` deep-clones the
+  boxed service beneath it, per #2193/#2198), so the two fields still held
+  as an owned `Option<String>`/`String` — rather than shared behind an
+  `Arc` like the rest of the struct — paid a fresh heap allocation on every
+  one of those clones instead of once per request. Both now live behind an
+  `Arc<str>`; `profile()` and `auth_session_key()` are unchanged (`&str`
+  via `Deref`), and `with_profile`/`with_auth_session_key` still take
+  `impl Into<String>`. Measured with the debug-profile allocation-counter
+  gate already used for #2198's `config_arc` work (`autumn/tests/config_alloc_gate.rs`):
+  a `TestClient` request drops from 220 to 172 allocation blocks (-22%),
+  identical across repeated runs.
+- **mail:** list-mail sends (`Mailer::send` with `list_unsubscribe` set) now
+  resolve suppression for the whole recipient batch in one query instead of
+  one `SELECT` per recipient. The `SuppressionStore` trait gained a batched
+  `is_suppressed_many` method (default implementation loops over
+  `is_suppressed`, so existing custom stores keep working unchanged);
+  `DbSuppressionStore` overrides it with a single `WHERE list_id = $1 AND
+  subscriber = ANY($2)` query, chunked at 50,000 recipients on Postgres (a
+  backstop against an unbounded single-statement bind, not a tuning knob for
+  ordinary sends: a tighter chunk size can land statements past a planner
+  cost crossover where `= ANY(...)` stops using the index and falls back to
+  a table scan, then re-pay that scan's fixed cost once per chunk) and at
+  `repository::MAX_BIND_PARAMS - 1` on SQLite, which binds `eq_any` as one
+  parameter per element instead of Postgres's single array parameter.
+  Measured
+  (`pg_stat_statements`, production-shaped `mail_unsubscribes` fixture):
+  statement count per send drops from N to 1 at every batch size tested
+  (200/2,000/20,000 recipients); total buffers 660→604 (200), 6,600→6,004
+  (2,000), and 66,000→8,070 (20,000, −87.8%). No index or migration changes
+  — see `docs/reports/2026-08-15-ledger-mail-suppression-batch/`.
+- **scaffold:** the generated `index` page for a `belongs_to`/`references`
+  field with a resolved display column (#1146) no longer scans the *entire*
+  referenced table to label the ~20 rows on one page. `autumn-cli`'s
+  `render_index_reference_label_loads` reused the create/edit form's
+  `{name}_select_options` loader — a full, unfiltered `SELECT id, col FROM
+  table ORDER BY id` that genuinely needs every row for a `<select>` — to
+  build the index's parent-label map too, so every index page view re-read
+  the whole referenced table regardless of page size. It now scopes the
+  query to `WHERE id = ANY(...)` the page's own FK values
+  (`page_data.content`, already fetched), and the identical fix applies to
+  the `--belongs-to` nested list (`children_section_with`). Measured
+  (`EXPLAIN (ANALYZE, BUFFERS)` + `pg_stat_statements`, production-shaped
+  fixture): rows read at the scan node drop from 500,000→20 (-99.996%) at
+  500k parent rows, with total buffers 7,051→83 (-98.8%); 707→61 (-91.4%)
+  at 50k rows and 72→54 (-25.0%) at 5k rows. No index or migration changes
+  — see `docs/reports/2026-08-16-ledger-scaffold-index-label-scope/`.
+
+### Added
+
 - **cluster:** an embedded, zero-dependency self-clustering substrate (#1762).
   Two instances of the same binary, started with a shared secret and no
   external coordination service — no Redis, no Postgres, no etcd — discover
