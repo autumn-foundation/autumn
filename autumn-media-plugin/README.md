@@ -13,8 +13,8 @@ It packages the two primitives an interactive streaming product needs:
 
 ```toml
 [dependencies]
-autumn-web = "0.6"
-autumn-media-plugin = "0.6"
+autumn-web = "0.7"
+autumn-media-plugin = "0.7"
 ```
 
 ## `[media]` configuration

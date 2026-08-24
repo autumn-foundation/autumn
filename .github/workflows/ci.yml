@@ -105,6 +105,19 @@ jobs:
         # queueing behind ~20 minutes of workspace clippy in `lint` — and a
         # clippy failure can't stop it from running.
         run: ./scripts/check-migration-guides.sh
+      - name: Skill version marker gate
+        # The `autumn-web` agent skill annotates each API with the release it
+        # arrived in. Those markers are hand-maintained and drifted badly
+        # across the 0.6.0 -> 0.7.0 cut — a marker naming too NEW a release
+        # tells a reader an API is out of reach when it already shipped, which
+        # is the damaging direction. Nothing mechanical caught it; a review
+        # did, repeatedly. This resolves every issue-referenced marker against
+        # the CHANGELOG section that introduced it.
+        #
+        # Shares the docs-only `migration-guides` job for the same reason that
+        # job exists standalone: no toolchain, no cache, reports in seconds,
+        # and cannot be blocked by a clippy failure in `lint`.
+        run: ./scripts/check-skill-version-markers.sh
 
   supply-chain:
     name: Supply chain (cargo-deny)

@@ -62,10 +62,10 @@ acme = ["tls", "autumn-web/acme"]
 sqlite = ["autumn-web/sqlite", "diesel_migrations/sqlite"]
 
 [dependencies]
-autumn-web = { version = "0.6.0", path = "../autumn", default-features = false, features = [
+autumn-web = { version = "0.7.0", path = "../autumn", default-features = false, features = [
     "db", "htmx", "maud", "storage", "i18n", "telemetry-otlp", "redis", "cache-moka", "http-client", "reporting"
 ] }
-autumn-schema-core = { version = "0.6.0", path = "../autumn-schema-core" }
+autumn-schema-core = { version = "0.7.0", path = "../autumn-schema-core" }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 diesel = { workspace = true }

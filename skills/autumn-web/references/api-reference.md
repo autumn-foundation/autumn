@@ -1,26 +1,32 @@
-# autumn-web API Reference (published 0.5.0 + trunk-dev)
+# autumn-web API Reference (0.7.0)
 
 Use this file as a quick map for public names, features, dependency versions,
 and config keys. Verify against current source when exact code matters.
 
-Version identity: crates.io serves **0.5.0** (the latest published release);
-the `trunk-dev` workspace is versioned **0.6.0 (unpublished)**. Entries marked
-**(unreleased)** exist on trunk-dev but NOT in the published 0.5.0 crates.
+Version identity: this reference tracks **0.7.0**, the current release line,
+which is also the version `trunk-dev` carries. Entries carry the release they
+arrived in: **(0.6.0)** is absent from 0.5.x, and **(0.7.0)** is absent from
+0.6.x and earlier. Unmarked entries predate 0.6.0.
 
 ## Published crates
 
 | Crate | Directory | Notes |
 |---|---|---|
 | `autumn-macros` | `autumn-macros/` | Proc macros; publish first |
+| `autumn-schema-core` | `autumn-schema-core/` | Schema primitives shared by the CLI; no Autumn runtime deps |
+| `autumn-edge` | `autumn-edge/` | Edge/WASM capsule runtime; `autumn-web` pins it (optionally) so it publishes before `autumn-web` |
 | `autumn-web` | `autumn/` | Main framework crate; import path `autumn_web` |
 | `autumn-cli` | `autumn-cli/` | Binary crate; binary name `autumn` |
 | `autumn-admin-plugin` | `autumn-admin-plugin/` | First-party admin UI plugin |
+| `autumn-media-plugin` | `autumn-media-plugin/` | Live-streaming media plugin (broadcast + rooms) |
 | `autumn-storage-s3` | `autumn-storage-s3/` | S3-compatible `BlobStore` plugin |
 | `autumn-cache-redis` | `autumn-cache-redis/` | Redis cache plugin |
 | `autumn-search` | `autumn-search/` | Keyword + vector search plugin |
 
 All publishable crates share the `[workspace.package]` version and release
-together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
+together at `0.7.0`. This table lists the same crates, in the same order, as
+`CRATES` in `scripts/check-publish-dry-run.sh` — that script is the executable
+copy of the publish order.
 
 ## Top-level exports
 
@@ -56,7 +62,7 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
   `broadcasts_on(topic)` / `assert_broadcast(topic, predicate)` /
   `assert_broadcast_count(topic, n)` / `assert_no_broadcasts(topic)`
   (`RecordedBroadcast` exposes `.topic()` / `.payload()`)
-- Resumable SSE **(unreleased — trunk-dev, issue #1356)**:
+- Resumable SSE **(0.6.0, issue #1356)**:
   `sse::stream_resumable(&state, topic, last_event_id: Option<u64>)` — automatic
   monotonic per-topic event ids + `Last-Event-ID` replay from a bounded
   per-topic ring buffer, with a `gap` sentinel (`event: gap`,
@@ -109,7 +115,7 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
 | `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools |
 | `#[service]` | Service implementation scaffolding (`db`) |
 | `#[secured]` | Session auth and role guard |
-| `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (**unreleased** — trunk-dev, #1604) |
+| `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.6.0, #1604) |
 | `#[authorize]` | Record-level policy guard |
 | `#[api_doc]` | Route OpenAPI metadata |
 | `#[oauth2_callback]` | OAuth2/OIDC callback route |
@@ -123,11 +129,11 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
 | `#[feature_flag]` | Feature-flag definition |
 | `#[inbound_mail]` | Inbound mail handler |
 | `#[step_up]` | Step-up authentication guard |
-| `#[throttle]` | Per-route rate limit — inline (`limit`/`per`/`key`) or named (`#[throttle("login")]`) (**unreleased**) |
-| `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**unreleased**) — publish via the `Events` extractor, register with `.listeners(...)` |
+| `#[throttle]` | Per-route rate limit — inline (`limit`/`per`/`key`) or named (`#[throttle("login")]`) (**0.6.0**) |
+| `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**0.6.0**) — publish via the `Events` extractor, register with `.listeners(...)` |
 
 Route macros accept a `seo(...)` argument declaring per-page meta tag defaults
-(**unreleased** — trunk-dev, #1182):
+(0.7.0, #1182):
 `#[get("/about", seo(title = "About", description = "…"))]`. Keys mirror the
 `SeoMeta` builder — `title`, `description`, `canonical`, `og_title`,
 `og_description`, `og_image`, `og_type`, `og_url`, `twitter_card`,
@@ -139,7 +145,7 @@ builder), then refine them with per-request data before calling
 `seo.render()`. `#[static_get]` honours the argument too. The declared values
 are also recorded on `Route::seo` as a `SeoRouteDefaults`.
 
-**Locale-prefixed routing** (**unreleased** — trunk-dev, #1251): `[i18n]
+**Locale-prefixed routing** (0.7.0, #1251): `[i18n]
 locale_prefix_enabled = true` in `autumn.toml` (default `false`, no behavior
 change) makes every route registered via `routes(...)` also reachable under
 `/{locale}/...` for each `supported_locales` entry — no route definitions are
@@ -158,7 +164,7 @@ supported_locales)` emit `<link rel="alternate" hreflang="…">` tags (plus
 static route when the flag is on.
 
 `#[model]` also recognizes `#[belongs_to]` / `#[has_many]` / `#[has_one]`
-struct-level attributes (**unreleased** — trunk-dev, not in published 0.5.0)
+struct-level attributes (0.6.0)
 for declarative associations with batched eager
 preloading (`Model::preload()`, `repo.preload(records, spec)`); these are
 consumed by `#[model]` itself, not separately-registered proc macros.
@@ -176,7 +182,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
 `docs/guide/state-machines.md`.
 
 `#[model]` field attributes for column privacy and canonicalization
-(**unreleased** — trunk-dev, not in published 0.5.0):
+(0.6.0):
 
 - `#[private]` (issue #1374) — excludes the column from the model's `Serialize`
   impl so it never appears in `Json` output, the auto-generated `--api`
@@ -190,7 +196,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   *set* it). `autumn doctor` warns (`model_private_columns`) when a
   sensitively-named column (`password`, `token`, `secret`, `*_hash`) is not
   marked `#[private]`.
-- `#[translatable]` (issue #1384, needs the `i18n` feature) — the column stores
+- **(0.7.0)** `#[translatable]` (issue #1384, needs the `i18n` feature) — the column stores
   an **independent value per locale tag** and resolves to the request's active
   locale with no locale argument in the handler. The field type becomes
   `autumn_web::i18n::Translated`, a per-locale container persisted as a JSON
@@ -249,9 +255,9 @@ Published 0.5.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
 `scope =`, `primary_reads`, `soft_delete`, `tenant_scoped`, `hooks =`,
 `mcp` / `mcp = "read"`.
 
-**(unreleased)**: `preload(records, spec)` (declarative associations);
+**(0.6.0)**: `preload(records, spec)` (declarative associations);
 `from_shard(&ShardedDb)`; `with_pool_untracked` (new on
-trunk-dev — published 0.5.0 repositories have no pool constructor);
+the 0.6.0 rename of `with_pool`; 0.5.x repositories had no pool constructor);
 `find_in_batches(batch_size)` / `find_each(batch_size)` — bounded-memory
 whole-table iteration on every repository via a primary-key keyset cursor
 (`WHERE id > last ORDER BY id ASC LIMIT batch_size`, never `LIMIT`/`OFFSET`).
@@ -265,7 +271,7 @@ clamped to `MAX_PAGE_SIZE`; sharded repositories reject cross-shard
 `across_tenants()` iteration like `cursor_page`. See "Batched iteration" in
 `docs/guide/pagination.md`.
 
-**(unreleased)** — `find_or_create_by_<field>[_and_<field>...]`: declare
+**(0.6.0)** — `find_or_create_by_<field>[_and_<field>...]`: declare
 `fn find_or_create_by_slug(slug: String);` (lookup fields only) in the
 `#[repository]` trait to generate an inherent
 `find_or_create_by_slug(&self, slug: String, new: &NewModel) ->
@@ -281,7 +287,7 @@ Requires a unique constraint covering the lookup column(s); `_or_` is rejected
 (it would span constraints). See "Race-safe get-or-insert" in
 `docs/guide/repositories.md`.
 
-**(unreleased)** — typed grouped aggregate queries (#1364): declare
+**(0.6.0)** — typed grouped aggregate queries (#1364): declare
 `fn count_grouped_by_<col>() -> Vec<(K, i64)>` or
 `fn <sum|avg|min|max>_<num_col>_grouped_by_<col>() -> Vec<(K, Option<T>)>`
 (`avg` → `Option<f64>`) in the `#[repository]` trait — the pair return type is
@@ -301,7 +307,7 @@ returning a per-shard-partial answer. `DateBucket` and the `GroupedAggregate`
 builder live in `autumn_web::aggregate`. See "Grouped aggregate queries" in
 `docs/guide/repositories.md`.
 
-**(unreleased)** — `#[commentable]` polymorphic comment helpers (#1367):
+**(0.7.0)** — `#[commentable]` polymorphic comment helpers (#1367):
 declaring `#[commentable(by = User, author_name = username)]` on a `#[model]`
 emits `Model::COMMENTABLE_TYPE`, `Model::commentable_spec()`, an `inventory`
 registration, and a `{Model}Comments` trait blanket-implemented for that
@@ -345,7 +351,7 @@ private records must set `CommentsConfig::authorize(...)`. Build a host page's
 own thread with `commentable::thread_dom_id`/`thread_action` so the router's
 re-render lands on the same element. See `docs/guide/commentable.md`.
 
-**(unreleased)** — `#[votable]` reaction helpers (#1362): declaring
+**(0.7.0)** — `#[votable]` reaction helpers (#1362): declaring
 `#[votable(by = User, aggregate = sum|count)]` on a `#[model]` emits a
 `{Model}Reactions` trait blanket-implemented for that model's repository (no
 `#[repository]` attribute needed — it rides the same `M2mConnSource<Model =
@@ -400,7 +406,7 @@ join an enclosing `Db::tx`** — never hold a `Db` extractor across the call, or
 the handler needs two connections at once and deadlocks once concurrency
 reaches the pool size. See `docs/guide/votable.md`.
 
-**(unreleased)** — `ListQuery` extractor + `SortDir` (#1126): an `Infallible`
+**(0.6.0)** — `ListQuery` extractor + `SortDir` (#1126): an `Infallible`
 query extractor parsing `?sort=<col>`, `?dir=asc|desc`, and
 `?filter[<col>]=<val>`. It **never rejects** — an empty or unknown `sort` falls
 back to the model's default order, and an invalid `dir` falls back to `asc`
@@ -409,7 +415,7 @@ back to the model's default order, and an invalid `dir` falls back to `asc`
 so only real columns can reach SQL (unknown sort/filter columns are ignored, not
 injected).
 
-**(unreleased)** — `Query<T>` decodes sequences and nested structures (#1972):
+**(0.7.0)** — `Query<T>` decodes sequences and nested structures (#1972):
 the extractor no longer delegates to `serde_urlencoded`, so a query field does
 **not** have to be a scalar. A query string of unique scalar keys behaves
 exactly as before; on top of that it accepts
@@ -457,7 +463,7 @@ clients must send it), and `#[repository]`'s update raises
 `RepositoryError::Conflict` — mapped to HTTP 409 — when the stored version
 moved on. The model also gains a derived `etag()`.
 
-**(unreleased — trunk-dev, #1318)** `autumn generate model` / `generate
+**(0.7.0, #1318)** `autumn generate model` / `generate
 scaffold` wire this from the field name alone: the attribute, an
 `INTEGER/BIGINT NOT NULL DEFAULT 0` column (the INSERT never names it), a
 hidden `lock_version` input on the scaffolded edit form, an `update` handler
@@ -474,9 +480,9 @@ delete actions remain last-write-wins.
 
 ## Db transactions
 
-- `Db::tx(f)` — READ COMMITTED, one attempt (published 0.5.0).
+- `Db::tx(f)` — READ COMMITTED, one attempt (0.5.0).
 - `Db::tx_with(opts: TxOptions, f) -> Result<T, AutumnError>`
-  (**unreleased**) — closure gets `&mut AsyncPgConnection`; auto-retries
+  (**0.6.0**) — closure gets `&mut AsyncPgConnection`; auto-retries
   SQLSTATE 40001 with capped exponential backoff.
 - `autumn_web::db::IsolationLevel` {`ReadCommitted` (default),
   `RepeatableRead`, `Serializable`}; `TxOptions` builders
@@ -492,9 +498,9 @@ Free functions rendering changeset-aware, accessible inputs:
 - Published 0.5.0: `form_tag`, `method_input`, `text_input`,
   `text_input_htmx`; `Changeset`-bound methods (`form.form_tag(...)`,
   `form.text_input(...)`).
-- **(unreleased)**: `checkbox_input`, `number_input`, `date_input`,
+- **(0.6.0)**: `checkbox_input`, `number_input`, `date_input`,
   `datetime_input`, `select_input`.
-- **(unreleased — trunk-dev, not in published 0.5.0)**: `form_for(&changeset,
+- **(0.6.0)**: `form_for(&changeset,
   action, method) -> FormFor` whole-form builder. Renders the opening
   `<form>` (audited CSRF injection + hidden `_method` override, as
   `form_tag`), one pre-filled control with inline errors per
@@ -523,7 +529,7 @@ Free functions rendering changeset-aware, accessible inputs:
   values decode; RFC 3339 still accepted). `DateTime` columns with a zone
   other than `Utc`/`Local` render as `Text` (RFC 3339 string), not a picker.
 
-## Typed accessible primitives (`autumn_web::a11y`, feature `maud`, unreleased — trunk-dev only, #1706)
+## Typed accessible primitives (`autumn_web::a11y`, feature `maud`, 0.6.0, #1706)
 
 Render-implementing structs that make the accessible name a **type-level
 obligation** — the inaccessible form does not compile (the missing name is a
@@ -583,7 +589,7 @@ Per-primitive setters (in addition to the shared set):
 - **`FileField::new(name)`** — `.accept(s)` (MIME/extension filter),
   `.multiple()` (sets the `multiple` attribute).
 
-## View widgets and UI (all unreleased — trunk-dev only)
+## View widgets and UI (all 0.6.0)
 
 - `autumn_web::widgets`: `card(&body, &CardConfig)`,
   `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
@@ -742,13 +748,13 @@ Per-primitive setters (in addition to the shared set):
 `TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` — are documented
 in **Typed accessible primitives** above.)
 
-## Cache read-through (unreleased)
+## Cache read-through (0.6.0)
 
 `autumn_web::cache::{get_or_compute, get_or_compute_with,
 GetOrComputeOptions, CacheFillError, jittered_ttl}` — single-flight fills,
 optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
 
-## Downloads (unreleased)
+## Downloads (0.6.0)
 
 `autumn_web::download::Download` — a typed file-download `IntoResponse`.
 
@@ -771,7 +777,7 @@ optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
   object's bytes; `LocalBlobStore` overrides it to stream from disk, other
   backends inherit a buffering default.
 
-### Range / 206 Partial Content (unreleased)
+### Range / 206 Partial Content (0.6.0)
 
 `autumn_web::range` — reusable HTTP `Range` (RFC 7233) parsing + response
 building, wired into `Download` and the embedded static-asset path.
@@ -804,7 +810,7 @@ building, wired into `Download` and the embedded static-asset path.
   (`LocalBlobStore` seeks + takes off disk; other backends inherit a buffering
   default) — a seek in a large video never buffers the whole object.
 
-## PDF generation (unreleased)
+## PDF generation (0.7.0)
 
 `autumn_web::pdf::Pdf` (`pdf` Cargo feature, off by default) — renders an
 HTML string, typically a `maud::Markup` view you already render on-screen,
@@ -841,12 +847,12 @@ to a downloadable PDF `IntoResponse` built on `Download`.
 - Published 0.5.0 `#[job]` keys: `name`, `max_attempts`, `backoff_ms`,
   `unique`, `unique_by`, `unique_window`, `unique_for_ms`, `concurrency`,
   `concurrency_key`.
-- **(unreleased)**: `queue = "name"` + `[jobs] queues` strict-priority list or
+- **(0.6.0)**: `queue = "name"` + `[jobs] queues` strict-priority list or
   `[jobs.queues]` weight table; tracked jobs (`job::enqueue_tracked`,
   `enqueue_tracked_for`, `TrackedJobHandle`, optional third `JobContext`
   handler arg, `GET /_autumn/jobs/{token}`, `jobs.tracking.*` config).
 
-## Distributed locks (unreleased — trunk-dev)
+## Distributed locks (0.6.0)
 
 - `autumn_web::lock::Lock` (prelude: `Lock`, `LockGuard`, `LockError`; `db`
   feature). Named, cluster-wide Postgres advisory lock for
@@ -864,7 +870,7 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   / `Timeout` map to `503`.
 - Non-goals: not fair, not a lease, not row-level (`with_lock`), Postgres only.
 
-## Embedded clustering (unreleased — trunk-dev, #1762)
+## Embedded clustering (0.7.0, #1762)
 
 - `autumn_web::cluster` — zero-dependency two-node clustering: authenticated
   TCP gossip membership plus one shared primitive, an eventually consistent
@@ -894,12 +900,12 @@ to a downloadable PDF `IntoResponse` built on `Download`.
 - Published 0.5.0: `autumn generate auth` session management (`{user}_sessions`
   table, `sessions()` / `revoke_session` / `revoke_other_sessions` /
   `revoke_all_sessions`, `/account/sessions` page, `[auth.sessions]` config).
-- **(unreleased)**: scoped service tokens — `IssueTokenSpec`,
+- **(0.6.0)**: scoped service tokens — `IssueTokenSpec`,
   `issue_scoped_api_token`, `#[secured(scopes = [...])]`,
   `PolicyContext::has_scope/has_any_scope/has_all_scopes`, `autumn token
   issue --name/--scope/--expires-at | list | rotate`, admin `TokenAdminModel`.
 
-## Submit tokens (unreleased — trunk-dev, #1360)
+## Submit tokens (0.6.0, #1360)
 
 One-time, at-most-once form submission with no JS — defends against
 double-submits and replays.
@@ -927,7 +933,7 @@ double-submits and replays.
   **Note**: `#[model]` and `#[repository]` are NOT in the prelude — use
   `#[autumn_web::model]` and `#[autumn_web::repository]` (qualified paths).
 - Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
-- Accessibility primitives (`maud` feature, **unreleased** — trunk-dev):
+- Accessibility primitives (`maud` feature, 0.6.0):
   `Button`, `ButtonType`, `Img`, `Link`, `MenuItem`, `TextField`.
 - Extractors: `Db`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
@@ -974,9 +980,9 @@ double-submits and replays.
 | `with_audit_sink(sink)` | Structured audit sink |
 | `policy::<R, P>(policy)`, `scope::<R, S>(scope)` | Repository authorization |
 | `plugin(plugin)`, `plugins(tuple)` | Plugin install |
-| `listeners(listeners![...])` | Event listeners (**unreleased**) |
-| `static_gate(layer)`, `has_static_gate::<L>()`, `get_static_gate_types()` | Static pre-render gating middleware (**unreleased**) |
-| `with_shard_router(router)` | Sharding router (**unreleased**) |
+| `listeners(listeners![...])` | Event listeners (**0.6.0**) |
+| `static_gate(layer)`, `has_static_gate::<L>()`, `get_static_gate_types()` | Static pre-render gating middleware (**0.6.0**) |
+| `with_shard_router(router)` | Sharding router (**0.6.0**) |
 | `run()` | Start server |
 
 ## Deterministic time and entropy (`autumn_web::time`, `autumn_web::entropy`)
@@ -989,13 +995,13 @@ to a wall-clock jump in production.
 | API | Purpose |
 |---|---|
 | `Clock` extractor -> `.now()` | Wall-clock instant, snapshotted at request start |
-| `Clock` extractor -> `.monotonic()` | Monotonic *request-start* instant (**unreleased**) |
-| `AppState::monotonic()` | Live monotonic reading — the closing half of an elapsed measurement (**unreleased**) |
-| `MonotonicInstant::saturating_duration_since(earlier)` | Elapsed duration; never negative, never panics (**unreleased**) |
-| `MonotonicInstant::saturating_add(dur)` | Deadline arithmetic without `Instant + Duration`'s panic (**unreleased**) |
-| `time::monotonic_now()` | Real monotonic clock, for code with no `ClockSource` in scope (**unreleased**) |
+| `Clock` extractor -> `.monotonic()` | Monotonic *request-start* instant (**0.7.0**) |
+| `AppState::monotonic()` | Live monotonic reading — the closing half of an elapsed measurement (**0.7.0**) |
+| `MonotonicInstant::saturating_duration_since(earlier)` | Elapsed duration; never negative, never panics (**0.7.0**) |
+| `MonotonicInstant::saturating_add(dur)` | Deadline arithmetic without `Instant + Duration`'s panic (**0.7.0**) |
+| `time::monotonic_now()` | Real monotonic clock, for code with no `ClockSource` in scope (**0.7.0**) |
 | `time::clock_unix_secs(clock)` / `clock_unix_duration(clock)` | Unix time from the injected clock |
-| `ClockSource::now` / `ClockSource::monotonic` | The trait; `monotonic` is defaulted to real time, so a **virtual** clock must override it (**unreleased**) |
+| `ClockSource::now` / `ClockSource::monotonic` | The trait; `monotonic` is defaulted to real time, so a **virtual** clock must override it (**0.7.0**) |
 | `Rng` extractor -> `.uuid_v4()` / `.uuid_v7(ms)` / `.next_u64()` | Ids and randomness from the injected `Entropy` source |
 | `AppState::entropy()` | The same source, for framework/job code |
 | `SystemClock` / `FixedClock` / `TickingClock` | Real, pinned, and steppable `ClockSource` implementations |
@@ -1016,7 +1022,7 @@ Dev-dependency only.
 | `SystemTest::new()` | Builder; `test` profile with CSRF disabled |
 | `.routes(routes![...])` | Routes to serve; additive across calls |
 | `.state(AppState)` | Supply a pre-built state (real DB pool, policies); its embedded config wins |
-| `.layer(layer)` | App-wide Tower middleware, same `IntoAppLayer` bound and stack position as `AppBuilder::layer` — first call is outermost on ingress (**unreleased**) |
+| `.layer(layer)` | App-wide Tower middleware, same `IntoAppLayer` bound and stack position as `AppBuilder::layer` — first call is outermost on ingress (**0.7.0**) |
 | `.artifact_dir(path)` | Where failure screenshots/HTML go (default `target/system-tests/<test>/`) |
 | `.browser_timeout(d)` / `.hx_settle_timeout(d)` | Launch and htmx-settle deadlines |
 | `.build()` | Boot server + browser → `SystemTestRunner` |
@@ -1085,7 +1091,7 @@ csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
 ```
 
-`storage-s3` is not a feature in 0.5.0. Use `autumn-storage-s3 = "0.5"`.
+`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.7"`.
 
 ## Workspace dependency versions
 
@@ -1196,7 +1202,7 @@ Endpoint builders:
 
 ## Cache-Control freshness (`etag::cache_for` / `CacheControl`)
 
-Declarative per-handler `Cache-Control` header (unreleased — issue #1344).
+Declarative per-handler `Cache-Control` header (0.6.0, issue #1344).
 While `fresh_when` handles *revalidation* (is a cached copy still valid?),
 `cache_for` handles *freshness* (how long may a copy be reused before
 revalidating?). Both are re-exported from the prelude.
@@ -1229,8 +1235,7 @@ revalidating?). Both are re-exported from the prelude.
 
 ## Config layering and env keys
 
-Reading the resolved config from handler/service code (**unreleased** —
-trunk-dev, #2198): `AppState::config_arc() -> Arc<AutumnConfig>` is the cheap
+Reading the resolved config from handler/service code (0.7.0, #2198): `AppState::config_arc() -> Arc<AutumnConfig>` is the cheap
 accessor — a refcount bump, no deep clone; reach for it on anything that runs
 per request. `AppState::config() -> AutumnConfig` is unchanged and still right
 when you need an owned, independently mutable snapshot — it deep-clones every
@@ -1252,7 +1257,7 @@ Profile selection precedence:
 3. `--profile <name>`
 4. `AUTUMN_IS_DEBUG` auto-detection from the macro
 
-`.env` auto-loading (unreleased — trunk-dev): a project-root `.env` file is a
+`.env` auto-loading (0.6.0): a project-root `.env` file is a
 local-dev feeder for the env-var layer (6), not a new precedence tier. On
 startup Autumn injects `.env` values into the process environment only for keys
 that are still unset, so a real environment variable of the same name always
@@ -1272,7 +1277,7 @@ Frequently used env keys:
 | `AUTUMN_SESSION__BACKEND` | `session.backend` |
 | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` |
 | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` |
-| `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (unreleased — trunk-dev) |
+| `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (0.6.0) |
 | `AUTUMN_JOBS__BACKEND` | `jobs.backend` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
 | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` |
@@ -1283,9 +1288,9 @@ Frequently used env keys:
 | `AUTUMN_MAIL__ALLOW_IN_PROCESS_DELIVER_LATER_IN_PRODUCTION` | `mail.allow_in_process_deliver_later_in_production` |
 | `AUTUMN_STORAGE__BACKEND` | `storage.backend` |
 | `AUTUMN_CACHE__BACKEND` | `cache.backend` |
-| `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (unreleased — trunk-dev) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
+| `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (0.6.0) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
 
-### `[cluster]` — embedded clustering (unreleased — trunk-dev, #1762)
+### `[cluster]` — embedded clustering (0.7.0, #1762)
 
 Opt-in, zero-dependency two-node clustering (see "Embedded clustering" above).
 Off by default; when enabled a secret of ≥16 bytes is required (fail-fast
@@ -1307,7 +1312,7 @@ suspicion_timeout_ms = 2500       # ≥ 3× push_interval_ms enforced
 Env form `AUTUMN_CLUSTER__<KEY>`; addresses are IP literals (no hostname
 resolution).
 
-### `[failure_capture]` — failure capsules (unreleased — trunk-dev, #1598)
+### `[failure_capture]` — failure capsules (0.7.0, #1598)
 
 Opt-in deterministic replay capsules: every caught handler panic or 5xx writes
 one redacted JSON file (the request, the PostgreSQL wire traffic the handler
@@ -1347,7 +1352,7 @@ max_capsules = 50         # oldest-first prune (capsule-named files only), befor
   are not maskable; treat the directory like a database dump and read
   `docs/guide/failure-capsules.md` (security section leads) before enabling.
 
-### `[server.tls]` (feature `tls`, unreleased — trunk-dev, #1603)
+### `[server.tls]` (feature `tls`, 0.6.0, #1603)
 
 In-process HTTPS termination on the same host:port (off by default).
 
@@ -1357,7 +1362,7 @@ In-process HTTPS termination on the same host:port (off by default).
 - `handshake_timeout_secs` (default `10`).
 - Fail-fast at startup on bad / missing / mismatched / expired PEM.
 
-### `[server.tls.acme]` (feature `acme`, unreleased — trunk-dev, #1608)
+### `[server.tls.acme]` (feature `acme`, 0.6.0, #1608)
 
 Automatic ACME certificate provisioning + renewal; builds on `tls`, off by
 default. Mutually exclusive with static `cert_path` / `key_path`.

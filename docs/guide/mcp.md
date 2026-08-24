@@ -23,7 +23,7 @@ The `mcp` feature builds on the OpenAPI schema machinery, so it implies the
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-web = { version = "0.5", features = ["mcp"] }
+autumn-web = { version = "0.7", features = ["mcp"] }
 ```
 
 ---

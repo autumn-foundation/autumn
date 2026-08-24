@@ -40,7 +40,7 @@ Open `Cargo.toml` and add a `[dev-dependencies]` section:
 [dev-dependencies]
 # autumn-web with test-support enables TestDb (shared Postgres testcontainer).
 # The `db` feature is already active from [dependencies]; test-support adds TestDb.
-autumn-web = { version = "0.4", features = ["test-support"] }
+autumn-web = { version = "0.7", features = ["test-support"] }
 serde_json = "1"
 ```
 

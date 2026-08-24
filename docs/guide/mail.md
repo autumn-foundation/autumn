@@ -4,7 +4,7 @@ Enable the optional mail subsystem when your app needs password resets, signup
 confirmations, or transactional notifications:
 
 ```toml
-autumn-web = { version = "0.5", features = ["mail"] }
+autumn-web = { version = "0.7", features = ["mail"] }
 ```
 
 ## Configuration

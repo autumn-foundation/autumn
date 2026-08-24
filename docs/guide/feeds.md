@@ -32,7 +32,7 @@ pulls in `chrono`:
 
 ```toml
 [dependencies]
-autumn-web = "0.6"
+autumn-web = "0.7"
 chrono = "0.4"
 ```
 
