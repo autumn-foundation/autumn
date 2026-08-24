@@ -66,7 +66,6 @@ use diesel::{Connection, PgConnection, QueryableByName};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
-use serde_json::json;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -77,6 +76,7 @@ const COMMIT_HOOK_UP: &str = include_str!(
 
 const HISTORICAL_ROWS: i64 = 200_000;
 const BACKLOG_ROWS: i64 = 20_000;
+const TOTAL_ROWS: i64 = HISTORICAL_ROWS + BACKLOG_ROWS;
 const MAX_ROWS_PER_DRAIN: usize = 32;
 const DRAIN_TICKS: usize = 10;
 
@@ -90,16 +90,16 @@ fn seed_fixture(conn: &mut PgConnection) {
          (id, handler_key, hook_name, status, attempt, enqueued_at, started_at, finished_at, run_at) \
          SELECT \
            'h_' || gs, \
-           CASE WHEN r < 0.70 THEN 'PgPostRepository' \
-                WHEN r < 0.85 THEN 'PgCommentRepository' \
-                WHEN r < 0.95 THEN 'PgVoteRepository' \
+           CASE WHEN gs % 100 < 70 THEN 'PgPostRepository' \
+                WHEN gs % 100 < 85 THEN 'PgCommentRepository' \
+                WHEN gs % 100 < 95 THEN 'PgVoteRepository' \
                 ELSE 'PgUserRepository' END, \
            'create', 'completed', 1, \
            NOW() - (random() * interval '30 days'), \
            NOW() - (random() * interval '30 days'), \
            NOW() - (random() * interval '30 days'), \
            NOW() - (random() * interval '30 days') \
-         FROM generate_series(1, {HISTORICAL_ROWS}) AS gs, LATERAL (SELECT random() AS r) rr"
+         FROM generate_series(1, {HISTORICAL_ROWS}) AS gs"
     ))
     .expect("seed historical completed hooks");
 
@@ -108,19 +108,63 @@ fn seed_fixture(conn: &mut PgConnection) {
          (id, handler_key, hook_name, status, attempt, enqueued_at, run_at) \
          SELECT \
            'e_' || gs, \
-           CASE WHEN r < 0.70 THEN 'PgPostRepository' \
-                WHEN r < 0.85 THEN 'PgCommentRepository' \
-                WHEN r < 0.95 THEN 'PgVoteRepository' \
+           CASE WHEN gs % 100 < 70 THEN 'PgPostRepository' \
+                WHEN gs % 100 < 85 THEN 'PgCommentRepository' \
+                WHEN gs % 100 < 95 THEN 'PgVoteRepository' \
                 ELSE 'PgUserRepository' END, \
            'create', 'enqueued', 1, \
            NOW() - (random() * interval '2 minutes'), \
            NOW() - (random() * interval '2 minutes') \
-         FROM generate_series(1, {BACKLOG_ROWS}) AS gs, LATERAL (SELECT random() AS r) rr"
+         FROM generate_series(1, {BACKLOG_ROWS}) AS gs"
     ))
     .expect("seed enqueued backlog hooks");
 
     conn.batch_execute("ANALYZE autumn_repository_commit_hooks")
         .expect("analyze");
+}
+
+#[derive(QueryableByName, Debug)]
+struct HandlerKeyCount {
+    #[diesel(sql_type = Text)]
+    handler_key: String,
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+/// Guards the fixture's advertised 70/15/10/5 handler-key skew: a review
+/// caught (chatgpt-codex-connector on PR #2300) that an earlier version of
+/// this seed generated its skew with `random()` inside a `LATERAL` subquery
+/// that did not reference `gs`, so Postgres evaluated it once for the whole
+/// `INSERT` instead of once per row -- every row silently landed in
+/// whichever single bucket that one draw picked, instead of the advertised
+/// skew. The fix (`gs % 100` thresholds, correlated with `gs` directly) is
+/// deterministic, so this asserts the exact split rather than a tolerance.
+fn assert_handler_key_skew(conn: &mut PgConnection) {
+    use diesel::RunQueryDsl;
+    let rows = diesel::sql_query(
+        "SELECT handler_key, COUNT(*) AS n FROM autumn_repository_commit_hooks \
+         GROUP BY handler_key ORDER BY n DESC",
+    )
+    .load::<HandlerKeyCount>(conn)
+    .expect("query handler_key distribution");
+    let total: i64 = TOTAL_ROWS;
+    let expected: [(&str, i64); 4] = [
+        ("PgPostRepository", (total * 70) / 100),
+        ("PgCommentRepository", (total * 15) / 100),
+        ("PgVoteRepository", (total * 10) / 100),
+        ("PgUserRepository", (total * 5) / 100),
+    ];
+    for (handler_key, expected_n) in expected {
+        let actual_n = rows
+            .iter()
+            .find(|row| row.handler_key == handler_key)
+            .unwrap_or_else(|| panic!("{handler_key} must appear in the seeded fixture"))
+            .n;
+        assert_eq!(
+            actual_n, expected_n,
+            "{handler_key} must land exactly on its deterministic gs%100 share"
+        );
+    }
 }
 
 #[derive(QueryableByName, Debug)]
@@ -242,6 +286,7 @@ async fn repository_commit_hooks_claim_ack_profile() {
         .expect("apply real repository-commit-hook queue migration");
 
     seed_fixture(&mut conn);
+    assert_handler_key_skew(&mut conn);
 
     let config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let pool = Pool::builder(config).build().expect("pool");
@@ -370,9 +415,4 @@ async fn repository_commit_hooks_claim_ack_profile() {
         Err(diesel::result::Error::RollbackTransaction)
     })
     .ok();
-
-    // Sanity-check the fixture's shape landed as intended: unused here beyond
-    // documenting what was seeded (referenced so nothing needs updating if
-    // the seed constants change independently of each other).
-    let _ = (HISTORICAL_ROWS, BACKLOG_ROWS, json!({}));
 }
