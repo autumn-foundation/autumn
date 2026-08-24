@@ -98,6 +98,26 @@ fn ttl_millis_for_redis(ttl: std::time::Duration) -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
+/// Escape Redis GLOB pattern metacharacters (`\`, `*`, `?`, `[`) in `s` so it
+/// matches only literally when used inside a `SCAN`/`KEYS` `MATCH` pattern.
+///
+/// `key_prefix` is an operator-supplied config value (`cache.redis.key_prefix`
+/// in `autumn.toml`), not attacker-controlled request input, but an operator
+/// prefix that happens to contain one of these characters (e.g. `tenant:*`)
+/// would otherwise be interpreted as a glob by [`RedisCache::clear`]'s `SCAN
+/// MATCH {prefix}:*`, letting `clear()` match — and delete — keys outside the
+/// namespace the prefix was meant to scope it to.
+fn escape_redis_glob(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '\\' | '*' | '?' | '[') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 /// Whether `url` needs the `rustls` `CryptoProvider` installed to connect —
 /// true only for the two TLS schemes `redis::Client::open` itself
 /// recognizes (`rediss://` and Valkey's `valkeys://`), matched
@@ -289,7 +309,7 @@ impl Cache for RedisCache {
     fn clear(&self) {
         // Use SCAN instead of KEYS to avoid blocking the Redis server on large
         // keyspaces. SCAN is O(1) per call and processes the keyspace in batches.
-        let pattern = format!("{}:*", self.key_prefix);
+        let pattern = format!("{}:*", escape_redis_glob(&self.key_prefix));
         let mut conn = self.manager.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
@@ -471,6 +491,24 @@ mod tests {
         // installed (if nothing else in the process had installed one
         // first) and panic instead of returning a connection error.
         assert!(needs_tls_crypto_provider("valkeys://127.0.0.1:6380/"));
+    }
+
+    #[test]
+    fn escape_redis_glob_leaves_plain_prefixes_unchanged() {
+        assert_eq!(escape_redis_glob("myapp:cache"), "myapp:cache");
+    }
+
+    #[test]
+    fn escape_redis_glob_escapes_scan_match_metacharacters() {
+        // Regression: `clear()` builds a SCAN MATCH pattern as
+        // "{key_prefix}:*". An unescaped operator-supplied prefix containing
+        // a glob metacharacter (e.g. "tenant:*") would let SCAN MATCH match
+        // — and clear() then delete — keys well outside that prefix's
+        // intended namespace.
+        assert_eq!(escape_redis_glob("tenant:*"), r"tenant:\*");
+        assert_eq!(escape_redis_glob("a?b"), r"a\?b");
+        assert_eq!(escape_redis_glob("[ab]"), r"\[ab]");
+        assert_eq!(escape_redis_glob(r"back\slash"), r"back\\slash");
     }
 
     #[test]
