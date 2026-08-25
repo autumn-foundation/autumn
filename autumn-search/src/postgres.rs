@@ -269,6 +269,72 @@ impl PostgresSearchStore {
     /// `watermark`. The single write path behind both
     /// [`SearchBackend::index`] and [`SearchBackend::index_unless_newer`], so
     /// the conditional and unconditional forms cannot drift apart.
+    ///
+    /// Issues ONE statement per CHUNK of the batch (almost always exactly
+    /// one statement total), not one per document.
+    /// [`SearchClient::backfill`](crate::SearchClient::backfill) drives this
+    /// with up to `DEFAULT_BACKFILL_BATCH` (500) documents at a time, so a
+    /// per-document round trip turned a full-table backfill into one DB
+    /// round trip per row — invisible in a buffer ranking (each statement is
+    /// cheap) but dominant in `pg_stat_statements.calls`. `index_name` and
+    /// `language` are the same for every document in one call, so they are
+    /// bound ONCE (`$1`, `$2`) per chunk and referenced by every row, which
+    /// is also what keeps a chunk's statement shape — and so its place in
+    /// diesel's prepared-statement cache — independent of chunk size.
+    ///
+    /// `documents` is a caller-supplied slice on a PUBLIC trait method, not
+    /// something this type controls the shape of — [`SearchDocument::fields`]
+    /// is itself a public, uncapped `Vec` a hand-built document can push
+    /// arbitrarily many (even repeated) entries onto — so four defenses
+    /// apply before any SQL is built:
+    ///
+    /// - **duplicate `record_id`s are deduplicated** — a single statement's
+    ///   `ON CONFLICT DO UPDATE` cannot affect the same conflict target
+    ///   twice (Postgres: "ON CONFLICT DO UPDATE command cannot affect row a
+    ///   second time"), so an un-deduplicated multi-row statement would turn
+    ///   a batch a hand-built caller (or a third-party `DocumentSource`) is
+    ///   entitled to send into a hard error. Which occurrence survives
+    ///   depends on `watermark`, because the OLD per-document loop's
+    ///   observable behavior differed between the two forms:
+    ///     - **unconditional** (`watermark` is `None`): N sequential
+    ///       UPSERTs with no guard, so the LAST occurrence's write is what a
+    ///       later occurrence would overwrite. Deduplicate keeping the LAST.
+    ///     - **watermark-guarded** (`index_unless_newer`): the FIRST
+    ///       occurrence's UPSERT sets `updated_at = NOW()`, which is now
+    ///       newer than `watermark` — so every LATER occurrence's own guard
+    ///       (`WHERE updated_at <= watermark`) fails against that
+    ///       just-written row and silently no-ops. Deduplicate keeping the
+    ///       FIRST, to match.
+    /// - **the batch is split into chunks sized so no single statement can
+    ///   approach Postgres's 65,535 bind-parameter limit**, using each
+    ///   document's ACTUAL bind count (not `definition.fields.len()`, which
+    ///   undercounts a document built with repeated field entries) —
+    ///   however large `BackfillOptions::batch_size`, however many fields
+    ///   `definition` declares, or however a hand-built document's own
+    ///   `fields` was constructed. Each chunk is still its own atomic
+    ///   statement; a batch that needed more than one chunk (never true at
+    ///   the framework's own 500-document default with a realistic field
+    ///   count) is atomic per CHUNK, not across the whole call — a narrower
+    ///   guarantee than the single-chunk case, and disclosed as such rather
+    ///   than silently assumed.
+    /// - **a chunk also caps at `MAX_ROWS_PER_CHUNK` rows**, independent of
+    ///   the parameter budget — a document with few or no weighted fields
+    ///   consumes very few binds, so the param budget alone could still
+    ///   admit thousands of rows into one statement. The watermark-guarded
+    ///   shape joins rows with `UNION ALL`, and a deeply nested chain of
+    ///   those risks Postgres' `max_stack_depth` during parsing even while
+    ///   comfortably under the bind limit.
+    /// - **the deduplicated batch is sorted by `record_id`**, so every
+    ///   writer of overlapping ids locks conflict rows in the SAME order.
+    ///   The old per-document loop held at most one row lock at a time
+    ///   (autocommit per statement); a multi-row statement can hold several
+    ///   at once, so two batches indexing the same ids in different orders
+    ///   could otherwise lock-and-wait on each other in a cycle — a
+    ///   deadlock a per-document loop could never produce. A fixed order
+    ///   across every caller makes that cycle impossible, and changes
+    ///   nothing about the query's result, since each row's own
+    ///   `ON CONFLICT` target is independent of row order.
+    #[allow(clippy::too_many_lines)] // one linear per-row statement builder, clearest unsplit
     async fn write_documents(
         &self,
         definition: &IndexDefinition,
@@ -276,6 +342,22 @@ impl PostgresSearchStore {
         watermark: Option<&str>,
     ) -> SearchResult<()> {
         use std::fmt::Write as _;
+
+        // Leaves comfortable headroom under Postgres' real 65,535
+        // bind-parameter cap for the few shared params (`$1`/`$2`[/`$3`]).
+        const PARAM_BUDGET: usize = 60_000;
+
+        // A SEPARATE cap from `PARAM_BUDGET`: a document with few or no
+        // weighted fields consumes very few binds, so the param budget
+        // alone could still admit thousands of rows into one statement.
+        // The watermarked shape joins rows with `UNION ALL`, and a deeply
+        // nested `SELECT ... UNION ALL ...` chain risks Postgres'
+        // `max_stack_depth` during parsing/planning — a failure mode the
+        // old per-document loop, and the unconditional `VALUES` form (a
+        // flat list, not a nested tree), do not have. Comfortably above
+        // the framework's own 500-document default batch, so it never
+        // engages for realistic use.
+        const MAX_ROWS_PER_CHUNK: usize = 1_000;
 
         checked(definition)?;
         if documents.is_empty() {
@@ -289,106 +371,211 @@ impl PostgresSearchStore {
         // pgvector-mode reader silently ranks on. `None` width means the
         // column is absent and must stay out of the column list entirely.
         let vector_width = self.vector_column_width();
+        let (vec_column, vec_update) = if vector_width.is_some() {
+            (
+                ", embedding_vec",
+                ", embedding_vec = EXCLUDED.embedding_vec",
+            )
+        } else {
+            ("", "")
+        };
 
-        for document in documents {
-            // The weighted tsvector, built exactly as #842 does:
-            // `setweight(to_tsvector(<lang>, <value>), <weight>)` per
-            // field, concatenated.
-            //
-            // The weight letter is interpolated, so it comes from the
-            // VALIDATED definition rather than from the document: a
-            // hand-built document (or a third-party `DocumentSource`) can
-            // carry any `char`. A field the index does not declare is
-            // skipped entirely.
-            //
-            // Bound: $1 index_name, $2 record_id, $3 tenant_id, $4 fields
-            // json, $5 language, $6 content, $7 embedding, ($8 vector),
-            // then one per field value.
+        // See the doc comment above for why the direction depends on
+        // `watermark`.
+        let mut kept_documents = dedupe_by_id(documents, watermark.is_some());
+
+        // Sorted by `record_id` so every writer of overlapping ids —
+        // concurrent callers, or successive backfill batches — locks
+        // conflict rows in the SAME order. The old per-document loop held
+        // at most one row lock at a time (autocommit per statement), so it
+        // could never deadlock on row-lock order; a multi-row statement can
+        // hold several at once, and two batches indexing the same ids in
+        // different orders (e.g. `[1, 2]` and `[2, 1]`) would otherwise be
+        // able to lock-and-wait on each other in a cycle. A fixed
+        // (ascending) order across every caller makes that cycle
+        // impossible. Sorting after dedup, not before, since a stable
+        // canonical order only has to hold across the SURVIVING ids, not
+        // whichever occurrence of a duplicate lost — and this changes
+        // nothing about the QUERY RESULT, since each row's own
+        // `ON CONFLICT` target is independent of row order.
+        kept_documents.sort_unstable_by_key(|document| document.id());
+
+        let mut cursor = 0usize;
+        while cursor < kept_documents.len() {
+            // $1 index_name, $2 language[, $3 watermark] — shared by every row
+            // in this chunk's statement.
             let mut binds = vec![
                 Bound::Text(definition.name.to_owned()),
-                Bound::BigInt(document.id()),
-                Bound::NullableText(document.document.tenant_id.clone()),
-                Bound::Text(fields_json(document)?),
                 Bound::Text(definition.language.to_owned()),
-                Bound::Text(document.document.text()),
-                Bound::NullableText(document.embedding.as_deref().map(array_literal)),
             ];
-            if let Some(width) = vector_width {
-                let literal = match document.embedding.as_deref() {
-                    // A width the column cannot hold would fail the insert,
-                    // and leaving the old value in place is exactly the
-                    // staleness this avoids — so it never reaches SQL.
-                    //
-                    // Whether that is an ERROR depends on which column this
-                    // process is actually reading. In pgvector mode k-NN
-                    // runs off `embedding_vec`, so writing NULL would leave
-                    // the row permanently invisible to semantic search
-                    // while every write reported success — a silent hole,
-                    // and the worst outcome available. Say so instead.
-                    Some(embedding) if embedding.len() != width => {
-                        if self.vector_mode().is_some_and(VectorMode::is_pgvector) {
-                            return Err(SearchError::DimensionMismatch {
-                                expected: width,
-                                actual: embedding.len(),
-                            });
-                        }
-                        // Not in pgvector mode: `embedding_vec` is a
-                        // leftover column from a previous width, k-NN runs
-                        // off the portable `embedding` array (bound above,
-                        // at full width), and NULLing the stale copy is the
-                        // correct repair rather than a loss.
-                        None
-                    }
-                    other => other.map(vector_literal),
-                };
-                binds.push(Bound::NullableText(literal));
-            }
+            let watermark_param = watermark.map(|value| {
+                binds.push(Bound::Text(value.to_owned()));
+                3usize
+            });
+            let mut next_param: usize = if watermark_param.is_some() { 4 } else { 3 };
 
-            let mut vector_sql = String::new();
-            let mut param = binds.len().saturating_add(1);
-            for field in &document.document.fields {
-                let Some(weight) = definition.weight_of(field.name) else {
-                    continue;
-                };
-                if !vector_sql.is_empty() {
-                    vector_sql.push_str(" || ");
+            let mut rows = Vec::new();
+            let mut record_ids = Vec::new();
+
+            while let Some(&document) = kept_documents.get(cursor) {
+                // This document's EXACT bind count: 5 fixed params, +1 for
+                // the vector literal if the column exists, +1 per field
+                // VALUE the document actually carries that `definition`
+                // also declares a weight for — mirrors the loop below
+                // exactly (same predicate, `definition.weight_of`), so a
+                // document with repeated field entries is measured
+                // precisely rather than assumed to carry at most one value
+                // per declared field.
+                let doc_param_count = 5usize
+                    .saturating_add(usize::from(vector_width.is_some()))
+                    .saturating_add(
+                        document
+                            .document
+                            .fields
+                            .iter()
+                            .filter(|field| definition.weight_of(field.name).is_some())
+                            .count(),
+                    );
+                if !rows.is_empty()
+                    && (next_param.saturating_add(doc_param_count) > PARAM_BUDGET
+                        || rows.len() >= MAX_ROWS_PER_CHUNK)
+                {
+                    // Would overflow this chunk's param budget OR row-count
+                    // cap: stop here (without consuming `document` —
+                    // `cursor` is untouched) and let the outer `while` start
+                    // a fresh chunk for it. A chunk with zero rows so far
+                    // always admits at least one document regardless of its
+                    // own size, so a single document pathological enough to
+                    // exceed the budget alone gets exactly the old
+                    // per-document loop's behavior: its own statement,
+                    // which Postgres would equally have rejected before
+                    // this change existed.
+                    break;
                 }
-                // `$5::text::regconfig`, not `$5::regconfig`: the same
-                // parameter is also the `language` column value, and the
-                // untyped form is "inconsistent types deduced for
-                // parameter" under any client that does not declare bind
-                // types.
-                let _ = write!(
-                    vector_sql,
-                    "setweight(to_tsvector($5::text::regconfig, ${param}), '{weight}')"
+                cursor = cursor.saturating_add(1);
+
+                let record_id = document.id();
+                record_ids.push(record_id);
+                let record_id_param = format!("${next_param}");
+                binds.push(Bound::BigInt(record_id));
+                next_param = next_param.saturating_add(1);
+
+                let tenant_param = format!("${next_param}");
+                binds.push(Bound::NullableText(document.document.tenant_id.clone()));
+                next_param = next_param.saturating_add(1);
+
+                let fields_param = format!("${next_param}");
+                binds.push(Bound::Text(fields_json(document)?));
+                next_param = next_param.saturating_add(1);
+
+                let content_param = format!("${next_param}");
+                binds.push(Bound::Text(document.document.text()));
+                next_param = next_param.saturating_add(1);
+
+                let embedding_param = format!("${next_param}");
+                binds.push(Bound::NullableText(
+                    document.embedding.as_deref().map(array_literal),
+                ));
+                next_param = next_param.saturating_add(1);
+
+                let vec_value = if let Some(width) = vector_width {
+                    let literal = match document.embedding.as_deref() {
+                        // A width the column cannot hold would fail the insert,
+                        // and leaving the old value in place is exactly the
+                        // staleness this avoids — so it never reaches SQL.
+                        //
+                        // Whether that is an ERROR depends on which column this
+                        // process is actually reading. In pgvector mode k-NN
+                        // runs off `embedding_vec`, so writing NULL would leave
+                        // the row permanently invisible to semantic search
+                        // while every write reported success — a silent hole,
+                        // and the worst outcome available. Say so instead.
+                        //
+                        // Returning here leaves THIS chunk's statement
+                        // unexecuted — a document earlier in the SAME chunk
+                        // never reaches SQL either, unlike the old per-document
+                        // loop where earlier rows would already be committed.
+                        // A prior CHUNK, if any, has already committed by this
+                        // point (see the doc comment above: atomic per chunk,
+                        // not across the whole call).
+                        Some(embedding) if embedding.len() != width => {
+                            if self.vector_mode().is_some_and(VectorMode::is_pgvector) {
+                                return Err(SearchError::DimensionMismatch {
+                                    expected: width,
+                                    actual: embedding.len(),
+                                });
+                            }
+                            // Not in pgvector mode: `embedding_vec` is a
+                            // leftover column from a previous width, k-NN runs
+                            // off the portable `embedding` array (bound above,
+                            // at full width), and NULLing the stale copy is the
+                            // correct repair rather than a loss.
+                            None
+                        }
+                        other => other.map(vector_literal),
+                    };
+                    let placeholder = format!(", ${next_param}::vector");
+                    binds.push(Bound::NullableText(literal));
+                    next_param = next_param.saturating_add(1);
+                    placeholder
+                } else {
+                    String::new()
+                };
+
+                // The weighted tsvector, built exactly as #842 does:
+                // `setweight(to_tsvector(<lang>, <value>), <weight>)` per
+                // field, concatenated.
+                //
+                // The weight letter is interpolated, so it comes from the
+                // VALIDATED definition rather than from the document: a
+                // hand-built document (or a third-party `DocumentSource`) can
+                // carry any `char`. A field the index does not declare is
+                // skipped entirely.
+                let mut vector_sql = String::new();
+                for field in &document.document.fields {
+                    let Some(weight) = definition.weight_of(field.name) else {
+                        continue;
+                    };
+                    if !vector_sql.is_empty() {
+                        vector_sql.push_str(" || ");
+                    }
+                    // `$2::text::regconfig`, not `$2::regconfig`: the same
+                    // parameter is also the `language` column value, and the
+                    // untyped form is "inconsistent types deduced for
+                    // parameter" under any client that does not declare bind
+                    // types.
+                    let field_value_param = format!("${next_param}");
+                    let _ = write!(
+                        vector_sql,
+                        "setweight(to_tsvector($2::text::regconfig, {field_value_param}), '{weight}')"
+                    );
+                    binds.push(Bound::Text(field.value.clone()));
+                    next_param = next_param.saturating_add(1);
+                }
+                if vector_sql.is_empty() {
+                    "to_tsvector($2::text::regconfig, '')".clone_into(&mut vector_sql);
+                }
+
+                let columns = format!(
+                    "$1, {record_id_param}, {tenant_param}, $2, {fields_param}::jsonb, \
+                 {content_param}, {vector_sql}, {embedding_param}::double precision[]{vec_value}"
                 );
-                binds.push(Bound::Text(field.value.clone()));
-                param = param.saturating_add(1);
-            }
-            if vector_sql.is_empty() {
-                "to_tsvector($5::text::regconfig, '')".clone_into(&mut vector_sql);
+                rows.push(UpsertRow {
+                    columns,
+                    record_id_param,
+                });
             }
 
-            let (vec_column, vec_value, vec_update) = if vector_width.is_some() {
-                (
-                    ", embedding_vec",
-                    ", $8::vector",
-                    ", embedding_vec = EXCLUDED.embedding_vec",
-                )
-            } else {
-                ("", "", "")
-            };
-
-            let sql = upsert_sql(
-                &vector_sql,
-                vec_column,
-                vec_value,
-                vec_update,
-                watermark.map(|_| param),
-            );
-            if let Some(watermark) = watermark {
-                binds.push(Bound::Text(watermark.to_owned()));
+            // Only consulted by `upsert_sql` on the unconditional path (the
+            // ledger clear), but the slot number and the bind must agree either
+            // way, so both are decided here, once, right after the loop that
+            // fixed `next_param`.
+            let ids_param = next_param;
+            if watermark_param.is_none() {
+                binds.push(Bound::Ids(record_ids));
             }
+
+            let sql = upsert_sql(&rows, vec_column, vec_update, ids_param, watermark_param);
 
             bind_all(
                 diesel::sql_query(sql).into_boxed::<autumn_web::RuntimeBackend>(),
@@ -399,9 +586,6 @@ impl PostgresSearchStore {
             .map_err(SearchError::backend)?;
         }
 
-        // The ledger clear is NOT a trailing statement: `upsert_sql` folds it
-        // into each document's own statement, so the write and the tombstone
-        // removal cannot be split by a concurrent delete.
         Ok(())
     }
 
@@ -602,8 +786,66 @@ fn pgvector_order_by(filtered: bool) -> String {
     }
 }
 
-/// The document upsert, optionally guarded by a watermark in parameter slot
-/// `watermark_param`.
+/// References into `documents` keeping only ONE occurrence of each
+/// `record_id` — the FIRST if `keep_first`, else the LAST — in ascending
+/// original-index order.
+///
+/// `documents` is a caller-supplied slice on a PUBLIC trait method
+/// (`SearchBackend::index` / `index_unless_newer`), so nothing guarantees
+/// unique ids — a hand-built batch, or a third-party `DocumentSource`, is
+/// entitled to send the same record twice. A single multi-row statement
+/// cannot tolerate that the way the old per-document loop did (N sequential
+/// UPSERTs), because Postgres rejects `ON CONFLICT DO UPDATE` acting on the
+/// same conflict target twice within one statement — see
+/// [`PostgresSearchStore::write_documents`]'s doc comment for why the
+/// surviving occurrence has to differ between the watermarked and
+/// unconditional forms to match the old loop's observable result.
+fn dedupe_by_id(documents: &[IndexedDocument], keep_first: bool) -> Vec<&IndexedDocument> {
+    let mut index_for_id: std::collections::HashMap<i64, usize> =
+        std::collections::HashMap::with_capacity(documents.len());
+    for (index, document) in documents.iter().enumerate() {
+        if keep_first {
+            index_for_id.entry(document.id()).or_insert(index);
+        } else {
+            index_for_id.insert(document.id(), index);
+        }
+    }
+    let mut kept_indices: Vec<usize> = index_for_id.into_values().collect();
+    kept_indices.sort_unstable();
+    kept_indices
+        .into_iter()
+        .filter_map(|index| documents.get(index))
+        .collect()
+}
+
+/// One row's already-rendered column-value expression list, in the exact
+/// order `upsert_sql`'s INSERT column list declares (`index_name,
+/// record_id, tenant_id, language, fields, content, search_vector,
+/// embedding[, embedding_vec]`) — built by [`PostgresSearchStore::write_documents`],
+/// one per document in the batch.
+///
+/// `record_id_param` is carried alongside `columns` rather than parsed back
+/// out of it, because the watermark guard (below) needs this row's OWN
+/// `record_id` placeholder to restrict the tombstone check to this record,
+/// and every row's placeholder number differs.
+struct UpsertRow {
+    columns: String,
+    record_id_param: String,
+}
+
+/// The document upsert for a whole batch of rows in ONE statement, optionally
+/// guarded by a watermark in parameter slot `watermark_param`. `ids_param`
+/// names the slot bound to the array of every row's `record_id`, consulted
+/// only on the unconditional (ledger-clearing) path below.
+///
+/// One statement rather than one per document: `write_documents` used to
+/// issue this per document, which turned a 500-document backfill batch into
+/// 500 round trips — invisible in a buffer-cost ranking (each statement is
+/// cheap) but dominant in `pg_stat_statements.calls`. Batching costs nothing
+/// in complexity here because every row's SQL is still built exactly as
+/// before (same per-field `setweight`/`to_tsvector` expression, same casts);
+/// this function only decides how the per-row fragments are joined into one
+/// statement.
 ///
 /// The guard goes on **both** arms, and the two failures are different:
 ///
@@ -615,17 +857,17 @@ fn pgvector_order_by(filtered: bool) -> String {
 ///   because, once the document is gone, it is the only evidence the insert
 ///   path has that anything happened.
 ///
-/// `INSERT ... SELECT ... WHERE` rather than `VALUES` when guarding, because
-/// `VALUES` admits no predicate and the delete guard would have nowhere to
-/// attach. `ON CONFLICT` applies to the `SELECT` form just the same.
-///
-/// Both guards reference the SAME parameter slot rather than binding the
-/// watermark twice.
+/// `INSERT ... SELECT ... UNION ALL SELECT ...` rather than a multi-row
+/// `VALUES` when guarding, because `VALUES` admits no predicate and the
+/// delete guard would have nowhere to attach. `ON CONFLICT` applies to the
+/// unioned `SELECT` form just the same, and each arm can carry its own
+/// `record_id` while all still sharing parameter slot `watermark_param` for
+/// the watermark itself — bound once, not once per row.
 fn upsert_sql(
-    vector_sql: &str,
+    rows: &[UpsertRow],
     vec_column: &str,
-    vec_value: &str,
     vec_update: &str,
+    ids_param: usize,
     watermark_param: Option<usize>,
 ) -> String {
     let (guard, values_source) = watermark_param.map_or_else(
@@ -633,21 +875,29 @@ fn upsert_sql(
             (
                 String::new(),
                 format!(
-                    "VALUES ($1, $2, $3, $5, $4::jsonb, $6, {vector_sql}, \
-                         $7::double precision[]{vec_value})"
+                    "VALUES {}",
+                    rows.iter()
+                        .map(|row| format!("({})", row.columns))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             )
         },
         |slot| {
             (
                 format!(" WHERE {DOCUMENTS_TABLE}.updated_at <= ${slot}::timestamptz"),
-                format!(
-                    "SELECT $1, $2, $3, $5, $4::jsonb, $6, {vector_sql}, \
-                            $7::double precision[]{vec_value} \
-                     WHERE NOT EXISTS (SELECT 1 FROM {DELETES_TABLE} d \
-                       WHERE d.index_name = $1 AND d.record_id = $2 \
-                         AND d.deleted_at > ${slot}::timestamptz)"
-                ),
+                rows.iter()
+                    .map(|row| {
+                        format!(
+                            "SELECT {} \
+                             WHERE NOT EXISTS (SELECT 1 FROM {DELETES_TABLE} d \
+                               WHERE d.index_name = $1 AND d.record_id = {} \
+                                 AND d.deleted_at > ${slot}::timestamptz)",
+                            row.columns, row.record_id_param
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" UNION ALL "),
             )
         },
     );
@@ -690,7 +940,7 @@ fn upsert_sql(
         "WITH upserted AS ( \
            {upsert} \
          ) \
-         DELETE FROM {DELETES_TABLE} WHERE index_name = $1 AND record_id = $2"
+         DELETE FROM {DELETES_TABLE} WHERE index_name = $1 AND record_id = ANY(${ids_param})"
     )
 }
 
@@ -873,11 +1123,29 @@ impl SearchBackend for PostgresSearchStore {
             //
             // `deleted_at` is refreshed on a replayed delete so a retry cannot
             // age out earlier than the delete it repeats.
+            //
+            // `doomed` locks its rows in ascending `record_id` order —
+            // matching `write_documents`' and `clear`'s own order — via
+            // `ORDER BY` + `FOR UPDATE` in a `SELECT`, the only thing that
+            // actually controls Postgres' row-lock acquisition order.
+            // Binding a pre-sorted array to `record_id = ANY($2)` does NOT:
+            // Postgres is free to satisfy that predicate with a sequential,
+            // bitmap, or index scan and locks rows in whatever order that
+            // scan visits them, independent of the array's own order — a
+            // bare `DELETE ... WHERE record_id = ANY($2)` could still lock
+            // its rows out of order and lock-and-wait against a concurrent
+            // `write_documents` batch.
             bind_all(
                 diesel::sql_query(format!(
-                    "WITH removed AS ( \
+                    "WITH doomed AS ( \
+                       SELECT record_id FROM {DOCUMENTS_TABLE} \
+                       WHERE index_name = $1 AND record_id = ANY($2) \
+                       ORDER BY record_id \
+                       FOR UPDATE \
+                     ), \
+                     removed AS ( \
                        DELETE FROM {DOCUMENTS_TABLE} \
-                        WHERE index_name = $1 AND record_id = ANY($2) \
+                       WHERE index_name = $1 AND record_id IN (SELECT record_id FROM doomed) \
                      ) \
                      INSERT INTO {DELETES_TABLE} (index_name, record_id) \
                      SELECT $1, unnest($2::bigint[]) \
@@ -905,9 +1173,25 @@ impl SearchBackend for PostgresSearchStore {
             // concurrent write must not be able to observe half of it. The
             // ledger has to go too, or the rebuild that follows would silently
             // skip everything previously deleted.
+            //
+            // `doomed` locks its rows in ascending `record_id` order (`FOR
+            // UPDATE` on a sorted `SELECT` acquires locks in the order rows
+            // are produced), matching `write_documents`' and `delete`'s own
+            // ascending order — a bare `DELETE ... WHERE index_name = $1`
+            // would instead lock whatever rows its scan happens to visit
+            // (physical heap order for a sequential scan), which a
+            // concurrent `write_documents` batch touching the SAME rows in
+            // ascending order could deadlock against.
             diesel::sql_query(format!(
-                "WITH removed AS ( \
-                   DELETE FROM {DOCUMENTS_TABLE} WHERE index_name = $1 \
+                "WITH doomed AS ( \
+                   SELECT record_id FROM {DOCUMENTS_TABLE} \
+                   WHERE index_name = $1 \
+                   ORDER BY record_id \
+                   FOR UPDATE \
+                 ), \
+                 removed AS ( \
+                   DELETE FROM {DOCUMENTS_TABLE} \
+                   WHERE index_name = $1 AND record_id IN (SELECT record_id FROM doomed) \
                  ) \
                  DELETE FROM {DELETES_TABLE} WHERE index_name = $1"
             ))
@@ -1631,6 +1915,186 @@ mod tests {
         IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
     }
 
+    fn doc(id: i64) -> IndexedDocument {
+        IndexedDocument::new(autumn_web::search::SearchDocument::new("articles", id))
+    }
+
+    #[test]
+    fn unconditional_dedup_keeps_the_last_occurrence() {
+        // The unconditional (`index`) form ran N sequential UPSERTs with no
+        // guard, so a later occurrence's write is what actually persists —
+        // keep the LAST, to match.
+        let documents = vec![doc(1), doc(2), doc(1), doc(3), doc(2)];
+        let kept: Vec<i64> = dedupe_by_id(&documents, false)
+            .into_iter()
+            .map(IndexedDocument::id)
+            .collect();
+        // documents[2] (id=1) and documents[4] (id=2) are the LAST
+        // occurrences of their ids; documents[3] (id=3) is unique.
+        // Ascending original-index order: 1, 3, 2.
+        assert_eq!(kept, vec![1, 3, 2], "{kept:?}");
+    }
+
+    #[test]
+    fn watermark_guarded_dedup_keeps_the_first_occurrence() {
+        // The old per-document loop's FIRST occurrence sets
+        // `updated_at = NOW()`, which is newer than `watermark` — so every
+        // LATER occurrence's own `WHERE updated_at <= watermark` guard fails
+        // against that just-written row and silently no-ops. Keep the
+        // FIRST, to match.
+        let documents = vec![doc(1), doc(2), doc(1), doc(3), doc(2)];
+        let kept: Vec<i64> = dedupe_by_id(&documents, true)
+            .into_iter()
+            .map(IndexedDocument::id)
+            .collect();
+        // documents[0] (id=1) and documents[1] (id=2) are the FIRST
+        // occurrences of their ids; documents[3] (id=3) is unique.
+        // Ascending original-index order: 1, 2, 3.
+        assert_eq!(kept, vec![1, 2, 3], "{kept:?}");
+    }
+
+    #[test]
+    fn no_duplicates_keeps_every_index_in_order_either_direction() {
+        let documents = vec![doc(10), doc(20), doc(30)];
+        for keep_first in [true, false] {
+            let kept: Vec<i64> = dedupe_by_id(&documents, keep_first)
+                .into_iter()
+                .map(IndexedDocument::id)
+                .collect();
+            assert_eq!(kept, vec![10, 20, 30], "keep_first={keep_first}");
+        }
+    }
+
+    #[test]
+    fn deduplicated_documents_sort_by_record_id_regardless_of_input_order() {
+        // The mechanism write_documents relies on to prevent a cross-batch
+        // deadlock: two callers indexing the same ids in different orders
+        // (e.g. `[1, 2]` and `[2, 1]`) must both end up locking conflict
+        // rows in the SAME order, or they can lock-and-wait on each other.
+        // A canonical (ascending) order across every caller is what makes
+        // that impossible — verified here for both dedup directions and
+        // several input orderings.
+        for keep_first in [true, false] {
+            for documents in [
+                vec![doc(2), doc(1), doc(3)],
+                vec![doc(3), doc(1), doc(2)],
+                vec![doc(1), doc(3), doc(2)],
+            ] {
+                let mut kept: Vec<&IndexedDocument> = dedupe_by_id(&documents, keep_first);
+                kept.sort_unstable_by_key(|document| document.id());
+                let ids: Vec<i64> = kept.into_iter().map(IndexedDocument::id).collect();
+                assert_eq!(
+                    ids,
+                    vec![1, 2, 3],
+                    "keep_first={keep_first} input={documents:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn greedy_chunking_never_lets_a_statement_approach_the_bind_limit_even_with_repeated_fields() {
+        // Mirrors write_documents' own greedy accounting: `SearchDocument::fields`
+        // is a public, uncapped `Vec` — a hand-built document can carry the
+        // SAME declared field many times over, each contributing its own
+        // bind. A per-document estimate based on `definition.fields.len()`
+        // (one declared field, one possible value) would undercount this;
+        // the real code counts each document's ACTUAL matching-field
+        // entries instead. Reproduces the reported case: many documents
+        // each carrying far more copies of one field than the index
+        // declares.
+        const PARAM_BUDGET: usize = 60_000;
+        let weight_of = |name: &str| if name == "title" { Some('A') } else { None };
+
+        // 800 documents, each with the SAME declared field repeated 90
+        // times: 5 fixed + 90 = 95 binds/document, 800 * 95 = 76,000 total —
+        // over PARAM_BUDGET, so this MUST split into more than one chunk.
+        let mut documents = Vec::new();
+        for id in 0..800i64 {
+            let mut document = autumn_web::search::SearchDocument::new("articles", id);
+            for _ in 0..90 {
+                document = document.with_field("title", 'A', "x");
+            }
+            documents.push(IndexedDocument::new(document));
+        }
+
+        let mut chunks: Vec<usize> = Vec::new();
+        let mut next_param = 3usize; // $1 index_name, $2 language (no watermark)
+        let mut chunk_len = 0usize;
+        for document in &documents {
+            let doc_param_count = 5usize.saturating_add(
+                document
+                    .document
+                    .fields
+                    .iter()
+                    .filter(|field| weight_of(field.name).is_some())
+                    .count(),
+            );
+            if chunk_len > 0 && next_param.saturating_add(doc_param_count) > PARAM_BUDGET {
+                chunks.push(next_param);
+                next_param = 3;
+                chunk_len = 0;
+            }
+            next_param = next_param.saturating_add(doc_param_count);
+            chunk_len = chunk_len.saturating_add(1);
+        }
+        chunks.push(next_param);
+
+        assert!(
+            chunks.len() > 1,
+            "the fixture must force more than one chunk: {chunks:?}"
+        );
+        for &total in &chunks {
+            assert!(
+                total < 65_535,
+                "a chunk's total bind count {total} must stay under Postgres' bind limit: \
+                 {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_count_cap_bounds_chunk_size_even_when_the_param_budget_never_would() {
+        // A document with NO weighted fields binds only 5 params — the
+        // param budget alone would admit 60_000 / 5 = 12,000 rows into one
+        // chunk. The watermark-guarded shape joins rows with `UNION ALL`,
+        // and a chain that deep risks Postgres' `max_stack_depth` during
+        // parsing even while comfortably under the bind limit — so a
+        // SEPARATE row-count cap has to apply regardless of how cheap each
+        // row's params are.
+        const PARAM_BUDGET: usize = 60_000;
+        const MAX_ROWS_PER_CHUNK: usize = 1_000;
+        let doc_param_count = 5usize; // no weighted fields on any document
+
+        let mut chunks: Vec<usize> = Vec::new();
+        let mut next_param = 3usize;
+        let mut chunk_len = 0usize;
+        for _ in 0..5_000 {
+            if chunk_len > 0
+                && (next_param.saturating_add(doc_param_count) > PARAM_BUDGET
+                    || chunk_len >= MAX_ROWS_PER_CHUNK)
+            {
+                chunks.push(chunk_len);
+                next_param = 3;
+                chunk_len = 0;
+            }
+            next_param = next_param.saturating_add(doc_param_count);
+            chunk_len = chunk_len.saturating_add(1);
+        }
+        chunks.push(chunk_len);
+
+        assert!(
+            chunks.len() > 1,
+            "5,000 minimal-field documents must still split into more than one chunk: {chunks:?}"
+        );
+        for &len in &chunks {
+            assert!(
+                len <= MAX_ROWS_PER_CHUNK,
+                "a chunk of {len} rows must never exceed MAX_ROWS_PER_CHUNK: {chunks:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_filtered_vector_query_does_not_let_ivfflat_decide_what_is_visible() {
         // Unfiltered: order by DISTANCE so ivfflat can serve it. That form is
@@ -1660,7 +2124,13 @@ mod tests {
         // stays absent — leaving a backfill able to see neither and resurrect
         // the record. One statement admits only the two consistent
         // serializations.
-        let sql = upsert_sql("to_tsvector('simple', '')", "", "", "", None);
+        let row = || UpsertRow {
+            columns: "$1, $4, $5, $2, $6::jsonb, $7, to_tsvector('simple', ''), \
+                      $8::double precision[]"
+                .to_owned(),
+            record_id_param: "$4".to_owned(),
+        };
+        let sql = upsert_sql(&[row()], "", "", 9, None);
         assert!(
             sql.starts_with("WITH upserted AS ("),
             "the upsert and the tombstone clear must be one statement: {sql}"
@@ -1669,11 +2139,12 @@ mod tests {
             sql.contains(&format!("DELETE FROM {DELETES_TABLE}")),
             "{sql}"
         );
+        assert!(sql.contains("record_id = ANY($9)"), "{sql}");
 
         // A watermarked (backfill) write leaves the ledger alone — its batch is
         // older than any tombstone by construction. Clearing it there would
         // undo the very delete the guard is protecting.
-        let guarded = upsert_sql("to_tsvector('simple', '')", "", "", "", Some(9));
+        let guarded = upsert_sql(&[row()], "", "", 9, Some(3));
         assert!(
             !guarded.contains(&format!("DELETE FROM {DELETES_TABLE}")),
             "a backfill write must never clear a tombstone: {guarded}"
@@ -1682,6 +2153,21 @@ mod tests {
             guarded.contains(&format!("SELECT 1 FROM {DELETES_TABLE}")),
             "but it must still be blocked by one: {guarded}"
         );
+
+        // Two rows, guarded: joined by UNION ALL, each with its own
+        // `record_id` in its own tombstone check, sharing the SAME watermark
+        // slot rather than binding it twice.
+        let second = UpsertRow {
+            columns: "$1, $9, $10, $2, $11::jsonb, $12, to_tsvector('simple', ''), \
+                      $13::double precision[]"
+                .to_owned(),
+            record_id_param: "$9".to_owned(),
+        };
+        let multi = upsert_sql(&[row(), second], "", "", 99, Some(3));
+        assert_eq!(multi.matches(" UNION ALL ").count(), 1, "{multi}");
+        assert_eq!(multi.matches("$3::timestamptz").count(), 3, "{multi}");
+        assert!(multi.contains("record_id = $4"), "{multi}");
+        assert!(multi.contains("record_id = $9"), "{multi}");
     }
 
     #[test]
