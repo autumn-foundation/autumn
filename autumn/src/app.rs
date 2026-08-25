@@ -2838,6 +2838,18 @@ impl AppBuilder {
     /// with an already-deployed app, verify manually before rolling out
     /// (e.g. confirm the plugin's expected tables don't already exist under
     /// a different name) rather than relying on this to resolve it for you.
+    ///
+    /// A second, narrower residual gap: `autumn migrate status` / `autumn
+    /// migrate down` (the CLI's user-migration status and rollback commands)
+    /// resolve applied versions against the app's own `migrations/`
+    /// directory only — they have no visibility into which plugins were
+    /// registered at runtime. If your own app's migration is the one that
+    /// loses a collision and gets tracked under a substitute version, those
+    /// two commands cannot currently resolve or revert it by name; reverting
+    /// it needs manual intervention (inspect
+    /// `__diesel_schema_migrations` directly). A plugin's own migrations are
+    /// unaffected, since the CLI's user-rollback commands never touch them
+    /// either way.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn plugin_migrations(

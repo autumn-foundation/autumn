@@ -827,7 +827,13 @@ where
 /// visible. This ordering is a pure function of the colliding migrations'
 /// own names — **not** of `named_sets`' order — so reordering
 /// `.migrations()`/`.plugin_migrations()` calls, or adding a new plugin,
-/// never flips which one already-settled collisions resolve to. A version
+/// never flips which one already-settled collisions resolve to; this
+/// includes the source name a duplicate's substitute is hashed from, which is
+/// the lexicographically-first name among every source that folded that
+/// duplicate in, not whichever happened to register it first. Every
+/// generated substitute is also checked against every RAW version already in
+/// use (not just other substitutes), so it can never coincide with an
+/// unrelated migration's own plain version. A version
 /// reused under the exact SAME full name (e.g. a shard-required set folded
 /// verbatim into the full framework bundle too) is the intentional,
 /// harmless case and is left untouched — only genuinely different
@@ -850,27 +856,38 @@ where
 pub(crate) fn compute_migration_disambiguation(
     named_sets: &[(&str, EmbeddedMigrations)],
 ) -> HashMap<String, String> {
-    // version -> distinct (full_name, first-seen source_name) pairs. Only
-    // the DISTINCT full names matter for collision detection: the same
-    // migration folded into two bundles (the intentional, harmless case)
-    // contributes one entry, not two.
-    let mut by_version: std::collections::BTreeMap<String, Vec<(String, &str)>> =
-        std::collections::BTreeMap::new();
+    // version -> distinct (full_name, ALL source names that registered it)
+    // pairs. Only the DISTINCT full names matter for collision detection: the
+    // same migration folded into two bundles (the intentional, harmless
+    // case) contributes one entry, not two — but every source name that
+    // registered it is tracked (not just the first-seen one) so the
+    // substitute hash below can be derived independently of registration
+    // order.
+    let mut by_version: std::collections::BTreeMap<
+        String,
+        Vec<(String, std::collections::BTreeSet<&str>)>,
+    > = std::collections::BTreeMap::new();
     for (source_name, set) in named_sets {
         let Ok(pairs) = migration_versions_and_names::<Pg>(set) else {
             continue;
         };
         for (version, full_name) in pairs {
             let entries = by_version.entry(version).or_default();
-            if !entries.iter().any(|(name, _)| *name == full_name) {
-                entries.push((full_name, *source_name));
+            if let Some((_, sources)) = entries.iter_mut().find(|(name, _)| *name == full_name) {
+                sources.insert(*source_name);
+            } else {
+                entries.push((full_name, std::collections::BTreeSet::from([*source_name])));
             }
         }
     }
 
     let mut disambiguated = HashMap::new();
+    // Seed with every RAW version already claimed by some registered
+    // migration, not just substitutes handed out so far — otherwise a
+    // generated substitute could coincide with an unrelated migration's own
+    // plain version and the two would still share one Diesel tracking key.
     let mut substitutes_in_use: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+        by_version.keys().cloned().collect();
     for (version, mut entries) in by_version {
         if entries.len() <= 1 {
             continue; // 0 or 1 distinct migration claims this version -- no collision.
@@ -885,7 +902,19 @@ pub(crate) fn compute_migration_disambiguation(
         // colliding migration is mapped to a substitute below.
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         let kept_name = entries[0].0.clone();
-        for (full_name, source_name) in entries.into_iter().skip(1) {
+        for (full_name, source_names) in entries.into_iter().skip(1) {
+            // Canonical source identity for the substitute hash: the
+            // lexicographically-first name among every source that
+            // registered this exact full name (the same migration folded
+            // into more than one bundle), independent of which one happened
+            // to be registered first. Otherwise, reordering two
+            // otherwise-equivalent registration calls would change the
+            // generated substitute for an already-applied migration.
+            let source_name = source_names
+                .iter()
+                .next()
+                .copied()
+                .unwrap_or(full_name.as_str());
             let mut tie_breaker = 1u32;
             let mut substitute = bounded_substitute_version(&version, source_name, tie_breaker);
             while substitutes_in_use.contains(&substitute) {
@@ -3109,6 +3138,86 @@ mod tests {
             substitute.len() <= 50,
             "must fit __diesel_schema_migrations.version (VARCHAR(50)): {substitute}"
         );
+    }
+
+    #[test]
+    fn duplicate_migrations_substitute_hash_is_independent_of_registration_order() {
+        // A migration folded into two bundles under different source names
+        // (the intentional, harmless "same set registered twice" case) that
+        // ALSO collides at its version with a third, differently-named
+        // migration: the duplicate is the one that must be substituted
+        // ("20260101000000_a_third_migration" < "20260101000000_create_gizmos"
+        // lexicographically). The canonical source name driving the
+        // substitute hash must be the lexicographically-first of the
+        // duplicate's two registered names, regardless of which order those
+        // two registrations happen to run in.
+        const DUP: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        const OTHER: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision_2");
+
+        let order_a = compute_migration_disambiguation(&[
+            ("other", OTHER),
+            ("zzz-plugin", DUP),
+            ("aaa-plugin", DUP),
+        ]);
+        let order_b = compute_migration_disambiguation(&[
+            ("other", OTHER),
+            ("aaa-plugin", DUP),
+            ("zzz-plugin", DUP),
+        ]);
+
+        let substitute_a = order_a
+            .get("20260101000000_create_gizmos")
+            .expect("the duplicate must be disambiguated in registration order A");
+        let substitute_b = order_b
+            .get("20260101000000_create_gizmos")
+            .expect("the duplicate must be disambiguated in registration order B");
+        assert_eq!(
+            substitute_a, substitute_b,
+            "the substitute must not depend on which of the duplicate's two \
+             registrations happened to run first"
+        );
+        assert_eq!(
+            substitute_a,
+            &bounded_substitute_version("20260101000000", "aaa-plugin", 1),
+            "the canonical source name is the lexicographically-first of the \
+             duplicate's registered names ('aaa-plugin'), not whichever ran first"
+        );
+    }
+
+    #[test]
+    fn substitute_never_collides_with_an_unrelated_raw_version() {
+        // If a generated substitute happened to equal some OTHER, unrelated
+        // migration's own plain version, the two would share one Diesel
+        // tracking key -- exactly the bug this guard exists to prevent.
+        // Regression-guard the underlying invariant directly: no output
+        // substitute may equal any INPUT raw version.
+        const APP: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        const COLLIDING: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision");
+        let raw_versions: std::collections::HashSet<String> =
+            migration_versions_and_names::<Pg>(&APP)
+                .unwrap()
+                .into_iter()
+                .map(|(v, _)| v)
+                .chain(
+                    migration_versions_and_names::<Pg>(&COLLIDING)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(v, _)| v),
+                )
+                .collect();
+
+        let disambiguated =
+            compute_migration_disambiguation(&[("app", APP), ("test-plugin", COLLIDING)]);
+        for substitute in disambiguated.values() {
+            assert!(
+                !raw_versions.contains(substitute),
+                "substitute {substitute:?} must never coincide with an unrelated migration's own raw version"
+            );
+        }
     }
 
     #[test]
