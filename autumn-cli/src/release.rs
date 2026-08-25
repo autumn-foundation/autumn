@@ -2285,6 +2285,36 @@ previous_secrets = []
     }
 
     #[test]
+    fn azure_container_apps_defaults_to_zero_replicas_for_bootstrap_safety() {
+        // The initial Terraform-managed app revision uses a public placeholder image
+        // solely because Container Apps requires an image before the user's ACR has
+        // one. Keep it scaled to zero by default so that placeholder is not started
+        // with production secret refs or the app's Key Vault-capable identity.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        let min_replicas_block = variables_tf
+            .split("variable \"min_replicas\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("variables.tf must declare min_replicas");
+        assert!(
+            min_replicas_block.contains("default     = 0")
+                || min_replicas_block.contains("default = 0"),
+            "min_replicas must default to 0 so the public bootstrap image is not run \
+             with production secrets before the first real deploy: {variables_tf}"
+        );
+
+        let tfvars = fs::read_to_string(dir.join("terraform.tfvars.example")).unwrap();
+        assert!(
+            tfvars.contains("min_replicas        = 0") || tfvars.contains("min_replicas = 0"),
+            "terraform.tfvars.example must preserve the safe bootstrap default: {tfvars}"
+        );
+    }
+
+    #[test]
     fn variables_tf_marks_secret_inputs_sensitive_with_no_default() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
