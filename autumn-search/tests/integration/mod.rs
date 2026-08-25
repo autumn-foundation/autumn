@@ -9,6 +9,7 @@ mod memory_backend;
 mod plugin_runtime;
 mod plugin_wiring;
 mod postgres_backend;
+mod postgres_write_documents_batch_profile;
 mod reindex;
 mod search_client;
 mod sync_hooks;
