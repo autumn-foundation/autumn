@@ -3,7 +3,7 @@
 //! `checkbox_input`, `date_input`) on the same 12-field realistic workload as
 //! the committed `autumn/benches/form_render.rs` profiling harness (title,
 //! slug, password, summary, body, price, quantity, rating, published,
-//! published_at, sku, notes — two fields, title and price, carrying
+//! `published_at`, sku, notes — two fields, title and price, carrying
 //! validation errors, matching a re-rendered failed submission).
 //!
 //! Its own binary for the same `allocation-counter` global-allocator reason
