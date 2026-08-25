@@ -2764,11 +2764,110 @@ impl AppBuilder {
     ///         .await;
     /// }
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics immediately — before `.run()` even starts — if `migrations`
+    /// reuses a version already claimed by a **different** migration in a
+    /// previously registered set (the framework's, if registered; a
+    /// plugin's, via [`Self::plugin_migrations`]; or an earlier call to this
+    /// same method). See [`Self::plugin_migrations`]'s docs for why this
+    /// check exists.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn migrations(mut self, migrations: migrate::EmbeddedMigrations) -> Self {
-        self.migrations.push(migrations);
+        self.register_migrations("app", migrations);
         self
+    }
+
+    /// Register embedded Diesel migrations owned by a plugin or other
+    /// third-party integration, distinct from the app's own
+    /// [`Self::migrations`].
+    ///
+    /// Functionally identical to [`Self::migrations`] — the set is applied at
+    /// the same startup / one-shot points, subject to the same dev/prod
+    /// auto-apply policy — but `name` (e.g. `"autumn-admin-plugin"`) is used
+    /// to name this source if a version collision is detected, rather than
+    /// only the generic "app" label [`Self::migrations`] uses.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// autumn_web::app()
+    ///     .plugin_migrations("autumn-admin-plugin", autumn_admin_plugin::MIGRATIONS)
+    ///     .migrations(MIGRATIONS)
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics immediately — before `.run()` even starts — if `migrations`
+    /// reuses a version already claimed by a **different** migration in a
+    /// previously registered set. Diesel's `__diesel_schema_migrations`
+    /// table is keyed by **version alone** — it has no notion of which
+    /// registered source (the framework, a plugin, the app's own
+    /// `migrations/`) recorded a version. Nothing coordinates timestamps
+    /// across a plugin, the framework, and an app, so two independently
+    /// authored migrations reusing the same version by coincidence would
+    /// otherwise apply silently wrong: whichever set's apply runs first
+    /// "wins" the version, and every other set's same-versioned migration is
+    /// skipped forever as "already applied" even though its `up.sql` never
+    /// actually ran. Failing fast, by name, at registration time is far
+    /// cheaper than debugging a production schema that silently forked from
+    /// what a fresh build would produce. A version reused under the exact
+    /// same full migration name (e.g. a shard-required set folded verbatim
+    /// into another bundle too) is the intentional, harmless case and never
+    /// panics.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn plugin_migrations(
+        mut self,
+        name: &'static str,
+        migrations: migrate::EmbeddedMigrations,
+    ) -> Self {
+        self.register_migrations(name, migrations);
+        self
+    }
+
+    /// Shared implementation of [`Self::migrations`] and
+    /// [`Self::plugin_migrations`]: enumerate every migration already
+    /// registered (`self.migrations`, in call order), fail fast on a version
+    /// collision against `migrations` (see the panic docs above for why),
+    /// then register it.
+    ///
+    /// The check is pure and DB-free — it enumerates each `EmbeddedMigrations`
+    /// set's own version/name metadata (parsed from migration directory
+    /// names, not any database round-trip), so it runs at plain synchronous
+    /// app-wiring time, long before `.run()` opens any connection.
+    #[cfg(feature = "db")]
+    fn register_migrations(&mut self, name: &'static str, migrations: migrate::EmbeddedMigrations) {
+        let mut prior_by_version: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for existing in &self.migrations {
+            if let Ok(pairs) = migrate::migration_versions_and_names::<diesel::pg::Pg>(existing) {
+                for (version, full_name) in pairs {
+                    prior_by_version.entry(version).or_insert(full_name);
+                }
+            }
+        }
+        let new_pairs = migrate::migration_versions_and_names::<diesel::pg::Pg>(&migrations)
+            .unwrap_or_else(|e| {
+                panic!("failed to enumerate migrations registered via `{name}`: {e}")
+            });
+        if let Some((version, new_name, prior_name)) =
+            migrate::find_migration_version_collision(&prior_by_version, &new_pairs)
+        {
+            panic!(
+                "migration version {version} is claimed by two different migrations: `{new_name}` \
+                 (registered via `{name}`) and `{prior_name}` (already registered earlier). \
+                 Diesel's __diesel_schema_migrations table is keyed by version alone, so applying \
+                 both would silently skip whichever set runs second — forever — as \"already \
+                 applied\", even though its up.sql never actually ran. Rename one migration's \
+                 version (the timestamp prefix on its directory) so the two no longer collide."
+            );
+        }
+        self.migrations.push(migrations);
     }
 
     /// Embed the app's `static/` tree into the binary for single-binary deploys.
@@ -12319,6 +12418,64 @@ mod tests {
             "shards must receive the version-history migration even when the full \
              control framework set is also registered: {shard_names:?}"
         );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn plugin_migrations_registers_alongside_app_migrations() {
+        const APP_MIGRATIONS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        const PLUGIN_MIGRATIONS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+
+        let builder = app()
+            .migrations(APP_MIGRATIONS)
+            .plugin_migrations("test-plugin", PLUGIN_MIGRATIONS);
+
+        let names = migration_names(&builder.migrations);
+        assert!(
+            names.iter().any(|n| n == "00000000000000_create_todos"),
+            "app-registered migrations must still be applied: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "20260101000000_create_gizmos"),
+            "plugin-registered migrations must be applied too: {names:?}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    #[should_panic(expected = "is claimed by two different migrations")]
+    fn plugin_migrations_panics_on_version_collision_with_app_migrations() {
+        // Real-world shape this guards against: an app's own first migration
+        // and a plugin's migration coincidentally both using the same
+        // placeholder version (`00000000000000`) but with different content.
+        // Diesel's __diesel_schema_migrations is keyed by version alone, so
+        // without this check the plugin's `create_gadgets` would silently
+        // never run once the app's `create_todos` claimed that version first.
+        const APP_MIGRATIONS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        const COLLIDING_PLUGIN_MIGRATIONS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision");
+
+        let _ = app()
+            .migrations(APP_MIGRATIONS)
+            .plugin_migrations("test-plugin", COLLIDING_PLUGIN_MIGRATIONS);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn plugin_migrations_does_not_panic_on_identical_resubmission() {
+        // Registering the exact same set twice (e.g. two plugins that both
+        // depend on a shared migrations bundle) reuses the same versions
+        // AND full names — the intentional, harmless duplication case, not a
+        // collision.
+        const PLUGIN_MIGRATIONS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+
+        let _ = app()
+            .plugin_migrations("plugin-a", PLUGIN_MIGRATIONS)
+            .plugin_migrations("plugin-b", PLUGIN_MIGRATIONS);
     }
 
     #[cfg(feature = "db")]

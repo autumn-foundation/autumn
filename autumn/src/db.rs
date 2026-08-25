@@ -5929,9 +5929,15 @@ fn migration_connection_needs_rustls(database_url: &str) -> bool {
 
 /// Establish a [`MigrationConnection`] for `database_url`.
 ///
-/// **Never call from an async executor thread**: the rustls arm `block_on`s
-/// connection setup. Sync contexts (the CLI) and `spawn_blocking` tasks (the
-/// startup migration path) are both fine.
+/// Safe to call from **any** context — a plain sync context (the CLI), a
+/// `spawn_blocking` task (the startup migration path), or directly from
+/// inside an `async fn`/`.on_startup(|state| async move { ... })` body (an
+/// app's own migration hook: TLS-enabled migrations
+/// panicked in production — where `sslmode=require`/`verify-full` routes
+/// through the rustls arm below — while working fine in dev, where TLS is
+/// typically off and this whole arm is skipped). See the rustls arm's
+/// comment for why calling from within the ambient runtime's own worker
+/// threads no longer panics.
 ///
 /// # Errors
 ///
@@ -5950,8 +5956,8 @@ pub(crate) fn establish_migration_connection(
     let posture = tls::TlsPosture::from_database_url(database_url);
     // The driver task tokio::spawn()ed during establish must stay driven for
     // the connection's lifetime: reuse the ambient runtime when there is one
-    // (spawn_blocking context), otherwise create one and keep it alive
-    // alongside the connection.
+    // (spawn_blocking context, or a plain async caller — see below),
+    // otherwise create one and keep it alive alongside the connection.
     let (runtime, handle) = if let Ok(handle) = tokio::runtime::Handle::try_current() {
         (None, handle)
     } else {
@@ -5967,7 +5973,30 @@ pub(crate) fn establish_migration_connection(
         let handle = runtime.handle().clone();
         (Some(runtime), handle)
     };
-    let inner = handle.block_on(tls::establish(database_url, posture))?;
+    // `handle.block_on` panics ("Cannot start a runtime from within a
+    // runtime") if the CALLING thread is itself one of that runtime's own
+    // worker threads mid-poll — exactly what happens when this is called
+    // directly from a plain `async fn`/`.on_startup(|state| async move {
+    // ... })` body rather than from `spawn_blocking`. Running
+    // the actual `block_on` on a dedicated, freshly spawned OS thread
+    // sidesteps this unconditionally: that thread is never part of the
+    // runtime's worker pool, so blocking IT is always legal, regardless of
+    // whether the caller happened to already be inside the runtime. The
+    // runtime keeps driving the connection's background I/O task afterward
+    // either way — `tokio::spawn` (inside `tls::establish`) schedules onto
+    // the runtime itself, not onto whichever thread happened to call it.
+    let connect_handle = handle.clone();
+    let url = database_url.to_owned();
+    let inner = std::thread::Builder::new()
+        .name("autumn-migrate-tls-connect".to_owned())
+        .spawn(move || connect_handle.block_on(tls::establish(&url, posture)))
+        .map_err(|e| {
+            diesel::ConnectionError::BadConnection(format!(
+                "failed to spawn the TLS migration connect thread: {e}"
+            ))
+        })?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
     Ok(MigrationConnection::Rustls {
         runtime,
         conn: diesel_async::async_connection_wrapper::AsyncConnectionWrapper::from(inner),
@@ -6046,5 +6075,28 @@ mod migration_connection_tests {
                 "must use the rustls wrapper: {url}"
             );
         }
+    }
+
+    // Regression: TLS-enabled migrations panicked with "Cannot start
+    // a runtime from within a runtime" when called directly from an app's
+    // own async `on_startup` hook rather than from `spawn_blocking` --
+    // because the rustls arm's connect used to `block_on` on the CALLING
+    // thread, which IS one of the ambient runtime's own worker threads while
+    // an `.on_startup(|state| async move { ... })` body executes. TLS off
+    // (dev) never took this arm, so the bug only ever surfaced with
+    // `sslmode=require`/`verify-full` (prod).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn establish_migration_connection_does_not_panic_from_an_async_caller() {
+        // Calling this directly from an `async fn` body -- not wrapped in
+        // `spawn_blocking` -- mirrors the shape of an app's own async
+        // `on_startup` hook calling `autumn_web::migrate::run_pending(...)`.
+        // On a multi-threaded runtime (axum's default), matching production.
+        let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db?sslmode=require";
+        let result = super::establish_migration_connection(url);
+        assert!(
+            result.is_err(),
+            "an unreachable TLS-requiring host must fail with a connection error \
+             (not panic on nested block_on)"
+        );
     }
 }

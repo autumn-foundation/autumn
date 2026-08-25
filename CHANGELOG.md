@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **TLS-enabled migrations no longer panic when applied from an app's own
+  async `on_startup` hook:** `establish_migration_connection`'s rustls arm
+  (used whenever the database URL requires TLS — `sslmode=require`/
+  `verify-full`) used to `block_on` directly on the calling thread when an
+  ambient tokio runtime was detected. That is safe from a `spawn_blocking`
+  task (the framework's own startup migration path), but panics with
+  "Cannot start a runtime from within a runtime" when called directly from
+  a plain `async fn`/`.on_startup(|state| async move { ... })` body — e.g. an
+  app or plugin that calls `autumn_web::migrate::run_pending(...)` straight
+  from its own startup hook, rather than through the framework's built-in
+  `.migrations()`/`.plugin_migrations()` registration. Because the native
+  (non-TLS) path never touched a runtime at all, this only ever surfaced
+  once TLS was turned on — the exact "works in dev, breaks in prod against a
+  TLS-only database" shape. The connect now always runs on a dedicated,
+  freshly spawned OS thread, which is never part of the runtime's own worker
+  pool, so the same call is now safe from any context.
+
+### Added
+
+- **`AppBuilder::plugin_migrations(name, migrations)`:** a named registration
+  path for embedded Diesel migrations owned by a plugin or other third-party
+  integration, distinct from the app's own `.migrations()`. Both now share a
+  version-collision guard: registering a set that reuses a version already
+  claimed by a *different* migration in a previously registered set (the
+  framework's, a plugin's, or the app's own) now panics immediately, at
+  app-wiring time, naming both migrations and the version. Diesel's
+  `__diesel_schema_migrations` table is keyed by version alone, so without
+  this guard two independently authored migrations that happen to share a
+  version would collide silently: whichever set applies first "wins" the
+  version, and every other set's same-versioned migration is skipped forever
+  as "already applied" even though its `up.sql` never actually ran. A version
+  reused under the exact same full migration name (e.g. a shard-required set
+  folded verbatim into another bundle too) is the existing, intentional,
+  harmless case and is not flagged.
+
 ### Security
 
 - **consent-banner middleware now guards the already-rendered case against

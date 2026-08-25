@@ -744,6 +744,72 @@ where
     Ok(versions)
 }
 
+/// Enumerate `(version, full_name)` for every migration in an embedded set —
+/// `version` is what `__diesel_schema_migrations` actually keys on (e.g.
+/// `"20260101000000"`); `full_name` also carries the description (e.g.
+/// `"20260101000000_create_posts"`), which is what distinguishes "the exact
+/// same migration, registered twice" from "two unrelated migrations that
+/// happen to share a version".
+///
+/// Backend-generic so it enumerates a `SQLite`-oriented embedded set too —
+/// the version/name metadata comes from the migration directory naming, not
+/// from parsing the backend-specific SQL, so which `DB` is chosen here never
+/// changes the result.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] if the embedded set's metadata
+/// cannot be enumerated (not expected in practice for a `const` produced by
+/// `embed_migrations!`, but the underlying Diesel API is fallible).
+pub(crate) fn migration_versions_and_names<DB>(
+    source: &EmbeddedMigrations,
+) -> Result<Vec<(String, String)>, MigrationError>
+where
+    DB: diesel::backend::Backend,
+    EmbeddedMigrations: diesel::migration::MigrationSource<DB>,
+{
+    let migrations = MigrationSource::<DB>::migrations(source)
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(migrations
+        .iter()
+        .map(|m| (m.name().version().to_string(), m.name().to_string()))
+        .collect())
+}
+
+/// Find a version in `new_migrations` that is already claimed, under a
+/// **different** full name, by `prior_by_version`. Pure and DB-free, so it
+/// can run at app-wiring time (inside
+/// [`AppBuilder::migrations`](crate::app::AppBuilder::migrations) /
+/// [`AppBuilder::plugin_migrations`](crate::app::AppBuilder::plugin_migrations)),
+/// before any migration connection exists.
+///
+/// This is the actual bug this guards against: Diesel's
+/// `__diesel_schema_migrations` table is keyed by **version alone** — it has
+/// no notion of which registered source (the framework, a plugin, the app's
+/// own `migrations/`) recorded a version. Two independently authored
+/// migrations that happen to reuse the same version — nothing coordinates
+/// timestamps across a plugin, the framework, and an app — collide silently:
+/// whichever set's `run_pending` call runs first "wins" the version, and
+/// every other set's same-versioned migration is skipped forever as
+/// "already applied", even though its `up.sql` never actually ran. A version
+/// reused by the SAME full name (e.g. a shard-required set folded verbatim
+/// into the full framework bundle too) is the intentional, harmless case and
+/// is not reported.
+///
+/// Returns `(version, new_full_name, prior_full_name)` for the first
+/// collision found, in `new_migrations` order.
+pub(crate) fn find_migration_version_collision(
+    prior_by_version: &std::collections::HashMap<String, String>,
+    new_migrations: &[(String, String)],
+) -> Option<(String, String, String)> {
+    new_migrations.iter().find_map(|(version, full_name)| {
+        prior_by_version.get(version).and_then(|prior_full_name| {
+            (prior_full_name != full_name)
+                .then(|| (version.clone(), full_name.clone(), prior_full_name.clone()))
+        })
+    })
+}
+
 /// SHA-256 content hash of a migration's `up.sql`, used to detect the case
 /// where a migration was edited **after** it was applied. Deterministic across
 /// platforms:
@@ -2758,6 +2824,74 @@ pub(crate) fn auto_migrate_sqlite(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Migration-version collision guard (plugin/app/framework) ───────────
+
+    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(v, n)| (v.to_string(), n.to_string()))
+            .collect()
+    }
+
+    fn map(entries: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(v, n)| (v.to_string(), n.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn no_collision_when_versions_are_disjoint() {
+        let prior = map(&[("20260101000000", "20260101000000_create_posts")]);
+        let new_migrations = pairs(&[("20260102000000", "20260102000000_create_comments")]);
+        assert_eq!(
+            find_migration_version_collision(&prior, &new_migrations),
+            None
+        );
+    }
+
+    #[test]
+    fn no_collision_when_same_version_and_same_full_name() {
+        // The intentional, harmless case: a shard-required migration set
+        // folded verbatim into another bundle too (e.g. the standalone
+        // version-history set also ships inside FRAMEWORK_MIGRATIONS).
+        let prior = map(&[("20260101000000", "20260101000000_create_posts")]);
+        let new_migrations = pairs(&[("20260101000000", "20260101000000_create_posts")]);
+        assert_eq!(
+            find_migration_version_collision(&prior, &new_migrations),
+            None
+        );
+    }
+
+    #[test]
+    fn collision_when_same_version_different_full_name() {
+        // Real-world shape: a framework migration and an app's own first
+        // migration both picking the all-zero placeholder version.
+        let prior = map(&[("00000000000000", "00000000000000_create_api_tokens")]);
+        let new_migrations = pairs(&[("00000000000000", "00000000000000_create_todos")]);
+        assert_eq!(
+            find_migration_version_collision(&prior, &new_migrations),
+            Some((
+                "00000000000000".to_string(),
+                "00000000000000_create_todos".to_string(),
+                "00000000000000_create_api_tokens".to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn migration_versions_and_names_enumerates_todo_app_fixture() {
+        const MIGRATIONS: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        let pairs = migration_versions_and_names::<Pg>(&MIGRATIONS).unwrap();
+        assert!(
+            pairs
+                .iter()
+                .any(|(v, n)| v == "00000000000000" && n == "00000000000000_create_todos"),
+            "expected the todo-app fixture's first migration, got {pairs:?}"
+        );
+    }
 
     // ── Per-attempt connect_timeout injection (`--wait`) ───────────────────
 
