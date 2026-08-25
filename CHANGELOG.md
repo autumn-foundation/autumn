@@ -10,21 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **TLS-enabled migrations no longer panic when applied from an app's own
-  async `on_startup` hook:** `establish_migration_connection`'s rustls arm
-  (used whenever the database URL requires TLS — `sslmode=require`/
-  `verify-full`) used to `block_on` directly on the calling thread when an
-  ambient tokio runtime was detected. That is safe from a `spawn_blocking`
-  task (the framework's own startup migration path), but panics with
-  "Cannot start a runtime from within a runtime" when called directly from
-  a plain `async fn`/`.on_startup(|state| async move { ... })` body — e.g. an
-  app or plugin that calls `autumn_web::migrate::run_pending(...)` straight
-  from its own startup hook, rather than through the framework's built-in
-  `.migrations()`/`.plugin_migrations()` registration. Because the native
-  (non-TLS) path never touched a runtime at all, this only ever surfaced
-  once TLS was turned on — the exact "works in dev, breaks in prod against a
-  TLS-only database" shape. The connect now always runs on a dedicated,
-  freshly spawned OS thread, which is never part of the runtime's own worker
-  pool, so the same call is now safe from any context.
+  async `on_startup` hook:** the sync migration/wait-check path bridges to
+  Postgres through diesel-async's `AsyncConnectionWrapper` whenever the
+  database URL requires TLS (`sslmode=require`/`verify-full` — the native
+  libpq path can't reach a TLS-only server at all). That wrapper bridges
+  every sync diesel call — connecting, and separately every query it's later
+  asked to run — through its own internal `block_on`, which panics with
+  "Cannot start a runtime from within a runtime" if invoked from a thread
+  that is itself already inside some ambient tokio runtime's context. That's
+  exactly what happens when an app or plugin calls a migration function
+  (e.g. `autumn_web::migrate::run_pending(...)`) directly from a plain
+  `async fn`/`.on_startup(|state| async move { ... })` body, rather than from
+  `spawn_blocking`. Because the native (non-TLS) path never touches a
+  runtime at all, this only ever surfaced once TLS was turned on — the exact
+  "works in dev, breaks in prod against a TLS-only database" shape, and it
+  could still resurface even after only the initial connect was fixed, the
+  moment an actual migration query ran. The connect **and every subsequent
+  query** now run together on one freshly spawned OS thread that never
+  touches any ambient runtime, closing both failure points. Verified against
+  a real TLS-enabled Postgres server, on both a `current_thread` and
+  `multi_thread` tokio runtime, called directly from an async body.
 
 ### Added
 
@@ -43,12 +48,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until someone renames a migration in a dependency they may not control —
   the framework now detects the collision at apply time (across every
   registered source, including ones the framework itself folds in after
-  app-wiring time) and transparently tracks the later-registered migration
-  under a distinguishing version derived from its version and source name, so
-  **both** migrations still apply. This is logged at `INFO` so it is visible,
-  not silent. A version reused under the exact same full migration name (e.g.
-  a shard-required set folded verbatim into another bundle too) is the
-  separate, intentional, harmless case and is left untouched.
+  app-wiring time) and transparently tracks one of the colliding migrations
+  under a bounded, deterministic substitute version, so **both** migrations
+  still apply. Which one keeps the plain version is a pure function of the
+  migrations' own names (not registration order), so reordering
+  `.migrations()`/`.plugin_migrations()` calls or adding a new plugin never
+  flips an already-settled collision. This is logged at `INFO` so it is
+  visible, not silent, and it applies uniformly to Postgres and SQLite
+  targets. A version reused under the exact same full migration name (e.g. a
+  shard-required set folded verbatim into another bundle too) is the
+  separate, intentional, harmless case and is left untouched. This does not
+  (and, given Diesel's version-only tracking, cannot) recover history for a
+  new plugin whose migration collides with a version an app already applied
+  under an *earlier*, pre-plugin deploy — see the method's doc comment.
 
 ### Security
 

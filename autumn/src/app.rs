@@ -2812,13 +2812,32 @@ impl AppBuilder {
     /// plugin at all until someone renames a migration in a dependency they
     /// may not control — the framework detects the collision at apply time
     /// (across every registered set, including ones the framework itself
-    /// folds in) and transparently tracks the later-registered migration
-    /// under a distinguishing version derived from its version and source
-    /// name, so **both** migrations still apply. This is logged at `INFO`
-    /// so it is visible, not silent. A version reused under the exact same
-    /// full migration name (e.g. a shard-required set folded verbatim into
-    /// another bundle too) is the separate, intentional, harmless case and
-    /// is left untouched.
+    /// folds in) and transparently tracks one of the colliding migrations
+    /// under a distinguishing substitute version, so **both** migrations
+    /// still apply. This is logged at `INFO` so it is visible, not silent.
+    /// A version reused under the exact same full migration name (e.g. a
+    /// shard-required set folded verbatim into another bundle too) is the
+    /// separate, intentional, harmless case and is left untouched.
+    ///
+    /// Which of two colliding migrations keeps the plain version is decided
+    /// by a fixed rule — the lexicographically-first full migration name —
+    /// derived purely from the migrations' own content, **not** from
+    /// registration order. So reordering `.migrations()`/`.plugin_migrations()`
+    /// calls, or adding a new plugin, never changes an already-settled
+    /// assignment for a collision that existed before.
+    ///
+    /// One case this cannot make safe on its own: introducing a **new**
+    /// colliding source against a database that has **already** applied one
+    /// side of the collision under its plain version from an *earlier*
+    /// deploy (before the new source ever existed). Diesel's tracking table
+    /// records only the bare version string, not which migration produced
+    /// it, so there is no way to recover that history after the fact — the
+    /// fixed rule above has no way to know a version it would assign to the
+    /// new source is actually already claimed, in the real database, by the
+    /// older one. If you introduce a plugin whose migrations might collide
+    /// with an already-deployed app, verify manually before rolling out
+    /// (e.g. confirm the plugin's expected tables don't already exist under
+    /// a different name) rather than relying on this to resolve it for you.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn plugin_migrations(
@@ -5460,8 +5479,7 @@ impl AppBuilder {
                 // NO advisory lock via the SQLite harness. Sharding is rejected above,
                 // so a SQLite control target here is always unsharded (shard_targets
                 // is empty). Every non-SQLite target keeps the byte-identical locked
-                // Postgres applier. `SQLite` does not get the disambiguation
-                // treatment (out of scope for now).
+                // Postgres applier.
                 #[cfg(feature = "sqlite")]
                 let is_sqlite_control = crate::config::DatabaseBackend::detect(url)
                     == Some(crate::config::DatabaseBackend::Sqlite);
@@ -5470,7 +5488,11 @@ impl AppBuilder {
                 if is_sqlite_control {
                     #[cfg(feature = "sqlite")]
                     for (_, mig) in &migrations {
-                        total += apply_pending_sqlite_or_exit(url, mig, "control");
+                        total += apply_pending_sqlite_or_exit(
+                            url,
+                            crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
+                            "control",
+                        );
                     }
                 } else {
                     for (_, mig) in &migrations {
@@ -8809,7 +8831,7 @@ async fn setup_database(
 #[cfg(feature = "db")]
 fn apply_pending_or_exit(
     database_url: &str,
-    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
     target: &str,
 ) -> usize {
     match crate::migrate::run_pending_locked(database_url, migrations, None) {
@@ -8845,7 +8867,7 @@ fn apply_pending_or_exit(
 #[cfg(feature = "sqlite")]
 fn apply_pending_sqlite_or_exit(
     database_url: &str,
-    migrations: &crate::migrate::EmbeddedMigrations,
+    migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite> + Send,
     target: &str,
 ) -> usize {
     // Reject ANY in-memory target (private OR shared-cache) with registered
@@ -8854,17 +8876,11 @@ fn apply_pending_sqlite_or_exit(
     // migrated schema never survives to the runtime pool — a private `:memory:`
     // connection is its own empty database, and a shared in-memory database is
     // destroyed when its last connection closes (issue #1614 follow-up).
-    if let Some(err) = crate::migrate::reject_in_memory_migrations(
-        database_url,
-        &crate::migrate::EmbeddedMigrationsRef(migrations),
-    ) {
+    if let Some(err) = crate::migrate::reject_in_memory_migrations(database_url, &migrations) {
         eprintln!("autumn migrate: {err} (target {target})");
         std::process::exit(1);
     }
-    match crate::migrate::run_pending_sqlite(
-        database_url,
-        crate::migrate::EmbeddedMigrationsRef(migrations),
-    ) {
+    match crate::migrate::run_pending_sqlite(database_url, migrations) {
         Ok(result) => result.applied.len(),
         Err(error) => {
             let reason = match error {
@@ -9143,9 +9159,7 @@ async fn run_startup_migrations(
         // (`sqlite_sharding_unsupported_guard`), so there is nothing shard- or
         // directory-related to do on this path — the directory/shard-map framework
         // migrations below are skipped for a SQLite control target. The Postgres
-        // path is left byte-identical for every non-SQLite target. `SQLite` does
-        // not get the disambiguation treatment (out of scope for now); each set
-        // still applies under its own original versions.
+        // path is left byte-identical for every non-SQLite target.
         #[cfg(feature = "sqlite")]
         if let Some(url) = control_url.as_deref()
             && crate::config::DatabaseBackend::detect(url)
@@ -9157,7 +9171,7 @@ async fn run_startup_migrations(
                     profile.as_deref(),
                     auto_migrate,
                     auto_in_prod,
-                    mig,
+                    crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                     "control",
                 );
             }

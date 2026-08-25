@@ -1175,25 +1175,46 @@ pub struct PgSyncBackend {
 /// statement inside `transaction()` (semantically identical to
 /// `build_transaction()`, which is an inherent `PgConnection` method the
 /// wrapper does not expose).
+///
+/// The connect AND `$body` both run on a freshly spawned
+/// [`std::thread::scope`] thread, never the calling one — load-bearing, not
+/// an optimization: the rustls arm's connection bridges every sync diesel
+/// call through its own internal `block_on`
+/// (see [`crate::db::establish_migration_connection`]'s doc comment), which
+/// panics if run from a thread already inside some ambient runtime's
+/// context — e.g. `PgSyncBackend::ensure_schema` (or any other method here)
+/// called directly from an async body rather than from `spawn_blocking`. A
+/// freshly spawned thread has never entered any runtime, so it is always
+/// safe. `scope` (rather than a plain `'static` `std::thread::spawn`) lets
+/// `$body` borrow from the enclosing method (e.g. `&self`, request data)
+/// without needing to be `'static`.
 macro_rules! with_sync_pg_connection {
     ($url:expr, |$conn:ident| $body:expr) => {
-        match crate::db::establish_migration_connection($url).map_err(backend_err)? {
-            crate::db::MigrationConnection::Native(mut native) => {
-                let $conn = &mut native;
-                $body
-            }
-            crate::db::MigrationConnection::Rustls { mut conn, runtime } => {
-                let result = {
-                    let $conn = &mut conn;
-                    $body
-                };
-                // The runtime drives the connection's tokio driver task: it
-                // must outlive every use of `conn`.
-                drop(conn);
-                drop(runtime);
-                result
-            }
-        }
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    match crate::db::establish_migration_connection($url).map_err(backend_err)? {
+                        crate::db::MigrationConnection::Native(mut native) => {
+                            let $conn = &mut native;
+                            $body
+                        }
+                        crate::db::MigrationConnection::Rustls { mut conn, runtime } => {
+                            let result = {
+                                let $conn = &mut conn;
+                                $body
+                            };
+                            // The runtime drives the connection's tokio
+                            // driver task: it must outlive every use of
+                            // `conn`.
+                            drop(conn);
+                            drop(runtime);
+                            result
+                        }
+                    }
+                })
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
     };
 }
 
