@@ -285,7 +285,7 @@ impl PostgresSearchStore {
     /// `documents` is a caller-supplied slice on a PUBLIC trait method, not
     /// something this type controls the shape of — [`SearchDocument::fields`]
     /// is itself a public, uncapped `Vec` a hand-built document can push
-    /// arbitrarily many (even repeated) entries onto — so three defenses
+    /// arbitrarily many (even repeated) entries onto — so four defenses
     /// apply before any SQL is built:
     ///
     /// - **duplicate `record_id`s are deduplicated** — a single statement's
@@ -317,6 +317,13 @@ impl PostgresSearchStore {
     ///   count) is atomic per CHUNK, not across the whole call — a narrower
     ///   guarantee than the single-chunk case, and disclosed as such rather
     ///   than silently assumed.
+    /// - **a chunk also caps at `MAX_ROWS_PER_CHUNK` rows**, independent of
+    ///   the parameter budget — a document with few or no weighted fields
+    ///   consumes very few binds, so the param budget alone could still
+    ///   admit thousands of rows into one statement. The watermark-guarded
+    ///   shape joins rows with `UNION ALL`, and a deeply nested chain of
+    ///   those risks Postgres' `max_stack_depth` during parsing even while
+    ///   comfortably under the bind limit.
     /// - **the deduplicated batch is sorted by `record_id`**, so every
     ///   writer of overlapping ids locks conflict rows in the SAME order.
     ///   The old per-document loop held at most one row lock at a time
@@ -339,6 +346,18 @@ impl PostgresSearchStore {
         // Leaves comfortable headroom under Postgres' real 65,535
         // bind-parameter cap for the few shared params (`$1`/`$2`[/`$3`]).
         const PARAM_BUDGET: usize = 60_000;
+
+        // A SEPARATE cap from `PARAM_BUDGET`: a document with few or no
+        // weighted fields consumes very few binds, so the param budget
+        // alone could still admit thousands of rows into one statement.
+        // The watermarked shape joins rows with `UNION ALL`, and a deeply
+        // nested `SELECT ... UNION ALL ...` chain risks Postgres'
+        // `max_stack_depth` during parsing/planning — a failure mode the
+        // old per-document loop, and the unconditional `VALUES` form (a
+        // flat list, not a nested tree), do not have. Comfortably above
+        // the framework's own 500-document default batch, so it never
+        // engages for realistic use.
+        const MAX_ROWS_PER_CHUNK: usize = 1_000;
 
         checked(definition)?;
         if documents.is_empty() {
@@ -417,16 +436,20 @@ impl PostgresSearchStore {
                             .filter(|field| definition.weight_of(field.name).is_some())
                             .count(),
                     );
-                if !rows.is_empty() && next_param.saturating_add(doc_param_count) > PARAM_BUDGET {
-                    // Would overflow this chunk's budget: stop here (without
-                    // consuming `document` — `cursor` is untouched) and let
-                    // the outer `while` start a fresh chunk for it. A chunk
-                    // with zero rows so far always admits at least one
-                    // document regardless of its own size, so a single
-                    // document pathological enough to exceed the budget
-                    // alone gets exactly the old per-document loop's
-                    // behavior: its own statement, which Postgres would
-                    // equally have rejected before this change existed.
+                if !rows.is_empty()
+                    && (next_param.saturating_add(doc_param_count) > PARAM_BUDGET
+                        || rows.len() >= MAX_ROWS_PER_CHUNK)
+                {
+                    // Would overflow this chunk's param budget OR row-count
+                    // cap: stop here (without consuming `document` —
+                    // `cursor` is untouched) and let the outer `while` start
+                    // a fresh chunk for it. A chunk with zero rows so far
+                    // always admits at least one document regardless of its
+                    // own size, so a single document pathological enough to
+                    // exceed the budget alone gets exactly the old
+                    // per-document loop's behavior: its own statement,
+                    // which Postgres would equally have rejected before
+                    // this change existed.
                     break;
                 }
                 cursor = cursor.saturating_add(1);
@@ -1113,7 +1136,20 @@ impl SearchBackend for PostgresSearchStore {
                 .into_boxed::<autumn_web::RuntimeBackend>(),
                 [
                     Bound::Text(definition.name.to_owned()),
-                    Bound::Ids(ids.to_vec()),
+                    // Sorted ascending: `write_documents` locks its batch's
+                    // conflict rows in the same order (see its doc comment)
+                    // specifically so no two multi-row statements can ever
+                    // lock-and-wait on each other in a cycle. A `DELETE ...
+                    // WHERE record_id = ANY($2)` can lock several rows in
+                    // one statement too, in whatever order its plan visits
+                    // them — an unsorted array leaves that order to the
+                    // planner, which is not guaranteed to agree with
+                    // `write_documents`'s ascending order.
+                    Bound::Ids({
+                        let mut sorted_ids = ids.to_vec();
+                        sorted_ids.sort_unstable();
+                        sorted_ids
+                    }),
                 ],
             )
             .execute(&mut conn)
@@ -1992,6 +2028,48 @@ mod tests {
                 total < 65_535,
                 "a chunk's total bind count {total} must stay under Postgres' bind limit: \
                  {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_count_cap_bounds_chunk_size_even_when_the_param_budget_never_would() {
+        // A document with NO weighted fields binds only 5 params — the
+        // param budget alone would admit 60_000 / 5 = 12,000 rows into one
+        // chunk. The watermark-guarded shape joins rows with `UNION ALL`,
+        // and a chain that deep risks Postgres' `max_stack_depth` during
+        // parsing even while comfortably under the bind limit — so a
+        // SEPARATE row-count cap has to apply regardless of how cheap each
+        // row's params are.
+        const PARAM_BUDGET: usize = 60_000;
+        const MAX_ROWS_PER_CHUNK: usize = 1_000;
+        let doc_param_count = 5usize; // no weighted fields on any document
+
+        let mut chunks: Vec<usize> = Vec::new();
+        let mut next_param = 3usize;
+        let mut chunk_len = 0usize;
+        for _ in 0..5_000 {
+            if chunk_len > 0
+                && (next_param.saturating_add(doc_param_count) > PARAM_BUDGET
+                    || chunk_len >= MAX_ROWS_PER_CHUNK)
+            {
+                chunks.push(chunk_len);
+                next_param = 3;
+                chunk_len = 0;
+            }
+            next_param = next_param.saturating_add(doc_param_count);
+            chunk_len = chunk_len.saturating_add(1);
+        }
+        chunks.push(chunk_len);
+
+        assert!(
+            chunks.len() > 1,
+            "5,000 minimal-field documents must still split into more than one chunk: {chunks:?}"
+        );
+        for &len in &chunks {
+            assert!(
+                len <= MAX_ROWS_PER_CHUNK,
+                "a chunk of {len} rows must never exceed MAX_ROWS_PER_CHUNK: {chunks:?}"
             );
         }
     }
