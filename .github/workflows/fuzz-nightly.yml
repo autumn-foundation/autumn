@@ -61,7 +61,7 @@ jobs:
       # to the newest prior cache for this target+ref if the exact key misses, so
       # the corpus is never silently reset to the committed seeds alone.
       - name: Restore persisted corpus
-        uses: actions/cache@v7
+        uses: actions/cache@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.ref }}-${{ github.run_id }}
