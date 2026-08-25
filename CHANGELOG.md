@@ -71,7 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own `migrations/` directory only, with no visibility into which plugins
   were registered at runtime — if the app's own migration is the one that
   loses a collision, those two CLI commands cannot currently resolve or
-  revert it by name; see the method's doc comment for the manual fallback.
+  revert it by name, and the migration checksum/drift-detection system
+  likewise can't see it (so a later edit to that migration would not trigger
+  the drift guard); see the method's doc comment for the manual fallback and
+  the (accepted, very-low-probability) edge case around a future migration's
+  raw version coinciding with an already-applied substitute.
 
 ### Security
 

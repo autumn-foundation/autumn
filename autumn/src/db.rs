@@ -6125,13 +6125,25 @@ mod migration_connection_tests {
     async fn migration_functions_do_not_hang_on_a_current_thread_runtime() {
         const MIGRATIONS: crate::migrate::EmbeddedMigrations =
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
-        let watchdog = std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_secs(20));
-            eprintln!(
-                "migration_functions_do_not_hang_on_a_current_thread_runtime: \
-                 timed out after 20s -- the TLS connect hung instead of failing fast"
-            );
-            std::process::exit(101);
+        // A plain `sleep`-then-`exit` watchdog can't be cancelled once
+        // spawned, so a detached one would keep counting down after this
+        // test returns and could later `process::exit` the shared test
+        // binary mid-suite, on an unrelated test, if the suite is still
+        // running 20s after this test passed. A channel lets the main
+        // thread signal "the call returned, stand down" so the watchdog only
+        // ever fires on a genuine hang.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if done_rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .is_err()
+            {
+                eprintln!(
+                    "migration_functions_do_not_hang_on_a_current_thread_runtime: \
+                     timed out after 20s -- the TLS connect hung instead of failing fast"
+                );
+                std::process::exit(101);
+            }
         });
 
         let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db?sslmode=require";
@@ -6141,9 +6153,10 @@ mod migration_connection_tests {
             "an unreachable TLS-requiring host must fail with a connection error"
         );
 
-        // Returned without hanging -- let the watchdog's sleeping thread be
-        // reaped with normal process teardown; there is no clean cancel API
-        // for it, and a detached sleeping thread is harmless.
-        drop(watchdog);
+        // Stand the watchdog down and wait for it to exit cleanly, rather
+        // than leaving a live "exit(101) in 20s" timer running in the shared
+        // test binary after this test has already passed.
+        let _ = done_tx.send(());
+        let _ = watchdog.join();
     }
 }

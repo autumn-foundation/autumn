@@ -2841,15 +2841,36 @@ impl AppBuilder {
     ///
     /// A second, narrower residual gap: `autumn migrate status` / `autumn
     /// migrate down` (the CLI's user-migration status and rollback commands)
-    /// resolve applied versions against the app's own `migrations/`
-    /// directory only — they have no visibility into which plugins were
-    /// registered at runtime. If your own app's migration is the one that
-    /// loses a collision and gets tracked under a substitute version, those
-    /// two commands cannot currently resolve or revert it by name; reverting
-    /// it needs manual intervention (inspect
-    /// `__diesel_schema_migrations` directly). A plugin's own migrations are
-    /// unaffected, since the CLI's user-rollback commands never touch them
-    /// either way.
+    /// and the migration checksum/drift-detection system (`autumn migrate
+    /// record-checksums`'s baseline and its later validation) all resolve
+    /// applied versions against the app's own `migrations/` directory only —
+    /// none of them have visibility into which plugins were registered at
+    /// runtime. If your own app's migration is the one that loses a
+    /// collision and gets tracked under a substitute version: `migrate
+    /// status`/`migrate down` cannot currently resolve or revert it by name
+    /// (reverting it needs manual intervention — inspect
+    /// `__diesel_schema_migrations` directly); and checksum baselining/drift
+    /// detection cannot see it either, so a later edit to that migration's
+    /// `up.sql` will not trigger the drift guard. A plugin's own migrations
+    /// are unaffected by either gap, since neither system touches plugin
+    /// migrations either way. Fixing this needs the full registered
+    /// migration set (not just the app's own directory) threaded through to
+    /// these CLI-facing functions — out of scope for the auto-resolution
+    /// added here.
+    ///
+    /// A third, even narrower edge case: an already-applied migration's
+    /// substitute version is recomputed fresh on every startup from the
+    /// CURRENTLY registered sources, reserved only against versions those
+    /// sources currently claim. If a later release adds an entirely new
+    /// migration whose own raw version happens to exactly equal an
+    /// already-applied substitute (astronomically unlikely in practice,
+    /// since a substitute is a source-name hash suffix no ordinary migration
+    /// timestamp would organically collide with), the already-applied
+    /// migration's substitute would be reassigned to free up that version —
+    /// changing a previously-settled collision's tracked identity. This is
+    /// accepted as a residual risk rather than solved by, say, persisting
+    /// substitute assignments to the database, which the framework does not
+    /// otherwise need to do.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn plugin_migrations(
