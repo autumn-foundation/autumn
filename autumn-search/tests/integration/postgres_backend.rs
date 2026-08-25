@@ -444,6 +444,34 @@ async fn indexing_the_same_record_twice_stores_one_document() {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+async fn a_duplicate_id_within_one_index_call_keeps_the_last_write() {
+    // `index()` is a public trait method, not something that promises
+    // `documents` carries unique ids. Batching every document into one
+    // multi-row statement must not turn a repeated id into a Postgres
+    // "ON CONFLICT DO UPDATE command cannot affect row a second time"
+    // cardinality-violation error — it must behave exactly like the old
+    // per-document loop's sequential last-write-wins.
+    let fixture = Fixture::start().await;
+    fixture
+        .index(&[
+            doc(&article(1, "Gardening weekly", "tomatoes only")),
+            doc(&article(1, "Rust web frameworks", "a survey")),
+        ])
+        .await;
+
+    assert_eq!(
+        fixture.search("rust").await,
+        vec![1],
+        "the second (last) write in the batch must be what's stored"
+    );
+    assert!(
+        fixture.search("tomatoes").await.is_empty(),
+        "the first, overwritten write must not linger"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn deleting_removes_the_document_and_replays_cleanly() {
     let fixture = Fixture::start().await;
     for record in corpus() {

@@ -270,16 +270,41 @@ impl PostgresSearchStore {
     /// [`SearchBackend::index`] and [`SearchBackend::index_unless_newer`], so
     /// the conditional and unconditional forms cannot drift apart.
     ///
-    /// Issues ONE statement for the whole batch, not one per document.
+    /// Issues ONE statement per CHUNK of the batch (almost always exactly
+    /// one statement total), not one per document.
     /// [`SearchClient::backfill`](crate::SearchClient::backfill) drives this
     /// with up to `DEFAULT_BACKFILL_BATCH` (500) documents at a time, so a
     /// per-document round trip turned a full-table backfill into one DB
     /// round trip per row — invisible in a buffer ranking (each statement is
     /// cheap) but dominant in `pg_stat_statements.calls`. `index_name` and
     /// `language` are the same for every document in one call, so they are
-    /// bound ONCE (`$1`, `$2`) and referenced by every row, which is also
-    /// what keeps the statement's shape — and so its place in diesel's
-    /// prepared-statement cache — independent of `documents.len()`.
+    /// bound ONCE (`$1`, `$2`) per chunk and referenced by every row, which
+    /// is also what keeps a chunk's statement shape — and so its place in
+    /// diesel's prepared-statement cache — independent of chunk size.
+    ///
+    /// `documents` is a caller-supplied slice on a PUBLIC trait method, not
+    /// something this type controls the shape of, so two defenses apply
+    /// before any SQL is built:
+    ///
+    /// - **duplicate `record_id`s are deduplicated, keeping the LAST
+    ///   occurrence** — matching the old per-document loop's sequential
+    ///   last-write-wins behavior. A single statement's `ON CONFLICT DO
+    ///   UPDATE` cannot affect the same conflict target twice (Postgres:
+    ///   "ON CONFLICT DO UPDATE command cannot affect row a second time"),
+    ///   so an un-deduplicated multi-row statement would turn a batch a
+    ///   hand-built caller (or a third-party `DocumentSource`) is entitled
+    ///   to send into a hard error instead of the old accept-and-overwrite
+    ///   behavior.
+    /// - **the batch is split into chunks sized so no single statement can
+    ///   approach Postgres's 65,535 bind-parameter limit**, however large
+    ///   `BackfillOptions::batch_size` or however many searchable fields
+    ///   `definition` declares — both are caller/config-controlled, not
+    ///   bounded by this method. Each chunk is still its own atomic
+    ///   statement; a batch that needed more than one chunk (never true at
+    ///   the framework's own 500-document default with a realistic field
+    ///   count) is atomic per CHUNK, not across the whole call — a narrower
+    ///   guarantee than the single-chunk case, and disclosed as such rather
+    ///   than silently assumed.
     #[allow(clippy::too_many_lines)] // one linear per-row statement builder, clearest unsplit
     async fn write_documents(
         &self,
@@ -288,6 +313,11 @@ impl PostgresSearchStore {
         watermark: Option<&str>,
     ) -> SearchResult<()> {
         use std::fmt::Write as _;
+
+        // Leaves comfortable headroom under Postgres' real 65,535
+        // bind-parameter cap for the few shared params (`$1`/`$2`[/`$3`])
+        // and the worst-case slack in `max_params_per_document` below.
+        const PARAM_BUDGET: usize = 60_000;
 
         checked(definition)?;
         if documents.is_empty() {
@@ -310,149 +340,169 @@ impl PostgresSearchStore {
             ("", "")
         };
 
-        // $1 index_name, $2 language[, $3 watermark] — shared by every row.
-        let mut binds = vec![
-            Bound::Text(definition.name.to_owned()),
-            Bound::Text(definition.language.to_owned()),
-        ];
-        let watermark_param = watermark.map(|value| {
-            binds.push(Bound::Text(value.to_owned()));
-            3usize
-        });
-        let mut next_param: usize = if watermark_param.is_some() { 4 } else { 3 };
+        let kept_documents = dedupe_last_by_id(documents);
 
-        let mut rows = Vec::with_capacity(documents.len());
-        let mut record_ids = Vec::with_capacity(documents.len());
+        // Worst case every kept document binds: record_id, tenant_id,
+        // fields, content, embedding (5), the vector literal if the column
+        // exists (+1), and one value per field the document might carry
+        // that `definition` also declares a weight for (at most
+        // `definition.fields.len()`).
+        let max_params_per_document = 5usize
+            .saturating_add(usize::from(vector_width.is_some()))
+            .saturating_add(definition.fields.len());
+        let chunk_size = PARAM_BUDGET
+            .checked_div(max_params_per_document.max(1))
+            .unwrap_or(1)
+            .max(1);
 
-        for document in documents {
-            let record_id = document.id();
-            record_ids.push(record_id);
-            let record_id_param = format!("${next_param}");
-            binds.push(Bound::BigInt(record_id));
-            next_param = next_param.saturating_add(1);
-
-            let tenant_param = format!("${next_param}");
-            binds.push(Bound::NullableText(document.document.tenant_id.clone()));
-            next_param = next_param.saturating_add(1);
-
-            let fields_param = format!("${next_param}");
-            binds.push(Bound::Text(fields_json(document)?));
-            next_param = next_param.saturating_add(1);
-
-            let content_param = format!("${next_param}");
-            binds.push(Bound::Text(document.document.text()));
-            next_param = next_param.saturating_add(1);
-
-            let embedding_param = format!("${next_param}");
-            binds.push(Bound::NullableText(
-                document.embedding.as_deref().map(array_literal),
-            ));
-            next_param = next_param.saturating_add(1);
-
-            let vec_value = if let Some(width) = vector_width {
-                let literal = match document.embedding.as_deref() {
-                    // A width the column cannot hold would fail the insert,
-                    // and leaving the old value in place is exactly the
-                    // staleness this avoids — so it never reaches SQL.
-                    //
-                    // Whether that is an ERROR depends on which column this
-                    // process is actually reading. In pgvector mode k-NN
-                    // runs off `embedding_vec`, so writing NULL would leave
-                    // the row permanently invisible to semantic search
-                    // while every write reported success — a silent hole,
-                    // and the worst outcome available. Say so instead.
-                    //
-                    // Returning here, mid-batch, leaves `conn` untouched and
-                    // no statement executed — nothing in `documents` before
-                    // this one has been written either, unlike the old
-                    // per-document loop where earlier rows would already be
-                    // committed. One statement means one atomic outcome.
-                    Some(embedding) if embedding.len() != width => {
-                        if self.vector_mode().is_some_and(VectorMode::is_pgvector) {
-                            return Err(SearchError::DimensionMismatch {
-                                expected: width,
-                                actual: embedding.len(),
-                            });
-                        }
-                        // Not in pgvector mode: `embedding_vec` is a
-                        // leftover column from a previous width, k-NN runs
-                        // off the portable `embedding` array (bound above,
-                        // at full width), and NULLing the stale copy is the
-                        // correct repair rather than a loss.
-                        None
-                    }
-                    other => other.map(vector_literal),
-                };
-                let placeholder = format!(", ${next_param}::vector");
-                binds.push(Bound::NullableText(literal));
-                next_param = next_param.saturating_add(1);
-                placeholder
-            } else {
-                String::new()
-            };
-
-            // The weighted tsvector, built exactly as #842 does:
-            // `setweight(to_tsvector(<lang>, <value>), <weight>)` per
-            // field, concatenated.
-            //
-            // The weight letter is interpolated, so it comes from the
-            // VALIDATED definition rather than from the document: a
-            // hand-built document (or a third-party `DocumentSource`) can
-            // carry any `char`. A field the index does not declare is
-            // skipped entirely.
-            let mut vector_sql = String::new();
-            for field in &document.document.fields {
-                let Some(weight) = definition.weight_of(field.name) else {
-                    continue;
-                };
-                if !vector_sql.is_empty() {
-                    vector_sql.push_str(" || ");
-                }
-                // `$2::text::regconfig`, not `$2::regconfig`: the same
-                // parameter is also the `language` column value, and the
-                // untyped form is "inconsistent types deduced for
-                // parameter" under any client that does not declare bind
-                // types.
-                let field_value_param = format!("${next_param}");
-                let _ = write!(
-                    vector_sql,
-                    "setweight(to_tsvector($2::text::regconfig, {field_value_param}), '{weight}')"
-                );
-                binds.push(Bound::Text(field.value.clone()));
-                next_param = next_param.saturating_add(1);
-            }
-            if vector_sql.is_empty() {
-                "to_tsvector($2::text::regconfig, '')".clone_into(&mut vector_sql);
-            }
-
-            let columns = format!(
-                "$1, {record_id_param}, {tenant_param}, $2, {fields_param}::jsonb, \
-                 {content_param}, {vector_sql}, {embedding_param}::double precision[]{vec_value}"
-            );
-            rows.push(UpsertRow {
-                columns,
-                record_id_param,
+        for chunk in kept_documents.chunks(chunk_size) {
+            // $1 index_name, $2 language[, $3 watermark] — shared by every row
+            // in this chunk's statement.
+            let mut binds = vec![
+                Bound::Text(definition.name.to_owned()),
+                Bound::Text(definition.language.to_owned()),
+            ];
+            let watermark_param = watermark.map(|value| {
+                binds.push(Bound::Text(value.to_owned()));
+                3usize
             });
+            let mut next_param: usize = if watermark_param.is_some() { 4 } else { 3 };
+
+            let mut rows = Vec::with_capacity(chunk.len());
+            let mut record_ids = Vec::with_capacity(chunk.len());
+
+            for &document in chunk {
+                let record_id = document.id();
+                record_ids.push(record_id);
+                let record_id_param = format!("${next_param}");
+                binds.push(Bound::BigInt(record_id));
+                next_param = next_param.saturating_add(1);
+
+                let tenant_param = format!("${next_param}");
+                binds.push(Bound::NullableText(document.document.tenant_id.clone()));
+                next_param = next_param.saturating_add(1);
+
+                let fields_param = format!("${next_param}");
+                binds.push(Bound::Text(fields_json(document)?));
+                next_param = next_param.saturating_add(1);
+
+                let content_param = format!("${next_param}");
+                binds.push(Bound::Text(document.document.text()));
+                next_param = next_param.saturating_add(1);
+
+                let embedding_param = format!("${next_param}");
+                binds.push(Bound::NullableText(
+                    document.embedding.as_deref().map(array_literal),
+                ));
+                next_param = next_param.saturating_add(1);
+
+                let vec_value = if let Some(width) = vector_width {
+                    let literal = match document.embedding.as_deref() {
+                        // A width the column cannot hold would fail the insert,
+                        // and leaving the old value in place is exactly the
+                        // staleness this avoids — so it never reaches SQL.
+                        //
+                        // Whether that is an ERROR depends on which column this
+                        // process is actually reading. In pgvector mode k-NN
+                        // runs off `embedding_vec`, so writing NULL would leave
+                        // the row permanently invisible to semantic search
+                        // while every write reported success — a silent hole,
+                        // and the worst outcome available. Say so instead.
+                        //
+                        // Returning here leaves THIS chunk's statement
+                        // unexecuted — a document earlier in the SAME chunk
+                        // never reaches SQL either, unlike the old per-document
+                        // loop where earlier rows would already be committed.
+                        // A prior CHUNK, if any, has already committed by this
+                        // point (see the doc comment above: atomic per chunk,
+                        // not across the whole call).
+                        Some(embedding) if embedding.len() != width => {
+                            if self.vector_mode().is_some_and(VectorMode::is_pgvector) {
+                                return Err(SearchError::DimensionMismatch {
+                                    expected: width,
+                                    actual: embedding.len(),
+                                });
+                            }
+                            // Not in pgvector mode: `embedding_vec` is a
+                            // leftover column from a previous width, k-NN runs
+                            // off the portable `embedding` array (bound above,
+                            // at full width), and NULLing the stale copy is the
+                            // correct repair rather than a loss.
+                            None
+                        }
+                        other => other.map(vector_literal),
+                    };
+                    let placeholder = format!(", ${next_param}::vector");
+                    binds.push(Bound::NullableText(literal));
+                    next_param = next_param.saturating_add(1);
+                    placeholder
+                } else {
+                    String::new()
+                };
+
+                // The weighted tsvector, built exactly as #842 does:
+                // `setweight(to_tsvector(<lang>, <value>), <weight>)` per
+                // field, concatenated.
+                //
+                // The weight letter is interpolated, so it comes from the
+                // VALIDATED definition rather than from the document: a
+                // hand-built document (or a third-party `DocumentSource`) can
+                // carry any `char`. A field the index does not declare is
+                // skipped entirely.
+                let mut vector_sql = String::new();
+                for field in &document.document.fields {
+                    let Some(weight) = definition.weight_of(field.name) else {
+                        continue;
+                    };
+                    if !vector_sql.is_empty() {
+                        vector_sql.push_str(" || ");
+                    }
+                    // `$2::text::regconfig`, not `$2::regconfig`: the same
+                    // parameter is also the `language` column value, and the
+                    // untyped form is "inconsistent types deduced for
+                    // parameter" under any client that does not declare bind
+                    // types.
+                    let field_value_param = format!("${next_param}");
+                    let _ = write!(
+                        vector_sql,
+                        "setweight(to_tsvector($2::text::regconfig, {field_value_param}), '{weight}')"
+                    );
+                    binds.push(Bound::Text(field.value.clone()));
+                    next_param = next_param.saturating_add(1);
+                }
+                if vector_sql.is_empty() {
+                    "to_tsvector($2::text::regconfig, '')".clone_into(&mut vector_sql);
+                }
+
+                let columns = format!(
+                    "$1, {record_id_param}, {tenant_param}, $2, {fields_param}::jsonb, \
+                 {content_param}, {vector_sql}, {embedding_param}::double precision[]{vec_value}"
+                );
+                rows.push(UpsertRow {
+                    columns,
+                    record_id_param,
+                });
+            }
+
+            // Only consulted by `upsert_sql` on the unconditional path (the
+            // ledger clear), but the slot number and the bind must agree either
+            // way, so both are decided here, once, right after the loop that
+            // fixed `next_param`.
+            let ids_param = next_param;
+            if watermark_param.is_none() {
+                binds.push(Bound::Ids(record_ids));
+            }
+
+            let sql = upsert_sql(&rows, vec_column, vec_update, ids_param, watermark_param);
+
+            bind_all(
+                diesel::sql_query(sql).into_boxed::<autumn_web::RuntimeBackend>(),
+                binds,
+            )
+            .execute(&mut conn)
+            .await
+            .map_err(SearchError::backend)?;
         }
-
-        // Only consulted by `upsert_sql` on the unconditional path (the
-        // ledger clear), but the slot number and the bind must agree either
-        // way, so both are decided here, once, right after the loop that
-        // fixed `next_param`.
-        let ids_param = next_param;
-        if watermark_param.is_none() {
-            binds.push(Bound::Ids(record_ids));
-        }
-
-        let sql = upsert_sql(&rows, vec_column, vec_update, ids_param, watermark_param);
-
-        bind_all(
-            diesel::sql_query(sql).into_boxed::<autumn_web::RuntimeBackend>(),
-            binds,
-        )
-        .execute(&mut conn)
-        .await
-        .map_err(SearchError::backend)?;
 
         Ok(())
     }
@@ -652,6 +702,30 @@ fn pgvector_order_by(filtered: bool) -> String {
     } else {
         "ORDER BY (embedding_vec <=> $2::vector) ASC, record_id ASC".to_owned()
     }
+}
+
+/// References into `documents` keeping only the LAST occurrence of each
+/// `record_id`, in ascending original-index order.
+///
+/// `documents` is a caller-supplied slice on a PUBLIC trait method
+/// (`SearchBackend::index` / `index_unless_newer`), so nothing guarantees
+/// unique ids — a hand-built batch, or a third-party `DocumentSource`, is
+/// entitled to send the same record twice. The old per-document loop
+/// tolerated that (N sequential UPSERTs, last one wins); a single
+/// multi-row statement cannot, because Postgres rejects `ON CONFLICT DO
+/// UPDATE` acting on the same conflict target twice within one statement.
+fn dedupe_last_by_id(documents: &[IndexedDocument]) -> Vec<&IndexedDocument> {
+    let mut last_index_for_id: std::collections::HashMap<i64, usize> =
+        std::collections::HashMap::with_capacity(documents.len());
+    for (index, document) in documents.iter().enumerate() {
+        last_index_for_id.insert(document.id(), index);
+    }
+    let mut kept_indices: Vec<usize> = last_index_for_id.into_values().collect();
+    kept_indices.sort_unstable();
+    kept_indices
+        .into_iter()
+        .filter_map(|index| documents.get(index))
+        .collect()
 }
 
 /// One row's already-rendered column-value expression list, in the exact
@@ -1715,6 +1789,73 @@ mod tests {
 
     fn definition() -> IndexDefinition {
         IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
+    }
+
+    fn doc(id: i64) -> IndexedDocument {
+        IndexedDocument::new(autumn_web::search::SearchDocument::new("articles", id))
+    }
+
+    #[test]
+    fn a_duplicate_record_id_keeps_only_its_last_occurrence() {
+        // A caller-supplied batch on a PUBLIC trait method is entitled to
+        // repeat an id; the old per-document loop tolerated it (sequential
+        // last-write-wins). A single multi-row statement's `ON CONFLICT DO
+        // UPDATE` cannot touch the same target twice, so the batch must be
+        // deduplicated — keeping the LAST occurrence, to match that old
+        // last-write-wins outcome exactly — before it ever reaches SQL.
+        let documents = vec![doc(1), doc(2), doc(1), doc(3), doc(2)];
+        let kept: Vec<i64> = dedupe_last_by_id(&documents)
+            .into_iter()
+            .map(IndexedDocument::id)
+            .collect();
+        // documents[2] (id=1) and documents[4] (id=2) are the LAST
+        // occurrences of their ids; documents[3] (id=3) is unique.
+        // Ascending original-index order: 1, 3, 2.
+        assert_eq!(kept, vec![1, 3, 2], "{kept:?}");
+    }
+
+    #[test]
+    fn no_duplicates_keeps_every_index_in_order() {
+        let documents = vec![doc(10), doc(20), doc(30)];
+        let kept: Vec<i64> = dedupe_last_by_id(&documents)
+            .into_iter()
+            .map(IndexedDocument::id)
+            .collect();
+        assert_eq!(kept, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn chunk_size_never_lets_a_statement_approach_the_bind_limit() {
+        // Mirrors write_documents' own chunk-size arithmetic: worst case
+        // every kept document binds 5 fixed params, +1 for a vector column,
+        // +1 per declared field (every field weighted AND present). This
+        // must stay comfortably under Postgres' real 65,535-parameter cap
+        // for any field count a real `IndexDefinition` could declare.
+        const PARAM_BUDGET: usize = 60_000;
+        for field_count in [0usize, 1, 2, 50, 200] {
+            for has_vector in [false, true] {
+                let max_params_per_document = 5usize
+                    .saturating_add(usize::from(has_vector))
+                    .saturating_add(field_count);
+                let chunk_size = (PARAM_BUDGET / max_params_per_document.max(1)).max(1);
+                let worst_case_params = chunk_size.saturating_mul(max_params_per_document);
+                assert!(
+                    worst_case_params < 65_535,
+                    "field_count={field_count} has_vector={has_vector} chunk_size={chunk_size} \
+                     worst_case_params={worst_case_params} must stay under Postgres' bind limit"
+                );
+                // And the framework's own default backfill batch (500) must
+                // never itself trigger chunking for any realistic field
+                // count — only pathological batch sizes or field counts do.
+                if field_count <= 50 {
+                    assert!(
+                        chunk_size >= 500,
+                        "field_count={field_count} has_vector={has_vector} chunk_size={chunk_size} \
+                         would needlessly split the framework's own 500-document default batch"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
