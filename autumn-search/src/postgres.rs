@@ -1123,11 +1123,29 @@ impl SearchBackend for PostgresSearchStore {
             //
             // `deleted_at` is refreshed on a replayed delete so a retry cannot
             // age out earlier than the delete it repeats.
+            //
+            // `doomed` locks its rows in ascending `record_id` order —
+            // matching `write_documents`' and `clear`'s own order — via
+            // `ORDER BY` + `FOR UPDATE` in a `SELECT`, the only thing that
+            // actually controls Postgres' row-lock acquisition order.
+            // Binding a pre-sorted array to `record_id = ANY($2)` does NOT:
+            // Postgres is free to satisfy that predicate with a sequential,
+            // bitmap, or index scan and locks rows in whatever order that
+            // scan visits them, independent of the array's own order — a
+            // bare `DELETE ... WHERE record_id = ANY($2)` could still lock
+            // its rows out of order and lock-and-wait against a concurrent
+            // `write_documents` batch.
             bind_all(
                 diesel::sql_query(format!(
-                    "WITH removed AS ( \
+                    "WITH doomed AS ( \
+                       SELECT record_id FROM {DOCUMENTS_TABLE} \
+                       WHERE index_name = $1 AND record_id = ANY($2) \
+                       ORDER BY record_id \
+                       FOR UPDATE \
+                     ), \
+                     removed AS ( \
                        DELETE FROM {DOCUMENTS_TABLE} \
-                        WHERE index_name = $1 AND record_id = ANY($2) \
+                       WHERE index_name = $1 AND record_id IN (SELECT record_id FROM doomed) \
                      ) \
                      INSERT INTO {DELETES_TABLE} (index_name, record_id) \
                      SELECT $1, unnest($2::bigint[]) \
@@ -1136,20 +1154,7 @@ impl SearchBackend for PostgresSearchStore {
                 .into_boxed::<autumn_web::RuntimeBackend>(),
                 [
                     Bound::Text(definition.name.to_owned()),
-                    // Sorted ascending: `write_documents` locks its batch's
-                    // conflict rows in the same order (see its doc comment)
-                    // specifically so no two multi-row statements can ever
-                    // lock-and-wait on each other in a cycle. A `DELETE ...
-                    // WHERE record_id = ANY($2)` can lock several rows in
-                    // one statement too, in whatever order its plan visits
-                    // them — an unsorted array leaves that order to the
-                    // planner, which is not guaranteed to agree with
-                    // `write_documents`'s ascending order.
-                    Bound::Ids({
-                        let mut sorted_ids = ids.to_vec();
-                        sorted_ids.sort_unstable();
-                        sorted_ids
-                    }),
+                    Bound::Ids(ids.to_vec()),
                 ],
             )
             .execute(&mut conn)
