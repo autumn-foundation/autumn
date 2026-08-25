@@ -1168,9 +1168,25 @@ impl SearchBackend for PostgresSearchStore {
             // concurrent write must not be able to observe half of it. The
             // ledger has to go too, or the rebuild that follows would silently
             // skip everything previously deleted.
+            //
+            // `doomed` locks its rows in ascending `record_id` order (`FOR
+            // UPDATE` on a sorted `SELECT` acquires locks in the order rows
+            // are produced), matching `write_documents`' and `delete`'s own
+            // ascending order — a bare `DELETE ... WHERE index_name = $1`
+            // would instead lock whatever rows its scan happens to visit
+            // (physical heap order for a sequential scan), which a
+            // concurrent `write_documents` batch touching the SAME rows in
+            // ascending order could deadlock against.
             diesel::sql_query(format!(
-                "WITH removed AS ( \
-                   DELETE FROM {DOCUMENTS_TABLE} WHERE index_name = $1 \
+                "WITH doomed AS ( \
+                   SELECT record_id FROM {DOCUMENTS_TABLE} \
+                   WHERE index_name = $1 \
+                   ORDER BY record_id \
+                   FOR UPDATE \
+                 ), \
+                 removed AS ( \
+                   DELETE FROM {DOCUMENTS_TABLE} \
+                   WHERE index_name = $1 AND record_id IN (SELECT record_id FROM doomed) \
                  ) \
                  DELETE FROM {DELETES_TABLE} WHERE index_name = $1"
             ))
