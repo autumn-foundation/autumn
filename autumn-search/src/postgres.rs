@@ -283,23 +283,35 @@ impl PostgresSearchStore {
     /// diesel's prepared-statement cache — independent of chunk size.
     ///
     /// `documents` is a caller-supplied slice on a PUBLIC trait method, not
-    /// something this type controls the shape of, so two defenses apply
+    /// something this type controls the shape of — [`SearchDocument::fields`]
+    /// is itself a public, uncapped `Vec` a hand-built document can push
+    /// arbitrarily many (even repeated) entries onto — so two defenses apply
     /// before any SQL is built:
     ///
-    /// - **duplicate `record_id`s are deduplicated, keeping the LAST
-    ///   occurrence** — matching the old per-document loop's sequential
-    ///   last-write-wins behavior. A single statement's `ON CONFLICT DO
-    ///   UPDATE` cannot affect the same conflict target twice (Postgres:
-    ///   "ON CONFLICT DO UPDATE command cannot affect row a second time"),
-    ///   so an un-deduplicated multi-row statement would turn a batch a
-    ///   hand-built caller (or a third-party `DocumentSource`) is entitled
-    ///   to send into a hard error instead of the old accept-and-overwrite
-    ///   behavior.
+    /// - **duplicate `record_id`s are deduplicated** — a single statement's
+    ///   `ON CONFLICT DO UPDATE` cannot affect the same conflict target
+    ///   twice (Postgres: "ON CONFLICT DO UPDATE command cannot affect row a
+    ///   second time"), so an un-deduplicated multi-row statement would turn
+    ///   a batch a hand-built caller (or a third-party `DocumentSource`) is
+    ///   entitled to send into a hard error. Which occurrence survives
+    ///   depends on `watermark`, because the OLD per-document loop's
+    ///   observable behavior differed between the two forms:
+    ///     - **unconditional** (`watermark` is `None`): N sequential
+    ///       UPSERTs with no guard, so the LAST occurrence's write is what a
+    ///       later occurrence would overwrite. Deduplicate keeping the LAST.
+    ///     - **watermark-guarded** (`index_unless_newer`): the FIRST
+    ///       occurrence's UPSERT sets `updated_at = NOW()`, which is now
+    ///       newer than `watermark` — so every LATER occurrence's own guard
+    ///       (`WHERE updated_at <= watermark`) fails against that
+    ///       just-written row and silently no-ops. Deduplicate keeping the
+    ///       FIRST, to match.
     /// - **the batch is split into chunks sized so no single statement can
-    ///   approach Postgres's 65,535 bind-parameter limit**, however large
-    ///   `BackfillOptions::batch_size` or however many searchable fields
-    ///   `definition` declares — both are caller/config-controlled, not
-    ///   bounded by this method. Each chunk is still its own atomic
+    ///   approach Postgres's 65,535 bind-parameter limit**, using each
+    ///   document's ACTUAL bind count (not `definition.fields.len()`, which
+    ///   undercounts a document built with repeated field entries) —
+    ///   however large `BackfillOptions::batch_size`, however many fields
+    ///   `definition` declares, or however a hand-built document's own
+    ///   `fields` was constructed. Each chunk is still its own atomic
     ///   statement; a batch that needed more than one chunk (never true at
     ///   the framework's own 500-document default with a realistic field
     ///   count) is atomic per CHUNK, not across the whole call — a narrower
@@ -315,8 +327,7 @@ impl PostgresSearchStore {
         use std::fmt::Write as _;
 
         // Leaves comfortable headroom under Postgres' real 65,535
-        // bind-parameter cap for the few shared params (`$1`/`$2`[/`$3`])
-        // and the worst-case slack in `max_params_per_document` below.
+        // bind-parameter cap for the few shared params (`$1`/`$2`[/`$3`]).
         const PARAM_BUDGET: usize = 60_000;
 
         checked(definition)?;
@@ -340,22 +351,12 @@ impl PostgresSearchStore {
             ("", "")
         };
 
-        let kept_documents = dedupe_last_by_id(documents);
+        // See the doc comment above for why the direction depends on
+        // `watermark`.
+        let kept_documents = dedupe_by_id(documents, watermark.is_some());
 
-        // Worst case every kept document binds: record_id, tenant_id,
-        // fields, content, embedding (5), the vector literal if the column
-        // exists (+1), and one value per field the document might carry
-        // that `definition` also declares a weight for (at most
-        // `definition.fields.len()`).
-        let max_params_per_document = 5usize
-            .saturating_add(usize::from(vector_width.is_some()))
-            .saturating_add(definition.fields.len());
-        let chunk_size = PARAM_BUDGET
-            .checked_div(max_params_per_document.max(1))
-            .unwrap_or(1)
-            .max(1);
-
-        for chunk in kept_documents.chunks(chunk_size) {
+        let mut cursor = 0usize;
+        while cursor < kept_documents.len() {
             // $1 index_name, $2 language[, $3 watermark] — shared by every row
             // in this chunk's statement.
             let mut binds = vec![
@@ -368,10 +369,42 @@ impl PostgresSearchStore {
             });
             let mut next_param: usize = if watermark_param.is_some() { 4 } else { 3 };
 
-            let mut rows = Vec::with_capacity(chunk.len());
-            let mut record_ids = Vec::with_capacity(chunk.len());
+            let mut rows = Vec::new();
+            let mut record_ids = Vec::new();
 
-            for &document in chunk {
+            while let Some(&document) = kept_documents.get(cursor) {
+                // This document's EXACT bind count: 5 fixed params, +1 for
+                // the vector literal if the column exists, +1 per field
+                // VALUE the document actually carries that `definition`
+                // also declares a weight for — mirrors the loop below
+                // exactly (same predicate, `definition.weight_of`), so a
+                // document with repeated field entries is measured
+                // precisely rather than assumed to carry at most one value
+                // per declared field.
+                let doc_param_count = 5usize
+                    .saturating_add(usize::from(vector_width.is_some()))
+                    .saturating_add(
+                        document
+                            .document
+                            .fields
+                            .iter()
+                            .filter(|field| definition.weight_of(field.name).is_some())
+                            .count(),
+                    );
+                if !rows.is_empty() && next_param.saturating_add(doc_param_count) > PARAM_BUDGET {
+                    // Would overflow this chunk's budget: stop here (without
+                    // consuming `document` — `cursor` is untouched) and let
+                    // the outer `while` start a fresh chunk for it. A chunk
+                    // with zero rows so far always admits at least one
+                    // document regardless of its own size, so a single
+                    // document pathological enough to exceed the budget
+                    // alone gets exactly the old per-document loop's
+                    // behavior: its own statement, which Postgres would
+                    // equally have rejected before this change existed.
+                    break;
+                }
+                cursor = cursor.saturating_add(1);
+
                 let record_id = document.id();
                 record_ids.push(record_id);
                 let record_id_param = format!("${next_param}");
@@ -704,23 +737,31 @@ fn pgvector_order_by(filtered: bool) -> String {
     }
 }
 
-/// References into `documents` keeping only the LAST occurrence of each
-/// `record_id`, in ascending original-index order.
+/// References into `documents` keeping only ONE occurrence of each
+/// `record_id` — the FIRST if `keep_first`, else the LAST — in ascending
+/// original-index order.
 ///
 /// `documents` is a caller-supplied slice on a PUBLIC trait method
 /// (`SearchBackend::index` / `index_unless_newer`), so nothing guarantees
 /// unique ids — a hand-built batch, or a third-party `DocumentSource`, is
-/// entitled to send the same record twice. The old per-document loop
-/// tolerated that (N sequential UPSERTs, last one wins); a single
-/// multi-row statement cannot, because Postgres rejects `ON CONFLICT DO
-/// UPDATE` acting on the same conflict target twice within one statement.
-fn dedupe_last_by_id(documents: &[IndexedDocument]) -> Vec<&IndexedDocument> {
-    let mut last_index_for_id: std::collections::HashMap<i64, usize> =
+/// entitled to send the same record twice. A single multi-row statement
+/// cannot tolerate that the way the old per-document loop did (N sequential
+/// UPSERTs), because Postgres rejects `ON CONFLICT DO UPDATE` acting on the
+/// same conflict target twice within one statement — see
+/// [`PostgresSearchStore::write_documents`]'s doc comment for why the
+/// surviving occurrence has to differ between the watermarked and
+/// unconditional forms to match the old loop's observable result.
+fn dedupe_by_id(documents: &[IndexedDocument], keep_first: bool) -> Vec<&IndexedDocument> {
+    let mut index_for_id: std::collections::HashMap<i64, usize> =
         std::collections::HashMap::with_capacity(documents.len());
     for (index, document) in documents.iter().enumerate() {
-        last_index_for_id.insert(document.id(), index);
+        if keep_first {
+            index_for_id.entry(document.id()).or_insert(index);
+        } else {
+            index_for_id.insert(document.id(), index);
+        }
     }
-    let mut kept_indices: Vec<usize> = last_index_for_id.into_values().collect();
+    let mut kept_indices: Vec<usize> = index_for_id.into_values().collect();
     kept_indices.sort_unstable();
     kept_indices
         .into_iter()
@@ -1796,15 +1837,12 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_record_id_keeps_only_its_last_occurrence() {
-        // A caller-supplied batch on a PUBLIC trait method is entitled to
-        // repeat an id; the old per-document loop tolerated it (sequential
-        // last-write-wins). A single multi-row statement's `ON CONFLICT DO
-        // UPDATE` cannot touch the same target twice, so the batch must be
-        // deduplicated — keeping the LAST occurrence, to match that old
-        // last-write-wins outcome exactly — before it ever reaches SQL.
+    fn unconditional_dedup_keeps_the_last_occurrence() {
+        // The unconditional (`index`) form ran N sequential UPSERTs with no
+        // guard, so a later occurrence's write is what actually persists —
+        // keep the LAST, to match.
         let documents = vec![doc(1), doc(2), doc(1), doc(3), doc(2)];
-        let kept: Vec<i64> = dedupe_last_by_id(&documents)
+        let kept: Vec<i64> = dedupe_by_id(&documents, false)
             .into_iter()
             .map(IndexedDocument::id)
             .collect();
@@ -1815,46 +1853,93 @@ mod tests {
     }
 
     #[test]
-    fn no_duplicates_keeps_every_index_in_order() {
-        let documents = vec![doc(10), doc(20), doc(30)];
-        let kept: Vec<i64> = dedupe_last_by_id(&documents)
+    fn watermark_guarded_dedup_keeps_the_first_occurrence() {
+        // The old per-document loop's FIRST occurrence sets
+        // `updated_at = NOW()`, which is newer than `watermark` — so every
+        // LATER occurrence's own `WHERE updated_at <= watermark` guard fails
+        // against that just-written row and silently no-ops. Keep the
+        // FIRST, to match.
+        let documents = vec![doc(1), doc(2), doc(1), doc(3), doc(2)];
+        let kept: Vec<i64> = dedupe_by_id(&documents, true)
             .into_iter()
             .map(IndexedDocument::id)
             .collect();
-        assert_eq!(kept, vec![10, 20, 30]);
+        // documents[0] (id=1) and documents[1] (id=2) are the FIRST
+        // occurrences of their ids; documents[3] (id=3) is unique.
+        // Ascending original-index order: 1, 2, 3.
+        assert_eq!(kept, vec![1, 2, 3], "{kept:?}");
     }
 
     #[test]
-    fn chunk_size_never_lets_a_statement_approach_the_bind_limit() {
-        // Mirrors write_documents' own chunk-size arithmetic: worst case
-        // every kept document binds 5 fixed params, +1 for a vector column,
-        // +1 per declared field (every field weighted AND present). This
-        // must stay comfortably under Postgres' real 65,535-parameter cap
-        // for any field count a real `IndexDefinition` could declare.
+    fn no_duplicates_keeps_every_index_in_order_either_direction() {
+        let documents = vec![doc(10), doc(20), doc(30)];
+        for keep_first in [true, false] {
+            let kept: Vec<i64> = dedupe_by_id(&documents, keep_first)
+                .into_iter()
+                .map(IndexedDocument::id)
+                .collect();
+            assert_eq!(kept, vec![10, 20, 30], "keep_first={keep_first}");
+        }
+    }
+
+    #[test]
+    fn greedy_chunking_never_lets_a_statement_approach_the_bind_limit_even_with_repeated_fields() {
+        // Mirrors write_documents' own greedy accounting: `SearchDocument::fields`
+        // is a public, uncapped `Vec` — a hand-built document can carry the
+        // SAME declared field many times over, each contributing its own
+        // bind. A per-document estimate based on `definition.fields.len()`
+        // (one declared field, one possible value) would undercount this;
+        // the real code counts each document's ACTUAL matching-field
+        // entries instead. Reproduces the reported case: many documents
+        // each carrying far more copies of one field than the index
+        // declares.
         const PARAM_BUDGET: usize = 60_000;
-        for field_count in [0usize, 1, 2, 50, 200] {
-            for has_vector in [false, true] {
-                let max_params_per_document = 5usize
-                    .saturating_add(usize::from(has_vector))
-                    .saturating_add(field_count);
-                let chunk_size = (PARAM_BUDGET / max_params_per_document.max(1)).max(1);
-                let worst_case_params = chunk_size.saturating_mul(max_params_per_document);
-                assert!(
-                    worst_case_params < 65_535,
-                    "field_count={field_count} has_vector={has_vector} chunk_size={chunk_size} \
-                     worst_case_params={worst_case_params} must stay under Postgres' bind limit"
-                );
-                // And the framework's own default backfill batch (500) must
-                // never itself trigger chunking for any realistic field
-                // count — only pathological batch sizes or field counts do.
-                if field_count <= 50 {
-                    assert!(
-                        chunk_size >= 500,
-                        "field_count={field_count} has_vector={has_vector} chunk_size={chunk_size} \
-                         would needlessly split the framework's own 500-document default batch"
-                    );
-                }
+        let weight_of = |name: &str| if name == "title" { Some('A') } else { None };
+
+        // 800 documents, each with the SAME declared field repeated 90
+        // times: 5 fixed + 90 = 95 binds/document, 800 * 95 = 76,000 total —
+        // over PARAM_BUDGET, so this MUST split into more than one chunk.
+        let mut documents = Vec::new();
+        for id in 0..800i64 {
+            let mut document = autumn_web::search::SearchDocument::new("articles", id);
+            for _ in 0..90 {
+                document = document.with_field("title", 'A', "x");
             }
+            documents.push(IndexedDocument::new(document));
+        }
+
+        let mut chunks: Vec<usize> = Vec::new();
+        let mut next_param = 3usize; // $1 index_name, $2 language (no watermark)
+        let mut chunk_len = 0usize;
+        for document in &documents {
+            let doc_param_count = 5usize.saturating_add(
+                document
+                    .document
+                    .fields
+                    .iter()
+                    .filter(|field| weight_of(field.name).is_some())
+                    .count(),
+            );
+            if chunk_len > 0 && next_param.saturating_add(doc_param_count) > PARAM_BUDGET {
+                chunks.push(next_param);
+                next_param = 3;
+                chunk_len = 0;
+            }
+            next_param = next_param.saturating_add(doc_param_count);
+            chunk_len = chunk_len.saturating_add(1);
+        }
+        chunks.push(next_param);
+
+        assert!(
+            chunks.len() > 1,
+            "the fixture must force more than one chunk: {chunks:?}"
+        );
+        for &total in &chunks {
+            assert!(
+                total < 65_535,
+                "a chunk's total bind count {total} must stay under Postgres' bind limit: \
+                 {chunks:?}"
+            );
         }
     }
 

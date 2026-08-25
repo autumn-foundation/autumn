@@ -22,7 +22,7 @@ use autumn_search::{
     PostgresSearchStore, ReindexArgs, SearchBackend as _, SearchClient, SearchFilter, VectorQuery,
 };
 use autumn_web::pagination::PageRequest;
-use autumn_web::search::{IndexDefinition, SearchIndexed as _};
+use autumn_web::search::{IndexDefinition, SearchDocument, SearchIndexed as _};
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -468,6 +468,38 @@ async fn a_duplicate_id_within_one_index_call_keeps_the_last_write() {
         fixture.search("tomatoes").await.is_empty(),
         "the first, overwritten write must not linger"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_document_with_far_more_field_values_than_the_index_declares_does_not_blow_the_bind_limit()
+ {
+    // `SearchDocument::fields` is a public, uncapped `Vec` — a hand-built
+    // document (this test doesn't go through the `#[searchable]` derive at
+    // all) can carry the SAME declared field many times over. A chunk-size
+    // estimate based on `definition.fields.len()` (one declared field, one
+    // assumed value) would undercount this and could still overflow
+    // Postgres' 65,535 bind-parameter limit. 800 documents * (5 fixed + 90
+    // repeated `title` values) = 76,000 binds — over budget, forcing more
+    // than one statement — must still succeed with no Postgres error.
+    let fixture = Fixture::start().await;
+    let mut documents = Vec::with_capacity(800);
+    for id in 1..=800i64 {
+        let mut document = SearchDocument::new("search_articles", id);
+        for _ in 0..90 {
+            document = document.with_field("title", 'A', "rust");
+        }
+        document = document.with_field("body", 'B', "a rust framework");
+        documents.push(IndexedDocument::new(document));
+    }
+
+    fixture.index(&documents).await; // must not panic / return a backend error
+
+    let (ids, total) = fixture
+        .search_filtered("rust", SearchFilter::default())
+        .await;
+    assert_eq!(total, 800, "every one of the 800 documents must be stored");
+    assert_eq!(ids.len(), 20, "one page (default page size) of hits");
 }
 
 #[tokio::test]
