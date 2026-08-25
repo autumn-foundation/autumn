@@ -34,6 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`autumn-search`'s Postgres backend now batches a document write into one
+  statement instead of one per document:** `PostgresSearchStore::write_documents`
+  — the single write path behind both `SearchBackend::index` and
+  `SearchBackend::index_unless_newer` — looped over its `documents` slice and
+  issued one `INSERT ... ON CONFLICT DO UPDATE` per document. `SearchClient::backfill`
+  drives this with up to 500 documents per call, so a full-index backfill cost
+  one DB round trip per row indexed. All documents in one call now land in a
+  single multi-row statement (a plain `VALUES` list when unconditional, a
+  `UNION ALL` of guarded `SELECT`s when watermark-guarded), cutting statement
+  count from one-per-document to one-per-backfill-batch. Every per-field SQL
+  expression is unchanged; only how many round trips carry it changed. See
+  `docs/reports/2026-08-25-ledger-search-write-documents-batch/`.
+
 - **scaffolded form helpers no longer re-escape their own constant HTML at
   render time:** `text_input`, `password_input`, `textarea_input`,
   `number_input`, `checkbox_input`, `date_input`/`datetime_input` (and their
