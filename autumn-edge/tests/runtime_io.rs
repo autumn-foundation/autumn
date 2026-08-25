@@ -86,6 +86,16 @@ async fn aliased_extension(_ext: Alias) -> &'static str {
     "never reached: the capsule installs no extensions"
 }
 
+/// A handler whose body exceeds the runtime's response-body cap — the shape
+/// a streaming response, or one sized off a path/query parameter, could take.
+/// Collecting it must fail closed into a fallthrough rather than buffer
+/// without bound.
+async fn oversized_body() -> Vec<u8> {
+    // One byte past `runtime::MAX_RESPONSE_BODY_BYTES` (16 MiB); mirrored here
+    // as a literal since the constant is private to the crate.
+    vec![b'x'; 16 * 1024 * 1024 + 1]
+}
+
 /// A handler whose response header value is valid HTTP but not valid UTF-8 —
 /// it cannot cross the JSON wire byte-faithfully, so the runtime must decline
 /// rather than serve a lossily rewritten value the origin would never send.
@@ -112,6 +122,13 @@ fn routes() -> Vec<EdgeRoute> {
             path: "/latin1",
             handler: edge_get(latin1_header),
             name: "latin1_header",
+            needs: &[],
+        },
+        EdgeRoute {
+            method: http::Method::GET,
+            path: "/oversized",
+            handler: edge_get(oversized_body),
+            name: "oversized_body",
             needs: &[],
         },
         EdgeRoute {
@@ -299,6 +316,19 @@ fn a_cookie_setting_handler_is_a_fallthrough_not_a_cacheable_session_leak() {
     assert!(
         detail.contains("cookie") && detail.contains("origin-only"),
         "the decline must name the cookie hazard: {detail}"
+    );
+}
+
+#[test]
+fn an_oversized_response_body_is_a_fallthrough_not_an_unbounded_buffer() {
+    let frames = drive(&[request_line(EdgeRequest::get("/oversized"), &[])]);
+
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    let (reason, detail) = expect_fallthrough(&frames[0]);
+    assert_eq!(reason, FallthroughReason::CapsuleError);
+    assert!(
+        detail.contains("/oversized"),
+        "the decline must name the request: {detail}"
     );
 }
 

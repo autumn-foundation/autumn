@@ -32,6 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now rejects `all` (case-insensitive) at index-registration time, so the
   ambiguity can never reach a backfill.
 
+- **the edge-capsule runtime now bounds a dispatched handler's response body
+  at 16 MiB:** `EdgeHandler` accepts any axum handler return type, including
+  a streaming body whose length is unbounded or driven by request input.
+  `serve_io` collected a dispatched handler's response with no limit before
+  emitting the wire frame, so one such request could buffer without bound —
+  the wasm guest's own allocator eventually traps against the host's memory
+  budget, but only after the attempt, and `serve_io` can also run natively
+  with no wasm host in the loop at all, where nothing else bounds it.
+  Exceeding the new cap now fails closed into the same
+  `FallthroughReason::CapsuleError` fallthrough the runtime already uses for
+  every other decline, so the origin serves the request instead.
+
 ### Performance
 
 - **scaffolded form helpers no longer re-escape their own constant HTML at
