@@ -70,6 +70,24 @@ use crate::wire::{
     canonicalize_headers, from_line, strip_sensitive_headers, strip_sentinel, to_line,
 };
 
+/// Cap on a single response body collected from a dispatched handler, in
+/// bytes (16 MiB).
+///
+/// `EdgeHandler` accepts any axum handler return type, including a streaming
+/// body whose length is unbounded or driven by request input (e.g. a path or
+/// query parameter). Without a limit here, collecting one such response would
+/// buffer without bound — the wasm guest's own allocator eventually traps
+/// against [`host::MEMORY_BUDGET_BYTES`](crate::host::MEMORY_BUDGET_BYTES),
+/// but only after the attempt, and `serve_io` can also run natively with no
+/// wasm host in the loop at all (see the module docs), where nothing else
+/// bounds it. Sized to match `host::STDOUT_LINE_BUDGET_BYTES`'s own "honest
+/// frame" assumption (16 MiB pre-base64) so a body within this limit is also
+/// within that budget once framed for the wire. Exceeding it fails
+/// `to_bytes` below, which the existing error arm already turns into a
+/// [`FallthroughReason::CapsuleError`] — the origin serves the request
+/// instead of the capsule exhausting memory on it.
+const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Serve edge requests over stdin/stdout until the host closes the stream.
 ///
 /// This is the entire body of a capsule's `main`. It returns on EOF; a
@@ -369,7 +387,7 @@ where
             );
         }
 
-        let body = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+        let body = match axum::body::to_bytes(response.into_body(), MAX_RESPONSE_BODY_BYTES).await {
             Ok(body) => body.to_vec(),
             Err(err) => {
                 return EdgeOutcome::fallthrough(
