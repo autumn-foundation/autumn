@@ -1004,7 +1004,7 @@ pub fn text_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -1017,9 +1017,9 @@ pub fn text_input<T: Serialize>(
                 value=(value)
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -1141,7 +1141,7 @@ pub fn text_input_htmx_with_token_field<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
     let target = "closest [data-autumn-field-wrapper]";
     let hx_params = format!("not {token_field}");
@@ -1156,7 +1156,7 @@ pub fn text_input_htmx_with_token_field<T: Serialize>(
                 value=(value)
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" })
+                aria-describedby=(error_id.as_deref().unwrap_or(""))
                 hx-post=(validate_url)
                 hx-trigger="change"
                 hx-target=(target)
@@ -1164,7 +1164,7 @@ pub fn text_input_htmx_with_token_field<T: Serialize>(
                 hx-include="closest form"
                 hx-params=(hx_params);
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -1229,7 +1229,7 @@ pub fn required_text_input_htmx_with_token_field<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
     let target = "closest [data-autumn-field-wrapper]";
     let hx_params = format!("not {token_field}");
@@ -1246,7 +1246,7 @@ pub fn required_text_input_htmx_with_token_field<T: Serialize>(
                 aria-required="true"
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" })
+                aria-describedby=(error_id.as_deref().unwrap_or(""))
                 hx-post=(validate_url)
                 hx-trigger="change"
                 hx-target=(target)
@@ -1254,7 +1254,7 @@ pub fn required_text_input_htmx_with_token_field<T: Serialize>(
                 hx-include="closest form"
                 hx-params=(hx_params);
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -1291,7 +1291,7 @@ pub fn password_input<T: Serialize>(
 ) -> maud::Markup {
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -1303,9 +1303,9 @@ pub fn password_input<T: Serialize>(
                 name=(field)
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -1330,7 +1330,7 @@ pub fn textarea_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -1341,10 +1341,10 @@ pub fn textarea_input<T: Serialize>(
                 name=(field)
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" })
+                aria-describedby=(error_id.as_deref().unwrap_or(""))
                 { (value) }
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -1617,14 +1617,14 @@ fn rich_text_area_inner<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let hint_id = format!("{field}-hint");
     let wrapper_id = format!("{field}-field");
     let preview_id = format!("{field}-preview");
     // The hint is always present, so `aria-describedby` is never empty and
     // never names an element that isn't in the DOM.
     let described_by = if has_errors {
-        format!("{hint_id} {error_id}")
+        format!("{hint_id} {}", error_id.as_deref().unwrap_or_default())
     } else {
         hint_id.clone()
     };
@@ -1660,7 +1660,7 @@ fn rich_text_area_inner<T: Serialize>(
                 { (value) }
             p id=(hint_id) class="autumn-rich-text__hint" { (RICH_TEXT_HINT) }
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -1722,7 +1722,7 @@ pub fn required_text_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -1736,9 +1736,9 @@ pub fn required_text_input<T: Serialize>(
                 required
                 aria-required="true"
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" {
                     @for error in errors {
                         p { (error) }
                     }
@@ -1791,7 +1791,7 @@ pub fn checkbox_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let checked = changeset.field_value(field).as_deref() == Some("true");
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -1805,9 +1805,9 @@ pub fn checkbox_input<T: Serialize>(
                 checked[checked]
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -1836,7 +1836,7 @@ pub fn number_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -1850,9 +1850,9 @@ pub fn number_input<T: Serialize>(
                 step=[step]
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -1878,7 +1878,7 @@ pub fn required_number_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -1894,9 +1894,9 @@ pub fn required_number_input<T: Serialize>(
                 aria-required="true"
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -2265,7 +2265,7 @@ pub fn date_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = normalize_date_value(&changeset.field_value(field).unwrap_or_default());
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -2278,9 +2278,9 @@ pub fn date_input<T: Serialize>(
                 value=(value)
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -2305,7 +2305,7 @@ pub fn required_date_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = normalize_date_value(&changeset.field_value(field).unwrap_or_default());
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -2320,9 +2320,9 @@ pub fn required_date_input<T: Serialize>(
                 aria-required="true"
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -2378,7 +2378,7 @@ pub fn datetime_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = normalize_datetime_local_value(&changeset.field_value(field).unwrap_or_default());
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -2392,9 +2392,9 @@ pub fn datetime_input<T: Serialize>(
                 step="any"
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -2419,7 +2419,7 @@ pub fn required_datetime_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = normalize_datetime_local_value(&changeset.field_value(field).unwrap_or_default());
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -2435,9 +2435,9 @@ pub fn required_datetime_input<T: Serialize>(
                 aria-required="true"
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -2471,7 +2471,7 @@ pub fn select_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let current = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -2482,13 +2482,13 @@ pub fn select_input<T: Serialize>(
                 name=(field)
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" }) {
+                aria-describedby=(error_id.as_deref().unwrap_or("")) {
                 @for (option_value, option_label) in options {
                     option value=(option_value) selected[*option_value == current] { (option_label) }
                 }
             }
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -2516,7 +2516,7 @@ pub fn required_select_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let current = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -2529,13 +2529,13 @@ pub fn required_select_input<T: Serialize>(
                 aria-required="true"
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" }) {
+                aria-describedby=(error_id.as_deref().unwrap_or("")) {
                 @for (option_value, option_label) in options {
                     option value=(option_value) selected[*option_value == current] { (option_label) }
                 }
             }
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -3085,13 +3085,13 @@ fn wrap_field_control(
     control: impl maud::Render,
     errors: &[String],
 ) -> maud::Markup {
-    let error_id = format!("{field_name}-error");
+    let error_id = (!errors.is_empty()).then(|| format!("{field_name}-error"));
     let wrapper_id = format!("{field_name}-field");
     maud::html! {
         div id=(wrapper_id) class="autumn-field" {
             (control)
             @if !errors.is_empty() {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
