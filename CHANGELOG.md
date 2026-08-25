@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same two headers the injection path already sets are now applied on this
   path too.
 
+- **`"all"` is now a reserved search index name:** `AUTUMN_SEARCH_BACKFILL`
+  and `autumn search reindex --index` use the literal value `all`
+  (case-insensitive) as a sentinel meaning "every registered index." Nothing
+  previously stopped an app from registering a real index actually named
+  `all` (a valid identifier, so `IndexDefinition::validate` accepted it) —
+  requesting a rebuild of that specific index instead reindexed, or with
+  `--purge`, emptied, every index in the app. `IndexDefinition::validate`
+  now rejects `all` (case-insensitive) at index-registration time, so the
+  ambiguity can never reach a backfill.
+
 ### Performance
 
 - **scaffolded form helpers no longer re-escape their own constant HTML at
