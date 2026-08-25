@@ -24,7 +24,7 @@ autumn-macros = { version = "0.7.0", path = "../autumn-macros" }
 axum = { version = "0.8", default-features = false, features = ["json", "query"] }
 # Not pinned in `[workspace.dependencies]`; matches the `base64 = "0.22"` line
 # already used by `autumn`, `autumn-cli`, and `examples/todo-app`.
-base64 = "0.22"
+base64 = "0.23"
 futures = { workspace = true }
 http = { workspace = true }
 serde = { workspace = true }

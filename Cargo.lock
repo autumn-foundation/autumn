@@ -470,7 +470,7 @@ version = "0.7.0"
 dependencies = [
  "autumn-schema-core",
  "autumn-web",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "crossterm",
@@ -518,7 +518,7 @@ version = "0.7.0"
 dependencies = [
  "autumn-macros",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "futures",
  "http 1.5.0",
  "serde",
@@ -623,7 +623,7 @@ dependencies = [
  "autumn-edge",
  "autumn-macros",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bcrypt",
  "brotli",
  "bytes",
@@ -8228,7 +8228,7 @@ name = "todo-app"
 version = "0.1.0"
 dependencies = [
  "autumn-web",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "diesel",
  "diesel-async",
