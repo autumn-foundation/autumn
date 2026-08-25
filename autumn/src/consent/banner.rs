@@ -388,6 +388,17 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
             // not just the bare class name) rather than assuming any
             // particular route.
             if contains_ascii_case_insensitive(&bytes, RENDERED_BANNER_MARKER.as_bytes()) {
+                // The handler's own rendering already carries a live,
+                // per-visitor CSRF token (see `consent_banner_markup`) —
+                // apply the same cache guards as the injection path below so
+                // a shared cache can't replay this visitor's token to
+                // someone else.
+                parts
+                    .headers
+                    .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+                parts
+                    .headers
+                    .append(VARY, HeaderValue::from_static("Cookie"));
                 return Response::from_parts(parts, Body::from(bytes));
             }
 
@@ -1277,6 +1288,46 @@ mod tests {
             html.matches(RENDERED_BANNER_MARKER).count(),
             1,
             "must not splice a second banner when the response already contains one: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stamps_cache_guards_when_handler_already_rendered_the_banner() {
+        // The handler's own rendering (as in the test above) carries a live,
+        // per-visitor CSRF token. Even though this middleware doesn't splice
+        // anything into that response, it must still stamp the same
+        // no-cache guards as the injection path — otherwise a shared cache
+        // could serve one visitor's token-bearing form to another.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    let banner = consent_banner_markup(Some("tok"), "_csrf").into_string();
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::from(format!("<html><body>{banner}</body></html>")))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+            }));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("private, no-store"),
+            "an already-rendered banner still carries a live CSRF token and must not be cached"
+        );
+        assert_eq!(
+            response.headers().get(VARY).and_then(|v| v.to_str().ok()),
+            Some("Cookie"),
+            "a shared cache must vary on the visitor's consent/CSRF cookie"
         );
     }
 
