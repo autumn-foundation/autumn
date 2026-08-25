@@ -102,8 +102,8 @@ macro_rules! with_migration_connection {
                     let $conn = &mut conn;
                     $body
                 };
-                // The runtime (when owned) drives the connection's tokio
-                // driver task: it must outlive every use of `conn`.
+                // The runtime drives the connection's tokio driver task: it
+                // must outlive every use of `conn`.
                 drop(conn);
                 drop(runtime);
                 result
@@ -776,38 +776,180 @@ where
         .collect())
 }
 
-/// Find a version in `new_migrations` that is already claimed, under a
-/// **different** full name, by `prior_by_version`. Pure and DB-free, so it
-/// can run at app-wiring time (inside
-/// [`AppBuilder::migrations`](crate::app::AppBuilder::migrations) /
-/// [`AppBuilder::plugin_migrations`](crate::app::AppBuilder::plugin_migrations)),
-/// before any migration connection exists.
+/// Compute a `full migration name -> substitute version` map that resolves
+/// every migration-version collision across `named_sets` automatically,
+/// rather than rejecting registration — see
+/// [`AppBuilder::plugin_migrations`](crate::app::AppBuilder::plugin_migrations)
+/// for the full rationale. Pure and DB-free (parses each embedded set's own
+/// version/name metadata; no connection involved), so it can run right
+/// before the apply loop, on the FINAL set of registered sources — including
+/// ones the framework itself folds in after app-wiring time (the
+/// shard-required version-history / commit-hook-queue sets), closing the gap
+/// a purely registration-time check would miss.
 ///
-/// This is the actual bug this guards against: Diesel's
-/// `__diesel_schema_migrations` table is keyed by **version alone** — it has
-/// no notion of which registered source (the framework, a plugin, the app's
-/// own `migrations/`) recorded a version. Two independently authored
-/// migrations that happen to reuse the same version — nothing coordinates
-/// timestamps across a plugin, the framework, and an app — collide silently:
-/// whichever set's `run_pending` call runs first "wins" the version, and
-/// every other set's same-versioned migration is skipped forever as
-/// "already applied", even though its `up.sql` never actually ran. A version
-/// reused by the SAME full name (e.g. a shard-required set folded verbatim
-/// into the full framework bundle too) is the intentional, harmless case and
-/// is not reported.
+/// Diesel's `__diesel_schema_migrations` table is keyed by **version
+/// alone** — it has no notion of which registered source (the framework, a
+/// plugin, the app's own `migrations/`) recorded a version. Two
+/// independently authored migrations that happen to reuse the same version
+/// — nothing coordinates timestamps across a plugin, the framework, and an
+/// app — would otherwise collide silently: whichever set's `run_pending`
+/// call runs first "wins" the version, and every other set's same-versioned
+/// migration is skipped forever as "already applied", even though its
+/// `up.sql` never actually ran.
 ///
-/// Returns `(version, new_full_name, prior_full_name)` for the first
-/// collision found, in `new_migrations` order.
-pub(crate) fn find_migration_version_collision(
-    prior_by_version: &std::collections::HashMap<String, String>,
-    new_migrations: &[(String, String)],
-) -> Option<(String, String, String)> {
-    new_migrations.iter().find_map(|(version, full_name)| {
-        prior_by_version.get(version).and_then(|prior_full_name| {
-            (prior_full_name != full_name)
-                .then(|| (version.clone(), full_name.clone(), prior_full_name.clone()))
-        })
-    })
+/// Sets are walked in `named_sets` order; the FIRST migration to claim a
+/// version keeps it untouched (so an existing, already-deployed database
+/// never sees its recorded version change). Each SUBSEQUENT migration whose
+/// version collides with a DIFFERENT already-claimed migration is mapped
+/// here to `"{version}+{source_name}"` (with a numeric tie-breaker appended
+/// on the rare chance that string is itself already in use), logged at
+/// `INFO` so the resolution is visible. A version reused under the exact
+/// SAME full name (e.g. a shard-required set folded verbatim into the full
+/// framework bundle too) is the intentional, harmless case and is left
+/// untouched — only genuinely different migrations get remapped.
+///
+/// Returns an empty map when nothing collides — the overwhelmingly common
+/// case — so callers can skip wrapping entirely when it's empty.
+pub(crate) fn compute_migration_disambiguation(
+    named_sets: &[(&str, EmbeddedMigrations)],
+) -> HashMap<String, String> {
+    let mut claimed_by_version: HashMap<String, String> = HashMap::new();
+    let mut versions_in_use: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut disambiguated: HashMap<String, String> = HashMap::new();
+
+    for (source_name, set) in named_sets {
+        let Ok(pairs) = migration_versions_and_names::<Pg>(set) else {
+            continue;
+        };
+        for (version, full_name) in pairs {
+            match claimed_by_version.get(&version) {
+                Some(prior_full_name) if *prior_full_name != full_name => {
+                    let mut substitute = format!("{version}+{source_name}");
+                    let mut tie_breaker = 2u32;
+                    while versions_in_use.contains(&substitute) {
+                        substitute = format!("{version}+{source_name}-{tie_breaker}");
+                        tie_breaker += 1;
+                    }
+                    tracing::info!(
+                        version = %version,
+                        migration = %full_name,
+                        collides_with = %prior_full_name,
+                        substitute_version = %substitute,
+                        "Migration version collision resolved automatically — both migrations will still apply"
+                    );
+                    versions_in_use.insert(substitute.clone());
+                    disambiguated.insert(full_name, substitute);
+                }
+                _ => {
+                    versions_in_use.insert(version.clone());
+                    claimed_by_version.entry(version).or_insert(full_name);
+                }
+            }
+        }
+    }
+    disambiguated
+}
+
+/// A migration whose TRACKED identity is a substitute version, while its
+/// actual behavior (`run`/`revert`/`metadata`) delegates entirely to the
+/// original. Built by [`DisambiguatedMigrations`] for an entry named in a
+/// [`compute_migration_disambiguation`] result.
+struct RenamedMigration<DB: diesel::backend::Backend + 'static> {
+    inner: Box<dyn Migration<DB>>,
+    name: RenamedMigrationName,
+}
+
+/// The [`diesel::migration::MigrationName`] a [`RenamedMigration`] reports:
+/// the same display text as the original (so logs and `autumn migrate
+/// status` still show the real migration name), but a substitute version.
+struct RenamedMigrationName {
+    display: String,
+    version: String,
+}
+
+impl std::fmt::Display for RenamedMigrationName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display)
+    }
+}
+
+impl diesel::migration::MigrationName for RenamedMigrationName {
+    fn version(&self) -> diesel::migration::MigrationVersion<'_> {
+        diesel::migration::MigrationVersion::from(self.version.as_str())
+    }
+}
+
+impl<DB: diesel::backend::Backend + 'static> Migration<DB> for RenamedMigration<DB> {
+    fn run(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+    ) -> diesel::migration::Result<()> {
+        self.inner.run(conn)
+    }
+
+    fn revert(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+    ) -> diesel::migration::Result<()> {
+        self.inner.revert(conn)
+    }
+
+    fn metadata(&self) -> &dyn diesel::migration::MigrationMetadata {
+        self.inner.metadata()
+    }
+
+    fn name(&self) -> &dyn diesel::migration::MigrationName {
+        &self.name
+    }
+}
+
+/// Wraps an [`EmbeddedMigrations`] set, transparently substituting the
+/// tracked version of any migration named in `disambiguated` (full name ->
+/// substitute version — see [`compute_migration_disambiguation`]). Every
+/// other migration in the set passes through completely unchanged — this is
+/// a no-op wrapper when `disambiguated` is empty, the overwhelmingly common
+/// case (no collision was ever detected).
+pub(crate) struct DisambiguatedMigrations<'a> {
+    inner: &'a EmbeddedMigrations,
+    disambiguated: &'a HashMap<String, String>,
+}
+
+impl<'a> DisambiguatedMigrations<'a> {
+    pub(crate) const fn new(
+        inner: &'a EmbeddedMigrations,
+        disambiguated: &'a HashMap<String, String>,
+    ) -> Self {
+        Self {
+            inner,
+            disambiguated,
+        }
+    }
+}
+
+impl<DB> MigrationSource<DB> for DisambiguatedMigrations<'_>
+where
+    DB: diesel::backend::Backend + 'static,
+    EmbeddedMigrations: MigrationSource<DB>,
+{
+    fn migrations(&self) -> diesel::migration::Result<Vec<Box<dyn Migration<DB>>>> {
+        let migrations = MigrationSource::<DB>::migrations(self.inner)?;
+        Ok(migrations
+            .into_iter()
+            .map(|m| {
+                let full_name = m.name().to_string();
+                match self.disambiguated.get(&full_name) {
+                    Some(substitute) => Box::new(RenamedMigration {
+                        name: RenamedMigrationName {
+                            display: full_name,
+                            version: substitute.clone(),
+                        },
+                        inner: m,
+                    }) as Box<dyn Migration<DB>>,
+                    None => m,
+                }
+            })
+            .collect())
+    }
 }
 
 /// SHA-256 content hash of a migration's `up.sql`, used to detect the case
@@ -2582,7 +2724,7 @@ pub(crate) fn auto_migrate(
     profile: Option<&str>,
     auto_migrate: Option<bool>,
     auto_migrate_in_production: bool,
-    migrations: &EmbeddedMigrations,
+    migrations: impl MigrationSource<Pg>,
     target: &str,
 ) {
     let profile_name = profile.unwrap_or("none");
@@ -2646,12 +2788,7 @@ pub(crate) fn auto_migrate(
             None
         };
 
-        match run_pending_locked_inner(
-            database_url,
-            EmbeddedMigrationsRef(migrations),
-            None,
-            up_by_version.as_ref(),
-        ) {
+        match run_pending_locked_inner(database_url, migrations, None, up_by_version.as_ref()) {
             Ok(result) if result.applied.is_empty() => {
                 tracing::info!(target = %target, "No pending migrations");
             }
@@ -2692,7 +2829,7 @@ pub(crate) fn auto_migrate(
         }
     } else {
         // In non-dev modes, just report status
-        match pending_migrations(database_url, EmbeddedMigrationsRef(migrations)) {
+        match pending_migrations(database_url, migrations) {
             Ok(pending) if pending.is_empty() => {
                 tracing::info!(target = %target, "Database migrations are up to date");
             }
@@ -2825,59 +2962,60 @@ pub(crate) fn auto_migrate_sqlite(
 mod tests {
     use super::*;
 
-    // ── Migration-version collision guard (plugin/app/framework) ───────────
-
-    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
-        entries
-            .iter()
-            .map(|(v, n)| (v.to_string(), n.to_string()))
-            .collect()
-    }
-
-    fn map(entries: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
-        entries
-            .iter()
-            .map(|(v, n)| (v.to_string(), n.to_string()))
-            .collect()
-    }
+    // ── Migration-version collision auto-resolution (plugin/app/framework) ─
 
     #[test]
-    fn no_collision_when_versions_are_disjoint() {
-        let prior = map(&[("20260101000000", "20260101000000_create_posts")]);
-        let new_migrations = pairs(&[("20260102000000", "20260102000000_create_comments")]);
-        assert_eq!(
-            find_migration_version_collision(&prior, &new_migrations),
-            None
+    fn no_disambiguation_when_versions_are_disjoint() {
+        const A: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        const B: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        let disambiguated = compute_migration_disambiguation(&[("app", A), ("test-plugin", B)]);
+        assert!(
+            disambiguated.is_empty(),
+            "disjoint version sets must not be touched: {disambiguated:?}"
         );
     }
 
     #[test]
-    fn no_collision_when_same_version_and_same_full_name() {
-        // The intentional, harmless case: a shard-required migration set
-        // folded verbatim into another bundle too (e.g. the standalone
-        // version-history set also ships inside FRAMEWORK_MIGRATIONS).
-        let prior = map(&[("20260101000000", "20260101000000_create_posts")]);
-        let new_migrations = pairs(&[("20260101000000", "20260101000000_create_posts")]);
-        assert_eq!(
-            find_migration_version_collision(&prior, &new_migrations),
-            None
+    fn no_disambiguation_when_same_set_registered_twice() {
+        // The intentional, harmless case: the exact same migration set
+        // registered from two different call sites (e.g. two plugins that
+        // both depend on a shared migrations bundle) reuses the same
+        // versions AND full names.
+        const A: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        let disambiguated = compute_migration_disambiguation(&[("plugin-a", A), ("plugin-b", A)]);
+        assert!(
+            disambiguated.is_empty(),
+            "re-registering the identical set must not be treated as a collision: {disambiguated:?}"
         );
     }
 
     #[test]
-    fn collision_when_same_version_different_full_name() {
+    fn disambiguates_a_real_version_collision() {
         // Real-world shape: a framework migration and an app's own first
-        // migration both picking the all-zero placeholder version.
-        let prior = map(&[("00000000000000", "00000000000000_create_api_tokens")]);
-        let new_migrations = pairs(&[("00000000000000", "00000000000000_create_todos")]);
-        assert_eq!(
-            find_migration_version_collision(&prior, &new_migrations),
-            Some((
-                "00000000000000".to_string(),
-                "00000000000000_create_todos".to_string(),
-                "00000000000000_create_api_tokens".to_string(),
-            ))
+        // migration both picking the all-zero placeholder version — exactly
+        // what `examples/todo-app` hits against the framework's legacy
+        // `create_api_tokens` migration.
+        const APP: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        const COLLIDING: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision");
+
+        let disambiguated =
+            compute_migration_disambiguation(&[("app", APP), ("test-plugin", COLLIDING)]);
+
+        // The FIRST-registered migration (the app's own) is untouched.
+        assert!(
+            !disambiguated.contains_key("00000000000000_create_todos"),
+            "the first-registered migration must keep its original version: {disambiguated:?}"
         );
+        // The SECOND-registered, colliding migration gets a substitute.
+        let substitute = disambiguated
+            .get("00000000000000_create_gadgets")
+            .expect("the colliding migration must be disambiguated");
+        assert_eq!(substitute, "00000000000000+test-plugin");
     }
 
     #[test]

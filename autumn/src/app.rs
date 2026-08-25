@@ -353,9 +353,11 @@ pub struct AppBuilder {
     /// Custom error page renderer (overrides built-in pages).
     #[cfg(feature = "maud")]
     error_page_renderer: Option<SharedRenderer>,
-    /// Embedded Diesel migrations, registered via `.migrations()`.
+    /// Embedded Diesel migrations, registered via `.migrations()` (tagged
+    /// `"app"`) or [`Self::plugin_migrations`] (tagged with the caller's
+    /// `name`) — see [`Self::plugin_migrations`] for why the name matters.
     #[cfg(feature = "db")]
-    migrations: Vec<migrate::EmbeddedMigrations>,
+    migrations: Vec<(&'static str, migrate::EmbeddedMigrations)>,
     /// Custom config loader (tier-1 subsystem replacement). When `None`, the
     /// default [`TomlEnvConfigLoader`](crate::config::TomlEnvConfigLoader) runs.
     config_loader_factory: Option<ConfigLoaderFactory>,
@@ -2765,18 +2767,10 @@ impl AppBuilder {
     /// }
     /// ```
     ///
-    /// # Panics
-    ///
-    /// Panics immediately — before `.run()` even starts — if `migrations`
-    /// reuses a version already claimed by a **different** migration in a
-    /// previously registered set (the framework's, if registered; a
-    /// plugin's, via [`Self::plugin_migrations`]; or an earlier call to this
-    /// same method). See [`Self::plugin_migrations`]'s docs for why this
-    /// check exists.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn migrations(mut self, migrations: migrate::EmbeddedMigrations) -> Self {
-        self.register_migrations("app", migrations);
+        self.migrations.push(("app", migrations));
         self
     }
 
@@ -2786,9 +2780,9 @@ impl AppBuilder {
     ///
     /// Functionally identical to [`Self::migrations`] — the set is applied at
     /// the same startup / one-shot points, subject to the same dev/prod
-    /// auto-apply policy — but `name` (e.g. `"autumn-admin-plugin"`) is used
-    /// to name this source if a version collision is detected, rather than
-    /// only the generic "app" label [`Self::migrations`] uses.
+    /// auto-apply policy — but tagged with `name` (e.g.
+    /// `"autumn-admin-plugin"`) rather than the generic `"app"` label
+    /// [`Self::migrations`] uses.
     ///
     /// # Examples
     ///
@@ -2800,25 +2794,31 @@ impl AppBuilder {
     ///     .await;
     /// ```
     ///
-    /// # Panics
+    /// # Version collisions are resolved automatically, never rejected
     ///
-    /// Panics immediately — before `.run()` even starts — if `migrations`
-    /// reuses a version already claimed by a **different** migration in a
-    /// previously registered set. Diesel's `__diesel_schema_migrations`
-    /// table is keyed by **version alone** — it has no notion of which
-    /// registered source (the framework, a plugin, the app's own
-    /// `migrations/`) recorded a version. Nothing coordinates timestamps
-    /// across a plugin, the framework, and an app, so two independently
-    /// authored migrations reusing the same version by coincidence would
-    /// otherwise apply silently wrong: whichever set's apply runs first
-    /// "wins" the version, and every other set's same-versioned migration is
-    /// skipped forever as "already applied" even though its `up.sql` never
-    /// actually ran. Failing fast, by name, at registration time is far
-    /// cheaper than debugging a production schema that silently forked from
-    /// what a fresh build would produce. A version reused under the exact
-    /// same full migration name (e.g. a shard-required set folded verbatim
-    /// into another bundle too) is the intentional, harmless case and never
-    /// panics.
+    /// Diesel's `__diesel_schema_migrations` table is keyed by **version
+    /// alone** — it has no notion of which registered source (the
+    /// framework, a plugin, the app's own `migrations/`) recorded a
+    /// version. Nothing coordinates timestamps across a plugin, the
+    /// framework, and an app, so it is entirely normal for two
+    /// independently authored migrations to reuse the same version by
+    /// coincidence — e.g. both picking an all-zero placeholder for their
+    /// first migration. Applied naively, whichever set's apply runs first
+    /// would "win" the version, and every other set's same-versioned
+    /// migration would be skipped forever as "already applied" even though
+    /// its `up.sql` never actually ran.
+    ///
+    /// Rather than reject this — which would leave an app unable to use a
+    /// plugin at all until someone renames a migration in a dependency they
+    /// may not control — the framework detects the collision at apply time
+    /// (across every registered set, including ones the framework itself
+    /// folds in) and transparently tracks the later-registered migration
+    /// under a distinguishing version derived from its version and source
+    /// name, so **both** migrations still apply. This is logged at `INFO`
+    /// so it is visible, not silent. A version reused under the exact same
+    /// full migration name (e.g. a shard-required set folded verbatim into
+    /// another bundle too) is the separate, intentional, harmless case and
+    /// is left untouched.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn plugin_migrations(
@@ -2826,48 +2826,8 @@ impl AppBuilder {
         name: &'static str,
         migrations: migrate::EmbeddedMigrations,
     ) -> Self {
-        self.register_migrations(name, migrations);
+        self.migrations.push((name, migrations));
         self
-    }
-
-    /// Shared implementation of [`Self::migrations`] and
-    /// [`Self::plugin_migrations`]: enumerate every migration already
-    /// registered (`self.migrations`, in call order), fail fast on a version
-    /// collision against `migrations` (see the panic docs above for why),
-    /// then register it.
-    ///
-    /// The check is pure and DB-free — it enumerates each `EmbeddedMigrations`
-    /// set's own version/name metadata (parsed from migration directory
-    /// names, not any database round-trip), so it runs at plain synchronous
-    /// app-wiring time, long before `.run()` opens any connection.
-    #[cfg(feature = "db")]
-    fn register_migrations(&mut self, name: &'static str, migrations: migrate::EmbeddedMigrations) {
-        let mut prior_by_version: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for existing in &self.migrations {
-            if let Ok(pairs) = migrate::migration_versions_and_names::<diesel::pg::Pg>(existing) {
-                for (version, full_name) in pairs {
-                    prior_by_version.entry(version).or_insert(full_name);
-                }
-            }
-        }
-        let new_pairs = migrate::migration_versions_and_names::<diesel::pg::Pg>(&migrations)
-            .unwrap_or_else(|e| {
-                panic!("failed to enumerate migrations registered via `{name}`: {e}")
-            });
-        if let Some((version, new_name, prior_name)) =
-            migrate::find_migration_version_collision(&prior_by_version, &new_pairs)
-        {
-            panic!(
-                "migration version {version} is claimed by two different migrations: `{new_name}` \
-                 (registered via `{name}`) and `{prior_name}` (already registered earlier). \
-                 Diesel's __diesel_schema_migrations table is keyed by version alone, so applying \
-                 both would silently skip whichever set runs second — forever — as \"already \
-                 applied\", even though its up.sql never actually ran. Rename one migration's \
-                 version (the timestamp prefix on its directory) so the two no longer collide."
-            );
-        }
-        self.migrations.push(migrations);
     }
 
     /// Embed the app's `static/` tree into the binary for single-binary deploys.
@@ -5485,6 +5445,12 @@ impl AppBuilder {
             }
         }
 
+        // Computed once, on the FINAL registered set (after the fold above),
+        // so a version collision between any two registered sources is
+        // resolved automatically rather than one migration silently never
+        // applying. See `compute_migration_disambiguation`.
+        let disambiguated = crate::migrate::compute_migration_disambiguation(&migrations);
+
         // The diesel harness and the advisory-lock poll block, so apply off the
         // Tokio worker threads. Each target's failure exits non-zero from inside.
         let applied_total = tokio::task::spawn_blocking(move || {
@@ -5494,7 +5460,8 @@ impl AppBuilder {
                 // NO advisory lock via the SQLite harness. Sharding is rejected above,
                 // so a SQLite control target here is always unsharded (shard_targets
                 // is empty). Every non-SQLite target keeps the byte-identical locked
-                // Postgres applier.
+                // Postgres applier. `SQLite` does not get the disambiguation
+                // treatment (out of scope for now).
                 #[cfg(feature = "sqlite")]
                 let is_sqlite_control = crate::config::DatabaseBackend::detect(url)
                     == Some(crate::config::DatabaseBackend::Sqlite);
@@ -5502,12 +5469,16 @@ impl AppBuilder {
                 let is_sqlite_control = false;
                 if is_sqlite_control {
                     #[cfg(feature = "sqlite")]
-                    for mig in &migrations {
+                    for (_, mig) in &migrations {
                         total += apply_pending_sqlite_or_exit(url, mig, "control");
                     }
                 } else {
-                    for mig in &migrations {
-                        total += apply_pending_or_exit(url, mig, "control");
+                    for (_, mig) in &migrations {
+                        total += apply_pending_or_exit(
+                            url,
+                            crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
+                            "control",
+                        );
                     }
                 }
             }
@@ -5516,11 +5487,15 @@ impl AppBuilder {
             // A `sqlite:` shard is rejected by the guard above, so every shard here
             // is Postgres.
             for (label, url) in &shard_targets {
-                for mig in migrations
+                for (_, mig) in migrations
                     .iter()
-                    .filter(|mig| !migration_set_is_control_framework(mig))
+                    .filter(|(_, mig)| !migration_set_is_control_framework(mig))
                 {
-                    total += apply_pending_or_exit(url, mig, label);
+                    total += apply_pending_or_exit(
+                        url,
+                        crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
+                        label,
+                    );
                 }
             }
             total
@@ -8600,7 +8575,7 @@ async fn resolve_shard_set(
 #[allow(clippy::too_many_lines)]
 async fn setup_database(
     config: &AutumnConfig,
-    migrations: Vec<crate::migrate::EmbeddedMigrations>,
+    migrations: Vec<(&'static str, crate::migrate::EmbeddedMigrations)>,
     pool_provider: Option<PoolProviderFactory>,
     shard_provider: Option<ShardProviderFactory>,
     shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
@@ -8834,14 +8809,10 @@ async fn setup_database(
 #[cfg(feature = "db")]
 fn apply_pending_or_exit(
     database_url: &str,
-    migrations: &crate::migrate::EmbeddedMigrations,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
     target: &str,
 ) -> usize {
-    match crate::migrate::run_pending_locked(
-        database_url,
-        crate::migrate::EmbeddedMigrationsRef(migrations),
-        None,
-    ) {
+    match crate::migrate::run_pending_locked(database_url, migrations, None) {
         Ok(result) => result.applied.len(),
         Err(error) => {
             let reason = match error {
@@ -9129,7 +9100,7 @@ async fn run_startup_migrations(
     control_configured: bool,
     shards_configured: bool,
     provider_migration_url: Option<String>,
-    migrations: Vec<crate::migrate::EmbeddedMigrations>,
+    migrations: Vec<(&'static str, crate::migrate::EmbeddedMigrations)>,
     directory_migration_required: bool,
     shard_map_migration_required: bool,
 ) {
@@ -9157,6 +9128,13 @@ async fn run_startup_migrations(
     let profile = config.profile.clone();
     let auto_migrate = config.database.auto_migrate;
     let auto_in_prod = config.database.auto_migrate_in_production;
+    // Computed once, on the FINAL registered set (after `setup_database`'s own
+    // fold added any shard-required sets), so a version collision between
+    // ANY two registered sources — framework, plugin, app, or a
+    // framework-required set folded in after app-wiring time — is resolved
+    // automatically rather than causing one migration to be silently
+    // skipped. See `compute_migration_disambiguation` for why.
+    let disambiguated = crate::migrate::compute_migration_disambiguation(&migrations);
     let migration_result = tokio::task::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (issue #1614, PR3): apply
         // the registered migrations to a `sqlite://` control target with NO
@@ -9165,13 +9143,15 @@ async fn run_startup_migrations(
         // (`sqlite_sharding_unsupported_guard`), so there is nothing shard- or
         // directory-related to do on this path — the directory/shard-map framework
         // migrations below are skipped for a SQLite control target. The Postgres
-        // path is left byte-identical for every non-SQLite target.
+        // path is left byte-identical for every non-SQLite target. `SQLite` does
+        // not get the disambiguation treatment (out of scope for now); each set
+        // still applies under its own original versions.
         #[cfg(feature = "sqlite")]
         if let Some(url) = control_url.as_deref()
             && crate::config::DatabaseBackend::detect(url)
                 == Some(crate::config::DatabaseBackend::Sqlite)
         {
-            for mig in &migrations {
+            for (_, mig) in &migrations {
                 crate::migrate::auto_migrate_sqlite(
                     url,
                     profile.as_deref(),
@@ -9185,13 +9165,13 @@ async fn run_startup_migrations(
         }
 
         if let Some(url) = control_url {
-            for mig in &migrations {
+            for (_, mig) in &migrations {
                 crate::migrate::auto_migrate(
                     &url,
                     profile.as_deref(),
                     auto_migrate,
                     auto_in_prod,
-                    mig,
+                    crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                     "control",
                 );
             }
@@ -9203,7 +9183,9 @@ async fn run_startup_migrations(
                     profile.as_deref(),
                     auto_migrate,
                     auto_in_prod,
-                    &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
+                    crate::migrate::EmbeddedMigrationsRef(
+                        &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
+                    ),
                     "control",
                 );
             }
@@ -9221,7 +9203,7 @@ async fn run_startup_migrations(
                     profile.as_deref(),
                     auto_migrate,
                     auto_in_prod,
-                    &crate::sharding::SHARD_MAP_MIGRATIONS,
+                    crate::migrate::EmbeddedMigrationsRef(&crate::sharding::SHARD_MAP_MIGRATIONS),
                     "control",
                 );
             }
@@ -9233,16 +9215,16 @@ async fn run_startup_migrations(
         // keep reporting them as pending, even though `autumn migrate --shard`
         // applies only the shard-required framework migrations.
         for (target, url) in &shard_targets {
-            for mig in migrations
+            for (_, mig) in migrations
                 .iter()
-                .filter(|mig| !migration_set_is_control_framework(mig))
+                .filter(|(_, mig)| !migration_set_is_control_framework(mig))
             {
                 crate::migrate::auto_migrate(
                     url,
                     profile.as_deref(),
                     auto_migrate,
                     auto_in_prod,
-                    mig,
+                    crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                     target,
                 );
             }
@@ -9499,22 +9481,28 @@ enum RepositoryCommitHookQueueMigrationMode {
 
 #[cfg(feature = "db")]
 fn migrations_with_repository_framework_migrations(
-    mut migrations: Vec<crate::migrate::EmbeddedMigrations>,
+    mut migrations: Vec<(&'static str, crate::migrate::EmbeddedMigrations)>,
     hook_queue_required: bool,
     version_history_required: bool,
     mode: RepositoryCommitHookQueueMigrationMode,
-) -> Vec<crate::migrate::EmbeddedMigrations> {
+) -> Vec<(&'static str, crate::migrate::EmbeddedMigrations)> {
     if hook_queue_required
         && mode == RepositoryCommitHookQueueMigrationMode::Runtime
         && !shard_applied_sets_include(&migrations, REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION)
     {
-        migrations.push(crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS);
+        migrations.push((
+            "repository-commit-hooks",
+            crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+        ));
     }
     if version_history_required
         && mode == RepositoryCommitHookQueueMigrationMode::Runtime
         && !shard_applied_sets_include(&migrations, VERSION_HISTORY_MIGRATION)
     {
-        migrations.push(crate::version_history::VERSION_HISTORY_MIGRATIONS);
+        migrations.push((
+            "version-history",
+            crate::version_history::VERSION_HISTORY_MIGRATIONS,
+        ));
     }
     migrations
 }
@@ -9535,7 +9523,7 @@ fn migrations_with_repository_framework_migrations(
 /// by the control framework set, so Diesel skips it there.
 #[cfg(feature = "db")]
 fn shard_applied_sets_include(
-    migrations: &[crate::migrate::EmbeddedMigrations],
+    migrations: &[(&'static str, crate::migrate::EmbeddedMigrations)],
     migration_name: &str,
 ) -> bool {
     use diesel::migration::{Migration, MigrationSource as _};
@@ -9543,8 +9531,8 @@ fn shard_applied_sets_include(
 
     migrations
         .iter()
-        .filter(|set| !migration_set_is_control_framework(set))
-        .any(|source| {
+        .filter(|(_, set)| !migration_set_is_control_framework(set))
+        .any(|(_, source)| {
             let Ok(source_migrations): Result<Vec<Box<dyn Migration<Pg>>>, _> = source.migrations()
             else {
                 return false;
@@ -12198,7 +12186,7 @@ mod tests {
     #[test]
     fn hooked_repository_apps_include_hook_queue_framework_migration() {
         let migrations = migrations_with_repository_framework_migrations(
-            vec![APP_TEST_MIGRATIONS],
+            vec![("app", APP_TEST_MIGRATIONS)],
             true,
             false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
@@ -12240,7 +12228,7 @@ mod tests {
     #[test]
     fn versioned_repository_apps_include_version_history_framework_migration() {
         let migrations = migrations_with_repository_framework_migrations(
-            vec![APP_TEST_MIGRATIONS],
+            vec![("app", APP_TEST_MIGRATIONS)],
             false,
             true,
             RepositoryCommitHookQueueMigrationMode::Runtime,
@@ -12340,13 +12328,13 @@ mod tests {
     }
 
     #[cfg(feature = "db")]
-    fn migration_names(migrations: &[crate::migrate::EmbeddedMigrations]) -> Vec<String> {
+    fn migration_names(migrations: &[(&str, crate::migrate::EmbeddedMigrations)]) -> Vec<String> {
         use diesel::migration::{Migration, MigrationSource as _};
         use diesel::pg::Pg;
 
         migrations
             .iter()
-            .flat_map(|source| {
+            .flat_map(|(_, source)| {
                 let migrations: Vec<Box<dyn Migration<Pg>>> = source.migrations().unwrap();
                 migrations
             })
@@ -12385,7 +12373,7 @@ mod tests {
         // the standalone shard-required sets must still be appended — otherwise
         // shards never get those tables.
         let migrations = migrations_with_repository_framework_migrations(
-            vec![crate::migrate::FRAMEWORK_MIGRATIONS],
+            vec![("app", crate::migrate::FRAMEWORK_MIGRATIONS)],
             true,
             true,
             RepositoryCommitHookQueueMigrationMode::Runtime,
@@ -12395,8 +12383,8 @@ mod tests {
         // that is not the control framework set (which gets stripped on shards).
         let shard_names: Vec<String> = migrations
             .iter()
-            .filter(|set| !migration_set_is_control_framework(set))
-            .flat_map(|set| {
+            .filter(|(_, set)| !migration_set_is_control_framework(set))
+            .flat_map(|(_, set)| {
                 let ms: Vec<Box<dyn Migration<Pg>>> = set.migrations().unwrap_or_default();
                 ms.into_iter()
                     .map(|m| m.name().to_string())
@@ -12445,22 +12433,35 @@ mod tests {
 
     #[cfg(feature = "db")]
     #[test]
-    #[should_panic(expected = "is claimed by two different migrations")]
-    fn plugin_migrations_panics_on_version_collision_with_app_migrations() {
+    fn plugin_migrations_registration_never_panics_on_version_collision() {
         // Real-world shape this guards against: an app's own first migration
         // and a plugin's migration coincidentally both using the same
-        // placeholder version (`00000000000000`) but with different content.
-        // Diesel's __diesel_schema_migrations is keyed by version alone, so
-        // without this check the plugin's `create_gadgets` would silently
-        // never run once the app's `create_todos` claimed that version first.
+        // placeholder version (`00000000000000`) but with different content
+        // -- exactly what `examples/todo-app` hits against the framework's
+        // legacy `create_api_tokens` migration. Registration must always
+        // succeed; the collision is resolved automatically at apply time
+        // instead (see `compute_migration_disambiguation`'s own tests) --
+        // rejecting it here would leave an app unable to use a plugin at all
+        // until someone renames a migration in a dependency they may not
+        // control.
         const APP_MIGRATIONS: crate::migrate::EmbeddedMigrations =
             diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
         const COLLIDING_PLUGIN_MIGRATIONS: crate::migrate::EmbeddedMigrations =
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision");
 
-        let _ = app()
+        let builder = app()
             .migrations(APP_MIGRATIONS)
             .plugin_migrations("test-plugin", COLLIDING_PLUGIN_MIGRATIONS);
+
+        let names = migration_names(&builder.migrations);
+        assert!(
+            names.iter().any(|n| n == "00000000000000_create_todos"),
+            "the app's own colliding migration must still be registered: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "00000000000000_create_gadgets"),
+            "the plugin's colliding migration must still be registered: {names:?}"
+        );
     }
 
     #[cfg(feature = "db")]

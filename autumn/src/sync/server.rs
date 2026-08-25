@@ -1187,8 +1187,8 @@ macro_rules! with_sync_pg_connection {
                     let $conn = &mut conn;
                     $body
                 };
-                // The runtime (when owned) drives the connection's tokio
-                // driver task: it must outlive every use of `conn`.
+                // The runtime drives the connection's tokio driver task: it
+                // must outlive every use of `conn`.
                 drop(conn);
                 drop(runtime);
                 result

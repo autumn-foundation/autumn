@@ -30,19 +30,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`AppBuilder::plugin_migrations(name, migrations)`:** a named registration
   path for embedded Diesel migrations owned by a plugin or other third-party
-  integration, distinct from the app's own `.migrations()`. Both now share a
-  version-collision guard: registering a set that reuses a version already
-  claimed by a *different* migration in a previously registered set (the
-  framework's, a plugin's, or the app's own) now panics immediately, at
-  app-wiring time, naming both migrations and the version. Diesel's
-  `__diesel_schema_migrations` table is keyed by version alone, so without
-  this guard two independently authored migrations that happen to share a
-  version would collide silently: whichever set applies first "wins" the
-  version, and every other set's same-versioned migration is skipped forever
-  as "already applied" even though its `up.sql` never actually ran. A version
-  reused under the exact same full migration name (e.g. a shard-required set
-  folded verbatim into another bundle too) is the existing, intentional,
-  harmless case and is not flagged.
+  integration, distinct from the app's own `.migrations()`. Diesel's
+  `__diesel_schema_migrations` table is keyed by version alone, so it is
+  entirely normal for two independently authored migrations — the framework's,
+  a plugin's, the app's own — to reuse the same version by coincidence (e.g.
+  `examples/todo-app`'s own first migration collides with the framework's
+  legacy `create_api_tokens` migration, both using the all-zero placeholder
+  version). Applied naively, whichever set runs first would "win" the
+  version and the other's same-versioned migration would be skipped forever
+  as "already applied", even though its `up.sql` never actually ran. Rather
+  than reject this — which would leave an app unable to use a plugin at all
+  until someone renames a migration in a dependency they may not control —
+  the framework now detects the collision at apply time (across every
+  registered source, including ones the framework itself folds in after
+  app-wiring time) and transparently tracks the later-registered migration
+  under a distinguishing version derived from its version and source name, so
+  **both** migrations still apply. This is logged at `INFO` so it is visible,
+  not silent. A version reused under the exact same full migration name (e.g.
+  a shard-required set folded verbatim into another bundle too) is the
+  separate, intentional, harmless case and is left untouched.
 
 ### Security
 

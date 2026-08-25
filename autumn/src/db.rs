@@ -5906,14 +5906,68 @@ pub(crate) enum MigrationConnection {
     Native(diesel::PgConnection),
     /// rustls-backed sync wrapper (TLS posture `Require`/`VerifyFull`).
     Rustls {
-        /// Runtime owning the connection's tokio driver task when none was
-        /// ambient (plain sync contexts like the CLI); `None` when an
-        /// ambient runtime drives it (`spawn_blocking` contexts). Callers
-        /// must keep this alive as long as `conn` — dropping the runtime
-        /// kills the driver and every query after that hangs or errors.
-        runtime: Option<tokio::runtime::Runtime>,
+        /// Dedicated runtime owning the connection's tokio driver task —
+        /// always present, never the caller's ambient runtime (see
+        /// [`establish_migration_connection`] for why). Callers must keep
+        /// this alive as long as `conn` — dropping it kills the driver and
+        /// every query after that hangs or errors.
+        runtime: BackgroundRuntime,
         conn: diesel_async::async_connection_wrapper::AsyncConnectionWrapper<AsyncPgConnection>,
     },
+}
+
+/// A `tokio::runtime::Runtime` whose actual shutdown runs on a dedicated
+/// background OS thread when this value is dropped, rather than on whatever
+/// thread the drop happens to run on.
+///
+/// `Runtime::drop` synchronously blocks to join its worker and blocking-pool
+/// threads — and tokio forbids that from a thread already inside ANY
+/// runtime's async-task execution, panicking with "Cannot drop a runtime in
+/// a context where blocking is not allowed". A [`MigrationConnection`] (and
+/// the runtime inside it) may be dropped from exactly such a thread — e.g.
+/// an app's own `.on_startup(|state| async move { ... })` hook — so the
+/// actual join is deferred to a freshly spawned, un-managed OS thread, which
+/// is never "inside" any runtime and can always join safely. This mirrors
+/// why [`establish_migration_connection`]'s connect step also runs on its
+/// own dedicated thread rather than the calling one.
+pub(crate) struct BackgroundRuntime(Option<tokio::runtime::Runtime>);
+
+impl BackgroundRuntime {
+    fn new(runtime: tokio::runtime::Runtime) -> Self {
+        Self(Some(runtime))
+    }
+
+    /// A handle to the wrapped runtime, valid until this value is dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after the runtime has already been taken by
+    /// [`Drop::drop`] — not reachable through normal use, since `drop` only
+    /// runs once, at the end of this value's lifetime.
+    fn handle(&self) -> tokio::runtime::Handle {
+        self.0
+            .as_ref()
+            .expect("BackgroundRuntime used after its runtime was dropped")
+            .handle()
+            .clone()
+    }
+}
+
+impl Drop for BackgroundRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            // Best-effort: if the OS refuses to spawn even one more thread
+            // (exhausted at process shutdown, say), the closure — and the
+            // runtime it captured — is simply dropped in place as part of
+            // `spawn`'s own `Err` path, synchronously, right here. That
+            // risks the exact panic this type exists to avoid, but only in
+            // that near-impossible scenario — no worse than not having this
+            // type at all.
+            let _ = std::thread::Builder::new()
+                .name("autumn-migrate-runtime-shutdown".to_owned())
+                .spawn(move || drop(runtime));
+        }
+    }
 }
 
 /// Whether migrations/wait checks for `database_url` must go through the
@@ -5932,12 +5986,11 @@ fn migration_connection_needs_rustls(database_url: &str) -> bool {
 /// Safe to call from **any** context — a plain sync context (the CLI), a
 /// `spawn_blocking` task (the startup migration path), or directly from
 /// inside an `async fn`/`.on_startup(|state| async move { ... })` body (an
-/// app's own migration hook: TLS-enabled migrations
-/// panicked in production — where `sslmode=require`/`verify-full` routes
-/// through the rustls arm below — while working fine in dev, where TLS is
-/// typically off and this whole arm is skipped). See the rustls arm's
-/// comment for why calling from within the ambient runtime's own worker
-/// threads no longer panics.
+/// app's own migration hook: TLS-enabled migrations used to panic in
+/// production — where `sslmode=require`/`verify-full` routes through the
+/// rustls arm below — while working fine in dev, where TLS is typically off
+/// and this whole arm is skipped). See the rustls arm's comment for why this
+/// is now safe regardless of the caller's runtime context.
 ///
 /// # Errors
 ///
@@ -5954,42 +6007,55 @@ pub(crate) fn establish_migration_connection(
         return diesel::PgConnection::establish(database_url).map(MigrationConnection::Native);
     }
     let posture = tls::TlsPosture::from_database_url(database_url);
-    // The driver task tokio::spawn()ed during establish must stay driven for
-    // the connection's lifetime: reuse the ambient runtime when there is one
-    // (spawn_blocking context, or a plain async caller — see below),
-    // otherwise create one and keep it alive alongside the connection.
-    let (runtime, handle) = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        (None, handle)
-    } else {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                diesel::ConnectionError::BadConnection(format!(
-                    "failed to build a tokio runtime for the TLS migration connection: {e}"
-                ))
-            })?;
-        let handle = runtime.handle().clone();
-        (Some(runtime), handle)
-    };
-    // `handle.block_on` panics ("Cannot start a runtime from within a
-    // runtime") if the CALLING thread is itself one of that runtime's own
-    // worker threads mid-poll — exactly what happens when this is called
-    // directly from a plain `async fn`/`.on_startup(|state| async move {
-    // ... })` body rather than from `spawn_blocking`. Running
-    // the actual `block_on` on a dedicated, freshly spawned OS thread
-    // sidesteps this unconditionally: that thread is never part of the
-    // runtime's worker pool, so blocking IT is always legal, regardless of
-    // whether the caller happened to already be inside the runtime. The
-    // runtime keeps driving the connection's background I/O task afterward
-    // either way — `tokio::spawn` (inside `tls::establish`) schedules onto
-    // the runtime itself, not onto whichever thread happened to call it.
-    let connect_handle = handle.clone();
+    // Always build a DEDICATED runtime, and always connect on a dedicated,
+    // freshly spawned OS thread — never the caller's ambient runtime, and
+    // never the calling thread. Two independent hazards rule out reusing an
+    // ambient runtime/handle here:
+    //
+    //   * `Handle::block_on` panics ("Cannot start a runtime from within a
+    //     runtime") if the CALLING thread is itself inside ANY runtime's
+    //     context — e.g. an app's own `.on_startup(|state| async move {
+    //     ... })` hook, which runs as a task on one of the ambient runtime's
+    //     own worker threads. This is what TLS-enabled migrations used to
+    //     hit in production.
+    //   * Even routed through a helper thread, reusing the AMBIENT
+    //     runtime's handle is only actually safe if that runtime still has
+    //     spare capacity to keep driving I/O/timers while this call blocks —
+    //     which is never true for a `current_thread` runtime (it has exactly
+    //     one driving thread, and it would be the one now blocked here,
+    //     hanging the connect forever instead of returning or panicking),
+    //     and is fragile to reason about for a `multi_thread` runtime with
+    //     too few idle workers.
+    //
+    // Building a fully independent runtime sidesteps both: it owes nothing
+    // to whatever runtime the caller happens to be on, and connecting on a
+    // dedicated OS thread means the calling thread is never the one that
+    // has to enter it. A migration connection is established once per boot
+    // (this whole path only runs for TLS-requiring targets), so one extra
+    // small runtime + thread is a negligible, one-time cost. The runtime
+    // must stay alive for the connection's whole lifetime (its background
+    // I/O-driving task keeps running on it), so it is kept alongside `conn`
+    // in [`MigrationConnection::Rustls`].
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            diesel::ConnectionError::BadConnection(format!(
+                "failed to build a tokio runtime for the TLS migration connection: {e}"
+            ))
+        })?;
+    // Wrap immediately, before anything below can fail and return early: an
+    // early `?` must drop `runtime` through `BackgroundRuntime`'s deferred
+    // shutdown too, not as a raw `tokio::runtime::Runtime` on the calling
+    // thread (which is exactly the connect-failure path this function's own
+    // regression tests exercise).
+    let runtime = BackgroundRuntime::new(runtime);
+    let handle = runtime.handle();
     let url = database_url.to_owned();
     let inner = std::thread::Builder::new()
         .name("autumn-migrate-tls-connect".to_owned())
-        .spawn(move || connect_handle.block_on(tls::establish(&url, posture)))
+        .spawn(move || handle.block_on(tls::establish(&url, posture)))
         .map_err(|e| {
             diesel::ConnectionError::BadConnection(format!(
                 "failed to spawn the TLS migration connect thread: {e}"
@@ -6098,5 +6164,40 @@ mod migration_connection_tests {
             "an unreachable TLS-requiring host must fail with a connection error \
              (not panic on nested block_on)"
         );
+    }
+
+    // Regression guard: `#[tokio::test]`'s default flavor is `current_thread`
+    // -- exactly one thread drives this runtime's I/O and timers, and that
+    // thread is the one about to call `establish_migration_connection`
+    // directly (mirroring an app's own `.on_startup` hook body, not
+    // `spawn_blocking`). If this ever went back to reusing the AMBIENT
+    // runtime's handle (from a helper thread or otherwise) instead of
+    // building a fully independent one, this would DEADLOCK rather than
+    // fail fast: there would be nothing left free to drive the connect's
+    // I/O. A watchdog thread bounds that -- there is no clean way to cancel
+    // a genuinely stuck OS thread, so a real regression here hard-exits the
+    // process instead of hanging the suite.
+    #[tokio::test]
+    async fn establish_migration_connection_does_not_hang_on_a_current_thread_runtime() {
+        let watchdog = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            eprintln!(
+                "establish_migration_connection_does_not_hang_on_a_current_thread_runtime: \
+                 timed out after 20s -- the TLS connect hung instead of failing fast"
+            );
+            std::process::exit(101);
+        });
+
+        let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db?sslmode=require";
+        let result = super::establish_migration_connection(url);
+        assert!(
+            result.is_err(),
+            "an unreachable TLS-requiring host must fail with a connection error"
+        );
+
+        // Returned without hanging -- let the watchdog's sleeping thread be
+        // reaped with normal process teardown; there is no clean cancel API
+        // for it, and a detached sleeping thread is harmless.
+        drop(watchdog);
     }
 }
