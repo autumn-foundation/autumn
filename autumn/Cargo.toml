@@ -476,6 +476,14 @@ path = "tests/config_alloc_gate.rs"
 name = "password_policy_alloc_gate"
 path = "tests/password_policy_alloc_gate.rs"
 
+# Allocation gate for the scaffolded form-render helpers on the same 12-field
+# workload as `benches/form_render.rs` (Bolt follow-up to #2295/#2298, looking
+# at the per-field `error_id` allocation). Own binary for the same
+# `allocation-counter` global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "form_render_alloc_gate"
+path = "tests/form_render_alloc_gate.rs"
+
 # SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
 # `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
 # `cargo test` compiles it to an empty (passing) binary. Run explicitly:
