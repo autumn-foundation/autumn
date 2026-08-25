@@ -5906,12 +5906,19 @@ pub(crate) enum MigrationConnection {
     Native(diesel::PgConnection),
     /// rustls-backed sync wrapper (TLS posture `Require`/`VerifyFull`).
     Rustls {
-        /// Runtime owning the connection's tokio driver task when none was
-        /// ambient (plain sync contexts like the CLI); `None` when an
-        /// ambient runtime drives it (`spawn_blocking` contexts). Callers
-        /// must keep this alive as long as `conn` — dropping the runtime
-        /// kills the driver and every query after that hangs or errors.
-        runtime: Option<tokio::runtime::Runtime>,
+        /// Dedicated runtime owning the connection's tokio driver task —
+        /// always present, never the caller's ambient runtime (see
+        /// [`establish_migration_connection`] for why). Callers must keep
+        /// this alive as long as `conn` — dropping it kills the driver and
+        /// every query after that hangs or errors. It is safe to drop
+        /// normally (no deferred-shutdown wrapper needed): every caller of
+        /// [`establish_migration_connection`] reaches it only from a thread
+        /// that has never entered any runtime (see that function's doc
+        /// comment), and stays off any runtime's "entered" state except
+        /// during each individual `block_on` call this connection or `conn`
+        /// makes — so a drop between those calls is never "from within an
+        /// asynchronous context" the way tokio forbids.
+        runtime: tokio::runtime::Runtime,
         conn: diesel_async::async_connection_wrapper::AsyncConnectionWrapper<AsyncPgConnection>,
     },
 }
@@ -5929,9 +5936,32 @@ fn migration_connection_needs_rustls(database_url: &str) -> bool {
 
 /// Establish a [`MigrationConnection`] for `database_url`.
 ///
-/// **Never call from an async executor thread**: the rustls arm `block_on`s
-/// connection setup. Sync contexts (the CLI) and `spawn_blocking` tasks (the
-/// startup migration path) are both fine.
+/// # Thread-safety contract — read before adding a new caller
+///
+/// This function itself is unconditionally safe to call from any thread: it
+/// only ever enters/exits a runtime it just built, on the thread it is
+/// running on, never touching an ambient one. But the connection it returns
+/// is NOT fully self-contained for the rustls arm — the returned
+/// [`AsyncConnectionWrapper`] bridges every subsequent sync diesel call
+/// (`MigrationHarness::run_pending_migrations`, plain queries, ...) through
+/// its OWN internal `block_on`, and that bridging still panics
+/// ("Cannot start a runtime from within a runtime") if invoked from a thread
+/// that is itself already inside some OTHER ambient runtime's context — the
+/// exact shape of an app's own `.on_startup(|state| async move { ... })`
+/// hook calling a migration function directly (TLS-enabled migrations used
+/// to panic in production this way; TLS off never hit this arm, so it never
+/// surfaced in dev). So this function alone does not make that case safe —
+/// **every caller must ensure the connection is established AND used
+/// entirely on a thread that has never entered any runtime**, e.g. via
+/// [`with_migration_connection!`]/`with_sync_pg_connection!`, which dispatch
+/// their whole body (this call plus every query `$body` makes) onto a
+/// freshly spawned [`std::thread::scope`] thread. [`hold_migration_lock`]'s
+/// caller (the CLI's `autumn migrate`) satisfies this by construction — it
+/// never runs inside a tokio runtime at all.
+///
+/// [`AsyncConnectionWrapper`]:
+///     diesel_async::async_connection_wrapper::AsyncConnectionWrapper
+/// [`with_migration_connection!`]: crate::migrate
 ///
 /// # Errors
 ///
@@ -5948,26 +5978,25 @@ pub(crate) fn establish_migration_connection(
         return diesel::PgConnection::establish(database_url).map(MigrationConnection::Native);
     }
     let posture = tls::TlsPosture::from_database_url(database_url);
-    // The driver task tokio::spawn()ed during establish must stay driven for
-    // the connection's lifetime: reuse the ambient runtime when there is one
-    // (spawn_blocking context), otherwise create one and keep it alive
-    // alongside the connection.
-    let (runtime, handle) = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        (None, handle)
-    } else {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                diesel::ConnectionError::BadConnection(format!(
-                    "failed to build a tokio runtime for the TLS migration connection: {e}"
-                ))
-            })?;
-        let handle = runtime.handle().clone();
-        (Some(runtime), handle)
-    };
-    let inner = handle.block_on(tls::establish(database_url, posture))?;
+    // Build a dedicated runtime and connect ON THE CALLING THREAD directly
+    // (no further nested thread-spawn needed here): per this function's own
+    // contract above, every caller already guarantees the calling thread has
+    // never entered any runtime, so entering this freshly built one is
+    // always safe. It drives the connection's background I/O task for as
+    // long as `conn` is used, so it is kept alongside `conn` in
+    // [`MigrationConnection::Rustls`] — dropping it is likewise safe here,
+    // since by the time it drops (after every query `$body` makes has
+    // completed) this thread is not mid-`block_on` on anything.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            diesel::ConnectionError::BadConnection(format!(
+                "failed to build a tokio runtime for the TLS migration connection: {e}"
+            ))
+        })?;
+    let inner = runtime.block_on(tls::establish(database_url, posture))?;
     Ok(MigrationConnection::Rustls {
         runtime,
         conn: diesel_async::async_connection_wrapper::AsyncConnectionWrapper::from(inner),
@@ -6046,5 +6075,88 @@ mod migration_connection_tests {
                 "must use the rustls wrapper: {url}"
             );
         }
+    }
+
+    // Regression: TLS-enabled migrations panicked with "Cannot start
+    // a runtime from within a runtime" when called directly from an app's
+    // own async `on_startup` hook rather than from `spawn_blocking` --
+    // because the rustls arm's connect used to `block_on` on the CALLING
+    // thread, which IS one of the ambient runtime's own worker threads while
+    // an `.on_startup(|state| async move { ... })` body executes. TLS off
+    // (dev) never took this arm, so the bug only ever surfaced with
+    // `sslmode=require`/`verify-full` (prod).
+    //
+    // Exercises `crate::migrate::pending_migrations` -- the actual public
+    // entry point apps call -- rather than `establish_migration_connection`
+    // directly: that bare function is only safe when the whole connect +
+    // query sequence runs on a thread that never entered a runtime, a
+    // guarantee `with_migration_connection!` (which `pending_migrations`
+    // uses internally) provides by construction. Calling it directly, as
+    // this test used to, no longer represents how any real caller uses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_functions_do_not_panic_from_an_async_caller() {
+        const MIGRATIONS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        // Calling this directly from an `async fn` body -- not wrapped in
+        // `spawn_blocking` -- mirrors the shape of an app's own async
+        // `on_startup` hook calling `autumn_web::migrate::run_pending(...)`.
+        // On a multi-threaded runtime (axum's default), matching production.
+        let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db?sslmode=require";
+        let result = crate::migrate::pending_migrations(url, MIGRATIONS);
+        assert!(
+            result.is_err(),
+            "an unreachable TLS-requiring host must fail with a connection error \
+             (not panic on nested block_on)"
+        );
+    }
+
+    // Regression guard: `#[tokio::test]`'s default flavor is `current_thread`
+    // -- exactly one thread drives this runtime's I/O and timers, and that
+    // thread is the one about to call a migration function directly
+    // (mirroring an app's own `.on_startup` hook body, not `spawn_blocking`).
+    // If `with_migration_connection!` ever went back to running the connect
+    // (or the query) on the CALLING thread instead of a freshly spawned
+    // `thread::scope` thread, this would DEADLOCK rather than fail fast:
+    // there would be nothing left free to drive the connect's I/O. A
+    // watchdog thread bounds that -- there is no clean way to cancel a
+    // genuinely stuck OS thread, so a real regression here hard-exits the
+    // process instead of hanging the suite.
+    #[tokio::test]
+    async fn migration_functions_do_not_hang_on_a_current_thread_runtime() {
+        const MIGRATIONS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        // A plain `sleep`-then-`exit` watchdog can't be cancelled once
+        // spawned, so a detached one would keep counting down after this
+        // test returns and could later `process::exit` the shared test
+        // binary mid-suite, on an unrelated test, if the suite is still
+        // running 20s after this test passed. A channel lets the main
+        // thread signal "the call returned, stand down" so the watchdog only
+        // ever fires on a genuine hang.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if done_rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .is_err()
+            {
+                eprintln!(
+                    "migration_functions_do_not_hang_on_a_current_thread_runtime: \
+                     timed out after 20s -- the TLS connect hung instead of failing fast"
+                );
+                std::process::exit(101);
+            }
+        });
+
+        let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db?sslmode=require";
+        let result = crate::migrate::pending_migrations(url, MIGRATIONS);
+        assert!(
+            result.is_err(),
+            "an unreachable TLS-requiring host must fail with a connection error"
+        );
+
+        // Stand the watchdog down and wait for it to exit cleanly, rather
+        // than leaving a live "exit(101) in 20s" timer running in the shared
+        // test binary after this test has already passed.
+        let _ = done_tx.send(());
+        let _ = watchdog.join();
     }
 }

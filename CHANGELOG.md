@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **TLS-enabled migrations no longer panic when applied from an app's own
+  async `on_startup` hook:** the sync migration/wait-check path bridges to
+  Postgres through diesel-async's `AsyncConnectionWrapper` whenever the
+  database URL requires TLS (`sslmode=require`/`verify-full` — the native
+  libpq path can't reach a TLS-only server at all). That wrapper bridges
+  every sync diesel call — connecting, and separately every query it's later
+  asked to run — through its own internal `block_on`, which panics with
+  "Cannot start a runtime from within a runtime" if invoked from a thread
+  that is itself already inside some ambient tokio runtime's context. That's
+  exactly what happens when an app or plugin calls a migration function
+  (e.g. `autumn_web::migrate::run_pending(...)`) directly from a plain
+  `async fn`/`.on_startup(|state| async move { ... })` body, rather than from
+  `spawn_blocking`. Because the native (non-TLS) path never touches a
+  runtime at all, this only ever surfaced once TLS was turned on — the exact
+  "works in dev, breaks in prod against a TLS-only database" shape, and it
+  could still resurface even after only the initial connect was fixed, the
+  moment an actual migration query ran. The connect **and every subsequent
+  query** now run together on one freshly spawned OS thread that never
+  touches any ambient runtime, closing both failure points. Verified against
+  a real TLS-enabled Postgres server, on both a `current_thread` and
+  `multi_thread` tokio runtime, called directly from an async body.
+
+### Added
+
+- **`AppBuilder::plugin_migrations(name, migrations)`:** a named registration
+  path for embedded Diesel migrations owned by a plugin or other third-party
+  integration, distinct from the app's own `.migrations()`. Diesel's
+  `__diesel_schema_migrations` table is keyed by version alone, so it is
+  entirely normal for two independently authored migrations — the framework's,
+  a plugin's, the app's own — to reuse the same version by coincidence (e.g.
+  `examples/todo-app`'s own first migration collides with the framework's
+  legacy `create_api_tokens` migration, both using the all-zero placeholder
+  version). Applied naively, whichever set runs first would "win" the
+  version and the other's same-versioned migration would be skipped forever
+  as "already applied", even though its `up.sql` never actually ran. Rather
+  than reject this — which would leave an app unable to use a plugin at all
+  until someone renames a migration in a dependency they may not control —
+  the framework now detects the collision at apply time (across every
+  registered source, including ones the framework itself folds in after
+  app-wiring time) and transparently tracks one of the colliding migrations
+  under a bounded, deterministic substitute version, so **both** migrations
+  still apply. Which one keeps the plain version is a pure function of the
+  migrations' own names (not registration order), so reordering
+  `.migrations()`/`.plugin_migrations()` calls or adding a new plugin never
+  flips an already-settled collision. This is logged at `INFO` so it is
+  visible, not silent, and it applies uniformly to Postgres and SQLite
+  targets. A version reused under the exact same full migration name (e.g. a
+  shard-required set folded verbatim into another bundle too) is the
+  separate, intentional, harmless case and is left untouched. This does not
+  (and, given Diesel's version-only tracking, cannot) recover history for a
+  new plugin whose migration collides with a version an app already applied
+  under an *earlier*, pre-plugin deploy — see the method's doc comment.
+  A migration's generated substitute is salted with its OWN full name (fixed
+  by its directory naming), never with a source name or the changing set of
+  sources that register it — so the substitute stays stable across releases
+  even as a duplicate bundle is later folded into an additional plugin, and
+  is independent of which registration happens to run first. A generated
+  substitute is also checked against every raw version already claimed by
+  any registered migration, not just other substitutes, so it can never
+  coincide with an unrelated migration's own version. `autumn migrate
+  status`/`autumn migrate down` resolve applied versions against the app's
+  own `migrations/` directory only, with no visibility into which plugins
+  were registered at runtime — if the app's own migration is the one that
+  loses a collision, those two CLI commands cannot currently resolve or
+  revert it by name, and the migration checksum/drift-detection system
+  likewise can't see it (so a later edit to that migration would not trigger
+  the drift guard); see the method's doc comment for the manual fallback and
+  the (accepted, very-low-probability) edge case around a future migration's
+  raw version coinciding with an already-applied substitute. Collision
+  resolution also now includes the two standalone shard-directory / shard-map
+  control migrations, which are applied straight from their own `const`s
+  rather than through the app's registered set — a plugin claiming one of
+  their (fixed, framework-owned) versions under a different name previously
+  skipped past this guard entirely — but only when the app has shards
+  configured at all, so an unsharded or `sqlite` app (which never applies
+  either set) never has its own migrations' versions perturbed by a
+  collision against one it will never actually record.
+
 ### Security
 
 - **consent-banner middleware now guards the already-rendered case against

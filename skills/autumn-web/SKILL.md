@@ -229,6 +229,7 @@ Use `.one_off_tasks(one_off_tasks![...])` for `#[task]` handlers invoked by
 | `.jobs(jobs![...])` | Register request-triggered `#[job]` work |
 | `.one_off_tasks(one_off_tasks![...])` | Register operational `#[task]` commands |
 | `.migrations(MIGRATIONS)` | Register embedded Diesel migrations |
+| `.plugin_migrations(name, MIGRATIONS)` | Register a plugin's embedded Diesel migrations (named; version collisions with other sources auto-resolve) |
 | `.plugin(plugin)` / `.plugins((...))` | Install first- or third-party plugins |
 | `.openapi(config)` | Configure OpenAPI generation |
 | `.policy::<R, _>(policy)` / `.scope::<R, _>(scope)` | Register repository API authorization |
