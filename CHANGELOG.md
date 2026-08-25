@@ -37,6 +37,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already-allocated buffer; the win is pure CPU, not allocations) — all 203
   `form`/`nested_form` lib tests pass unchanged.
 
+- **scaffolded form helpers no longer allocate a validation-error id string
+  on fields that have no error:** `text_input`, `password_input`,
+  `textarea_input`, `number_input`, `checkbox_input`,
+  `date_input`/`datetime_input` (and their `required_*`/`*_htmx` variants),
+  plus the newer `a11y`-routed `wrap_field_control`, unconditionally built
+  `format!("{field}-error")` up front, even though the string is read only
+  when that field actually carries a validation error. On a realistic
+  scaffolded form most fields don't — the committed 12-field
+  `autumn/benches/form_render.rs` workload has errors on 2 of 12. The fix
+  defers the `format!` behind `has_errors.then(...)`, allocating only when
+  the id is actually needed; output is byte-for-byte unchanged (verified by
+  the unchanged 203 form/nested_form lib tests).
+
+  Measured with a new allocation gate
+  (`autumn/tests/form_render_alloc_gate.rs`, `allocation-counter`, same
+  12-field workload) and `valgrind --tool=callgrind` on the existing
+  `form_render` bench (3,000 iterations = 3,050 renders), before and after
+  on the same machine:
+
+  | | before | after | delta |
+  | --- | ---: | ---: | ---: |
+  | Instructions (3,000-iteration run) | 203,331,276 | 185,748,259 | **-8.65%** |
+  | `alloc::fmt::format::format_inner` instructions | 6,734,400 (3.31%) | 3,928,400 (2.11%) | **-41.7%** |
+  | Allocation blocks (200 renders) | 24,800 | 20,800 | **-16.1%** |
+  | Allocation bytes (200 renders) | 4,498,200 | 4,495,800 | -0.05% |
+
+  Bytes barely move — each wasted allocation is a handful of bytes against a
+  ~22KB/render budget dominated by larger buffers — but the block-count and
+  instruction-count deltas both clear the impact floor on their own.
+
 ## [0.7.0] - 2026-08-23
 
 For a narrative tour of this release, see the

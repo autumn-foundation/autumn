@@ -119,27 +119,30 @@ fn scaffolded_form_render_allocations_on_a_12_field_workload() {
         info.count_total, info.bytes_total
     );
 
-    // Baseline (debug profile, default features, deterministic across runs):
-    // 124 blocks / 22,491 bytes per render, 24,800 blocks / 4,498,200 bytes
-    // total for 200 renders. Every text/password/textarea/number/checkbox/date
-    // helper unconditionally builds `format!("{field}-error")` even on the 10
-    // of 12 fields with no validation error, where the string is never read —
-    // a fix is coming in `autumn/src/form.rs` (defer the allocation until
-    // `has_errors` is confirmed true). Ceiling sits at the current measurement
-    // plus a little headroom for feature-set/toolchain variance, same
-    // convention as `config_alloc_gate`/`password_policy_alloc_gate`; a
-    // failure a hair over the line means re-measure and re-derive, not nudge
-    // upwards.
+    // Debug profile, default features, deterministic across runs. Before the
+    // fix, every text/password/textarea/number/checkbox/date helper
+    // unconditionally built `format!("{field}-error")` even on the 10 of 12
+    // fields with no validation error, where the string is never read: 124
+    // blocks / 22,491 bytes per render, 24,800 blocks / 4,498,200 bytes total
+    // for 200 renders. See `autumn/src/form.rs`'s helpers for the fix (defers
+    // the allocation until `has_errors` is confirmed true). After: **104
+    // blocks** / 22,479 bytes per render, 20,800 / 4,495,800 total (-16.1%
+    // blocks; bytes barely move — each wasted allocation is a handful of
+    // bytes against a ~22KB/render budget dominated by larger buffers). Ceiling
+    // sits at the current measurement plus a little headroom for
+    // feature-set/toolchain variance, same convention as
+    // `config_alloc_gate`/`password_policy_alloc_gate`; a failure a hair over
+    // the line means re-measure and re-derive, not nudge upwards.
     assert!(
-        info.count_total <= 25_000,
+        info.count_total <= 21_500,
         "scaffolded form render allocated {} blocks over {RENDERS} renders, over the \
-         25,000-block ceiling (24,800 measured baseline)",
+         21,500-block ceiling (20,800 measured; 24,800 was the pre-fix baseline)",
         info.count_total,
     );
     assert!(
         info.bytes_total <= 4_550_000,
         "scaffolded form render allocated {} bytes over {RENDERS} renders, over the \
-         4,550,000-byte ceiling (4,498,200 measured baseline)",
+         4,550,000-byte ceiling (4,495,800 measured; 4,498,200 was the pre-fix baseline)",
         info.bytes_total,
     );
 }
