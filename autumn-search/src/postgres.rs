@@ -285,8 +285,8 @@ impl PostgresSearchStore {
     /// `documents` is a caller-supplied slice on a PUBLIC trait method, not
     /// something this type controls the shape of — [`SearchDocument::fields`]
     /// is itself a public, uncapped `Vec` a hand-built document can push
-    /// arbitrarily many (even repeated) entries onto — so two defenses apply
-    /// before any SQL is built:
+    /// arbitrarily many (even repeated) entries onto — so three defenses
+    /// apply before any SQL is built:
     ///
     /// - **duplicate `record_id`s are deduplicated** — a single statement's
     ///   `ON CONFLICT DO UPDATE` cannot affect the same conflict target
@@ -317,6 +317,16 @@ impl PostgresSearchStore {
     ///   count) is atomic per CHUNK, not across the whole call — a narrower
     ///   guarantee than the single-chunk case, and disclosed as such rather
     ///   than silently assumed.
+    /// - **the deduplicated batch is sorted by `record_id`**, so every
+    ///   writer of overlapping ids locks conflict rows in the SAME order.
+    ///   The old per-document loop held at most one row lock at a time
+    ///   (autocommit per statement); a multi-row statement can hold several
+    ///   at once, so two batches indexing the same ids in different orders
+    ///   could otherwise lock-and-wait on each other in a cycle — a
+    ///   deadlock a per-document loop could never produce. A fixed order
+    ///   across every caller makes that cycle impossible, and changes
+    ///   nothing about the query's result, since each row's own
+    ///   `ON CONFLICT` target is independent of row order.
     #[allow(clippy::too_many_lines)] // one linear per-row statement builder, clearest unsplit
     async fn write_documents(
         &self,
@@ -353,7 +363,23 @@ impl PostgresSearchStore {
 
         // See the doc comment above for why the direction depends on
         // `watermark`.
-        let kept_documents = dedupe_by_id(documents, watermark.is_some());
+        let mut kept_documents = dedupe_by_id(documents, watermark.is_some());
+
+        // Sorted by `record_id` so every writer of overlapping ids —
+        // concurrent callers, or successive backfill batches — locks
+        // conflict rows in the SAME order. The old per-document loop held
+        // at most one row lock at a time (autocommit per statement), so it
+        // could never deadlock on row-lock order; a multi-row statement can
+        // hold several at once, and two batches indexing the same ids in
+        // different orders (e.g. `[1, 2]` and `[2, 1]`) would otherwise be
+        // able to lock-and-wait on each other in a cycle. A fixed
+        // (ascending) order across every caller makes that cycle
+        // impossible. Sorting after dedup, not before, since a stable
+        // canonical order only has to hold across the SURVIVING ids, not
+        // whichever occurrence of a duplicate lost — and this changes
+        // nothing about the QUERY RESULT, since each row's own
+        // `ON CONFLICT` target is independent of row order.
+        kept_documents.sort_unstable_by_key(|document| document.id());
 
         let mut cursor = 0usize;
         while cursor < kept_documents.len() {
@@ -1879,6 +1905,33 @@ mod tests {
                 .map(IndexedDocument::id)
                 .collect();
             assert_eq!(kept, vec![10, 20, 30], "keep_first={keep_first}");
+        }
+    }
+
+    #[test]
+    fn deduplicated_documents_sort_by_record_id_regardless_of_input_order() {
+        // The mechanism write_documents relies on to prevent a cross-batch
+        // deadlock: two callers indexing the same ids in different orders
+        // (e.g. `[1, 2]` and `[2, 1]`) must both end up locking conflict
+        // rows in the SAME order, or they can lock-and-wait on each other.
+        // A canonical (ascending) order across every caller is what makes
+        // that impossible — verified here for both dedup directions and
+        // several input orderings.
+        for keep_first in [true, false] {
+            for documents in [
+                vec![doc(2), doc(1), doc(3)],
+                vec![doc(3), doc(1), doc(2)],
+                vec![doc(1), doc(3), doc(2)],
+            ] {
+                let mut kept: Vec<&IndexedDocument> = dedupe_by_id(&documents, keep_first);
+                kept.sort_unstable_by_key(|document| document.id());
+                let ids: Vec<i64> = kept.into_iter().map(IndexedDocument::id).collect();
+                assert_eq!(
+                    ids,
+                    vec![1, 2, 3],
+                    "keep_first={keep_first} input={documents:?}"
+                );
+            }
         }
     }
 
