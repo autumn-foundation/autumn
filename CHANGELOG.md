@@ -75,7 +75,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   likewise can't see it (so a later edit to that migration would not trigger
   the drift guard); see the method's doc comment for the manual fallback and
   the (accepted, very-low-probability) edge case around a future migration's
-  raw version coinciding with an already-applied substitute.
+  raw version coinciding with an already-applied substitute. Collision
+  resolution also now includes the two standalone shard-directory / shard-map
+  control migrations, which are applied straight from their own `const`s
+  rather than through the app's registered set — a plugin claiming one of
+  their (fixed, framework-owned) versions under a different name previously
+  skipped past this guard entirely.
 
 ### Security
 

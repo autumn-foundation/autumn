@@ -807,8 +807,14 @@ where
 /// version/name metadata; no connection involved), so it can run right
 /// before the apply loop, on the FINAL set of registered sources — including
 /// ones the framework itself folds in after app-wiring time (the
-/// shard-required version-history / commit-hook-queue sets), closing the gap
-/// a purely registration-time check would miss.
+/// shard-required version-history / commit-hook-queue sets, and the two
+/// standalone shard-directory / shard-map control migrations, which are
+/// otherwise applied straight from their own `const`s rather than through
+/// the app's registered `migrations`), closing the gap a purely
+/// registration-time check would miss. Callers pass borrowed `EmbeddedMigrations`
+/// (not owned) so a call site can cheaply include such standalone `const`
+/// sets alongside an already-built `Vec` of owned ones without needing
+/// `EmbeddedMigrations` to implement `Clone` (it deliberately doesn't).
 ///
 /// Diesel's `__diesel_schema_migrations` table is keyed by **version
 /// alone** — it has no notion of which registered source (the framework, a
@@ -854,7 +860,7 @@ where
 /// Returns an empty map when nothing collides — the overwhelmingly common
 /// case — so callers can skip wrapping entirely when it's empty.
 pub(crate) fn compute_migration_disambiguation(
-    named_sets: &[(&str, EmbeddedMigrations)],
+    named_sets: &[(&str, &EmbeddedMigrations)],
 ) -> HashMap<String, String> {
     // version -> distinct (full_name, ALL source names that registered it)
     // pairs. Only the DISTINCT full names matter for collision detection: the
@@ -3083,7 +3089,7 @@ mod tests {
             diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
         const B: EmbeddedMigrations =
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
-        let disambiguated = compute_migration_disambiguation(&[("app", A), ("test-plugin", B)]);
+        let disambiguated = compute_migration_disambiguation(&[("app", &A), ("test-plugin", &B)]);
         assert!(
             disambiguated.is_empty(),
             "disjoint version sets must not be touched: {disambiguated:?}"
@@ -3098,7 +3104,7 @@ mod tests {
         // versions AND full names.
         const A: EmbeddedMigrations =
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
-        let disambiguated = compute_migration_disambiguation(&[("plugin-a", A), ("plugin-b", A)]);
+        let disambiguated = compute_migration_disambiguation(&[("plugin-a", &A), ("plugin-b", &A)]);
         assert!(
             disambiguated.is_empty(),
             "re-registering the identical set must not be treated as a collision: {disambiguated:?}"
@@ -3117,7 +3123,7 @@ mod tests {
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision");
 
         let disambiguated =
-            compute_migration_disambiguation(&[("app", APP), ("test-plugin", COLLIDING)]);
+            compute_migration_disambiguation(&[("app", &APP), ("test-plugin", &COLLIDING)]);
 
         // Deterministic, content-based order (lexicographic full name):
         // "00000000000000_create_gadgets" < "00000000000000_create_todos",
@@ -3157,14 +3163,14 @@ mod tests {
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision_2");
 
         let order_a = compute_migration_disambiguation(&[
-            ("other", OTHER),
-            ("zzz-plugin", DUP),
-            ("aaa-plugin", DUP),
+            ("other", &OTHER),
+            ("zzz-plugin", &DUP),
+            ("aaa-plugin", &DUP),
         ]);
         let order_b = compute_migration_disambiguation(&[
-            ("other", OTHER),
-            ("aaa-plugin", DUP),
-            ("zzz-plugin", DUP),
+            ("other", &OTHER),
+            ("aaa-plugin", &DUP),
+            ("zzz-plugin", &DUP),
         ]);
 
         let substitute_a = order_a
@@ -3211,13 +3217,45 @@ mod tests {
                 .collect();
 
         let disambiguated =
-            compute_migration_disambiguation(&[("app", APP), ("test-plugin", COLLIDING)]);
+            compute_migration_disambiguation(&[("app", &APP), ("test-plugin", &COLLIDING)]);
         for substitute in disambiguated.values() {
             assert!(
                 !raw_versions.contains(substitute),
                 "substitute {substitute:?} must never coincide with an unrelated migration's own raw version"
             );
         }
+    }
+
+    #[test]
+    fn disambiguates_a_collision_against_the_standalone_shard_control_migrations() {
+        // `SHARD_DIRECTORY_MIGRATIONS`/`SHARD_MAP_MIGRATIONS` are applied
+        // straight from their own `const`s (not through the app's
+        // `migrations`), so callers must pass them into
+        // `compute_migration_disambiguation` explicitly alongside the
+        // registered set -- this fixture's version
+        // ("20260612000000") matches the real shard-directory migration's,
+        // under a different name, exactly the scenario a plugin could hit.
+        const PLUGIN: EmbeddedMigrations = diesel_migrations::embed_migrations!(
+            "tests/fixtures/plugin_migrations_collision_shard_directory"
+        );
+        let disambiguated = compute_migration_disambiguation(&[
+            ("test-plugin", &PLUGIN),
+            (
+                "shard-directory",
+                &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
+            ),
+        ]);
+        // "20260612000000_a_plugin_thing" < "20260612000000_create_shard_directory"
+        // lexicographically, so the PLUGIN keeps the plain version and the
+        // framework's own shard-directory migration is the one substituted.
+        assert!(
+            !disambiguated.contains_key("20260612000000_a_plugin_thing"),
+            "the lexicographically-first migration must keep its original version: {disambiguated:?}"
+        );
+        assert!(
+            disambiguated.contains_key("20260612000000_create_shard_directory"),
+            "the collision against the standalone shard-directory set must be caught: {disambiguated:?}"
+        );
     }
 
     #[test]

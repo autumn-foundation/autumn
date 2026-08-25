@@ -5427,6 +5427,7 @@ impl AppBuilder {
     /// and 1 on the first failure, so a failed migration aborts the deploy before
     /// cutover with the old release still serving (AC-3).
     #[cfg(feature = "db")]
+    #[allow(clippy::too_many_lines)]
     async fn run_migrate_only_mode(self) {
         let Self {
             migrations,
@@ -5498,10 +5499,14 @@ impl AppBuilder {
         }
 
         // Computed once, on the FINAL registered set (after the fold above),
-        // so a version collision between any two registered sources is
-        // resolved automatically rather than one migration silently never
-        // applying. See `compute_migration_disambiguation`.
-        let disambiguated = crate::migrate::compute_migration_disambiguation(&migrations);
+        // so a version collision resolves automatically instead of one
+        // migration silently never applying — see
+        // `compute_migration_disambiguation`. `migration_sets_for_disambiguation`
+        // folds in the two standalone shard control sets too, matching
+        // `run_startup_migrations`, so both paths reach the same decision
+        // regardless of which runs first.
+        let disambiguation_sets = migration_sets_for_disambiguation(&migrations);
+        let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
 
         // The diesel harness and the advisory-lock poll block, so apply off the
         // Tokio worker threads. Each target's failure exits non-zero from inside.
@@ -9142,8 +9147,37 @@ mod sqlite_sharding_unsupported_guard_tests {
     }
 }
 
+/// Combine the app's registered migration sets with the two standalone
+/// shard-directory / shard-map control migrations — applied straight from
+/// their own `const`s rather than through `migrations` — into one input for
+/// [`crate::migrate::compute_migration_disambiguation`]. Without this, a
+/// plugin claiming one of those fixed, framework-owned versions under a
+/// different name would skip past collision detection entirely, since
+/// neither standalone set is otherwise part of the registered `migrations`
+/// this function is given.
 #[cfg(feature = "db")]
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+fn migration_sets_for_disambiguation<'a>(
+    migrations: &'a [(&'static str, crate::migrate::EmbeddedMigrations)],
+) -> Vec<(&'a str, &'a crate::migrate::EmbeddedMigrations)> {
+    migrations
+        .iter()
+        .map(|(name, set)| (*name, set))
+        .chain([
+            (
+                "shard-directory",
+                &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
+            ),
+            ("shard-map", &crate::sharding::SHARD_MAP_MIGRATIONS),
+        ])
+        .collect()
+}
+
+#[cfg(feature = "db")]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_lines
+)]
 async fn run_startup_migrations(
     config: &AutumnConfig,
     control_configured: bool,
@@ -9178,12 +9212,12 @@ async fn run_startup_migrations(
     let auto_migrate = config.database.auto_migrate;
     let auto_in_prod = config.database.auto_migrate_in_production;
     // Computed once, on the FINAL registered set (after `setup_database`'s own
-    // fold added any shard-required sets), so a version collision between
-    // ANY two registered sources — framework, plugin, app, or a
-    // framework-required set folded in after app-wiring time — is resolved
-    // automatically rather than causing one migration to be silently
-    // skipped. See `compute_migration_disambiguation` for why.
-    let disambiguated = crate::migrate::compute_migration_disambiguation(&migrations);
+    // fold added any shard-required sets), so a version collision between ANY
+    // two registered sources is resolved automatically rather than causing
+    // one migration to be silently skipped — see
+    // `compute_migration_disambiguation` and `migration_sets_for_disambiguation`.
+    let disambiguation_sets = migration_sets_for_disambiguation(&migrations);
+    let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
     let migration_result = tokio::task::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (issue #1614, PR3): apply
         // the registered migrations to a `sqlite://` control target with NO
@@ -9230,8 +9264,9 @@ async fn run_startup_migrations(
                     profile.as_deref(),
                     auto_migrate,
                     auto_in_prod,
-                    crate::migrate::EmbeddedMigrationsRef(
+                    crate::migrate::DisambiguatedMigrations::new(
                         &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
+                        &disambiguated,
                     ),
                     "control",
                 );
@@ -9250,7 +9285,10 @@ async fn run_startup_migrations(
                     profile.as_deref(),
                     auto_migrate,
                     auto_in_prod,
-                    crate::migrate::EmbeddedMigrationsRef(&crate::sharding::SHARD_MAP_MIGRATIONS),
+                    crate::migrate::DisambiguatedMigrations::new(
+                        &crate::sharding::SHARD_MAP_MIGRATIONS,
+                        &disambiguated,
+                    ),
                     "control",
                 );
             }
