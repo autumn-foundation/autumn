@@ -5505,7 +5505,8 @@ impl AppBuilder {
         // folds in the two standalone shard control sets too, matching
         // `run_startup_migrations`, so both paths reach the same decision
         // regardless of which runs first.
-        let disambiguation_sets = migration_sets_for_disambiguation(&migrations);
+        let disambiguation_sets =
+            migration_sets_for_disambiguation(&migrations, config.database.has_shards());
         let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
 
         // The diesel harness and the advisory-lock poll block, so apply off the
@@ -9155,21 +9156,47 @@ mod sqlite_sharding_unsupported_guard_tests {
 /// different name would skip past collision detection entirely, since
 /// neither standalone set is otherwise part of the registered `migrations`
 /// this function is given.
+///
+/// The two standalone sets are included only when `shards_configured` is
+/// true. An unsharded app (including every `sqlite` app, which rejects
+/// sharding outright) never applies either set, so including them
+/// unconditionally would treat their fixed versions as live collision
+/// participants for an app that will never actually record them — risking
+/// an already-applied, unrelated migration being reassigned a new
+/// substitute the moment this framework version is adopted, purely because
+/// of a coincidental version match against a migration that was never a
+/// real collision for that app. `shards_configured` (`database.has_shards()`)
+/// is a conservative superset of the precise runtime conditions
+/// `directory_migration_required`/`shard_map_migration_required` gate the
+/// actual apply on (both imply shards are configured; the converse doesn't
+/// hold for e.g. an explicit custom shard router) — deliberately so: BOTH
+/// call sites (`run_startup_migrations` and the `autumn migrate` CLI path,
+/// which cannot cheaply reconstruct the precise runtime flags) must use the
+/// IDENTICAL condition, or the two paths could reach different
+/// disambiguation decisions for the same migration depending on which one
+/// happens to run first — the exact hazard this whole mechanism exists to
+/// avoid. The residual narrow case (a sharded app using an explicit custom
+/// router) may see a harmless, unnecessary disambiguation entry for a shard
+/// version it will never apply; that is safe, just imprecise.
 #[cfg(feature = "db")]
 fn migration_sets_for_disambiguation<'a>(
     migrations: &'a [(&'static str, crate::migrate::EmbeddedMigrations)],
+    shards_configured: bool,
 ) -> Vec<(&'a str, &'a crate::migrate::EmbeddedMigrations)> {
-    migrations
-        .iter()
-        .map(|(name, set)| (*name, set))
-        .chain([
-            (
-                "shard-directory",
-                &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
-            ),
-            ("shard-map", &crate::sharding::SHARD_MAP_MIGRATIONS),
-        ])
-        .collect()
+    let owned = migrations.iter().map(|(name, set)| (*name, set));
+    if shards_configured {
+        owned
+            .chain([
+                (
+                    "shard-directory",
+                    &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
+                ),
+                ("shard-map", &crate::sharding::SHARD_MAP_MIGRATIONS),
+            ])
+            .collect()
+    } else {
+        owned.collect()
+    }
 }
 
 #[cfg(feature = "db")]
@@ -9216,7 +9243,8 @@ async fn run_startup_migrations(
     // two registered sources is resolved automatically rather than causing
     // one migration to be silently skipped — see
     // `compute_migration_disambiguation` and `migration_sets_for_disambiguation`.
-    let disambiguation_sets = migration_sets_for_disambiguation(&migrations);
+    let disambiguation_sets =
+        migration_sets_for_disambiguation(&migrations, config.database.has_shards());
     let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
     let migration_result = tokio::task::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (issue #1614, PR3): apply

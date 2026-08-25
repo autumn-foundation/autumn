@@ -61,12 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (and, given Diesel's version-only tracking, cannot) recover history for a
   new plugin whose migration collides with a version an app already applied
   under an *earlier*, pre-plugin deploy — see the method's doc comment.
-  Substitute-hash selection for a migration folded into more than one bundle
-  under different names (the intentional "same set registered twice" case)
-  is also independent of which of those registrations happens to run first,
-  and a generated substitute is checked against every raw version already
-  claimed by any registered migration, not just other substitutes, so it can
-  never coincide with an unrelated migration's own version. `autumn migrate
+  A migration's generated substitute is salted with its OWN full name (fixed
+  by its directory naming), never with a source name or the changing set of
+  sources that register it — so the substitute stays stable across releases
+  even as a duplicate bundle is later folded into an additional plugin, and
+  is independent of which registration happens to run first. A generated
+  substitute is also checked against every raw version already claimed by
+  any registered migration, not just other substitutes, so it can never
+  coincide with an unrelated migration's own version. `autumn migrate
   status`/`autumn migrate down` resolve applied versions against the app's
   own `migrations/` directory only, with no visibility into which plugins
   were registered at runtime — if the app's own migration is the one that
@@ -80,7 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control migrations, which are applied straight from their own `const`s
   rather than through the app's registered set — a plugin claiming one of
   their (fixed, framework-owned) versions under a different name previously
-  skipped past this guard entirely.
+  skipped past this guard entirely — but only when the app has shards
+  configured at all, so an unsharded or `sqlite` app (which never applies
+  either set) never has its own migrations' versions perturbed by a
+  collision against one it will never actually record.
 
 ### Security
 

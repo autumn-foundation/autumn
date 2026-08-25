@@ -833,13 +833,17 @@ where
 /// visible. This ordering is a pure function of the colliding migrations'
 /// own names — **not** of `named_sets`' order — so reordering
 /// `.migrations()`/`.plugin_migrations()` calls, or adding a new plugin,
-/// never flips which one already-settled collisions resolve to; this
-/// includes the source name a duplicate's substitute is hashed from, which is
-/// the lexicographically-first name among every source that folded that
-/// duplicate in, not whichever happened to register it first. Every
-/// generated substitute is also checked against every RAW version already in
-/// use (not just other substitutes), so it can never coincide with an
-/// unrelated migration's own plain version. A version
+/// never flips which one already-settled collisions resolve to. The
+/// substitute itself is also salted with the LOSING migration's own full
+/// name (never a source name), which stays fixed for the migration's
+/// lifetime even as the *set* of sources registering a duplicate grows or
+/// shrinks release over release (the same bundle later folded into an
+/// additional plugin, say) — hashing on that changeable set instead would
+/// silently reassign an already-applied migration's tracked substitute the
+/// moment its registration footprint changed, even though the migration
+/// itself never did. Every generated substitute is also checked against
+/// every RAW version already in use (not just other substitutes), so it can
+/// never coincide with an unrelated migration's own plain version. A version
 /// reused under the exact SAME full name (e.g. a shard-required set folded
 /// verbatim into the full framework bundle too) is the intentional,
 /// harmless case and is left untouched — only genuinely different
@@ -862,27 +866,21 @@ where
 pub(crate) fn compute_migration_disambiguation(
     named_sets: &[(&str, &EmbeddedMigrations)],
 ) -> HashMap<String, String> {
-    // version -> distinct (full_name, ALL source names that registered it)
-    // pairs. Only the DISTINCT full names matter for collision detection: the
-    // same migration folded into two bundles (the intentional, harmless
-    // case) contributes one entry, not two — but every source name that
-    // registered it is tracked (not just the first-seen one) so the
-    // substitute hash below can be derived independently of registration
-    // order.
-    let mut by_version: std::collections::BTreeMap<
-        String,
-        Vec<(String, std::collections::BTreeSet<&str>)>,
-    > = std::collections::BTreeMap::new();
-    for (source_name, set) in named_sets {
+    // version -> distinct full names claiming it. Only the DISTINCT full
+    // names matter for collision detection: the same migration folded into
+    // two bundles under different source names (the intentional, harmless
+    // case) contributes one entry, not two, regardless of how many sources
+    // register it or in what order.
+    let mut by_version: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (_, set) in named_sets {
         let Ok(pairs) = migration_versions_and_names::<Pg>(set) else {
             continue;
         };
         for (version, full_name) in pairs {
             let entries = by_version.entry(version).or_default();
-            if let Some((_, sources)) = entries.iter_mut().find(|(name, _)| *name == full_name) {
-                sources.insert(*source_name);
-            } else {
-                entries.push((full_name, std::collections::BTreeSet::from([*source_name])));
+            if !entries.contains(&full_name) {
+                entries.push(full_name);
             }
         }
     }
@@ -906,26 +904,24 @@ pub(crate) fn compute_migration_disambiguation(
         // plugin, must not change which migration keeps the plain version.
         // The lexicographically-first full name wins it; every other
         // colliding migration is mapped to a substitute below.
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let kept_name = entries[0].0.clone();
-        for (full_name, source_names) in entries.into_iter().skip(1) {
-            // Canonical source identity for the substitute hash: the
-            // lexicographically-first name among every source that
-            // registered this exact full name (the same migration folded
-            // into more than one bundle), independent of which one happened
-            // to be registered first. Otherwise, reordering two
-            // otherwise-equivalent registration calls would change the
-            // generated substitute for an already-applied migration.
-            let source_name = source_names
-                .iter()
-                .next()
-                .copied()
-                .unwrap_or(full_name.as_str());
+        entries.sort();
+        let kept_name = entries[0].clone();
+        for full_name in entries.into_iter().skip(1) {
+            // The substitute hash is derived from the LOSING migration's own
+            // full name -- not from which source(s) currently register it.
+            // A migration's full name is fixed by its own directory naming
+            // and never changes across releases, whereas the *set* of
+            // sources registering a duplicate can grow or shrink over time
+            // (the same bundle folded into an additional plugin, say) —
+            // hashing on that set would silently reassign an
+            // already-applied migration's tracked substitute the moment its
+            // registration footprint changed, even though the migration
+            // itself never did.
             let mut tie_breaker = 1u32;
-            let mut substitute = bounded_substitute_version(&version, source_name, tie_breaker);
+            let mut substitute = bounded_substitute_version(&version, &full_name, tie_breaker);
             while substitutes_in_use.contains(&substitute) {
                 tie_breaker += 1;
-                substitute = bounded_substitute_version(&version, source_name, tie_breaker);
+                substitute = bounded_substitute_version(&version, &full_name, tie_breaker);
             }
             tracing::info!(
                 version = %version,
@@ -945,17 +941,18 @@ pub(crate) fn compute_migration_disambiguation(
 /// collides with the original version or any other substitute already
 /// handed out (`tie_breaker` bumps on a collision), and (b) always fits
 /// Diesel's `__diesel_schema_migrations.version` column (`VARCHAR(50)`)
-/// regardless of how long `version` or `source_name` are —
-/// `AppBuilder::plugin_migrations` accepts an arbitrary `&'static str` name,
-/// so it cannot be appended unbounded.
+/// regardless of how long `version` or `salt` are.
 ///
-/// Uses a short, stable hash of `source_name` (not the name itself, which
-/// could alone exceed the column width) plus a numeric tie-breaker suffix.
-/// Deterministic: the same `(version, source_name, tie_breaker)` always
-/// produces the same substitute.
-fn bounded_substitute_version(version: &str, source_name: &str, tie_breaker: u32) -> String {
+/// `salt` should be a value that is stable for the lifetime of the migration
+/// it disambiguates — [`compute_migration_disambiguation`] passes the
+/// migration's own full name (fixed by its directory naming, never by which
+/// or how many sources currently register it). Uses a short, stable hash of
+/// `salt` (not the value itself, which could alone exceed the column width)
+/// plus a numeric tie-breaker suffix. Deterministic: the same `(version,
+/// salt, tie_breaker)` always produces the same substitute.
+fn bounded_substitute_version(version: &str, salt: &str, tie_breaker: u32) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(source_name.as_bytes());
+    hasher.update(salt.as_bytes());
     let hash = hex::encode(hasher.finalize());
     let short_hash = &hash[..8];
     let suffix = if tie_breaker <= 1 {
@@ -3138,7 +3135,7 @@ mod tests {
             .expect("the other colliding migration must be disambiguated");
         assert_eq!(
             substitute,
-            &bounded_substitute_version("00000000000000", "app", 1)
+            &bounded_substitute_version("00000000000000", "00000000000000_create_todos", 1)
         );
         assert!(
             substitute.len() <= 50,
@@ -3153,10 +3150,11 @@ mod tests {
         // ALSO collides at its version with a third, differently-named
         // migration: the duplicate is the one that must be substituted
         // ("20260101000000_a_third_migration" < "20260101000000_create_gizmos"
-        // lexicographically). The canonical source name driving the
-        // substitute hash must be the lexicographically-first of the
-        // duplicate's two registered names, regardless of which order those
-        // two registrations happen to run in.
+        // lexicographically). The substitute hash is derived from the
+        // duplicate's own full name, not from which source(s) register it,
+        // so it must be identical regardless of registration order --
+        // and, more importantly, regardless of whether it's EVER registered
+        // under a second name at all (see the next test).
         const DUP: EmbeddedMigrations =
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
         const OTHER: EmbeddedMigrations =
@@ -3186,9 +3184,39 @@ mod tests {
         );
         assert_eq!(
             substitute_a,
-            &bounded_substitute_version("20260101000000", "aaa-plugin", 1),
-            "the canonical source name is the lexicographically-first of the \
-             duplicate's registered names ('aaa-plugin'), not whichever ran first"
+            &bounded_substitute_version("20260101000000", "20260101000000_create_gizmos", 1),
+            "the substitute is salted with the duplicate's own full name, not any source name"
+        );
+    }
+
+    #[test]
+    fn duplicate_migrations_substitute_hash_is_stable_as_registrations_change() {
+        // The stronger guarantee `duplicate_migrations_substitute_hash_is_independent_of_registration_order`
+        // only hints at: an ALREADY-APPLIED migration's substitute must not
+        // change merely because the set of sources registering it grows or
+        // shrinks across releases (e.g. the same bundle later folded into an
+        // additional plugin too) -- only the migration's own, permanently
+        // fixed full name may drive the hash. Registered once vs. registered
+        // twice (under an entirely different second name) must produce the
+        // SAME substitute for the losing migration.
+        const DUP: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        const OTHER: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision_2");
+
+        let registered_once =
+            compute_migration_disambiguation(&[("other", &OTHER), ("only-plugin", &DUP)]);
+        let registered_twice = compute_migration_disambiguation(&[
+            ("other", &OTHER),
+            ("only-plugin", &DUP),
+            ("a-brand-new-plugin-added-later", &DUP),
+        ]);
+
+        assert_eq!(
+            registered_once.get("20260101000000_create_gizmos"),
+            registered_twice.get("20260101000000_create_gizmos"),
+            "adding a second registration of an already-duplicated migration must not \
+             change the substitute already assigned to it"
         );
     }
 
