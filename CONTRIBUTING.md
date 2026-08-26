@@ -56,6 +56,7 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 | `generated_scaffold_cargo_checks` | `generate.rs` | `generate scaffold` → `cargo check --tests` |
 | `generated_scaffold_config_cargo_checks` | `generate.rs` | config-driven scaffold → `cargo check --tests` |
 | `generated_scaffold_serves_posts_index_and_json_api` | `generate.rs` | scaffold + Postgres migrations + live HTTP |
+| `generated_constrained_scaffold_enforces_validation_end_to_end` | `generate.rs` | scaffold DSL `{…}` constraints + Postgres + live HTTP: rendered HTML5 attributes, 422 + inline errors, nothing stored (#1388) |
 | `console_bare_playground_target_compiles_untouched` | `integration/console.rs` | `autumn console` first-run scaffold → `cargo check --bin playground` |
 | `console_playground_target_compiles_with_a_repository_round_trip` | `integration/console.rs` | playground + `repo.find_all()` → `cargo check --bin playground` |
 | `console_run_exits_non_zero_when_the_database_is_unreachable` | `integration/console.rs` | `autumn console` propagates config/connection failures non-zero |
@@ -65,10 +66,11 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 | `encrypted_live_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--live` → `cargo check --tests` |
 | `encrypted_nested_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--belongs-to` → `cargo check --tests` |
 | `encrypted_admin_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `generate admin` (wired in) → `cargo check --tests` |
+| `constrained_scaffold_cargo_checks` | `integration/scaffold_validation.rs` | `{min,max}`/`{email}`/`{url}`/nullable-bound scaffold → `cargo check --tests` (#1388) |
 
-The `console.rs` and `scaffold_encrypted.rs` entries compile into the
-consolidated `cli_tests` binary, whose only other CI `--ignored` invocation
-filters on `offsite`. They are therefore named **explicitly** in
+The `console.rs`, `scaffold_encrypted.rs`, and `scaffold_validation.rs` entries
+compile into the consolidated `cli_tests` binary, whose only other CI
+`--ignored` invocation filters on `offsite`. They are therefore named **explicitly** in
 `.github/workflows/generator-conformance.yml`; a new `#[ignore]`d test in that
 binary which is not added there will never run in CI.
 
@@ -79,7 +81,7 @@ These tests carry `#[ignore]` annotations so that `cargo test --workspace`
 everyday development. **The `#[ignore]` label means "CI-gated, not
 abandoned."**
 
-The `.github/workflows/generator-conformance.yml` workflow runs all four
+The `.github/workflows/generator-conformance.yml` workflow runs each of these
 tests explicitly via `-- --ignored --exact`. It fires on every PR or push
 that touches:
 
@@ -103,10 +105,12 @@ cargo test -p autumn-cli --test e2e    generated_project_compiles_runs_and_serve
 cargo test -p autumn-cli --test generate generated_scaffold_cargo_checks             -- --ignored --exact
 cargo test -p autumn-cli --test generate generated_scaffold_config_cargo_checks      -- --ignored --exact
 cargo test -p autumn-cli --test generate generated_scaffold_serves_posts_index_and_json_api -- --ignored --exact
+cargo test -p autumn-cli --test generate generated_constrained_scaffold_enforces_validation_end_to_end -- --ignored --exact
+cargo test -p autumn-cli --test cli_tests integration::scaffold_validation::constrained_scaffold_cargo_checks -- --ignored --exact
 ```
 
-The last test requires Docker (for the Postgres testcontainer) and the
-`diesel` CLI on `PATH`.
+The two `--test generate` Postgres gates require Docker (for the Postgres
+testcontainer) and the `diesel` CLI on `PATH`.
 
 ### What triggers a failure?
 
