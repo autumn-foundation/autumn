@@ -51,11 +51,18 @@
 //! # Threat model
 //!
 //! The chain is **tamper-evident**, not tamper-proof.
-//! [`verify_chain_against`] — which the generated `ledger_verify` calls — detects
-//! any mutation, insertion, deletion, or reordering of stored revisions that
-//! does not also re-derive every subsequent hash, plus, by cross-checking the
-//! head against the live row, a truncated tail and any write that reached the
-//! table without appending a revision.
+//! [`verify_chain_against`](crate::ledger::verify_chain_against) — which the
+//! generated `ledger_verify` calls — detects any mutation, insertion, deletion,
+//! or reordering of stored revisions that does not also re-derive every
+//! subsequent hash, plus, by cross-checking the head against the live row, a
+//! truncated tail and any write that reached the table without appending a
+//! revision.
+//!
+//! (That link is written out in full because `lib.rs` puts an outer `///`
+//! comment on `pub mod ledger;`: rustdoc concatenates it with this header and
+//! resolves the whole block from the **crate root**, where only the re-exported
+//! types are in scope. A bare `[`verify_chain_against`]` fails
+//! `-D rustdoc::broken_intra_doc_links`.)
 //!
 //! What it cannot see is a *consistent* rewrite: the hashing rule is open
 //! source, so an adversary with write access to the ledger table can re-derive a
