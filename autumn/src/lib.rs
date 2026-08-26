@@ -435,6 +435,11 @@ pub mod pdf;
 /// [`preload::Preloadable`] trait that generated code implements.
 pub mod preload;
 pub mod prelude;
+/// Compile-time per-route database query budgets (#1667).
+///
+/// See [`query_budget::StaticQueryBudget`] and the
+/// [`query_budget`](macro@crate::query_budget) attribute macro.
+pub mod query_budget;
 pub use paths::PathExt;
 #[cfg(feature = "presence")]
 pub mod presence;
@@ -1271,6 +1276,33 @@ pub use autumn_macros::step_up;
 /// }
 /// ```
 pub use autumn_macros::throttle;
+
+/// Bound a handler's database query count at compile time.
+///
+/// `#[query_budget(N)]` fails the build when a statically reachable path
+/// through the handler can issue more than `N` queries — the classic N+1 (a
+/// repository call inside a loop over runtime-sized rows) is the canonical
+/// case. Unlike the runtime tools (the dev inspector and
+/// [`crate::test::TestResponse::assert_max_queries`]), the gate fires on every
+/// branch, tested or not.
+///
+/// ```ignore
+/// use autumn_web::{get, query_budget};
+///
+/// #[get("/posts")]
+/// #[query_budget(2)]
+/// async fn index(repo: PgPostRepository) -> AutumnResult<Markup> {
+///     let posts = repo.find_all().await?;
+///     let posts = repo.preload(posts, Post::preload().author()).await?;
+///     Ok(render(&posts))
+/// }
+/// ```
+///
+/// Escape hatches: `#[query_budget(unbounded, reason = "…")]` on the handler,
+/// and `#[query_cost(N)]` / `#[query_exempt(reason = "…")]` on a statement.
+/// See [`query_budget::StaticQueryBudget`] for the constant the expansion
+/// leaves behind, and `docs/guide/query-budgets.md` for the guide.
+pub use autumn_macros::query_budget;
 
 /// Gate a route handler on a named feature flag. If the flag is disabled for
 /// the current actor the handler responds with `404 Not Found` (default) or

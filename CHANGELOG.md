@@ -33,6 +33,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`#[query_budget(N)]` — a compile-time, per-route database query budget
+  (#1667):** declare a handler's query ceiling and the build fails when any
+  statically reachable path can exceed it. The canonical case is the N+1 — a
+  repository or `Db` call inside a loop over a runtime-sized collection — and
+  the diagnostic names the offending call site and the loop it sits in. Because
+  the gate runs during `cargo build` it fires on every branch, tested or not,
+  where the existing runtime tools (the dev inspector's N+1 badge, and
+  `TestResponse::assert_max_queries`) only catch a regression when its exact
+  path happens to be exercised. Autumn can attribute queries to a route
+  statically because it owns 100% of the query-issuing surface: the handle is
+  always named in the handler's signature, so straight-line statements sum,
+  `if`/`match` arms take the worst arm, a handle-rooted chain is one query
+  however many builder methods it carries, and
+  `.preload(rows, Post::preload().author().tags())` is one batched query per
+  association. The analysis is conservative by construction: a loop whose body
+  queries is unbounded unless the iterable has a literal bound, a repository
+  future is counted where it is *built* (so collecting futures for `join_all`
+  is still an N+1), and anything unreadable — a helper handed the handle, a
+  macro body naming it, a closure that may run per element — is reported rather
+  than assumed query-free. Three escape hatches keep legitimately dynamic code
+  compiling: `#[query_budget(unbounded, reason = "…")]` on the handler, and
+  `#[query_cost(N)]` / `#[query_exempt(reason = "…")]` on a statement. Each
+  annotated function also emits a hidden `StaticQueryBudget` constant recording
+  what was declared and what was proved. See
+  [the query budgets guide](docs/guide/query-budgets.md).
+
 - **`AppBuilder::plugin_migrations(name, migrations)`:** a named registration
   path for embedded Diesel migrations owned by a plugin or other third-party
   integration, distinct from the app's own `.migrations()`. Diesel's

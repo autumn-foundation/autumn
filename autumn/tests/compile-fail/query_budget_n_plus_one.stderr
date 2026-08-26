@@ -1,0 +1,7 @@
+error: `#[query_budget(2)]` cannot be proven: a database query (`find_author`) runs inside a loop, so this handler's query count grows with the size of the collection — the classic N+1.
+
+       Batch the per-row lookup into one query with `preload(...)`, declare the call site with `#[query_cost(N)]`, exempt it with `#[query_exempt(reason = ...)]`, or opt the handler out with `#[query_budget(unbounded, reason = ...)]`.
+  --> tests/compile-fail/query_budget_n_plus_one.rs:27:5
+   |
+27 |     for post in &posts {
+   |     ^^^

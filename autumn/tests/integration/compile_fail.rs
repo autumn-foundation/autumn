@@ -175,6 +175,16 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/a11y_checkbox_unlabeled.rs");
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_filefield_unlabeled.rs");
+
+    // Compile-time query budgets (#1667). Always available: `#[query_budget]`
+    // is re-exported unconditionally and the analysis is purely syntactic, so
+    // these fixtures name no database types of their own.
+    t.compile_fail("tests/compile-fail/query_budget_n_plus_one.rs");
+    t.compile_fail("tests/compile-fail/query_budget_over_budget.rs");
+    t.compile_fail("tests/compile-fail/query_budget_opaque_helper.rs");
+    t.compile_fail("tests/compile-fail/query_budget_loop_closure.rs");
+    t.compile_fail("tests/compile-fail/query_budget_macro_body.rs");
+    t.compile_fail("tests/compile-fail/query_budget_bad_attr.rs");
 }
 
 #[test]
@@ -194,6 +204,13 @@ fn compile_pass_tests() {
     // Lifecycle macro (always available): a well-formed lifecycle builds and
     // exercises the typestate machine + metadata (#1675).
     t.pass("tests/compile-pass/lifecycle_valid.rs");
+
+    // Compile-time query budgets (#1667): every in-budget handler shape, plus
+    // the three escape hatches, plus the `StaticQueryBudget` proof the
+    // expansion leaves behind.
+    t.pass("tests/compile-pass/query_budget_valid.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/query_budget_route.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
