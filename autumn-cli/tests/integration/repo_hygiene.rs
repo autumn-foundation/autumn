@@ -833,10 +833,16 @@ fn generator_conformance_ci_gate_is_configured() {
     // Matched as the full `<name> -- --ignored --exact` INVOCATION, not the bare
     // name: every gate is also mentioned in the job's header comment, so a bare
     // substring check would stay green after the `run:` step itself was deleted
-    // — exactly the regression this pin exists to catch. Shell line
-    // continuations are folded first, since the longer invocations wrap.
+    // — exactly the regression this pin exists to catch.
+    //
+    // Backslashes are dropped and all whitespace collapsed first, because the
+    // longer invocations wrap across shell line continuations. Folding on the
+    // literal "\\\n" would be WRONG: on a Windows checkout the workflow arrives
+    // with CRLF endings, so the continuation is a backslash followed by "\\r\\n"
+    // and the fold silently no-ops — which is exactly how this assertion first
+    // failed on `Test (windows-latest)` while passing everywhere else.
     let invocations = workflow
-        .replace("\\\n", " ")
+        .replace('\\', " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
