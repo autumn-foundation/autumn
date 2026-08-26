@@ -175,6 +175,15 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/a11y_checkbox_unlabeled.rs");
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_filefield_unlabeled.rs");
+}
+
+/// The `#[query_budget]` fixtures get their own `TestCases` rather than
+/// riding along in `compile_fail_tests`: they are a self-contained feature
+/// (#1667), and keeping them separate holds that function under the
+/// `clippy::too_many_lines` ceiling.
+#[test]
+fn query_budget_compile_fail_tests() {
+    let t = trybuild::TestCases::new();
 
     // Compile-time query budgets (#1667). Always available: `#[query_budget]`
     // is re-exported unconditionally and the analysis is purely syntactic, so
