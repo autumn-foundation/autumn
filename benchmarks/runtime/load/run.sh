@@ -83,21 +83,27 @@ run_suite() {
   echo "Output:    $out"
   echo "========================================"
 
+  # Percentiles reported in the exported summary. p(50)/p(95)/p(99) are the
+  # columns RESULTS.md asks for; k6's default trend stats omit p(99).
   local k6_common_args=(
     --vus "$VUS"
     --duration "$DURATION"
-    --summary-export "$out/summary.json"
+    --summary-trend-stats "avg,min,med,p(50),p(95),p(99),max"
   )
 
   for script in json-crud html-page validation-fail auth-protected; do
     echo ""
     echo "--- Running $script ---"
+    # --summary-export must be per-scenario: a single shared summary.json is
+    # overwritten by each successive k6 run, leaving only the last scenario's
+    # numbers behind.
     BASE_URL="$url" \
     BENCH_TOKEN="$BENCH_TOKEN" \
     VUS="$VUS" \
     DURATION="$DURATION" \
     k6 run \
       "${k6_common_args[@]}" \
+      --summary-export "$out/${script}-summary.json" \
       --out "json=$out/${script}.json" \
       "$K6_DIR/${script}.js" \
       2>&1 | tee "$out/${script}.log" || true

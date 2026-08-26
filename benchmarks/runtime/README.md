@@ -139,6 +139,28 @@ The Compose Postgres service raises `max_connections` for this all-services
 track. Otherwise idle pools from the six apps can exhaust the default Postgres
 connection budget and poison later runs.
 
+**Running the apps outside Compose? Raise `max_connections` yourself.** The
+same exhaustion applies to any Postgres the whole app matrix points at, and
+the failure is silent rather than obvious: the apps still start and still
+answer single requests, then under load whichever framework's pool loses the
+race stalls until its own connect timeout fires and reports *its* latency as
+the framework's. A run where one framework shows a flat latency equal to its
+configured connect timeout, or a double-digit error rate that vanishes at
+concurrency 1, is this — not a framework characteristic. Set it before the
+warmup pass:
+
+```bash
+psql -c 'ALTER SYSTEM SET max_connections = 300;'   # then restart Postgres
+psql -tAc 'show max_connections'                     # verify: 300
+```
+
+Cross-check while the apps are idle — the sum must leave headroom for the
+load itself:
+
+```bash
+psql -c 'select datname, count(*) from pg_stat_activity group by datname order by 2 desc;'
+```
+
 ### Running Against a Single Framework
 
 ```bash
