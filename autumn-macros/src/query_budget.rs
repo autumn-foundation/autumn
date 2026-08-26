@@ -372,16 +372,28 @@ impl Analyzer {
     // ── Blocks and statements ────────────────────────────────────────
 
     fn block(&mut self, block: &Block) -> Cost {
-        // Handle identity is lexically scoped. A binding introduced (or
-        // *shadowed away*) inside a block must not outlive it — without the
-        // restore, `{ let repo = something_else; }` would strip `repo` for the
-        // rest of the function and silently stop counting its queries.
+        // A block scopes the names its own `let`s introduce (or shadow away),
+        // so `{ let repo = 1; }` must not strip `repo` for the rest of the
+        // function. It does *not* scope an assignment to a name declared
+        // outside it: `if flag { active = repo; }` is how a conditional
+        // initialises an outer binding, and restoring the whole set discarded
+        // that (#1667 review, round five). Restore exactly the declared names.
         let outer = self.handles.clone();
+        let mut declared = HashSet::new();
         let mut cost = Cost::ZERO;
         for stmt in &block.stmts {
+            if let Stmt::Local(local) = stmt {
+                collect_pat_idents(&local.pat, &mut declared);
+            }
             cost = cost.then(self.stmt(stmt));
         }
-        self.handles = outer;
+        for name in declared {
+            if outer.contains(&name) {
+                self.handles.insert(name);
+            } else {
+                self.handles.remove(&name);
+            }
+        }
         cost
     }
 
@@ -474,6 +486,33 @@ impl Analyzer {
         }
     }
 
+    /// Bind `pat` for a nested scope, returning what those names meant before.
+    ///
+    /// Restoring *only* these names matters: a whole-set snapshot would also
+    /// undo an assignment the scope made to an **outer** name, and assignments
+    /// are not lexically scoped (#1667 review, round five).
+    fn enter_binding_scope(&mut self, pat: &Pat, is_handle: bool) -> Vec<(String, bool)> {
+        let mut names = HashSet::new();
+        collect_pat_idents(pat, &mut names);
+        let saved: Vec<(String, bool)> = names
+            .iter()
+            .map(|n| (n.clone(), self.handles.contains(n)))
+            .collect();
+        self.rebind(pat, is_handle);
+        saved
+    }
+
+    /// Undo an [`Self::enter_binding_scope`], name by name.
+    fn leave_binding_scope(&mut self, saved: Vec<(String, bool)>) {
+        for (name, was_handle) in saved {
+            if was_handle {
+                self.handles.insert(name);
+            } else {
+                self.handles.remove(&name);
+            }
+        }
+    }
+
     /// Bind every name in `pat` to a handle, or clear whatever identity those
     /// names carried. Insertion alone is not enough: a `HashSet` of names has
     /// no notion of shadowing, so a rebinding must actively remove.
@@ -560,7 +599,23 @@ impl Analyzer {
                 for arg in &call.args {
                     cost = cost.then(self.expr(arg));
                 }
-                cost.then(self.expr(&closure.body))
+                // Bind each parameter from its argument before walking the
+                // body. `(|active| async move { active.find_all().await })(repo)`
+                // otherwise left `active` untracked and the finder free (#1667
+                // review, round five) — the general closure arm scopes
+                // parameters, but this shortcut bypassed it.
+                let mut saved = Vec::new();
+                for (param, arg) in closure.inputs.iter().zip(call.args.iter()) {
+                    let is_handle = self.expr_carries_handle(arg);
+                    saved.extend(self.enter_binding_scope(param, is_handle));
+                }
+                // A parameter with no matching argument still shadows.
+                for param in closure.inputs.iter().skip(call.args.len()) {
+                    saved.extend(self.enter_binding_scope(param, false));
+                }
+                let body = self.expr(&closure.body);
+                self.leave_binding_scope(saved);
+                cost.then(body)
             }
             Expr::Call(call) => self.call(call),
             Expr::Macro(m) => self.mac(&m.mac),
@@ -570,12 +625,12 @@ impl Analyzer {
                 // the repository. Analysing the body against the outer
                 // identity scored `len()` as a query and then blamed the
                 // closure for it (#1667 review, round four).
-                let outer = self.handles.clone();
+                let mut saved = Vec::new();
                 for input in &closure.inputs {
-                    self.rebind(input, false);
+                    saved.extend(self.enter_binding_scope(input, false));
                 }
                 let body = self.expr(&closure.body);
-                self.handles = outer;
+                self.leave_binding_scope(saved);
                 if body.is_zero() {
                     Cost::ZERO
                 } else if matches!(body, Cost::Unbounded(_)) {
@@ -597,8 +652,15 @@ impl Analyzer {
 
             Expr::ForLoop(f) => {
                 let iter = self.expr(&f.expr);
+                // The loop variable inherits the iterable's provenance:
+                // `for active in [repo]` yields a handle under a new name, and
+                // leaving it untracked made the body's finder free (#1667
+                // review, round five).
+                let yields_handle = self.expr_carries_handle(&f.expr);
+                let saved = self.enter_binding_scope(&f.pat, yields_handle);
                 let before = self.ledger.len();
                 let body = self.block(&f.body);
+                self.leave_binding_scope(saved);
                 iter.then(self.bound_loop(body, const_bound(&f.expr), f.span(), before))
             }
             Expr::While(w) => {
@@ -909,12 +971,12 @@ impl Analyzer {
         // Same scoping as the general closure arm: a parameter shadows the
         // outer meaning of its name. A transaction's parameter *is* a
         // connection, so it binds; any other parameter clears.
-        let outer = self.handles.clone();
+        let mut saved = Vec::new();
         for input in &closure.inputs {
-            self.rebind(input, binds_handle);
+            saved.extend(self.enter_binding_scope(input, binds_handle));
         }
         let cost = self.expr(&closure.body);
-        self.handles = outer;
+        self.leave_binding_scope(saved);
         cost
     }
 
@@ -2843,6 +2905,98 @@ mod tests {
             ";
         assert_clean("2", handler);
         assert_error_contains("1", handler, &["2"]);
+    }
+
+    #[test]
+    fn an_iife_binds_its_parameters_from_its_arguments() {
+        // The `#[cached]` shortcut looked through the closure without binding
+        // parameters, so the handle arrived under a new name and vanished
+        // (#1667 review, round five).
+        let handler = r"
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                let rows = (|active| async move { active.find_all().await })(repo).await?;
+                Ok(rows.len())
+            }
+            ";
+        assert_error_contains("0", handler, &["1"]);
+        assert_clean("1", handler);
+    }
+
+    #[test]
+    fn a_for_loop_pattern_inherits_the_iterables_provenance() {
+        // `for active in [repo]` yields a handle under a new name; leaving it
+        // untracked made the body's finder free.
+        //
+        // A literal array carries a const bound, so this loop is *bounded* —
+        // one iteration, one query. The point is that the query is seen at
+        // all, not that it is unbounded.
+        let handler = r"
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                let mut n = 0;
+                for active in [repo] {
+                    n += active.find_all().await?.len();
+                }
+                Ok(n)
+            }
+            ";
+        assert_error_contains("0", handler, &["find_all"]);
+        assert_clean("1", handler);
+    }
+
+    #[test]
+    fn a_loop_pattern_does_not_leak_past_the_loop() {
+        // Counterpart: the loop variable's identity is scoped to the loop.
+        let handler = r"
+            async fn index(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> {
+                for repo in &ids {
+                    let _ = repo;
+                }
+                let rows = repo.find_all().await?;
+                Ok(rows.len())
+            }
+            ";
+        assert_clean("1", handler);
+        assert_error_contains("0", handler, &["1"]);
+    }
+
+    #[test]
+    fn a_handle_assigned_inside_a_branch_survives_the_branch() {
+        // A block scopes its own `let`s, not an assignment to a name declared
+        // outside it. Restoring the whole handle set discarded the alias and
+        // the finder after the conditional went uncounted (#1667 review,
+        // round five) — a regression from the block-scoping fix.
+        let handler = r"
+            async fn index(repo: PgPostRepository, replica: PgPostRepository) -> AutumnResult<usize> {
+                let active;
+                if flag {
+                    active = repo;
+                } else {
+                    active = replica;
+                }
+                let rows = active.find_all().await?;
+                Ok(rows.len())
+            }
+            ";
+        assert_error_contains("0", handler, &["1"]);
+        assert_clean("1", handler);
+    }
+
+    #[test]
+    fn a_let_inside_a_branch_is_still_scoped_to_it() {
+        // The guard on the fix above: a `let` really is block-scoped, so an
+        // inner shadow must not strip the outer handle afterwards.
+        let handler = r"
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                if flag {
+                    let repo = 1;
+                    let _ = repo;
+                }
+                let rows = repo.find_all().await?;
+                Ok(rows.len())
+            }
+            ";
+        assert_clean("1", handler);
+        assert_error_contains("0", handler, &["1"]);
     }
 
     #[test]
